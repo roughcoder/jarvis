@@ -9,6 +9,7 @@ dependencies = [
     "pydantic-settings>=2.3",
     "httpx>=0.27",
     "python-dotenv>=1.0",
+    "websockets>=12",          # brain<->intercom WebSocket transport (Phase 3 W4)
 ]
 
 [project.optional-dependencies]

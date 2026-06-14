@@ -287,21 +287,18 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         return 130
 
 
-def _cmd_run(_args: argparse.Namespace) -> int:
-    """Step 6 gate: hands-free wake-word loop (PASSIVE→ACTIVE→THINKING→SPEAKING)."""
-    from jarvis.intercom.audio import AudioIO
+def _run_local(cfg) -> None:  # noqa: ANN001
+    """In-process single-machine loop (brain + edge in one process)."""
     from jarvis.brain.gateway_client import GatewayClient
     from jarvis.brain.memory_client import MemoryClient
-    from jarvis.services.stt import Transcriber
     from jarvis.brain.tracing import Tracer
-    from jarvis.services.tts import InworldTTS
     from jarvis.brain.turnloop import TurnLoop
+    from jarvis.intercom.audio import AudioIO
     from jarvis.intercom.vad import SileroVAD
     from jarvis.intercom.wake import WakeWord
+    from jarvis.services.stt import Transcriber
+    from jarvis.services.tts import InworldTTS
 
-    cfg = load_config()
-    if _args.no_bargein:
-        cfg.vad.bargein_enabled = False
     loop = TurnLoop(
         cfg,
         audio=AudioIO(cfg.audio),
@@ -313,12 +310,55 @@ def _cmd_run(_args: argparse.Namespace) -> int:
         memory=MemoryClient(cfg.memory),
         tracer=Tracer(cfg.trace),
     )
+    asyncio.run(loop.run())
+
+
+def _run_intercom(cfg) -> None:  # noqa: ANN001
+    """Thin intercom client: capture/playback locally, talk to the brain (W4)."""
+    from jarvis.intercom.audio import AudioIO
+    from jarvis.intercom.client import IntercomClient
+    from jarvis.intercom.vad import SileroVAD
+    from jarvis.intercom.wake import WakeWord
+
+    client = IntercomClient(
+        cfg, audio=AudioIO(cfg.audio), vad=SileroVAD(cfg.vad), wake=WakeWord(cfg.wake)
+    )
+    asyncio.run(client.run())
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    """Hands-free wake-word loop. Default: thin intercom -> brain server (W4).
+    `--local` runs the whole thing in one process (no server needed)."""
+    cfg = load_config()
+    if args.no_bargein:
+        cfg.vad.bargein_enabled = False
+    if args.brain:
+        host, _, port = args.brain.partition(":")
+        cfg.intercom.brain_host = host or cfg.intercom.brain_host
+        if port:
+            cfg.intercom.brain_port = int(port)
     try:
-        asyncio.run(loop.run())
+        if args.local:
+            _run_local(cfg)
+        else:
+            _run_intercom(cfg)
     except KeyboardInterrupt:
         print("\n(stopped)")
         # Blocking mic-read worker threads can't be joined on Ctrl-C; exit hard
         # so the interpreter's atexit thread-join doesn't hang.
+        os._exit(0)
+    return 0
+
+
+def _cmd_brain(_args: argparse.Namespace) -> int:
+    """Run the brain WebSocket server that intercoms connect to (Phase 3 W4)."""
+    from jarvis.brain.server import serve
+
+    cfg = load_config()
+    try:
+        asyncio.run(serve(cfg))
+    except KeyboardInterrupt:
+        print("\n(stopped)")
         os._exit(0)
     return 0
 
@@ -413,13 +453,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_chat.set_defaults(func=_cmd_chat)
 
-    p_run = sub.add_parser("run", help="Hands-free wake-word loop (Steps 6/7)")
+    p_run = sub.add_parser("run", help="Hands-free wake-word loop (intercom -> brain)")
     p_run.add_argument(
         "--no-bargein",
         action="store_true",
         help="Disable barge-in (use on bare speakers without an AEC mic)",
     )
+    p_run.add_argument(
+        "--local",
+        action="store_true",
+        help="Run brain + edge in one process (no separate brain server)",
+    )
+    p_run.add_argument(
+        "--brain",
+        metavar="HOST[:PORT]",
+        help="Brain server to connect to (overrides INTERCOM_BRAIN_HOST/PORT)",
+    )
     p_run.set_defaults(func=_cmd_run)
+
+    p_brain = sub.add_parser("brain", help="Run the brain server intercoms connect to (W4)")
+    p_brain.set_defaults(func=_cmd_brain)
 
     p_traces = sub.add_parser("traces", help="View recent per-turn pipeline traces")
     p_traces.add_argument("-n", type=int, default=20, help="How many recent traces")

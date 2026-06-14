@@ -257,6 +257,34 @@ class ToolsConfig(_Base):
     websearch_max_results: int = 5
 
 
+class BrainConfig(_Base):
+    """The brain WebSocket server (Phase 3 W4). Intercoms connect here."""
+
+    model_config = SettingsConfigDict(env_prefix="BRAIN_", env_file=".env", extra="ignore")
+
+    host: str = "localhost"
+    port: int = 8700
+    # Shared pairing secret. Empty => accept any device (dev/local only).
+    pairing_token: SecretStr = SecretStr("")
+
+
+class IntercomConfig(_Base):
+    """The intercom client (Phase 3 W4): where the brain is + the pairing token.
+    The device's own id/profile come from CapabilityConfig (CAPS_DEVICE_ID), one
+    source of truth. The intercom holds NO provider credentials (review HIGH #2)."""
+
+    model_config = SettingsConfigDict(env_prefix="INTERCOM_", env_file=".env", extra="ignore")
+
+    brain_host: str = "localhost"
+    brain_port: int = 8700
+    token: SecretStr = SecretStr("")
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def brain_url(self) -> str:
+        return f"ws://{self.brain_host}:{self.brain_port}"
+
+
 class Config:
     """Aggregate config. Construct once and pass modules their slice."""
 
@@ -273,6 +301,8 @@ class Config:
         self.trace = TraceConfig()
         self.capabilities = CapabilityConfig()
         self.tools = ToolsConfig()
+        self.brain = BrainConfig()
+        self.intercom = IntercomConfig()
 
     def resolved(self) -> dict:
         """Flat, secret-masked view for the dry-run printout (Step 0 gate)."""
@@ -329,6 +359,11 @@ class Config:
             "tools.websearch_provider": self.tools.websearch_provider,
             "tools.websearch_api_key": mask(self.tools.websearch_api_key),
             "tools.timeout_s": self.tools.timeout_s,
+            "brain.host": self.brain.host,
+            "brain.port": self.brain.port,
+            "brain.pairing_token": mask(self.brain.pairing_token),
+            "intercom.brain_url": self.intercom.brain_url,
+            "intercom.token": mask(self.intercom.token),
         }
 
 

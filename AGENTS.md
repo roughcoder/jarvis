@@ -92,8 +92,16 @@ Secrets to put in `.env` (gitignored): `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
 | `jarvis say "text" [--stop-after S]` | streaming TTS + hard-stop demo |
 | `jarvis listen [--rounds N]` | push-to-talk STT |
 | `jarvis chat [--manual] [--rounds N]` | push-to-talk / VAD round-trip |
-| `jarvis run [--no-bargein]` | the hands-free wake-word loop |
+| `jarvis brain` | run the brain WebSocket server (Phase 3 W4) |
+| `jarvis run [--no-bargein] [--local] [--brain H:P]` | hands-free loop: thin intercom → brain (`--local` = one process) |
 | `jarvis traces [-n N]` | view per-turn pipeline timings |
+
+Phase 3 (see `docs/PHASE3.md`) split the loop into a **brain server** + thin
+**intercom** clients over a WebSocket protocol (`jarvis brain` + `jarvis run`),
+with a deny-by-default capability gate and a tool layer. `jarvis run --local`
+keeps the original single-process behaviour. The think/speak core is shared
+(`brain/session.py`, `BrainSession`); the edge (mic/wake/VAD/playback) lives in
+`intercom/`.
 
 ## Conventions
 
