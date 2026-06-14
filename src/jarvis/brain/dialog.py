@@ -38,15 +38,18 @@ _VOICE_FORMAT_EXPRESSIVE = (
 # Conversation control: how the model signals the user is done so the loop can
 # return to PASSIVE (wake word required again). Detected + stripped before TTS.
 _END_INSTRUCTION = (
-    "Ending the conversation: end when the user clearly signals they're finished "
-    "— a goodbye ('bye', 'goodnight', 'see you'), declining further help ('no "
-    "thanks', \"no, that's good, thanks\", \"I'm good\", 'we're good'), or "
+    "Ending the conversation: end only when the user clearly signals they're "
+    "finished — a goodbye ('bye', 'goodnight', 'see you'), declining further help "
+    "('no thanks', \"no, that's good, thanks\", \"I'm good\", 'we're good'), or "
     "'that's all'/'stop'/'go to sleep'. To end, give a short, warm farewell of a "
     "few words and NOTHING else, then put [[END]] as the very last characters. "
-    "IMPORTANT: if your reply is itself a goodbye, you MUST include [[END]]. If a "
-    "message is only a vague acknowledgement and you can't tell whether they're "
-    "done (a bare 'thanks', 'ok', 'cool', 'great'), do NOT end — give your reply "
-    "and briefly ASK if there's anything else. When unsure, ask rather than end."
+    "IMPORTANT: if your reply is itself a goodbye, you MUST include [[END]]. "
+    "Otherwise, just answer naturally and stop. Do NOT habitually tack on 'is "
+    "there anything else?', 'want to know more?', or similar filler — only ask a "
+    "follow-up question when you genuinely need it to help (e.g. to clarify an "
+    "ambiguous request). When you can't tell whether they're done, simply finish "
+    "your reply normally — no farewell, no [[END]]; the mic stays open, so you "
+    "never need to prompt them to keep talking."
 )
 # Matches [[END]] / [END] (case-insensitive). Stripped from the spoken reply.
 _END_RE = re.compile(r"\s*\[\[?\s*end\s*\]\]?\s*", re.IGNORECASE)
