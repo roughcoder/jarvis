@@ -1,0 +1,135 @@
+# Jarvis Phase 1 local services. Reads secrets from the root .env file.
+#
+#   Step 1: litellm                       (LLM gateway)
+#   Step 8: honcho-db / honcho-redis /
+#           honcho-api / honcho-deriver   (memory service, spec §4)
+#
+# Honcho runs in this same compose so its deriver/summary/dream/embedding LLM
+# calls reach LiteLLM over the internal network at http://litellm:4000/v1 —
+# i.e. NO local model (spec §4). The real OpenAI key lives only in litellm;
+# Honcho authenticates to LiteLLM with the gateway master key.
+#
+# Ports come from .env so Phase 2 (spec §3.1) is an env change, not an edit.
+# (DB/redis healthchecks below are for correct boot ordering, not Phase 3
+# hardening; restart policies are intentionally omitted per spec §2.)
+
+x-honcho-env: &honcho-env
+  DB_CONNECTION_URI: postgresql+psycopg://postgres:postgres@honcho-db:5432/postgres
+  CACHE_URL: redis://honcho-redis:6379/0?suppress=true
+  CACHE_ENABLED: "true"
+  AUTH_USE_AUTH: "false"
+  LOG_LEVEL: INFO
+  # Honcho v2.0.3: every LLM feature uses the "custom" provider, which is an
+  # OpenAI-compatible client pointed at LiteLLM — i.e. no local model, all
+  # reasoning routed through the gateway (spec §4). Embeddings stay off
+  # (EMBED_MESSAGES=false) so no extra key is needed for Phase 1.
+  LLM_OPENAI_COMPATIBLE_BASE_URL: http://litellm:4000/v1
+  LLM_OPENAI_COMPATIBLE_API_KEY: ${GATEWAY_API_KEY:-sk-jarvis-local}
+  # Required at startup even with embeddings off (EmbeddingClient is OpenAI-only
+  # in v2.0.3). Real key so embeddings work if ever enabled; reasoning still
+  # goes through LiteLLM via the custom provider above.
+  LLM_OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-jarvis-local}
+  LLM_DIALECTIC_PROVIDER: custom
+  LLM_DIALECTIC_MODEL: honcho-llm
+  LLM_QUERY_GENERATION_PROVIDER: custom
+  LLM_QUERY_GENERATION_MODEL: honcho-llm
+  LLM_TOM_INFERENCE_PROVIDER: custom
+  LLM_TOM_INFERENCE_MODEL: honcho-llm
+  LLM_SUMMARY_PROVIDER: custom
+  LLM_SUMMARY_MODEL: honcho-llm
+  LLM_EMBED_MESSAGES: "false"
+
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: jarvis-litellm
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    ports:
+      - "${GATEWAY_PORT:-4000}:4000"
+    environment:
+      LITELLM_MASTER_KEY: ${GATEWAY_API_KEY:-sk-jarvis-local}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      # Admin UI needs a DB (proxy routing itself does not). Reuses the Postgres
+      # instance with a separate `litellm` database.
+      DATABASE_URL: postgresql://postgres:postgres@honcho-db:5432/litellm
+    depends_on:
+      honcho-db:
+        condition: service_healthy
+    volumes:
+      - ./deploy/litellm/config.yaml:/app/config.yaml:ro
+
+  honcho-db:
+    image: pgvector/pgvector:pg15
+    container_name: jarvis-honcho-db
+    command: ["postgres", "-c", "max_connections=200"]
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_HOST_AUTH_METHOD: trust
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./deploy/honcho/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - honcho-pgdata:/var/lib/postgresql/data/
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  honcho-redis:
+    image: redis:8.2
+    container_name: jarvis-honcho-redis
+    volumes:
+      - honcho-redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  honcho-api:
+    image: ghcr.io/plastic-labs/honcho:v2.0.3
+    container_name: jarvis-honcho-api
+    # Prebuilt image's default CMD runs the API but skips migrations; run
+    # provision_db.py first, then start the server.
+    entrypoint: ["sh", "-c"]
+    command:
+      - "/app/.venv/bin/python scripts/provision_db.py && exec /app/.venv/bin/fastapi run --host 0.0.0.0 src/main.py"
+    depends_on:
+      honcho-db:
+        condition: service_healthy
+      honcho-redis:
+        condition: service_healthy
+    ports:
+      - "${MEMORY_PORT:-8000}:8000"
+    environment: *honcho-env
+    healthcheck:
+      # v2.0.3 has no /health route; /openapi.json is a cheap 200 liveness probe.
+      test:
+        ["CMD", "/app/.venv/bin/python", "-c",
+         "import urllib.request; urllib.request.urlopen('http://localhost:8000/openapi.json', timeout=2).read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  honcho-deriver:
+    image: ghcr.io/plastic-labs/honcho:v2.0.3
+    container_name: jarvis-honcho-deriver
+    entrypoint: ["/app/.venv/bin/python", "-m", "src.deriver"]
+    depends_on:
+      honcho-api:
+        condition: service_healthy
+      honcho-db:
+        condition: service_healthy
+      honcho-redis:
+        condition: service_healthy
+    environment: *honcho-env
+
+volumes:
+  honcho-pgdata:
+  honcho-redis-data:

@@ -1,0 +1,15 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.cache/
+.pytest_cache/
+.ruff_cache/
+models/*.ppn
+*.egg-info/
+dist/
+build/
+
+# Agent/harness state (not part of the project)
+.omc/
+.omx/

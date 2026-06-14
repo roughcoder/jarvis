@@ -1,0 +1,61 @@
+[project]
+name = "jarvis"
+version = "0.1.0"
+description = "Jarvis — all-local voice assistant (Phase 1)"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+# Installed incrementally as each build step is reached, so Step 0 stays light.
+gateway = [
+    "openai>=1.40",            # OpenAI-compatible client -> LiteLLM gateway
+]
+tts = [
+    "sounddevice>=0.4.7",
+    "numpy>=1.26",
+]
+stt = [
+    "faster-whisper>=1.0",
+    "sounddevice>=0.4.7",
+    "numpy>=1.26",
+]
+vad = [
+    "silero-vad>=5.1",
+    "torch>=2.2",
+]
+wake = [
+    "openwakeword>=0.6",
+    "pvporcupine>=3.0",
+]
+memory = [
+    "honcho-ai>=1.5",
+]
+
+[project.scripts]
+jarvis = "jarvis.cli:main"
+
+[tool.uv]
+# The audio / turn-loop tier always runs on the Mac (`hive`); Phase 2 only
+# relocates the Docker services. Restricting resolution to macOS drops a
+# Linux-only, cp312-less openwakeword sub-dependency (tflite-runtime) that we
+# don't use (we run openWakeWord on the ONNX backend).
+environments = ["sys_platform == 'darwin'"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jarvis"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]

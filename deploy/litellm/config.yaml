@@ -1,0 +1,60 @@
+# LiteLLM proxy config (spec §4, Step 1).
+# The turn loop talks ONLY to this proxy and selects a model by ROUTE NAME
+# (model_name below) — never a provider SDK id. Switching fast<->strong, or
+# OpenAI<->OpenRouter, is a parameter change, not a code change.
+#
+# Provider API keys are injected from the environment (see docker-compose.yml /
+# root .env); they live here, NOT in the turn loop.
+#
+# Primary fast/strong run on OpenAI (funded, reliable). OpenRouter models are
+# kept as cross-provider alternates — repoint by swapping the route name.
+#
+# max_tokens is capped on every route: voice replies are short, and it avoids
+# reserving a model's full output budget against the credit balance.
+
+model_list:
+  # --- primary routes (OpenAI) -------------------------------------------
+  - model_name: fast            # GATEWAY_FAST_MODEL
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+      max_tokens: 512
+
+  - model_name: strong          # GATEWAY_STRONG_MODEL
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+      max_tokens: 1024
+
+  # --- cross-provider alternates (OpenRouter) ----------------------------
+  - model_name: fast-openrouter
+    litellm_params:
+      model: openrouter/anthropic/claude-3.5-haiku
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 512
+
+  - model_name: strong-openrouter
+    litellm_params:
+      model: openrouter/anthropic/claude-sonnet-4.5
+      api_key: os.environ/OPENROUTER_API_KEY
+      max_tokens: 1024
+
+  # --- Honcho memory service (Step 8) ------------------------------------
+  # Honcho's deriver / summary / dream features route here (NOT a local model,
+  # spec §4). Uncapped max_tokens so its reasoning output isn't truncated.
+  - model_name: honcho-llm
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+  # Embeddings for Honcho's working representation (OpenAI-compatible).
+  - model_name: embed
+    litellm_params:
+      model: openai/text-embedding-3-small
+      api_key: os.environ/OPENAI_API_KEY
+
+litellm_settings:
+  drop_params: true             # tolerate provider-specific param differences
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
