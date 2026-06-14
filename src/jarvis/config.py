@@ -133,6 +133,11 @@ class VADConfig(_Base):
     bargein_min_ms: int = 200             # vad-mode sustained speech to barge in
     bargein_grace_ms: int = 250           # vad-mode: ignore playback onset window
     min_speech_ms: int = 200
+    # Conversation mode (spec §5 follow-up nice-to-have): after a reply, keep
+    # listening for this long so the user can continue WITHOUT re-saying the wake
+    # word. On silence past the window, drop back to PASSIVE (wake required).
+    conversation_mode: bool = True
+    conversation_timeout_ms: int = 8000
 
 
 class WakeConfig(_Base):

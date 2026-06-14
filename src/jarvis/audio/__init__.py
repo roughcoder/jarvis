@@ -185,6 +185,10 @@ class MicStream:
         """Next 512-sample PCM frame. Blocks until one is available."""
         return self._queue.get(timeout=timeout)
 
+    def qsize(self) -> int:
+        """Number of buffered (unread) frames — a backlog indicator."""
+        return self._queue.qsize()
+
     def drain(self) -> None:
         """Discard any buffered frames (e.g. Jarvis's own audio tail)."""
         while True:

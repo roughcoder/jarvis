@@ -72,8 +72,9 @@ Per-step extras install as each build step is reached, e.g.
       in gateway logs). Memory client uses the raw /v2 REST API. Recall via the
       cold-path dialectic (Neil/sailing fact stored + retrieved). DB on :5433
       (5432 taken by alice-postgres).
-- [~] Step 9 — memory wired into `jarvis run`: hot path injects the local
-      cached representation (~0.03ms read) into the prompt; cold path is a
-      detached task (write turn → deriver → refresh cache, ~11s) fired before
-      speaking so it never blocks. Recall verified offline; live voice gate pending.
+- [x] Step 9 — memory wired into `jarvis run`: hot path injects the local
+      cached representation (~0.03ms read); cold path is a detached task (write
+      → deriver → refresh) that never blocks. Confirmed live: cross-session
+      recall + mid-conversation fact updates. Plus conversation mode (follow-up
+      window so you don't re-wake each turn, VAD_CONVERSATION_MODE).
 - [ ] Step 10 — Phase 1 acceptance

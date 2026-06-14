@@ -78,12 +78,21 @@ class TurnLoop:
 
     # --- blocking frame loops (run via to_thread) --------------------------
     def _wait_for_wake(self, mic: MicStream) -> None:
+        # If the wake loop falls behind (e.g. a CPU/thread spike from the
+        # cold-path memory work just after a turn), the queue backs up and we'd
+        # be detecting stale audio. Drop the backlog and reset so detection
+        # always tracks live audio and stays responsive.
+        backlog_frames = int(1.5 * self._sr / FRAME_SAMPLES)
         while True:
+            if mic.qsize() > backlog_frames:
+                mic.drain()
+                self._wake.reset()
+                continue
             frame = mic.read()
             if self._wake.process(frame):
                 return
 
-    def _capture_utterance(self, mic: MicStream) -> bytes:
+    def _capture_utterance(self, mic: MicStream, *, initial_wait_ms: float = 8000) -> bytes:
         frame_ms = FRAME_SAMPLES / self._sr * 1000.0
         self._vad.reset()
         ep = Endpointer(
@@ -98,7 +107,7 @@ class TurnLoop:
             done = ep.feed(frame, self._vad.prob(frame))
             if not ep.started:
                 waited_ms += frame_ms
-                if waited_ms >= 8000:  # gave the wake word but said nothing
+                if waited_ms >= initial_wait_ms:  # no speech within the window
                     return b""
             if done or len(ep.audio) / 2 / self._sr >= 30.0:
                 return ep.audio
@@ -126,6 +135,7 @@ class TurnLoop:
         self.state = State.PASSIVE
         mic.drain()
         self._wake.reset()
+        print("● idle — say \"Hey Jarvis\"")
         await asyncio.to_thread(self._wait_for_wake, mic)
         self.state = State.ACTIVE
         print("● wake")
@@ -180,12 +190,28 @@ class TurnLoop:
 
             # SPEAKING (barge-in armed)
             interrupted = await self._speak_with_bargein(mic, reply)
-            if not interrupted:
-                return  # normal completion → back to PASSIVE
-            # INTERRUPTED → re-listen immediately (ACTIVE), no wake word
-            print("⊘ interrupted — listening…")
+            if interrupted:
+                # INTERRUPTED → re-listen immediately (ACTIVE), no wake word.
+                print("⊘ interrupted — listening…")
+                self.state = State.ACTIVE
+                pcm = await asyncio.to_thread(self._capture_utterance, mic)
+                continue
+
+            # Normal completion. Conversation mode: keep listening briefly so the
+            # user can continue without the wake word. Silence past the window
+            # drops back to PASSIVE.
+            if not self._cfg.vad.conversation_mode:
+                return
             self.state = State.ACTIVE
-            pcm = await asyncio.to_thread(self._capture_utterance, mic)
+            mic.drain()  # discard Jarvis's own reply tail before listening
+            print("  …(listening — keep talking, or stay quiet to sleep)")
+            pcm = await asyncio.to_thread(
+                self._capture_utterance,
+                mic,
+                initial_wait_ms=self._cfg.vad.conversation_timeout_ms,
+            )
+            if not pcm:
+                return  # conversation went idle → PASSIVE (wake word required)
 
     def _fire_cold_path(self, user_text: str, assistant_text: str) -> None:
         """Detached background task — never awaited on the hot path."""
@@ -200,6 +226,7 @@ class TurnLoop:
         try:
             await self._memory.write_turn(user_text, assistant_text)
             await self._memory.refresh_cache()
+            print("  [memory] updated in background")
         except Exception as exc:  # noqa: BLE001 - memory must never break a turn
             print(f"  [memory] cold-path skipped: {exc}")
 
