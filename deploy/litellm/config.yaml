@@ -58,3 +58,9 @@ litellm_settings:
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
+  # Full request/response tracing in the admin UI: persist routes/keys plus the
+  # prompt + completion content into the DB (needs DATABASE_URL, set on the
+  # litellm service in docker-compose.yml). Messages are only redacted if
+  # turn_off_message_logging is set — we leave it off.
+  store_model_in_db: true
+  store_prompts_in_spend_logs: true
