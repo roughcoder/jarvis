@@ -71,7 +71,7 @@ class TurnLoop:
         # Per-request identity/capability envelope (Phase 3 §4) — single-principal
         # in 3a. The think/speak core is shared with the brain server.
         self._ctx = build_request_context(cfg.capabilities)
-        self._registry = build_registry(cfg.tools)
+        self._registry = build_registry(cfg.tools, worker=cfg.worker)
         self._session = BrainSession(
             cfg,
             self._ctx,
