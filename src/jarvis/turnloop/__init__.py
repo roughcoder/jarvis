@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import queue
+import re
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -67,6 +68,58 @@ _VOICE_FORMAT_EXPRESSIVE = (
     "Most lines need no tags at all — reach for them only when feeling genuinely "
     "colours what you're saying."
 )
+
+# Conversation control: how the model signals the user is done so the loop can
+# return to PASSIVE (wake word required again). Detected + stripped before TTS.
+_END_INSTRUCTION = (
+    "Ending the conversation: only end when you are CERTAIN the user is finished. "
+    "Unmistakable sign-offs — 'goodbye', 'bye', 'stop', 'go to sleep', \"that's "
+    "all\", \"that's everything\", \"I'm done\" — mean end: give a short, warm "
+    "farewell of a few words and NOTHING else, then put [[END]] as the very last "
+    "characters. If a message MIGHT mean they're done but you're not certain (a "
+    "bare 'thanks', 'no thanks', \"that's good\", 'ok', 'cool', 'great'), do NOT "
+    "end — give your normal reply and briefly ask if there's anything else. When "
+    "in doubt, ASK, never end. Never use [[END]] while they still want to continue."
+)
+# Matches [[END]] / [END] (case-insensitive). Stripped from the spoken reply.
+_END_RE = re.compile(r"\s*\[\[?\s*end\s*\]\]?\s*", re.IGNORECASE)
+
+# Deterministic safety net: ONLY unmistakable closers (the model handles the
+# ambiguous ones by asking). Kept high-precision so it never ends a turn the
+# user meant to continue. Matched against the whole normalised utterance.
+_CLEAR_SIGNOFFS = frozenset(
+    {
+        "goodbye", "bye", "bye bye", "good night", "goodnight",
+        "stop", "stop listening", "go to sleep", "go to bed",
+        "thats all", "that is all", "thatll be all", "that will be all",
+        "thats everything", "that is everything", "thats it", "that is it",
+        "nothing else", "im done", "i am done", "were done", "we are done",
+        "go away", "dismissed",
+    }
+)
+
+
+_SIGNOFF_LEAD = re.compile(
+    r"^(no|nope|nah|yeah|yep|yes|ok|okay|alright|right|well|so|um|uh|cool|great|"
+    r"thanks|thank you|cheers|jarvis)\s+"
+)
+_SIGNOFF_TRAIL = re.compile(
+    r"\s+(please|thanks|thank you|cheers|now|then|mate|jarvis|ok|okay|here)$"
+)
+
+
+def _is_clear_signoff(text: str) -> bool:
+    """True only for an unambiguous goodbye, after stripping filler words."""
+    t = text.lower().replace("'", "")
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    # Peel leading/trailing fillers so "no, that's all, thanks" -> "thats all".
+    while True:
+        stripped = _SIGNOFF_TRAIL.sub("", _SIGNOFF_LEAD.sub("", t))
+        if stripped == t:
+            break
+        t = stripped
+    return t in _CLEAR_SIGNOFFS
 
 
 class State(enum.Enum):
@@ -218,9 +271,18 @@ class TurnLoop:
             ]
             trace.start("llm")
             reply = await self._gateway.complete(messages, model=model)
+            # End-of-conversation: the model's [[END]] marker (detect + strip so
+            # it's never spoken/stored) OR a deterministic unmistakable sign-off.
+            ended = self._cfg.vad.conversation_mode and (
+                bool(_END_RE.search(reply or "")) or _is_clear_signoff(text)
+            )
+            if _END_RE.search(reply or ""):
+                reply = _END_RE.sub(" ", reply).strip()
             trace.end("llm", model=model, chars=len(reply or ""), memory=bool(memory))
-            print(f"  jarvis [{model}]: {reply}")
+            print(f"  jarvis [{model}]: {reply}{'  ⏹' if ended else ''}")
             if not reply:
+                if ended:
+                    print('  …(conversation closed — say "Hey Jarvis")')
                 self._tracer.emit(trace)
                 return
             # One continuous conversation: remember the exchange for next turn.
@@ -243,9 +305,13 @@ class TurnLoop:
                 pcm = await asyncio.to_thread(self._capture_utterance, mic)
                 continue
 
-            # Normal completion. Conversation mode: keep listening briefly so the
-            # user can continue without the wake word. Silence past the window
-            # drops back to PASSIVE.
+            # Normal completion. If the user signed off, close the conversation
+            # and return to PASSIVE (wake word required again).
+            if ended:
+                print('  …(conversation closed — say "Hey Jarvis")')
+                return
+            # Conversation mode: keep listening briefly so the user can continue
+            # without the wake word. Silence past the window drops to PASSIVE.
             if not self._cfg.vad.conversation_mode:
                 return
             self.state = State.ACTIVE
@@ -269,6 +335,8 @@ class TurnLoop:
             if self._cfg.persona.expressive
             else _VOICE_FORMAT_BASE
         )
+        if self._cfg.vad.conversation_mode:
+            parts.append(_END_INSTRUCTION)
         if memory:
             parts.append(
                 "What you already know about the user (use it naturally only if "
