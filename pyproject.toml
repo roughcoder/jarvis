@@ -37,6 +37,11 @@ wake = [
 memory = [
     "honcho-ai>=1.5",
 ]
+# The worker Mac daemon — installed ONLY on the worker host, not the brain or an
+# intercom (it talks to the brain over HTTP; nothing imports it). Phase 3c.
+worker = [
+    "aiohttp>=3.9",
+]
 
 [project.scripts]
 jarvis = "jarvis.cli:main"

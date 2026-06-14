@@ -363,6 +363,20 @@ def _cmd_brain(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_worker(_args: argparse.Namespace) -> int:
+    """Run the worker daemon — deep work + machine control on this host (W3c).
+    A standalone service the brain dispatches to over HTTP."""
+    from jarvis.worker.server import serve
+
+    cfg = load_config()
+    try:
+        asyncio.run(serve(cfg.worker))
+    except KeyboardInterrupt:
+        print("\n(stopped)")
+        os._exit(0)
+    return 0
+
+
 def _cmd_traces(args: argparse.Namespace) -> int:
     """View recent per-turn pipeline traces (STT/LLM/TTS/memory timings)."""
     import json
@@ -473,6 +487,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_brain = sub.add_parser("brain", help="Run the brain server intercoms connect to (W4)")
     p_brain.set_defaults(func=_cmd_brain)
+
+    p_worker = sub.add_parser("worker", help="Run the worker daemon (deep work + machine control, W3c)")
+    p_worker.set_defaults(func=_cmd_worker)
 
     p_traces = sub.add_parser("traces", help="View recent per-turn pipeline traces")
     p_traces.add_argument("-n", type=int, default=20, help="How many recent traces")

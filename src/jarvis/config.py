@@ -290,6 +290,32 @@ class IntercomConfig(_Base):
         return f"ws://{self.brain_host}:{self.brain_port}"
 
 
+class WorkerConfig(_Base):
+    """The worker Mac daemon (Phase 3c): a boundary peer the brain dispatches deep
+    work + machine control to. Token-authed; provider/agent binaries are local to
+    the worker. The brain reaches it at host:port; the daemon binds bind_host
+    (default = host)."""
+
+    model_config = SettingsConfigDict(env_prefix="WORKER_", env_file=".env", extra="ignore")
+
+    host: str = "localhost"          # where the brain reaches the worker
+    port: int = 8780
+    bind_host: str = ""              # daemon bind addr; empty => host
+    token: SecretStr = SecretStr("")  # shared pairing token
+    workspace: str = "jarvis-workspace/worker"  # default cwd for actions/jobs
+    agent: str = "codex"             # default coding agent: codex | claude
+    codex_bin: str = "codex"
+    claude_bin: str = "claude"
+    shell_timeout_s: float = 30.0    # sync shell/applescript max runtime
+    job_timeout_s: float = 1800.0    # background code job max runtime (30 min)
+    request_timeout_s: float = 40.0  # brain->worker HTTP timeout (> shell_timeout)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+
 class Config:
     """Aggregate config. Construct once and pass modules their slice."""
 
@@ -308,6 +334,7 @@ class Config:
         self.tools = ToolsConfig()
         self.brain = BrainConfig()
         self.intercom = IntercomConfig()
+        self.worker = WorkerConfig()
 
     def resolved(self) -> dict:
         """Flat, secret-masked view for the dry-run printout (Step 0 gate)."""
@@ -369,6 +396,10 @@ class Config:
             "brain.pairing_token": mask(self.brain.pairing_token),
             "intercom.brain_url": self.intercom.brain_url,
             "intercom.token": mask(self.intercom.token),
+            "worker.base_url": self.worker.base_url,
+            "worker.token": mask(self.worker.token),
+            "worker.agent": self.worker.agent,
+            "worker.workspace": self.worker.workspace,
         }
 
 
