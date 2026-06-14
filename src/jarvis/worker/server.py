@@ -65,11 +65,13 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             agent = args.get("agent") or cfg.agent
             argv = code_argv(agent, cfg.codex_bin, cfg.claude_bin, args.get("prompt", ""))
             label = args.get("prompt", "")[:80] or agent
+            job_cwd = args.get("repo") or cfg.workspace
             job = jobs.start(
                 "code",
                 label,
-                run_exec(argv, args.get("repo") or cfg.workspace, cfg.job_timeout_s),
+                run_exec(argv, job_cwd, cfg.job_timeout_s),
                 name=args.get("name", ""),
+                cwd=job_cwd,
             )
             return web.json_response(
                 {"ok": True, "job_id": job.id, "name": job.name, "status": "running"}

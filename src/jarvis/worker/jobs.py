@@ -34,6 +34,7 @@ class Job:
     action: str
     label: str  # the full task/prompt (the "description")
     name: str = ""  # short human handle (user-given or auto-slugged)
+    cwd: str = ""  # the working directory the job ran in (where file changes land)
     status: str = "running"  # running | done | error | interrupted
     output: str = ""
     session_id: str | None = None  # the coding agent's session (for `codex resume`)
@@ -67,6 +68,7 @@ class JobManager:
                 action=d.get("action", "?"),
                 label=d.get("label", ""),
                 name=d.get("name", ""),
+                cwd=d.get("cwd", ""),
                 status=d.get("status", "done"),
                 output=d.get("output", ""),
                 session_id=d.get("session_id"),
@@ -87,9 +89,15 @@ class JobManager:
             pass  # persistence is best-effort; never break a job over it
 
     # --- lifecycle ---------------------------------------------------------
-    def start(self, action: str, label: str, coro: Awaitable[str], name: str = "") -> Job:
+    def start(
+        self, action: str, label: str, coro: Awaitable[str], name: str = "", cwd: str = ""
+    ) -> Job:
         job = Job(
-            id=uuid.uuid4().hex[:12], action=action, label=label, name=slugify(name or label)
+            id=uuid.uuid4().hex[:12],
+            action=action,
+            label=label,
+            name=slugify(name or label),
+            cwd=cwd,
         )
         self._jobs[job.id] = job
         self._persist(job)

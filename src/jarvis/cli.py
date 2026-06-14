@@ -409,6 +409,8 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
             f"  {clock}  {(j.get('name') or j.get('id'))[:30]:<30} "
             f"{j.get('status'):<11} {out}"
         )
+        if j.get("cwd"):
+            print(f"            └─ ran in: {j['cwd']}  (git -C … diff to see changes)")
         if j.get("session_id"):
             print(f"            └─ full transcript: codex resume {j['session_id']}")
     return 0
