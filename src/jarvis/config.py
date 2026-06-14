@@ -306,6 +306,9 @@ class WorkerConfig(_Base):
     agent: str = "codex"             # default coding agent: codex | claude
     codex_bin: str = "codex"
     claude_bin: str = "claude"
+    # Repo jobs run on an isolated worktree branch "<prefix>/<name>-<id>", never
+    # the user's checkout.
+    worktree_branch_prefix: str = "jarvis"
     shell_timeout_s: float = 30.0    # sync shell/applescript max runtime
     job_timeout_s: float = 1800.0    # background code job max runtime (30 min)
     request_timeout_s: float = 40.0  # brain->worker HTTP timeout (> shell_timeout)

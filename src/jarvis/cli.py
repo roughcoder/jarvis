@@ -409,8 +409,10 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
             f"  {clock}  {(j.get('name') or j.get('id'))[:30]:<30} "
             f"{j.get('status'):<11} {out}"
         )
-        if j.get("cwd"):
-            print(f"            └─ ran in: {j['cwd']}  (git -C … diff to see changes)")
+        if j.get("branch"):
+            print(f"            └─ branch: {j['branch']}  (review: git -C {j.get('cwd')} diff)")
+        elif j.get("cwd"):
+            print(f"            └─ ran in: {j['cwd']}  (git -C {j['cwd']} diff)")
         if j.get("session_id"):
             print(f"            └─ full transcript: codex resume {j['session_id']}")
     return 0

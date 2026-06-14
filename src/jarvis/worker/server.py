@@ -22,6 +22,7 @@ from aiohttp import web
 from jarvis.config import WorkerConfig
 from jarvis.worker.actions import (
     code_argv,
+    prepare_worktree,
     run_applescript,
     run_exec,
     run_shell,
@@ -67,12 +68,22 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             agent = args.get("agent") or cfg.agent
             argv = code_argv(agent, cfg.codex_bin, cfg.claude_bin, args.get("prompt", ""))
             label = args.get("prompt", "")[:80] or agent
-            # Run in the given repo, else an isolated per-job scratch dir so jobs
-            # never clobber each other or the workspace root.
+            slug = slugify(args.get("name") or args.get("prompt") or "job")
+            branch = None
             if args.get("repo"):
-                job_cwd = args["repo"]
+                # Isolate on a fresh git worktree branch — never the user's
+                # checkout. Refuse the job if a real repo can't be isolated.
+                job_cwd, branch, err = await prepare_worktree(
+                    args["repo"],
+                    str(workspace / "worktrees"),
+                    slug,
+                    cfg.worktree_branch_prefix,
+                    cfg.shell_timeout_s,
+                )
+                if err:
+                    return web.json_response({"ok": False, "error": err}, status=400)
             else:
-                slug = slugify(args.get("name") or args.get("prompt") or "job")
+                # No repo: an isolated per-job scratch dir.
                 job_cwd = str(workspace / "runs" / f"{slug}-{uuid.uuid4().hex[:6]}")
                 pathlib.Path(job_cwd).mkdir(parents=True, exist_ok=True)
             job = jobs.start(
@@ -81,9 +92,10 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 run_exec(argv, job_cwd, cfg.job_timeout_s),
                 name=args.get("name", ""),
                 cwd=job_cwd,
+                branch=branch,
             )
             return web.json_response(
-                {"ok": True, "job_id": job.id, "name": job.name, "status": "running"}
+                {"ok": True, "job_id": job.id, "name": job.name, "branch": branch, "status": "running"}
             )
         return web.json_response({"error": f"unknown action {action!r}"}, status=400)
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import pathlib
 import time
+import uuid
 
 
 async def run_shell(cmd: str, cwd: str | None, timeout_s: float) -> str:
@@ -71,3 +72,24 @@ def code_argv(agent: str, codex_bin: str, claude_bin: str, prompt: str) -> list[
     if agent == "claude":
         return [claude_bin, "-p", prompt]
     return [codex_bin, "exec", prompt]  # codex default
+
+
+async def prepare_worktree(
+    repo: str, worktrees_dir: str, slug: str, branch_prefix: str, timeout_s: float
+) -> tuple[str | None, str | None, str | None]:
+    """Isolate a repo job. For a git repo, create a fresh worktree on a new branch
+    off HEAD and return (worktree_path, branch, None) — the job edits there, never
+    the user's checkout. For a non-git directory, return (repo, None, None) (run in
+    place; there's no working tree to protect). On failure to isolate a real repo,
+    return (None, None, error) so the caller refuses rather than touching HEAD."""
+    inside = await run_exec(["git", "-C", repo, "rev-parse", "--is-inside-work-tree"], None, timeout_s)
+    if inside.strip() != "true":
+        return repo, None, None  # not a git repo — run in the dir as given
+    suffix = uuid.uuid4().hex[:6]
+    branch = f"{branch_prefix}/{slug}-{suffix}"
+    worktree = str(pathlib.Path(worktrees_dir) / f"{slug}-{suffix}")
+    pathlib.Path(worktrees_dir).mkdir(parents=True, exist_ok=True)
+    out = await run_exec(["git", "-C", repo, "worktree", "add", "-b", branch, worktree], None, timeout_s)
+    if not pathlib.Path(worktree).exists():
+        return None, None, f"error: could not create worktree ({out})"
+    return worktree, branch, None

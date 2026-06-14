@@ -75,8 +75,10 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
             data = await post("code", body)
         except Exception as exc:  # noqa: BLE001
             return f"error: worker unreachable ({exc})"
+        branch = data.get("branch")
+        where = f" on an isolated branch, {branch}," if branch else ""
         return (
-            f"Started the coding job {data.get('name')!r} on the worker. "
+            f"Started the coding job {data.get('name')!r}{where} on the worker. "
             "It runs in the background — ask me to check on it by name."
         )
 
@@ -94,9 +96,11 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
             return f"error: worker unreachable ({exc})"
         name = data.get("name") or data.get("label") or data.get("action")
         status = data.get("status")
+        branch = data.get("branch")
+        on = f" on branch {branch}" if branch else ""
         if status == "running":
-            return f"the job {name!r} is still running."
-        return f"the job {name!r} {status}. result: {_clean_output(data.get('output') or '')}"
+            return f"the job {name!r}{on} is still running."
+        return f"the job {name!r}{on} {status}. result: {_clean_output(data.get('output') or '')}"
 
     async def jobs_list(ctx: RequestContext, args: dict[str, Any]) -> str:
         try:

@@ -91,3 +91,31 @@ def test_no_repo_jobs_get_isolated_run_dirs(tmp_path) -> None:
     assert j1["cwd"] != j2["cwd"]  # isolated per job
     assert "/runs/" in j1["cwd"]
     assert "job-one" in j1["cwd"]
+
+
+def test_repo_job_isolates_on_a_worktree_branch(tmp_path) -> None:
+    import pathlib
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run([*git, "init", "-q"], cwd=repo, check=True)
+    subprocess.run([*git, "commit", "--allow-empty", "-qm", "init"], cwd=repo, check=True)
+    (repo / "original.txt").write_text("untouched")
+
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "ws"), codex_bin="echo")
+
+    async def calls(base, c):  # noqa: ANN001
+        r = (await c.post(base + "/run", json={"action": "code", "args": {"prompt": "do x", "name": "refactor", "repo": str(repo)}})).json()
+        await asyncio.sleep(0.3)
+        j = (await c.get(f"{base}/jobs/{r['job_id']}")).json()
+        return r, j
+
+    r, j = asyncio.run(_with_server(cfg, 8812, calls))
+    assert r["branch"].startswith("jarvis/refactor-")
+    assert "/worktrees/" in j["cwd"] and pathlib.Path(j["cwd"]).exists()
+    assert j["cwd"] != str(repo)  # NOT the user's checkout
+    assert (repo / "original.txt").read_text() == "untouched"  # checkout untouched
+    branches = subprocess.run(["git", "-C", str(repo), "branch", "--list", r["branch"]], capture_output=True, text=True).stdout
+    assert r["branch"] in branches

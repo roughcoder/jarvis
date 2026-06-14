@@ -35,6 +35,7 @@ class Job:
     label: str  # the full task/prompt (the "description")
     name: str = ""  # short human handle (user-given or auto-slugged)
     cwd: str = ""  # the working directory the job ran in (where file changes land)
+    branch: str | None = None  # git branch for an isolated repo-job worktree
     status: str = "running"  # running | done | error | interrupted
     output: str = ""
     session_id: str | None = None  # the coding agent's session (for `codex resume`)
@@ -69,6 +70,7 @@ class JobManager:
                 label=d.get("label", ""),
                 name=d.get("name", ""),
                 cwd=d.get("cwd", ""),
+                branch=d.get("branch"),
                 status=d.get("status", "done"),
                 output=d.get("output", ""),
                 session_id=d.get("session_id"),
@@ -90,7 +92,13 @@ class JobManager:
 
     # --- lifecycle ---------------------------------------------------------
     def start(
-        self, action: str, label: str, coro: Awaitable[str], name: str = "", cwd: str = ""
+        self,
+        action: str,
+        label: str,
+        coro: Awaitable[str],
+        name: str = "",
+        cwd: str = "",
+        branch: str | None = None,
     ) -> Job:
         job = Job(
             id=uuid.uuid4().hex[:12],
@@ -98,6 +106,7 @@ class JobManager:
             label=label,
             name=slugify(name or label),
             cwd=cwd,
+            branch=branch,
         )
         self._jobs[job.id] = job
         self._persist(job)
