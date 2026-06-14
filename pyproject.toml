@@ -47,6 +47,13 @@ jarvis = "jarvis.cli:main"
 # don't use (we run openWakeWord on the ONNX backend).
 environments = ["sys_platform == 'darwin'"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "integration: real services/hardware/keys; opt-in via --run-integration",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
