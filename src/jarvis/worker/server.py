@@ -75,7 +75,8 @@ def make_app(cfg: WorkerConfig) -> web.Application:
     async def get_job(request: web.Request) -> web.Response:
         if not authorised(request):
             return web.json_response({"error": "unauthorized"}, status=401)
-        job = jobs.get(request.match_info["id"])
+        job_id = request.match_info["id"]
+        job = jobs.latest() if job_id == "latest" else jobs.get(job_id)
         if job is None:
             return web.json_response({"error": "no such job"}, status=404)
         return web.json_response(job.public())

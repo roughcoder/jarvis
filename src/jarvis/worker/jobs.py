@@ -62,5 +62,8 @@ class JobManager:
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
 
+    def latest(self) -> Job | None:
+        return next(reversed(self._jobs.values()), None)
+
     def recent(self, n: int = 20) -> list[Job]:
         return list(self._jobs.values())[-n:]

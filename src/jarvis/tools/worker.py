@@ -18,6 +18,27 @@ from jarvis.config import WorkerConfig
 from jarvis.tools.base import Tool
 
 
+_CODEX_NOISE = (
+    "OpenAI Codex", "workdir:", "model:", "provider:", "approval:", "sandbox:",
+    "reasoning", "session id:", "--------", "tokens used",
+)
+
+
+def _clean_output(text: str) -> str:
+    """Strip a coding agent's session boilerplate (headers, hook lines, token
+    counts) so the spoken readback is the actual result, not noise."""
+    keep: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s in ("user", "codex") or s.isdigit() or s.startswith("hook:"):
+            continue
+        if any(s.startswith(p) for p in _CODEX_NOISE):
+            continue
+        keep.append(s)
+    cleaned = " ".join(keep).strip()
+    return cleaned[-500:] if len(cleaned) > 500 else (cleaned or "(no output)")
+
+
 def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
     def headers() -> dict[str, str]:
         tok = cfg.token.get_secret_value()
@@ -58,22 +79,36 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
         )
 
     async def check(ctx: RequestContext, args: dict[str, Any]) -> str:
-        jid = (args.get("job_id") or "").strip()
-        if not jid:
-            return "error: need a job_id"
+        # Default to the most recent job — "check the coding job" needs no id.
+        jid = (args.get("job_id") or "").strip() or "latest"
         try:
             async with httpx.AsyncClient(timeout=cfg.request_timeout_s) as client:
                 r = await client.get(f"{cfg.base_url}/jobs/{jid}", headers=headers())
             if r.status_code == 404:
-                return f"no job {jid}"
+                return "no coding jobs yet" if jid == "latest" else f"no job {jid}"
             r.raise_for_status()
             data = r.json()
         except Exception as exc:  # noqa: BLE001
             return f"error: worker unreachable ({exc})"
+        label = data.get("label") or data.get("action")
         status = data.get("status")
         if status == "running":
-            return f"job {jid} is still running."
-        return f"job {jid} {status}. output: {(data.get('output') or '')[-1000:]}"
+            return f"the job {label!r} is still running."
+        return f"the job {label!r} {status}. result: {_clean_output(data.get('output') or '')}"
+
+    async def jobs_list(ctx: RequestContext, args: dict[str, Any]) -> str:
+        try:
+            async with httpx.AsyncClient(timeout=cfg.request_timeout_s) as client:
+                r = await client.get(f"{cfg.base_url}/jobs", headers=headers())
+            r.raise_for_status()
+            jobs = r.json().get("jobs", [])
+        except Exception as exc:  # noqa: BLE001
+            return f"error: worker unreachable ({exc})"
+        if not jobs:
+            return "no coding jobs."
+        running = sum(1 for j in jobs if j.get("status") == "running")
+        recent = "; ".join(f"{j.get('label')} — {j.get('status')}" for j in jobs[-5:])
+        return f"{running} running, {len(jobs)} total. Recent: {recent}."
 
     async def screenshot(ctx: RequestContext, args: dict[str, Any]) -> str:
         try:
@@ -120,10 +155,19 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
         ),
         Tool(
             "check_coding_job",
-            "Check the status and result of a coding job by its id.",
-            {"type": obj, "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]},
+            "Check a coding job's status and result. Defaults to the most recent "
+            "job if no id is given.",
+            {"type": obj, "properties": {"job_id": {"type": "string", "description": "Optional."}}},
             "worker.code",
             check,
+            announce=False,
+        ),
+        Tool(
+            "list_coding_jobs",
+            "List recent coding jobs and how many are running.",
+            {"type": obj, "properties": {}},
+            "worker.code",
+            jobs_list,
             announce=False,
         ),
         Tool(

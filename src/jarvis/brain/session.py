@@ -19,7 +19,7 @@ import json
 import pathlib
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from jarvis.brain.context import RequestContext
 from jarvis.brain.dialog import (
@@ -87,6 +87,9 @@ class TurnResult:
     raw: str = ""  # reply incl. any [[END]] marker (may be partial on barge-in)
     reply: str = ""  # spoken/stored reply (marker stripped); set by finalize()
     ended: bool = False  # conversation closed; set by finalize()
+    # The turn's tool calls + results (assistant tool_calls then tool messages),
+    # kept so the NEXT turn knows what was done (e.g. a job id it just created).
+    tool_messages: list = field(default_factory=list)
 
 
 class BrainSession:
@@ -170,8 +173,8 @@ class BrainSession:
             or _is_clear_signoff(user_text)
             or _is_reply_farewell(raw)
         )
+        self._remember(user_text, result)
         if result.reply:
-            self._remember(user_text, result.reply)
             self._fire_cold_path(user_text, result.reply)
 
     def _system_prompt(self, memory: str) -> str:
@@ -213,7 +216,7 @@ class BrainSession:
                 result.raw = msg.content or ""
                 self._record_llm(trace, t0, model, result.raw, n_tools)
                 return
-            messages.append({
+            assistant_msg = {
                 "role": "assistant",
                 "content": msg.content or "",
                 "tool_calls": [
@@ -224,7 +227,9 @@ class BrainSession:
                     }
                     for tc in msg.tool_calls
                 ],
-            })
+            }
+            messages.append(assistant_msg)
+            result.tool_messages.append(assistant_msg)  # carry into history
             for tc in msg.tool_calls:
                 n_tools += 1
                 tool = self._registry.get(tc.function.name)
@@ -241,9 +246,9 @@ class BrainSession:
                     tool_result = await self._execute_call(tc)  # instant: no pulse
                 if trace is not None:
                     trace.event("tool", tool=tc.function.name)
-                messages.append(
-                    {"role": "tool", "tool_call_id": tc.id, "content": tool_result}
-                )
+                tool_msg = {"role": "tool", "tool_call_id": tc.id, "content": tool_result}
+                messages.append(tool_msg)
+                result.tool_messages.append(tool_msg)  # carry into history
         # Out of tool rounds — force a final answer with no further tool calls.
         msg = await self._gateway.complete_with_tools(messages, model=model, tools=None)
         result.raw = msg.content or ""
@@ -296,13 +301,28 @@ class BrainSession:
             self._heartbeat_pcm = _make_heartbeat(self._cfg.tts.sample_rate)
         return self._heartbeat_pcm
 
-    def _remember(self, user_text: str, assistant_text: str) -> None:
-        """Append the exchange to the rolling shared-context window."""
+    def _remember(self, user_text: str, result: TurnResult) -> None:
+        """Append the full turn to the rolling shared-context window — user, any
+        tool calls + results (so the next turn knows what was done), then the
+        spoken reply."""
+        if not (result.reply or result.tool_messages):
+            return
         self._history.append({"role": "user", "content": user_text})
-        self._history.append({"role": "assistant", "content": assistant_text})
+        self._history.extend(result.tool_messages)
+        if result.reply:
+            self._history.append({"role": "assistant", "content": result.reply})
+        self._trim_history()
+
+    def _trim_history(self) -> None:
         limit = max(0, self._cfg.persona.history_messages)
-        if len(self._history) > limit:
-            self._history = self._history[-limit:]
+        if len(self._history) <= limit:
+            return
+        trimmed = self._history[-limit:]
+        # A tool message orphaned from its assistant tool_calls is invalid, so
+        # never start the window mid tool-group: drop leading non-user messages.
+        while trimmed and trimmed[0].get("role") != "user":
+            trimmed.pop(0)
+        self._history = trimmed
 
     def _fire_cold_path(self, user_text: str, assistant_text: str) -> None:
         """Detached background task — never awaited on the hot path."""

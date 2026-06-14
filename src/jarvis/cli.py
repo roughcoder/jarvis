@@ -377,6 +377,41 @@ def _cmd_worker(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_jobs(args: argparse.Namespace) -> int:
+    """List the worker daemon's recent jobs (deep-work jobs + their results)."""
+    import datetime
+
+    import httpx
+
+    cfg = load_config()
+    headers = {}
+    tok = cfg.worker.token.get_secret_value()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    try:
+        r = httpx.get(f"{cfg.worker.base_url}/jobs", headers=headers, timeout=5)
+        r.raise_for_status()
+        jobs = r.json().get("jobs", [])
+    except Exception as exc:  # noqa: BLE001
+        print(f"Worker not reachable at {cfg.worker.base_url} ({exc}).")
+        print("Start it with: jarvis worker")
+        return 1
+    if not jobs:
+        print("No jobs yet.")
+        return 0
+    print(f"Worker jobs at {cfg.worker.base_url}:\n")
+    for j in jobs[-args.n :]:
+        clock = datetime.datetime.fromtimestamp(j.get("started", 0)).strftime("%H:%M:%S")
+        out = (j.get("output") or "").replace("\n", " ")
+        if len(out) > 70:
+            out = out[:70] + "…"
+        print(
+            f"  {clock}  {j.get('id')}  {j.get('status'):<8} "
+            f"{(j.get('label') or '')[:36]:<36}  {out}"
+        )
+    return 0
+
+
 def _cmd_traces(args: argparse.Namespace) -> int:
     """View recent per-turn pipeline traces (STT/LLM/TTS/memory timings)."""
     import json
@@ -490,6 +525,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_worker = sub.add_parser("worker", help="Run the worker daemon (deep work + machine control, W3c)")
     p_worker.set_defaults(func=_cmd_worker)
+
+    p_jobs = sub.add_parser("jobs", help="List the worker's recent jobs + results")
+    p_jobs.add_argument("-n", type=int, default=20, help="How many recent jobs")
+    p_jobs.set_defaults(func=_cmd_jobs)
 
     p_traces = sub.add_parser("traces", help="View recent per-turn pipeline traces")
     p_traces.add_argument("-n", type=int, default=20, help="How many recent traces")

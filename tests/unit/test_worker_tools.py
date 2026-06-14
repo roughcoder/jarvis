@@ -46,6 +46,20 @@ def test_shell_tool_unreachable_returns_error() -> None:
     assert out.startswith("error: worker unreachable")
 
 
+def test_clean_output_strips_codex_noise() -> None:
+    from jarvis.tools.worker import _clean_output
+
+    raw = (
+        "OpenAI Codex v0.1\n--------\nworkdir: /x\nmodel: gpt\n--------\n"
+        "user\nsay hi\nhook: SessionStart\ncodex\npong\ntokens used\n21000\npong"
+    )
+    out = _clean_output(raw)
+    assert "hook:" not in out
+    assert "tokens used" not in out
+    assert "OpenAI Codex" not in out
+    assert "pong" in out
+
+
 def test_shell_tool_against_live_daemon() -> None:
     pytest.importorskip("aiohttp")
     from aiohttp import web
@@ -66,3 +80,34 @@ def test_shell_tool_against_live_daemon() -> None:
             await runner.cleanup()
 
     assert asyncio.run(go()) == "brain-to-worker"
+
+
+def test_check_latest_and_list_against_live_daemon() -> None:
+    pytest.importorskip("aiohttp")
+    from aiohttp import web
+
+    from jarvis.worker.server import make_app
+
+    async def go():  # noqa: ANN202
+        # `echo` stands in for the coding agent so the job finishes instantly.
+        daemon = WorkerConfig(_env_file=None, token="", workspace="jarvis-workspace/worker", codex_bin="echo")
+        runner = web.AppRunner(make_app(daemon))
+        await runner.setup()
+        site = web.TCPSite(runner, "localhost", 8805)
+        await site.start()
+        try:
+            tcfg = WorkerConfig(_env_file=None, host="localhost", port=8805, request_timeout_s=10.0)
+            tools = {t.name: t for t in make_worker_tools(tcfg)}
+            ctx = _ctx("worker.code")
+            started = await tools["start_coding_job"].handler(ctx, {"task": "say hi"})
+            await asyncio.sleep(0.3)
+            checked = await tools["check_coding_job"].handler(ctx, {})  # no id => latest
+            listed = await tools["list_coding_jobs"].handler(ctx, {})
+            return started, checked, listed
+        finally:
+            await runner.cleanup()
+
+    started, checked, listed = asyncio.run(go())
+    assert "Started a coding job" in started
+    assert "say hi" in checked  # checked the latest job by its label
+    assert "total" in listed
