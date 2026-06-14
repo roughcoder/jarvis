@@ -15,7 +15,7 @@ import httpx
 import pytest
 
 from jarvis.config import MemoryConfig
-from jarvis.memory_client import MemoryClient
+from jarvis.brain.memory_client import MemoryClient
 
 
 def _client(tmp_path, **over):

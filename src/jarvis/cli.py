@@ -33,7 +33,7 @@ def _cmd_config(_args: argparse.Namespace) -> int:
 def _cmd_ping_gateway(args: argparse.Namespace) -> int:
     """Step 1 gate: prove fast + strong routes return completions, and that
     switching model is a parameter (same code path, different route name)."""
-    from jarvis.gateway_client import GatewayClient
+    from jarvis.brain.gateway_client import GatewayClient
 
     cfg = load_config()
     prompt = args.prompt
@@ -71,8 +71,8 @@ def _cmd_say(args: argparse.Namespace) -> int:
     synthesis finishes; stop() cuts within ~100ms."""
     import time
 
-    from jarvis.audio import AudioIO
-    from jarvis.tts import InworldTTS
+    from jarvis.intercom.audio import AudioIO
+    from jarvis.services.tts import InworldTTS
 
     cfg = load_config()
     tts = InworldTTS(cfg.tts)
@@ -156,8 +156,8 @@ def _cmd_listen(args: argparse.Namespace) -> int:
     """Step 3 gate: push-to-talk transcription. ENTER to start, ENTER to stop."""
     import time
 
-    from jarvis.audio import AudioIO
-    from jarvis.stt import Transcriber
+    from jarvis.intercom.audio import AudioIO
+    from jarvis.services.stt import Transcriber
 
     cfg = load_config()
     audio = AudioIO(cfg.audio)
@@ -202,11 +202,11 @@ _VOICE_SYSTEM_PROMPT = (
 def _cmd_chat(args: argparse.Namespace) -> int:
     """Step 4 gate: push-to-talk voice round-trip — speak → STT → gateway LLM
     → streaming TTS. The first 'it talks' milestone."""
-    from jarvis.audio import AudioIO
-    from jarvis.gateway_client import GatewayClient
-    from jarvis.stt import Transcriber
-    from jarvis.tts import InworldTTS
-    from jarvis.vad import SileroVAD
+    from jarvis.intercom.audio import AudioIO
+    from jarvis.brain.gateway_client import GatewayClient
+    from jarvis.services.stt import Transcriber
+    from jarvis.services.tts import InworldTTS
+    from jarvis.intercom.vad import SileroVAD
 
     cfg = load_config()
     audio = AudioIO(cfg.audio)
@@ -289,15 +289,15 @@ def _cmd_chat(args: argparse.Namespace) -> int:
 
 def _cmd_run(_args: argparse.Namespace) -> int:
     """Step 6 gate: hands-free wake-word loop (PASSIVE→ACTIVE→THINKING→SPEAKING)."""
-    from jarvis.audio import AudioIO
-    from jarvis.gateway_client import GatewayClient
-    from jarvis.memory_client import MemoryClient
-    from jarvis.stt import Transcriber
-    from jarvis.tracing import Tracer
-    from jarvis.tts import InworldTTS
-    from jarvis.turnloop import TurnLoop
-    from jarvis.vad import SileroVAD
-    from jarvis.wake import WakeWord
+    from jarvis.intercom.audio import AudioIO
+    from jarvis.brain.gateway_client import GatewayClient
+    from jarvis.brain.memory_client import MemoryClient
+    from jarvis.services.stt import Transcriber
+    from jarvis.brain.tracing import Tracer
+    from jarvis.services.tts import InworldTTS
+    from jarvis.brain.turnloop import TurnLoop
+    from jarvis.intercom.vad import SileroVAD
+    from jarvis.intercom.wake import WakeWord
 
     cfg = load_config()
     if _args.no_bargein:

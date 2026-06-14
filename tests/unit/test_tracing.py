@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 
 from jarvis.config import TraceConfig
-from jarvis.tracing import Tracer, TurnTrace, _summary
+from jarvis.brain.tracing import Tracer, TurnTrace, _summary
 
 
 def test_turntrace_accumulates_stages_events_and_meta() -> None:

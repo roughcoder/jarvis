@@ -253,9 +253,9 @@ class AudioIO:
         """VAD endpointing capture (spec Step 5): record until the user stops.
 
         Opens its own short-lived mic stream (used by `chat`). The always-open
-        state machine uses MicStream + jarvis.vad.Endpointer directly.
+        state machine uses MicStream + jarvis.intercom.vad.Endpointer directly.
         """
-        from jarvis.vad import Endpointer
+        from jarvis.intercom.vad import Endpointer
 
         FRAME = 512
         frame_ms = FRAME / sample_rate * 1000.0

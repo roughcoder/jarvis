@@ -12,7 +12,7 @@ import socket
 import pytest
 
 from jarvis.config import load_config
-from jarvis.gateway_client import GatewayClient
+from jarvis.brain.gateway_client import GatewayClient
 
 pytestmark = pytest.mark.integration
 

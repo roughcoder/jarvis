@@ -28,15 +28,15 @@ import threading
 import time
 from collections.abc import AsyncIterator
 
-from jarvis.audio import AudioIO, MicStream
+from jarvis.intercom.audio import AudioIO, MicStream
 from jarvis.config import Config
-from jarvis.gateway_client import GatewayClient
-from jarvis.memory_client import MemoryClient
-from jarvis.stt import Transcriber
-from jarvis.tracing import Tracer
-from jarvis.tts import InworldTTS
-from jarvis.vad import Endpointer, SileroVAD
-from jarvis.wake import WakeWord
+from jarvis.brain.gateway_client import GatewayClient
+from jarvis.brain.memory_client import MemoryClient
+from jarvis.services.stt import Transcriber
+from jarvis.brain.tracing import Tracer
+from jarvis.services.tts import InworldTTS
+from jarvis.intercom.vad import Endpointer, SileroVAD
+from jarvis.intercom.wake import WakeWord
 
 FRAME_SAMPLES = 512
 

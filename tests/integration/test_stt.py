@@ -16,7 +16,7 @@ pytestmark = pytest.mark.integration
 
 def test_stt_loads_and_transcribes_silence() -> None:
     cfg = load_config()
-    from jarvis.stt import Transcriber
+    from jarvis.services.stt import Transcriber
 
     stt = Transcriber(cfg.stt)
     stt.load()  # downloads the model on first run

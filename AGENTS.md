@@ -30,24 +30,32 @@ started from; honour it.
 
 ## Architecture
 
+Phase 3 restructured `src/jarvis/` into engine subpackages along the network
+boundary (see `docs/PHASE3.md`). Modules are unchanged — only their homes moved.
+
 ```
 src/jarvis/
-  config.py        all config from env / .env (pydantic-settings); nothing hardcoded
-  cli.py           entry point: jarvis <command>
-  audio/           always-open mic (MicStream) + streaming player (hard-stop barge-in)
-  gateway_client/  HTTP -> LiteLLM proxy (OpenAI-compatible); per-turn model routing
-  stt/             local Faster-Whisper transcription
-  vad/             Silero VAD + Endpointer (endpointing AND barge-in, one instance)
-  wake/            wake word: openWakeWord (default) or Porcupine, same interface
-  tts/             Inworld streaming TTS -> raw PCM
-  memory_client/   Honcho /v2 REST over httpx; hot=local cache, cold=write+refresh
-  tracing/         per-turn pipeline traces (STT/LLM/TTS/memory timings)
-  turnloop/        the 5-state machine: PASSIVE→ACTIVE→THINKING→SPEAKING→(INTERRUPTED)
+  config.py            all config from env / .env (pydantic-settings); nothing hardcoded
+  cli.py               entry point: jarvis <command>
+  intercom/            the thin edge (wake, capture, playback) — runs on each device
+    audio/             always-open mic (MicStream) + streaming player (hard-stop barge-in)
+    vad/               Silero VAD + Endpointer (endpointing AND barge-in, one instance)
+    wake/              wake word: openWakeWord (default) or Porcupine, same interface
+  services/            speech<->text services (in-process under the brain for 3a)
+    stt/               local Faster-Whisper transcription
+    tts/               Inworld streaming TTS -> raw PCM
+  brain/               orchestration tier
+    gateway_client/    HTTP -> LiteLLM proxy (OpenAI-compatible); per-turn model routing
+    memory_client/     Honcho /v2 REST over httpx; hot=local cache, cold=write+refresh
+    tracing/           per-turn pipeline traces (STT/LLM/TTS/memory timings)
+    turnloop/          the 5-state machine: PASSIVE→ACTIVE→THINKING→SPEAKING→(INTERRUPTED)
+  protocol/            brain<->intercom WebSocket message schemas (Phase 3 W4)
+  tools/               capability-gated actions the brain can invoke (Phase 3 W3)
 ```
 
 Keep the turn loop, audio I/O, memory client, and gateway client as **separate
 modules with config-driven URLs** — this is what makes the tiers independently
-movable in Phase 2.
+movable (Phase 2 relocation; Phase 3 brain/intercom split).
 
 ### Services (docker-compose.yml)
 

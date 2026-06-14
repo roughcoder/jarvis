@@ -11,7 +11,7 @@ import asyncio
 import pytest
 
 from jarvis.config import load_config
-from jarvis.memory_client import MemoryClient
+from jarvis.brain.memory_client import MemoryClient
 
 pytestmark = pytest.mark.integration
 

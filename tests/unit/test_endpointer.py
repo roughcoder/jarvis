@@ -6,7 +6,7 @@ torch needed (only SileroVAD loads the model); we drive probabilities directly.
 
 from __future__ import annotations
 
-from jarvis.vad import Endpointer
+from jarvis.intercom.vad import Endpointer
 
 FRAME = bytes(1024)  # 512 int16 samples; content irrelevant to the logic
 

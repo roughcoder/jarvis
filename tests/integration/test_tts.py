@@ -25,7 +25,7 @@ def _cfg_with_key():
 
 def test_tts_stream_yields_audio() -> None:
     cfg = _cfg_with_key()
-    from jarvis.tts import InworldTTS
+    from jarvis.services.tts import InworldTTS
 
     tts = InworldTTS(cfg.tts)
 
@@ -40,8 +40,8 @@ def test_tts_stream_yields_audio() -> None:
 
 def test_tts_hard_stop_cuts_fast() -> None:
     cfg = _cfg_with_key()
-    from jarvis.audio import AudioIO
-    from jarvis.tts import InworldTTS
+    from jarvis.intercom.audio import AudioIO
+    from jarvis.services.tts import InworldTTS
 
     try:
         audio = AudioIO(cfg.audio)
