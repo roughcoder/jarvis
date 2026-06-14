@@ -14,6 +14,8 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import pathlib
+import uuid
 
 from aiohttp import web
 
@@ -25,15 +27,14 @@ from jarvis.worker.actions import (
     run_shell,
     take_screenshot,
 )
-from jarvis.worker.jobs import JobManager
+from jarvis.worker.jobs import JobManager, slugify
 
 
 def make_app(cfg: WorkerConfig) -> web.Application:
-    import pathlib
-
-    pathlib.Path(cfg.workspace).mkdir(parents=True, exist_ok=True)  # default cwd
+    workspace = pathlib.Path(cfg.workspace)
+    workspace.mkdir(parents=True, exist_ok=True)
     # Persist jobs to disk under the workspace so they survive a daemon restart.
-    jobs = JobManager(store_dir=str(pathlib.Path(cfg.workspace) / "jobs"))
+    jobs = JobManager(store_dir=str(workspace / "jobs"))
 
     def authorised(request: web.Request) -> bool:
         token = cfg.token.get_secret_value()
@@ -59,13 +60,21 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             out = await run_applescript(args.get("script", ""), cfg.shell_timeout_s)
             return web.json_response({"ok": True, "output": out})
         if action == "screenshot":
-            out = await take_screenshot(cfg.workspace, args.get("name"), cfg.shell_timeout_s)
+            shots = str(workspace / "screenshots")
+            out = await take_screenshot(shots, args.get("name"), cfg.shell_timeout_s)
             return web.json_response({"ok": True, "output": out})
         if action == "code":
             agent = args.get("agent") or cfg.agent
             argv = code_argv(agent, cfg.codex_bin, cfg.claude_bin, args.get("prompt", ""))
             label = args.get("prompt", "")[:80] or agent
-            job_cwd = args.get("repo") or cfg.workspace
+            # Run in the given repo, else an isolated per-job scratch dir so jobs
+            # never clobber each other or the workspace root.
+            if args.get("repo"):
+                job_cwd = args["repo"]
+            else:
+                slug = slugify(args.get("name") or args.get("prompt") or "job")
+                job_cwd = str(workspace / "runs" / f"{slug}-{uuid.uuid4().hex[:6]}")
+                pathlib.Path(job_cwd).mkdir(parents=True, exist_ok=True)
             job = jobs.start(
                 "code",
                 label,

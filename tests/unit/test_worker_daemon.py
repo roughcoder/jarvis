@@ -74,3 +74,20 @@ def test_daemon_code_dispatch_runs_a_job() -> None:
     assert disp["ok"] and disp["job_id"]
     assert status == "done"
     assert len(listed["jobs"]) >= 1
+
+
+def test_no_repo_jobs_get_isolated_run_dirs(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path), codex_bin="echo")
+
+    async def calls(base, c):  # noqa: ANN001
+        r1 = (await c.post(base + "/run", json={"action": "code", "args": {"prompt": "a", "name": "job one"}})).json()
+        r2 = (await c.post(base + "/run", json={"action": "code", "args": {"prompt": "b", "name": "job two"}})).json()
+        await asyncio.sleep(0.3)
+        j1 = (await c.get(f"{base}/jobs/{r1['job_id']}")).json()
+        j2 = (await c.get(f"{base}/jobs/{r2['job_id']}")).json()
+        return j1, j2
+
+    j1, j2 = asyncio.run(_with_server(cfg, 8810, calls))
+    assert j1["cwd"] != j2["cwd"]  # isolated per job
+    assert "/runs/" in j1["cwd"]
+    assert "job-one" in j1["cwd"]
