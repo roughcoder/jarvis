@@ -111,6 +111,8 @@ class TTSConfig(_Base):
     model_id: str = "inworld-tts-2"  # Realtime model: lowest TTFA (~450ms)
     language: str = "en-US"
     sample_rate: int = 24000  # LINEAR16 PCM playback rate
+    # Expressiveness of delivery: STABLE | BALANCED | CREATIVE (most emotional).
+    delivery_mode: str = "BALANCED"
 
 
 class STTConfig(_Base):
@@ -192,6 +194,7 @@ class PersonaConfig(_Base):
 
     soul_path: str = "SOUL.md"      # personality layer injected into the prompt
     history_messages: int = 16      # rolling shared context window (user+assistant)
+    expressive: bool = True         # let replies use Inworld TTS-2 emotion cues
 
 
 class TraceConfig(_Base):

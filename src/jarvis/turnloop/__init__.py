@@ -41,9 +41,31 @@ FRAME_SAMPLES = 512
 
 # Technical format layer (always present). Personality comes from the soul
 # (SOUL.md); what Jarvis knows about the user comes from memory.
-_VOICE_FORMAT = (
-    "Reply for the ear: one or two short sentences, plain text only — no "
-    "markdown, lists, code blocks, or emoji."
+#
+# Base TTS hygiene + (optionally) Inworld TTS-2 expressive steering, per
+# Inworld's prompting/steering guides: one steering instruction at the START
+# only (scopes the whole line), non-verbals inline, tags consumed not spoken.
+_VOICE_FORMAT_BASE = (
+    "Write for the ear, not the page: one or two short spoken sentences. Use "
+    "contractions and natural phrasing. Write numbers as words ('twenty-three', "
+    "not '23'). Never use markdown, bullet points, headings, emoji, or special "
+    "characters."
+)
+_VOICE_FORMAT_EXPRESSIVE = (
+    _VOICE_FORMAT_BASE + "\n\n"
+    "Let real feeling colour your delivery when the moment calls for it, using "
+    "Inworld TTS-2 cues with a light touch:\n"
+    "- Delivery/emotion: at most ONE instruction in [square brackets] at the "
+    "very START of the reply — it sets mood, pace and tone for the whole line. "
+    "Describe it concretely and match it to the words, e.g. [say warmly with a "
+    "relaxed, conversational pace] or [say gently, a little concerned]. Never "
+    "put a steering tag mid-sentence, never use more than one, never contradict "
+    "the words.\n"
+    "- Non-verbals may go INLINE where the sound happens: [laugh], [sigh], "
+    "[breathe], [clear throat], [yawn].\n"
+    "- For stress, capitalise a whole word ('I did NOT'), rarely.\n"
+    "Most lines need no tags at all — reach for them only when feeling genuinely "
+    "colours what you're saying."
 )
 
 
@@ -242,7 +264,11 @@ class TurnLoop:
         parts = []
         if self._soul:
             parts.append(self._soul)
-        parts.append(_VOICE_FORMAT)
+        parts.append(
+            _VOICE_FORMAT_EXPRESSIVE
+            if self._cfg.persona.expressive
+            else _VOICE_FORMAT_BASE
+        )
         if memory:
             parts.append(
                 "What you already know about the user (use it naturally only if "

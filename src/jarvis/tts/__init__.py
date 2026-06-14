@@ -89,6 +89,8 @@ class InworldTTS:
                 "sampleRateHertz": self._cfg.sample_rate,
             },
             "language": self._cfg.language,
+            # STABLE | BALANCED | CREATIVE — overall expressiveness; fine-grained
+            "deliveryMode": self._cfg.delivery_mode,
         }
 
         buffer = ""
