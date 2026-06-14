@@ -69,6 +69,8 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
         body: dict[str, Any] = {"prompt": task}
         if args.get("name"):
             body["name"] = args["name"]
+        if args.get("agent"):
+            body["agent"] = args["agent"]  # codex | claude (local agent choice)
         if args.get("repo"):
             body["repo"] = args["repo"]
         try:
@@ -189,7 +191,12 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
                         "type": "string",
                         "description": "A short human name for the job if the user gives one (optional).",
                     },
-                    "repo": {"type": "string", "description": "Repo path on the worker (optional)."},
+                    "agent": {
+                        "type": "string",
+                        "enum": ["codex", "claude"],
+                        "description": "Which local coding agent to use (optional; default is the worker's).",
+                    },
+                    "repo": {"type": "string", "description": "Repo name or path (optional)."},
                 },
                 "required": ["task"],
             },
