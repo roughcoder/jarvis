@@ -21,6 +21,7 @@ from aiohttp import web
 
 from jarvis.config import WorkerConfig
 from jarvis.worker.actions import (
+    cleanup_job,
     code_argv,
     prepare_worktree,
     run_applescript,
@@ -93,10 +94,29 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 name=args.get("name", ""),
                 cwd=job_cwd,
                 branch=branch,
+                repo=args.get("repo", ""),
             )
             return web.json_response(
                 {"ok": True, "job_id": job.id, "name": job.name, "branch": branch, "status": "running"}
             )
+        if action == "cleanup":
+            ref = (args.get("job") or "").strip()
+            finished = {"done", "error", "interrupted"}
+            if ref in ("", "finished", "all", "done"):
+                targets = [j for j in jobs.recent(1000) if j.status in finished]
+            else:
+                j = jobs.get(ref) or jobs.find(ref)
+                if j is None:
+                    return web.json_response({"ok": False, "error": f"no job {ref!r}"}, status=404)
+                if j.status not in finished:
+                    return web.json_response({"ok": False, "error": f"job {j.name!r} is still running"})
+                targets = [j]
+            cleaned = []
+            for j in targets:
+                await cleanup_job(j.repo, j.cwd, j.branch, cfg.shell_timeout_s)
+                jobs.remove(j.id)
+                cleaned.append(j.name)
+            return web.json_response({"ok": True, "cleaned": cleaned})
         return web.json_response({"error": f"unknown action {action!r}"}, status=400)
 
     async def get_job(request: web.Request) -> web.Response:

@@ -119,3 +119,47 @@ def test_repo_job_isolates_on_a_worktree_branch(tmp_path) -> None:
     assert (repo / "original.txt").read_text() == "untouched"  # checkout untouched
     branches = subprocess.run(["git", "-C", str(repo), "branch", "--list", r["branch"]], capture_output=True, text=True).stdout
     assert r["branch"] in branches
+
+
+def test_cleanup_removes_worktree_and_branch(tmp_path) -> None:
+    import pathlib
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run([*git, "init", "-q"], cwd=repo, check=True)
+    subprocess.run([*git, "commit", "--allow-empty", "-qm", "init"], cwd=repo, check=True)
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "ws"), codex_bin="echo")
+
+    async def calls(base, c):  # noqa: ANN001
+        r = (await c.post(base + "/run", json={"action": "code", "args": {"prompt": "x", "name": "cleanme", "repo": str(repo)}})).json()
+        await asyncio.sleep(0.3)
+        wt = (await c.get(f"{base}/jobs/{r['job_id']}")).json()["cwd"]
+        clean = (await c.post(base + "/run", json={"action": "cleanup", "args": {"job": "cleanme"}})).json()
+        after = (await c.get(base + "/jobs")).json()["jobs"]
+        return r["branch"], wt, clean, after
+
+    branch, wt, clean, after = asyncio.run(_with_server(cfg, 8814, calls))
+    assert "cleanme" in clean["cleaned"]
+    assert not pathlib.Path(wt).exists()  # worktree removed
+    branches = subprocess.run(["git", "-C", str(repo), "branch", "--list", branch], capture_output=True, text=True).stdout
+    assert branch not in branches  # branch deleted
+    assert after == []  # job dropped from the list
+
+
+def test_cleanup_all_removes_scratch_dir(tmp_path) -> None:
+    import pathlib
+
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "ws"), codex_bin="echo")
+
+    async def calls(base, c):  # noqa: ANN001
+        r = (await c.post(base + "/run", json={"action": "code", "args": {"prompt": "x", "name": "scratchy"}})).json()
+        await asyncio.sleep(0.3)
+        cwd = (await c.get(f"{base}/jobs/{r['job_id']}")).json()["cwd"]
+        clean = (await c.post(base + "/run", json={"action": "cleanup", "args": {"job": ""}})).json()
+        return cwd, clean
+
+    cwd, clean = asyncio.run(_with_server(cfg, 8815, calls))
+    assert "scratchy" in clean["cleaned"]
+    assert not pathlib.Path(cwd).exists()

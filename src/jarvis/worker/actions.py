@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import pathlib
+import shutil
 import time
 import uuid
 
@@ -93,3 +94,16 @@ async def prepare_worktree(
     if not pathlib.Path(worktree).exists():
         return None, None, f"error: could not create worktree ({out})"
     return worktree, branch, None
+
+
+async def cleanup_job(repo: str, cwd: str, branch: str | None, timeout_s: float) -> str:
+    """Tidy a finished job's working area: remove the worktree + delete the branch
+    for a repo job, or delete the scratch dir for a no-repo job."""
+    if repo and branch and cwd:
+        await run_exec(["git", "-C", repo, "worktree", "remove", "--force", cwd], None, timeout_s)
+        await run_exec(["git", "-C", repo, "branch", "-D", branch], None, timeout_s)
+        return f"removed worktree + branch {branch}"
+    if cwd:
+        shutil.rmtree(cwd, ignore_errors=True)
+        return f"removed {cwd}"
+    return "nothing to remove"

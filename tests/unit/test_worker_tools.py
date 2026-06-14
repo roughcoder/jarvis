@@ -35,6 +35,7 @@ def test_worker_tools_registered_and_gated() -> None:
     assert tools["run_shell"].required_capability == "worker.shell"
     assert tools["start_coding_job"].required_capability == "worker.code"
     assert tools["run_applescript"].required_capability == "worker.applescript"
+    assert tools["clean_up_coding_jobs"].required_capability == "worker.code"
     assert tools["run_shell"].announce is True
     assert tools["take_screenshot"].announce is False
 

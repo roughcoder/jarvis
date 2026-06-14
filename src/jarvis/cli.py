@@ -384,16 +384,28 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
     import httpx
 
     cfg = load_config()
+    base = cfg.worker.base_url
     headers = {}
     tok = cfg.worker.token.get_secret_value()
     if tok:
         headers["Authorization"] = f"Bearer {tok}"
+
+    if args.prune:  # clean up all finished jobs (worktrees + branches)
+        try:
+            r = httpx.post(f"{base}/run", json={"action": "cleanup", "args": {"job": ""}}, headers=headers, timeout=30)
+            cleaned = r.json().get("cleaned", [])
+        except Exception as exc:  # noqa: BLE001
+            print(f"Worker not reachable at {base} ({exc}).\nStart it with: jarvis worker")
+            return 1
+        print(f"Cleaned up {len(cleaned)} finished job(s)." + (f" ({', '.join(cleaned)})" if cleaned else ""))
+        return 0
+
     try:
-        r = httpx.get(f"{cfg.worker.base_url}/jobs", headers=headers, timeout=5)
+        r = httpx.get(f"{base}/jobs", headers=headers, timeout=5)
         r.raise_for_status()
         jobs = r.json().get("jobs", [])
     except Exception as exc:  # noqa: BLE001
-        print(f"Worker not reachable at {cfg.worker.base_url} ({exc}).")
+        print(f"Worker not reachable at {base} ({exc}).")
         print("Start it with: jarvis worker")
         return 1
     if not jobs:
@@ -534,6 +546,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_jobs = sub.add_parser("jobs", help="List the worker's recent jobs + results")
     p_jobs.add_argument("-n", type=int, default=20, help="How many recent jobs")
+    p_jobs.add_argument(
+        "--prune", action="store_true", help="Clean up all finished jobs (worktrees + branches)"
+    )
     p_jobs.set_defaults(func=_cmd_jobs)
 
     p_traces = sub.add_parser("traces", help="View recent per-turn pipeline traces")

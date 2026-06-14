@@ -36,6 +36,7 @@ class Job:
     name: str = ""  # short human handle (user-given or auto-slugged)
     cwd: str = ""  # the working directory the job ran in (where file changes land)
     branch: str | None = None  # git branch for an isolated repo-job worktree
+    repo: str = ""  # the source repo (for worktree jobs) — needed to clean up
     status: str = "running"  # running | done | error | interrupted
     output: str = ""
     session_id: str | None = None  # the coding agent's session (for `codex resume`)
@@ -71,6 +72,7 @@ class JobManager:
                 name=d.get("name", ""),
                 cwd=d.get("cwd", ""),
                 branch=d.get("branch"),
+                repo=d.get("repo", ""),
                 status=d.get("status", "done"),
                 output=d.get("output", ""),
                 session_id=d.get("session_id"),
@@ -81,12 +83,16 @@ class JobManager:
                 job.status = "interrupted"
             self._jobs[job.id] = job
 
+    def _path(self, job: Job) -> pathlib.Path | None:
+        # human-readable filename: <name>-<shortid>.json
+        return None if self._store is None else self._store / f"{job.name}-{job.id[:6]}.json"
+
     def _persist(self, job: Job) -> None:
-        if self._store is None:
+        path = self._path(job)
+        if path is None:
             return
         try:
-            # human-readable filename: <name>-<shortid>.json
-            (self._store / f"{job.name}-{job.id[:6]}.json").write_text(json.dumps(job.public()))
+            path.write_text(json.dumps(job.public()))
         except OSError:
             pass  # persistence is best-effort; never break a job over it
 
@@ -99,6 +105,7 @@ class JobManager:
         name: str = "",
         cwd: str = "",
         branch: str | None = None,
+        repo: str = "",
     ) -> Job:
         job = Job(
             id=uuid.uuid4().hex[:12],
@@ -107,6 +114,7 @@ class JobManager:
             name=slugify(name or label),
             cwd=cwd,
             branch=branch,
+            repo=repo,
         )
         self._jobs[job.id] = job
         self._persist(job)
@@ -131,6 +139,16 @@ class JobManager:
 
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
+
+    def remove(self, job_id: str) -> None:
+        """Drop a job from the list and delete its record file (after its worktree
+        has been cleaned up by the caller)."""
+        job = self._jobs.pop(job_id, None)
+        if job is None:
+            return
+        path = self._path(job)
+        if path is not None and path.exists():
+            path.unlink()
 
     def find(self, query: str) -> Job | None:
         """Most recent job matching `query` by name or label (for 'check the

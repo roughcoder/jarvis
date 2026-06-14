@@ -118,6 +118,25 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
         )
         return f"{running} running, {len(jobs)} total. Recent: {recent}."
 
+    async def cleanup(ctx: RequestContext, args: dict[str, Any]) -> str:
+        ref = (args.get("job") or "").strip()
+        try:
+            async with httpx.AsyncClient(timeout=cfg.request_timeout_s) as client:
+                r = await client.post(
+                    f"{cfg.base_url}/run",
+                    json={"action": "cleanup", "args": {"job": ref}},
+                    headers=headers(),
+                )
+            data = r.json()  # the daemon returns JSON even on 404
+        except Exception as exc:  # noqa: BLE001
+            return f"error: worker unreachable ({exc})"
+        if data.get("error"):
+            return data["error"]
+        cleaned = data.get("cleaned", [])
+        if not cleaned:
+            return "nothing to clean up."
+        return f"cleaned up {len(cleaned)} job(s): {', '.join(cleaned)}."
+
     async def screenshot(ctx: RequestContext, args: dict[str, Any]) -> str:
         try:
             data = await post("screenshot", {})
@@ -186,6 +205,16 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
             "worker.code",
             jobs_list,
             announce=False,
+        ),
+        Tool(
+            "clean_up_coding_jobs",
+            "Clean up a finished coding job by name (removes its worktree and "
+            "deletes its branch), or all finished jobs if none is named. Only do "
+            "this once the user has reviewed/merged the work — the branch is deleted.",
+            {"type": obj, "properties": {"job": {"type": "string", "description": "Job name (optional)."}}},
+            "worker.code",
+            cleanup,
+            announce=True,
         ),
         Tool(
             "take_screenshot",
