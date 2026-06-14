@@ -24,7 +24,9 @@ x-honcho-env: &honcho-env
   # reasoning routed through the gateway (spec §4). Embeddings stay off
   # (EMBED_MESSAGES=false) so no extra key is needed for Phase 1.
   LLM_OPENAI_COMPATIBLE_BASE_URL: http://litellm:4000/v1
-  LLM_OPENAI_COMPATIBLE_API_KEY: ${GATEWAY_API_KEY:-sk-jarvis-local}
+  # Honcho's own virtual key (alias "honcho-memory") so memory reasoning is
+  # attributable separately from voice in the gateway logs.
+  LLM_OPENAI_COMPATIBLE_API_KEY: ${HONCHO_LLM_KEY:-sk-honcho-memory}
   # Required at startup even with embeddings off (EmbeddingClient is OpenAI-only
   # in v2.0.3). Real key so embeddings work if ever enabled; reasoning still
   # goes through LiteLLM via the custom provider above.

@@ -17,12 +17,18 @@ from jarvis.config import GatewayConfig
 class GatewayClient:
     def __init__(self, cfg: GatewayConfig) -> None:
         self._cfg = cfg
+        # Authenticate with the voice virtual key (falls back to master) so the
+        # gateway logs attribute voice calls to the "jarvis-voice" key alias.
+        key = cfg.client_key.get_secret_value() or cfg.api_key.get_secret_value()
         # base_url points at the LiteLLM proxy; /v1 is the OpenAI-compatible path.
         self._client = AsyncOpenAI(
             base_url=f"{cfg.base_url}/v1",
-            api_key=cfg.api_key.get_secret_value(),
+            api_key=key,
             timeout=cfg.request_timeout_s,
         )
+        self._speaker = cfg.speaker  # End User attribution (who's talking)
+        # Room attached as a LiteLLM tag so multi-instance traffic is separable.
+        self._extra_body = {"metadata": {"tags": [f"room:{cfg.room}"]}}
 
     def _resolve(self, model: str | None) -> str:
         # Default to the fast route; callers pass cfg.strong_model when needed.
@@ -33,6 +39,8 @@ class GatewayClient:
         resp = await self._client.chat.completions.create(
             model=self._resolve(model),
             messages=messages,  # type: ignore[arg-type]
+            user=self._speaker,
+            extra_body=self._extra_body,
         )
         return resp.choices[0].message.content or ""
 
@@ -44,6 +52,8 @@ class GatewayClient:
             model=self._resolve(model),
             messages=messages,  # type: ignore[arg-type]
             stream=True,
+            user=self._speaker,
+            extra_body=self._extra_body,
         )
         async for chunk in stream:
             if not chunk.choices:

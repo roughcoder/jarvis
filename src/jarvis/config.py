@@ -30,7 +30,19 @@ class GatewayConfig(_Base):
 
     host: str = "localhost"
     port: int = 4000
-    api_key: SecretStr = SecretStr("sk-jarvis-local")  # LiteLLM master key
+    api_key: SecretStr = SecretStr("sk-jarvis-local")  # LiteLLM master/admin key
+    # The voice turn loop authenticates with its OWN virtual key (alias
+    # "jarvis-voice") so its calls are attributable separately from memory in
+    # the gateway logs. Falls back to the master key if unset.
+    client_key: SecretStr = SecretStr("")
+    # End User = the SPEAKER identity. "family" when Jarvis can't tell who's
+    # talking; a person's name once voice recognition can. A future speaker-ID
+    # step sets this per turn; it's also the natural Honcho peer id. Filter
+    # gateway logs by End User to see one person.
+    speaker: str = "family"
+    # The physical instance / room, attached as a log tag so multiple Jarvis
+    # instances running at once are distinguishable.
+    room: str = "default"
     # Per-turn model routing (spec §6 Step 1, §8): names are LiteLLM route names,
     # never provider SDK identifiers. Swapping model is a parameter, not code.
     fast_model: str = "fast"
