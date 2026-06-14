@@ -22,11 +22,18 @@ from dataclasses import asdict, dataclass, field
 _SESSION_ID = re.compile(r"session id:\s*(\S+)", re.IGNORECASE)
 
 
+def slugify(text: str, max_words: int = 6) -> str:
+    """A short, file- and speech-friendly handle from free text."""
+    words = re.findall(r"[a-z0-9]+", text.lower())[:max_words]
+    return "-".join(words) or "job"
+
+
 @dataclass
 class Job:
     id: str
     action: str
-    label: str
+    label: str  # the full task/prompt (the "description")
+    name: str = ""  # short human handle (user-given or auto-slugged)
     status: str = "running"  # running | done | error | interrupted
     output: str = ""
     session_id: str | None = None  # the coding agent's session (for `codex resume`)
@@ -59,6 +66,7 @@ class JobManager:
                 id=d["id"],
                 action=d.get("action", "?"),
                 label=d.get("label", ""),
+                name=d.get("name", ""),
                 status=d.get("status", "done"),
                 output=d.get("output", ""),
                 session_id=d.get("session_id"),
@@ -73,13 +81,16 @@ class JobManager:
         if self._store is None:
             return
         try:
-            (self._store / f"{job.id}.json").write_text(json.dumps(job.public()))
+            # human-readable filename: <name>-<shortid>.json
+            (self._store / f"{job.name}-{job.id[:6]}.json").write_text(json.dumps(job.public()))
         except OSError:
             pass  # persistence is best-effort; never break a job over it
 
     # --- lifecycle ---------------------------------------------------------
-    def start(self, action: str, label: str, coro: Awaitable[str]) -> Job:
-        job = Job(id=uuid.uuid4().hex[:12], action=action, label=label)
+    def start(self, action: str, label: str, coro: Awaitable[str], name: str = "") -> Job:
+        job = Job(
+            id=uuid.uuid4().hex[:12], action=action, label=label, name=slugify(name or label)
+        )
         self._jobs[job.id] = job
         self._persist(job)
         task = asyncio.create_task(self._run(job, coro))
@@ -103,6 +114,16 @@ class JobManager:
 
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
+
+    def find(self, query: str) -> Job | None:
+        """Most recent job matching `query` by name or label (for 'check the
+        polymarket job')."""
+        q = query.lower().strip()
+        qs = slugify(query)
+        for job in reversed(self._jobs.values()):
+            if (qs and qs in job.name) or (q and q in job.label.lower()):
+                return job
+        return None
 
     def latest(self) -> Job | None:
         return next(reversed(self._jobs.values()), None)

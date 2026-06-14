@@ -90,6 +90,34 @@ def test_jobs_persist_to_disk_and_reload(tmp_path) -> None:
     assert reloaded.session_id == "abc-123"  # bridge to `codex resume`
 
 
+def test_slugify_makes_readable_handles() -> None:
+    from jarvis.worker.jobs import slugify
+
+    assert slugify("Polymarket Refactor!") == "polymarket-refactor"
+    assert slugify("") == "job"
+
+
+def test_jobs_named_and_findable() -> None:
+    async def go():
+        jm = JobManager()
+
+        async def w() -> str:
+            return "ok"
+
+        job = jm.start("code", "fix the login bug", w(), name="login fix")
+        for _ in range(100):
+            if jm.get(job.id).status != "running":
+                break
+            await asyncio.sleep(0.01)
+        return jm, job
+
+    jm, job = asyncio.run(go())
+    assert job.name == "login-fix"  # user-given name, slugified
+    assert jm.find("login").id == job.id  # by name
+    assert jm.find("login bug").id == job.id  # by label
+    assert jm.find("nonexistent") is None
+
+
 def test_stale_running_job_reloads_as_interrupted(tmp_path) -> None:
     import json
 

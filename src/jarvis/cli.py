@@ -406,8 +406,8 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
         if len(out) > 64:
             out = out[:64] + "…"
         print(
-            f"  {clock}  {j.get('id')}  {j.get('status'):<11} "
-            f"{(j.get('label') or '')[:34]:<34}  {out}"
+            f"  {clock}  {(j.get('name') or j.get('id'))[:30]:<30} "
+            f"{j.get('status'):<11} {out}"
         )
         if j.get("session_id"):
             print(f"            └─ full transcript: codex resume {j['session_id']}")

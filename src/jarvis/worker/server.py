@@ -64,20 +64,26 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         if action == "code":
             agent = args.get("agent") or cfg.agent
             argv = code_argv(agent, cfg.codex_bin, cfg.claude_bin, args.get("prompt", ""))
-            label = args.get("prompt", "")[:60] or agent
+            label = args.get("prompt", "")[:80] or agent
             job = jobs.start(
                 "code",
                 label,
                 run_exec(argv, args.get("repo") or cfg.workspace, cfg.job_timeout_s),
+                name=args.get("name", ""),
             )
-            return web.json_response({"ok": True, "job_id": job.id, "status": "running"})
+            return web.json_response(
+                {"ok": True, "job_id": job.id, "name": job.name, "status": "running"}
+            )
         return web.json_response({"error": f"unknown action {action!r}"}, status=400)
 
     async def get_job(request: web.Request) -> web.Response:
         if not authorised(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         job_id = request.match_info["id"]
-        job = jobs.latest() if job_id == "latest" else jobs.get(job_id)
+        if job_id == "latest":
+            job = jobs.latest()
+        else:  # exact id, else fuzzy match by name/label
+            job = jobs.get(job_id) or jobs.find(job_id)
         if job is None:
             return web.json_response({"error": "no such job"}, status=404)
         return web.json_response(job.public())

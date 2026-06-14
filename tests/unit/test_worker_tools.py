@@ -108,6 +108,6 @@ def test_check_latest_and_list_against_live_daemon() -> None:
             await runner.cleanup()
 
     started, checked, listed = asyncio.run(go())
-    assert "Started a coding job" in started
-    assert "say hi" in checked  # checked the latest job by its label
+    assert "Started the coding job" in started
+    assert "say hi" in checked  # checked the latest job, result echoed
     assert "total" in listed

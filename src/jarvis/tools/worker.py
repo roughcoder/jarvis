@@ -67,6 +67,8 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
         if not task:
             return "error: empty task"
         body: dict[str, Any] = {"prompt": task}
+        if args.get("name"):
+            body["name"] = args["name"]
         if args.get("repo"):
             body["repo"] = args["repo"]
         try:
@@ -74,27 +76,27 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
         except Exception as exc:  # noqa: BLE001
             return f"error: worker unreachable ({exc})"
         return (
-            f"Started a coding job on the worker (id {data.get('job_id')}). "
-            "It runs in the background — ask me to check on it."
+            f"Started the coding job {data.get('name')!r} on the worker. "
+            "It runs in the background — ask me to check on it by name."
         )
 
     async def check(ctx: RequestContext, args: dict[str, Any]) -> str:
-        # Default to the most recent job — "check the coding job" needs no id.
-        jid = (args.get("job_id") or "").strip() or "latest"
+        # By name or id; defaults to the most recent ("check the coding job").
+        ref = (args.get("job") or args.get("job_id") or "").strip() or "latest"
         try:
             async with httpx.AsyncClient(timeout=cfg.request_timeout_s) as client:
-                r = await client.get(f"{cfg.base_url}/jobs/{jid}", headers=headers())
+                r = await client.get(f"{cfg.base_url}/jobs/{ref}", headers=headers())
             if r.status_code == 404:
-                return "no coding jobs yet" if jid == "latest" else f"no job {jid}"
+                return "no coding jobs yet" if ref == "latest" else f"no job called {ref!r}"
             r.raise_for_status()
             data = r.json()
         except Exception as exc:  # noqa: BLE001
             return f"error: worker unreachable ({exc})"
-        label = data.get("label") or data.get("action")
+        name = data.get("name") or data.get("label") or data.get("action")
         status = data.get("status")
         if status == "running":
-            return f"the job {label!r} is still running."
-        return f"the job {label!r} {status}. result: {_clean_output(data.get('output') or '')}"
+            return f"the job {name!r} is still running."
+        return f"the job {name!r} {status}. result: {_clean_output(data.get('output') or '')}"
 
     async def jobs_list(ctx: RequestContext, args: dict[str, Any]) -> str:
         try:
@@ -107,7 +109,9 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
         if not jobs:
             return "no coding jobs."
         running = sum(1 for j in jobs if j.get("status") == "running")
-        recent = "; ".join(f"{j.get('label')} — {j.get('status')}" for j in jobs[-5:])
+        recent = "; ".join(
+            f"{j.get('name') or j.get('label')} — {j.get('status')}" for j in jobs[-5:]
+        )
         return f"{running} running, {len(jobs)} total. Recent: {recent}."
 
     async def screenshot(ctx: RequestContext, args: dict[str, Any]) -> str:
@@ -145,6 +149,10 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
                 "type": obj,
                 "properties": {
                     "task": {"type": "string", "description": "What to build/fix."},
+                    "name": {
+                        "type": "string",
+                        "description": "A short human name for the job if the user gives one (optional).",
+                    },
                     "repo": {"type": "string", "description": "Repo path on the worker (optional)."},
                 },
                 "required": ["task"],
@@ -155,9 +163,14 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
         ),
         Tool(
             "check_coding_job",
-            "Check a coding job's status and result. Defaults to the most recent "
-            "job if no id is given.",
-            {"type": obj, "properties": {"job_id": {"type": "string", "description": "Optional."}}},
+            "Check a coding job's status and result. Give the job's name or id, or "
+            "nothing to check the most recent.",
+            {
+                "type": obj,
+                "properties": {
+                    "job": {"type": "string", "description": "Job name or id (optional)."}
+                },
+            },
             "worker.code",
             check,
             announce=False,
