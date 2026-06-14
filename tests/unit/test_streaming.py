@@ -7,7 +7,7 @@ rest generates. Pure string logic; high regression risk during the restructure
 
 from __future__ import annotations
 
-from jarvis.brain.turnloop import _extract_steering, _next_sentence
+from jarvis.brain.dialog import _extract_steering, _next_sentence
 
 # --- _next_sentence --------------------------------------------------------
 

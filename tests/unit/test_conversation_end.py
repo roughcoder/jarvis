@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from jarvis.brain.turnloop import _END_RE, _is_clear_signoff, _is_reply_farewell, _norm
+from jarvis.brain.dialog import _END_RE, _is_clear_signoff, _is_reply_farewell, _norm
 
 # --- _is_clear_signoff: deterministic user sign-off net --------------------
 

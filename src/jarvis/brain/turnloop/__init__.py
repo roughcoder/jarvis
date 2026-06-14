@@ -1,4 +1,4 @@
-"""Turn loop — the five-state voice machine (spec §5).
+"""Turn loop — single-process orchestration of the voice state machine (spec §5).
 
   PASSIVE  -> (wake "Jarvis")     -> ACTIVE
   ACTIVE   -> (endpoint silence)  -> THINKING
@@ -6,219 +6,35 @@
   SPEAKING -> (reply done)        -> PASSIVE
   SPEAKING -> (user speaks)       -> INTERRUPTED -> ACTIVE   (Step 7)
 
-ONE always-open mic (MicStream) feeds whichever consumer the active state
-needs: Porcupine in PASSIVE, Silero+Endpointer in ACTIVE. Both want 512-sample
-16kHz frames, so the same stream serves both.
-
-The loop runs in a single asyncio event loop (so the async gateway/TTS clients
-stay on one loop); the blocking frame loops (wake wait, endpoint capture, STT)
-run via asyncio.to_thread.
-
-Step 6 implements PASSIVE→ACTIVE→THINKING→SPEAKING→PASSIVE. Barge-in (INTERRUPTED)
-arrives in Step 7; memory (hot/cold) in Step 9.
+This owns the *edge* — the always-open mic, wake word, VAD, audio playback —
+plus STT and the state machine. The think/speak core (prompt, tools, TTS,
+end-detection, memory) lives in BrainSession (brain/session.py), reused
+unchanged by the WebSocket brain server (Phase 3 W4). This is the in-process
+path (`jarvis run`): capture an utterance, transcribe it, hand the text to the
+session, and play the reply with hard-stop barge-in.
 """
 
 from __future__ import annotations
 
 import asyncio
 import enum
-import json
 import queue
-import re
 import threading
-import time
-from collections.abc import AsyncIterator
 
-from jarvis.intercom.audio import AudioIO, MicStream
 from jarvis.brain.capabilities import build_request_context
-from jarvis.config import Config
-from jarvis.tools import build_registry
 from jarvis.brain.gateway_client import GatewayClient
 from jarvis.brain.memory_client import MemoryClient
-from jarvis.services.stt import Transcriber
+from jarvis.brain.session import BrainSession, TurnResult
 from jarvis.brain.tracing import Tracer
-from jarvis.services.tts import InworldTTS
+from jarvis.config import Config
+from jarvis.intercom.audio import AudioIO, MicStream
 from jarvis.intercom.vad import Endpointer, SileroVAD
 from jarvis.intercom.wake import WakeWord
+from jarvis.services.stt import Transcriber
+from jarvis.services.tts import InworldTTS
+from jarvis.tools import build_registry
 
 FRAME_SAMPLES = 512
-
-# Technical format layer (always present). Personality comes from the soul
-# (SOUL.md); what Jarvis knows about the user comes from memory.
-#
-# Base TTS hygiene + (optionally) Inworld TTS-2 expressive steering, per
-# Inworld's prompting/steering guides: one steering instruction at the START
-# only (scopes the whole line), non-verbals inline, tags consumed not spoken.
-_VOICE_FORMAT_BASE = (
-    "Write for the ear, not the page: one or two short spoken sentences. Use "
-    "contractions and natural phrasing. Write numbers as words ('twenty-three', "
-    "not '23'). Never use markdown, bullet points, headings, emoji, or special "
-    "characters."
-)
-_VOICE_FORMAT_EXPRESSIVE = (
-    _VOICE_FORMAT_BASE + "\n\n"
-    "Let real feeling colour your delivery when the moment calls for it, using "
-    "Inworld TTS-2 cues with a light touch:\n"
-    "- Delivery/emotion: at most ONE instruction in [square brackets] at the "
-    "very START of the reply — it sets mood, pace and tone for the whole line. "
-    "Describe it concretely and match it to the words, e.g. [say warmly with a "
-    "relaxed, conversational pace] or [say gently, a little concerned]. Never "
-    "put a steering tag mid-sentence, never use more than one, never contradict "
-    "the words.\n"
-    "- Non-verbals may go INLINE where the sound happens: [laugh], [sigh], "
-    "[breathe], [clear throat], [yawn].\n"
-    "- For stress, capitalise a whole word ('I did NOT'), rarely.\n"
-    "Most lines need no tags at all — reach for them only when feeling genuinely "
-    "colours what you're saying."
-)
-
-# Conversation control: how the model signals the user is done so the loop can
-# return to PASSIVE (wake word required again). Detected + stripped before TTS.
-_END_INSTRUCTION = (
-    "Ending the conversation: end when the user clearly signals they're finished "
-    "— a goodbye ('bye', 'goodnight', 'see you'), declining further help ('no "
-    "thanks', \"no, that's good, thanks\", \"I'm good\", 'we're good'), or "
-    "'that's all'/'stop'/'go to sleep'. To end, give a short, warm farewell of a "
-    "few words and NOTHING else, then put [[END]] as the very last characters. "
-    "IMPORTANT: if your reply is itself a goodbye, you MUST include [[END]]. If a "
-    "message is only a vague acknowledgement and you can't tell whether they're "
-    "done (a bare 'thanks', 'ok', 'cool', 'great'), do NOT end — give your reply "
-    "and briefly ASK if there's anything else. When unsure, ask rather than end."
-)
-# Matches [[END]] / [END] (case-insensitive). Stripped from the spoken reply.
-_END_RE = re.compile(r"\s*\[\[?\s*end\s*\]\]?\s*", re.IGNORECASE)
-
-# --- Deterministic backstops (the model handles nuance; these guarantee the
-# clear cases and never fire on a turn the user meant to continue) -----------
-
-# Any request/question word → never a sign-off.
-_REQUEST_CUE = re.compile(
-    r"\b(tell|what|whats|how|why|when|where|who|which|show|give|explain|"
-    r"recommend|suggest|find|search|list|define|describe|help)\b"
-)
-# Short command / closer phrases (matched after stripping filler words).
-_CLEAR_SIGNOFFS = frozenset(
-    {
-        "goodbye", "bye", "bye bye", "good night", "goodnight",
-        "stop", "stop listening", "go to sleep", "go to bed", "go away",
-        "dismissed", "that is all", "thats all", "that is it", "thats it",
-        "im done", "i am done", "were done", "we are done", "nothing else",
-    }
-)
-# Farewell / "we're finished" phrasing anywhere in the utterance.
-_USER_FAREWELL = re.compile(
-    r"\b(goodbye|good ?night|see you|see ya|were good|we are good|were done|"
-    r"we are done|were finished|im off|that(s| is) (all|it|everything))\b"
-)
-# "no … <specific done-phrase>" — a decline of further help. Uses specific
-# phrases (never bare 'good') so "no, that's a good idea" is NOT a sign-off.
-_DECLINE_CLOSER = re.compile(
-    r"^(no|nope|nah)\b.*\b(thanks|thank you|cheers|im good|im fine|im done|"
-    r"im all set|im set|all good|all set|all done|good thanks|fine thanks|"
-    r"great thanks|were good|were done|thats all|thats it|thats fine|"
-    r"thats everything|nothing else)\b"
-)
-_SIGNOFF_LEAD = re.compile(
-    r"^(no|nope|nah|yeah|yep|yes|ok|okay|alright|right|well|so|um|uh|cool|great|"
-    r"thanks|thank you|cheers|jarvis)\s+"
-)
-_SIGNOFF_TRAIL = re.compile(
-    r"\s+(please|thanks|thank you|cheers|now|then|mate|jarvis|ok|okay|here)$"
-)
-# Jarvis's OWN reply is a goodbye → end even if it forgot the [[END]] marker.
-_REPLY_FAREWELL = re.compile(
-    r"\b(goodbye|good ?night|see you|see ya|sleep well|take care|farewell|"
-    r"talk soon|bye)\b",
-    re.IGNORECASE,
-)
-_REPLY_CONTINUE = re.compile(
-    r"\?|anything else|let me know|give me a shout|what else|tell me|how about|"
-    r"shall i|would you like|need anything",
-    re.IGNORECASE,
-)
-
-
-def _norm(text: str) -> str:
-    t = text.lower().replace("'", "")
-    t = re.sub(r"[^\w\s]", " ", t)
-    return re.sub(r"\s+", " ", t).strip()
-
-
-def _is_clear_signoff(text: str) -> bool:
-    """True only for an unambiguous goodbye / decline of further help."""
-    base = _norm(text)
-    if _REQUEST_CUE.search(base):
-        return False
-    if _USER_FAREWELL.search(base) or _DECLINE_CLOSER.search(base):
-        return True
-    t = base
-    while True:
-        stripped = _SIGNOFF_TRAIL.sub("", _SIGNOFF_LEAD.sub("", t))
-        if stripped == t:
-            break
-        t = stripped
-    return t in _CLEAR_SIGNOFFS
-
-
-def _is_reply_farewell(reply: str) -> bool:
-    """True if Jarvis's reply is a goodbye with no continuation cue."""
-    return bool(_REPLY_FAREWELL.search(reply)) and not _REPLY_CONTINUE.search(reply)
-
-
-# --- Streaming: sentence segmentation + steering reuse ----------------------
-
-# Inworld non-verbals stay inline; everything else leading is a steering
-# directive that must be reused across sentences (its scope is the whole call).
-_NONVERBALS = frozenset(
-    {"laugh", "sigh", "breathe", "cough", "yawn", "clear throat", "gasp"}
-)
-_LEAD_BRACKET = re.compile(r"^\s*\[([^\]]+)\]\s*")
-
-
-def _extract_steering(text: str) -> tuple[str, str]:
-    """Pull a leading steering directive off the first sentence so it can be
-    re-applied to later sentences. Returns (steering_tag_or_empty, remainder)."""
-    m = _LEAD_BRACKET.match(text)
-    if not m:
-        return "", text
-    if m.group(1).strip().lower() in _NONVERBALS:
-        return "", text  # a sound, not a directive — leave it inline
-    return f"[{m.group(1).strip()}]", text[m.end() :]
-
-
-_ABBREV = frozenset(
-    {"mr", "mrs", "ms", "dr", "prof", "st", "sr", "jr", "vs", "etc", "eg", "ie", "mt"}
-)
-_LAST_WORD = re.compile(r"([A-Za-z]+)$")
-
-
-def _next_sentence(buf: str, min_len: int = 12, max_len: int = 180) -> tuple[str, str] | None:
-    """Split off the first complete sentence from a streaming buffer, never
-    breaking inside [...] or <...>. Returns (sentence, rest) or None if not yet."""
-    depth_sq = depth_ang = 0
-    for i, ch in enumerate(buf):
-        if ch == "[":
-            depth_sq += 1
-        elif ch == "]":
-            depth_sq = max(0, depth_sq - 1)
-        elif ch == "<":
-            depth_ang += 1
-        elif ch == ">":
-            depth_ang = max(0, depth_ang - 1)
-        elif ch in ".!?" and depth_sq == 0 and depth_ang == 0:
-            if i + 1 < len(buf) and buf[i + 1] in " \n" and i + 1 >= min_len:
-                if ch == ".":  # don't split after an abbreviation or initial
-                    m = _LAST_WORD.search(buf[:i])
-                    w = m.group(1).lower() if m else ""
-                    if w in _ABBREV or len(w) == 1:
-                        continue
-                return buf[: i + 1].strip(), buf[i + 2 :].lstrip()
-    # Force-flush an over-long clause (rare for short replies) at a space.
-    if len(buf) >= max_len and depth_sq == 0 and depth_ang == 0:
-        cut = buf.rfind(" ", min_len)
-        if cut != -1:
-            return buf[:cut].strip(), buf[cut + 1 :].lstrip()
-    return None
 
 
 class State(enum.Enum):
@@ -248,21 +64,23 @@ class TurnLoop:
         self._stt = stt
         self._vad = vad
         self._wake = wake
-        self._gateway = gateway
-        self._tts = tts
-        self._memory = memory
+        self._tts = tts  # kept for the wake acknowledgement ("speak" mode)
         self._tracer = tracer
+        self._gateway = gateway  # kept so run() can aclose it
         self._sr = cfg.audio.sample_rate
-        self._cold_tasks: set[asyncio.Task] = set()
-        self._soul = ""  # personality (SOUL.md), loaded at start
-        self._history: list[dict] = []  # rolling shared conversation context
-        # Per-request identity/capability envelope (Phase 3 §4). Single-principal
-        # in 3a (built once from config); W3 gates tool dispatch on it, and the
-        # W4 brain server builds one per connection instead.
+        # Per-request identity/capability envelope (Phase 3 §4) — single-principal
+        # in 3a. The think/speak core is shared with the brain server.
         self._ctx = build_request_context(cfg.capabilities)
-        # Tool registry. Registration is not a grant — `available_for(ctx)` only
-        # offers tools the context's capabilities allow (deny-by-default).
         self._registry = build_registry(cfg.tools)
+        self._session = BrainSession(
+            cfg,
+            self._ctx,
+            gateway=gateway,
+            tts=tts,
+            memory=memory,
+            tracer=tracer,
+            registry=self._registry,
+        )
         self.state = State.PASSIVE
 
     # --- blocking frame loops (run via to_thread) --------------------------
@@ -302,17 +120,9 @@ class TurnLoop:
                 return ep.audio
 
     # --- the loop ----------------------------------------------------------
-    def _load_soul(self) -> None:
-        import pathlib
-
-        path = pathlib.Path(self._cfg.persona.soul_path)
-        if path.exists():
-            self._soul = path.read_text(encoding="utf-8").strip()
-            print(f"Soul loaded from {path} ({len(self._soul)} chars).")
-
     async def run(self) -> None:
         print("Loading models…")
-        self._load_soul()
+        self._session.load_soul()
         self._stt.load()
         self._vad.load()
         self._wake.load()
@@ -333,7 +143,7 @@ class TurnLoop:
         self.state = State.PASSIVE
         mic.drain()
         self._wake.reset()
-        print("● idle — say \"Hey Jarvis\"")
+        print('● idle — say "Hey Jarvis"')
         await asyncio.to_thread(self._wait_for_wake, mic)
         self.state = State.ACTIVE
         print("● wake")
@@ -353,77 +163,27 @@ class TurnLoop:
             )
             secs = len(pcm) / 2 / self._sr
             trace.start("stt")
-            text = await asyncio.to_thread(
-                self._stt.transcribe, pcm, sample_rate=self._sr
-            )
+            text = await asyncio.to_thread(self._stt.transcribe, pcm, sample_rate=self._sr)
             trace.end("stt", audio_s=round(secs, 1), chars=len(text))
             print(f"  you: {text!r}")
             if not text:
                 return
 
-            # THINKING — hot path: inject the LOCAL cached representation only
-            # (a fast file read), never a live memory reasoning call (spec §3.2).
+            # THINKING/SPEAKING — the session does the work (hot path reads the
+            # LOCAL memory cache only); _speak_with_bargein plays the PCM and
+            # watches for a barge-in, cancelling the in-flight generation.
             self.state = State.THINKING
-            model = (
-                self._cfg.gateway.strong_model
-                if len(text) > 120
-                else self._cfg.gateway.fast_model
+            result = TurnResult()
+            interrupted = await self._speak_with_bargein(
+                mic, self._session.respond(text, trace, result)
             )
-            memory = self._memory.read_cached_representation()
-            messages = [
-                {"role": "system", "content": self._system_prompt(memory)},
-                *self._history,  # shared context: the conversation so far
-                {"role": "user", "content": text},
-            ]
-
-            # Generate + speak. Streaming: speech starts on the first sentence
-            # while the rest generates. The full raw reply lands in holder.
-            self.state = State.SPEAKING
-            tool_schemas = [t.openai_schema() for t in self._registry.available_for(self._ctx)]
-            if tool_schemas:
-                # Tool turn: run the (non-streaming) tool loop to a final answer,
-                # then speak it. Casual no-tool setups never enter this branch, so
-                # their streaming TTFT is unchanged.
-                raw_reply = await self._run_tool_loop(messages, model, trace, tool_schemas)
-                spoken = _END_RE.sub(" ", raw_reply or "").strip()
-                interrupted = await self._speak_with_bargein(
-                    mic, self._tts_source(spoken, trace)
-                )
-            elif self._cfg.gateway.stream:
-                holder: dict = {"reply": ""}
-                interrupted = await self._speak_with_bargein(
-                    mic, self._stream_speech(messages, model, trace, holder)
-                )
-                raw_reply = holder["reply"]
-            else:
-                trace.start("llm")
-                raw_reply = await self._gateway.complete(messages, model=model)
-                trace.end(
-                    "llm", model=model, chars=len(raw_reply or ""), memory=bool(memory)
-                )
-                spoken = _END_RE.sub(" ", raw_reply or "").strip()
-                interrupted = await self._speak_with_bargein(
-                    mic, self._tts_source(spoken, trace)
-                )
-
-            # End-of-conversation: the model's [[END]] marker OR a deterministic
-            # unmistakable sign-off OR Jarvis's own reply being a goodbye.
-            ended = self._cfg.vad.conversation_mode and (
-                bool(_END_RE.search(raw_reply or ""))
-                or _is_clear_signoff(text)
-                or _is_reply_farewell(raw_reply or "")
-            )
-            reply = _END_RE.sub(" ", raw_reply or "").strip()  # never store the marker
-            print(f"  jarvis [{model}]: {reply}{'  ⏹' if ended else ''}")
+            # finalize() runs even after a barge-in: result.raw is what was said.
+            self._session.finalize(text, result)
+            reply, ended = result.reply, result.ended
+            print(f"  jarvis: {reply}{'  ⏹' if ended else ''}")
             if interrupted:
                 trace.event("barge_in")
             self._tracer.emit(trace)
-
-            # Remember + cold-path the exchange (runs while/after speaking, never
-            # blocking the hot path). On barge-in, `reply` is what was actually said.
-            if reply:
-                self._remember(text, reply)
-                self._fire_cold_path(text, reply)
 
             if interrupted:
                 # INTERRUPTED → re-listen immediately (ACTIVE), no wake word.
@@ -456,119 +216,6 @@ class TurnLoop:
             if not pcm:
                 return  # conversation went idle → PASSIVE (wake word required)
 
-    def _system_prompt(self, memory: str) -> str:
-        """Soul (who Jarvis is) + format + memory (what he knows about you)."""
-        parts = []
-        if self._soul:
-            parts.append(self._soul)
-        parts.append(
-            _VOICE_FORMAT_EXPRESSIVE
-            if self._cfg.persona.expressive
-            else _VOICE_FORMAT_BASE
-        )
-        if self._cfg.vad.conversation_mode:
-            parts.append(_END_INSTRUCTION)
-        if memory:
-            parts.append(
-                "What you already know about the user (use it naturally only if "
-                f"relevant; do not recite it):\n{memory}"
-            )
-        return "\n\n".join(parts)
-
-    async def _run_tool_loop(self, messages, model, trace, tool_schemas) -> str:  # noqa: ANN001
-        """Tool-aware completion: let the model call gated tools, feed results
-        back, repeat until it answers. Returns the final text (then spoken). Each
-        tool is capability-checked and hard-timeout-bounded; a tool error is fed
-        back to the model rather than breaking the turn."""
-        t0 = time.perf_counter()
-        n_tools = 0
-        for _ in range(max(1, self._cfg.tools.max_rounds)):
-            msg = await self._gateway.complete_with_tools(
-                messages, model=model, tools=tool_schemas
-            )
-            if not msg.tool_calls:
-                if trace is not None:
-                    trace.stage(
-                        "llm",
-                        (time.perf_counter() - t0) * 1000,
-                        model=model,
-                        chars=len(msg.content or ""),
-                        tools=n_tools,
-                    )
-                return msg.content or ""
-            messages.append({
-                "role": "assistant",
-                "content": msg.content or "",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in msg.tool_calls
-                ],
-            })
-            for tc in msg.tool_calls:
-                n_tools += 1
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                    result = await self._registry.execute(
-                        self._ctx, tc.function.name, args, timeout_s=self._cfg.tools.timeout_s
-                    )
-                except Exception as exc:  # noqa: BLE001 - tools must never break a turn
-                    result = f"error: {exc}"
-                if trace is not None:
-                    trace.event("tool", name=tc.function.name)
-                messages.append(
-                    {"role": "tool", "tool_call_id": tc.id, "content": result}
-                )
-        # Out of tool rounds — force a final answer with no further tool calls.
-        msg = await self._gateway.complete_with_tools(messages, model=model, tools=None)
-        if trace is not None:
-            trace.stage(
-                "llm",
-                (time.perf_counter() - t0) * 1000,
-                model=model,
-                chars=len(msg.content or ""),
-                tools=n_tools,
-            )
-        return msg.content or ""
-
-    def _remember(self, user_text: str, assistant_text: str) -> None:
-        """Append the exchange to the rolling shared-context window."""
-        self._history.append({"role": "user", "content": user_text})
-        self._history.append({"role": "assistant", "content": assistant_text})
-        limit = max(0, self._cfg.persona.history_messages)
-        if len(self._history) > limit:
-            self._history = self._history[-limit:]
-
-    def _fire_cold_path(self, user_text: str, assistant_text: str) -> None:
-        """Detached background task — never awaited on the hot path."""
-        task = asyncio.create_task(self._cold_path(user_text, assistant_text))
-        self._cold_tasks.add(task)
-        task.add_done_callback(self._cold_tasks.discard)
-
-    async def _cold_path(self, user_text: str, assistant_text: str) -> None:
-        # Write the turn to Honcho (deriver reasons in the background), then
-        # refresh the local representation cache for the next turn. Resilient:
-        # if memory is unreachable, the turn loop is unaffected.
-        t0 = time.perf_counter()
-        try:
-            await self._memory.write_turn(user_text, assistant_text)
-            refreshed = await self._memory.refresh_cache(
-                min_interval_s=self._cfg.memory.refresh_interval_s
-            )
-            if refreshed:
-                ms = (time.perf_counter() - t0) * 1000
-                mt = self._tracer.turn(
-                    room=self._cfg.gateway.room, speaker=self._cfg.gateway.speaker
-                )
-                mt.set(kind="memory")
-                mt.stage("memory", ms)
-                self._tracer.emit(mt)
-        except Exception as exc:  # noqa: BLE001 - memory must never break a turn
-            print(f"  [memory] cold-path skipped: {exc}")
-
     async def _acknowledge(self) -> None:
         """Confirm the wake word was heard before listening (configurable)."""
         mode = self._cfg.audio.ack_mode
@@ -582,95 +229,6 @@ class TurnLoop:
         else:  # "beep"
             await asyncio.to_thread(self._audio.play_tone)
 
-    async def _tts_source(self, text: str, trace=None) -> AsyncIterator[bytes]:  # noqa: ANN001
-        """Wrap the TTS stream to capture its timing (time-to-first-audio, total
-        duration, bytes) into the turn trace — the Inworld call isn't visible in
-        the gateway logs, so this is where it's measured."""
-        t0 = time.perf_counter()
-        first_ms: float | None = None
-        total = 0
-        try:
-            async for chunk in self._tts.synthesize_stream(text):
-                if first_ms is None:
-                    first_ms = (time.perf_counter() - t0) * 1000
-                total += len(chunk)
-                yield chunk
-        finally:
-            if trace is not None:
-                trace.stage(
-                    "tts",
-                    (time.perf_counter() - t0) * 1000,
-                    ttfa_ms=round(first_ms, 1) if first_ms is not None else None,
-                    bytes=total,
-                    chars=len(text),
-                    voice=self._cfg.tts.voice,
-                    provider=self._cfg.tts.provider,
-                )
-
-    async def _stream_speech(self, messages, model, trace, holder) -> AsyncIterator[bytes]:  # noqa: ANN001
-        """Stream the LLM, segment into sentences, synthesise each through TTS,
-        and yield a single continuous PCM stream — so speech starts on sentence 1
-        while later sentences are still generating. Accumulates the full reply
-        into holder['reply'] (even on barge-in) and records LLM/TTS timings."""
-        t0 = time.perf_counter()
-        first_tok: float | None = None
-        llm_done: float | None = None
-        tts_first: float | None = None
-        full: list[str] = []
-        steering: str | None = None
-
-        async def sentences() -> AsyncIterator[str]:
-            nonlocal first_tok, llm_done
-            buf = ""
-            async for delta in self._gateway.stream(messages, model=model):
-                if first_tok is None:
-                    first_tok = time.perf_counter()
-                full.append(delta)
-                buf += delta
-                while True:
-                    split = _next_sentence(buf)
-                    if split is None:
-                        break
-                    sent, buf = split
-                    if sent.strip():
-                        yield sent
-            llm_done = time.perf_counter()
-            if buf.strip():
-                yield buf
-
-        try:
-            async for sent in sentences():
-                if steering is None:  # capture the leading directive once
-                    steering, sent = _extract_steering(sent)
-                tts_text = _END_RE.sub(" ", sent).strip()  # never speak the marker
-                if not tts_text:
-                    continue
-                if steering:
-                    tts_text = f"{steering} {tts_text}"
-                async for pcm in self._tts.synthesize_stream(tts_text):
-                    if tts_first is None:
-                        tts_first = time.perf_counter()
-                    yield pcm
-        finally:
-            holder["reply"] = "".join(full)
-            if trace is not None:
-                end = time.perf_counter()
-                if first_tok is not None:
-                    trace.stage(
-                        "llm",
-                        ((llm_done or end) - t0) * 1000,
-                        model=model,
-                        ttft_ms=round((first_tok - t0) * 1000, 1),
-                        chars=len(holder["reply"]),
-                    )
-                trace.stage(
-                    "tts",
-                    (end - (first_tok or t0)) * 1000,
-                    ttfa_ms=round((tts_first - t0) * 1000, 1) if tts_first else None,
-                    voice=self._cfg.tts.voice,
-                    provider=self._cfg.tts.provider,
-                )
-
     async def _speak_with_bargein(self, mic: MicStream, pcm_source) -> bool:  # noqa: ANN001
         """Play a PCM source (a single audio stream, possibly spanning several
         streamed sentences) while watching the mic for the user talking over it.
@@ -683,9 +241,7 @@ class TurnLoop:
         self.state = State.SPEAKING
         if not self._cfg.vad.bargein_enabled:
             # No AEC input path: just speak, don't listen for interruptions.
-            await self._audio.play_stream(
-                pcm_source, sample_rate=self._cfg.tts.sample_rate
-            )
+            await self._audio.play_stream(pcm_source, sample_rate=self._cfg.tts.sample_rate)
             return False
         mic.drain()  # don't react to pre-speech frames
         wakeword_mode = self._cfg.vad.bargein_mode == "wakeword"
