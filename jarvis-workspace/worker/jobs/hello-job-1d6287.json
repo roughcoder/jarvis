@@ -1,1 +1,0 @@
-{"id": "1d62872fe461", "action": "code", "label": "hello-job", "name": "hello-job", "cwd": "jarvis-workspace/worker/runs/hello-job-78b9f8", "status": "done", "output": "exec hello-job", "session_id": null, "started": 1781472946.4, "ended": 1781472946.5}

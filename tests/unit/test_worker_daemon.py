@@ -148,6 +148,42 @@ def test_cleanup_removes_worktree_and_branch(tmp_path) -> None:
     assert after == []  # job dropped from the list
 
 
+def test_unknown_repo_returns_helpful_error(tmp_path) -> None:
+    import subprocess
+
+    dev = tmp_path / "dev"
+    (dev / "realrepo").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=dev / "realrepo", check=True)
+    cfg = WorkerConfig(
+        _env_file=None, token="", workspace=str(tmp_path / "ws"),
+        repo_root=str(dev), clone_missing=False, codex_bin="echo",
+    )
+
+    async def calls(base, c):  # noqa: ANN001
+        r = await c.post(base + "/run", json={"action": "code", "args": {"prompt": "x", "repo": "missing"}})
+        return r.status_code, r.json()
+
+    status, data = asyncio.run(_with_server(cfg, 8817, calls))
+    assert status == 404
+    assert "couldn't find" in data["error"]
+    assert "realrepo" in data["error"]  # the error lists the repos it can see
+
+
+def test_list_repos_action(tmp_path) -> None:
+    import subprocess
+
+    dev = tmp_path / "dev"
+    (dev / "alpha").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=dev / "alpha", check=True)
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "ws"), repo_root=str(dev))
+
+    async def calls(base, c):  # noqa: ANN001
+        return (await c.post(base + "/run", json={"action": "list_repos"})).json()
+
+    data = asyncio.run(_with_server(cfg, 8818, calls))
+    assert data["repos"] == ["alpha"]
+
+
 def test_cleanup_all_removes_scratch_dir(tmp_path) -> None:
     import pathlib
 

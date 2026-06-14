@@ -22,8 +22,11 @@ from aiohttp import web
 from jarvis.config import WorkerConfig
 from jarvis.worker.actions import (
     cleanup_job,
+    clone_repo,
     code_argv,
+    list_repos,
     prepare_worktree,
+    resolve_repo,
     run_applescript,
     run_exec,
     run_shell,
@@ -71,15 +74,27 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             label = args.get("prompt", "")[:80] or agent
             slug = slugify(args.get("name") or args.get("prompt") or "job")
             branch = None
+            resolved = ""
             if args.get("repo"):
-                # Isolate on a fresh git worktree branch — never the user's
-                # checkout. Refuse the job if a real repo can't be isolated.
+                # Resolve the repo name to a real path (clone it if missing) before
+                # isolating it on a fresh worktree branch — never the user's checkout.
+                resolved = resolve_repo(args["repo"], cfg.repo_root)
+                if resolved is None and cfg.clone_missing and cfg.repo_root:
+                    resolved, clone_err = await clone_repo(
+                        args["repo"], cfg.repo_root, cfg.clone_timeout_s
+                    )
+                    if resolved is None:
+                        return web.json_response({"ok": False, "error": clone_err}, status=400)
+                if resolved is None:
+                    avail = list_repos(cfg.repo_root)
+                    hint = f" I can see: {', '.join(avail)}." if avail else ""
+                    return web.json_response(
+                        {"ok": False, "error": f"couldn't find a repo called {args['repo']!r}.{hint}"},
+                        status=404,
+                    )
                 job_cwd, branch, err = await prepare_worktree(
-                    args["repo"],
-                    str(workspace / "worktrees"),
-                    slug,
-                    cfg.worktree_branch_prefix,
-                    cfg.shell_timeout_s,
+                    resolved, str(workspace / "worktrees"), slug,
+                    cfg.worktree_branch_prefix, cfg.shell_timeout_s,
                 )
                 if err:
                     return web.json_response({"ok": False, "error": err}, status=400)
@@ -94,11 +109,13 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 name=args.get("name", ""),
                 cwd=job_cwd,
                 branch=branch,
-                repo=args.get("repo", ""),
+                repo=resolved or "",
             )
             return web.json_response(
                 {"ok": True, "job_id": job.id, "name": job.name, "branch": branch, "status": "running"}
             )
+        if action == "list_repos":
+            return web.json_response({"ok": True, "repos": list_repos(cfg.repo_root)})
         if action == "cleanup":
             ref = (args.get("job") or "").strip()
             finished = {"done", "error", "interrupted"}

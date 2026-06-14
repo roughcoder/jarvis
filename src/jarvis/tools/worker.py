@@ -44,12 +44,12 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
         tok = cfg.token.get_secret_value()
         return {"Authorization": f"Bearer {tok}"} if tok else {}
 
-    async def post(action: str, args: dict[str, Any]) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=cfg.request_timeout_s) as client:
+    async def post(action: str, args: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
+        # No raise_for_status: the daemon returns helpful JSON errors on 4xx too.
+        async with httpx.AsyncClient(timeout=timeout or cfg.request_timeout_s) as client:
             r = await client.post(
                 f"{cfg.base_url}/run", json={"action": action, "args": args}, headers=headers()
             )
-            r.raise_for_status()
             return r.json()
 
     async def shell(ctx: RequestContext, args: dict[str, Any]) -> str:
@@ -60,7 +60,7 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
             data = await post("shell", {"command": cmd})
         except Exception as exc:  # noqa: BLE001 - worker may be down
             return f"error: worker unreachable ({exc})"
-        return data.get("output", "") or "(no output)"
+        return data.get("error") or data.get("output") or "(no output)"
 
     async def code(ctx: RequestContext, args: dict[str, Any]) -> str:
         task = (args.get("task") or "").strip()
@@ -72,9 +72,12 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
         if args.get("repo"):
             body["repo"] = args["repo"]
         try:
-            data = await post("code", body)
+            # generous timeout: dispatch may clone a missing repo first
+            data = await post("code", body, timeout=cfg.clone_timeout_s + 10)
         except Exception as exc:  # noqa: BLE001
             return f"error: worker unreachable ({exc})"
+        if data.get("error"):
+            return data["error"]  # e.g. "couldn't find a repo called 'x'. I can see: ..."
         branch = data.get("branch")
         where = f" on an isolated branch, {branch}," if branch else ""
         return (
@@ -142,7 +145,7 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
             data = await post("screenshot", {})
         except Exception as exc:  # noqa: BLE001
             return f"error: worker unreachable ({exc})"
-        return data.get("output", "")
+        return data.get("error") or data.get("output") or "(no output)"
 
     async def applescript(ctx: RequestContext, args: dict[str, Any]) -> str:
         script = (args.get("script") or "").strip()
@@ -152,7 +155,17 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
             data = await post("applescript", {"script": script})
         except Exception as exc:  # noqa: BLE001
             return f"error: worker unreachable ({exc})"
-        return data.get("output", "") or "(no output)"
+        return data.get("error") or data.get("output") or "(no output)"
+
+    async def repos_list(ctx: RequestContext, args: dict[str, Any]) -> str:
+        try:
+            data = await post("list_repos", {})
+        except Exception as exc:  # noqa: BLE001
+            return f"error: worker unreachable ({exc})"
+        repos = data.get("repos", [])
+        if not repos:
+            return "no repos are configured (the worker repo root isn't set)."
+        return "the repos I can work in are: " + ", ".join(repos) + "."
 
     obj = "object"
     return [
@@ -204,6 +217,15 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
             {"type": obj, "properties": {}},
             "worker.code",
             jobs_list,
+            announce=False,
+        ),
+        Tool(
+            "list_repos",
+            "List the git repos the worker can run coding jobs in (use the exact "
+            "name when starting a job).",
+            {"type": obj, "properties": {}},
+            "worker.code",
+            repos_list,
             announce=False,
         ),
         Tool(

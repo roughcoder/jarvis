@@ -90,6 +90,22 @@ def test_jobs_persist_to_disk_and_reload(tmp_path) -> None:
     assert reloaded.session_id == "abc-123"  # bridge to `codex resume`
 
 
+def test_resolve_repo_and_list_repos(tmp_path) -> None:
+    import subprocess
+
+    from jarvis.worker.actions import list_repos, resolve_repo
+
+    root = tmp_path / "dev"
+    (root / "polymarket").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=root / "polymarket", check=True)
+
+    assert resolve_repo("polymarket", str(root)) == str(root / "polymarket")  # by name
+    assert resolve_repo(str(root / "polymarket"), "") == str(root / "polymarket")  # abs path
+    assert resolve_repo("nope", str(root)) is None  # not found
+    assert list_repos(str(root)) == ["polymarket"]  # git repos under root
+    assert list_repos("") == []
+
+
 def test_slugify_makes_readable_handles() -> None:
     from jarvis.worker.jobs import slugify
 

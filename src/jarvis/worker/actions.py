@@ -75,6 +75,42 @@ def code_argv(agent: str, codex_bin: str, claude_bin: str, prompt: str) -> list[
     return [codex_bin, "exec", prompt]  # codex default
 
 
+def list_repos(repo_root: str) -> list[str]:
+    """Git repos directly under the configured repo root (the names a job may use)."""
+    if not repo_root:
+        return []
+    root = pathlib.Path(repo_root).expanduser()
+    if not root.is_dir():
+        return []
+    return sorted(d.name for d in root.iterdir() if (d / ".git").exists())
+
+
+def resolve_repo(repo: str, repo_root: str) -> str | None:
+    """Turn a repo reference into an absolute path: an existing absolute path as
+    given, or a bare name resolved under the repo root. None if not found."""
+    p = pathlib.Path(repo).expanduser()
+    if p.is_absolute() and p.is_dir():
+        return str(p)
+    if repo_root:
+        candidate = pathlib.Path(repo_root).expanduser() / pathlib.Path(repo).name
+        if candidate.is_dir():
+            return str(candidate)
+    return None
+
+
+async def clone_repo(name: str, repo_root: str, timeout_s: float) -> tuple[str | None, str | None]:
+    """Clone a missing repo into repo_root with `gh repo clone` (auth handled by
+    gh). `name` may be a bare name (your namespace) or "org/name". Returns
+    (path, None) on success or (None, error)."""
+    dest = pathlib.Path(repo_root).expanduser() / pathlib.Path(name).name
+    if (dest / ".git").exists():
+        return str(dest), None
+    out = await run_exec(["gh", "repo", "clone", name, str(dest)], None, timeout_s)
+    if (dest / ".git").exists():
+        return str(dest), None
+    return None, f"couldn't clone {name!r}: {out[:200]}"
+
+
 async def prepare_worktree(
     repo: str, worktrees_dir: str, slug: str, branch_prefix: str, timeout_s: float
 ) -> tuple[str | None, str | None, str | None]:

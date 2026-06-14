@@ -303,6 +303,14 @@ class WorkerConfig(_Base):
     bind_host: str = ""              # daemon bind addr; empty => host
     token: SecretStr = SecretStr("")  # shared pairing token
     workspace: str = "jarvis-workspace/worker"  # default cwd for actions/jobs
+    # Where the user's git repos live, so a job can name a repo ("polymarket")
+    # instead of an absolute path. Empty = names must be absolute paths.
+    repo_root: str = ""
+    # If a named repo isn't found under repo_root, clone it there with `gh repo
+    # clone <name>` (auth handled by gh; bare names resolve to your namespace,
+    # cross-org repos need "org/name").
+    clone_missing: bool = True
+    clone_timeout_s: float = 240.0
     agent: str = "codex"             # default coding agent: codex | claude
     codex_bin: str = "codex"
     claude_bin: str = "claude"
@@ -403,6 +411,7 @@ class Config:
             "worker.token": mask(self.worker.token),
             "worker.agent": self.worker.agent,
             "worker.workspace": self.worker.workspace,
+            "worker.repo_root": self.worker.repo_root or "<unset>",
         }
 
 
