@@ -240,6 +240,23 @@ class CapabilityConfig(_Base):
     default_capabilities: str = ""
 
 
+class ToolsConfig(_Base):
+    """Tool layer (Phase 3 §6). Provider keys live brain-side only."""
+
+    model_config = SettingsConfigDict(env_prefix="TOOLS_", env_file=".env", extra="ignore")
+
+    # Hot-path guards: a single tool call can't hang a turn, and a turn can't loop
+    # on tools forever.
+    timeout_s: float = 8.0
+    max_rounds: int = 4
+    # files tool sandbox root (everything resolves within this; escapes rejected).
+    files_root: str = "jarvis-workspace/files"
+    # web_search provider + key (tavily). No key => the tool reports unconfigured.
+    websearch_provider: str = "tavily"
+    websearch_api_key: SecretStr = SecretStr("")
+    websearch_max_results: int = 5
+
+
 class Config:
     """Aggregate config. Construct once and pass modules their slice."""
 
@@ -255,6 +272,7 @@ class Config:
         self.persona = PersonaConfig()
         self.trace = TraceConfig()
         self.capabilities = CapabilityConfig()
+        self.tools = ToolsConfig()
 
     def resolved(self) -> dict:
         """Flat, secret-masked view for the dry-run printout (Step 0 gate)."""
@@ -307,6 +325,10 @@ class Config:
             "capabilities.default_capabilities": (
                 self.capabilities.default_capabilities or "<none — deny-by-default>"
             ),
+            "tools.files_root": self.tools.files_root,
+            "tools.websearch_provider": self.tools.websearch_provider,
+            "tools.websearch_api_key": mask(self.tools.websearch_api_key),
+            "tools.timeout_s": self.tools.timeout_s,
         }
 
 

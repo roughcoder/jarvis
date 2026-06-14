@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import json
 import queue
 import re
 import threading
@@ -31,6 +32,7 @@ from collections.abc import AsyncIterator
 from jarvis.intercom.audio import AudioIO, MicStream
 from jarvis.brain.capabilities import build_request_context
 from jarvis.config import Config
+from jarvis.tools import build_registry
 from jarvis.brain.gateway_client import GatewayClient
 from jarvis.brain.memory_client import MemoryClient
 from jarvis.services.stt import Transcriber
@@ -258,6 +260,9 @@ class TurnLoop:
         # in 3a (built once from config); W3 gates tool dispatch on it, and the
         # W4 brain server builds one per connection instead.
         self._ctx = build_request_context(cfg.capabilities)
+        # Tool registry. Registration is not a grant — `available_for(ctx)` only
+        # offers tools the context's capabilities allow (deny-by-default).
+        self._registry = build_registry(cfg.tools)
         self.state = State.PASSIVE
 
     # --- blocking frame loops (run via to_thread) --------------------------
@@ -374,7 +379,17 @@ class TurnLoop:
             # Generate + speak. Streaming: speech starts on the first sentence
             # while the rest generates. The full raw reply lands in holder.
             self.state = State.SPEAKING
-            if self._cfg.gateway.stream:
+            tool_schemas = [t.openai_schema() for t in self._registry.available_for(self._ctx)]
+            if tool_schemas:
+                # Tool turn: run the (non-streaming) tool loop to a final answer,
+                # then speak it. Casual no-tool setups never enter this branch, so
+                # their streaming TTFT is unchanged.
+                raw_reply = await self._run_tool_loop(messages, model, trace, tool_schemas)
+                spoken = _END_RE.sub(" ", raw_reply or "").strip()
+                interrupted = await self._speak_with_bargein(
+                    mic, self._tts_source(spoken, trace)
+                )
+            elif self._cfg.gateway.stream:
                 holder: dict = {"reply": ""}
                 interrupted = await self._speak_with_bargein(
                     mic, self._stream_speech(messages, model, trace, holder)
@@ -459,6 +474,65 @@ class TurnLoop:
                 f"relevant; do not recite it):\n{memory}"
             )
         return "\n\n".join(parts)
+
+    async def _run_tool_loop(self, messages, model, trace, tool_schemas) -> str:  # noqa: ANN001
+        """Tool-aware completion: let the model call gated tools, feed results
+        back, repeat until it answers. Returns the final text (then spoken). Each
+        tool is capability-checked and hard-timeout-bounded; a tool error is fed
+        back to the model rather than breaking the turn."""
+        t0 = time.perf_counter()
+        n_tools = 0
+        for _ in range(max(1, self._cfg.tools.max_rounds)):
+            msg = await self._gateway.complete_with_tools(
+                messages, model=model, tools=tool_schemas
+            )
+            if not msg.tool_calls:
+                if trace is not None:
+                    trace.stage(
+                        "llm",
+                        (time.perf_counter() - t0) * 1000,
+                        model=model,
+                        chars=len(msg.content or ""),
+                        tools=n_tools,
+                    )
+                return msg.content or ""
+            messages.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in msg.tool_calls
+                ],
+            })
+            for tc in msg.tool_calls:
+                n_tools += 1
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                    result = await self._registry.execute(
+                        self._ctx, tc.function.name, args, timeout_s=self._cfg.tools.timeout_s
+                    )
+                except Exception as exc:  # noqa: BLE001 - tools must never break a turn
+                    result = f"error: {exc}"
+                if trace is not None:
+                    trace.event("tool", name=tc.function.name)
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": result}
+                )
+        # Out of tool rounds — force a final answer with no further tool calls.
+        msg = await self._gateway.complete_with_tools(messages, model=model, tools=None)
+        if trace is not None:
+            trace.stage(
+                "llm",
+                (time.perf_counter() - t0) * 1000,
+                model=model,
+                chars=len(msg.content or ""),
+                tools=n_tools,
+            )
+        return msg.content or ""
 
     def _remember(self, user_text: str, assistant_text: str) -> None:
         """Append the exchange to the rolling shared-context window."""

@@ -62,5 +62,26 @@ class GatewayClient:
             if delta:
                 yield delta
 
+    async def complete_with_tools(
+        self,
+        messages: list[dict],
+        *,
+        model: str | None = None,
+        tools: list[dict] | None = None,
+    ):
+        """One tool-aware completion. Returns the assistant message (which carries
+        `.content` and `.tool_calls`) so the caller can run the tool loop. Tools
+        are omitted entirely when none are offered (a plain completion)."""
+        kwargs: dict = {
+            "model": self._resolve(model),
+            "messages": messages,
+            "user": self._speaker,
+            "extra_body": self._extra_body,
+        }
+        if tools:
+            kwargs["tools"] = tools
+        resp = await self._client.chat.completions.create(**kwargs)
+        return resp.choices[0].message
+
     async def aclose(self) -> None:
         await self._client.close()
