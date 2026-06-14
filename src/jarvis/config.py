@@ -327,6 +327,27 @@ class WorkerConfig(_Base):
         return f"http://{self.host}:{self.port}"
 
 
+class RemoteConfig(_Base):
+    """Claude Managed Agents — the cloud coding lane (Phase 3, PHASE3.md §8). A
+    remote job runs in an Anthropic-managed sandbox. Agent + environment ids are
+    created once by `jarvis remote-setup`."""
+
+    model_config = SettingsConfigDict(env_prefix="ANTHROPIC_", env_file=".env", extra="ignore")
+
+    api_key: SecretStr = SecretStr("")  # ANTHROPIC_API_KEY (also used by the gateway stack)
+    agent_id: str = ""                  # ANTHROPIC_AGENT_ID (from remote-setup)
+    environment_id: str = ""            # ANTHROPIC_ENVIRONMENT_ID (from remote-setup)
+    base_url: str = "https://api.anthropic.com"
+    model: str = "claude-opus-4-8"
+    beta: str = "managed-agents-2026-04-01"
+    request_timeout_s: float = 60.0
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key.get_secret_value() and self.agent_id and self.environment_id)
+
+
 class Config:
     """Aggregate config. Construct once and pass modules their slice."""
 
@@ -346,6 +367,7 @@ class Config:
         self.brain = BrainConfig()
         self.intercom = IntercomConfig()
         self.worker = WorkerConfig()
+        self.remote = RemoteConfig()
 
     def resolved(self) -> dict:
         """Flat, secret-masked view for the dry-run printout (Step 0 gate)."""
@@ -412,6 +434,9 @@ class Config:
             "worker.agent": self.worker.agent,
             "worker.workspace": self.worker.workspace,
             "worker.repo_root": self.worker.repo_root or "<unset>",
+            "remote.api_key": mask(self.remote.api_key),
+            "remote.configured": self.remote.configured,
+            "remote.model": self.remote.model,
         }
 
 

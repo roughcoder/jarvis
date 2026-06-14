@@ -430,6 +430,56 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _upsert_env(key: str, value: str, path: str = ".env") -> None:
+    """Set key=value in .env, replacing any existing line."""
+    import pathlib
+    import re
+
+    p = pathlib.Path(path)
+    text = p.read_text() if p.exists() else ""
+    line = f"{key}={value}"
+    if re.search(rf"^{re.escape(key)}=.*$", text, re.MULTILINE):
+        text = re.sub(rf"^{re.escape(key)}=.*$", line, text, flags=re.MULTILINE)
+    else:
+        text = (text.rstrip("\n") + "\n" if text else "") + line + "\n"
+    p.write_text(text)
+
+
+def _cmd_remote_setup(_args: argparse.Namespace) -> int:
+    """One-time: create the cloud agent + environment for remote coding jobs."""
+    from jarvis.remote.client import RemoteClient
+
+    cfg = load_config()
+    if not cfg.remote.api_key.get_secret_value():
+        print("Set ANTHROPIC_API_KEY in .env first.")
+        return 1
+    client = RemoteClient(cfg.remote)
+    system = (
+        "You are Jarvis's autonomous coding agent. Work carefully and incrementally, "
+        "explain what you change, and avoid anything destructive without good reason."
+    )
+
+    async def run() -> tuple[str, str]:
+        print("Creating cloud agent…")
+        agent = await client.create_agent("Jarvis coding agent", system)
+        print(f"  agent: {agent['id']}")
+        print("Creating cloud environment…")
+        env = await client.create_environment("jarvis-cloud")
+        print(f"  environment: {env['id']}")
+        return agent["id"], env["id"]
+
+    try:
+        agent_id, env_id = asyncio.run(run())
+    except Exception as exc:  # noqa: BLE001
+        print(f"Setup failed: {exc}")
+        return 1
+    _upsert_env("ANTHROPIC_AGENT_ID", agent_id)
+    _upsert_env("ANTHROPIC_ENVIRONMENT_ID", env_id)
+    print("\nWritten ANTHROPIC_AGENT_ID + ANTHROPIC_ENVIRONMENT_ID to .env.")
+    print("Add remote.code to CAPS_DEFAULT_CAPABILITIES to use it by voice.")
+    return 0
+
+
 def _cmd_traces(args: argparse.Namespace) -> int:
     """View recent per-turn pipeline traces (STT/LLM/TTS/memory timings)."""
     import json
@@ -543,6 +593,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_worker = sub.add_parser("worker", help="Run the worker daemon (deep work + machine control, W3c)")
     p_worker.set_defaults(func=_cmd_worker)
+
+    p_remote = sub.add_parser("remote-setup", help="One-time: create the cloud agent + environment (remote coding)")
+    p_remote.set_defaults(func=_cmd_remote_setup)
 
     p_jobs = sub.add_parser("jobs", help="List the worker's recent jobs + results")
     p_jobs.add_argument("-n", type=int, default=20, help="How many recent jobs")

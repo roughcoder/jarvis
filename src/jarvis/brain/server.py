@@ -44,7 +44,7 @@ class BrainServer:
         self._cfg = cfg
         self._stt = Transcriber(cfg.stt)
         self._tracer = Tracer(cfg.trace)
-        self._registry = build_registry(cfg.tools, worker=cfg.worker)
+        self._registry = build_registry(cfg.tools, worker=cfg.worker, remote=cfg.remote)
         # The gateway/tts/memory clients are effectively stateless; share one set
         # across connections. Per-connection state (history/ctx) lives in the
         # BrainSession.
