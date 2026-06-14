@@ -162,6 +162,62 @@ def _is_reply_farewell(reply: str) -> bool:
     return bool(_REPLY_FAREWELL.search(reply)) and not _REPLY_CONTINUE.search(reply)
 
 
+# --- Streaming: sentence segmentation + steering reuse ----------------------
+
+# Inworld non-verbals stay inline; everything else leading is a steering
+# directive that must be reused across sentences (its scope is the whole call).
+_NONVERBALS = frozenset(
+    {"laugh", "sigh", "breathe", "cough", "yawn", "clear throat", "gasp"}
+)
+_LEAD_BRACKET = re.compile(r"^\s*\[([^\]]+)\]\s*")
+
+
+def _extract_steering(text: str) -> tuple[str, str]:
+    """Pull a leading steering directive off the first sentence so it can be
+    re-applied to later sentences. Returns (steering_tag_or_empty, remainder)."""
+    m = _LEAD_BRACKET.match(text)
+    if not m:
+        return "", text
+    if m.group(1).strip().lower() in _NONVERBALS:
+        return "", text  # a sound, not a directive — leave it inline
+    return f"[{m.group(1).strip()}]", text[m.end() :]
+
+
+_ABBREV = frozenset(
+    {"mr", "mrs", "ms", "dr", "prof", "st", "sr", "jr", "vs", "etc", "eg", "ie", "mt"}
+)
+_LAST_WORD = re.compile(r"([A-Za-z]+)$")
+
+
+def _next_sentence(buf: str, min_len: int = 12, max_len: int = 180) -> tuple[str, str] | None:
+    """Split off the first complete sentence from a streaming buffer, never
+    breaking inside [...] or <...>. Returns (sentence, rest) or None if not yet."""
+    depth_sq = depth_ang = 0
+    for i, ch in enumerate(buf):
+        if ch == "[":
+            depth_sq += 1
+        elif ch == "]":
+            depth_sq = max(0, depth_sq - 1)
+        elif ch == "<":
+            depth_ang += 1
+        elif ch == ">":
+            depth_ang = max(0, depth_ang - 1)
+        elif ch in ".!?" and depth_sq == 0 and depth_ang == 0:
+            if i + 1 < len(buf) and buf[i + 1] in " \n" and i + 1 >= min_len:
+                if ch == ".":  # don't split after an abbreviation or initial
+                    m = _LAST_WORD.search(buf[:i])
+                    w = m.group(1).lower() if m else ""
+                    if w in _ABBREV or len(w) == 1:
+                        continue
+                return buf[: i + 1].strip(), buf[i + 2 :].lstrip()
+    # Force-flush an over-long clause (rare for short replies) at a space.
+    if len(buf) >= max_len and depth_sq == 0 and depth_ang == 0:
+        cut = buf.rfind(" ", min_len)
+        if cut != -1:
+            return buf[:cut].strip(), buf[cut + 1 :].lstrip()
+    return None
+
+
 class State(enum.Enum):
     PASSIVE = "passive_listening"
     ACTIVE = "active_listening"
@@ -309,43 +365,56 @@ class TurnLoop:
                 *self._history,  # shared context: the conversation so far
                 {"role": "user", "content": text},
             ]
-            trace.start("llm")
-            reply = await self._gateway.complete(messages, model=model)
-            # End-of-conversation: the model's [[END]] marker (detect + strip so
-            # it's never spoken/stored) OR a deterministic unmistakable sign-off.
+
+            # Generate + speak. Streaming: speech starts on the first sentence
+            # while the rest generates. The full raw reply lands in holder.
+            self.state = State.SPEAKING
+            if self._cfg.gateway.stream:
+                holder: dict = {"reply": ""}
+                interrupted = await self._speak_with_bargein(
+                    mic, self._stream_speech(messages, model, trace, holder)
+                )
+                raw_reply = holder["reply"]
+            else:
+                trace.start("llm")
+                raw_reply = await self._gateway.complete(messages, model=model)
+                trace.end(
+                    "llm", model=model, chars=len(raw_reply or ""), memory=bool(memory)
+                )
+                spoken = _END_RE.sub(" ", raw_reply or "").strip()
+                interrupted = await self._speak_with_bargein(
+                    mic, self._tts_source(spoken, trace)
+                )
+
+            # End-of-conversation: the model's [[END]] marker OR a deterministic
+            # unmistakable sign-off OR Jarvis's own reply being a goodbye.
             ended = self._cfg.vad.conversation_mode and (
-                bool(_END_RE.search(reply or ""))
+                bool(_END_RE.search(raw_reply or ""))
                 or _is_clear_signoff(text)
-                or _is_reply_farewell(reply or "")
+                or _is_reply_farewell(raw_reply or "")
             )
-            if _END_RE.search(reply or ""):
-                reply = _END_RE.sub(" ", reply).strip()
-            trace.end("llm", model=model, chars=len(reply or ""), memory=bool(memory))
+            reply = _END_RE.sub(" ", raw_reply or "").strip()  # never store the marker
             print(f"  jarvis [{model}]: {reply}{'  ⏹' if ended else ''}")
-            if not reply:
-                if ended:
-                    print('  …(conversation closed — say "Hey Jarvis")')
-                self._tracer.emit(trace)
-                return
-            # One continuous conversation: remember the exchange for next turn.
-            self._remember(text, reply)
-
-            # COLD path: fire-and-forget BEFORE speaking so the memory write +
-            # background reasoning + cache refresh happen while Jarvis talks —
-            # never blocking the hot path (spec §3.2).
-            self._fire_cold_path(text, reply)
-
-            # SPEAKING (barge-in armed)
-            interrupted = await self._speak_with_bargein(mic, reply, trace)
             if interrupted:
                 trace.event("barge_in")
             self._tracer.emit(trace)
+
+            # Remember + cold-path the exchange (runs while/after speaking, never
+            # blocking the hot path). On barge-in, `reply` is what was actually said.
+            if reply:
+                self._remember(text, reply)
+                self._fire_cold_path(text, reply)
+
             if interrupted:
                 # INTERRUPTED → re-listen immediately (ACTIVE), no wake word.
                 print("⊘ interrupted — listening…")
                 self.state = State.ACTIVE
                 pcm = await asyncio.to_thread(self._capture_utterance, mic)
                 continue
+            if not reply:
+                if ended:
+                    print('  …(conversation closed — say "Hey Jarvis")')
+                return
 
             # Normal completion. If the user signed off, close the conversation
             # and return to PASSIVE (wake word required again).
@@ -459,11 +528,76 @@ class TurnLoop:
                     provider=self._cfg.tts.provider,
                 )
 
-    async def _speak_with_bargein(self, mic: MicStream, reply: str, trace=None) -> bool:  # noqa: ANN001
-        """Play the reply while watching the mic for the user talking over it.
+    async def _stream_speech(self, messages, model, trace, holder) -> AsyncIterator[bytes]:  # noqa: ANN001
+        """Stream the LLM, segment into sentences, synthesise each through TTS,
+        and yield a single continuous PCM stream — so speech starts on sentence 1
+        while later sentences are still generating. Accumulates the full reply
+        into holder['reply'] (even on barge-in) and records LLM/TTS timings."""
+        t0 = time.perf_counter()
+        first_tok: float | None = None
+        llm_done: float | None = None
+        tts_first: float | None = None
+        full: list[str] = []
+        steering: str | None = None
+
+        async def sentences() -> AsyncIterator[str]:
+            nonlocal first_tok, llm_done
+            buf = ""
+            async for delta in self._gateway.stream(messages, model=model):
+                if first_tok is None:
+                    first_tok = time.perf_counter()
+                full.append(delta)
+                buf += delta
+                while True:
+                    split = _next_sentence(buf)
+                    if split is None:
+                        break
+                    sent, buf = split
+                    if sent.strip():
+                        yield sent
+            llm_done = time.perf_counter()
+            if buf.strip():
+                yield buf
+
+        try:
+            async for sent in sentences():
+                if steering is None:  # capture the leading directive once
+                    steering, sent = _extract_steering(sent)
+                tts_text = _END_RE.sub(" ", sent).strip()  # never speak the marker
+                if not tts_text:
+                    continue
+                if steering:
+                    tts_text = f"{steering} {tts_text}"
+                async for pcm in self._tts.synthesize_stream(tts_text):
+                    if tts_first is None:
+                        tts_first = time.perf_counter()
+                    yield pcm
+        finally:
+            holder["reply"] = "".join(full)
+            if trace is not None:
+                end = time.perf_counter()
+                if first_tok is not None:
+                    trace.stage(
+                        "llm",
+                        ((llm_done or end) - t0) * 1000,
+                        model=model,
+                        ttft_ms=round((first_tok - t0) * 1000, 1),
+                        chars=len(holder["reply"]),
+                    )
+                trace.stage(
+                    "tts",
+                    (end - (first_tok or t0)) * 1000,
+                    ttfa_ms=round((tts_first - t0) * 1000, 1) if tts_first else None,
+                    voice=self._cfg.tts.voice,
+                    provider=self._cfg.tts.provider,
+                )
+
+    async def _speak_with_bargein(self, mic: MicStream, pcm_source) -> bool:  # noqa: ANN001
+        """Play a PCM source (a single audio stream, possibly spanning several
+        streamed sentences) while watching the mic for the user talking over it.
 
         Returns True if the user barged in (playback was cut and the in-flight
-        TTS request cancelled), False on a clean finish. AEC is assumed in
+        TTS + LLM stream cancelled), False on a clean finish. AEC is assumed in
         hardware (spec §2); a sustained-speech + grace-window guard reduces
         self-triggering without building software AEC.
         """
@@ -471,8 +605,7 @@ class TurnLoop:
         if not self._cfg.vad.bargein_enabled:
             # No AEC input path: just speak, don't listen for interruptions.
             await self._audio.play_stream(
-                self._tts_source(reply, trace),
-                sample_rate=self._cfg.tts.sample_rate,
+                pcm_source, sample_rate=self._cfg.tts.sample_rate
             )
             return False
         mic.drain()  # don't react to pre-speech frames
@@ -526,10 +659,7 @@ class TurnLoop:
         monitor = monitor_wakeword if wakeword_mode else monitor_vad
 
         play_task = asyncio.create_task(
-            self._audio.play_stream(
-                self._tts_source(reply, trace),
-                sample_rate=self._cfg.tts.sample_rate,
-            )
+            self._audio.play_stream(pcm_source, sample_rate=self._cfg.tts.sample_rate)
         )
         mon_task = asyncio.create_task(asyncio.to_thread(monitor))
         try:

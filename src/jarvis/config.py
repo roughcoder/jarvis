@@ -48,6 +48,9 @@ class GatewayConfig(_Base):
     fast_model: str = "fast"
     strong_model: str = "strong"
     request_timeout_s: float = 60.0
+    # Stream the reply and synthesise sentence-by-sentence so speech starts on
+    # the first sentence (lower felt latency). False = wait for the full reply.
+    stream: bool = True
 
     @computed_field  # type: ignore[prop-decorator]
     @property
