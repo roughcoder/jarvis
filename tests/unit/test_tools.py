@@ -39,6 +39,13 @@ def test_available_for_filters_by_capability(tmp_path) -> None:
     assert full == {"read_file", "list_files", "write_file", "web_search"}
 
 
+def test_announce_flag_only_on_remote_tools(tmp_path) -> None:
+    reg = build_registry(_cfg(tmp_path))
+    assert reg.get("web_search").announce is True  # remote => beep
+    assert reg.get("read_file").announce is False  # instant => no beep
+    assert reg.get("write_file").announce is False
+
+
 def test_execute_denies_ungranted_capability(tmp_path) -> None:
     reg = build_registry(_cfg(tmp_path))
     with pytest.raises(CapabilityError):

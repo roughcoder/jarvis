@@ -40,6 +40,29 @@ from jarvis.services.tts import InworldTTS
 from jarvis.tools.base import ToolRegistry
 
 
+def _now_line(tz_name: str) -> str:
+    """A human 'right now' string injected so Jarvis knows the date/time without
+    a tool or a search. `tz_name` is an IANA name; empty = host local time."""
+    from datetime import datetime
+
+    now = None
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+
+            now = datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            now = None
+    if now is None:
+        now = datetime.now().astimezone()
+    tz = now.strftime("%Z") or "local time"
+    # e.g. "Right now it's Saturday, 14 June 2026, 8:47 pm BST."
+    return (
+        f"Right now it's {now.strftime('%A, %-d %B %Y')}, "
+        f"{now.strftime('%-I:%M %p').lower()} {tz}."
+    )
+
+
 def _make_earcon(sample_rate: int, *, freq: float = 880.0, ms: int = 160) -> bytes:
     """A short, faded sine beep as 16-bit PCM at the playback rate — the audible
     "looking that up" cue played before a tool runs."""
@@ -163,6 +186,9 @@ class BrainSession:
                 "What you already know about the user (use it naturally only if "
                 f"relevant; do not recite it):\n{memory}"
             )
+        # Most volatile (changes each minute) → last, so the stable prefix above
+        # stays cacheable. Lets Jarvis answer time/date instantly, no tool needed.
+        parts.append(_now_line(self._cfg.persona.timezone))
         return "\n\n".join(parts)
 
     async def _run_tool_loop(self, messages, model, trace, tool_schemas, result):  # noqa: ANN001
@@ -193,7 +219,8 @@ class BrainSession:
                     for tc in msg.tool_calls
                 ],
             })
-            yield self._earcon()  # audible "looking that up" cue, before tools run
+            if self._should_announce(msg.tool_calls):
+                yield self._earcon()  # "looking that up" cue — slow/remote tools only
             for tc in msg.tool_calls:
                 n_tools += 1
                 try:
@@ -225,10 +252,19 @@ class BrainSession:
             )
 
     def _earcon(self) -> bytes:
-        """A short tone played before a tool runs (cached at the TTS rate)."""
+        """A short tone played before a slow tool runs (cached at the TTS rate)."""
         if self._earcon_pcm is None:
             self._earcon_pcm = _make_earcon(self._cfg.tts.sample_rate)
         return self._earcon_pcm
+
+    def _should_announce(self, tool_calls) -> bool:  # noqa: ANN001
+        """True if any tool in this round is announced (slow/remote, e.g. web
+        search) — instant local tools (files, time) don't earn a beep."""
+        for tc in tool_calls:
+            tool = self._registry.get(tc.function.name)
+            if tool is not None and tool.announce:
+                return True
+        return False
 
     def _remember(self, user_text: str, assistant_text: str) -> None:
         """Append the exchange to the rolling shared-context window."""

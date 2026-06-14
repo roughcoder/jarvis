@@ -46,6 +46,7 @@ def make_web_search_tool(cfg: ToolsConfig) -> Tool:
         },
         required_capability=CAPABILITY,
         handler=handler,
+        announce=True,  # remote search — earns the "looking that up" earcon
     )
 
 

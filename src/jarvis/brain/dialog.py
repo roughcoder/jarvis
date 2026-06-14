@@ -14,9 +14,12 @@ import re
 # (SOUL.md); what Jarvis knows about the user comes from memory.
 _VOICE_FORMAT_BASE = (
     "Write for the ear, not the page: one or two short spoken sentences. Use "
-    "contractions and natural phrasing. Write numbers as words ('twenty-three', "
-    "not '23'). Never use markdown, bullet points, headings, emoji, or special "
-    "characters."
+    "contractions and natural phrasing. Speak dates and times the way a person "
+    "would — 'today', 'tomorrow', 'this Saturday', 'in a few days', 'next week' "
+    "for anything near now; give a full date only when it's far off or genuinely "
+    "needed, and keep it light ('the seventeenth', not 'June the seventeenth, "
+    "twenty twenty-six'). Write numbers as words ('twenty-three', not '23'). "
+    "Never use markdown, bullet points, headings, emoji, or special characters."
 )
 _VOICE_FORMAT_EXPRESSIVE = (
     _VOICE_FORMAT_BASE + "\n\n"

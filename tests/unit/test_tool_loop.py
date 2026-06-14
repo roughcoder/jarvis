@@ -91,10 +91,37 @@ def test_tool_loop_executes_then_answers(tmp_path) -> None:
 
     assert result.raw == "Saved your note."
     assert (tmp_path / "note.md").read_text() == "buy milk"  # tool really ran
-    assert chunks and isinstance(chunks[0], bytes) and chunks[0]  # earcon emitted
+    assert chunks == []  # files are instant => no earcon beep
     # the regression: this trace event used to raise and kill the turn
     assert {"name": "tool", "tool": "write_file"} in trace.data["events"]
     assert "llm" in trace.data["stages"]
+
+
+def test_announced_tool_emits_earcon(tmp_path) -> None:
+    from jarvis.tools.base import Tool, ToolRegistry
+
+    async def handler(ctx, args):  # noqa: ANN001
+        return "looked up"
+
+    reg = ToolRegistry()
+    reg.register(
+        Tool("lookup", "desc", {"type": "object", "properties": {}}, "web.search", handler, announce=True)
+    )
+    gateway = _FakeGateway([
+        _FakeMsg(tool_calls=[_FakeToolCall("c1", "lookup", "{}")]),
+        _FakeMsg(content="Here you go."),
+    ])
+    ctx = RequestContext("dev", "house", "house", frozenset({"web.search"}))
+    session = BrainSession(
+        load_config(), ctx, gateway=gateway, tts=None, memory=None, tracer=None, registry=reg
+    )
+    trace = TurnTrace(room="x", speaker="house")
+    result = TurnResult()
+
+    chunks = _run(session, trace, result)
+
+    assert result.raw == "Here you go."
+    assert chunks and chunks[0]  # announced (remote) tool => earcon emitted
 
 
 def test_no_tool_call_sets_reply_without_earcon(tmp_path) -> None:

@@ -210,6 +210,9 @@ class PersonaConfig(_Base):
     soul_path: str = "SOUL.md"      # personality layer injected into the prompt
     history_messages: int = 16      # rolling shared context window (user+assistant)
     expressive: bool = True         # let replies use Inworld TTS-2 emotion cues
+    # IANA tz name (e.g. "Europe/London") injected so Jarvis knows "now" without
+    # a tool/search. Empty = the host's local timezone.
+    timezone: str = ""
 
 
 class TraceConfig(_Base):

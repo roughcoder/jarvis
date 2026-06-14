@@ -32,6 +32,9 @@ class Tool:
     parameters: dict[str, Any]  # JSON Schema for the function arguments
     required_capability: str
     handler: Handler
+    # True for slow/remote tools (web search) that warrant a "looking that up"
+    # earcon. Instant local tools (files, time) leave it False — no beep.
+    announce: bool = False
 
     def openai_schema(self) -> dict[str, Any]:
         return {
