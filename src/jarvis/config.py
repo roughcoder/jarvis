@@ -120,6 +120,10 @@ class TTSConfig(_Base):
     sample_rate: int = 24000  # LINEAR16 PCM playback rate
     # Expressiveness of delivery: STABLE | BALANCED | CREATIVE (most emotional).
     delivery_mode: str = "BALANCED"
+    # Network timeouts (tunables live in config). connect: time to establish the
+    # stream; request: overall read budget for the streamed response.
+    connect_timeout_s: float = 10.0
+    request_timeout_s: float = 60.0
 
 
 class STTConfig(_Base):

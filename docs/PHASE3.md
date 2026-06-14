@@ -73,6 +73,14 @@ down the same socket. One mechanism for channel I/O *and* proactivity.
 locally (lowest latency, self-contained). A Pi runs only wake + audio locally
 and reaches STT/TTS/LLM/memory over the LAN. *Same code, different `.env`.*
 
+**Credential boundary (do not blur this).** "Runs STT/TTS locally" means the
+credentialed *service* is co-located on that machine — **never** that the thin
+intercom embeds provider keys. Provider credentials (TTS/LLM/`google`/MCP) live
+only in the brain or a credentialed service; the intercom holds **no** provider
+keys and authenticates **only** to the brain/service with its pairing token. So
+the existing in-process TTS key (`tts/__init__.py`) is correct *because that
+client is brain/service-side* — it must never ship inside an intercom build.
+
 **Device lifecycle (the intercom CLI):**
 
 ```
@@ -141,6 +149,11 @@ principal: unknown or family/shared → house.
 ## 6. The v1 tool surface
 
 Deliberately small. OpenClaw is a menu to shop from, not a kit to clone.
+
+**Every tool declares a required capability and runs behind a deny-by-default
+gate** — the `RequestContext`→capability check from §4 stands in front of all of
+them, present from 3a (§12) before the first tool that touches an account or the
+filesystem. A tool with no granted capability does not run, single-principal or not.
 
 **Atomic tools (hand-built, few):**
 
@@ -231,6 +244,14 @@ Config knobs (into `config.py`, per convention): context cap, `reserve_tokens`,
 per-channel `history_window`, `compaction_enabled` (off for voice), the silent
 sentinel. No floors, no branch summaries.
 
+**Restructure note (single-principal → per-context).** Today's state is global:
+one cache file (`.cache/representation.json`), one `voice` session, one rolling
+`_history`. The brain split must make each **per-`(device × user)`** — a cache
+key, a session, and a history window per context, plus a shared house context —
+with isolation tests written as that lands (§11). Single-principal is the
+characterised baseline until then; do not let it leak across users once channels
+multiply.
+
 ## 10. Repo & project layout
 
 The split that matters is **engine vs instance**, not "Jarvis vs Jarvis-Extra".
@@ -285,35 +306,48 @@ order (§9).
 
 ## 11. Testing
 
-The boundary architecture is, conveniently, very testable. Two tiers (in place
-now, against current code — see `tests/`):
+The boundary architecture is, conveniently, very testable. Two tiers (`tests/`):
 
-- **Unit** (`tests/unit`, default, runs in <1s): pure logic — conversation-end
-  detection, config resolution, identity/scope/capability gating, cache-ordering,
-  protocol (de)serialisation, the memory hot/cold boundary. `uv run pytest`.
+- **Unit** (`tests/unit`, default, runs in <1s): pure logic. `uv run pytest`.
 - **Integration** (`tests/integration`, opt-in): real gateway / memory / TTS /
   STT, latency budgets, and the dead-boundary readiness check. Marked
   `integration`, self-skip when a dependency is absent. `uv run pytest
   --run-integration`.
 
-As Phase 3 lands: the boundary is the **mock seam** (test each side against a
-faked counterpart); the shared `protocol/` gets **contract tests** both clients
-check against; the two hard constraints become **assertions** (hot read works at
-a dead boundary; the hot path never awaits the network). Write the test before
-moving the code — characterise current behaviour, restructure, prove the cleave.
+**In place now** (characterising current Phase 1 behaviour): conversation-end
+detection, streaming segmentation, config resolution, the memory hot/cold
+boundary (the PHASE2 readiness check, automated), VAD endpointing, tracing.
+
+**Added as each Phase 3 layer lands** (does not exist yet — write the test *with*
+the code, TDD): identity/scope/capability gating, cache-ordered prompt assembly,
+protocol (de)serialisation, and per-`(device × user)` cache/session/history
+isolation. The boundary is the **mock seam** (test each side against a faked
+counterpart); the shared `protocol/` gets **contract tests** both clients check
+against; the two hard constraints become **assertions** (hot read works at a
+dead boundary; the hot path never awaits the network). Always write the test
+before moving the code — characterise, restructure, prove the cleave held.
 
 ## 12. Build order
 
 Each step is small and independently useful; the full system emerges. Never hold
 all of it in your head at once.
 
-1. **3a — Brain + your Mac + the 3 atomic tools** (`web-search`, `files`,
-   `google`). Just you, one device. Works completely.
-2. **3b — WhatsApp connector + heartbeat.** Proactive outbound; identity on a
-   strong channel.
+**Enforcement before capability** — the privacy/capability wall is built *before*
+any tool that can touch an account or the filesystem, even while there's only one
+user. The identity stack is not deferred to 3d; only its *multiplicity* is.
+
+1. **3a — Brain-as-server + the capability spine, _then_ the tools.** First a
+   minimal `RequestContext` (who / where / scope — single-principal to start) and
+   a **deny-by-default capability gate**: no tool runs without an explicit grant.
+   *Only then* add `web-search`, `files`, `google`, each registered against a
+   required capability. One user, one device, house principal — but the gate
+   exists from the first capability-bearing tool, so nothing predates the wall.
+2. **3b — WhatsApp connector + heartbeat.** A real second channel → the first
+   exercise of the know-or-ask identity rule and per-user credential resolution.
 3. **3c — Worker Mac daemon + `code-dispatch`.** Jarvis gets hands.
-4. **3d — A room Pi + capability profiles + a second user (Jules).** Multi-device,
-   multi-person, the full resolution stack.
+4. **3d — Room Pi + per-device profiles + a second user (Jules).** Multi-device,
+   multi-person — the resolution stack now *fully populated* (enforcement built in
+   3a; the multiplicity of profiles, users, and credentials added here).
 
 The MCP **work bundle** slots into 3a/3b as your real work stack comes online,
 gated to your work profile.
@@ -329,7 +363,12 @@ gated to your work profile.
   confidence** (§5).
 - **No work MCP or dispatch ever lands on the voice hot path** (§2, §9); every
   bridged call has a timeout.
-- **The intercom holds no intelligence and no credentials** — the brain does (§1).
+- **The intercom holds no intelligence and no credentials** — the brain does
+  (§1). Provider credentials (TTS/LLM/`google`/MCP) live only in the brain or a
+  credentialed service; an intercom authenticates only to the brain via pairing
+  token (§3).
+- **No capability-bearing tool predates the deny-by-default gate** — the gate
+  exists from 3a, before any tool that touches an account or the filesystem (§12).
 - **Secrets live in `.env`/a vault, never in instance markdown** (§10).
 
 ## 14. What Phase 3 is NOT

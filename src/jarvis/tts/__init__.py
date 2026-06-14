@@ -94,7 +94,10 @@ class InworldTTS:
         }
 
         buffer = ""
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
+        timeout = httpx.Timeout(
+            self._cfg.request_timeout_s, connect=self._cfg.connect_timeout_s
+        )
+        async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream("POST", url, headers=headers, json=body) as resp:
                 if resp.status_code != 200:
                     detail = (await resp.aread()).decode("utf-8", "replace")
