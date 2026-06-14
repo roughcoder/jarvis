@@ -185,6 +185,16 @@ class AudioConfig(_Base):
     ack_phrase: str = "Yes?"
 
 
+class TraceConfig(_Base):
+    """Per-turn pipeline tracing (STT/LLM/TTS/memory timings)."""
+
+    model_config = SettingsConfigDict(env_prefix="TRACE_", env_file=".env", extra="ignore")
+
+    enabled: bool = True
+    path: str = ".cache/traces.jsonl"   # one JSON object per turn
+    console: bool = True                # also print a compact per-turn summary
+
+
 class Config:
     """Aggregate config. Construct once and pass modules their slice."""
 
@@ -197,6 +207,7 @@ class Config:
         self.vad = VADConfig()
         self.wake = WakeConfig()
         self.audio = AudioConfig()
+        self.trace = TraceConfig()
 
     def resolved(self) -> dict:
         """Flat, secret-masked view for the dry-run printout (Step 0 gate)."""
@@ -238,6 +249,8 @@ class Config:
             "audio.sample_rate": self.audio.sample_rate,
             "audio.frame_ms": self.audio.frame_ms,
             "audio.ack_mode": self.audio.ack_mode,
+            "trace.enabled": self.trace.enabled,
+            "trace.path": self.trace.path,
         }
 
 

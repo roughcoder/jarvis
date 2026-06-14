@@ -293,6 +293,7 @@ def _cmd_run(_args: argparse.Namespace) -> int:
     from jarvis.gateway_client import GatewayClient
     from jarvis.memory_client import MemoryClient
     from jarvis.stt import Transcriber
+    from jarvis.tracing import Tracer
     from jarvis.tts import InworldTTS
     from jarvis.turnloop import TurnLoop
     from jarvis.vad import SileroVAD
@@ -310,6 +311,7 @@ def _cmd_run(_args: argparse.Namespace) -> int:
         gateway=GatewayClient(cfg.gateway),
         tts=InworldTTS(cfg.tts),
         memory=MemoryClient(cfg.memory),
+        tracer=Tracer(cfg.trace),
     )
     try:
         asyncio.run(loop.run())
@@ -318,6 +320,44 @@ def _cmd_run(_args: argparse.Namespace) -> int:
         # Blocking mic-read worker threads can't be joined on Ctrl-C; exit hard
         # so the interpreter's atexit thread-join doesn't hang.
         os._exit(0)
+    return 0
+
+
+def _cmd_traces(args: argparse.Namespace) -> int:
+    """View recent per-turn pipeline traces (STT/LLM/TTS/memory timings)."""
+    import json
+    import pathlib
+
+    cfg = load_config()
+    path = pathlib.Path(cfg.trace.path)
+    if not path.exists():
+        print(f"No traces yet at {path} (run `jarvis run` first).")
+        return 0
+    lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+    rows = []
+    for ln in lines[-args.n :]:
+        try:
+            rows.append(json.loads(ln))
+        except json.JSONDecodeError:
+            continue
+    print(f"Last {len(rows)} traces from {path}:\n")
+    for d in rows:
+        s = d.get("stages", {})
+        kind = d.get("kind", "turn")
+        if kind == "memory":
+            print(f"  memory   mem={s.get('memory', {}).get('ms', 0):.0f}ms")
+            continue
+        stt = s.get("stt", {})
+        llm = s.get("llm", {})
+        tts = s.get("tts", {})
+        ev = ",".join(e["name"] for e in d.get("events", []))
+        print(
+            f"  turn  speaker={d.get('speaker', '?'):<7} room={d.get('room', '?'):<8} "
+            f"stt={stt.get('ms', 0):.0f}ms "
+            f"llm[{llm.get('model', '?')}]={llm.get('ms', 0):.0f}ms "
+            f"tts={tts.get('ms', 0):.0f}ms(ttfa {tts.get('ttfa_ms') or 0:.0f}) "
+            f"total={d.get('total_ms', 0):.0f}ms" + (f"  [{ev}]" if ev else "")
+        )
     return 0
 
 
@@ -370,6 +410,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable barge-in (use on bare speakers without an AEC mic)",
     )
     p_run.set_defaults(func=_cmd_run)
+
+    p_traces = sub.add_parser("traces", help="View recent per-turn pipeline traces")
+    p_traces.add_argument("-n", type=int, default=20, help="How many recent traces")
+    p_traces.set_defaults(func=_cmd_traces)
 
     return parser
 

@@ -24,12 +24,15 @@ import asyncio
 import enum
 import queue
 import threading
+import time
+from collections.abc import AsyncIterator
 
 from jarvis.audio import AudioIO, MicStream
 from jarvis.config import Config
 from jarvis.gateway_client import GatewayClient
 from jarvis.memory_client import MemoryClient
 from jarvis.stt import Transcriber
+from jarvis.tracing import Tracer
 from jarvis.tts import InworldTTS
 from jarvis.vad import Endpointer, SileroVAD
 from jarvis.wake import WakeWord
@@ -63,6 +66,7 @@ class TurnLoop:
         gateway: GatewayClient,
         tts: InworldTTS,
         memory: MemoryClient,
+        tracer: Tracer,
     ) -> None:
         self._cfg = cfg
         self._audio = audio
@@ -72,6 +76,7 @@ class TurnLoop:
         self._gateway = gateway
         self._tts = tts
         self._memory = memory
+        self._tracer = tracer
         self._sr = cfg.audio.sample_rate
         self._cold_tasks: set[asyncio.Task] = set()
         self.state = State.PASSIVE
@@ -150,9 +155,15 @@ class TurnLoop:
             if not pcm:
                 print("  (nothing said)")
                 return
+            trace = self._tracer.turn(
+                room=self._cfg.gateway.room, speaker=self._cfg.gateway.speaker
+            )
+            secs = len(pcm) / 2 / self._sr
+            trace.start("stt")
             text = await asyncio.to_thread(
                 self._stt.transcribe, pcm, sample_rate=self._sr
             )
+            trace.end("stt", audio_s=round(secs, 1), chars=len(text))
             print(f"  you: {text!r}")
             if not text:
                 return
@@ -172,6 +183,7 @@ class TurnLoop:
                     "\n\nWhat you already know about the user (use it naturally "
                     f"only if relevant; do not recite it):\n{memory}"
                 )
+            trace.start("llm")
             reply = await self._gateway.complete(
                 [
                     {"role": "system", "content": system},
@@ -179,8 +191,10 @@ class TurnLoop:
                 ],
                 model=model,
             )
+            trace.end("llm", model=model, chars=len(reply or ""), memory=bool(memory))
             print(f"  jarvis [{model}]: {reply}")
             if not reply:
+                self._tracer.emit(trace)
                 return
 
             # COLD path: fire-and-forget BEFORE speaking so the memory write +
@@ -189,7 +203,10 @@ class TurnLoop:
             self._fire_cold_path(text, reply)
 
             # SPEAKING (barge-in armed)
-            interrupted = await self._speak_with_bargein(mic, reply)
+            interrupted = await self._speak_with_bargein(mic, reply, trace)
+            if interrupted:
+                trace.event("barge_in")
+            self._tracer.emit(trace)
             if interrupted:
                 # INTERRUPTED → re-listen immediately (ACTIVE), no wake word.
                 print("⊘ interrupted — listening…")
@@ -223,10 +240,17 @@ class TurnLoop:
         # Write the turn to Honcho (deriver reasons in the background), then
         # refresh the local representation cache for the next turn. Resilient:
         # if memory is unreachable, the turn loop is unaffected.
+        t0 = time.perf_counter()
         try:
             await self._memory.write_turn(user_text, assistant_text)
             await self._memory.refresh_cache()
-            print("  [memory] updated in background")
+            ms = (time.perf_counter() - t0) * 1000
+            mt = self._tracer.turn(
+                room=self._cfg.gateway.room, speaker=self._cfg.gateway.speaker
+            )
+            mt.set(kind="memory")
+            mt.stage("memory", ms)
+            self._tracer.emit(mt)
         except Exception as exc:  # noqa: BLE001 - memory must never break a turn
             print(f"  [memory] cold-path skipped: {exc}")
 
@@ -243,7 +267,32 @@ class TurnLoop:
         else:  # "beep"
             await asyncio.to_thread(self._audio.play_tone)
 
-    async def _speak_with_bargein(self, mic: MicStream, reply: str) -> bool:
+    async def _tts_source(self, text: str, trace=None) -> AsyncIterator[bytes]:  # noqa: ANN001
+        """Wrap the TTS stream to capture its timing (time-to-first-audio, total
+        duration, bytes) into the turn trace — the Inworld call isn't visible in
+        the gateway logs, so this is where it's measured."""
+        t0 = time.perf_counter()
+        first_ms: float | None = None
+        total = 0
+        try:
+            async for chunk in self._tts.synthesize_stream(text):
+                if first_ms is None:
+                    first_ms = (time.perf_counter() - t0) * 1000
+                total += len(chunk)
+                yield chunk
+        finally:
+            if trace is not None:
+                trace.stage(
+                    "tts",
+                    (time.perf_counter() - t0) * 1000,
+                    ttfa_ms=round(first_ms, 1) if first_ms is not None else None,
+                    bytes=total,
+                    chars=len(text),
+                    voice=self._cfg.tts.voice,
+                    provider=self._cfg.tts.provider,
+                )
+
+    async def _speak_with_bargein(self, mic: MicStream, reply: str, trace=None) -> bool:  # noqa: ANN001
         """Play the reply while watching the mic for the user talking over it.
 
         Returns True if the user barged in (playback was cut and the in-flight
@@ -255,7 +304,7 @@ class TurnLoop:
         if not self._cfg.vad.bargein_enabled:
             # No AEC input path: just speak, don't listen for interruptions.
             await self._audio.play_stream(
-                self._tts.synthesize_stream(reply),
+                self._tts_source(reply, trace),
                 sample_rate=self._cfg.tts.sample_rate,
             )
             return False
@@ -311,7 +360,7 @@ class TurnLoop:
 
         play_task = asyncio.create_task(
             self._audio.play_stream(
-                self._tts.synthesize_stream(reply),
+                self._tts_source(reply, trace),
                 sample_rate=self._cfg.tts.sample_rate,
             )
         )
