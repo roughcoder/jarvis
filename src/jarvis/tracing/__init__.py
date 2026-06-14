@@ -25,7 +25,16 @@ class TurnTrace:
     def __init__(self, *, room: str, speaker: str) -> None:
         self._t0 = time.perf_counter()
         self._starts: dict[str, float] = {}
-        self.data: dict = {"room": room, "speaker": speaker, "stages": {}, "events": []}
+        # Wall-clock start so turn and cold-path (memory) traces can be lined up
+        # on a timeline — e.g. to see if a slow follow-up turn overlapped a
+        # cold-path/deriver burst (contention) vs ambient noise.
+        self.data: dict = {
+            "ts": round(time.time(), 3),
+            "room": room,
+            "speaker": speaker,
+            "stages": {},
+            "events": [],
+        }
 
     def start(self, stage: str) -> None:
         self._starts[stage] = time.perf_counter()

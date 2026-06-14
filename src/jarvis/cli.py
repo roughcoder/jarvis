@@ -340,19 +340,29 @@ def _cmd_traces(args: argparse.Namespace) -> int:
             rows.append(json.loads(ln))
         except json.JSONDecodeError:
             continue
-    print(f"Last {len(rows)} traces from {path}:\n")
+    import datetime
+
+    def clock(d: dict) -> str:
+        ts = d.get("ts")
+        if not ts:
+            return "--:--:--"
+        return datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+
+    print(f"Last {len(rows)} traces from {path} (time column lines up the timeline):\n")
     for d in rows:
         s = d.get("stages", {})
         kind = d.get("kind", "turn")
         if kind == "memory":
-            print(f"  memory   mem={s.get('memory', {}).get('ms', 0):.0f}ms")
+            # Indented so a cold-path burst is easy to see against the turn it
+            # overlaps — useful for telling contention from ambient noise.
+            print(f"  {clock(d)}  memory      mem={s.get('memory', {}).get('ms', 0):.0f}ms (cold path)")
             continue
         stt = s.get("stt", {})
         llm = s.get("llm", {})
         tts = s.get("tts", {})
         ev = ",".join(e["name"] for e in d.get("events", []))
         print(
-            f"  turn  speaker={d.get('speaker', '?'):<7} room={d.get('room', '?'):<8} "
+            f"  {clock(d)}  turn  {d.get('speaker', '?'):<7} {d.get('room', '?'):<8} "
             f"stt={stt.get('ms', 0):.0f}ms "
             f"llm[{llm.get('model', '?')}]={llm.get('ms', 0):.0f}ms "
             f"tts={tts.get('ms', 0):.0f}ms(ttfa {tts.get('ttfa_ms') or 0:.0f}) "

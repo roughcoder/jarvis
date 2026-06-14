@@ -126,6 +126,34 @@ Secrets to put in `.env` (gitignored): `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
   START (scopes the whole call), non-verbals `[laugh]` inline; numbers as words;
   no markdown/emoji. Streaming reuses the leading steering tag per sentence.
 
+## Invariants to keep true
+
+- **SOUL.md is authoritative for personality; memory is strictly user-scoped and
+  subordinate.** Honcho scopes memory to the *user* peer; the system prompt
+  injects it as "what you know about the **user**", never "who you are". The
+  deriver summarises the user, not Jarvis. Don't let memory blur into
+  personality — keep these on separate rails (this is already true by
+  construction; the note is so it stays true).
+- **Phase 2 readiness: `MEMORY_HOST` is the only load-bearing migration var on
+  Hive.** Jarvis never connects to Postgres directly (only Honcho does, via its
+  compose-internal URI), so the DB moves *with* Honcho as a unit — `DB_HOST` in
+  the app's `.env` is effectively vestigial. Readiness test (run before any
+  migration): point memory at a dead boundary and confirm the hot-path cache
+  read still works while the cold-path write/refresh fails cleanly at the
+  boundary (ConnectError, not a hang, not a silent half-success):
+  `MEMORY_PORT=1 uv run python -c "..."` — see the cold-path methods in
+  `memory_client`. If anything on the hot path needs the network, there's a
+  co-location shortcut to find before migrating.
+- **Watch cold-path/VAD contention in the follow-up window.** The cold path
+  (memory write + deriver, and the debounced dialectic) fires right as
+  conversation mode opens the mic for the next utterance — the most
+  compute-active moment coincides with the most noise-sensitive one. On a Mac,
+  Docker shares the host CPU, so a deriver burst can starve the VAD loop. If
+  real-room testing shows follow-up twitchiness, **check the trace timeline
+  first** (`jarvis traces` — a slow turn overlapping a `(cold path)` line =
+  contention) before reaching for `VAD_SPEECH_THRESHOLD` / `VAD_MIN_SPEECH_MS`.
+  Don't tune the symptom if the cause is contention.
+
 ## Memory for agents
 
 Durable, non-obvious project decisions live in the Claude memory file

@@ -77,4 +77,24 @@ Per-step extras install as each build step is reached, e.g.
       → deriver → refresh) that never blocks. Confirmed live: cross-session
       recall + mid-conversation fact updates. Plus conversation mode (follow-up
       window so you don't re-wake each turn, VAD_CONVERSATION_MODE).
-- [ ] Step 10 — Phase 1 acceptance
+- [x] Step 10 — Phase 1 acceptance: hands-free wake→ask→answer→idle, natural
+      endpointing, barge-in, cross-session recall, no felt memory latency,
+      per-turn routing, all env-driven (Phase-2 readiness test passes).
+
+## Beyond the spec (added during Phase 1)
+
+- Conversation mode (follow-ups without re-waking) + voice-controlled ending
+  (model `[[END]]` + deterministic sign-off net + reply-farewell backstop)
+- Soul (`SOUL.md` personality) + shared conversation context
+- Emotional speech (Inworld TTS-2 steering) and **streamed sentence-by-sentence
+  replies** (lower time-to-first-audio)
+- Latency: `small.en` STT (~0.8s), debounced memory refresh
+- Full LiteLLM attribution (team / key / internal user / end-user=speaker /
+  room tag) + per-turn pipeline tracing with a wall-clock timeline
+
+## Docs
+
+- **[AGENTS.md](AGENTS.md)** — architecture, hard constraints, conventions,
+  gotchas, invariants (read first; `CLAUDE.md` imports it).
+- **[docs/PHASE2.md](docs/PHASE2.md)** — the Frankfurt migration spec; the
+  readiness test is its entry gate.
