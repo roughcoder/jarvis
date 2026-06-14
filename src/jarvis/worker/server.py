@@ -32,7 +32,8 @@ def make_app(cfg: WorkerConfig) -> web.Application:
     import pathlib
 
     pathlib.Path(cfg.workspace).mkdir(parents=True, exist_ok=True)  # default cwd
-    jobs = JobManager()
+    # Persist jobs to disk under the workspace so they survive a daemon restart.
+    jobs = JobManager(store_dir=str(pathlib.Path(cfg.workspace) / "jobs"))
 
     def authorised(request: web.Request) -> bool:
         token = cfg.token.get_secret_value()

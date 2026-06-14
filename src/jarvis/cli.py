@@ -403,12 +403,14 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
     for j in jobs[-args.n :]:
         clock = datetime.datetime.fromtimestamp(j.get("started", 0)).strftime("%H:%M:%S")
         out = (j.get("output") or "").replace("\n", " ")
-        if len(out) > 70:
-            out = out[:70] + "…"
+        if len(out) > 64:
+            out = out[:64] + "…"
         print(
-            f"  {clock}  {j.get('id')}  {j.get('status'):<8} "
-            f"{(j.get('label') or '')[:36]:<36}  {out}"
+            f"  {clock}  {j.get('id')}  {j.get('status'):<11} "
+            f"{(j.get('label') or '')[:34]:<34}  {out}"
         )
+        if j.get("session_id"):
+            print(f"            └─ full transcript: codex resume {j['session_id']}")
     return 0
 
 

@@ -1,17 +1,25 @@
-"""In-memory job tracking for long-running worker actions (Phase 3c).
+"""Job tracking for long-running worker actions, persisted to disk (Phase 3c).
 
 Deep work (a coding-agent run) takes minutes, so the daemon starts it as a
-background task and returns a job id immediately — the brain never blocks. No
-aiohttp/brain imports, so it's unit-testable on its own.
+background task and returns a job id immediately — the brain never blocks. Jobs
+are persisted as one JSON file each under a store dir (no database — matches the
+project's file-based operational data and keeps the worker self-contained), so
+they survive a daemon restart. A job left "running" when the daemon died is
+reloaded as "interrupted".
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import pathlib
+import re
 import time
 import uuid
 from collections.abc import Awaitable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+
+_SESSION_ID = re.compile(r"session id:\s*(\S+)", re.IGNORECASE)
 
 
 @dataclass
@@ -19,31 +27,61 @@ class Job:
     id: str
     action: str
     label: str
-    status: str = "running"  # running | done | error
+    status: str = "running"  # running | done | error | interrupted
     output: str = ""
+    session_id: str | None = None  # the coding agent's session (for `codex resume`)
     started: float = field(default_factory=time.time)
     ended: float | None = None
 
     def public(self) -> dict:
-        return {
-            "id": self.id,
-            "action": self.action,
-            "label": self.label,
-            "status": self.status,
-            "output": self.output,
-            "started": round(self.started, 1),
-            "ended": self.ended,
-        }
+        d = asdict(self)
+        d["started"] = round(self.started, 1)
+        return d
 
 
 class JobManager:
-    def __init__(self) -> None:
+    def __init__(self, store_dir: str | None = None) -> None:
         self._jobs: dict[str, Job] = {}
         self._tasks: set[asyncio.Task] = set()
+        self._store = pathlib.Path(store_dir) if store_dir else None
+        if self._store is not None:
+            self._store.mkdir(parents=True, exist_ok=True)
+            self._load()
 
+    # --- persistence -------------------------------------------------------
+    def _load(self) -> None:
+        for f in sorted(self._store.glob("*.json")):  # type: ignore[union-attr]
+            try:
+                d = json.loads(f.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            job = Job(
+                id=d["id"],
+                action=d.get("action", "?"),
+                label=d.get("label", ""),
+                status=d.get("status", "done"),
+                output=d.get("output", ""),
+                session_id=d.get("session_id"),
+                started=d.get("started", 0.0),
+                ended=d.get("ended"),
+            )
+            if job.status == "running":  # the daemon died mid-job
+                job.status = "interrupted"
+            self._jobs[job.id] = job
+
+    def _persist(self, job: Job) -> None:
+        if self._store is None:
+            return
+        try:
+            (self._store / f"{job.id}.json").write_text(json.dumps(job.public()))
+        except OSError:
+            pass  # persistence is best-effort; never break a job over it
+
+    # --- lifecycle ---------------------------------------------------------
     def start(self, action: str, label: str, coro: Awaitable[str]) -> Job:
         job = Job(id=uuid.uuid4().hex[:12], action=action, label=label)
         self._jobs[job.id] = job
+        self._persist(job)
         task = asyncio.create_task(self._run(job, coro))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -58,6 +96,10 @@ class JobManager:
             job.status = "error"
         finally:
             job.ended = round(time.time(), 1)
+            m = _SESSION_ID.search(job.output)
+            if m:
+                job.session_id = m.group(1)
+            self._persist(job)
 
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)

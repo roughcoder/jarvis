@@ -67,3 +67,37 @@ def test_job_manager_records_error() -> None:
     job = _drain(boom())
     assert job.status == "error"
     assert "kaboom" in job.output
+
+
+def test_jobs_persist_to_disk_and_reload(tmp_path) -> None:
+    async def work() -> str:
+        return "session id: abc-123\npong"
+
+    async def go() -> str:
+        jm = JobManager(store_dir=str(tmp_path))
+        job = jm.start("code", "label", work())
+        for _ in range(100):
+            if jm.get(job.id).status != "running":
+                break
+            await asyncio.sleep(0.01)
+        return job.id
+
+    jid = asyncio.run(go())
+    # a fresh manager (daemon restart) loads the job from disk
+    reloaded = JobManager(store_dir=str(tmp_path)).get(jid)
+    assert reloaded is not None
+    assert reloaded.status == "done"
+    assert reloaded.session_id == "abc-123"  # bridge to `codex resume`
+
+
+def test_stale_running_job_reloads_as_interrupted(tmp_path) -> None:
+    import json
+
+    (tmp_path / "deadbeef0000.json").write_text(
+        json.dumps(
+            {"id": "deadbeef0000", "action": "code", "label": "x", "status": "running",
+             "output": "", "started": 1.0, "ended": None}
+        )
+    )
+    jm = JobManager(store_dir=str(tmp_path))
+    assert jm.get("deadbeef0000").status == "interrupted"
