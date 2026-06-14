@@ -297,14 +297,17 @@ class TurnLoop:
         t0 = time.perf_counter()
         try:
             await self._memory.write_turn(user_text, assistant_text)
-            await self._memory.refresh_cache()
-            ms = (time.perf_counter() - t0) * 1000
-            mt = self._tracer.turn(
-                room=self._cfg.gateway.room, speaker=self._cfg.gateway.speaker
+            refreshed = await self._memory.refresh_cache(
+                min_interval_s=self._cfg.memory.refresh_interval_s
             )
-            mt.set(kind="memory")
-            mt.stage("memory", ms)
-            self._tracer.emit(mt)
+            if refreshed:
+                ms = (time.perf_counter() - t0) * 1000
+                mt = self._tracer.turn(
+                    room=self._cfg.gateway.room, speaker=self._cfg.gateway.speaker
+                )
+                mt.set(kind="memory")
+                mt.stage("memory", ms)
+                self._tracer.emit(mt)
         except Exception as exc:  # noqa: BLE001 - memory must never break a turn
             print(f"  [memory] cold-path skipped: {exc}")
 

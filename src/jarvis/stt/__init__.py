@@ -37,6 +37,7 @@ class Transcriber:
         segments, _info = self._model.transcribe(
             audio,
             language=self._cfg.language,
+            beam_size=self._cfg.beam_size,
             vad_filter=False,
         )
         return "".join(seg.text for seg in segments).strip()

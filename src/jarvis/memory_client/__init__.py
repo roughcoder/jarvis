@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import pathlib
+import time
 
 from jarvis.config import MemoryConfig
 
@@ -45,6 +46,7 @@ class MemoryClient:
         self._cfg = cfg
         self._ws = cfg.workspace_id
         self._ensured = False
+        self._last_refresh = 0.0  # monotonic; debounces the dialectic refresh
 
     def _ws_url(self) -> str:
         return f"{self._cfg.base_url}/v2/workspaces/{self._ws}"
@@ -90,9 +92,14 @@ class MemoryClient:
             )
             r.raise_for_status()
 
-    def _refresh_cache_sync(self) -> str:
+    def _refresh_cache_sync(self, min_interval_s: float = 0.0) -> str | None:
         import httpx
 
+        # Debounce: skip the expensive dialectic if we refreshed recently — but
+        # always refresh when the cache is still empty (first facts).
+        if min_interval_s > 0 and self.read_cached_representation():
+            if (time.monotonic() - self._last_refresh) < min_interval_s:
+                return None
         with httpx.Client(timeout=self._cfg.write_timeout_s, headers=self._headers()) as c:
             self._ensure(c)
             r = c.post(
@@ -104,13 +111,16 @@ class MemoryClient:
         path = pathlib.Path(self._cfg.cache_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"representation": text}))
+        self._last_refresh = time.monotonic()
         return text
 
     async def write_turn(self, user_text: str, assistant_text: str) -> None:
         await asyncio.to_thread(self._write_turn_sync, user_text, assistant_text)
 
-    async def refresh_cache(self) -> None:
-        await asyncio.to_thread(self._refresh_cache_sync)
+    async def refresh_cache(self, min_interval_s: float = 0.0) -> bool:
+        """Refresh the cache; returns True if it actually ran (not debounced)."""
+        result = await asyncio.to_thread(self._refresh_cache_sync, min_interval_s)
+        return result is not None
 
     # --- helpers / gate support -------------------------------------------
     def deriver_idle(self) -> bool:

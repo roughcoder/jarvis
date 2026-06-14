@@ -69,6 +69,10 @@ class MemoryConfig(_Base):
     # Hot path reads a LOCAL cache (spec §3.2), never the live reasoning endpoint.
     cache_path: str = ".cache/representation.json"
     write_timeout_s: float = 30.0
+    # The turn is always WRITTEN to Honcho (facts captured immediately), but the
+    # expensive dialectic cache refresh is debounced to at most once per this
+    # interval — avoids a ~9s reasoning call every single turn.
+    refresh_interval_s: float = 30.0
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -120,10 +124,14 @@ class STTConfig(_Base):
 
     model_config = SettingsConfigDict(env_prefix="STT_", env_file=".env", extra="ignore")
 
-    model: str = "distil-large-v3"  # or "turbo"
+    # small.en ≈ 0.8s/turn vs distil-large-v3 ≈ 2.9s (Whisper STT is encoder-
+    # bound: time is ~fixed by model size, not clip length). distil-large-v3 for
+    # max accuracy, base.en for max speed.
+    model: str = "small.en"
     device: str = "auto"            # "auto" -> cpu/metal as available
     compute_type: str = "int8"
     language: str = "en"
+    beam_size: int = 1              # greedy = fastest; raise for accuracy
 
 
 class VADConfig(_Base):
