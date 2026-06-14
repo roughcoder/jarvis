@@ -72,33 +72,49 @@ _VOICE_FORMAT_EXPRESSIVE = (
 # Conversation control: how the model signals the user is done so the loop can
 # return to PASSIVE (wake word required again). Detected + stripped before TTS.
 _END_INSTRUCTION = (
-    "Ending the conversation: only end when you are CERTAIN the user is finished. "
-    "Unmistakable sign-offs — 'goodbye', 'bye', 'stop', 'go to sleep', \"that's "
-    "all\", \"that's everything\", \"I'm done\" — mean end: give a short, warm "
-    "farewell of a few words and NOTHING else, then put [[END]] as the very last "
-    "characters. If a message MIGHT mean they're done but you're not certain (a "
-    "bare 'thanks', 'no thanks', \"that's good\", 'ok', 'cool', 'great'), do NOT "
-    "end — give your normal reply and briefly ask if there's anything else. When "
-    "in doubt, ASK, never end. Never use [[END]] while they still want to continue."
+    "Ending the conversation: end when the user clearly signals they're finished "
+    "— a goodbye ('bye', 'goodnight', 'see you'), declining further help ('no "
+    "thanks', \"no, that's good, thanks\", \"I'm good\", 'we're good'), or "
+    "'that's all'/'stop'/'go to sleep'. To end, give a short, warm farewell of a "
+    "few words and NOTHING else, then put [[END]] as the very last characters. "
+    "IMPORTANT: if your reply is itself a goodbye, you MUST include [[END]]. If a "
+    "message is only a vague acknowledgement and you can't tell whether they're "
+    "done (a bare 'thanks', 'ok', 'cool', 'great'), do NOT end — give your reply "
+    "and briefly ASK if there's anything else. When unsure, ask rather than end."
 )
 # Matches [[END]] / [END] (case-insensitive). Stripped from the spoken reply.
 _END_RE = re.compile(r"\s*\[\[?\s*end\s*\]\]?\s*", re.IGNORECASE)
 
-# Deterministic safety net: ONLY unmistakable closers (the model handles the
-# ambiguous ones by asking). Kept high-precision so it never ends a turn the
-# user meant to continue. Matched against the whole normalised utterance.
+# --- Deterministic backstops (the model handles nuance; these guarantee the
+# clear cases and never fire on a turn the user meant to continue) -----------
+
+# Any request/question word → never a sign-off.
+_REQUEST_CUE = re.compile(
+    r"\b(tell|what|whats|how|why|when|where|who|which|show|give|explain|"
+    r"recommend|suggest|find|search|list|define|describe|help)\b"
+)
+# Short command / closer phrases (matched after stripping filler words).
 _CLEAR_SIGNOFFS = frozenset(
     {
         "goodbye", "bye", "bye bye", "good night", "goodnight",
-        "stop", "stop listening", "go to sleep", "go to bed",
-        "thats all", "that is all", "thatll be all", "that will be all",
-        "thats everything", "that is everything", "thats it", "that is it",
-        "nothing else", "im done", "i am done", "were done", "we are done",
-        "go away", "dismissed",
+        "stop", "stop listening", "go to sleep", "go to bed", "go away",
+        "dismissed", "that is all", "thats all", "that is it", "thats it",
+        "im done", "i am done", "were done", "we are done", "nothing else",
     }
 )
-
-
+# Farewell / "we're finished" phrasing anywhere in the utterance.
+_USER_FAREWELL = re.compile(
+    r"\b(goodbye|good ?night|see you|see ya|were good|we are good|were done|"
+    r"we are done|were finished|im off|that(s| is) (all|it|everything))\b"
+)
+# "no … <specific done-phrase>" — a decline of further help. Uses specific
+# phrases (never bare 'good') so "no, that's a good idea" is NOT a sign-off.
+_DECLINE_CLOSER = re.compile(
+    r"^(no|nope|nah)\b.*\b(thanks|thank you|cheers|im good|im fine|im done|"
+    r"im all set|im set|all good|all set|all done|good thanks|fine thanks|"
+    r"great thanks|were good|were done|thats all|thats it|thats fine|"
+    r"thats everything|nothing else)\b"
+)
 _SIGNOFF_LEAD = re.compile(
     r"^(no|nope|nah|yeah|yep|yes|ok|okay|alright|right|well|so|um|uh|cool|great|"
     r"thanks|thank you|cheers|jarvis)\s+"
@@ -106,20 +122,44 @@ _SIGNOFF_LEAD = re.compile(
 _SIGNOFF_TRAIL = re.compile(
     r"\s+(please|thanks|thank you|cheers|now|then|mate|jarvis|ok|okay|here)$"
 )
+# Jarvis's OWN reply is a goodbye → end even if it forgot the [[END]] marker.
+_REPLY_FAREWELL = re.compile(
+    r"\b(goodbye|good ?night|see you|see ya|sleep well|take care|farewell|"
+    r"talk soon|bye)\b",
+    re.IGNORECASE,
+)
+_REPLY_CONTINUE = re.compile(
+    r"\?|anything else|let me know|give me a shout|what else|tell me|how about|"
+    r"shall i|would you like|need anything",
+    re.IGNORECASE,
+)
+
+
+def _norm(text: str) -> str:
+    t = text.lower().replace("'", "")
+    t = re.sub(r"[^\w\s]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
 
 
 def _is_clear_signoff(text: str) -> bool:
-    """True only for an unambiguous goodbye, after stripping filler words."""
-    t = text.lower().replace("'", "")
-    t = re.sub(r"[^\w\s]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    # Peel leading/trailing fillers so "no, that's all, thanks" -> "thats all".
+    """True only for an unambiguous goodbye / decline of further help."""
+    base = _norm(text)
+    if _REQUEST_CUE.search(base):
+        return False
+    if _USER_FAREWELL.search(base) or _DECLINE_CLOSER.search(base):
+        return True
+    t = base
     while True:
         stripped = _SIGNOFF_TRAIL.sub("", _SIGNOFF_LEAD.sub("", t))
         if stripped == t:
             break
         t = stripped
     return t in _CLEAR_SIGNOFFS
+
+
+def _is_reply_farewell(reply: str) -> bool:
+    """True if Jarvis's reply is a goodbye with no continuation cue."""
+    return bool(_REPLY_FAREWELL.search(reply)) and not _REPLY_CONTINUE.search(reply)
 
 
 class State(enum.Enum):
@@ -274,7 +314,9 @@ class TurnLoop:
             # End-of-conversation: the model's [[END]] marker (detect + strip so
             # it's never spoken/stored) OR a deterministic unmistakable sign-off.
             ended = self._cfg.vad.conversation_mode and (
-                bool(_END_RE.search(reply or "")) or _is_clear_signoff(text)
+                bool(_END_RE.search(reply or ""))
+                or _is_clear_signoff(text)
+                or _is_reply_farewell(reply or "")
             )
             if _END_RE.search(reply or ""):
                 reply = _END_RE.sub(" ", reply).strip()
