@@ -20,11 +20,17 @@ auth=(-H "Authorization: Bearer ${MASTER}" -H "Content-Type: application/json")
 
 echo "Provisioning LiteLLM attribution at ${BASE} …"
 
-# 1) Household team (get-or-create by alias). /team/list is a GET → bare list.
-curl -s -X POST "${BASE}/team/new" "${auth[@]}" \
-  -d '{"team_alias":"jarvis"}' >/dev/null 2>&1 || true
-TID=$(curl -s "${BASE}/team/list" "${auth[@]}" 2>/dev/null \
-  | python3 -c "import sys,json;rows=json.load(sys.stdin);rows=rows if isinstance(rows,list) else rows.get('teams',[]);print(next((t['team_id'] for t in rows if t.get('team_alias')=='jarvis'),''))")
+# 1) Household team — GET-OR-CREATE. /team/new is NOT idempotent (it makes a
+# new team every call), so look it up first and only create if missing.
+team_id_by_alias() {  # /team/list is a GET returning a bare list
+  curl -s "${BASE}/team/list" "${auth[@]}" 2>/dev/null \
+    | python3 -c "import sys,json;rows=json.load(sys.stdin);rows=rows if isinstance(rows,list) else rows.get('teams',[]);ids=[t['team_id'] for t in rows if t.get('team_alias')=='jarvis'];print(ids[0] if ids else '')"
+}
+TID=$(team_id_by_alias)
+if [ -z "${TID}" ]; then
+  curl -s -X POST "${BASE}/team/new" "${auth[@]}" -d '{"team_alias":"jarvis"}' >/dev/null 2>&1 || true
+  TID=$(team_id_by_alias)
+fi
 if [ -z "${TID}" ]; then echo "  ERROR: could not resolve team 'jarvis'"; exit 1; fi
 echo "  team jarvis -> ${TID}"
 
