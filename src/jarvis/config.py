@@ -185,6 +185,15 @@ class AudioConfig(_Base):
     ack_phrase: str = "Yes?"
 
 
+class PersonaConfig(_Base):
+    """Soul (static personality) + short-term conversation context."""
+
+    model_config = SettingsConfigDict(env_prefix="PERSONA_", env_file=".env", extra="ignore")
+
+    soul_path: str = "SOUL.md"      # personality layer injected into the prompt
+    history_messages: int = 16      # rolling shared context window (user+assistant)
+
+
 class TraceConfig(_Base):
     """Per-turn pipeline tracing (STT/LLM/TTS/memory timings)."""
 
@@ -207,6 +216,7 @@ class Config:
         self.vad = VADConfig()
         self.wake = WakeConfig()
         self.audio = AudioConfig()
+        self.persona = PersonaConfig()
         self.trace = TraceConfig()
 
     def resolved(self) -> dict:
@@ -249,6 +259,8 @@ class Config:
             "audio.sample_rate": self.audio.sample_rate,
             "audio.frame_ms": self.audio.frame_ms,
             "audio.ack_mode": self.audio.ack_mode,
+            "persona.soul_path": self.persona.soul_path,
+            "persona.history_messages": self.persona.history_messages,
             "trace.enabled": self.trace.enabled,
             "trace.path": self.trace.path,
         }

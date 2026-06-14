@@ -39,10 +39,11 @@ from jarvis.wake import WakeWord
 
 FRAME_SAMPLES = 512
 
-_VOICE_SYSTEM_PROMPT = (
-    "You are Jarvis, a concise spoken voice assistant. Answer in one or two "
-    "short sentences meant to be read aloud. Use plain text only — no markdown, "
-    "lists, code blocks, or emoji."
+# Technical format layer (always present). Personality comes from the soul
+# (SOUL.md); what Jarvis knows about the user comes from memory.
+_VOICE_FORMAT = (
+    "Reply for the ear: one or two short sentences, plain text only — no "
+    "markdown, lists, code blocks, or emoji."
 )
 
 
@@ -79,6 +80,8 @@ class TurnLoop:
         self._tracer = tracer
         self._sr = cfg.audio.sample_rate
         self._cold_tasks: set[asyncio.Task] = set()
+        self._soul = ""  # personality (SOUL.md), loaded at start
+        self._history: list[dict] = []  # rolling shared conversation context
         self.state = State.PASSIVE
 
     # --- blocking frame loops (run via to_thread) --------------------------
@@ -118,8 +121,17 @@ class TurnLoop:
                 return ep.audio
 
     # --- the loop ----------------------------------------------------------
+    def _load_soul(self) -> None:
+        import pathlib
+
+        path = pathlib.Path(self._cfg.persona.soul_path)
+        if path.exists():
+            self._soul = path.read_text(encoding="utf-8").strip()
+            print(f"Soul loaded from {path} ({len(self._soul)} chars).")
+
     async def run(self) -> None:
         print("Loading models…")
+        self._load_soul()
         self._stt.load()
         self._vad.load()
         self._wake.load()
@@ -176,26 +188,21 @@ class TurnLoop:
                 if len(text) > 120
                 else self._cfg.gateway.fast_model
             )
-            system = _VOICE_SYSTEM_PROMPT
             memory = self._memory.read_cached_representation()
-            if memory:
-                system += (
-                    "\n\nWhat you already know about the user (use it naturally "
-                    f"only if relevant; do not recite it):\n{memory}"
-                )
+            messages = [
+                {"role": "system", "content": self._system_prompt(memory)},
+                *self._history,  # shared context: the conversation so far
+                {"role": "user", "content": text},
+            ]
             trace.start("llm")
-            reply = await self._gateway.complete(
-                [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": text},
-                ],
-                model=model,
-            )
+            reply = await self._gateway.complete(messages, model=model)
             trace.end("llm", model=model, chars=len(reply or ""), memory=bool(memory))
             print(f"  jarvis [{model}]: {reply}")
             if not reply:
                 self._tracer.emit(trace)
                 return
+            # One continuous conversation: remember the exchange for next turn.
+            self._remember(text, reply)
 
             # COLD path: fire-and-forget BEFORE speaking so the memory write +
             # background reasoning + cache refresh happen while Jarvis talks —
@@ -229,6 +236,27 @@ class TurnLoop:
             )
             if not pcm:
                 return  # conversation went idle → PASSIVE (wake word required)
+
+    def _system_prompt(self, memory: str) -> str:
+        """Soul (who Jarvis is) + format + memory (what he knows about you)."""
+        parts = []
+        if self._soul:
+            parts.append(self._soul)
+        parts.append(_VOICE_FORMAT)
+        if memory:
+            parts.append(
+                "What you already know about the user (use it naturally only if "
+                f"relevant; do not recite it):\n{memory}"
+            )
+        return "\n\n".join(parts)
+
+    def _remember(self, user_text: str, assistant_text: str) -> None:
+        """Append the exchange to the rolling shared-context window."""
+        self._history.append({"role": "user", "content": user_text})
+        self._history.append({"role": "assistant", "content": assistant_text})
+        limit = max(0, self._cfg.persona.history_messages)
+        if len(self._history) > limit:
+            self._history = self._history[-limit:]
 
     def _fire_cold_path(self, user_text: str, assistant_text: str) -> None:
         """Detached background task — never awaited on the hot path."""
