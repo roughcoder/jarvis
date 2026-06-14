@@ -222,6 +222,24 @@ class TraceConfig(_Base):
     console: bool = True                # also print a compact per-turn summary
 
 
+class CapabilityConfig(_Base):
+    """Identity + capability resolution (Phase 3 §4/§5). Deny-by-default: with no
+    profile file and no default, the device is granted nothing."""
+
+    model_config = SettingsConfigDict(env_prefix="CAPS_", env_file=".env", extra="ignore")
+
+    # Which device this process is (the intercom/host identity). Picks the
+    # profile file and, in W4, what the brain pairs it as.
+    device_id: str = "local-mac"
+    # Single-principal defaults for Phase 3a; per-utterance in 3b+.
+    identity: str = "house"
+    scope: str = "house"  # house | personal
+    # profiles/<device_id>.md front-matter lists granted capabilities.
+    profiles_dir: str = "jarvis-workspace/profiles"
+    # CSV fallback used only when no profile file exists for this device.
+    default_capabilities: str = ""
+
+
 class Config:
     """Aggregate config. Construct once and pass modules their slice."""
 
@@ -236,6 +254,7 @@ class Config:
         self.audio = AudioConfig()
         self.persona = PersonaConfig()
         self.trace = TraceConfig()
+        self.capabilities = CapabilityConfig()
 
     def resolved(self) -> dict:
         """Flat, secret-masked view for the dry-run printout (Step 0 gate)."""
@@ -281,6 +300,13 @@ class Config:
             "persona.history_messages": self.persona.history_messages,
             "trace.enabled": self.trace.enabled,
             "trace.path": self.trace.path,
+            "capabilities.device_id": self.capabilities.device_id,
+            "capabilities.identity": self.capabilities.identity,
+            "capabilities.scope": self.capabilities.scope,
+            "capabilities.profiles_dir": self.capabilities.profiles_dir,
+            "capabilities.default_capabilities": (
+                self.capabilities.default_capabilities or "<none — deny-by-default>"
+            ),
         }
 
 

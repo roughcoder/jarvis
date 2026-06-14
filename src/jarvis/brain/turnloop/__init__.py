@@ -29,6 +29,7 @@ import time
 from collections.abc import AsyncIterator
 
 from jarvis.intercom.audio import AudioIO, MicStream
+from jarvis.brain.capabilities import build_request_context
 from jarvis.config import Config
 from jarvis.brain.gateway_client import GatewayClient
 from jarvis.brain.memory_client import MemoryClient
@@ -253,6 +254,10 @@ class TurnLoop:
         self._cold_tasks: set[asyncio.Task] = set()
         self._soul = ""  # personality (SOUL.md), loaded at start
         self._history: list[dict] = []  # rolling shared conversation context
+        # Per-request identity/capability envelope (Phase 3 §4). Single-principal
+        # in 3a (built once from config); W3 gates tool dispatch on it, and the
+        # W4 brain server builds one per connection instead.
+        self._ctx = build_request_context(cfg.capabilities)
         self.state = State.PASSIVE
 
     # --- blocking frame loops (run via to_thread) --------------------------
