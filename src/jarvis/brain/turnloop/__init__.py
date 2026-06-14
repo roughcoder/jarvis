@@ -305,5 +305,10 @@ class TurnLoop:
                 await asyncio.sleep(0.02)
         finally:
             stop_monitor.set()
-            await asyncio.gather(play_task, mon_task, return_exceptions=True)
+            results = await asyncio.gather(play_task, mon_task, return_exceptions=True)
+            # Surface a real failure in the reply generator (LLM/tool/TTS) instead
+            # of swallowing it into a silent empty turn.
+            for r in results:
+                if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
+                    print(f"  [turn error] {r!r}")
         return interrupted.is_set()

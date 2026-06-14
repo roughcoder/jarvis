@@ -1,0 +1,110 @@
+"""BrainSession tool loop — the path that silently broke once (Phase 3 W3/W4).
+
+Drives _run_tool_loop with a scripted fake gateway (no network): the model asks
+for a tool, the (real, local) files tool runs, the model then answers. Guards:
+- the final answer lands in result.raw,
+- the tool actually executed,
+- a tool-search earcon is emitted into the audio stream,
+- the per-turn trace records a `tool` event (the exact call that raised
+  TypeError: event() got multiple values for 'name' and ate the whole turn).
+"""
+
+from __future__ import annotations
+
+import asyncio
+
+from jarvis.brain.context import RequestContext
+from jarvis.brain.session import BrainSession, TurnResult
+from jarvis.brain.tracing import TurnTrace
+from jarvis.config import ToolsConfig, load_config
+from jarvis.tools import build_registry
+
+
+class _FakeFn:
+    def __init__(self, name: str, arguments: str) -> None:
+        self.name = name
+        self.arguments = arguments
+
+
+class _FakeToolCall:
+    def __init__(self, id: str, name: str, arguments: str) -> None:
+        self.id = id
+        self.function = _FakeFn(name, arguments)
+
+
+class _FakeMsg:
+    def __init__(self, content=None, tool_calls=None) -> None:  # noqa: ANN001
+        self.content = content
+        self.tool_calls = tool_calls
+
+
+class _FakeGateway:
+    """Returns scripted assistant messages, one per complete_with_tools call."""
+
+    def __init__(self, scripted: list[_FakeMsg]) -> None:
+        self._scripted = scripted
+        self.calls = 0
+
+    async def complete_with_tools(self, messages, *, model=None, tools=None):  # noqa: ANN001
+        msg = self._scripted[self.calls]
+        self.calls += 1
+        return msg
+
+
+def _session(tmp_path, gateway) -> BrainSession:  # noqa: ANN001
+    cfg = load_config()
+    ctx = RequestContext(
+        "dev", "house", "house", frozenset({"files.read", "files.write"})
+    )
+    registry = build_registry(ToolsConfig(_env_file=None, files_root=str(tmp_path)))
+    return BrainSession(
+        cfg, ctx, gateway=gateway, tts=None, memory=None, tracer=None, registry=registry
+    )
+
+
+def _run(session: BrainSession, trace: TurnTrace, result: TurnResult) -> list[bytes]:
+    schemas = [t.openai_schema() for t in session._registry.available_for(session._ctx)]
+    chunks: list[bytes] = []
+
+    async def go() -> None:
+        async for pcm in session._run_tool_loop(
+            [{"role": "user", "content": "save a note"}], "fast", trace, schemas, result
+        ):
+            chunks.append(pcm)
+
+    asyncio.run(go())
+    return chunks
+
+
+def test_tool_loop_executes_then_answers(tmp_path) -> None:
+    gateway = _FakeGateway([
+        _FakeMsg(tool_calls=[
+            _FakeToolCall("c1", "write_file", '{"path": "note.md", "content": "buy milk"}')
+        ]),
+        _FakeMsg(content="Saved your note."),
+    ])
+    session = _session(tmp_path, gateway)
+    trace = TurnTrace(room="x", speaker="house")
+    result = TurnResult()
+
+    chunks = _run(session, trace, result)
+
+    assert result.raw == "Saved your note."
+    assert (tmp_path / "note.md").read_text() == "buy milk"  # tool really ran
+    assert chunks and isinstance(chunks[0], bytes) and chunks[0]  # earcon emitted
+    # the regression: this trace event used to raise and kill the turn
+    assert {"name": "tool", "tool": "write_file"} in trace.data["events"]
+    assert "llm" in trace.data["stages"]
+
+
+def test_no_tool_call_sets_reply_without_earcon(tmp_path) -> None:
+    gateway = _FakeGateway([_FakeMsg(content="Two plus two is four.")])
+    session = _session(tmp_path, gateway)
+    trace = TurnTrace(room="x", speaker="house")
+    result = TurnResult()
+
+    chunks = _run(session, trace, result)
+
+    assert result.raw == "Two plus two is four."
+    assert chunks == []  # no tool fired => no earcon
+    assert trace.data["events"] == []

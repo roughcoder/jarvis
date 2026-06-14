@@ -40,6 +40,20 @@ from jarvis.services.tts import InworldTTS
 from jarvis.tools.base import ToolRegistry
 
 
+def _make_earcon(sample_rate: int, *, freq: float = 880.0, ms: int = 160) -> bytes:
+    """A short, faded sine beep as 16-bit PCM at the playback rate — the audible
+    "looking that up" cue played before a tool runs."""
+    import numpy as np
+
+    t = np.linspace(0, ms / 1000, int(sample_rate * ms / 1000), False)
+    tone = 0.2 * np.sin(2 * np.pi * freq * t)
+    fade = max(1, int(sample_rate * 0.01))  # 10ms fades kill clicks
+    env = np.ones_like(tone)
+    env[:fade] = np.linspace(0, 1, fade)
+    env[-fade:] = np.linspace(1, 0, fade)
+    return (tone * env * 32767).astype(np.int16).tobytes()
+
+
 @dataclass
 class TurnResult:
     raw: str = ""  # reply incl. any [[END]] marker (may be partial on barge-in)
@@ -69,6 +83,7 @@ class BrainSession:
         self._soul = ""  # personality (SOUL.md), loaded at start
         self._history: list[dict] = []  # rolling shared conversation context
         self._cold_tasks: set[asyncio.Task] = set()
+        self._earcon_pcm: bytes | None = None  # cached tool-search tone
 
     def load_soul(self) -> None:
         path = pathlib.Path(self._cfg.persona.soul_path)
@@ -98,12 +113,13 @@ class BrainSession:
         tool_schemas = [t.openai_schema() for t in self._registry.available_for(self._ctx)]
 
         if tool_schemas:
-            # Tool turn: run the (non-streaming) tool loop to a final answer, then
-            # speak it. Casual no-tool setups never enter this branch, so their
+            # Tool turn: run the tool loop (which yields a short "looking that up"
+            # earcon into the audio stream when a tool fires), then speak the final
+            # answer. Casual no-tool setups never enter this branch, so their
             # streaming TTFT is unchanged.
-            raw = await self._run_tool_loop(messages, model, trace, tool_schemas)
-            result.raw = raw
-            async for pcm in self._tts_source(_END_RE.sub(" ", raw or "").strip(), trace):
+            async for pcm in self._run_tool_loop(messages, model, trace, tool_schemas, result):
+                yield pcm
+            async for pcm in self._tts_source(_END_RE.sub(" ", result.raw or "").strip(), trace):
                 yield pcm
         elif self._cfg.gateway.stream:
             async for pcm in self._stream_speech(messages, model, trace, result):
@@ -149,11 +165,12 @@ class BrainSession:
             )
         return "\n\n".join(parts)
 
-    async def _run_tool_loop(self, messages, model, trace, tool_schemas) -> str:  # noqa: ANN001
+    async def _run_tool_loop(self, messages, model, trace, tool_schemas, result):  # noqa: ANN001
         """Tool-aware completion: let the model call gated tools, feed results
-        back, repeat until it answers. Each tool is capability-checked and
-        hard-timeout-bounded; a tool error is fed back rather than breaking the
-        turn."""
+        back, repeat until it answers. Sets `result.raw` to the final text and
+        yields a short earcon (a "looking that up" cue) into the audio stream when
+        a tool fires. Each tool is capability-checked and hard-timeout-bounded; a
+        tool error is fed back rather than breaking the turn."""
         t0 = time.perf_counter()
         n_tools = 0
         for _ in range(max(1, self._cfg.tools.max_rounds)):
@@ -161,15 +178,9 @@ class BrainSession:
                 messages, model=model, tools=tool_schemas
             )
             if not msg.tool_calls:
-                if trace is not None:
-                    trace.stage(
-                        "llm",
-                        (time.perf_counter() - t0) * 1000,
-                        model=model,
-                        chars=len(msg.content or ""),
-                        tools=n_tools,
-                    )
-                return msg.content or ""
+                result.raw = msg.content or ""
+                self._record_llm(trace, t0, model, result.raw, n_tools)
+                return
             messages.append({
                 "role": "assistant",
                 "content": msg.content or "",
@@ -182,31 +193,42 @@ class BrainSession:
                     for tc in msg.tool_calls
                 ],
             })
+            yield self._earcon()  # audible "looking that up" cue, before tools run
             for tc in msg.tool_calls:
                 n_tools += 1
                 try:
                     args = json.loads(tc.function.arguments or "{}")
-                    result = await self._registry.execute(
+                    tool_result = await self._registry.execute(
                         self._ctx, tc.function.name, args, timeout_s=self._cfg.tools.timeout_s
                     )
                 except Exception as exc:  # noqa: BLE001 - tools must never break a turn
-                    result = f"error: {exc}"
+                    tool_result = f"error: {exc}"
                 if trace is not None:
-                    trace.event("tool", name=tc.function.name)
+                    trace.event("tool", tool=tc.function.name)
                 messages.append(
-                    {"role": "tool", "tool_call_id": tc.id, "content": result}
+                    {"role": "tool", "tool_call_id": tc.id, "content": tool_result}
                 )
         # Out of tool rounds — force a final answer with no further tool calls.
         msg = await self._gateway.complete_with_tools(messages, model=model, tools=None)
+        result.raw = msg.content or ""
+        self._record_llm(trace, t0, model, result.raw, n_tools)
+
+    @staticmethod
+    def _record_llm(trace, t0: float, model: str, content: str, n_tools: int) -> None:  # noqa: ANN001
         if trace is not None:
             trace.stage(
                 "llm",
                 (time.perf_counter() - t0) * 1000,
                 model=model,
-                chars=len(msg.content or ""),
+                chars=len(content),
                 tools=n_tools,
             )
-        return msg.content or ""
+
+    def _earcon(self) -> bytes:
+        """A short tone played before a tool runs (cached at the TTS rate)."""
+        if self._earcon_pcm is None:
+            self._earcon_pcm = _make_earcon(self._cfg.tts.sample_rate)
+        return self._earcon_pcm
 
     def _remember(self, user_text: str, assistant_text: str) -> None:
         """Append the exchange to the rolling shared-context window."""

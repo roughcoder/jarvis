@@ -204,7 +204,10 @@ class IntercomClient:
                 await asyncio.sleep(0.02)
         finally:
             stop_monitor.set()
-            await asyncio.gather(play_task, mon_task, return_exceptions=True)
+            results = await asyncio.gather(play_task, mon_task, return_exceptions=True)
+            for r in results:
+                if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
+                    print(f"  [reply error] {r!r}")
         return interrupted.is_set()
 
     # --- local capture (parallel to TurnLoop) ------------------------------
