@@ -157,21 +157,23 @@ filesystem. A tool with no granted capability does not run, single-principal or 
 
 **Atomic tools (hand-built, few):**
 
-| Tool | Source | Lane | Runs on |
-|---|---|---|---|
-| `web-search` | **build** (Brave/Tavily/Exa) | cloud | brain |
-| `files` | fs-safe pattern (root-bounded) | local | device/worker |
-| `google` | gogcli — Jarvis's own Gmail + Calendar | cloud | brain |
+| Tool | Source | Status |
+|---|---|---|
+| `web-search` | Tavily wrapper (provider-configurable) | ✅ built |
+| `files` | fs-safe pattern (root-bounded read/list/write) | ✅ built |
+| `worker.*` | coding/shell/screenshot dispatch → worker daemon (§8) | ✅ built |
+| `remote.*` | cloud coding → Claude Managed Agents (§8) | ✅ built, dormant |
+| `google` | gogcli — Jarvis's own Gmail + Calendar | ⏸ deferred (OAuth) |
 
-**MCP bridge (v1 core, disciplined):** a native MCP client + a profile-gated
-**work bundle** (Granola, Notion, Slack, Linear). Connections are keyed by
-`(user, service)`. The profile is the firewall against sprawl — each profile
-sees only its slice, so "lots of MCPs" never becomes "400 tools every turn".
-**Timeout every call.** Consume fast lookups inline (hot); push heavy multi-MCP
-synthesis to skills/heartbeat (cold).
+**MCP bridge (the next build, not yet built):** a native MCP client + a
+profile-gated **work bundle** (gh, Granola, Notion, Slack, Linear). Connections
+keyed by `(user, service)`. The profile is the firewall against sprawl — each
+profile sees only its slice, so "lots of MCPs" never becomes "400 tools every
+turn". **Timeout every call.** Fast lookups inline (hot); heavy multi-MCP
+synthesis to skills/heartbeat (cold). This is where "install the gh MCP" happens.
 
-**Lanes (decided, build alongside):** WhatsApp channel + heartbeat · `code-dispatch`
-(§9) · `mac-control` (peekaboo/AXorcist via the worker daemon).
+**Lanes:** coding deep-work via the worker daemon (§8, ✅ built) · WhatsApp
+channel + heartbeat (⬜ 3b) · `mac-control` (peekaboo/AXorcist, ⏸ deferred).
 
 **Not building now:** the ~40 OpenClaw project-internal tools; the crawler
 family (a maybe-someday memory feature); spogo/goplaces/clawpdf/rastermill/
@@ -197,25 +199,48 @@ summarise → speak / drop a note via `files`. No new tool.
 - **Storage:** a `SKILLS.md` index + `skills/*.md` bodies — the same one-line
   index pattern Jarvis already uses for `MEMORY.md`.
 
-## 8. Dispatch lanes (deep work)
+## 8. Coding lanes (deep work) — as built
 
-Two distinct lanes; do not conflate them.
+Jarvis kicks off autonomous coding via the **worker daemon** (`jarvis worker`,
+Phase 3c): a standalone HTTP service the brain dispatches to (boundary peer,
+token-authed), gated by `worker.code` / `worker.shell`. The brain tool is a thin
+HTTP client; the daemon imports nothing from the brain.
 
-**Cloud coding — vendor-agnostic dispatch.** Jarvis is a *dispatcher*: it creates
-a task and hands you a session URL to watch/steer in the vendor's app.
-- **Start with Claude Code on the web** — it has the real HTTP API today
-  (Sessions API `POST /v1/sessions`; **Routines**, each a saved prompt+repos+
-  connectors bundle with its own bearer-token `/fire` endpoint returning a live
-  session URL). Routines *are* the "small reusable feature" model.
-- **Codex is pluggable behind the same interface** (via `codex exec` / app-server
-  now; its cloud task API when it ships). You like watching agents in the Codex
-  app — keep that as an alternative backend, not the starting point.
-- The `code-dispatch` tool is one stateless HTTP call → returns a URL → Jarvis
-  WhatsApps it to you. A perfect boundary-everywhere citizen.
+**Local — the default (built).** The worker runs a coding agent headless on the
+worker Mac: **Codex** (`codex exec`) or **Claude** (`claude -p`), chosen per job.
+- Repo jobs run on an **isolated git worktree + branch** (`jarvis/<name>-<id>`),
+  never your checkout — you review the branch and merge. No-repo jobs get their
+  own `runs/<name>-<id>/` scratch dir.
+- Repos are **named, not pathed** (`WORKER_REPO_ROOT`); an unknown name is cloned
+  with `gh`. Jobs are **named, persisted to disk** (`<workspace>/jobs/`), and
+  checkable / listable / cleanable by name (`jarvis jobs`, or by voice), each
+  linked to the agent's session (`codex resume <id>`).
+- **Cost + visibility (why it's the default):** both CLIs run on your *existing
+  Codex/Claude subscriptions*, and results are visible through Jarvis (the jobs
+  list, the worktree branch, `codex resume`). Subscription-billed and
+  Jarvis-visible.
 
-**Local machine control — the worker daemon.** peekaboo + AXorcist on a
-dedicated Mac, behind a dispatch API. The cloud can't touch a real Mac's GUI;
-this is the genuine "its own Mac." Approvals route back over a channel.
+**Remote (cloud) — built but dormant.** `start_remote_coding_job` (gated
+`remote.code`) dispatches to **Claude Managed Agents** (`POST /v1/sessions`;
+`jarvis remote-setup` creates the agent + environment). It works, but a hard
+three-way trade-off surfaced — you can have any *two* of {Jarvis-triggered,
+subscription-billed, app-visible}, not all three:
+
+| Path | Jarvis-triggered | Billing | Visible in Claude app |
+|---|---|---|---|
+| **Managed Agents** (built) | ✅ clean API | pay-as-you-go | ❌ console only |
+| **Claude Code on the web** | ❌ app-launched | subscription | ✅ |
+| **Local worker** (default) | ✅ | subscription | ✅ via `jarvis jobs` |
+
+So the remote lane stays **off** (no `ANTHROPIC_AGENT_ID`) — it's API-cost +
+console-only, a worse deal than local for everyday use. Keep it for *programmatic
+cloud* only; flip one config value if Anthropic ships a subscription-billed
+Sessions API.
+
+**Local machine control (deferred).** `shell` / `applescript` / `screenshot`
+already work (macOS built-ins). Rich GUI automation (peekaboo + AXorcist) needs a
+`brew install` + Screen-Recording/Accessibility permissions — the action pattern
+is ready for it.
 
 ## 9. Session, caching & hygiene
 
@@ -327,30 +352,29 @@ against; the two hard constraints become **assertions** (hot read works at a
 dead boundary; the hot path never awaits the network). Always write the test
 before moving the code — characterise, restructure, prove the cleave held.
 
-## 12. Build order
-
-Each step is small and independently useful; the full system emerges. Never hold
-all of it in your head at once.
+## 12. Build status
 
 **Enforcement before capability** — the privacy/capability wall is built *before*
 any tool that can touch an account or the filesystem, even while there's only one
 user. The identity stack is not deferred to 3d; only its *multiplicity* is.
 
-1. **3a — Brain-as-server + the capability spine, _then_ the tools.** First a
-   minimal `RequestContext` (who / where / scope — single-principal to start) and
-   a **deny-by-default capability gate**: no tool runs without an explicit grant.
-   *Only then* add `web-search`, `files`, `google`, each registered against a
-   required capability. One user, one device, house principal — but the gate
-   exists from the first capability-bearing tool, so nothing predates the wall.
-2. **3b — WhatsApp connector + heartbeat.** A real second channel → the first
-   exercise of the know-or-ask identity rule and per-user credential resolution.
-3. **3c — Worker Mac daemon + `code-dispatch`.** Jarvis gets hands.
-4. **3d — Room Pi + per-device profiles + a second user (Jules).** Multi-device,
-   multi-person — the resolution stack now *fully populated* (enforcement built in
-   3a; the multiplicity of profiles, users, and credentials added here).
-
-The MCP **work bundle** slots into 3a/3b as your real work stack comes online,
-gated to your work profile.
+- ✅ **3a — Brain-as-server + capability spine + tools.** WebSocket brain server +
+  thin intercom (`jarvis brain` / `jarvis run`, plus `--local`), a deny-by-default
+  capability gate + `RequestContext`, and the atomic tools `web-search` + `files`.
+  The gate exists from the first capability-bearing tool — nothing predates the wall.
+- ✅ **3c — Worker daemon (built ahead of 3b).** Local codex/claude coding jobs
+  with git-worktree isolation, repo resolve-or-clone, on-disk persistence, names,
+  cleanup (§8); plus the remote Managed-Agents lane (built, dormant). `jarvis
+  worker` / `jarvis jobs` / `jarvis remote-setup`.
+- ⬜ **MCP bridge — the next build.** Plug gh / Granola / Notion / Slack in as
+  capability-gated tools (the work bundle). Promoted from "v1 escape hatch" — it's
+  the next transformative step.
+- ⬜ **3b — WhatsApp connector + heartbeat.** A real second channel + proactive
+  push; first exercise of know-or-ask + per-user credentials. Needs WhatsApp +
+  Google account setup.
+- ⬜ **3d — Room Pi + per-device profiles + a second user (Jules).** Multi-device,
+  multi-person — the resolution stack fully populated.
+- ⏸ **`google` tool (gogcli / Gmail+Calendar)** deferred pending its OAuth setup.
 
 ## 13. Invariants to keep true
 

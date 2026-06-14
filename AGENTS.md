@@ -39,23 +39,26 @@ src/jarvis/
   cli.py               entry point: jarvis <command>
   intercom/            the thin edge (wake, capture, playback) — runs on each device
     audio/             always-open mic (MicStream) + streaming player (hard-stop barge-in)
-    vad/               Silero VAD + Endpointer (endpointing AND barge-in, one instance)
-    wake/              wake word: openWakeWord (default) or Porcupine, same interface
-  services/            speech<->text services (in-process under the brain for 3a)
-    stt/               local Faster-Whisper transcription
-    tts/               Inworld streaming TTS -> raw PCM
+    vad/  wake/        Silero VAD + Endpointer; wake word (openWakeWord/Porcupine)
+  services/            stt/ (Faster-Whisper) + tts/ (Inworld) — in-process under the brain for 3a
   brain/               orchestration tier
-    gateway_client/    HTTP -> LiteLLM proxy (OpenAI-compatible); per-turn model routing
-    memory_client/     Honcho /v2 REST over httpx; hot=local cache, cold=write+refresh
-    tracing/           per-turn pipeline traces (STT/LLM/TTS/memory timings)
-    turnloop/          the 5-state machine: PASSIVE→ACTIVE→THINKING→SPEAKING→(INTERRUPTED)
+    server.py          WebSocket brain server (intercoms connect here)
+    turnloop/          single-process loop (jarvis run --local); 5-state machine
+    session.py         BrainSession — shared think/speak core (prompt, tools, end-detect)
+    dialog.py          pure text helpers (prompt fragments, end-detection, segmentation)
+    context.py / capabilities.py   RequestContext + deny-by-default capability gate (§4)
+    gateway_client/    HTTP -> LiteLLM proxy; memory_client/ Honcho; tracing/
   protocol/            brain<->intercom WebSocket message schemas (Phase 3 W4)
-  tools/               capability-gated actions the brain can invoke (Phase 3 W3)
+  tools/               capability-gated tools: web_search, files, worker, remote (+ base/registry)
+  worker/              standalone deep-work daemon (jarvis worker) — codex/claude, worktrees, jobs
+  remote/              Claude Managed Agents client (cloud coding lane, dormant)
 ```
 
-Keep the turn loop, audio I/O, memory client, and gateway client as **separate
-modules with config-driven URLs** — this is what makes the tiers independently
-movable (Phase 2 relocation; Phase 3 brain/intercom split).
+Keep the turn loop, audio I/O, memory/gateway clients, the worker, and the remote
+client as **separate modules with config-driven URLs / boundary peers** — this is
+what makes the tiers independently movable (Phase 2 relocation; Phase 3
+brain/intercom split; the worker & remote talk over HTTP, importing nothing from
+the brain).
 
 ### Services (docker-compose.yml)
 
@@ -94,6 +97,9 @@ Secrets to put in `.env` (gitignored): `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
 | `jarvis chat [--manual] [--rounds N]` | push-to-talk / VAD round-trip |
 | `jarvis brain` | run the brain WebSocket server (Phase 3 W4) |
 | `jarvis run [--no-bargein] [--local] [--brain H:P]` | hands-free loop: thin intercom → brain (`--local` = one process) |
+| `jarvis worker` | run the deep-work daemon (codex/claude coding jobs, shell, screenshot — Phase 3c) |
+| `jarvis jobs [-n N] [--prune]` | list worker jobs (name, status, branch, `codex resume`); `--prune` cleans finished |
+| `jarvis remote-setup` | one-time: create the cloud agent + environment for the (dormant) remote lane |
 | `jarvis traces [-n N]` | view per-turn pipeline timings |
 
 Phase 3 (see `docs/PHASE3.md`) split the loop into a **brain server** + thin
