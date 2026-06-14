@@ -97,31 +97,57 @@ def test_tool_loop_executes_then_answers(tmp_path) -> None:
     assert "llm" in trace.data["stages"]
 
 
-def test_announced_tool_emits_earcon(tmp_path) -> None:
+def _announced_registry(handler):  # noqa: ANN001
     from jarvis.tools.base import Tool, ToolRegistry
-
-    async def handler(ctx, args):  # noqa: ANN001
-        return "looked up"
 
     reg = ToolRegistry()
     reg.register(
         Tool("lookup", "desc", {"type": "object", "properties": {}}, "web.search", handler, announce=True)
     )
+    return reg
+
+
+def test_announced_tool_emits_heartbeat(tmp_path) -> None:
+    async def handler(ctx, args):  # noqa: ANN001
+        return "looked up"
+
     gateway = _FakeGateway([
         _FakeMsg(tool_calls=[_FakeToolCall("c1", "lookup", "{}")]),
         _FakeMsg(content="Here you go."),
     ])
     ctx = RequestContext("dev", "house", "house", frozenset({"web.search"}))
     session = BrainSession(
-        load_config(), ctx, gateway=gateway, tts=None, memory=None, tracer=None, registry=reg
+        load_config(), ctx, gateway=gateway, tts=None, memory=None, tracer=None,
+        registry=_announced_registry(handler),
     )
-    trace = TurnTrace(room="x", speaker="house")
     result = TurnResult()
-
-    chunks = _run(session, trace, result)
+    chunks = _run(session, TurnTrace(room="x", speaker="house"), result)
 
     assert result.raw == "Here you go."
-    assert chunks and chunks[0]  # announced (remote) tool => earcon emitted
+    assert chunks and chunks[0]  # announced (remote) tool => at least one pulse
+
+
+def test_slow_tool_emits_repeating_heartbeats(tmp_path) -> None:
+    async def slow(ctx, args):  # noqa: ANN001
+        await asyncio.sleep(0.12)
+        return "done searching"
+
+    gateway = _FakeGateway([
+        _FakeMsg(tool_calls=[_FakeToolCall("c1", "lookup", "{}")]),
+        _FakeMsg(content="Found it."),
+    ])
+    cfg = load_config()
+    cfg.tools.heartbeat_interval_s = 0.03  # fast cadence so the test stays quick
+    ctx = RequestContext("dev", "house", "house", frozenset({"web.search"}))
+    session = BrainSession(
+        cfg, ctx, gateway=gateway, tts=None, memory=None, tracer=None,
+        registry=_announced_registry(slow),
+    )
+    result = TurnResult()
+    chunks = _run(session, TurnTrace(room="x", speaker="house"), result)
+
+    assert result.raw == "Found it."
+    assert len(chunks) >= 2  # pulses kept coming while the tool ran
 
 
 def test_no_tool_call_sets_reply_without_earcon(tmp_path) -> None:

@@ -63,18 +63,23 @@ def _now_line(tz_name: str) -> str:
     )
 
 
-def _make_earcon(sample_rate: int, *, freq: float = 880.0, ms: int = 160) -> bytes:
-    """A short, faded sine beep as 16-bit PCM at the playback rate — the audible
-    "looking that up" cue played before a tool runs."""
+def _make_heartbeat(sample_rate: int) -> bytes:
+    """A soft 'lub-dub' as 16-bit PCM at the playback rate — the gentle pulse
+    played periodically while a slow tool (web search) runs."""
     import numpy as np
 
-    t = np.linspace(0, ms / 1000, int(sample_rate * ms / 1000), False)
-    tone = 0.2 * np.sin(2 * np.pi * freq * t)
-    fade = max(1, int(sample_rate * 0.01))  # 10ms fades kill clicks
-    env = np.ones_like(tone)
-    env[:fade] = np.linspace(0, 1, fade)
-    env[-fade:] = np.linspace(1, 0, fade)
-    return (tone * env * 32767).astype(np.int16).tobytes()
+    def thump(freq: float, ms: int, amp: float):  # noqa: ANN202
+        t = np.linspace(0, ms / 1000, int(sample_rate * ms / 1000), False)
+        tone = amp * np.sin(2 * np.pi * freq * t)
+        fade = max(1, int(sample_rate * 0.012))  # 12ms fades kill clicks
+        env = np.ones_like(tone)
+        env[:fade] = np.linspace(0, 1, fade)
+        env[-fade:] = np.linspace(1, 0, fade)
+        return tone * env
+
+    gap = np.zeros(int(sample_rate * 0.10))  # 100ms between lub and dub
+    buf = np.concatenate([thump(150, 90, 0.16), gap, thump(120, 110, 0.12)])
+    return (buf * 32767).astype(np.int16).tobytes()
 
 
 @dataclass
@@ -106,7 +111,7 @@ class BrainSession:
         self._soul = ""  # personality (SOUL.md), loaded at start
         self._history: list[dict] = []  # rolling shared conversation context
         self._cold_tasks: set[asyncio.Task] = set()
-        self._earcon_pcm: bytes | None = None  # cached tool-search tone
+        self._heartbeat_pcm: bytes | None = None  # cached tool-search pulse
 
     def load_soul(self) -> None:
         path = pathlib.Path(self._cfg.persona.soul_path)
@@ -193,10 +198,11 @@ class BrainSession:
 
     async def _run_tool_loop(self, messages, model, trace, tool_schemas, result):  # noqa: ANN001
         """Tool-aware completion: let the model call gated tools, feed results
-        back, repeat until it answers. Sets `result.raw` to the final text and
-        yields a short earcon (a "looking that up" cue) into the audio stream when
-        a tool fires. Each tool is capability-checked and hard-timeout-bounded; a
-        tool error is fed back rather than breaking the turn."""
+        back, repeat until it answers. Sets `result.raw` to the final text. While a
+        slow/announced tool runs it yields a soft heartbeat pulse into the audio
+        stream (instant local tools stay silent). Each tool is capability-checked
+        and hard-timeout-bounded; a tool error is fed back rather than breaking the
+        turn."""
         t0 = time.perf_counter()
         n_tools = 0
         for _ in range(max(1, self._cfg.tools.max_rounds)):
@@ -219,17 +225,20 @@ class BrainSession:
                     for tc in msg.tool_calls
                 ],
             })
-            if self._should_announce(msg.tool_calls):
-                yield self._earcon()  # "looking that up" cue — slow/remote tools only
             for tc in msg.tool_calls:
                 n_tools += 1
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                    tool_result = await self._registry.execute(
-                        self._ctx, tc.function.name, args, timeout_s=self._cfg.tools.timeout_s
-                    )
-                except Exception as exc:  # noqa: BLE001 - tools must never break a turn
-                    tool_result = f"error: {exc}"
+                tool = self._registry.get(tc.function.name)
+                if tool is not None and tool.announce:
+                    # Slow/remote tool (web search): a soft heartbeat pulses while
+                    # it runs so the user hears the search is happening.
+                    tool_result = ""
+                    async for item in self._execute_with_heartbeat(tc):
+                        if isinstance(item, bytes):
+                            yield item
+                        else:
+                            tool_result = item
+                else:
+                    tool_result = await self._execute_call(tc)  # instant: no pulse
                 if trace is not None:
                     trace.event("tool", tool=tc.function.name)
                 messages.append(
@@ -251,20 +260,41 @@ class BrainSession:
                 tools=n_tools,
             )
 
-    def _earcon(self) -> bytes:
-        """A short tone played before a slow tool runs (cached at the TTS rate)."""
-        if self._earcon_pcm is None:
-            self._earcon_pcm = _make_earcon(self._cfg.tts.sample_rate)
-        return self._earcon_pcm
+    async def _execute_call(self, tc) -> str:  # noqa: ANN001
+        """Run one tool call to its result string. Never raises — a tool error is
+        returned as text and fed back to the model."""
+        try:
+            args = json.loads(tc.function.arguments or "{}")
+            return await self._registry.execute(
+                self._ctx, tc.function.name, args, timeout_s=self._cfg.tools.timeout_s
+            )
+        except Exception as exc:  # noqa: BLE001 - tools must never break a turn
+            return f"error: {exc}"
 
-    def _should_announce(self, tool_calls) -> bool:  # noqa: ANN001
-        """True if any tool in this round is announced (slow/remote, e.g. web
-        search) — instant local tools (files, time) don't earn a beep."""
-        for tc in tool_calls:
-            tool = self._registry.get(tc.function.name)
-            if tool is not None and tool.announce:
-                return True
-        return False
+    async def _execute_with_heartbeat(self, tc):  # noqa: ANN001
+        """Run a slow tool, yielding a soft heartbeat pulse (bytes) every
+        `heartbeat_interval_s` while it runs, then the result (str) last — the two
+        are told apart by type. The task is cancelled if the caller stops (a
+        barge-in closes the generator)."""
+        task = asyncio.create_task(self._execute_call(tc))
+        try:
+            yield self._heartbeat()  # first pulse — the search has started
+            while not task.done():
+                done, _ = await asyncio.wait(
+                    {task}, timeout=self._cfg.tools.heartbeat_interval_s
+                )
+                if not done:
+                    yield self._heartbeat()
+            yield task.result()
+        finally:
+            if not task.done():
+                task.cancel()
+
+    def _heartbeat(self) -> bytes:
+        """A soft 'still working' pulse (cached at the TTS rate)."""
+        if self._heartbeat_pcm is None:
+            self._heartbeat_pcm = _make_heartbeat(self._cfg.tts.sample_rate)
+        return self._heartbeat_pcm
 
     def _remember(self, user_text: str, assistant_text: str) -> None:
         """Append the exchange to the rolling shared-context window."""

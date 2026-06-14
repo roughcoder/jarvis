@@ -252,6 +252,8 @@ class ToolsConfig(_Base):
     # on tools forever.
     timeout_s: float = 8.0
     max_rounds: int = 4
+    # Soft heartbeat pulse cadence while a slow/remote tool (web search) runs.
+    heartbeat_interval_s: float = 1.2
     # files tool sandbox root (everything resolves within this; escapes rejected).
     files_root: str = "jarvis-workspace/files"
     # web_search provider + key (tavily). No key => the tool reports unconfigured.
