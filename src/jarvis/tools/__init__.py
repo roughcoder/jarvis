@@ -7,9 +7,10 @@ grant — the capability gate is.
 
 from __future__ import annotations
 
-from jarvis.config import RemoteConfig, ToolsConfig, WorkerConfig
+from jarvis.config import GoogleConfig, RemoteConfig, ToolsConfig, WorkerConfig
 from jarvis.tools.base import Tool, ToolError, ToolRegistry
 from jarvis.tools.files import make_files_tools
+from jarvis.tools.google import make_google_tools
 from jarvis.tools.remote import make_remote_tools
 from jarvis.tools.web_search import make_web_search_tool
 from jarvis.tools.worker import make_worker_tools
@@ -22,10 +23,15 @@ def build_registry(
     *,
     worker: WorkerConfig | None = None,
     remote: RemoteConfig | None = None,
+    google: GoogleConfig | None = None,
+    mcp: list[Tool] | None = None,
 ) -> ToolRegistry:
     """Register every tool. `worker` adds the local worker-daemon tools, `remote`
-    the cloud (Managed Agents) tools — both thin HTTP clients, capability-gated
-    like the rest, so registering them is not a grant. Pass None to omit."""
+    the cloud (Managed Agents) tools, `mcp` the bridged MCP-server tools (built by
+    `make_mcp_tools` after the bridge has connected) — all thin clients,
+    capability-gated like the rest, so registering them is not a grant. Pass None
+    to omit. MCP tools come pre-built because discovery is async (off the hot
+    path); the brain connects the bridge at startup, then registers the result."""
     reg = ToolRegistry()
     reg.register(make_web_search_tool(cfg))
     for tool in make_files_tools(cfg):
@@ -36,4 +42,9 @@ def build_registry(
     if remote is not None:
         for tool in make_remote_tools(remote):
             reg.register(tool)
+    if google is not None:
+        for tool in make_google_tools(google):
+            reg.register(tool)
+    for tool in mcp or []:
+        reg.register(tool)
     return reg

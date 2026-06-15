@@ -81,11 +81,34 @@ def resolve_capabilities(cfg: CapabilityConfig) -> set[str]:
 
 
 def build_request_context(cfg: CapabilityConfig) -> RequestContext:
-    """Single-principal RequestContext from config (Phase 3a). In W4 the brain
-    server builds one per connection from the paired device's profile instead."""
+    """Single-principal RequestContext from config (Phase 3a / single-process loop).
+    The brain server uses `context_for_resolution` to build one per utterance from
+    the resolved speaker instead (Phase 3d)."""
     return RequestContext(
         device_id=cfg.device_id,
         identity=cfg.identity,
         scope=cfg.scope,
         capabilities=frozenset(resolve_capabilities(cfg)),
+    )
+
+
+def context_for_resolution(cfg: CapabilityConfig, resolution) -> RequestContext:  # noqa: ANN001
+    """Per-utterance RequestContext (Phase 3d): the device profile is the ceiling
+    of what's allowed *here*; an identified user's own grants are added on top when
+    in personal scope (their MCP servers etc.). Identity/scope/peer come from the
+    resolution — that's what routes credentials + memory to the right principal.
+
+    `resolution` is a `jarvis.brain.identity.Resolution` (kept duck-typed to avoid a
+    circular import)."""
+    caps = set(resolve_capabilities(cfg))
+    user = getattr(resolution, "user", None)
+    if user is not None and resolution.scope == "personal":
+        caps |= set(user.capabilities)
+    return RequestContext(
+        device_id=cfg.device_id,
+        identity=resolution.identity,
+        scope=resolution.scope,
+        capabilities=frozenset(caps),
+        confidence=resolution.confidence,
+        peer=getattr(user, "peer", "") if user is not None else "",
     )

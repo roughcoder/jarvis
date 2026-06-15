@@ -1,4 +1,9 @@
 .env
+jarvis-workspace/.mcp-auth/
+jarvis-workspace/worker/jobs/
+jarvis-workspace/worker/runs/
+jarvis-workspace/worker/worktrees/
+jarvis-workspace/worker/screenshots/
 .venv/
 __pycache__/
 *.pyc

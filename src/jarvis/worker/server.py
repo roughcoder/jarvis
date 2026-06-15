@@ -24,11 +24,13 @@ from jarvis.worker.actions import (
     cleanup_job,
     clone_repo,
     code_argv,
+    gui_doctor,
     list_repos,
     prepare_worktree,
     resolve_repo,
     run_applescript,
     run_exec,
+    run_peekaboo,
     run_shell,
     take_screenshot,
 )
@@ -114,6 +116,11 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             return web.json_response(
                 {"ok": True, "job_id": job.id, "name": job.name, "branch": branch, "status": "running"}
             )
+        if action == "peekaboo":
+            out = await run_peekaboo(cfg.peekaboo_bin, args.get("argv") or [], cfg.shell_timeout_s)
+            return web.json_response({"ok": True, "output": out})
+        if action == "gui_doctor":
+            return web.json_response({"ok": True, **gui_doctor(cfg.peekaboo_bin)})
         if action == "list_repos":
             return web.json_response({"ok": True, "repos": list_repos(cfg.repo_root)})
         if action == "cleanup":

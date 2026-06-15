@@ -45,17 +45,24 @@ class GatewayClient:
         return resp.choices[0].message.content or ""
 
     async def stream(
-        self, messages: list[dict], *, model: str | None = None
+        self, messages: list[dict], *, model: str | None = None, usage_out: dict | None = None
     ) -> AsyncIterator[str]:
-        """Streaming completion: yields text deltas for time-to-first-token."""
-        stream = await self._client.chat.completions.create(
-            model=self._resolve(model),
-            messages=messages,  # type: ignore[arg-type]
-            stream=True,
-            user=self._speaker,
-            extra_body=self._extra_body,
-        )
+        """Streaming completion: yields text deltas for time-to-first-token. When
+        `usage_out` is given, request usage and fill it with prompt-cache stats from
+        the final chunk (for cache hit/miss tracing, §9)."""
+        kwargs: dict = {
+            "model": self._resolve(model),
+            "messages": messages,
+            "stream": True,
+            "user": self._speaker,
+            "extra_body": self._extra_body,
+        }
+        if usage_out is not None:
+            kwargs["stream_options"] = {"include_usage": True}
+        stream = await self._client.chat.completions.create(**kwargs)
         async for chunk in stream:
+            if usage_out is not None and getattr(chunk, "usage", None) is not None:
+                usage_out.update(_usage_dict(chunk.usage))
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta.content
@@ -68,10 +75,12 @@ class GatewayClient:
         *,
         model: str | None = None,
         tools: list[dict] | None = None,
+        usage_out: dict | None = None,
     ):
         """One tool-aware completion. Returns the assistant message (which carries
         `.content` and `.tool_calls`) so the caller can run the tool loop. Tools
-        are omitted entirely when none are offered (a plain completion)."""
+        are omitted entirely when none are offered (a plain completion). When
+        `usage_out` is given, it's filled with prompt-cache stats (§9)."""
         kwargs: dict = {
             "model": self._resolve(model),
             "messages": messages,
@@ -81,7 +90,35 @@ class GatewayClient:
         if tools:
             kwargs["tools"] = tools
         resp = await self._client.chat.completions.create(**kwargs)
+        if usage_out is not None:
+            usage_out.update(_usage_dict(getattr(resp, "usage", None)))
         return resp.choices[0].message
+
+    async def embed(self, texts: list[str], *, model: str | None = None) -> list[list[float]]:
+        """Embed texts via the LiteLLM embeddings route (optional tool-relevance scorer)."""
+        resp = await self._client.embeddings.create(
+            model=model or self._cfg.embed_model, input=texts
+        )
+        return [d.embedding for d in resp.data]
 
     async def aclose(self) -> None:
         await self._client.close()
+
+
+def _usage_dict(usage) -> dict:  # noqa: ANN001
+    """Normalise an OpenAI/LiteLLM usage object to a small dict, including cached
+    (prompt-cache) tokens however the provider reports them."""
+    if usage is None:
+        return {}
+    out = {
+        "prompt_tokens": getattr(usage, "prompt_tokens", None),
+        "completion_tokens": getattr(usage, "completion_tokens", None),
+    }
+    details = getattr(usage, "prompt_tokens_details", None)
+    cached = None
+    if details is not None:
+        cached = details.get("cached_tokens") if isinstance(details, dict) else getattr(details, "cached_tokens", None)
+    if cached is None:  # Anthropic-style (via LiteLLM)
+        cached = getattr(usage, "cache_read_input_tokens", None)
+    out["cached_tokens"] = cached or 0
+    return {k: v for k, v in out.items() if v is not None}

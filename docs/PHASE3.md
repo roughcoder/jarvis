@@ -165,12 +165,31 @@ filesystem. A tool with no granted capability does not run, single-principal or 
 | `remote.*` | cloud coding → Claude Managed Agents (§8) | ✅ built, dormant |
 | `google` | gogcli — Jarvis's own Gmail + Calendar | ⏸ deferred (OAuth) |
 
-**MCP bridge (the next build, not yet built):** a native MCP client + a
-profile-gated **work bundle** (gh, Granola, Notion, Slack, Linear). Connections
-keyed by `(user, service)`. The profile is the firewall against sprawl — each
-profile sees only its slice, so "lots of MCPs" never becomes "400 tools every
-turn". **Timeout every call.** Fast lookups inline (hot); heavy multi-MCP
-synthesis to skills/heartbeat (cold). This is where "install the gh MCP" happens.
+**MCP bridge (✅ built):** a native MCP client (`mcp/`, isolation-first — imports
+nothing from the brain) + a profile-gated **work bundle**. Each configured server
+(`MCP_SERVERS`, mirroring a Claude-Code `mcpServers` entry — `stdio` or `http`) is
+connected once at brain startup (cold path), its tools discovered, namespaced
+`<server>_<tool>`, and registered gated by `mcp.<server>`. **The profile is the
+firewall against sprawl** — a device sees a server's tools only if its profile
+grants `mcp.<server>`, so "lots of MCPs" never becomes "400 tools every turn"
+(plus a per-server `include` allow-list + `max_tools_per_server` cap). **Every
+call is hard-bounded twice** (the registry's `tools.timeout_s` and the bridge's
+`mcp.call_timeout_s`) so no bridged call can hang the hot path. Probe with
+`jarvis mcp`. The tool layer (`tools/mcp.py`) is a thin client over the bridge,
+exactly as `tools/worker.py` is over the worker daemon. Connections are keyed per
+server now; per-`(user, service)` keying lands with multi-user (3d). Heavy
+multi-MCP synthesis still belongs on skills/heartbeat (cold).
+
+**OAuth (http servers).** A server with no static headers authenticates via
+OAuth 2.0 (Notion, Granola, Linear, M365). Interactive auth happens ONLY in
+`jarvis mcp login` — it walks the OAuth servers one at a time, opens the browser,
+catches the redirect on a localhost loopback, and caches the token per server
+under `<MCP_AUTH_DIR>/<server>.json` (gitignored). The **brain never pops a
+browser**: at startup it builds a *headless* provider that silently refreshes a
+cached token, or — if fresh auth is needed — fails fast and the bridge skips that
+server with a "run `jarvis mcp login`" hint. The SDK supplies PKCE + dynamic
+client registration + metadata discovery; we supply only the token store and the
+loopback (`mcp/auth.py`).
 
 **Lanes:** coding deep-work via the worker daemon (§8, ✅ built) · WhatsApp
 channel + heartbeat (⬜ 3b) · `mac-control` (peekaboo/AXorcist, ⏸ deferred).
@@ -254,6 +273,17 @@ compaction apparatus.
   `memory cache → recent turns → current utterance`. The file-composition order
   *is* the caching strategy. Cache is keyed per `(device × user)`; a handful of
   warm prefixes for a household. Add cache hit/miss to `jarvis traces`.
+  *Status:* the stable→volatile ordering is in place and offered tool schemas are
+  name-sorted (canonical → cacheable). **Deferred:** explicit Anthropic
+  `cache_control` breakpoints, tool-block cache markers, and cache hit/miss in
+  `jarvis traces` (needs usage plumbing through `gateway_client`, incl. streaming
+  `include_usage`) — verify against the live gateway.
+- **Tool relevance prefilter (a latency win with many MCP tools).** With several
+  MCP servers a turn can face 100+ tool schemas; the prefilter (`tools/selection.py`,
+  `TOOLS_RELEVANCE_FILTER`) offers only the servers relevant to the utterance
+  (built-ins always on), keeping every tool registered + gated. *Status:* built,
+  keyword-based. **Deferred:** replace the keyword matcher with embedding similarity
+  (the keyword heuristic is brittle — tune per-server `keywords` meanwhile).
 - **Transcript hygiene.** Background/system events (heartbeat, cold-path writes,
   dispatch notifications) **never enter the conversational transcript** that
   feeds the voice prompt — the hot/cold split extended into context. Keep
@@ -366,15 +396,39 @@ user. The identity stack is not deferred to 3d; only its *multiplicity* is.
   with git-worktree isolation, repo resolve-or-clone, on-disk persistence, names,
   cleanup (§8); plus the remote Managed-Agents lane (built, dormant). `jarvis
   worker` / `jarvis jobs` / `jarvis remote-setup`.
-- ⬜ **MCP bridge — the next build.** Plug gh / Granola / Notion / Slack in as
-  capability-gated tools (the work bundle). Promoted from "v1 escape hatch" — it's
-  the next transformative step.
-- ⬜ **3b — WhatsApp connector + heartbeat.** A real second channel + proactive
-  push; first exercise of know-or-ask + per-user credentials. Needs WhatsApp +
-  Google account setup.
-- ⬜ **3d — Room Pi + per-device profiles + a second user (Jules).** Multi-device,
-  multi-person — the resolution stack fully populated.
-- ⏸ **`google` tool (gogcli / Gmail+Calendar)** deferred pending its OAuth setup.
+- ✅ **MCP bridge.** A native MCP client (`mcp/`, stdio + streamable-HTTP) that
+  connects configured servers at startup, discovers + namespaces their tools, and
+  registers them gated by `mcp.<server>` with double-bounded call timeouts. Config
+  is `MCP_SERVERS` (JSON, mirrors a Claude-Code `mcpServers` entry); the thin tool
+  layer is `tools/mcp.py`; probe with `jarvis mcp`. Proven end-to-end against the
+  context7 stdio server. The work bundle (gh / Granola / Notion / Slack / Linear)
+  is now just config — add a server entry + grant its `mcp.<name>` capability.
+  OAuth http servers (Notion/Granola/Linear/M365) are authorized once with
+  `jarvis mcp login` (browser loopback, tokens cached + auto-refreshed; the voice
+  path never pops a browser) — see `mcp/auth.py`.
+- ✅ **3d — Multi-device + multi-user (the resolution stack, fully populated).**
+  Per-utterance identity resolution (`brain/identity.py`: strong/claimed/unknown,
+  know-or-ask) from `users/<name>.md`; per-`(device × user)` sessions
+  (`brain/contexts.py`) with isolated history + memory peer/cache; per-device
+  profiles + identity-aware pairing (`BRAIN_DEVICES`, `authorise_device`, `jarvis
+  status`); per-user MCP credentials (`.mcp-auth/<user>/`, `jarvis mcp login
+  --user`). Room-Pi profile + `docs/PI.md`. Wired in both the brain server and the
+  `--local` loop. Isolation + gating + pairing unit-tested; loopback integration.
+- ✅ **Skills (§7).** `SKILLS.md` + `skills/*.md`, selected like tools, run via a
+  bounded gated tool loop, self-authored with `save_skill` — and a skill can never
+  exceed its profile's powers (`extra_capabilities` invariant). `brain/skills.py`.
+- ✅ **3b — WhatsApp connector + heartbeat.** `connectors/whatsapp.py` (wraps
+  `wacli`; `jarvis whatsapp`) — inbound message → brain turn (channel=whatsapp,
+  number→user), reply back out. Cold-path heartbeat (`brain/heartbeat.py` +
+  `HEARTBEAT.md`) with the silent-completion sentinel + Proactive broadcast. Live
+  WhatsApp self-skips until `wacli` is linked.
+- ✅ **`google` tool (gogcli / Gmail+Calendar).** `tools/google.py`, gated
+  `google.read` / `google.send`; `jarvis google-setup`. Self-skips without gogcli.
+- ✅ **`mac-control` (peekaboo).** `see_screen` / `control_mac` worker tools gated
+  `worker.gui`; `jarvis worker --doctor`. Self-skips without peekaboo + perms.
+- ✅ **WS8 polish.** Embedding-based relevance (opt-in `TOOLS_RELEVANCE_MODE=
+  embedding`, keyword fallback) + prompt-cache hit/miss in `jarvis traces`
+  (cached/prompt tokens via gateway usage; cache-friendly stable prefix).
 
 ## 13. Invariants to keep true
 

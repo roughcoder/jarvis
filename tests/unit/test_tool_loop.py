@@ -45,9 +45,11 @@ class _FakeGateway:
         self._scripted = scripted
         self.calls = 0
 
-    async def complete_with_tools(self, messages, *, model=None, tools=None):  # noqa: ANN001
+    async def complete_with_tools(self, messages, *, model=None, tools=None, usage_out=None):  # noqa: ANN001
         msg = self._scripted[self.calls]
         self.calls += 1
+        if usage_out is not None:
+            usage_out.update({"prompt_tokens": 100, "cached_tokens": 0})
         return msg
 
 
@@ -148,6 +150,35 @@ def test_slow_tool_emits_repeating_heartbeats(tmp_path) -> None:
 
     assert result.raw == "Found it."
     assert len(chunks) >= 2  # pulses kept coming while the tool ran
+
+
+def test_tool_calls_are_logged_to_console(tmp_path, capsys) -> None:  # noqa: ANN001
+    gateway = _FakeGateway([
+        _FakeMsg(tool_calls=[
+            _FakeToolCall("c1", "write_file", '{"path": "n.md", "content": "hi"}')
+        ]),
+        _FakeMsg(content="Done."),
+    ])
+    session = _session(tmp_path, gateway)
+    _run(session, TurnTrace(room="x", speaker="house"), TurnResult())
+
+    out = capsys.readouterr().out
+    assert "tool: write_file" in out
+    assert "[files.write]" in out  # the gating capability is shown (= server for mcp.*)
+
+
+def test_tool_logging_can_be_disabled(tmp_path, capsys) -> None:  # noqa: ANN001
+    gateway = _FakeGateway([
+        _FakeMsg(tool_calls=[
+            _FakeToolCall("c1", "write_file", '{"path": "n.md", "content": "hi"}')
+        ]),
+        _FakeMsg(content="Done."),
+    ])
+    session = _session(tmp_path, gateway)
+    session._cfg.tools.log_calls = False
+    _run(session, TurnTrace(room="x", speaker="house"), TurnResult())
+
+    assert "tool: write_file" not in capsys.readouterr().out
 
 
 def test_no_tool_call_sets_reply_without_earcon(tmp_path) -> None:

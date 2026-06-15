@@ -67,6 +67,34 @@ async def take_screenshot(workspace: str, name: str | None, timeout_s: float) ->
     return f"screenshot saved to {path}"
 
 
+async def run_peekaboo(peekaboo_bin: str, argv: list[str], timeout_s: float) -> str:
+    """Drive GUI automation via peekaboo (Phase 3c, deferred-until-installed). Returns
+    a clear 'not installed' message rather than failing when the binary is absent —
+    it needs `brew install` + Screen-Recording/Accessibility permissions."""
+    if not shutil.which(peekaboo_bin):
+        return (
+            "mac GUI control isn't set up — install peekaboo and grant Screen "
+            "Recording + Accessibility permissions (see `jarvis worker --doctor`)."
+        )
+    return await run_exec([peekaboo_bin, *argv], None, timeout_s)
+
+
+def gui_doctor(peekaboo_bin: str) -> dict:
+    """Report what mac GUI control needs (the perms can't be auto-granted)."""
+    present = bool(shutil.which(peekaboo_bin))
+    return {
+        "peekaboo_installed": present,
+        "binary": peekaboo_bin,
+        "next_steps": (
+            "ready — verify Screen Recording + Accessibility are granted in System "
+            "Settings > Privacy & Security."
+            if present
+            else "install peekaboo (e.g. `brew install peekaboo`), then grant Screen "
+            "Recording + Accessibility permissions to the worker's terminal."
+        ),
+    }
+
+
 def code_argv(agent: str, codex_bin: str, claude_bin: str, prompt: str) -> list[str]:
     """The headless coding-agent command for `agent`. Both run non-interactively
     in the job's repo cwd; tune flags per your setup via the *_bin config."""

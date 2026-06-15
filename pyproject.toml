@@ -42,6 +42,11 @@ memory = [
 worker = [
     "aiohttp>=3.9",
 ]
+# MCP bridge (Phase 3 §6) — the native MCP client. Brain-side only; provides the
+# stdio + streamable-http transports. Pure-Python, fine on the 3.12 pin.
+mcp = [
+    "mcp>=1.2",
+]
 
 [project.scripts]
 jarvis = "jarvis.cli:main"

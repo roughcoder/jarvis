@@ -35,6 +35,10 @@ class Tool:
     # True for slow/remote tools (web search) that warrant a "looking that up"
     # earcon. Instant local tools (files, time) leave it False — no beep.
     announce: bool = False
+    # Extra capabilities that must ALSO all be granted to offer/run this tool. Used
+    # by skills (§7): a skill composes tools, so it's only offered when the context
+    # grants every tool it would use — it can never exceed its profile's powers.
+    extra_capabilities: frozenset[str] = frozenset()
 
     def openai_schema(self) -> dict[str, Any]:
         return {
@@ -58,8 +62,13 @@ class ToolRegistry:
         return self._tools.get(name)
 
     def available_for(self, ctx: RequestContext) -> list[Tool]:
-        """Tools whose required capability this context grants (deny-by-default)."""
-        return [t for t in self._tools.values() if ctx.can(t.required_capability)]
+        """Tools whose required capability — and every extra capability — this
+        context grants (deny-by-default)."""
+        return [
+            t
+            for t in self._tools.values()
+            if ctx.can(t.required_capability) and t.extra_capabilities <= ctx.capabilities
+        ]
 
     async def execute(
         self,
@@ -75,6 +84,8 @@ class ToolRegistry:
         if tool is None:
             raise ToolError(f"unknown tool {name!r}")
         require(ctx, tool.required_capability)  # also filtered at offer time
+        for cap in tool.extra_capabilities:  # skills: every composed tool's cap
+            require(ctx, cap)
         result = tool.handler(ctx, args)
         if inspect.isawaitable(result):
             result = await asyncio.wait_for(result, timeout_s)

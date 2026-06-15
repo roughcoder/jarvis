@@ -363,12 +363,33 @@ def _cmd_brain(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_worker(_args: argparse.Namespace) -> int:
-    """Run the worker daemon — deep work + machine control on this host (W3c).
-    A standalone service the brain dispatches to over HTTP."""
-    from jarvis.worker.server import serve
+def _cmd_whatsapp(_args: argparse.Namespace) -> int:
+    """Run the WhatsApp connector (Phase 3b): bridge `wacli` ↔ the brain."""
+    from jarvis.connectors.whatsapp import WhatsAppConnector
 
     cfg = load_config()
+    try:
+        asyncio.run(WhatsAppConnector(cfg).run())
+    except KeyboardInterrupt:
+        print("\nstopped.")
+    return 0
+
+
+def _cmd_worker(args: argparse.Namespace) -> int:
+    """Run the worker daemon — deep work + machine control on this host (W3c).
+    A standalone service the brain dispatches to over HTTP. `--doctor` reports what
+    mac GUI control (peekaboo) needs instead of starting the daemon."""
+    cfg = load_config()
+    if getattr(args, "doctor", False):
+        import json
+
+        from jarvis.worker.actions import gui_doctor
+
+        d = gui_doctor(cfg.worker.peekaboo_bin)
+        print(json.dumps(d, indent=2))
+        return 0 if d["peekaboo_installed"] else 1
+    from jarvis.worker.server import serve
+
     try:
         asyncio.run(serve(cfg.worker))
     except KeyboardInterrupt:
@@ -478,6 +499,203 @@ def _cmd_remote_setup(_args: argparse.Namespace) -> int:
     print("\nWritten ANTHROPIC_AGENT_ID + ANTHROPIC_ENVIRONMENT_ID to .env.")
     print("Add remote.code to CAPS_DEFAULT_CAPABILITIES to use it by voice.")
     return 0
+
+
+def _cmd_google_setup(_args: argparse.Namespace) -> int:
+    """One-time OAuth for the `google` tool (Jarvis's own Gmail/Calendar via gogcli)."""
+    import shutil
+    import subprocess
+
+    cfg = load_config()
+    if not shutil.which(cfg.google.gogcli_bin):
+        print(f"{cfg.google.gogcli_bin!r} not found — install gogcli, then re-run.")
+        return 1
+    print("Launching gogcli auth (a browser window will open)…")
+    try:
+        return subprocess.run([cfg.google.gogcli_bin, "auth", "login"]).returncode
+    except KeyboardInterrupt:
+        return 1
+
+
+def _cmd_mcp(args: argparse.Namespace) -> int:
+    if getattr(args, "mcp_action", "probe") == "login":
+        return _cmd_mcp_login(args)
+    return _cmd_mcp_probe(args)
+
+
+def _wait_key(prompt: str) -> str:
+    """Print a prompt and return a single keypress — SPACE/ENTER to proceed, any
+    of s/q/Esc to skip. Falls back to line input when stdin isn't a TTY (CI/pipe)."""
+    import sys
+
+    print(prompt, end="", flush=True)
+    if not sys.stdin.isatty():
+        line = sys.stdin.readline()
+        print()
+        return (line.strip()[:1] or " ")
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    print()
+    return ch
+
+
+def _cmd_mcp_login(args: argparse.Namespace) -> int:
+    """Interactive OAuth onboarding for HTTP MCP servers (Notion, Granola, …). Walks
+    the configured OAuth servers one at a time: already authorized => skip; otherwise
+    open the browser, catch the redirect, save the token. Tokens persist so the brain
+    uses them silently afterwards. Optionally limit to one with --server."""
+    from jarvis.mcp.auth import build_oauth_provider, needs_oauth
+    from jarvis.mcp.bridge import _root_cause
+    from jarvis.mcp.client import MCPClient
+
+    cfg = load_config()
+    servers = cfg.mcp.servers
+    if args.server:
+        servers = [s for s in servers if s.name == args.server]
+        if not servers:
+            print(f"No MCP server named {args.server!r} in MCP_SERVERS.")
+            return 1
+    oauth = [s for s in servers if needs_oauth(s)]
+    if not oauth:
+        print(
+            "No OAuth MCP servers to log in to (stdio servers and http servers with "
+            "static headers need no browser auth)."
+        )
+        return 0
+
+    who = args.user or "house"
+    print(f"Authorizing as user {who!r} (tokens → {cfg.mcp.auth_dir}/{who}/).")
+    total = len(oauth)
+
+    async def run() -> tuple[int, int]:  # noqa: ANN202
+        ok = skipped = 0
+        for i, spec in enumerate(oauth, 1):
+            print(f"\n{'─' * 60}")
+            print(f"  [{i}/{total}]  {spec.name}")
+            print(f"           {spec.url}")
+            key = _wait_key("  ▶ press SPACE to authorize (s = skip, q = quit)… ")
+            if key in ("q", "Q", "\x03"):  # q / Ctrl-C
+                print("  quitting.")
+                break
+            if key in ("s", "S", "\x1b"):  # s / Esc
+                print("  skipped.")
+                skipped += 1
+                continue
+            provider, _storage, flow = build_oauth_provider(
+                spec, cfg.mcp, interactive=True, user=who
+            )
+            client = MCPClient(spec, call_timeout_s=cfg.mcp.call_timeout_s, auth=provider)
+            try:
+                tools = await asyncio.wait_for(client.connect(), 300)  # human-in-the-loop
+                state = "authorized" if (flow and flow.opened) else "already authorized"
+                print(f"  ✓ {state} — {len(tools)} tool(s) available")
+                ok += 1
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ✗ failed: {_root_cause(exc)}")
+            finally:
+                await client.aclose()
+        return ok, skipped
+
+    print(f"Authorizing {total} OAuth MCP server(s). I'll announce each — "
+          "press SPACE when ready and finish the login in your browser.")
+    ok, skipped = asyncio.run(run())
+    print(f"\n{'─' * 60}")
+    print(f"Done — {ok}/{total} authorized" + (f", {skipped} skipped" if skipped else "") + ".")
+    print(f"Tokens saved to {cfg.mcp.auth_dir}/; the brain refreshes them silently on next start.")
+    return 0 if ok else 1
+
+
+def _cmd_mcp_probe(args: argparse.Namespace) -> int:
+    """Probe the configured MCP servers: connect, discover tools, print what each
+    contributes and the capability a profile must grant. The same connect path the
+    brain runs at startup — a quick check that a server is reachable + gated."""
+    from jarvis.mcp import MCPBridge
+
+    cfg = load_config()
+    if not cfg.mcp.enabled:
+        print("MCP is disabled. Set MCP_ENABLED=true and MCP_SERVERS in .env.")
+        return 0
+    if not cfg.mcp.servers:
+        print("MCP is enabled but no servers are configured (MCP_SERVERS=[]).")
+        return 0
+
+    async def run() -> list:  # noqa: ANN202
+        bridge = MCPBridge(cfg.mcp, principals=[args.user] if args.user else ["house"])
+        try:
+            tools = await bridge.start()
+            # snapshot before aclose resets bridge state
+            return [(t.offered_name, t.server, t.required_capability, t.description) for t in tools]
+        finally:
+            await bridge.aclose()
+
+    print(f"Probing {len(cfg.mcp.servers)} MCP server(s)…\n")
+    try:
+        rows = asyncio.run(run())
+    except Exception as exc:  # noqa: BLE001
+        print(f"MCP probe failed: {exc}")
+        return 1
+    if not rows:
+        print("No tools discovered (servers may have failed to connect — see above).")
+        return 1
+    by_cap: dict[str, list] = {}
+    for name, server, cap, desc in rows:
+        by_cap.setdefault(cap, []).append((name, desc))
+    for cap in sorted(by_cap):
+        print(f"capability {cap!r} (grant in a device profile to enable):")
+        for name, desc in by_cap[cap]:
+            short = (desc[:70] + "…") if len(desc) > 71 else desc
+            print(f"    {name.ljust(34)}  {short}")
+        print()
+    print(f"{len(rows)} tool(s) total. Grant the capabilities above to offer them by voice.")
+    return 0
+
+
+def _cmd_status(_args: argparse.Namespace) -> int:
+    """Device lifecycle (§3): is the brain reachable, and what is THIS device allowed
+    to do? Pairs like an intercom (device id + token) and prints the Welcome."""
+    import websockets
+
+    from jarvis.protocol.messages import Hello, Reject, Welcome, decode, encode
+
+    cfg = load_config()
+    url = cfg.intercom.brain_url
+
+    async def go():  # noqa: ANN202
+        async with websockets.connect(url, open_timeout=5) as ws:
+            await ws.send(
+                encode(
+                    Hello(
+                        device_id=cfg.capabilities.device_id,
+                        token=cfg.intercom.token.get_secret_value(),
+                    )
+                )
+            )
+            return decode(await asyncio.wait_for(ws.recv(), 5))
+
+    print(f"Brain: {url}  (device: {cfg.capabilities.device_id})")
+    try:
+        res = asyncio.run(go())
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ✗ not reachable ({exc}) — is `jarvis brain` running?")
+        return 1
+    if isinstance(res, Welcome):
+        print("  ✓ reachable + paired")
+        print(f"    identity: {res.identity}   scope: {res.scope}")
+        print(f"    capabilities: {', '.join(res.capabilities) or '(none)'}")
+        return 0
+    if isinstance(res, Reject):
+        print(f"  ✗ pairing rejected: {res.reason} (check INTERCOM_TOKEN / BRAIN_DEVICES)")
+        return 1
+    print(f"  ✗ unexpected reply: {res}")
+    return 1
 
 
 def _cmd_traces(args: argparse.Namespace) -> int:
@@ -592,10 +810,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_brain.set_defaults(func=_cmd_brain)
 
     p_worker = sub.add_parser("worker", help="Run the worker daemon (deep work + machine control, W3c)")
+    p_worker.add_argument("--doctor", action="store_true", help="Report mac GUI control (peekaboo) readiness and exit")
     p_worker.set_defaults(func=_cmd_worker)
+
+    p_whatsapp = sub.add_parser("whatsapp", help="Run the WhatsApp connector (bridge wacli <-> brain, 3b)")
+    p_whatsapp.set_defaults(func=_cmd_whatsapp)
 
     p_remote = sub.add_parser("remote-setup", help="One-time: create the cloud agent + environment (remote coding)")
     p_remote.set_defaults(func=_cmd_remote_setup)
+
+    p_gsetup = sub.add_parser("google-setup", help="One-time: OAuth for the google tool (gogcli)")
+    p_gsetup.set_defaults(func=_cmd_google_setup)
+
+    p_mcp = sub.add_parser("mcp", help="MCP servers: probe tools, or `mcp login` for OAuth onboarding")
+    p_mcp.add_argument(
+        "mcp_action", nargs="?", choices=["probe", "login"], default="probe",
+        help="probe = discover tools (default); login = interactive OAuth for http servers",
+    )
+    p_mcp.add_argument("--server", default="", help="login: limit to one server by name")
+    p_mcp.add_argument(
+        "--user", default="", help="principal whose credentials to use (default: house)"
+    )
+    p_mcp.set_defaults(func=_cmd_mcp)
 
     p_jobs = sub.add_parser("jobs", help="List the worker's recent jobs + results")
     p_jobs.add_argument("-n", type=int, default=20, help="How many recent jobs")
@@ -603,6 +839,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--prune", action="store_true", help="Clean up all finished jobs (worktrees + branches)"
     )
     p_jobs.set_defaults(func=_cmd_jobs)
+
+    p_status = sub.add_parser("status", help="Is the brain reachable + what is this device allowed to do?")
+    p_status.set_defaults(func=_cmd_status)
 
     p_traces = sub.add_parser("traces", help="View recent per-turn pipeline traces")
     p_traces.add_argument("-n", type=int, default=20, help="How many recent traces")

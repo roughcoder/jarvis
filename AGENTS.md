@@ -47,11 +47,16 @@ src/jarvis/
     session.py         BrainSession — shared think/speak core (prompt, tools, end-detect)
     dialog.py          pure text helpers (prompt fragments, end-detection, segmentation)
     context.py / capabilities.py   RequestContext + deny-by-default capability gate (§4)
-    gateway_client/    HTTP -> LiteLLM proxy; memory_client/ Honcho; tracing/
+    identity.py / contexts.py      who's speaking (trust tiers, users/) + per-(device×user) sessions (3d §5/§9)
+    skills.py          self-authored recipes composing gated tools (§7)
+    heartbeat.py       proactive cold-path scheduler (silent sentinel, §3b)
+    gateway_client/    HTTP -> LiteLLM proxy; memory_client/ Honcho (per-user peer); tracing/
   protocol/            brain<->intercom WebSocket message schemas (Phase 3 W4)
-  tools/               capability-gated tools: web_search, files, worker, remote (+ base/registry)
-  worker/              standalone deep-work daemon (jarvis worker) — codex/claude, worktrees, jobs
+  tools/               capability-gated tools: web_search, files, worker, remote, google, mcp (+ selection prefilter)
+  mcp/                 native MCP client + bridge (stdio/http, per-user OAuth) -> gated tools
+  worker/              standalone deep-work daemon (jarvis worker) — codex/claude, worktrees, jobs, GUI
   remote/              Claude Managed Agents client (cloud coding lane, dormant)
+  connectors/          non-voice channels (whatsapp/ wraps wacli) — bridge to the brain over the protocol
 ```
 
 Keep the turn loop, audio I/O, memory/gateway clients, the worker, and the remote
@@ -97,9 +102,14 @@ Secrets to put in `.env` (gitignored): `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
 | `jarvis chat [--manual] [--rounds N]` | push-to-talk / VAD round-trip |
 | `jarvis brain` | run the brain WebSocket server (Phase 3 W4) |
 | `jarvis run [--no-bargein] [--local] [--brain H:P]` | hands-free loop: thin intercom → brain (`--local` = one process) |
-| `jarvis worker` | run the deep-work daemon (codex/claude coding jobs, shell, screenshot — Phase 3c) |
+| `jarvis worker [--doctor]` | run the deep-work daemon (codex/claude jobs, shell, screenshot, GUI); `--doctor` checks peekaboo |
+| `jarvis whatsapp` | run the WhatsApp connector (bridge wacli ↔ brain, 3b) |
+| `jarvis status` | is the brain reachable + what is this device allowed to do? (§3) |
+| `jarvis google-setup` | one-time OAuth for the google tool (gogcli) |
 | `jarvis jobs [-n N] [--prune]` | list worker jobs (name, status, branch, `codex resume`); `--prune` cleans finished |
 | `jarvis remote-setup` | one-time: create the cloud agent + environment for the (dormant) remote lane |
+| `jarvis mcp` | probe configured MCP servers: discover their tools + the capability each needs |
+| `jarvis mcp login [--server N] [--user U]` | one-time interactive OAuth for http MCP servers (browser); tokens cached per user |
 | `jarvis traces [-n N]` | view per-turn pipeline timings |
 
 Phase 3 (see `docs/PHASE3.md`) split the loop into a **brain server** + thin
@@ -144,6 +154,20 @@ keeps the original single-process behaviour. The think/speak core is shared
   deterministic user sign-off net + Jarvis-reply-farewell backstop) — see
   `turnloop/__init__.py`. It's transcript-driven; add new failure phrases to the
   test cases.
+- **MCP bridge lifecycle**: an MCP session holds anyio cancel scopes that MUST be
+  entered AND exited on the same task — and several servers' scopes interleave on
+  one task and fail to close independently (the symptom: "exit a cancel scope that
+  isn't the current task's current cancel scope" on the *second* server's
+  teardown). So each server runs in its **own dedicated runner task** that holds
+  the SDK's `async with` blocks open for the connection's life (`mcp/client.py`
+  `_run`); `aclose()` just cancels that task, so enter/exit are always same-task.
+  Tool *calls* come from any turn task — the SDK's streams tolerate that. The `mcp`
+  SDK is imported lazily, so a brain with `MCP_ENABLED=false` (or no servers) needs
+  neither the extra nor any startup cost. Servers connect on the COLD path
+  (startup), never the hot path; every call is timeout-bounded twice (registry +
+  bridge). A chatty server (Obsidian alone exposes ~39 tools) can dominate the
+  per-turn tool list — use a per-server `include` allow-list or lower
+  `MCP_MAX_TOOLS_PER_SERVER` if it gets heavy.
 - **TTS-2 expressive prompting**: ONE steering directive `[say ...]` at the
   START (scopes the whole call), non-verbals `[laugh]` inline; numbers as words;
   no markdown/emoji. Streaming reuses the leading steering tag per sentence.

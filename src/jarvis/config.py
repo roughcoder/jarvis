@@ -11,7 +11,7 @@ All values load from environment / a local .env file. Nothing is hardcoded.
 
 from __future__ import annotations
 
-from pydantic import SecretStr, computed_field
+from pydantic import BaseModel, SecretStr, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -47,6 +47,9 @@ class GatewayConfig(_Base):
     # never provider SDK identifiers. Swapping model is a parameter, not code.
     fast_model: str = "fast"
     strong_model: str = "strong"
+    # Embeddings route (LiteLLM) for the optional embedding-based tool relevance
+    # scorer (§9 / WS8). Only used when TOOLS_RELEVANCE_MODE=embedding.
+    embed_model: str = "embed"
     request_timeout_s: float = 60.0
     # Stream the reply and synthesise sentence-by-sentence so speech starts on
     # the first sentence (lower felt latency). False = wait for the full reply.
@@ -208,6 +211,8 @@ class PersonaConfig(_Base):
     model_config = SettingsConfigDict(env_prefix="PERSONA_", env_file=".env", extra="ignore")
 
     soul_path: str = "SOUL.md"      # personality layer injected into the prompt
+    # Skills (§7): self-authored markdown recipes composing tools. Index = SKILLS.md.
+    skills_dir: str = "jarvis-workspace/skills"
     history_messages: int = 16      # rolling shared context window (user+assistant)
     expressive: bool = True         # let replies use Inworld TTS-2 emotion cues
     # IANA tz name (e.g. "Europe/London") injected so Jarvis knows "now" without
@@ -239,6 +244,8 @@ class CapabilityConfig(_Base):
     scope: str = "house"  # house | personal
     # profiles/<device_id>.md front-matter lists granted capabilities.
     profiles_dir: str = "jarvis-workspace/profiles"
+    # users/<name>.md: per-user identity bindings + grants (Phase 3d, §5/§10).
+    users_dir: str = "jarvis-workspace/users"
     # CSV fallback used only when no profile file exists for this device.
     default_capabilities: str = ""
 
@@ -252,6 +259,20 @@ class ToolsConfig(_Base):
     # on tools forever.
     timeout_s: float = 8.0
     max_rounds: int = 4
+    # Console-log each tool call (name, gating capability, args, short result) so a
+    # turn's tool/MCP activity is visible when debugging. False => silent.
+    log_calls: bool = True
+    # Per-turn relevance prefilter (Phase 3 §9): keep ALL tools registered + gated,
+    # but only OFFER the MCP servers whose tools look relevant to the utterance, so
+    # the voice prompt isn't 100+ schemas every turn. Built-in tools (web/files/
+    # worker) are always offered. False => offer everything (no narrowing).
+    relevance_filter: bool = True
+    # How relevance is scored: "keyword" (instant, default — no hot-path network) or
+    # "embedding" (semantic similarity via the gateway embeddings route; better
+    # matching at the cost of one small embed call per turn). Embedding mode falls
+    # back to keyword on any error.
+    relevance_mode: str = "keyword"
+    relevance_threshold: float = 0.30  # min cosine similarity to include a server
     # Soft heartbeat pulse cadence while a slow/remote tool (web search) runs.
     heartbeat_interval_s: float = 1.2
     # files tool sandbox root (everything resolves within this; escapes rejected).
@@ -260,6 +281,17 @@ class ToolsConfig(_Base):
     websearch_provider: str = "tavily"
     websearch_api_key: SecretStr = SecretStr("")
     websearch_max_results: int = 5
+
+
+class DeviceAuth(BaseModel):
+    """One paired device (Phase 3d): its own pairing token, canonical id, and a
+    default identity (a personal device pins its owner; a shared room device leaves
+    it empty → house until a speaker is confirmed). The profile file is
+    `profiles/<device_id>.md`."""
+
+    token: str
+    device_id: str
+    identity: str = ""  # default principal for this device ("" => house/unknown)
 
 
 class BrainConfig(_Base):
@@ -271,6 +303,11 @@ class BrainConfig(_Base):
     port: int = 8700
     # Shared pairing secret. Empty => accept any device (dev/local only).
     pairing_token: SecretStr = SecretStr("")
+    # Per-device pairing (Phase 3d): a JSON array of DeviceAuth so each device has
+    # its own token (a token is bound to its device_id, so a leaked Pi token can't
+    # impersonate your Mac). The shared pairing_token above stays a fallback.
+    # BRAIN_DEVICES='[{"token":"…","device_id":"room-pi"},{"token":"…","device_id":"neil-mac","identity":"neil"}]'
+    devices: list[DeviceAuth] = []
 
 
 class IntercomConfig(_Base):
@@ -314,6 +351,7 @@ class WorkerConfig(_Base):
     agent: str = "codex"             # default coding agent: codex | claude
     codex_bin: str = "codex"
     claude_bin: str = "claude"
+    peekaboo_bin: str = "peekaboo"   # GUI automation (worker.gui; install + perms)
     # Repo jobs run on an isolated worktree branch "<prefix>/<name>-<id>", never
     # the user's checkout.
     worktree_branch_prefix: str = "jarvis"
@@ -348,6 +386,114 @@ class RemoteConfig(_Base):
         return bool(self.api_key.get_secret_value() and self.agent_id and self.environment_id)
 
 
+class MCPServerSpec(BaseModel):
+    """One MCP server the bridge connects to (Phase 3 §6). Mirrors the shape of a
+    Claude-Code `mcpServers` entry so existing servers drop in unchanged: a
+    `stdio` server is a `command` + `args` (a long-lived subprocess); an `http`
+    server is a `url`. Every server declares the capability a device profile must
+    grant before its tools are offered — the firewall against tool sprawl."""
+
+    name: str  # short id: capability default + tool-name namespace
+    transport: str = "stdio"  # stdio | http
+    # stdio transport
+    command: str = ""
+    args: list[str] = []
+    env: dict[str, str] = {}  # extra env for the subprocess (e.g. a vault path)
+    # http transport (streamable HTTP)
+    url: str = ""
+    headers: dict[str, str] = {}  # static auth headers; set => skip OAuth for this server
+    scope: str = ""  # optional OAuth scope to request at `jarvis mcp login`
+    # OAuth client auth method to request at registration. Default "none" (a public
+    # client + PKCE) — the right model for MCP clients, and what avoids the
+    # "token exchange 401" some servers (WorkOS/AuthKit, e.g. Granola) return when
+    # registered confidential. Override per server if one requires a secret.
+    token_endpoint_auth_method: str = "none"
+    # Capability a profile must grant for these tools (empty => "mcp.<name>").
+    capability: str = ""
+    # Optional allow-list of tool names to expose from this server; empty = all
+    # (still capped by MCPConfig.max_tools_per_server). The per-server firewall.
+    include: list[str] = []
+    # Optional extra trigger words for the per-turn relevance prefilter (§9), on top
+    # of the server name + words auto-derived from its tool names. Use for synonyms
+    # the tool names miss, e.g. linear -> ["ticket","bug","sprint"].
+    keywords: list[str] = []
+
+    @property
+    def required_capability(self) -> str:
+        return self.capability or f"mcp.{self.name}"
+
+
+class MCPConfig(_Base):
+    """MCP bridge (Phase 3 §6): the native MCP client + the profile-gated work
+    bundle. The brain connects to each server once (cold/startup), discovers its
+    tools, and registers them gated + timeout-bounded. No bridged call ever lands
+    on the hot path uncapped (constraint #2)."""
+
+    model_config = SettingsConfigDict(env_prefix="MCP_", env_file=".env", extra="ignore")
+
+    enabled: bool = False
+    # JSON array of MCPServerSpec, e.g. MCP_SERVERS='[{"name":"context7",...}]'.
+    servers: list[MCPServerSpec] = []
+    # Hot-path guard: a bridged call is hard-bounded here (in addition to the
+    # registry's tools.timeout_s). Connect/discovery happens off the hot path.
+    call_timeout_s: float = 20.0
+    connect_timeout_s: float = 20.0
+    # Tool-sprawl firewall: cap how many tools any one server can contribute, so
+    # a chatty server can't flood the model's tool list.
+    max_tools_per_server: int = 40
+    # Namespace tool names as "<server>_<tool>" to avoid clashes across servers
+    # and with built-in tools.
+    namespace: bool = True
+    # OAuth (http servers): where per-server tokens persist (gitignore it), and the
+    # localhost port the `jarvis mcp login` browser flow redirects back to. Auth is
+    # interactive ONLY in that command; the brain refreshes cached tokens silently
+    # and never pops a browser on the voice path.
+    auth_dir: str = "jarvis-workspace/.mcp-auth"
+    oauth_redirect_port: int = 41760
+
+
+class GoogleConfig(_Base):
+    """`google` tool (Phase 3 §6) — Jarvis's OWN Gmail + Calendar (the house
+    account), via the `gogcli` CLI. A thin client like the worker: it shells out to
+    a local, separately-authenticated binary; provider credentials never live in the
+    tool. `jarvis google-setup` does the one-time OAuth."""
+
+    model_config = SettingsConfigDict(env_prefix="GOOGLE_", env_file=".env", extra="ignore")
+
+    gogcli_bin: str = "gogcli"
+    timeout_s: float = 20.0
+    calendar_days: int = 7  # default look-ahead for "upcoming events"
+
+
+class HeartbeatConfig(_Base):
+    """Proactive heartbeat (Phase 3b, §9). A COLD-path scheduler: it periodically
+    works the HEARTBEAT.md checklist and pushes a Proactive message ONLY when it has
+    something worth saying (the silent-completion sentinel) — never on the voice hot
+    path, never into the conversational transcript."""
+
+    model_config = SettingsConfigDict(env_prefix="HEARTBEAT_", env_file=".env", extra="ignore")
+
+    enabled: bool = False
+    interval_s: float = 900.0  # how often to run the checklist (15 min)
+    path: str = "jarvis-workspace/HEARTBEAT.md"  # the proactive checklist
+    sentinel: str = "NO_REPLY"  # the model emits this when nothing's worth saying
+
+
+class WhatsAppConfig(_Base):
+    """WhatsApp connector (Phase 3b): a boundary peer wrapping `wacli` (a WhatsApp
+    CLI). Inbound messages become brain turns (channel=whatsapp, identity=number);
+    replies go back out via wacli. The connector authenticates to the brain with a
+    pairing token only — it holds no provider credentials."""
+
+    model_config = SettingsConfigDict(env_prefix="WHATSAPP_", env_file=".env", extra="ignore")
+
+    enabled: bool = False
+    wacli_bin: str = "wacli"
+    device_id: str = "whatsapp"
+    token: SecretStr = SecretStr("")  # brain pairing token for this connector
+    poll_interval_s: float = 2.0
+
+
 class Config:
     """Aggregate config. Construct once and pass modules their slice."""
 
@@ -368,6 +514,10 @@ class Config:
         self.intercom = IntercomConfig()
         self.worker = WorkerConfig()
         self.remote = RemoteConfig()
+        self.mcp = MCPConfig()
+        self.heartbeat = HeartbeatConfig()
+        self.whatsapp = WhatsAppConfig()
+        self.google = GoogleConfig()
 
     def resolved(self) -> dict:
         """Flat, secret-masked view for the dry-run printout (Step 0 gate)."""
@@ -410,6 +560,7 @@ class Config:
             "audio.frame_ms": self.audio.frame_ms,
             "audio.ack_mode": self.audio.ack_mode,
             "persona.soul_path": self.persona.soul_path,
+            "persona.skills_dir": self.persona.skills_dir,
             "persona.history_messages": self.persona.history_messages,
             "trace.enabled": self.trace.enabled,
             "trace.path": self.trace.path,
@@ -417,6 +568,7 @@ class Config:
             "capabilities.identity": self.capabilities.identity,
             "capabilities.scope": self.capabilities.scope,
             "capabilities.profiles_dir": self.capabilities.profiles_dir,
+            "capabilities.users_dir": self.capabilities.users_dir,
             "capabilities.default_capabilities": (
                 self.capabilities.default_capabilities or "<none — deny-by-default>"
             ),
@@ -424,9 +576,15 @@ class Config:
             "tools.websearch_provider": self.tools.websearch_provider,
             "tools.websearch_api_key": mask(self.tools.websearch_api_key),
             "tools.timeout_s": self.tools.timeout_s,
+            "tools.log_calls": self.tools.log_calls,
+            "tools.relevance_mode": self.tools.relevance_mode,
             "brain.host": self.brain.host,
             "brain.port": self.brain.port,
             "brain.pairing_token": mask(self.brain.pairing_token),
+            "brain.devices": (
+                ", ".join(f"{d.device_id}->{d.identity or 'house'}" for d in self.brain.devices)
+                or "<none — shared token>"
+            ),
             "intercom.brain_url": self.intercom.brain_url,
             "intercom.token": mask(self.intercom.token),
             "worker.base_url": self.worker.base_url,
@@ -437,6 +595,17 @@ class Config:
             "remote.api_key": mask(self.remote.api_key),
             "remote.configured": self.remote.configured,
             "remote.model": self.remote.model,
+            "mcp.enabled": self.mcp.enabled,
+            "mcp.servers": (
+                ", ".join(f"{s.name}[{s.transport}]" for s in self.mcp.servers)
+                or "<none>"
+            ),
+            "mcp.call_timeout_s": self.mcp.call_timeout_s,
+            "heartbeat.enabled": self.heartbeat.enabled,
+            "heartbeat.interval_s": self.heartbeat.interval_s,
+            "whatsapp.enabled": self.whatsapp.enabled,
+            "whatsapp.wacli_bin": self.whatsapp.wacli_bin,
+            "google.gogcli_bin": self.google.gogcli_bin,
         }
 
 

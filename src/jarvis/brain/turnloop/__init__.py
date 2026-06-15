@@ -21,18 +21,25 @@ import enum
 import queue
 import threading
 
-from jarvis.brain.capabilities import build_request_context
+from jarvis.brain.capabilities import context_for_resolution
+from jarvis.brain.context import RequestContext
+from jarvis.brain.contexts import ContextStore
 from jarvis.brain.gateway_client import GatewayClient
+from jarvis.brain.identity import HOUSE, IdentityResolver, load_users
 from jarvis.brain.memory_client import MemoryClient
 from jarvis.brain.session import BrainSession, TurnResult
+from jarvis.brain.skills import register_skills
 from jarvis.brain.tracing import Tracer
 from jarvis.config import Config
 from jarvis.intercom.audio import AudioIO, MicStream
 from jarvis.intercom.vad import Endpointer, SileroVAD
 from jarvis.intercom.wake import WakeWord
+from jarvis.mcp import MCPBridge
 from jarvis.services.stt import Transcriber
 from jarvis.services.tts import InworldTTS
 from jarvis.tools import build_registry
+from jarvis.tools.mcp import make_mcp_tools
+from jarvis.tools.selection import build_relevance
 
 FRAME_SAMPLES = 512
 
@@ -70,18 +77,36 @@ class TurnLoop:
         self._sr = cfg.audio.sample_rate
         # Per-request identity/capability envelope (Phase 3 §4) — single-principal
         # in 3a. The think/speak core is shared with the brain server.
-        self._ctx = build_request_context(cfg.capabilities)
-        self._registry = build_registry(cfg.tools, worker=cfg.worker, remote=cfg.remote)
-        self._session = BrainSession(
-            cfg,
-            self._ctx,
-            gateway=gateway,
-            tts=tts,
-            memory=memory,
-            tracer=tracer,
-            registry=self._registry,
-        )
+        self._registry = build_registry(cfg.tools, worker=cfg.worker, remote=cfg.remote, google=cfg.google)
+        users = load_users(cfg.capabilities.users_dir)
+        # MCP servers connect at startup (off the hot path); OAuth servers connect
+        # per principal (house + each user) so credentials isolate. See run().
+        self._mcp = MCPBridge(cfg.mcp, principals=list(users))
+        # Identity-aware like the brain server (§5): resolve the speaker per turn and
+        # route to that principal's session (own history + memory peer). With no
+        # users/ configured this stays house-only (single principal, base cache).
+        self._memory = memory
+        self._relevance = build_relevance(cfg, gateway)  # embedding scorer or None
+        self._resolver = IdentityResolver(users)
+        self._store = ContextStore(self._make_session)
+        self._asserted = "" if cfg.capabilities.identity == "house" else cfg.capabilities.identity
         self.state = State.PASSIVE
+
+    def _make_session(self, ctx: RequestContext) -> BrainSession:
+        return BrainSession(
+            self._cfg, ctx, gateway=self._gateway, tts=self._tts, memory=self._memory,
+            tracer=self._tracer, registry=self._registry, memory_user=ctx.memory_peer,
+            relevance=self._relevance,
+        )
+
+    def _resolve(self, utterance: str) -> RequestContext:
+        resolution = self._resolver.resolve(
+            device_id=self._cfg.capabilities.device_id,
+            channel="voice",
+            asserted=self._asserted,
+            utterance=utterance,
+        )
+        return context_for_resolution(self._cfg.capabilities, resolution)
 
     # --- blocking frame loops (run via to_thread) --------------------------
     def _wait_for_wake(self, mic: MicStream) -> None:
@@ -122,10 +147,10 @@ class TurnLoop:
     # --- the loop ----------------------------------------------------------
     async def run(self) -> None:
         print("Loading models…")
-        self._session.load_soul()
         self._stt.load()
         self._vad.load()
         self._wake.load()
+        await self._connect_mcp()
         try:
             with MicStream(
                 self._cfg.audio, sample_rate=self._sr, frame_samples=FRAME_SAMPLES
@@ -136,7 +161,16 @@ class TurnLoop:
                     await self._one_turn(mic)
         finally:
             self._wake.delete()
+            await self._mcp.aclose()
             await self._gateway.aclose()
+
+    async def _connect_mcp(self) -> None:
+        """Connect configured MCP servers and register their tools (best-effort —
+        a failed server is skipped, never fatal). No-op when MCP is disabled."""
+        await self._mcp.start()
+        for tool in make_mcp_tools(self._mcp):
+            self._registry.register(tool)
+        register_skills(self._registry, gateway=self._gateway, cfg=self._cfg)
 
     async def _one_turn(self, mic: MicStream) -> None:
         # PASSIVE → ACTIVE
@@ -159,7 +193,7 @@ class TurnLoop:
                 print("  (nothing said)")
                 return
             trace = self._tracer.turn(
-                room=self._cfg.gateway.room, speaker=self._cfg.gateway.speaker
+                room=self._cfg.gateway.room, speaker=self._asserted or "house"
             )
             secs = len(pcm) / 2 / self._sr
             trace.start("stt")
@@ -169,16 +203,25 @@ class TurnLoop:
             if not text:
                 return
 
+            # Resolve WHO is speaking from this utterance (§5) and route to that
+            # principal's session; a spoken claim ("it's Jules") sticks for the rest
+            # of the conversation.
+            ctx = self._resolve(text)
+            if ctx.confidence == "claimed" and ctx.identity != HOUSE:
+                self._asserted = ctx.identity
+            trace.set(speaker=ctx.identity)
+            session = self._store.get(ctx)
+
             # THINKING/SPEAKING — the session does the work (hot path reads the
             # LOCAL memory cache only); _speak_with_bargein plays the PCM and
             # watches for a barge-in, cancelling the in-flight generation.
             self.state = State.THINKING
             result = TurnResult()
             interrupted = await self._speak_with_bargein(
-                mic, self._session.respond(text, trace, result)
+                mic, session.respond(text, trace, result)
             )
             # finalize() runs even after a barge-in: result.raw is what was said.
-            self._session.finalize(text, result)
+            session.finalize(text, result)
             reply, ended = result.reply, result.ended
             print(f"  jarvis: {reply}{'  ⏹' if ended else ''}")
             if interrupted:

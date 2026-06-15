@@ -159,6 +159,24 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
             return f"error: worker unreachable ({exc})"
         return data.get("error") or data.get("output") or "(no output)"
 
+    async def see_screen(ctx: RequestContext, args: dict[str, Any]) -> str:
+        try:
+            data = await post("peekaboo", {"argv": ["see", "--json"]})
+        except Exception as exc:  # noqa: BLE001
+            return f"error: worker unreachable ({exc})"
+        return data.get("error") or data.get("output") or "(no output)"
+
+    async def control_mac(ctx: RequestContext, args: dict[str, Any]) -> str:
+        task = (args.get("task") or "").strip()
+        if not task:
+            return "error: empty task"
+        try:
+            # peekaboo's agent mode autonomously performs a GUI task.
+            data = await post("peekaboo", {"argv": ["agent", task]}, timeout=cfg.request_timeout_s)
+        except Exception as exc:  # noqa: BLE001
+            return f"error: worker unreachable ({exc})"
+        return data.get("error") or data.get("output") or "(no output)"
+
     async def repos_list(ctx: RequestContext, args: dict[str, Any]) -> str:
         try:
             data = await post("list_repos", {})
@@ -259,6 +277,25 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
             {"type": obj, "properties": {"script": {"type": "string"}}, "required": ["script"]},
             "worker.applescript",
             applescript,
+            announce=True,
+        ),
+        Tool(
+            "see_screen",
+            "Look at the worker Mac's screen — returns the visible UI elements/text "
+            "(uses peekaboo). Use to find something before controlling the Mac.",
+            {"type": obj, "properties": {}},
+            "worker.gui",
+            see_screen,
+            announce=True,
+        ),
+        Tool(
+            "control_mac",
+            "Perform a GUI task on the worker Mac (click, type, drive apps) by "
+            "describing it (uses peekaboo's agent). Use for on-screen actions that "
+            "shell/AppleScript can't do.",
+            {"type": obj, "properties": {"task": {"type": "string", "description": "What to do on screen."}}, "required": ["task"]},
+            "worker.gui",
+            control_mac,
             announce=True,
         ),
     ]

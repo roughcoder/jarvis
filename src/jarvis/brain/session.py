@@ -38,6 +38,7 @@ from jarvis.brain.tracing import Tracer
 from jarvis.config import Config
 from jarvis.services.tts import InworldTTS
 from jarvis.tools.base import ToolRegistry
+from jarvis.tools.selection import offered_servers, select_tools
 
 
 def _now_line(tz_name: str) -> str:
@@ -103,15 +104,26 @@ class BrainSession:
         memory: MemoryClient,
         tracer: Tracer,
         registry: ToolRegistry,
+        memory_user: str | None = None,
+        relevance=None,  # noqa: ANN001 - optional EmbeddingRelevance (else keyword prefilter)
     ) -> None:
         self._cfg = cfg
         self._ctx = ctx
+        self._relevance = relevance
+        # The memory principal (Honcho peer). None => single-principal base cache
+        # (the single-process loop / Phase 1). The brain server passes the resolved
+        # speaker so each user's memory is isolated (the privacy wall, §5).
+        self._memory_user = memory_user
         self._gateway = gateway
         self._tts = tts
         self._memory = memory
         self._tracer = tracer
         self._registry = registry
         self._soul = ""  # personality (SOUL.md), loaded at start
+        # Per-server keyword overrides for the relevance prefilter (§9). Built once.
+        self._server_keywords = {
+            s.name: set(s.keywords) for s in cfg.mcp.servers if s.keywords
+        }
         self._history: list[dict] = []  # rolling shared conversation context
         self._cold_tasks: set[asyncio.Task] = set()
         self._heartbeat_pcm: bytes | None = None  # cached tool-search pulse
@@ -135,13 +147,30 @@ class BrainSession:
             if len(user_text) > 120
             else self._cfg.gateway.fast_model
         )
-        memory = self._memory.read_cached_representation()
+        memory = self._memory.read_cached_representation(self._memory_user)
         messages = [
             {"role": "system", "content": self._system_prompt(memory)},
             *self._history,  # shared context: the conversation so far
             {"role": "user", "content": user_text},
         ]
-        tool_schemas = [t.openai_schema() for t in self._registry.available_for(self._ctx)]
+        available = self._registry.available_for(self._ctx)
+        # Relevance prefilter (§9): keep the per-turn tool list lean so TTFT/selection
+        # don't pay for 100+ MCP schemas every utterance. All tools stay registered.
+        # Embedding scorer when configured (semantic, with keyword fallback); else the
+        # instant keyword matcher.
+        if self._relevance is not None:
+            offered = await self._relevance.select(available, user_text)
+        else:
+            offered = select_tools(
+                available,
+                user_text,
+                enabled=self._cfg.tools.relevance_filter,
+                extra_keywords=self._server_keywords,
+            )
+        self._log_offered(available, offered)
+        # Canonical (name-sorted) order so an unchanged tool set is byte-identical
+        # turn to turn — a stable prefix the gateway/provider can cache (§9).
+        tool_schemas = [t.openai_schema() for t in sorted(offered, key=lambda t: t.name)]
 
         if tool_schemas:
             # Tool turn: run the tool loop (which yields a short "looking that up"
@@ -189,6 +218,16 @@ class BrainSession:
         )
         if self._cfg.vad.conversation_mode:
             parts.append(_END_INSTRUCTION)
+        # Who you're talking to (§5 know-or-ask). Known speaker → name them; unknown
+        # on a shared device → tell the model to ASK before anything personal.
+        if self._ctx.identity and self._ctx.identity != "house" and self._ctx.scope == "personal":
+            parts.append(f"You're speaking with {self._ctx.identity}.")
+        elif self._ctx.confidence == "unknown":
+            parts.append(
+                "You don't yet know who's speaking (a shared device). If a request "
+                "needs personal data or someone's accounts, first ask who you're "
+                "talking to; general questions don't need it."
+            )
         if memory:
             parts.append(
                 "What you already know about the user (use it naturally only if "
@@ -208,13 +247,14 @@ class BrainSession:
         turn."""
         t0 = time.perf_counter()
         n_tools = 0
+        usage: dict = {}
         for _ in range(max(1, self._cfg.tools.max_rounds)):
             msg = await self._gateway.complete_with_tools(
-                messages, model=model, tools=tool_schemas
+                messages, model=model, tools=tool_schemas, usage_out=usage
             )
             if not msg.tool_calls:
                 result.raw = msg.content or ""
-                self._record_llm(trace, t0, model, result.raw, n_tools)
+                self._record_llm(trace, t0, model, result.raw, n_tools, usage)
                 return
             assistant_msg = {
                 "role": "assistant",
@@ -244,25 +284,30 @@ class BrainSession:
                             tool_result = item
                 else:
                     tool_result = await self._execute_call(tc)  # instant: no pulse
+                self._log_tool_call(tool, tc, tool_result)
                 if trace is not None:
                     trace.event("tool", tool=tc.function.name)
                 tool_msg = {"role": "tool", "tool_call_id": tc.id, "content": tool_result}
                 messages.append(tool_msg)
                 result.tool_messages.append(tool_msg)  # carry into history
         # Out of tool rounds — force a final answer with no further tool calls.
-        msg = await self._gateway.complete_with_tools(messages, model=model, tools=None)
+        msg = await self._gateway.complete_with_tools(messages, model=model, tools=None, usage_out=usage)
         result.raw = msg.content or ""
-        self._record_llm(trace, t0, model, result.raw, n_tools)
+        self._record_llm(trace, t0, model, result.raw, n_tools, usage)
 
     @staticmethod
-    def _record_llm(trace, t0: float, model: str, content: str, n_tools: int) -> None:  # noqa: ANN001
+    def _record_llm(trace, t0: float, model: str, content: str, n_tools: int, usage: dict | None = None) -> None:  # noqa: ANN001
         if trace is not None:
+            extra = {}
+            if usage:  # prompt-cache visibility (§9)
+                extra = {k: usage[k] for k in ("prompt_tokens", "cached_tokens") if k in usage}
             trace.stage(
                 "llm",
                 (time.perf_counter() - t0) * 1000,
                 model=model,
                 chars=len(content),
                 tools=n_tools,
+                **extra,
             )
 
     async def _execute_call(self, tc) -> str:  # noqa: ANN001
@@ -275,6 +320,34 @@ class BrainSession:
             )
         except Exception as exc:  # noqa: BLE001 - tools must never break a turn
             return f"error: {exc}"
+
+    def _log_offered(self, available: list, offered: list) -> None:
+        """When the relevance prefilter narrowed the tool list, note what was offered
+        this turn (which MCP servers made the cut) — visible debugging of §9."""
+        if not (self._cfg.tools.log_calls and self._cfg.tools.relevance_filter):
+            return
+        if len(offered) == len(available):
+            return  # nothing trimmed
+        servers = ", ".join(offered_servers(offered)) or "none"
+        print(f"  ⚙ tools: offered {len(offered)}/{len(available)} (mcp: {servers})")
+
+    def _log_tool_call(self, tool, tc, result: str) -> None:  # noqa: ANN001
+        """One console line per tool call — name, the capability that gated it
+        (`mcp.<server>` for bridged MCP tools), the args, and a short result — so a
+        turn's tool/MCP activity is visible when debugging. Gated by tools.log_calls.
+        (Skills, when added in §7, compose these tools and will show the same way.)"""
+        if not self._cfg.tools.log_calls:
+            return
+        cap = tool.required_capability if tool is not None else "ungated?"
+        args = " ".join((tc.function.arguments or "").split())
+        if len(args) > 120:
+            args = args[:119] + "…"
+        out = " ".join((result or "").split())
+        errored = out[:6].lower().startswith("error")
+        if len(out) > 160:
+            out = out[:159] + "…"
+        print(f"  ⚙ tool: {tc.function.name}  [{cap}]  {args}".rstrip())
+        print(f"    {'✗' if errored else '↳'} {out}")
 
     async def _execute_with_heartbeat(self, tc):  # noqa: ANN001
         """Run a slow tool, yielding a soft heartbeat pulse (bytes) every
@@ -336,9 +409,9 @@ class BrainSession:
         # if memory is unreachable, the turn is unaffected.
         t0 = time.perf_counter()
         try:
-            await self._memory.write_turn(user_text, assistant_text)
+            await self._memory.write_turn(user_text, assistant_text, user=self._memory_user)
             refreshed = await self._memory.refresh_cache(
-                min_interval_s=self._cfg.memory.refresh_interval_s
+                min_interval_s=self._cfg.memory.refresh_interval_s, user=self._memory_user
             )
             if refreshed:
                 ms = (time.perf_counter() - t0) * 1000
@@ -387,11 +460,12 @@ class BrainSession:
         tts_first: float | None = None
         full: list[str] = []
         steering: str | None = None
+        usage: dict = {}
 
         async def sentences() -> AsyncIterator[str]:
             nonlocal first_tok, llm_done
             buf = ""
-            async for delta in self._gateway.stream(messages, model=model):
+            async for delta in self._gateway.stream(messages, model=model, usage_out=usage):
                 if first_tok is None:
                     first_tok = time.perf_counter()
                 full.append(delta)
@@ -425,12 +499,14 @@ class BrainSession:
             if trace is not None:
                 end = time.perf_counter()
                 if first_tok is not None:
+                    cache = {k: usage[k] for k in ("prompt_tokens", "cached_tokens") if k in usage}
                     trace.stage(
                         "llm",
                         ((llm_done or end) - t0) * 1000,
                         model=model,
                         ttft_ms=round((first_tok - t0) * 1000, 1),
                         chars=len(result.raw),
+                        **cache,
                     )
                 trace.stage(
                     "tts",
