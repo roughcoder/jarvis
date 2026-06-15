@@ -13,7 +13,7 @@ import pytest
 import websockets
 
 from jarvis.brain.server import BrainServer
-from jarvis.config import CapabilityConfig, MCPConfig, load_config
+from jarvis.config import BrainConfig, CapabilityConfig, MCPConfig, load_config
 from jarvis.protocol.messages import Hello, Welcome, decode, encode
 
 
@@ -33,6 +33,7 @@ def cfg(tmp_path):  # noqa: ANN001, ANN201
         _env_file=None, device_id="local-mac", profiles_dir=str(profiles), users_dir=str(users)
     )
     c.mcp = MCPConfig(_env_file=None, enabled=False)  # don't connect MCP in this test
+    c.brain = BrainConfig(_env_file=None)  # open pairing — ignore the real .env BRAIN_DEVICES
     return c
 
 

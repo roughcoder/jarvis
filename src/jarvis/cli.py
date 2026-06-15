@@ -645,16 +645,36 @@ def _cmd_mcp_probe(args: argparse.Namespace) -> int:
     if not rows:
         print("No tools discovered (servers may have failed to connect — see above).")
         return 1
+    # What the named user is actually granted (their own user-file caps). This is the
+    # per-user dimension — it's what tells discovery apart from access.
+    granted: set | None = None
+    if args.user and args.user != "house":
+        from jarvis.brain.identity import load_users
+
+        u = load_users(cfg.capabilities.users_dir).get(args.user)
+        granted = set(u.capabilities) if u else set()
+
     by_cap: dict[str, list] = {}
     for name, server, cap, desc in rows:
         by_cap.setdefault(cap, []).append((name, desc))
     for cap in sorted(by_cap):
-        print(f"capability {cap!r} (grant in a device profile to enable):")
+        if granted is None:
+            mark = "(needs this capability)"
+        elif cap in granted:
+            mark = f"✓ granted to {args.user}"
+        else:
+            mark = f"✗ NOT granted to {args.user} — discovery only"
+        print(f"capability {cap!r}  {mark}:")
         for name, desc in by_cap[cap]:
             short = (desc[:70] + "…") if len(desc) > 71 else desc
             print(f"    {name.ljust(34)}  {short}")
         print()
-    print(f"{len(rows)} tool(s) total. Grant the capabilities above to offer them by voice.")
+    print(f"{len(rows)} tool(s) discovered across {len(by_cap)} capabilit(ies).")
+    print(
+        "Note: this is a DISCOVERY view (what connects + the capability each tool "
+        "needs), not a grant. Actual access = the device profile + the speaker's "
+        "user-file caps; OAuth servers also need that user's own token."
+    )
     return 0
 
 

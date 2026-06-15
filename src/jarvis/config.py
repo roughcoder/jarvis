@@ -460,7 +460,7 @@ class GoogleConfig(_Base):
 
     model_config = SettingsConfigDict(env_prefix="GOOGLE_", env_file=".env", extra="ignore")
 
-    gogcli_bin: str = "gogcli"
+    gogcli_bin: str = "gog"  # the openclaw/tap/gogcli formula installs a `gog` binary
     timeout_s: float = 20.0
     calendar_days: int = 7  # default look-ahead for "upcoming events"
 

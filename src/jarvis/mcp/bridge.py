@@ -89,7 +89,8 @@ class MCPBridge:
         return self.tools
 
     def _registered(self, spec: MCPServerSpec) -> bool:
-        return any(s == spec.name for _, s in self._routes.values())
+        # _routes maps offered_name -> (server, tool); match on the SERVER.
+        return any(server == spec.name for server, _ in self._routes.values())
 
     def _has_token(self, spec: MCPServerSpec, principal: str) -> bool:
         from jarvis.mcp.auth import FileTokenStorage, auth_path

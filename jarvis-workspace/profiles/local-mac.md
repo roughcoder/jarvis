@@ -1,10 +1,12 @@
 ---
 # Capability profile for this Mac (CAPS_DEVICE_ID defaults to "local-mac").
-# This is the full-trust device: `jarvis run --local` (and a paired Mac intercom)
-# resolves its capabilities from here. A profile file OVERRIDES the .env
-# CAPS_DEFAULT_CAPABILITIES fallback entirely, so list everything the Mac should
-# have. Other intercoms (a room Pi, etc.) get their own, narrower profile; a
-# device with no profile file falls back to the CSV default.
+# This is the device CEILING — what's permitted *here*, for ANYONE the device
+# resolves to. So it lists only HOUSE-SAFE capabilities: house tools (worker,
+# google = Jarvis's own account) and house-safe MCP servers (context7 = public
+# docs). PERSONAL servers — Neil's Obsidian vault, his Notion/Linear/Granola
+# accounts — are NOT here; they live in `users/neil.md` so they flow with HIS
+# identity only, never to another speaker on this device. A profile file
+# OVERRIDES the .env CAPS_DEFAULT_CAPABILITIES fallback entirely.
 capabilities:
   - web.search
   - files.read
@@ -16,17 +18,13 @@ capabilities:
   - google.read
   - google.send
   - mcp.context7
-  - mcp.obsidian
-  - mcp.granola
-  - mcp.notion
-  - mcp.linear
 ---
 
-# local-mac — Neil's Mac (full scope)
+# local-mac — Neil's Mac
 
-Everything Jarvis can do locally is granted on this device.
-
-When you add an MCP server to `MCP_SERVERS` in `.env`, also add its
-`mcp.<name>` capability to the list above — otherwise the bridge will connect
-the server and discover its tools, but the deny-by-default gate will keep them
-hidden from the model on this device (the firewall against tool sprawl).
+The device ceiling: house-safe capabilities only. Neil's *personal* MCP servers
+(`mcp.obsidian`, `mcp.notion`, `mcp.linear`, `mcp.granola`) are granted in
+`users/neil.md`, so they attach to Neil's identity rather than to the device —
+another speaker resolved on this Mac would not inherit access to his vault or
+accounts. When you add a *house-safe* MCP server, grant its `mcp.<name>` here;
+a *personal* one goes in the owner's user file.

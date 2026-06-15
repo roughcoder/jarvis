@@ -18,10 +18,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import pathlib
 from typing import Any
 
 from jarvis.config import MCPConfig, MCPServerSpec
+
+# The SDK's OAuth provider logs a full ERROR traceback ("OAuth flow error") whenever
+# a headless connect can't refresh / needs fresh auth — which is our EXPECTED
+# "needs login" path (we already report it cleanly as "run jarvis mcp login"). Silence
+# that redundant traceback so the console stays readable; genuine login failures still
+# surface via our own messages.
+logging.getLogger("mcp.client.auth.oauth2").setLevel(logging.CRITICAL)
 
 
 class FileTokenStorage:

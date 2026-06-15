@@ -132,6 +132,7 @@ class BrainServer:
     async def _broadcast(self, text: str) -> None:
         """Push a proactive message to every connected intercom (heartbeat, §3b).
         Best-effort per connection; a dead socket is skipped, never fatal."""
+        print(f"  [heartbeat] proactive → {len(self._connections)} intercom(s): {text}")
         msg = encode(Proactive(text=text))
         for ws in list(self._connections):
             with contextlib.suppress(Exception):

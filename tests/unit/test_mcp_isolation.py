@@ -67,3 +67,12 @@ def test_stdio_server_is_shared_regardless_of_user(tmp_path) -> None:  # noqa: A
     b = _bridge_with(tmp_path)
     assert asyncio.run(b.call("ctx_q", {}, user="jules")) == "shared:q"
     assert asyncio.run(b.call("ctx_q", {}, user="neil")) == "shared:q"
+
+
+def test_registered_matches_server_not_tool_name(tmp_path) -> None:  # noqa: ANN001
+    # Regression: _registered must compare the SERVER, not the tool name — else a
+    # connected server is reported "no authorized user" and re-registers per user.
+    b = MCPBridge(MCPConfig(_env_file=None))
+    b._routes["notion_search"] = ("notion", "search")
+    assert b._registered(MCPServerSpec(name="notion", transport="http", url="https://x/mcp"))
+    assert not b._registered(MCPServerSpec(name="search", command="x"))
