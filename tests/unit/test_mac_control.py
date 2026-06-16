@@ -15,15 +15,22 @@ def _ctx(*caps: str) -> RequestContext:
     return RequestContext("mac", "neil", "personal", frozenset(caps))
 
 
+_GUI = {
+    "see_screen", "describe_screen", "list_apps", "launch_app",
+    "click", "type_text", "press_keys", "control_mac",
+}
+
+
 def test_gui_tools_gated_by_worker_gui() -> None:
     cfg = WorkerConfig(_env_file=None)
     tools = {t.name: t for t in make_worker_tools(cfg)}
-    assert tools["see_screen"].required_capability == "worker.gui"
-    assert tools["control_mac"].required_capability == "worker.gui"
+    assert _GUI <= set(tools)
+    for name in _GUI:
+        assert tools[name].required_capability == "worker.gui"
 
     reg = build_registry(ToolsConfig(_env_file=None), worker=cfg)
-    assert "control_mac" not in {t.name for t in reg.available_for(_ctx())}  # deny-by-default
-    assert "control_mac" in {t.name for t in reg.available_for(_ctx("worker.gui"))}
+    assert not _GUI & {t.name for t in reg.available_for(_ctx())}  # deny-by-default
+    assert _GUI <= {t.name for t in reg.available_for(_ctx("worker.gui"))}
 
 
 def test_gui_doctor_reports_missing_binary() -> None:
@@ -35,3 +42,20 @@ def test_gui_doctor_reports_missing_binary() -> None:
 def test_run_peekaboo_absent_is_graceful() -> None:
     out = asyncio.run(run_peekaboo("peekaboo-does-not-exist", ["see"], 5.0))
     assert "isn't set up" in out
+
+
+def test_gui_guidance_only_when_worker_gui_granted() -> None:
+    from jarvis.brain.session import _GUI_GUIDANCE, BrainSession
+    from jarvis.config import load_config
+    from jarvis.tools.base import ToolRegistry
+
+    cfg = load_config()
+
+    def prompt(*caps: str) -> str:
+        s = BrainSession(
+            cfg, _ctx(*caps), gateway=None, tts=None, memory=None, tracer=None, registry=ToolRegistry()
+        )
+        return s._system_prompt("")
+
+    assert _GUI_GUIDANCE in prompt("worker.gui")  # operating manual present
+    assert _GUI_GUIDANCE not in prompt("files.read")  # not for non-GUI contexts

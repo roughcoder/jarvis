@@ -95,6 +95,15 @@ class ReplyAudio(BaseModel):
         return cls(turn_id=turn_id, pcm_b64=_b64(pcm))
 
 
+class Transcript(BaseModel):
+    """Down: what the brain heard for this turn (STT runs brain-side, so the thin
+    intercom can't print the user's words without this)."""
+
+    type: Literal["transcript"] = "transcript"
+    turn_id: str
+    text: str
+
+
 class ReplyText(BaseModel):
     type: Literal["reply_text"] = "reply_text"
     turn_id: str
@@ -130,6 +139,7 @@ class WhoAreYou(BaseModel):
 Message = Union[
     Hello, Utterance, BargeIn, TextIn, Identify,
     Welcome, Reject, ReplyAudio, ReplyText, ReplyEnd, Cancel, Proactive, WhoAreYou,
+    Transcript,
 ]
 _ADAPTER: TypeAdapter = TypeAdapter(Annotated[Message, Field(discriminator="type")])
 

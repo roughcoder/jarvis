@@ -17,6 +17,7 @@ capabilities:
   - skills.author
   - google.read
   - google.send
+  - worker.gui
   - mcp.context7
 ---
 

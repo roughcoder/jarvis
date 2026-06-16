@@ -50,6 +50,9 @@ class GatewayConfig(_Base):
     # Embeddings route (LiteLLM) for the optional embedding-based tool relevance
     # scorer (§9 / WS8). Only used when TOOLS_RELEVANCE_MODE=embedding.
     embed_model: str = "embed"
+    # Multimodal route used once an image enters the turn (native vision —
+    # look_at_screen). Must map to a vision-capable model (e.g. gpt-4o).
+    vision_model: str = "strong"
     request_timeout_s: float = 60.0
     # Stream the reply and synthesise sentence-by-sentence so speech starts on
     # the first sentence (lower felt latency). False = wait for the full reply.
@@ -258,7 +261,9 @@ class ToolsConfig(_Base):
     # Hot-path guards: a single tool call can't hang a turn, and a turn can't loop
     # on tools forever.
     timeout_s: float = 8.0
-    max_rounds: int = 4
+    # Tool-loop rounds per turn. GUI control chains several (see -> act -> see), so
+    # allow more than a simple lookup needs; raise further for heavy automation.
+    max_rounds: int = 6
     # Console-log each tool call (name, gating capability, args, short result) so a
     # turn's tool/MCP activity is visible when debugging. False => silent.
     log_calls: bool = True
@@ -352,6 +357,13 @@ class WorkerConfig(_Base):
     codex_bin: str = "codex"
     claude_bin: str = "claude"
     peekaboo_bin: str = "peekaboo"   # GUI automation (worker.gui; install + perms)
+    # peekaboo's OWN agent (`control_mac`) needs an AI provider. The worker injects
+    # these into the peekaboo subprocess. Leave the base URL empty for direct OpenAI;
+    # set it to the LiteLLM gateway (http://<gateway>/v1) to route the agent through
+    # the same proxy as the voice loop. `providers` is peekaboo's "openai/<model>".
+    peekaboo_ai_providers: str = ""              # e.g. "openai/gpt-4o" or "openai/strong"
+    peekaboo_openai_base_url: str = ""           # e.g. http://localhost:4000/v1 (LiteLLM)
+    peekaboo_openai_api_key: SecretStr = SecretStr("")
     # Repo jobs run on an isolated worktree branch "<prefix>/<name>-<id>", never
     # the user's checkout.
     worktree_branch_prefix: str = "jarvis"

@@ -31,6 +31,7 @@ from jarvis.protocol.messages import (
     ReplyAudio,
     ReplyEnd,
     ReplyText,
+    Transcript,
     Utterance,
     Welcome,
     decode,
@@ -130,7 +131,9 @@ class IntercomClient:
                 msg = decode(raw)
             except Exception:
                 continue
-            if isinstance(msg, ReplyAudio) and msg.turn_id == turn_id:
+            if isinstance(msg, Transcript) and msg.turn_id == turn_id:
+                print(f"  you: {msg.text!r}")
+            elif isinstance(msg, ReplyAudio) and msg.turn_id == turn_id:
                 yield msg.pcm()
             elif isinstance(msg, ReplyText) and msg.turn_id == turn_id:
                 state["text"] = msg.text

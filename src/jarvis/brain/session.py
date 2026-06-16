@@ -41,6 +41,19 @@ from jarvis.tools.base import ToolRegistry
 from jarvis.tools.selection import offered_servers, select_tools
 
 
+_GUI_GUIDANCE = (
+    "Controlling the Mac (the screen tools, when granted): YOU operate the Mac step "
+    "by step. (1) PERCEIVE: see_screen lists the UI elements as text (best for finding "
+    "what to click and reading field values); look_at_screen sends you the actual "
+    "screen image to look at yourself (best for visual content the element list misses "
+    "— a rendered page, a chart, a result you otherwise can't read). (2) ACT with "
+    "launch_app / click / type_text / press_keys. (3) PERCEIVE AGAIN to confirm the "
+    "result before reporting it. Use each app's exact name ('Google Chrome', "
+    "'Calculator'). Carry out ALL the steps for the goal in one go, then tell the user "
+    "the actual result you saw — don't stop after one action or ask them to check it."
+)
+
+
 def _now_line(tz_name: str) -> str:
     """A human 'right now' string injected so Jarvis knows the date/time without
     a tool or a search. `tz_name` is an IANA name; empty = host local time."""
@@ -218,6 +231,8 @@ class BrainSession:
         )
         if self._cfg.vad.conversation_mode:
             parts.append(_END_INSTRUCTION)
+        if self._ctx.can("worker.gui"):
+            parts.append(_GUI_GUIDANCE)
         # Who you're talking to (§5 know-or-ask). Known speaker → name them; unknown
         # on a shared device → tell the model to ASK before anything personal.
         if self._ctx.identity and self._ctx.identity != "house" and self._ctx.scope == "personal":
@@ -287,9 +302,26 @@ class BrainSession:
                 self._log_tool_call(tool, tc, tool_result)
                 if trace is not None:
                     trace.event("tool", tool=tc.function.name)
-                tool_msg = {"role": "tool", "tool_call_id": tc.id, "content": tool_result}
-                messages.append(tool_msg)
-                result.tool_messages.append(tool_msg)  # carry into history
+                if tool is not None and tool.produces_image and not tool_result.startswith("error"):
+                    # Native vision: the tool returned a base64 image. Acknowledge the
+                    # tool call as text, then hand the image to the model as a user
+                    # message so it can SEE it, and switch to the vision route. The
+                    # image is NOT carried into long-term history (it's large).
+                    ack = {"role": "tool", "tool_call_id": tc.id, "content": "(screen captured — image below)"}
+                    messages.append(ack)
+                    result.tool_messages.append(ack)
+                    messages.append({
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "This is the current screen:"},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{tool_result}"}},
+                        ],
+                    })
+                    model = self._cfg.gateway.vision_model or model
+                else:
+                    tool_msg = {"role": "tool", "tool_call_id": tc.id, "content": tool_result}
+                    messages.append(tool_msg)
+                    result.tool_messages.append(tool_msg)  # carry into history
         # Out of tool rounds — force a final answer with no further tool calls.
         msg = await self._gateway.complete_with_tools(messages, model=model, tools=None, usage_out=usage)
         result.raw = msg.content or ""
@@ -342,7 +374,10 @@ class BrainSession:
         args = " ".join((tc.function.arguments or "").split())
         if len(args) > 120:
             args = args[:119] + "…"
-        out = " ".join((result or "").split())
+        if tool is not None and tool.produces_image and not (result or "").startswith("error"):
+            out = f"(image, {len(result)} b64 chars → sent to vision)"
+        else:
+            out = " ".join((result or "").split())
         errored = out[:6].lower().startswith("error")
         if len(out) > 160:
             out = out[:159] + "…"

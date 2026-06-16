@@ -39,6 +39,9 @@ class Tool:
     # by skills (§7): a skill composes tools, so it's only offered when the context
     # grants every tool it would use — it can never exceed its profile's powers.
     extra_capabilities: frozenset[str] = frozenset()
+    # True for tools whose result is a base64 PNG/JPEG image rather than text — the
+    # tool loop feeds it to Jarvis's multimodal model as an image (native vision).
+    produces_image: bool = False
 
     def openai_schema(self) -> dict[str, Any]:
         return {

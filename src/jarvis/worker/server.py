@@ -21,6 +21,7 @@ from aiohttp import web
 
 from jarvis.config import WorkerConfig
 from jarvis.worker.actions import (
+    capture_screen_jpeg_b64,
     cleanup_job,
     clone_repo,
     code_argv,
@@ -35,6 +36,20 @@ from jarvis.worker.actions import (
     take_screenshot,
 )
 from jarvis.worker.jobs import JobManager, slugify
+
+
+def _peekaboo_env(cfg: WorkerConfig) -> dict:
+    """peekaboo agent's AI-provider env (for `control_mac`). Empty base URL => direct
+    OpenAI; the LiteLLM gateway URL => route the agent through the proxy."""
+    env: dict[str, str] = {}
+    if cfg.peekaboo_ai_providers:
+        env["PEEKABOO_AI_PROVIDERS"] = cfg.peekaboo_ai_providers
+    if cfg.peekaboo_openai_base_url:
+        env["OPENAI_BASE_URL"] = cfg.peekaboo_openai_base_url
+    key = cfg.peekaboo_openai_api_key.get_secret_value()
+    if key:
+        env["OPENAI_API_KEY"] = key
+    return env
 
 
 def make_app(cfg: WorkerConfig) -> web.Application:
@@ -117,10 +132,18 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 {"ok": True, "job_id": job.id, "name": job.name, "branch": branch, "status": "running"}
             )
         if action == "peekaboo":
-            out = await run_peekaboo(cfg.peekaboo_bin, args.get("argv") or [], cfg.shell_timeout_s)
+            out = await run_peekaboo(
+                cfg.peekaboo_bin, args.get("argv") or [], cfg.shell_timeout_s,
+                env=_peekaboo_env(cfg) or None,
+            )
             return web.json_response({"ok": True, "output": out})
         if action == "gui_doctor":
             return web.json_response({"ok": True, **gui_doctor(cfg.peekaboo_bin)})
+        if action == "capture":
+            b64, err = await capture_screen_jpeg_b64(cfg.shell_timeout_s)
+            if err:
+                return web.json_response({"ok": False, "error": err})
+            return web.json_response({"ok": True, "image_b64": b64})
         if action == "list_repos":
             return web.json_response({"ok": True, "repos": list_repos(cfg.repo_root)})
         if action == "cleanup":

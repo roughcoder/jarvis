@@ -38,6 +38,7 @@ from jarvis.protocol.messages import (
     ReplyEnd,
     ReplyText,
     TextIn,
+    Transcript,
     Utterance,
     Welcome,
     decode,
@@ -236,6 +237,9 @@ class BrainServer:
         if not text:
             await ws.send(encode(ReplyEnd(turn_id=turn_id, ended=False)))
             return
+        print(f"  you: {text!r}")
+        with contextlib.suppress(Exception):  # let the intercom print what was heard
+            await ws.send(encode(Transcript(turn_id=turn_id, text=text)))
         # Resolve WHO this utterance is from (claim detection needs the transcript),
         # then route to that principal's session. A spoken claim sticks for the rest
         # of the conversation.

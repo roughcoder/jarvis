@@ -181,6 +181,62 @@ def test_tool_logging_can_be_disabled(tmp_path, capsys) -> None:  # noqa: ANN001
     assert "tool: write_file" not in capsys.readouterr().out
 
 
+def test_produces_image_tool_injects_image_and_switches_to_vision(tmp_path) -> None:  # noqa: ANN001
+    from jarvis.tools.base import Tool, ToolRegistry
+
+    captured: list = []
+
+    class _RecordingGateway:
+        def __init__(self, scripted) -> None:  # noqa: ANN001
+            self._s, self.calls = scripted, 0
+
+        async def complete_with_tools(self, messages, *, model=None, tools=None, usage_out=None):  # noqa: ANN001
+            captured.append({"model": model, "messages": list(messages)})
+            m = self._s[self.calls]
+            self.calls += 1
+            return m
+
+    async def look(ctx, args):  # noqa: ANN001 - returns base64 image, not text
+        return "FAKEB64DATA"
+
+    reg = ToolRegistry()
+    reg.register(Tool(
+        "look_at_screen", "see", {"type": "object", "properties": {}}, "worker.gui",
+        look, announce=False, produces_image=True,
+    ))
+    gw = _RecordingGateway([
+        _FakeMsg(tool_calls=[_FakeToolCall("c1", "look_at_screen", "{}")]),
+        _FakeMsg(content="I can see a calculator showing 300."),
+    ])
+    cfg = load_config()
+    ctx = RequestContext("dev", "neil", "personal", frozenset({"worker.gui"}))
+    session = BrainSession(cfg, ctx, gateway=gw, tts=None, memory=None, tracer=None, registry=reg)
+    result = TurnResult()
+    schemas = [t.openai_schema() for t in reg.available_for(ctx)]
+
+    async def go() -> None:
+        async for _ in session._run_tool_loop(
+            [{"role": "user", "content": "what's on screen"}],
+            "fast", TurnTrace(room="x", speaker="neil"), schemas, result,
+        ):
+            pass
+
+    asyncio.run(go())
+
+    assert result.raw == "I can see a calculator showing 300."
+    second = captured[1]["messages"]  # the call AFTER the image was injected
+    imgs = [
+        m for m in second
+        if isinstance(m.get("content"), list)
+        and any(p.get("type") == "image_url" for p in m["content"])
+    ]
+    assert imgs, "the captured screen image was injected as a user message"
+    assert "data:image/jpeg;base64,FAKEB64DATA" in imgs[0]["content"][1]["image_url"]["url"]
+    assert captured[1]["model"] == cfg.gateway.vision_model  # switched to the vision route
+    # the big image is NOT carried into long-term history
+    assert not any(isinstance(m.get("content"), list) for m in result.tool_messages)
+
+
 def test_no_tool_call_sets_reply_without_earcon(tmp_path) -> None:
     gateway = _FakeGateway([_FakeMsg(content="Two plus two is four.")])
     session = _session(tmp_path, gateway)

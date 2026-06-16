@@ -7,6 +7,7 @@ aiohttp — so the actions are unit-testable on their own.
 from __future__ import annotations
 
 import asyncio
+import os
 import pathlib
 import shutil
 import time
@@ -33,13 +34,17 @@ async def run_shell(cmd: str, cwd: str | None, timeout_s: float) -> str:
     return out.decode("utf-8", "replace").strip() or "(no output)"
 
 
-async def run_exec(argv: list[str], cwd: str | None, timeout_s: float) -> str:
+async def run_exec(
+    argv: list[str], cwd: str | None, timeout_s: float, env: dict | None = None
+) -> str:
     """Run a binary with explicit args (no shell) — for coding agents/built-ins.
-    Never raises — a missing binary / bad cwd comes back as an 'error:' string."""
+    `env` (if given) is layered ON TOP of the inherited environment. Never raises —
+    a missing binary / bad cwd comes back as an 'error:' string."""
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
             cwd=cwd or None,
+            env={**os.environ, **env} if env else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -67,16 +72,19 @@ async def take_screenshot(workspace: str, name: str | None, timeout_s: float) ->
     return f"screenshot saved to {path}"
 
 
-async def run_peekaboo(peekaboo_bin: str, argv: list[str], timeout_s: float) -> str:
-    """Drive GUI automation via peekaboo (Phase 3c, deferred-until-installed). Returns
-    a clear 'not installed' message rather than failing when the binary is absent —
-    it needs `brew install` + Screen-Recording/Accessibility permissions."""
+async def run_peekaboo(
+    peekaboo_bin: str, argv: list[str], timeout_s: float, env: dict | None = None
+) -> str:
+    """Drive GUI automation via peekaboo (Phase 3c). Returns a clear 'not installed'
+    message rather than failing when the binary is absent — it needs `brew install` +
+    Screen-Recording/Accessibility permissions. `env` carries peekaboo's AI-provider
+    config (for the `agent` subcommand) so it can route to OpenAI or LiteLLM."""
     if not shutil.which(peekaboo_bin):
         return (
             "mac GUI control isn't set up — install peekaboo and grant Screen "
             "Recording + Accessibility permissions (see `jarvis worker --doctor`)."
         )
-    return await run_exec([peekaboo_bin, *argv], None, timeout_s)
+    return await run_exec([peekaboo_bin, *argv], None, timeout_s, env=env)
 
 
 def gui_doctor(peekaboo_bin: str) -> dict:
@@ -93,6 +101,23 @@ def gui_doctor(peekaboo_bin: str) -> dict:
             "Recording + Accessibility permissions to the worker's terminal."
         ),
     }
+
+
+async def capture_screen_jpeg_b64(timeout_s: float) -> tuple[str, str]:
+    """Capture the screen as a base64 JPEG → (b64, error). JPEG (not PNG) keeps the
+    payload small for the HTTP hop + the vision model. Needs Screen Recording."""
+    import base64
+    import tempfile
+
+    tmp = pathlib.Path(tempfile.gettempdir()) / f"jarvis-screen-{uuid.uuid4().hex[:8]}.jpg"
+    out = await run_exec(["screencapture", "-x", "-t", "jpg", str(tmp)], None, timeout_s)
+    try:
+        if not tmp.exists():
+            return "", out or "error: screencapture produced no file"
+        data = base64.b64encode(tmp.read_bytes()).decode("ascii")
+        return data, ""
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def code_argv(agent: str, codex_bin: str, claude_bin: str, prompt: str) -> list[str]:
