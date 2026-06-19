@@ -14,6 +14,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import pathlib
 import uuid
@@ -299,8 +300,17 @@ async def serve(cfg: WorkerConfig) -> None:
     bcfg = app["browser_cfg"]
     if bcfg.enabled:
         print(f"  browser lane: default context {bcfg.default_context!r}, headless={bcfg.headless}")
+    # Run until a stop signal — and handle SIGTERM/SIGINT so a `kill` shuts Chrome down
+    # gracefully (a hard kill would orphan it and lock the profile).
+    import signal
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, stop.set)
     try:
-        await asyncio.Future()  # run forever
+        await stop.wait()
     finally:
         host = app["browser_holder"].get("h")
         if host is not None:

@@ -50,11 +50,10 @@ def test_browser_disabled_registers_nothing() -> None:
 
 def test_browser_tool_handles_worker_down() -> None:
     # No worker listening → the tool reports it cleanly, never raises into the turn.
+    # base_url is derived from host:port, so point port at a dead endpoint (not 8780).
     tools = {
         t.name: t
-        for t in make_browser_tools(
-            WorkerConfig(_env_file=None, base_url="http://127.0.0.1:1"), BrowserConfig(_env_file=None)
-        )
+        for t in make_browser_tools(WorkerConfig(_env_file=None, port=1), BrowserConfig(_env_file=None))
     }
     out = asyncio.run(tools["browser_open"].handler(_ctx("worker.browser"), {"url": "example.com"}))
     assert out.startswith("error:") and "unreachable" in out

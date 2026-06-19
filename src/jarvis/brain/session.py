@@ -66,7 +66,14 @@ _BROWSER_GUIDANCE = (
     "The web browser (when worker.browser is granted) is your hand for INTERACTIVE web — "
     "checking availability, filling forms, logging in, bookings, anything behind a click. "
     "For just reading facts, use web_search; to actually DO something on a site, use the "
-    "browser. To READ a page (extract an answer, a code, opening hours, availability) "
+    "browser. If you need to type but the snapshot shows only a 'Search' link or button "
+    "(not an input/textbox), CLICK it first to reveal the field, then snapshot again and "
+    "type into the input that appears — many sites hide the search box until you open it. "
+    "NEVER guess a domain — if you don't already know the exact URL, web_search "
+    "for it first (e.g. 'Old Crown Great Bookham booking') and open the real link from the "
+    "results; if a page won't load (DNS error, can't be reached), search for the correct "
+    "URL and try again rather than giving up. To READ a page (extract an answer, a code, "
+    "opening hours, availability) "
     "call browser_read — not snapshot. To ACT, browser_snapshot to see the elements "
     "(each has a [ref]), then browser_click / browser_type by ref, snapshot again after "
     "the page changes. Never give up after a snapshot shows nothing clickable — call "
@@ -74,7 +81,10 @@ _BROWSER_GUIDANCE = (
     "guessing. Two browsers: 'device' (the machine's Chrome with its "
     "logins) and 'jarvis' (his own profile) — omit context for the default. If you hit a "
     "login, captcha, or payment you can't pass, stop and tell the user what to do in the "
-    "browser window; don't pretend it failed."
+    "browser window; don't pretend it failed. Only state a time, price, or availability "
+    "you have ACTUALLY read off the page with browser_read — if you're not certain you read "
+    "the right figure, read again or say you couldn't confirm it; never fill the gap with a "
+    "plausible-sounding guess."
 )
 
 _GUI_GUIDANCE = (
