@@ -14,6 +14,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import os
 import pathlib
 import uuid
 
@@ -49,6 +50,39 @@ def _peekaboo_env(cfg: WorkerConfig) -> dict:
     key = cfg.peekaboo_openai_api_key.get_secret_value()
     if key:
         env["OPENAI_API_KEY"] = key
+    or_key = cfg.peekaboo_openrouter_api_key.get_secret_value()
+    if or_key:
+        env["OPENROUTER_API_KEY"] = or_key
+    return env
+
+
+def _summarize(args: dict) -> str:
+    """Compact one-line view of a request's args for the worker log — long/binary
+    fields (commands, base64 images) truncated so the log stays readable."""
+    parts = []
+    for k, v in args.items():
+        if k == "cwd":
+            continue
+        s = str(v)
+        parts.append(f"{k}={s[:57] + '…' if len(s) > 60 else s}")
+    return " ".join(parts) or "(no args)"
+
+
+def _shell_env(cfg: WorkerConfig) -> dict:
+    """Resolve the allowlisted secrets (WORKER_SHELL_SECRETS) into a name→value env,
+    read from the worker's environment or its local .env. These are injected into
+    shell commands so Jarvis can USE them by name without ever seeing the value."""
+    names = [n.strip() for n in cfg.shell_secrets.split(",") if n.strip()]
+    if not names:
+        return {}
+    from dotenv import dotenv_values
+
+    dotenv = dotenv_values(".env")  # reads .env WITHOUT mutating os.environ
+    env: dict[str, str] = {}
+    for n in names:
+        v = os.environ.get(n) or dotenv.get(n)
+        if v:
+            env[n] = v
     return env
 
 
@@ -74,9 +108,13 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         action = body.get("action")
         args = body.get("args") or {}
         cwd = args.get("cwd") or cfg.workspace
+        if cfg.verbose:
+            print(f"[worker] → {action}  {_summarize(args)}")
 
         if action == "shell":
-            out = await run_shell(args.get("command", ""), cwd, cfg.shell_timeout_s)
+            out = await run_shell(
+                args.get("command", ""), cwd, cfg.shell_timeout_s, env=_shell_env(cfg) or None
+            )
             return web.json_response({"ok": True, "output": out})
         if action == "applescript":
             out = await run_applescript(args.get("script", ""), cfg.shell_timeout_s)
@@ -132,10 +170,16 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 {"ok": True, "job_id": job.id, "name": job.name, "branch": branch, "status": "running"}
             )
         if action == "peekaboo":
+            argv = args.get("argv") or []
+            if cfg.verbose:
+                print(f"[worker]   peekaboo {' '.join(map(str, argv))}")
+            # the agent is multi-step → its own (longer) budget; atomic calls stay fast.
+            timeout = cfg.peekaboo_agent_timeout_s if argv[:1] == ["agent"] else cfg.shell_timeout_s
             out = await run_peekaboo(
-                cfg.peekaboo_bin, args.get("argv") or [], cfg.shell_timeout_s,
-                env=_peekaboo_env(cfg) or None,
+                cfg.peekaboo_bin, argv, timeout, env=_peekaboo_env(cfg) or None
             )
+            if cfg.verbose:
+                print(f"[worker]   ← {out}")  # FULL output (not truncated like the brain log)
             return web.json_response({"ok": True, "output": out})
         if action == "gui_doctor":
             return web.json_response({"ok": True, **gui_doctor(cfg.peekaboo_bin)})
@@ -204,6 +248,13 @@ async def serve(cfg: WorkerConfig) -> None:
     site = web.TCPSite(runner, bind, cfg.port)
     await site.start()
     print(f"Worker daemon listening on http://{bind}:{cfg.port} (agent={cfg.agent})")
+    penv = _peekaboo_env(cfg)
+    if penv.get("PEEKABOO_AI_PROVIDERS"):
+        via = penv.get("OPENAI_BASE_URL") or "OpenAI direct"
+        print(f"  peekaboo agent (control_mac): {penv['PEEKABOO_AI_PROVIDERS']} via {via}")
+    else:
+        print("  peekaboo agent (control_mac): no AI provider set — it will fail until "
+              "WORKER_PEEKABOO_AI_PROVIDERS + key are configured")
     try:
         await asyncio.Future()  # run forever
     finally:

@@ -51,6 +51,20 @@ from jarvis.tools.mcp import make_mcp_tools
 from jarvis.tools.selection import build_relevance
 
 
+def _can_bind(host: str, port: int) -> bool:
+    """True if (host, port) is free — a fast pre-flight so the brain gives a friendly
+    'port in use' message instead of a raw bind traceback after loading models."""
+    import socket
+
+    addr = "127.0.0.1" if host == "localhost" else host
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((addr, port))
+        return True
+    except OSError:
+        return False
+
+
 def authorise_device(brain, device_id: str, token: str) -> tuple[bool, str]:  # noqa: ANN001
     """Authorise a pairing → (ok, device_default_identity). A per-device token
     (BRAIN_DEVICES) is bound to its device_id and may pin a default identity; the
@@ -108,6 +122,13 @@ class BrainServer:
         )
 
     async def serve(self) -> None:
+        host, port = self._cfg.brain.host, self._cfg.brain.port
+        if not _can_bind(host, port):  # fail fast, before loading the STT model
+            print(
+                f"\n✗ Port {port} is already in use — is another `jarvis brain` "
+                f"running?\n  Free it with:  lsof -ti tcp:{port} | xargs kill\n"
+            )
+            return
         print("Loading STT model…")
         self._stt.load()
         await self._connect_mcp()

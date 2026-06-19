@@ -364,9 +364,30 @@ class WorkerConfig(_Base):
     peekaboo_ai_providers: str = ""              # e.g. "openai/gpt-4o" or "openai/strong"
     peekaboo_openai_base_url: str = ""           # e.g. http://localhost:4000/v1 (LiteLLM)
     peekaboo_openai_api_key: SecretStr = SecretStr("")
+    peekaboo_openrouter_api_key: SecretStr = SecretStr("")  # for --model openrouter/<p>/<m>
+    # The model `control_mac` passes to `peekaboo agent --model` (peekaboo's own default
+    # is gpt-5.5). Must be a peekaboo-supported name — the OpenAI family is gpt-5.x (NOT
+    # gpt-4o); or "openrouter/<provider>/<model>" to dodge OpenAI project restrictions.
+    peekaboo_agent_model: str = "gpt-5.5"
+    # control_mac (the agent) is multi-step and slow — its own budget, separate from
+    # the 30s shell timeout, so it isn't strangled mid-task.
+    peekaboo_agent_timeout_s: float = 120.0
+    # control_mac is one-shot (no way to answer a mid-task prompt), and the user asked
+    # for the task by voice — so by default tell the agent it's authorised to finish
+    # without pausing for confirmation (it still avoids clearly catastrophic actions).
+    # False => the agent may stop and ask; Jarvis relays the question to the user.
+    peekaboo_agent_autonomous: bool = True
     # Repo jobs run on an isolated worktree branch "<prefix>/<name>-<id>", never
     # the user's checkout.
     worktree_branch_prefix: str = "jarvis"
+    verbose: bool = True             # log each dispatched action + full peekaboo output
+    # Secrets Jarvis may USE (not see) in shell commands: a comma-separated allowlist
+    # of env var NAMES the worker injects into the shell environment (read from the
+    # worker's own .env / environment). The model references them by name — e.g.
+    # `curl -H "Authorization: Bearer $OPENAI_API_KEY"` — and never sees the value.
+    # Empty => no secrets exposed (deny-by-default). Opt in deliberately: anything
+    # with worker.shell could also print these, so only list what you're comfortable with.
+    shell_secrets: str = ""
     shell_timeout_s: float = 30.0    # sync shell/applescript max runtime
     job_timeout_s: float = 1800.0    # background code job max runtime (30 min)
     request_timeout_s: float = 40.0  # brain->worker HTTP timeout (> shell_timeout)

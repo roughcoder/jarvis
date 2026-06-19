@@ -42,15 +42,15 @@ from jarvis.tools.selection import offered_servers, select_tools
 
 
 _GUI_GUIDANCE = (
-    "Controlling the Mac (the screen tools, when granted): YOU operate the Mac step "
-    "by step. (1) PERCEIVE: see_screen lists the UI elements as text (best for finding "
-    "what to click and reading field values); look_at_screen sends you the actual "
-    "screen image to look at yourself (best for visual content the element list misses "
-    "— a rendered page, a chart, a result you otherwise can't read). (2) ACT with "
-    "launch_app / click / type_text / press_keys. (3) PERCEIVE AGAIN to confirm the "
-    "result before reporting it. Use each app's exact name ('Google Chrome', "
-    "'Calculator'). Carry out ALL the steps for the goal in one go, then tell the user "
-    "the actual result you saw — don't stop after one action or ask them to check it."
+    "Controlling the Mac (when worker.gui is granted): to DO anything on screen — open "
+    "apps, click, type, drive any app ('open the BBC Sport site in Chrome', 'leave the "
+    "Discord call') — use control_mac with a clear description of the WHOLE task. It's an "
+    "autonomous agent that plans, focuses the right window, acts, and verifies; report "
+    "what it actually returns (don't claim success it didn't confirm). If control_mac "
+    "comes back with a QUESTION or asks for confirmation, RELAY that to the user and act "
+    "on their answer — never say you simply can't do it when the agent was only asking "
+    "permission. To READ the screen without acting, use look_at_screen (it sends you the "
+    "actual image). Use each app's exact name ('Google Chrome')."
 )
 
 
@@ -233,6 +233,17 @@ class BrainSession:
             parts.append(_END_INSTRUCTION)
         if self._ctx.can("worker.gui"):
             parts.append(_GUI_GUIDANCE)
+        if self._ctx.can("worker.shell") and self._cfg.worker.shell_secrets:
+            names = ", ".join(
+                n.strip() for n in self._cfg.worker.shell_secrets.split(",") if n.strip()
+            )
+            parts.append(
+                "Secrets in shell commands: these are set as environment variables on the "
+                f"worker — {names}. Reference one by name in a command (e.g. "
+                'curl -H "Authorization: Bearer $OPENAI_API_KEY" …) rather than asking the '
+                "user for it or writing a placeholder. Never print, echo, or read back a "
+                "secret's value."
+            )
         # Who you're talking to (§5 know-or-ask). Known speaker → name them; unknown
         # on a shared device → tell the model to ASK before anything personal.
         if self._ctx.identity and self._ctx.identity != "house" and self._ctx.scope == "personal":

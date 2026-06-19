@@ -39,6 +39,21 @@ def _clean_output(text: str) -> str:
     return cleaned[-500:] if len(cleaned) > 500 else (cleaned or "(no output)")
 
 
+_AGENT_AUTHORISED = (
+    " The user asked for this by voice and has authorised it, so carry the WHOLE task "
+    "out and do NOT pause to ask them to confirm — they've already consented by asking. "
+    "(Still avoid clearly catastrophic or irreversible actions — deleting data, sending "
+    "money, posting publicly — unless that was explicitly the request.)"
+)
+
+
+def _agent_task(task: str, autonomous: bool) -> str:
+    """The instruction handed to peekaboo's agent. When autonomous, append the
+    authorisation clause so it finishes instead of stalling on a confirmation that a
+    one-shot call can never answer."""
+    return f"{task}{_AGENT_AUTHORISED}" if autonomous else task
+
+
 def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
     def headers() -> dict[str, str]:
         tok = cfg.token.get_secret_value()
@@ -166,33 +181,10 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
             return f"error: worker unreachable ({exc})"
         return data.get("error") or data.get("output") or "(no output)"
 
-    # Atomic GUI hands (no AI key — Jarvis orchestrates them). All gated worker.gui.
-    async def see_screen(ctx: RequestContext, args: dict[str, Any]) -> str:
-        # `--mode screen` captures the whole screen (bare `see` prints usage).
-        return await peekaboo(["see", "--mode", "screen"])
-
-    async def list_apps(ctx: RequestContext, args: dict[str, Any]) -> str:
-        return await peekaboo(["list", "apps"])
-
-    async def launch_app(ctx: RequestContext, args: dict[str, Any]) -> str:
-        app = (args.get("app") or "").strip()
-        return await peekaboo(["app", "launch", app]) if app else "error: which app?"
-
-    async def click(ctx: RequestContext, args: dict[str, Any]) -> str:
-        target = (args.get("target") or "").strip()
-        return await peekaboo(["click", target]) if target else "error: what should I click?"
-
-    async def type_text(ctx: RequestContext, args: dict[str, Any]) -> str:
-        text = args.get("text") or ""
-        return await peekaboo(["type", text]) if text else "error: nothing to type"
-
-    async def press_keys(ctx: RequestContext, args: dict[str, Any]) -> str:
-        keys = (args.get("keys") or "").strip()  # e.g. "cmd,space" or "cmd,shift,t"
-        return await peekaboo(["hotkey", keys]) if keys else "error: which keys?"
-
     async def look_at_screen(ctx: RequestContext, args: dict[str, Any]) -> str:
-        # Capture the screen and return it as base64 JPEG. The tool loop (produces_image)
-        # feeds it to Jarvis's OWN vision model — Jarvis sees the pixels directly.
+        # Read-only: capture the screen as base64 JPEG. The tool loop (produces_image)
+        # feeds it to Jarvis's OWN vision model — Jarvis sees the pixels directly. Uses
+        # `screencapture` (not peekaboo); it cannot control anything.
         try:
             data = await post("capture", {}, timeout=cfg.request_timeout_s)
         except Exception as exc:  # noqa: BLE001
@@ -201,21 +193,22 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
             return f"error: {data['error']}"
         return data.get("image_b64") or "error: no image captured"
 
-    async def describe_screen(ctx: RequestContext, args: dict[str, Any]) -> str:
-        # peekaboo's vision (`--analyze`): captures the screen + answers a question
-        # about it as TEXT. For visual content NOT in the UI element list (images,
-        # charts, rendered web pages). Needs peekaboo's AI provider configured.
-        q = (args.get("question") or "Describe what is currently shown on the screen.").strip()
-        return await peekaboo(["image", "--mode", "screen", "--analyze", q], timeout=cfg.request_timeout_s)
-
     async def control_mac(ctx: RequestContext, args: dict[str, Any]) -> str:
-        # peekaboo's OWN agent: one-shot natural-language automation. Needs peekaboo
-        # configured with an AI provider key (PEEKABOO_AI_PROVIDERS) — unlike the
-        # atomic tools above. Prefer those unless a whole task is easier in one go.
+        # The ONLY way to act on the Mac's GUI: peekaboo's autonomous agent. (Direct
+        # atomic peekaboo tools were removed — the agent has the skill to drive the UI;
+        # naive click/type orchestration didn't.) Needs an AI provider configured.
         task = (args.get("task") or "").strip()
         if not task:
             return "error: empty task"
-        return await peekaboo(["agent", task], timeout=cfg.request_timeout_s)
+        # Pin the model (peekaboo defaults to gpt-5.5, which a restricted project may
+        # lack) and add --verbose so the agent's step trace lands in the worker log.
+        argv = ["agent", _agent_task(task, cfg.peekaboo_agent_autonomous),
+                "--model", cfg.peekaboo_agent_model]
+        if cfg.verbose:
+            argv.append("--verbose")
+        # give the HTTP call a bit more than the worker's agent budget so it doesn't
+        # time out before the agent finishes.
+        return await peekaboo(argv, timeout=cfg.peekaboo_agent_timeout_s + 10)
 
     async def repos_list(ctx: RequestContext, args: dict[str, Any]) -> str:
         try:
@@ -320,60 +313,10 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
             announce=True,
         ),
         Tool(
-            "see_screen",
-            "Look at the Mac's screen — returns the visible UI elements/text (peekaboo). "
-            "Use first to find what to click before acting.",
-            {"type": obj, "properties": {}},
-            "worker.gui",
-            see_screen,
-            announce=True,
-        ),
-        Tool(
-            "list_apps",
-            "List the apps currently running on the Mac.",
-            {"type": obj, "properties": {}},
-            "worker.gui",
-            list_apps,
-            announce=False,
-        ),
-        Tool(
-            "launch_app",
-            "Open/launch an app on the Mac by name (e.g. Safari, Calculator).",
-            {"type": obj, "properties": {"app": {"type": "string"}}, "required": ["app"]},
-            "worker.gui",
-            launch_app,
-            announce=True,
-        ),
-        Tool(
-            "click",
-            "Click an on-screen element by its visible label or text (run see_screen "
-            "first to know what's there).",
-            {"type": obj, "properties": {"target": {"type": "string", "description": "The element label/text to click."}}, "required": ["target"]},
-            "worker.gui",
-            click,
-            announce=True,
-        ),
-        Tool(
-            "type_text",
-            "Type text into the focused field on the Mac.",
-            {"type": obj, "properties": {"text": {"type": "string"}}, "required": ["text"]},
-            "worker.gui",
-            type_text,
-            announce=True,
-        ),
-        Tool(
-            "press_keys",
-            "Press a keyboard shortcut on the Mac, e.g. 'cmd,space' or 'cmd,shift,t'.",
-            {"type": obj, "properties": {"keys": {"type": "string", "description": "Comma-separated combo."}}, "required": ["keys"]},
-            "worker.gui",
-            press_keys,
-            announce=True,
-        ),
-        Tool(
             "look_at_screen",
             "Look at the Mac's screen YOURSELF — captures it and sends the actual image "
-            "to your vision. Use to read or understand on-screen content (results, "
-            "images, web pages) that the UI element list doesn't give you.",
+            "to your vision so you can read or understand what's on screen (results, "
+            "images, web pages). Read-only: it sees but does not act.",
             {"type": obj, "properties": {}},
             "worker.gui",
             look_at_screen,
@@ -381,21 +324,12 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
             produces_image=True,
         ),
         Tool(
-            "describe_screen",
-            "Describe what's VISUALLY on the Mac's screen, or answer a question about "
-            "it (peekaboo's vision). An alternative to look_at_screen that returns text "
-            "instead of sending you the image. Needs peekaboo's AI provider configured.",
-            {"type": obj, "properties": {"question": {"type": "string", "description": "What to look for (optional)."}}},
-            "worker.gui",
-            describe_screen,
-            announce=True,
-        ),
-        Tool(
             "control_mac",
-            "Do a whole GUI task on the Mac from one natural-language description "
-            "(peekaboo's own agent). Needs peekaboo configured with an AI key; prefer "
-            "see_screen + click/type/press_keys/launch_app when you can.",
-            {"type": obj, "properties": {"task": {"type": "string", "description": "What to do on screen."}}, "required": ["task"]},
+            "Do ANY task on the Mac's screen from one natural-language description — an "
+            "autonomous agent that plans, focuses the right window, acts, and verifies. "
+            "This is the only way to control the GUI (open apps, click, type, drive any "
+            "app), e.g. 'open the BBC Sport site in Chrome' or 'leave the Discord call'.",
+            {"type": obj, "properties": {"task": {"type": "string", "description": "The full task to carry out on screen."}}, "required": ["task"]},
             "worker.gui",
             control_mac,
             announce=True,

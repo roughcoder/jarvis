@@ -14,13 +14,16 @@ import time
 import uuid
 
 
-async def run_shell(cmd: str, cwd: str | None, timeout_s: float) -> str:
+async def run_shell(cmd: str, cwd: str | None, timeout_s: float, env: dict | None = None) -> str:
     """Run a command through the shell, capturing stdout+stderr (timeout-bounded).
-    Never raises — a bad cwd / spawn error comes back as an 'error:' string."""
+    `env` (if given) is layered on top of the inherited environment — used to expose
+    allowlisted secrets ($OPENAI_API_KEY etc.). Never raises — a bad cwd / spawn error
+    comes back as an 'error:' string."""
     try:
         proc = await asyncio.create_subprocess_shell(
             cmd,
             cwd=cwd or None,
+            env={**os.environ, **env} if env else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
