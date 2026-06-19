@@ -53,11 +53,12 @@ src/jarvis/
     background.py      fire-and-forget lane: 'on it' now, run detached (asker's caps, no recursion), report the outcome via the proactive push
     gateway_client/    HTTP -> LiteLLM proxy; memory_client/ Honcho (per-user peer); tracing/
   protocol/            brain<->intercom WebSocket message schemas (Phase 3 W4)
-  tools/               capability-gated tools: web_search, files, worker, remote, google, mcp, background (+ selection prefilter)
+  tools/               capability-gated tools: web_search, files, worker, remote, google, mcp, background, browser (+ selection prefilter)
   mcp/                 native MCP client + bridge (stdio/http, per-user OAuth) -> gated tools
-  worker/              standalone deep-work daemon (jarvis worker) — codex/claude, worktrees, jobs, GUI
+  worker/              standalone deep-work daemon (jarvis worker) — codex/claude, worktrees, jobs, GUI, + browser host
+  browser/             self-contained Chrome-over-CDP host (nodriver, no Playwright); embedded in the worker, extractable; two contexts (device | jarvis)
   remote/              Claude Managed Agents client (cloud coding lane, dormant)
-  connectors/          non-voice channels (whatsapp/ wraps wacli) — bridge to the brain over the protocol
+  connectors/          non-voice channels: whatsapp/ (wraps wacli) + text.py (terminal console, the headless harness) — bridge to the brain over the protocol
 ```
 
 Keep the turn loop, audio I/O, memory/gateway clients, the worker, and the remote
@@ -105,6 +106,7 @@ Secrets to put in `.env` (gitignored): `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
 | `jarvis run [--no-bargein] [--local] [--brain H:P]` | hands-free loop: thin intercom → brain (`--local` = one process) |
 | `jarvis worker [--doctor]` | run the deep-work daemon (codex/claude jobs, shell, screenshot, GUI); `--doctor` checks peekaboo |
 | `jarvis whatsapp` | run the WhatsApp connector (bridge wacli ↔ brain, 3b) |
+| `jarvis text [--once MSG]` | text console: drive the brain from the terminal (no mic/STT/TTS); the headless dev + test harness |
 | `jarvis status` | is the brain reachable + what is this device allowed to do? (§3) |
 | `jarvis google-setup` | one-time OAuth for the google tool (gogcli) |
 | `jarvis jobs [-n N] [--prune]` | list worker jobs (name, status, branch, `codex resume`); `--prune` cleans finished |
