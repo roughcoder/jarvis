@@ -83,6 +83,7 @@ _TITLE_JS = "document.title"
 _URL_JS = "location.href"
 _TEXT_JS = "document.body ? document.body.innerText.slice(0, 6000) : ''"
 _READY_JS = "document.readyState"
+_COUNT_JS = "document.querySelectorAll('a,button,input,textarea,select,[role=button],[role=link],[role=textbox]').length"
 
 # Substrings that mark a dropped/failed CDP connection (recover + retry once).
 _CONN_MARKERS = ("no close frame", "connection closed", "failed to connect", "websocket", "is closed")
@@ -113,7 +114,7 @@ class BrowserHost:
                 return b
             import nodriver as uc  # lazy: only when the lane is actually used
 
-            kwargs: dict = {"headless": self._cfg.headless}
+            kwargs: dict = {"headless": self._cfg.headless, "browser_args": ["--start-maximized"]}
             prof = self._profile_dir(context)
             if prof:
                 p = pathlib.Path(prof)
@@ -170,6 +171,25 @@ class BrowserHost:
             await asyncio.sleep(0.6)  # let any gated widget load after consent
         except Exception:  # noqa: BLE001
             pass
+        await self._wait_stable(tab)
+
+    async def _wait_stable(self, tab, *, tries: int = 12, interval: float = 0.7) -> None:  # noqa: ANN001
+        """Wait for the interactive-element count to stop changing — a client-rendered
+        widget (React/Next.js booking forms, SPA journey planners) mounts AFTER
+        readyState=complete, so the first snapshot would otherwise miss it."""
+        last, stable = -1, 0
+        for _ in range(tries):
+            try:
+                n = await tab.evaluate(_COUNT_JS) or 0
+            except Exception:  # noqa: BLE001
+                return
+            if n == last:
+                stable += 1
+                if stable >= 2:  # two equal reads in a row → settled
+                    return
+            else:
+                last, stable = n, 0
+            await asyncio.sleep(interval)
 
     async def _tab(self, context: str):  # noqa: ANN202
         tab = self._tabs.get(context)
