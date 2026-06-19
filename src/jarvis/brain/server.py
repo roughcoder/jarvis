@@ -92,7 +92,9 @@ class BrainServer:
         self._cfg = cfg
         self._stt = Transcriber(cfg.stt)
         self._tracer = Tracer(cfg.trace)
-        self._registry = build_registry(cfg.tools, worker=cfg.worker, remote=cfg.remote, google=cfg.google)
+        self._registry = build_registry(
+            cfg.tools, worker=cfg.worker, remote=cfg.remote, google=cfg.google, browser=cfg.browser
+        )
         users = load_users(cfg.capabilities.users_dir)
         # MCP servers are connected at startup (async, off the hot path); OAuth
         # servers connect per principal (house + each user) so credentials isolate.

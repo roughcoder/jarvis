@@ -62,6 +62,21 @@ _BACKGROUND_GUIDANCE = (
     "proactively when it's done. Do it inline only when it's genuinely quick."
 )
 
+_BROWSER_GUIDANCE = (
+    "The web browser (when worker.browser is granted) is your hand for INTERACTIVE web — "
+    "checking availability, filling forms, logging in, bookings, anything behind a click. "
+    "For just reading facts, use web_search; to actually DO something on a site, use the "
+    "browser. To READ a page (extract an answer, a code, opening hours, availability) "
+    "call browser_read — not snapshot. To ACT, browser_snapshot to see the elements "
+    "(each has a [ref]), then browser_click / browser_type by ref, snapshot again after "
+    "the page changes. Never give up after a snapshot shows nothing clickable — call "
+    "browser_read to read the text. If a ref is stale, snapshot again rather than "
+    "guessing. Two browsers: 'device' (the machine's Chrome with its "
+    "logins) and 'jarvis' (his own profile) — omit context for the default. If you hit a "
+    "login, captcha, or payment you can't pass, stop and tell the user what to do in the "
+    "browser window; don't pretend it failed."
+)
+
 _GUI_GUIDANCE = (
     "Controlling the Mac (when worker.gui is granted): control_mac is the only way to "
     "ACT on screen — open apps, click, type, drive any app ('open the BBC Sport site in "
@@ -367,6 +382,8 @@ class BrainSession:
         parts.append(_AGENCY)  # act-by-default + persistence (stable, cacheable)
         if self._ctx.can("background.run"):
             parts.append(_BACKGROUND_GUIDANCE)
+        if self._ctx.can("worker.browser"):
+            parts.append(_BROWSER_GUIDANCE)
         if self._ctx.can("worker.gui"):
             parts.append(_GUI_GUIDANCE)
         if self._ctx.can("worker.shell") and self._cfg.worker.shell_secrets:

@@ -77,7 +77,9 @@ class TurnLoop:
         self._sr = cfg.audio.sample_rate
         # Per-request identity/capability envelope (Phase 3 §4) — single-principal
         # in 3a. The think/speak core is shared with the brain server.
-        self._registry = build_registry(cfg.tools, worker=cfg.worker, remote=cfg.remote, google=cfg.google)
+        self._registry = build_registry(
+            cfg.tools, worker=cfg.worker, remote=cfg.remote, google=cfg.google, browser=cfg.browser
+        )
         users = load_users(cfg.capabilities.users_dir)
         # MCP servers connect at startup (off the hot path); OAuth servers connect
         # per principal (house + each user) so credentials isolate. See run().

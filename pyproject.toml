@@ -47,6 +47,11 @@ worker = [
 mcp = [
     "mcp>=1.2",
 ]
+# Browser lane — a real Chrome driven over CDP via nodriver (no Playwright). Worker
+# host only (the brain talks to it over HTTP). Headed + stealthy; needs Chrome.
+browser = [
+    "nodriver>=0.37",
+]
 
 [project.scripts]
 jarvis = "jarvis.cli:main"

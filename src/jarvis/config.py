@@ -528,6 +528,27 @@ class BackgroundConfig(_Base):
     max_rounds: int = 12  # tool-loop rounds for a job (more than a voice turn — it's unattended)
 
 
+class BrowserConfig(_Base):
+    """Browser lane — a real Chrome the worker drives over CDP (nodriver, no
+    Playwright); the brain acts on it over HTTP via the worker. Two device-scoped
+    contexts share one host: 'jarvis' (his own headed, persistent profile — his
+    accounts, zero setup) and 'device' (the machine's default Chrome profile — its
+    real logins). Headed by default (less detectable + you can take the wheel for a
+    login/captcha). Gated by the `worker.browser` capability; per-device default via
+    the profile's `browser_default`."""
+
+    model_config = SettingsConfigDict(env_prefix="BROWSER_", env_file=".env", extra="ignore")
+
+    enabled: bool = True
+    chrome_path: str = ""  # explicit Chrome binary; "" => nodriver autodetect
+    jarvis_profile_dir: str = "jarvis-workspace/browser/jarvis-profile"  # persistent own profile
+    device_profile_dir: str = ""  # the OS default Chrome profile dir (the 'device' context); "" => unset
+    default_context: str = "jarvis"  # context when unspecified (profile browser_default overrides)
+    headless: bool = False  # headed by default; tests/headless servers override
+    nav_timeout_s: float = 30.0  # per navigation/action budget on the host
+    request_timeout_s: float = 45.0  # brain -> worker HTTP budget for a browser action
+
+
 class WhatsAppConfig(_Base):
     """WhatsApp connector (Phase 3b): a boundary peer wrapping `wacli` (a WhatsApp
     CLI). Inbound messages become brain turns (channel=whatsapp, identity=number);
@@ -566,6 +587,7 @@ class Config:
         self.mcp = MCPConfig()
         self.heartbeat = HeartbeatConfig()
         self.background = BackgroundConfig()
+        self.browser = BrowserConfig()
         self.whatsapp = WhatsAppConfig()
         self.google = GoogleConfig()
 
@@ -656,6 +678,11 @@ class Config:
             "background.enabled": self.background.enabled,
             "background.max_concurrent": self.background.max_concurrent,
             "background.timeout_s": self.background.timeout_s,
+            "browser.enabled": self.browser.enabled,
+            "browser.default_context": self.browser.default_context,
+            "browser.headless": self.browser.headless,
+            "browser.jarvis_profile_dir": self.browser.jarvis_profile_dir,
+            "browser.device_profile_dir": self.browser.device_profile_dir or "<unset>",
             "whatsapp.enabled": self.whatsapp.enabled,
             "whatsapp.wacli_bin": self.whatsapp.wacli_bin,
             "google.gogcli_bin": self.google.gogcli_bin,

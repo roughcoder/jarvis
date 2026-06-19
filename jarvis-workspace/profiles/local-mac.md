@@ -18,6 +18,7 @@ capabilities:
   - google.read
   - google.send
   - worker.gui
+  - worker.browser
   - background.run
   - mcp.context7
 ---

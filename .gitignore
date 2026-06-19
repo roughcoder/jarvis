@@ -21,3 +21,6 @@ build/
 
 # peekaboo / screencapture debris
 screen*.png
+
+# browser lane runtime profiles (Chrome user-data dirs)
+jarvis-workspace/browser/

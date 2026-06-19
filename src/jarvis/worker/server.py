@@ -92,6 +92,43 @@ def make_app(cfg: WorkerConfig) -> web.Application:
     # Persist jobs to disk under the workspace so they survive a daemon restart.
     jobs = JobManager(store_dir=str(workspace / "jobs"))
 
+    # Browser lane: one lazily-created BrowserHost per process (own config slice, read
+    # from env like the worker's). nodriver is imported only on first use.
+    from jarvis.config import BrowserConfig
+
+    browser_cfg = BrowserConfig()
+    browser_holder: dict = {}
+
+    async def browser_dispatch(action: str, args: dict) -> web.Response:
+        if not browser_cfg.enabled:
+            return web.json_response({"ok": False, "error": "browser lane disabled (BROWSER_ENABLED=false)"})
+        if action == "browser_doctor":
+            from jarvis.browser import browser_doctor
+
+            return web.json_response({"ok": True, **browser_doctor(browser_cfg)})
+        host = browser_holder.get("h")
+        if host is None:
+            from jarvis.browser import BrowserHost
+
+            host = BrowserHost(browser_cfg)
+            browser_holder["h"] = host
+        ctx = (args.get("context") or browser_cfg.default_context).strip()
+        if action == "browser_open":
+            data = await host.open(args.get("url", ""), ctx)
+        elif action == "browser_snapshot":
+            data = await host.snapshot(ctx)
+        elif action == "browser_click":
+            data = await host.click(int(args.get("ref", 0)), ctx)
+        elif action == "browser_type":
+            data = await host.type(
+                int(args.get("ref", 0)), args.get("text", ""), ctx, submit=bool(args.get("submit"))
+            )
+        elif action == "browser_read":
+            data = await host.read(ctx)
+        else:
+            return web.json_response({"error": f"unknown action {action!r}"}, status=400)
+        return web.json_response(data)
+
     def authorised(request: web.Request) -> bool:
         token = cfg.token.get_secret_value()
         if not token:
@@ -188,6 +225,8 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             if err:
                 return web.json_response({"ok": False, "error": err})
             return web.json_response({"ok": True, "image_b64": b64})
+        if action and action.startswith("browser"):
+            return await browser_dispatch(action, args)
         if action == "list_repos":
             return web.json_response({"ok": True, "repos": list_repos(cfg.repo_root)})
         if action == "cleanup":
@@ -231,6 +270,8 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         return web.json_response({"ok": True, "agent": cfg.agent})
 
     app = web.Application()
+    app["browser_holder"] = browser_holder  # for clean shutdown in serve()
+    app["browser_cfg"] = browser_cfg
     app.add_routes([
         web.post("/run", run),
         web.get("/jobs/{id}", get_job),
@@ -255,7 +296,13 @@ async def serve(cfg: WorkerConfig) -> None:
     else:
         print("  peekaboo agent (control_mac): no AI provider set — it will fail until "
               "WORKER_PEEKABOO_AI_PROVIDERS + key are configured")
+    bcfg = app["browser_cfg"]
+    if bcfg.enabled:
+        print(f"  browser lane: default context {bcfg.default_context!r}, headless={bcfg.headless}")
     try:
         await asyncio.Future()  # run forever
     finally:
+        host = app["browser_holder"].get("h")
+        if host is not None:
+            await host.aclose()
         await runner.cleanup()
