@@ -37,7 +37,7 @@ _REF_RE = re.compile(r"\[(\d+)\]")
 # frame), passing the running offset, so refs are unique across frames.
 def _snapshot_js(offset: int) -> str:
     return (
-        "Array.from(document.querySelectorAll('a,button,input,textarea,select,[role=button],[role=link],[role=textbox],[role=checkbox],[onclick],[contenteditable=true]'))"
+        "Array.from(document.querySelectorAll('a,button,input,textarea,select,[role=button],[role=link],[role=textbox],[role=checkbox],[role=option],[role=menuitem],[role=menuitemradio],[role=gridcell],[role=tab],[role=spinbutton],[role=combobox],[onclick],[contenteditable=true]'))"
         "  .filter(el => {"
         "    const r = el.getBoundingClientRect();"
         "    if (r.width === 0 || r.height === 0) return false;"
@@ -285,6 +285,7 @@ class BrowserHost:
                 return {"ok": False, "error": f"no element [{ref}] — snapshot again, the page may have changed"}
             await el.click()
             await asyncio.sleep(0.6)
+            await self._wait_stable(tab, tries=6)  # a click may open a popover/calendar — let it render
             cur, title = await self._where(tab)
             return {"ok": True, "url": cur, "title": title}
 
