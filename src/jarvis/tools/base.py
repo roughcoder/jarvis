@@ -42,6 +42,10 @@ class Tool:
     # True for tools whose result is a base64 PNG/JPEG image rather than text — the
     # tool loop feeds it to Jarvis's multimodal model as an image (native vision).
     produces_image: bool = False
+    # Per-call timeout override (seconds). None => the registry's default hot-path
+    # guard. Set for inherently slow tools (control_mac drives the screen for up to a
+    # couple of minutes) so they aren't cancelled mid-run with an empty timeout error.
+    timeout_s: float | None = None
 
     def openai_schema(self) -> dict[str, Any]:
         return {
@@ -91,5 +95,10 @@ class ToolRegistry:
             require(ctx, cap)
         result = tool.handler(ctx, args)
         if inspect.isawaitable(result):
-            result = await asyncio.wait_for(result, timeout_s)
+            # A slow tool (control_mac) may set its own budget; else the hot-path guard.
+            eff = tool.timeout_s or timeout_s
+            try:
+                result = await asyncio.wait_for(result, eff)
+            except TimeoutError as exc:  # bare TimeoutError stringifies to '' — be legible
+                raise ToolError(f"{name} timed out after {eff:.0f}s") from exc
         return str(result)

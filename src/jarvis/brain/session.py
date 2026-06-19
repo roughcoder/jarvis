@@ -41,16 +41,39 @@ from jarvis.tools.base import ToolRegistry
 from jarvis.tools.selection import offered_servers, select_tools
 
 
+_AGENCY = (
+    "Act, don't advise: you're an assistant with hands. When the user asks for something "
+    "you have a tool to do, DO it — never answer 'call them', 'use their website', "
+    "'you'll need to…', or 'I can't access that' when a tool could do it. Persist down "
+    "your options: try the right tool, and if it fails fix the obvious problem and try "
+    "again, or take another route, before you conclude you can't. Stop only at a GENUINE "
+    "wall — a login, two-factor, a payment, a captcha, or a destructive and irreversible "
+    "step — and when you hit one, say specifically what you need from the user to get "
+    "past it; don't refuse vaguely. Report only what truly happened: never claim you did "
+    "something you didn't confirm, and don't call it a failure when you merely reached a "
+    "permission prompt."
+)
+
+_BACKGROUND_GUIDANCE = (
+    "Slow work goes to the background: for anything that takes more than a few seconds — "
+    "driving the Mac through several steps, a multi-page web task, deep research, a "
+    "booking — hand it to run_in_background and tell the user you're on it, rather than "
+    "making them wait through it on this turn. You'll report the outcome to them "
+    "proactively when it's done. Do it inline only when it's genuinely quick."
+)
+
 _GUI_GUIDANCE = (
-    "Controlling the Mac (when worker.gui is granted): to DO anything on screen — open "
-    "apps, click, type, drive any app ('open the BBC Sport site in Chrome', 'leave the "
-    "Discord call') — use control_mac with a clear description of the WHOLE task. It's an "
-    "autonomous agent that plans, focuses the right window, acts, and verifies; report "
-    "what it actually returns (don't claim success it didn't confirm). If control_mac "
-    "comes back with a QUESTION or asks for confirmation, RELAY that to the user and act "
-    "on their answer — never say you simply can't do it when the agent was only asking "
-    "permission. To READ the screen without acting, use look_at_screen (it sends you the "
-    "actual image). Use each app's exact name ('Google Chrome')."
+    "Controlling the Mac (when worker.gui is granted): control_mac is the only way to "
+    "ACT on screen — open apps, click, type, drive any app ('open the BBC Sport site in "
+    "Chrome', 'leave the Discord call'). It's an autonomous agent that plans, focuses the "
+    "right window, acts, and verifies, but it works step by step and can take a while — "
+    "so for anything beyond a quick single action, start it via run_in_background and say "
+    "you're on it rather than waiting on the live turn. Report what it actually returns "
+    "(don't claim success it didn't confirm); if it comes back with a QUESTION or asks to "
+    "confirm, RELAY that to the user and act on their answer — never say you can't when "
+    "the agent was only asking permission. To READ the screen without acting, use "
+    "look_at_screen (it sends you the actual image); to look facts up, use web_search "
+    "rather than driving a browser by hand. Use each app's exact name ('Google Chrome')."
 )
 
 
@@ -302,6 +325,9 @@ class BrainSession:
         )
         if self._cfg.vad.conversation_mode:
             parts.append(_END_INSTRUCTION)
+        parts.append(_AGENCY)  # act-by-default + persistence (stable, cacheable)
+        if self._ctx.can("background.run"):
+            parts.append(_BACKGROUND_GUIDANCE)
         if self._ctx.can("worker.gui"):
             parts.append(_GUI_GUIDANCE)
         if self._ctx.can("worker.shell") and self._cfg.worker.shell_secrets:

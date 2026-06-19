@@ -229,6 +229,7 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
             "worker.shell",
             shell,
             announce=True,
+            timeout_s=cfg.request_timeout_s + 5,  # a shell call can exceed the 8s hot-path guard
         ),
         Tool(
             "start_coding_job",
@@ -333,5 +334,9 @@ def make_worker_tools(cfg: WorkerConfig) -> list[Tool]:
             "worker.gui",
             control_mac,
             announce=True,
+            # The peekaboo agent drives the screen for up to a couple of minutes; give the
+            # registry a budget past the handler's HTTP timeout so it isn't cancelled
+            # mid-run with an empty error (it should normally run via run_in_background).
+            timeout_s=cfg.peekaboo_agent_timeout_s + 15,
         ),
     ]
