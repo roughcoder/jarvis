@@ -278,12 +278,41 @@ class BrowserHost:
         except Exception:  # noqa: BLE001 - not found / timed out
             return doc, None
 
+    async def _real_click(self, doc, el) -> bool:  # noqa: ANN001
+        """A genuine pointer click — move → press → release at the element's centre via
+        CDP, the way a real browser does it. Synthetic DOM .click() doesn't fire the
+        pointerdown/mousedown many modern widgets (React-Aria/MUI dropdowns, custom
+        comboboxes) listen for; this does, so it's general, not site-specific. Dispatched
+        on the element's own document, so it works inside frames too. Returns False if
+        the element has no box (caller falls back to .click())."""
+        from nodriver import cdp  # lazy
+
+        with contextlib.suppress(Exception):
+            await el.scroll_into_view()
+        try:
+            center = (await el.get_position()).center
+        except Exception:  # noqa: BLE001
+            return False
+        if not center:
+            return False
+        x, y = center
+        btn = cdp.input_.MouseButton("left")
+        await doc.send(cdp.input_.dispatch_mouse_event("mouseMoved", x=x, y=y))
+        await doc.send(
+            cdp.input_.dispatch_mouse_event("mousePressed", x=x, y=y, button=btn, buttons=1, click_count=1)
+        )
+        await doc.send(
+            cdp.input_.dispatch_mouse_event("mouseReleased", x=x, y=y, button=btn, buttons=1, click_count=1)
+        )
+        return True
+
     async def click(self, ref: int, context: str) -> dict:
         async def fn(tab):  # noqa: ANN001, ANN202
-            _doc, el = await self._resolve(context, tab, ref)
+            doc, el = await self._resolve(context, tab, ref)
             if el is None:
                 return {"ok": False, "error": f"no element [{ref}] — snapshot again, the page may have changed"}
-            await el.click()
+            if not await self._real_click(doc, el):
+                await el.click()  # fallback for elements without a box model
             await asyncio.sleep(0.6)
             await self._wait_stable(tab, tries=6)  # a click may open a popover/calendar — let it render
             cur, title = await self._where(tab)
