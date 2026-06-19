@@ -1,0 +1,111 @@
+"""Text console connector — drive the brain from a terminal (no mic/STT/TTS).
+
+A developer convenience AND the headless test harness. It connects to the brain
+over the SAME WebSocket protocol the voice intercom uses, but sends
+`TextIn(text_only=True)` and prints `ReplyText` — the brain skips TTS for the turn,
+so this needs no audio stack and no TTS key. It exercises the whole brain (persona,
+tools, background lane, browser) as text:
+
+  jarvis text                      # interactive REPL (or piped stdin)
+  jarvis text --once "do the thing" # one turn, print the reply, exit (scriptable)
+
+A thin boundary peer like the WhatsApp connector — it imports nothing from the
+brain and pairs with the device id + intercom token.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+import uuid
+
+from jarvis.config import Config
+from jarvis.protocol.messages import (
+    Hello,
+    Proactive,
+    ReplyEnd,
+    ReplyText,
+    TextIn,
+    Welcome,
+    decode,
+    encode,
+)
+
+
+async def text_turn(ws, text: str) -> tuple[str, bool]:  # noqa: ANN001
+    """Drive ONE text turn through the brain and return (reply, ended). Sends a
+    text-only TextIn and collects ReplyText up to ReplyEnd; prints any Proactive
+    push (a background/heartbeat result) that arrives first. Pure routing —
+    unit-tested with a fake socket."""
+    turn_id = uuid.uuid4().hex
+    await ws.send(encode(TextIn(turn_id=turn_id, text=text, text_only=True)))
+    reply, ended = "", False
+    async for raw in ws:
+        m = decode(raw)
+        if isinstance(m, ReplyText) and m.turn_id == turn_id:
+            reply = m.text
+        elif isinstance(m, ReplyEnd) and m.turn_id == turn_id:
+            ended = m.ended
+            break
+        elif isinstance(m, Proactive):
+            print(f"\n🔔 {m.text}\n")
+    return reply, ended
+
+
+class TextConsole:
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg
+
+    async def _connect(self):  # noqa: ANN202 - returns (ws, Welcome)
+        import websockets
+
+        ws = await websockets.connect(self._cfg.intercom.brain_url, open_timeout=5)
+        await ws.send(
+            encode(
+                Hello(
+                    device_id=self._cfg.capabilities.device_id,
+                    token=self._cfg.intercom.token.get_secret_value(),
+                    channel="text",
+                )
+            )
+        )
+        welcome = decode(await asyncio.wait_for(ws.recv(), 5))
+        if not isinstance(welcome, Welcome):
+            await ws.close()
+            raise RuntimeError(f"pairing rejected: {welcome}")
+        return ws, welcome
+
+    async def once(self, text: str) -> int:
+        """Send one message, print the reply, exit — the scriptable path."""
+        ws, _ = await self._connect()
+        try:
+            reply, _ended = await text_turn(ws, text)
+            print(reply)
+        finally:
+            await ws.close()
+        return 0
+
+    async def repl(self) -> int:
+        """Interactive (or piped) REPL. Reads stdin lines, one turn each."""
+        ws, welcome = await self._connect()
+        caps = ", ".join(welcome.capabilities) or "(none)"
+        print(
+            f"jarvis text → {self._cfg.intercom.brain_url}\n"
+            f"paired as {welcome.identity} ({welcome.scope}); can: {caps}\n"
+            "Type a message, or Ctrl-D to exit.\n"
+        )
+        try:
+            while True:
+                line = await asyncio.to_thread(sys.stdin.readline)
+                if not line:  # EOF (Ctrl-D / end of pipe)
+                    break
+                text = line.strip()
+                if not text:
+                    continue
+                reply, ended = await text_turn(ws, text)
+                print(f"jarvis: {reply}")
+                if ended:
+                    print("(conversation ended)")
+        finally:
+            await ws.close()
+        return 0

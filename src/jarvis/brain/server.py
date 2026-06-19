@@ -278,10 +278,14 @@ class BrainServer:
             conn["asserted"] = ctx.identity
         session = self._contexts.get(ctx)
         trace = self._tracer.turn(room=self._cfg.gateway.room, speaker=ctx.identity)
+        text_only = isinstance(msg, TextIn) and msg.text_only
         result = TurnResult()
         try:
-            async for pcm in session.respond(text, trace, result):
-                await ws.send(encode(ReplyAudio.of(turn_id, pcm)))
+            if text_only:  # text console / scripted test — reply text only, no TTS
+                await session.respond_text(text, trace, result)
+            else:
+                async for pcm in session.respond(text, trace, result):
+                    await ws.send(encode(ReplyAudio.of(turn_id, pcm)))
         except asyncio.CancelledError:
             session.finalize(text, result)  # remember what was actually said
             self._tracer.emit(trace)

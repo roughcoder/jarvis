@@ -253,6 +253,45 @@ class BrainSession:
         if result.reply:
             self._fire_cold_path(user_text, result.reply)
 
+    async def respond_text(self, user_text: str, trace, result: TurnResult) -> str:  # noqa: ANN001
+        """Text-only turn: the SAME think core as respond() but it returns the reply
+        text and plays NO audio (a text client wants ReplyText only). Reuses the tool
+        loop, so tools work in text mode — the harness can drive the browser, etc.
+        Call finalize() afterwards for end-detection + memory, exactly like respond()."""
+        model = (
+            self._cfg.gateway.strong_model
+            if len(user_text) > 120
+            else self._cfg.gateway.fast_model
+        )
+        memory = self._memory.read_cached_representation(self._memory_user) if self._memory else ""
+        messages = [
+            {"role": "system", "content": self._system_prompt(memory)},
+            *self._history,
+            {"role": "user", "content": user_text},
+        ]
+        available = self._registry.available_for(self._ctx)
+        if self._relevance is not None:
+            offered = await self._relevance.select(available, user_text)
+        else:
+            offered = select_tools(
+                available, user_text, enabled=self._cfg.tools.relevance_filter,
+                extra_keywords=self._server_keywords,
+            )
+        self._log_offered(available, offered)
+        tool_schemas = [t.openai_schema() for t in sorted(offered, key=lambda t: t.name)]
+        if tool_schemas:
+            # Drain the tool loop's PCM (earcons / vision) — a text client never plays it.
+            async for _pcm in self._run_tool_loop(messages, model, trace, tool_schemas, result):
+                pass
+        else:
+            if trace is not None:
+                trace.start("llm")
+            raw = await self._gateway.complete(messages, model=model)
+            if trace is not None:
+                trace.end("llm", model=model, chars=len(raw or ""), memory=bool(memory))
+            result.raw = raw
+        return _END_RE.sub(" ", result.raw or "").strip()
+
     async def run_task(self, task: str, *, max_rounds: int) -> str:
         """Headless agentic execution for the background lane (fire-and-forget): run
         the gated tool loop to completion and return a short spoken-style summary of

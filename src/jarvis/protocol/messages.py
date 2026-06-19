@@ -65,6 +65,9 @@ class TextIn(BaseModel):
     type: Literal["text_in"] = "text_in"
     turn_id: str
     text: str
+    # A text client (the terminal console, scripted tests) wants ReplyText only —
+    # the brain skips TTS for the turn, so no audio stack / TTS key is needed.
+    text_only: bool = False
 
 
 # --- down: brain -> intercom -----------------------------------------------

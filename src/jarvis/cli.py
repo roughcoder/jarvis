@@ -375,6 +375,25 @@ def _cmd_whatsapp(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_text(args: argparse.Namespace) -> int:
+    """Text console: drive the brain from the terminal — no mic/STT/TTS. The dev +
+    test harness. `--once` sends one message and prints the reply (scriptable)."""
+    from jarvis.connectors.text import TextConsole
+
+    cfg = load_config()
+    console = TextConsole(cfg)
+    try:
+        if args.once is not None:
+            return asyncio.run(console.once(args.once))
+        return asyncio.run(console.repl())
+    except KeyboardInterrupt:
+        print("\nstopped.")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"✗ {exc} — is `jarvis brain` running?")
+        return 1
+
+
 def _cmd_worker(args: argparse.Namespace) -> int:
     """Run the worker daemon — deep work + machine control on this host (W3c).
     A standalone service the brain dispatches to over HTTP. `--doctor` reports what
@@ -835,6 +854,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_whatsapp = sub.add_parser("whatsapp", help="Run the WhatsApp connector (bridge wacli <-> brain, 3b)")
     p_whatsapp.set_defaults(func=_cmd_whatsapp)
+
+    p_text = sub.add_parser("text", help="Text console: drive the brain from the terminal (no mic/STT/TTS)")
+    p_text.add_argument("--once", metavar="MESSAGE", help="Send one message, print the reply, and exit (scriptable)")
+    p_text.set_defaults(func=_cmd_text)
 
     p_remote = sub.add_parser("remote-setup", help="One-time: create the cloud agent + environment (remote coding)")
     p_remote.set_defaults(func=_cmd_remote_setup)
