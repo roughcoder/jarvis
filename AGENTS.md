@@ -50,9 +50,10 @@ src/jarvis/
     identity.py / contexts.py      who's speaking (trust tiers, users/) + per-(device×user) sessions (3d §5/§9)
     skills.py          self-authored recipes composing gated tools (§7)
     heartbeat.py       proactive cold-path scheduler (silent sentinel, §3b)
+    background.py      fire-and-forget lane: 'on it' now, run detached (asker's caps, no recursion), report the outcome via the proactive push
     gateway_client/    HTTP -> LiteLLM proxy; memory_client/ Honcho (per-user peer); tracing/
   protocol/            brain<->intercom WebSocket message schemas (Phase 3 W4)
-  tools/               capability-gated tools: web_search, files, worker, remote, google, mcp (+ selection prefilter)
+  tools/               capability-gated tools: web_search, files, worker, remote, google, mcp, background (+ selection prefilter)
   mcp/                 native MCP client + bridge (stdio/http, per-user OAuth) -> gated tools
   worker/              standalone deep-work daemon (jarvis worker) — codex/claude, worktrees, jobs, GUI
   remote/              Claude Managed Agents client (cloud coding lane, dormant)

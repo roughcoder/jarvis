@@ -54,6 +54,17 @@ _GUI_GUIDANCE = (
 )
 
 
+_BACKGROUND_FRAMING = (
+    "You are completing this task in the BACKGROUND — the user has already been told "
+    "you're on it and has moved on, so there is NO ONE to ask follow-up questions. Make "
+    "sensible decisions yourself and use your tools to actually DO the task, end to end. "
+    "When you're finished, reply with ONE or two natural spoken sentences reporting the "
+    "outcome — what you did and the result, or, if you genuinely couldn't finish, what "
+    "stopped you. That sentence is spoken to the user out of the blue, so make it sound "
+    "like you're proactively letting them know it's done."
+)
+
+
 def _now_line(tz_name: str) -> str:
     """A human 'right now' string injected so Jarvis knows the date/time without
     a tool or a search. `tz_name` is an IANA name; empty = host local time."""
@@ -218,6 +229,66 @@ class BrainSession:
         self._remember(user_text, result)
         if result.reply:
             self._fire_cold_path(user_text, result.reply)
+
+    async def run_task(self, task: str, *, max_rounds: int) -> str:
+        """Headless agentic execution for the background lane (fire-and-forget): run
+        the gated tool loop to completion and return a short spoken-style summary of
+        the outcome. No TTS, no audio, no trace, and it does NOT touch the live
+        conversation history — its own ephemeral message list. Same `ctx` as the
+        asker, so it runs with their capabilities and never more. Uses the strong
+        model (off the hot path, quality over latency)."""
+        memory = self._memory.read_cached_representation(self._memory_user) if self._memory else ""
+        messages = [
+            {"role": "system", "content": f"{self._system_prompt(memory)}\n\n{_BACKGROUND_FRAMING}"},
+            {"role": "user", "content": task},
+        ]
+        model = self._cfg.gateway.strong_model
+        available = self._registry.available_for(self._ctx)
+        if self._relevance is not None:
+            offered = await self._relevance.select(available, task)
+        else:
+            offered = select_tools(
+                available, task, enabled=self._cfg.tools.relevance_filter,
+                extra_keywords=self._server_keywords,
+            )
+        tool_schemas = [t.openai_schema() for t in sorted(offered, key=lambda t: t.name)]
+        for _ in range(max(1, max_rounds)):
+            msg = await self._gateway.complete_with_tools(
+                messages, model=model, tools=tool_schemas or None
+            )
+            if not msg.tool_calls:
+                return _END_RE.sub(" ", msg.content or "").strip()
+            messages.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in msg.tool_calls
+                ],
+            })
+            for tc in msg.tool_calls:
+                tool = self._registry.get(tc.function.name)
+                tool_result = await self._execute_call(tc)
+                self._log_tool_call(tool, tc, tool_result)
+                if tool is not None and tool.produces_image and not tool_result.startswith("error"):
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": "(screen captured — image below)"})
+                    messages.append({
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "This is the current screen:"},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{tool_result}"}},
+                        ],
+                    })
+                    model = self._cfg.gateway.vision_model or model
+                else:
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result})
+        # Out of rounds — force a final summary with no further tool calls.
+        final = await self._gateway.complete_with_tools(messages, model=model, tools=None)
+        return _END_RE.sub(" ", final.content or "").strip()
 
     def _system_prompt(self, memory: str) -> str:
         """Soul (who Jarvis is) + format + memory (what he knows about you)."""

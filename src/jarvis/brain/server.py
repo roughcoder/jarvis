@@ -15,6 +15,7 @@ import dataclasses
 
 import websockets
 
+from jarvis.brain.background import BackgroundRunner
 from jarvis.brain.capabilities import context_for_resolution
 from jarvis.brain.context import RequestContext
 from jarvis.brain.contexts import ContextStore
@@ -47,6 +48,7 @@ from jarvis.protocol.messages import (
 from jarvis.services.stt import Transcriber
 from jarvis.services.tts import InworldTTS
 from jarvis.tools import build_registry
+from jarvis.tools.background import make_background_tool
 from jarvis.tools.mcp import make_mcp_tools
 from jarvis.tools.selection import build_relevance
 
@@ -107,6 +109,13 @@ class BrainServer:
         self._contexts = ContextStore(self._make_session)
         # Open intercom connections (for proactive heartbeat push, §3b).
         self._connections: set = set()
+        # Background-task lane (fire-and-forget): start() returns instantly; the
+        # outcome is pushed via the same proactive broadcast the heartbeat uses.
+        self._background = BackgroundRunner(
+            cfg.background, session_factory=self._make_session, notify=self._broadcast
+        )
+        if cfg.background.enabled:
+            self._registry.register(make_background_tool(self._background))
 
     def _make_session(self, ctx: RequestContext) -> BrainSession:
         return BrainSession(

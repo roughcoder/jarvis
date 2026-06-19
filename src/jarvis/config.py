@@ -512,6 +512,22 @@ class HeartbeatConfig(_Base):
     sentinel: str = "NO_REPLY"  # the model emits this when nothing's worth saying
 
 
+class BackgroundConfig(_Base):
+    """Background-task lane (fire-and-forget). Jarvis kicks off a slow, multi-step
+    task — book a table, deep research, a long Mac job — says 'on it' immediately on
+    the hot path, runs the work DETACHED (its own headless agentic tool loop, with the
+    SAME capabilities as the asker — never more), and pushes the outcome as a Proactive
+    message when it finishes. Gated by the `background.run` capability (deny-by-default).
+    Off the hot path by construction; a concurrency cap + per-job timeout bound it."""
+
+    model_config = SettingsConfigDict(env_prefix="BACKGROUND_", env_file=".env", extra="ignore")
+
+    enabled: bool = True
+    max_concurrent: int = 3  # reject new jobs past this many running at once
+    timeout_s: float = 600.0  # hard ceiling per job (10 min)
+    max_rounds: int = 12  # tool-loop rounds for a job (more than a voice turn — it's unattended)
+
+
 class WhatsAppConfig(_Base):
     """WhatsApp connector (Phase 3b): a boundary peer wrapping `wacli` (a WhatsApp
     CLI). Inbound messages become brain turns (channel=whatsapp, identity=number);
@@ -549,6 +565,7 @@ class Config:
         self.remote = RemoteConfig()
         self.mcp = MCPConfig()
         self.heartbeat = HeartbeatConfig()
+        self.background = BackgroundConfig()
         self.whatsapp = WhatsAppConfig()
         self.google = GoogleConfig()
 
@@ -636,6 +653,9 @@ class Config:
             "mcp.call_timeout_s": self.mcp.call_timeout_s,
             "heartbeat.enabled": self.heartbeat.enabled,
             "heartbeat.interval_s": self.heartbeat.interval_s,
+            "background.enabled": self.background.enabled,
+            "background.max_concurrent": self.background.max_concurrent,
+            "background.timeout_s": self.background.timeout_s,
             "whatsapp.enabled": self.whatsapp.enabled,
             "whatsapp.wacli_bin": self.whatsapp.wacli_bin,
             "google.gogcli_bin": self.google.gogcli_bin,
