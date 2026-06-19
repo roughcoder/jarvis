@@ -26,27 +26,34 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import pathlib
+import re
 
-# Tag every visible, interactive element with a 1-based [ref] and return one line per
-# element: `[n] role "name"`. A single chained expression (filter→map→join), not an
-# IIFE — nodriver's evaluate returns a plain expression's value but not always an IIFE's.
-_SNAPSHOT_JS = r"""
-Array.from(document.querySelectorAll('a,button,input,textarea,select,[role=button],[role=link],[role=textbox],[role=checkbox],[onclick],[contenteditable=true]'))
-  .filter(el => {
-    const r = el.getBoundingClientRect();
-    if (r.width === 0 || r.height === 0) return false;
-    const st = window.getComputedStyle(el);
-    return st.visibility !== 'hidden' && st.display !== 'none';
-  })
-  .map((el, i) => {
-    el.setAttribute('data-jref', String(i + 1));
-    const role = el.getAttribute('role') || el.tagName.toLowerCase();
-    const name = (el.getAttribute('aria-label') || el.placeholder || el.value ||
-                  el.innerText || el.getAttribute('name') || '').trim().replace(/\s+/g, ' ').slice(0, 80);
-    return '[' + (i + 1) + '] ' + role + ' ' + JSON.stringify(name);
-  })
-  .join('\n')
-"""
+_REF_RE = re.compile(r"\[(\d+)\]")
+
+# Tag every visible, interactive element with a global [ref] (continuing from `offset`
+# across documents) and return one line per element: `[n] role "name"`. A single chained
+# expression (filter→map→join), not an IIFE — nodriver's evaluate returns a plain
+# expression's value but not always an IIFE's. Run once per document (main page + each
+# frame), passing the running offset, so refs are unique across frames.
+def _snapshot_js(offset: int) -> str:
+    return (
+        "Array.from(document.querySelectorAll('a,button,input,textarea,select,[role=button],[role=link],[role=textbox],[role=checkbox],[onclick],[contenteditable=true]'))"
+        "  .filter(el => {"
+        "    const r = el.getBoundingClientRect();"
+        "    if (r.width === 0 || r.height === 0) return false;"
+        "    const st = window.getComputedStyle(el);"
+        "    return st.visibility !== 'hidden' && st.display !== 'none';"
+        "  })"
+        "  .map((el, i) => {"
+        "    const n = %d + i + 1;"
+        "    el.setAttribute('data-jref', String(n));"
+        "    const role = el.getAttribute('role') || el.tagName.toLowerCase();"
+        "    const name = (el.getAttribute('aria-label') || el.placeholder || el.value ||"
+        "                  el.innerText || el.getAttribute('name') || '').trim().replace(/\\s+/g, ' ').slice(0, 80);"
+        "    return '[' + n + '] ' + role + ' ' + JSON.stringify(name);"
+        "  })"
+        "  .join('\\n')" % offset
+    )
 # Click the first button/link whose text looks like a cookie/consent accept. Side-effect
 # only (the click) — its return value isn't relied on.
 _ACCEPT_COOKIES_JS = r"""
@@ -76,7 +83,6 @@ _TITLE_JS = "document.title"
 _URL_JS = "location.href"
 _TEXT_JS = "document.body ? document.body.innerText.slice(0, 6000) : ''"
 _READY_JS = "document.readyState"
-_FRAMES_JS = "document.querySelectorAll('iframe').length"
 
 # Substrings that mark a dropped/failed CDP connection (recover + retry once).
 _CONN_MARKERS = ("no close frame", "connection closed", "failed to connect", "websocket", "is closed")
@@ -92,6 +98,7 @@ class BrowserHost:
         self._browsers: dict[str, object] = {}  # context -> nodriver Browser
         self._tabs: dict[str, object] = {}  # context -> current Tab
         self._urls: dict[str, str] = {}  # context -> last navigated URL (for recovery)
+        self._frames: dict[str, dict[int, object]] = {}  # context -> {ref: document it lives in}
         self._lock = asyncio.Lock()
 
     def _profile_dir(self, context: str) -> str | None:
@@ -127,6 +134,7 @@ class BrowserHost:
         async with self._lock:
             b = self._browsers.pop(context, None)
             self._tabs.pop(context, None)
+            self._frames.pop(context, None)
         if b is not None:
             try:
                 b.stop()
@@ -207,30 +215,52 @@ class BrowserHost:
                 return {"ok": False, "error": f"couldn't open {url}: {exc}"}
         return {"ok": False, "error": f"couldn't open {url}"}
 
+    async def _documents(self, tab):  # noqa: ANN001, ANN202
+        """The main page document plus each connectable frame (cross-origin OOPIFs
+        included — that's where third-party booking/search widgets live). The first
+        entry is always the main tab."""
+        docs = [tab]
+        with contextlib.suppress(Exception):
+            docs.extend(await tab.get_frames())
+        return docs
+
     async def snapshot(self, context: str) -> dict:
         async def fn(tab):  # noqa: ANN001, ANN202
-            listing = await tab.evaluate(_SNAPSHOT_JS)
-            nframes = await tab.evaluate(_FRAMES_JS) or 0
+            docs = await self._documents(tab)
+            lines: list[str] = []
+            frame_map: dict[int, object] = {}
+            offset = 0
+            for di, doc in enumerate(docs):
+                try:
+                    listing = await doc.evaluate(_snapshot_js(offset))
+                except Exception:  # noqa: BLE001 - a frame may be unreachable; skip it
+                    continue
+                doc_lines = [ln for ln in (listing or "").split("\n") if ln.strip()]
+                for ln in doc_lines:
+                    m = _REF_RE.match(ln)
+                    if m:
+                        frame_map[int(m.group(1))] = doc
+                        lines.append(ln + ("  (in frame)" if di > 0 else ""))
+                offset += len(doc_lines)
+            self._frames[context] = frame_map
             cur, title = await self._where(tab)
-            elements = listing or "(no interactive elements found)"
-            if nframes:
-                elements += (
-                    f"\n({int(nframes)} embedded frame(s) on this page — controls inside them "
-                    "aren't listed yet; if the form you need is in one, tell the user.)"
-                )
+            elements = "\n".join(lines) or "(no interactive elements found)"
             return {"ok": True, "context": context, "url": cur, "title": title, "elements": elements}
 
         return await self._run(context, fn)
 
-    async def _resolve(self, tab, ref: int):  # noqa: ANN001, ANN202
+    async def _resolve(self, context: str, tab, ref: int):  # noqa: ANN001, ANN202
+        """Find element [ref] in whichever document (main page or a frame) the last
+        snapshot tagged it in — so click/type reach inside frames transparently."""
+        doc = self._frames.get(context, {}).get(int(ref)) or tab
         try:
-            return await tab.select(f'[data-jref="{ref}"]', timeout=5)
+            return doc, await doc.select(f'[data-jref="{ref}"]', timeout=5)
         except Exception:  # noqa: BLE001 - not found / timed out
-            return None
+            return doc, None
 
     async def click(self, ref: int, context: str) -> dict:
         async def fn(tab):  # noqa: ANN001, ANN202
-            el = await self._resolve(tab, ref)
+            _doc, el = await self._resolve(context, tab, ref)
             if el is None:
                 return {"ok": False, "error": f"no element [{ref}] — snapshot again, the page may have changed"}
             await el.click()
@@ -242,18 +272,17 @@ class BrowserHost:
 
     async def type(self, ref: int, text: str, context: str, *, submit: bool = False) -> dict:
         async def fn(tab):  # noqa: ANN001, ANN202
-            el = await self._resolve(tab, ref)
+            doc, el = await self._resolve(context, tab, ref)
             if el is None:
                 return {"ok": False, "error": f"no element [{ref}] — snapshot again"}
             await el.send_keys(text)
             if submit:
                 # nodriver's documented way to press Enter is sending the newline
-                # keystroke; the JS form-submit is a belt-and-braces fallback for boxes
-                # that ignore it. (Some single-page search widgets need neither — they
-                # react to typing — so re-snapshot afterwards to see what changed.)
+                # keystroke; the JS form-submit is a belt-and-braces fallback (run in
+                # the element's own document so it works inside a frame).
                 await el.send_keys("\n")
                 with contextlib.suppress(Exception):
-                    await tab.evaluate(_submit_js(ref))
+                    await doc.evaluate(_submit_js(ref))
                 await asyncio.sleep(1.4)  # let the navigation/search happen
             cur, title = await self._where(tab)
             return {"ok": True, "url": cur, "title": title}
@@ -277,3 +306,4 @@ class BrowserHost:
         self._browsers.clear()
         self._tabs.clear()
         self._urls.clear()
+        self._frames.clear()
