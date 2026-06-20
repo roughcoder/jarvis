@@ -51,6 +51,7 @@ src/jarvis/
     skills.py          self-authored recipes composing gated tools (§7)
     heartbeat.py       proactive cold-path scheduler (silent sentinel, §3b)
     scheduler.py       alarms & timers: fire on the setting device, repeat (ring/quiet) until acknowledged ('stop')
+    proactive.py / tones.py   server-initiated voice delivery: tone + spoken text frames for alarms/notifications (idle-aware hold, quiet hours, device + WhatsApp routing)
     background.py      fire-and-forget lane: 'on it' now, run detached (asker's caps, no recursion), report the outcome via the proactive push
     gateway_client/    HTTP -> LiteLLM proxy; memory_client/ Honcho (per-user peer); tracing/
   protocol/            brain<->intercom WebSocket message schemas (Phase 3 W4)
