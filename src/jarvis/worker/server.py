@@ -124,6 +124,8 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             data = await host.type(
                 int(args.get("ref", 0)), args.get("text", ""), ctx, submit=bool(args.get("submit"))
             )
+        elif action == "browser_press":
+            data = await host.press(args.get("keys"), ctx, ref=args.get("ref"))
         elif action == "browser_read":
             data = await host.read(ctx)
         else:

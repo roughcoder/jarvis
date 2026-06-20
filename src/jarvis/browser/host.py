@@ -82,6 +82,22 @@ def _submit_js(ref: int) -> str:
 _TITLE_JS = "document.title"
 _URL_JS = "location.href"
 _TEXT_JS = "document.body ? document.body.innerText.slice(0, 6000) : ''"
+# Friendly key name (case-insensitive, with aliases) -> (key, code, virtual-key, text).
+_KEYS = {
+    "enter": ("Enter", "Enter", 13, "\r"), "return": ("Enter", "Enter", 13, "\r"),
+    "tab": ("Tab", "Tab", 9, None),
+    "escape": ("Escape", "Escape", 27, None), "esc": ("Escape", "Escape", 27, None),
+    "space": (" ", "Space", 32, " "), "spacebar": (" ", "Space", 32, " "),
+    "backspace": ("Backspace", "Backspace", 8, None),
+    "delete": ("Delete", "Delete", 46, None), "del": ("Delete", "Delete", 46, None),
+    "arrowdown": ("ArrowDown", "ArrowDown", 40, None), "down": ("ArrowDown", "ArrowDown", 40, None),
+    "arrowup": ("ArrowUp", "ArrowUp", 38, None), "up": ("ArrowUp", "ArrowUp", 38, None),
+    "arrowleft": ("ArrowLeft", "ArrowLeft", 37, None), "left": ("ArrowLeft", "ArrowLeft", 37, None),
+    "arrowright": ("ArrowRight", "ArrowRight", 39, None), "right": ("ArrowRight", "ArrowRight", 39, None),
+    "home": ("Home", "Home", 36, None), "end": ("End", "End", 35, None),
+    "pageup": ("PageUp", "PageUp", 33, None), "pagedown": ("PageDown", "PageDown", 34, None),
+}
+
 _READY_JS = "document.readyState"
 _COUNT_JS = "document.querySelectorAll('a,button,input,textarea,select,[role=button],[role=link],[role=textbox]').length"
 
@@ -336,6 +352,43 @@ class BrowserHost:
                 await asyncio.sleep(1.4)  # let the navigation/search happen
             cur, title = await self._where(tab)
             return {"ok": True, "url": cur, "title": title}
+
+        return await self._run(context, fn)
+
+    async def press(self, keys, context: str, ref: int | None = None) -> dict:  # noqa: ANN001
+        """Press one or more keys (Enter, Tab, ArrowDown, Escape, Space…), optionally
+        focusing element [ref] first. The keyboard half of widget interaction — opens
+        keyboard-driven dropdowns (focus + ArrowDown), tabs between fields, submits, or
+        dismisses a popup (Escape). General, like the pointer click."""
+        seq = keys if isinstance(keys, list) else [keys]
+        specs = [(_KEYS.get(str(k).strip().lower()), k) for k in seq]
+        unknown = [k for spec, k in specs if spec is None]
+        if unknown:
+            return {"ok": False, "error": f"unknown key(s): {', '.join(map(str, unknown))}"}
+
+        async def fn(tab):  # noqa: ANN001, ANN202
+            from nodriver import cdp  # lazy
+
+            doc = tab
+            if ref is not None:
+                doc = self._frames.get(context, {}).get(int(ref)) or tab
+                with contextlib.suppress(Exception):
+                    await doc.evaluate(
+                        f'(() => {{ const e = document.querySelector(\'[data-jref="{int(ref)}"]\'); if (e) e.focus(); }})()'
+                    )
+            for spec, _name in specs:
+                key, code, vk, text = spec
+                down = {"key": key, "code": code, "windows_virtual_key_code": vk}
+                if text:
+                    down["text"] = text
+                await doc.send(cdp.input_.dispatch_key_event("keyDown", **down))
+                await doc.send(
+                    cdp.input_.dispatch_key_event("keyUp", key=key, code=code, windows_virtual_key_code=vk)
+                )
+                await asyncio.sleep(0.15)
+            await self._wait_stable(tab, tries=6)  # a key may open a popover / navigate
+            cur, title = await self._where(tab)
+            return {"ok": True, "pressed": [k for _, k in specs], "url": cur, "title": title}
 
         return await self._run(context, fn)
 

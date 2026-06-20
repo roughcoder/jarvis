@@ -74,6 +74,18 @@ def make_browser_tools(worker: WorkerConfig, browser: BrowserConfig) -> list[Too
             return f"error: {data.get('error', 'type failed')}"
         return f"Typed into [{args.get('ref')}]. Now at {data.get('title') or data.get('url')}."
 
+    async def press(ctx: RequestContext, args: dict) -> str:
+        keys = args.get("keys")
+        if isinstance(keys, str):
+            keys = [k.strip() for k in keys.split(",") if k.strip()]
+        body = {"keys": keys or [], **_ctx_arg(args)}
+        if args.get("ref") is not None:
+            body["ref"] = args.get("ref")
+        data = await _call("browser_press", body)
+        if not data.get("ok"):
+            return f"error: {data.get('error', 'press failed')}"
+        return f"Pressed {', '.join(map(str, data.get('pressed', [])))}. Now at {data.get('title') or data.get('url')}. Snapshot to see what changed."
+
     async def read(ctx: RequestContext, args: dict) -> str:
         data = await _call("browser_read", _ctx_arg(args))
         if not data.get("ok"):
@@ -125,6 +137,28 @@ def make_browser_tools(worker: WorkerConfig, browser: BrowserConfig) -> list[Too
                 "required": ["ref", "text"],
             },
             _CAP, type_text, announce=True,
+        ),
+        Tool(
+            "browser_press",
+            "Press keyboard keys — Enter, Tab, ArrowDown/Up/Left/Right, Escape, Space, "
+            "Backspace, etc. Give a ref to focus that element first. Use this for "
+            "keyboard-driven widgets that DON'T respond to a click: focus a dropdown/"
+            "combobox and press ArrowDown to open it then Enter to choose, Tab between "
+            "fields, or Escape to dismiss a popup.",
+            {
+                "type": obj,
+                "properties": {
+                    "keys": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Keys to press in order, e.g. ['ArrowDown','ArrowDown','Enter'].",
+                    },
+                    "ref": {"type": "integer", "description": "Focus this element (from the latest snapshot) first."},
+                    **context_param,
+                },
+                "required": ["keys"],
+            },
+            _CAP, press, announce=True,
         ),
         Tool(
             "browser_read",

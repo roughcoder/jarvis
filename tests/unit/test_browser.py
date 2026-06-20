@@ -17,7 +17,7 @@ from jarvis.tools import build_registry
 from jarvis.tools.base import ToolRegistry
 from jarvis.tools.browser import make_browser_tools
 
-_BROWSER = {"browser_open", "browser_snapshot", "browser_click", "browser_type", "browser_read"}
+_BROWSER = {"browser_open", "browser_snapshot", "browser_click", "browser_type", "browser_read", "browser_press"}
 
 
 def _ctx(*caps: str) -> RequestContext:
