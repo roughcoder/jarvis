@@ -23,6 +23,7 @@ from jarvis.brain.gateway_client import GatewayClient
 from jarvis.brain.heartbeat import HeartbeatScheduler, make_heartbeat_think
 from jarvis.brain.identity import HOUSE, IdentityResolver, load_users
 from jarvis.brain.memory_client import MemoryClient
+from jarvis.brain.scheduler import Ring, Scheduler
 from jarvis.brain.session import BrainSession, TurnResult
 from jarvis.brain.skills import register_skills
 from jarvis.brain.tracing import Tracer
@@ -48,9 +49,25 @@ from jarvis.protocol.messages import (
 from jarvis.services.stt import Transcriber
 from jarvis.services.tts import InworldTTS
 from jarvis.tools import build_registry
+from jarvis.tools.alarm import make_alarm_tools
 from jarvis.tools.background import make_background_tool
 from jarvis.tools.mcp import make_mcp_tools
 from jarvis.tools.selection import build_relevance
+
+
+import re
+
+# Only consulted while an alarm is actually ringing, so it can be liberal — any of
+# these silences it.
+_ALARM_ACK = re.compile(
+    r"\b(stop|dismiss|turn (it |the alarm )?off|cancel|enough|quiet|silence|shut up|"
+    r"got it|okay|ok|alright|thanks)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_alarm_ack(text: str) -> bool:
+    return bool(_ALARM_ACK.search(text or ""))
 
 
 def _can_bind(host: str, port: int) -> bool:
@@ -109,8 +126,10 @@ class BrainServer:
         # Identity resolution (§5): who is speaking, per utterance.
         self._resolver = IdentityResolver(users)
         self._contexts = ContextStore(self._make_session)
-        # Open intercom connections (for proactive heartbeat push, §3b).
+        # Open intercom connections (for proactive heartbeat push, §3b). Also indexed by
+        # device so an alarm/notification can be routed to the device that set it.
         self._connections: set = set()
+        self._device_conns: dict[str, set] = {}
         # Background-task lane (fire-and-forget): start() returns instantly; the
         # outcome is pushed via the same proactive broadcast the heartbeat uses.
         self._background = BackgroundRunner(
@@ -118,6 +137,11 @@ class BrainServer:
         )
         if cfg.background.enabled:
             self._registry.register(make_background_tool(self._background))
+        # Alarms & timers: the scheduler fires rings on the device that set them.
+        self._scheduler = Scheduler()
+        if cfg.alarm.enabled:
+            for tool in make_alarm_tools(self._scheduler, cfg):
+                self._registry.register(tool)
 
     def _make_session(self, ctx: RequestContext) -> BrainSession:
         return BrainSession(
@@ -145,6 +169,7 @@ class BrainServer:
         await self._connect_mcp()
         host, port = self._cfg.brain.host, self._cfg.brain.port
         heartbeat: asyncio.Task | None = None
+        alarms: asyncio.Task | None = None
         try:
             async with websockets.serve(self._handle, host, port):
                 print(f"Brain listening on ws://{host}:{port}")
@@ -156,11 +181,46 @@ class BrainServer:
                     )
                     heartbeat = asyncio.create_task(sched.run())
                     print(f"Heartbeat on (every {self._cfg.heartbeat.interval_s:.0f}s).")
+                if self._cfg.alarm.enabled:
+                    alarms = asyncio.create_task(self._alarm_loop())
+                    print("Alarms on.")
                 await asyncio.Future()  # run forever
         finally:
-            if heartbeat is not None:
-                heartbeat.cancel()
+            for t in (heartbeat, alarms):
+                if t is not None:
+                    t.cancel()
             await self._mcp.aclose()
+
+    async def _alarm_loop(self) -> None:
+        """Tick the scheduler; deliver any rings to the device that set them. Guarded —
+        an alarm failure must never crash the brain."""
+        import time
+
+        while True:
+            await asyncio.sleep(max(0.2, self._cfg.alarm.tick_s))
+            try:
+                for ring in self._scheduler.tick(time.time()):
+                    await self._deliver_ring(ring)
+            except Exception as exc:  # noqa: BLE001 - proactive work is best-effort
+                print(f"  [alarm] tick skipped: {exc}")
+
+    async def _deliver_ring(self, ring: Ring) -> None:
+        """Deliver one alarm ring to its device. For now a Proactive text push (the
+        first ring announces the label; repeats re-ping) — the voice tone/TTS layer
+        rides on the same routing."""
+        text = (f"Alarm: {ring.label}." if ring.first else f"Alarm still ringing: {ring.label}.") \
+            if ring.label != "alarm" else ("Your alarm." if ring.first else "Alarm still ringing.")
+        sent = await self._to_device(ring.device_id, encode(Proactive(text=text)))
+        print(f"  [alarm] ring → device={ring.device_id} ({sent} conn): {text}")
+
+    async def _to_device(self, device_id: str, msg: str) -> int:
+        """Send a frame to every open connection for a device; returns how many got it."""
+        n = 0
+        for ws in list(self._device_conns.get(device_id, set())):
+            with contextlib.suppress(Exception):
+                await ws.send(msg)
+                n += 1
+        return n
 
     async def _broadcast(self, text: str) -> None:
         """Push a proactive message to every connected intercom (heartbeat, §3b).
@@ -229,6 +289,7 @@ class BrainServer:
         print(f"intercom paired: device={device_id} channel={channel} identity={base.identity}")
 
         self._connections.add(ws)  # eligible for proactive heartbeat push
+        self._device_conns.setdefault(device_id, set()).add(ws)  # for device-routed alarms
         turn: asyncio.Task | None = None
         try:
             async for raw in ws:
@@ -248,6 +309,11 @@ class BrainServer:
                         await ws.send(encode(Cancel(turn_id=msg.turn_id)))
         finally:
             self._connections.discard(ws)
+            conns = self._device_conns.get(device_id)
+            if conns is not None:
+                conns.discard(ws)
+                if not conns:
+                    self._device_conns.pop(device_id, None)
             await self._cancel(turn)
 
     @staticmethod
@@ -272,6 +338,21 @@ class BrainServer:
         print(f"  you: {text!r}")
         with contextlib.suppress(Exception):  # let the intercom print what was heard
             await ws.send(encode(Transcript(turn_id=turn_id, text=text)))
+        text_only = isinstance(msg, TextIn) and msg.text_only
+        # Alarm acknowledgement: if one is ringing on this device and the user says
+        # stop/dismiss/etc, silence it without a full LLM turn.
+        if self._scheduler.ringing_on(device_id) and _is_alarm_ack(text):
+            stopped = self._scheduler.acknowledge(device_id)
+            reply = "Alarm off." if stopped else "Okay."
+            print(f"  [alarm] acknowledged on device={device_id}")
+            if not text_only:
+                with contextlib.suppress(Exception):
+                    async for pcm in self._tts.synthesize_stream(reply):
+                        await ws.send(encode(ReplyAudio.of(turn_id, pcm)))
+            with contextlib.suppress(Exception):
+                await ws.send(encode(ReplyText(turn_id=turn_id, text=reply)))
+                await ws.send(encode(ReplyEnd(turn_id=turn_id, ended=False)))
+            return
         # Resolve WHO this utterance is from (claim detection needs the transcript),
         # then route to that principal's session. A spoken claim sticks for the rest
         # of the conversation.
@@ -280,7 +361,6 @@ class BrainServer:
             conn["asserted"] = ctx.identity
         session = self._contexts.get(ctx)
         trace = self._tracer.turn(room=self._cfg.gateway.room, speaker=ctx.identity)
-        text_only = isinstance(msg, TextIn) and msg.text_only
         result = TurnResult()
         try:
             if text_only:  # text console / scripted test — reply text only, no TTS

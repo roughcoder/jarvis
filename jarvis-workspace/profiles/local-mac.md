@@ -20,6 +20,7 @@ capabilities:
   - worker.gui
   - worker.browser
   - background.run
+  - alarms.set
   - mcp.context7
 ---
 

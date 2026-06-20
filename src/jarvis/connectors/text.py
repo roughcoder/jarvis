@@ -26,6 +26,7 @@ from jarvis.protocol.messages import (
     ReplyEnd,
     ReplyText,
     TextIn,
+    Transcript,
     Welcome,
     decode,
     encode,
@@ -86,7 +87,10 @@ class TextConsole:
         return 0
 
     async def repl(self) -> int:
-        """Interactive (or piped) REPL. Reads stdin lines, one turn each."""
+        """Interactive (or piped) REPL. A single router task reads the socket — turn
+        replies go to a queue, and Proactive pushes (alarms, background completions,
+        heartbeat) print AS THEY ARRIVE, even between turns. That continuous reader is
+        what makes notification delivery work; a turn-only reader would miss them."""
         ws, welcome = await self._connect()
         caps = ", ".join(welcome.capabilities) or "(none)"
         print(
@@ -94,6 +98,8 @@ class TextConsole:
             f"paired as {welcome.identity} ({welcome.scope}); can: {caps}\n"
             "Type a message, or Ctrl-D to exit.\n"
         )
+        turn_q: asyncio.Queue = asyncio.Queue()
+        reader = asyncio.create_task(self._route(ws, turn_q))
         try:
             while True:
                 line = await asyncio.to_thread(sys.stdin.readline)
@@ -102,10 +108,38 @@ class TextConsole:
                 text = line.strip()
                 if not text:
                     continue
-                reply, ended = await text_turn(ws, text)
+                reply, ended = await self._turn(ws, turn_q, text)
                 print(f"jarvis: {reply}")
                 if ended:
                     print("(conversation ended)")
         finally:
+            reader.cancel()
             await ws.close()
         return 0
+
+    async def _route(self, ws, turn_q: asyncio.Queue) -> None:  # noqa: ANN001
+        """The single socket reader: turn frames → queue; proactive pushes → print now."""
+        try:
+            async for raw in ws:
+                m = decode(raw)
+                if isinstance(m, Proactive):
+                    print(f"\n🔔 {m.text}\n", flush=True)
+                elif isinstance(m, (ReplyText, ReplyEnd, Transcript)):
+                    await turn_q.put(m)
+                # ReplyAudio is ignored in text mode
+        except Exception:  # noqa: BLE001 - socket closed / shutting down
+            pass
+
+    @staticmethod
+    async def _turn(ws, turn_q: asyncio.Queue, text: str) -> tuple[str, bool]:  # noqa: ANN001
+        turn_id = uuid.uuid4().hex
+        await ws.send(encode(TextIn(turn_id=turn_id, text=text, text_only=True)))
+        reply, ended = "", False
+        while True:
+            m = await turn_q.get()
+            if isinstance(m, ReplyText) and m.turn_id == turn_id:
+                reply = m.text
+            elif isinstance(m, ReplyEnd) and m.turn_id == turn_id:
+                ended = m.ended
+                break
+        return reply, ended

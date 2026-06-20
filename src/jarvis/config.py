@@ -528,6 +528,24 @@ class BackgroundConfig(_Base):
     max_rounds: int = 12  # tool-loop rounds for a job (more than a voice turn — it's unattended)
 
 
+class AlarmConfig(_Base):
+    """Alarms & timers — scheduled proactive events that fire on the device they were
+    set on and REPEAT until acknowledged ('stop'). The sound and the repeat cadence are
+    config so they're trivial to change without touching code. The cadence is a simple
+    ring/quiet cycle: ring for `ring_s`, pause for `quiet_s`, repeat until acknowledged
+    or `max_s` elapses (a safety auto-stop)."""
+
+    model_config = SettingsConfigDict(env_prefix="ALARM_", env_file=".env", extra="ignore")
+
+    enabled: bool = True
+    ring_s: float = 10.0  # how long it rings each cycle
+    quiet_s: float = 10.0  # pause between rings
+    max_s: float = 300.0  # auto-stop after this long unacknowledged (safety net)
+    tick_s: float = 1.0  # scheduler resolution
+    sound: str = "chime"  # tone name (generated) or a path to a sound file — easily swapped
+    tone_freq: float = 880.0  # generated-tone pitch in Hz (tweak the sound without a file)
+
+
 class BrowserConfig(_Base):
     """Browser lane — a real Chrome the worker drives over CDP (nodriver, no
     Playwright); the brain acts on it over HTTP via the worker. Two device-scoped
@@ -587,6 +605,7 @@ class Config:
         self.mcp = MCPConfig()
         self.heartbeat = HeartbeatConfig()
         self.background = BackgroundConfig()
+        self.alarm = AlarmConfig()
         self.browser = BrowserConfig()
         self.whatsapp = WhatsAppConfig()
         self.google = GoogleConfig()
@@ -678,6 +697,10 @@ class Config:
             "background.enabled": self.background.enabled,
             "background.max_concurrent": self.background.max_concurrent,
             "background.timeout_s": self.background.timeout_s,
+            "alarm.enabled": self.alarm.enabled,
+            "alarm.ring_s": self.alarm.ring_s,
+            "alarm.quiet_s": self.alarm.quiet_s,
+            "alarm.sound": self.alarm.sound,
             "browser.enabled": self.browser.enabled,
             "browser.default_context": self.browser.default_context,
             "browser.headless": self.browser.headless,
