@@ -55,6 +55,21 @@ def due_from(
     return None
 
 
+def in_quiet_hours(now: float, start: str, end: str, tz_name: str = "") -> bool:
+    """True if `now` falls in the [start, end) quiet window (HH:MM strings; the window
+    may wrap past midnight). Empty start/end → never quiet."""
+    sh, sm = _parse_clock(start)
+    eh, em = _parse_clock(end)
+    if sh is None or eh is None:
+        return False
+    cur = _localnow(now, tz_name)
+    mins = cur.hour * 60 + cur.minute
+    s, e = sh * 60 + sm, eh * 60 + em
+    if s == e:
+        return False
+    return (s <= mins < e) if s < e else (mins >= s or mins < e)
+
+
 def _parse_clock(text: str) -> tuple[int | None, int]:
     import re
 

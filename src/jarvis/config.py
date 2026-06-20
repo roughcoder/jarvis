@@ -537,6 +537,12 @@ class NotifyConfig(_Base):
     model_config = SettingsConfigDict(env_prefix="NOTIFY_", env_file=".env", extra="ignore")
 
     also_whatsapp: bool = False
+    # Idle-aware timing: a notification that arrives mid-conversation is held and
+    # delivered at the next gap (never spoken over the user). Quiet hours suppress
+    # spoken notifications (HH:MM..HH:MM, wraps midnight; empty = off). Alarms ignore
+    # both — they're meant to interrupt.
+    quiet_start: str = ""  # e.g. "22:00"
+    quiet_end: str = ""  # e.g. "07:00"
 
 
 class AlarmConfig(_Base):

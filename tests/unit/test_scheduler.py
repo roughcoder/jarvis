@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from jarvis.brain.scheduler import Alarm, Scheduler, due_from, next_at
+import time
+from datetime import datetime
+
+from jarvis.brain.scheduler import Alarm, Scheduler, due_from, in_quiet_hours, next_at
 
 
 def _alarm(due: float, **kw) -> Alarm:
@@ -90,6 +93,21 @@ def test_cancel_by_label_and_id() -> None:
     assert s.cancel(a.id) is None  # already gone
     s.add(_alarm(due=200.0, label="x"))
     assert s.cancel("nope") is None
+
+
+def test_quiet_hours_empty_is_never_quiet() -> None:
+    now = time.time()
+    assert in_quiet_hours(now, "", "") is False
+    assert in_quiet_hours(now, "22:00", "22:00") is False  # zero-width window
+
+
+def test_quiet_hours_window_covering_now() -> None:
+    now = time.time()
+    h = datetime.fromtimestamp(now).hour
+    inside = (f"{h:02d}:00", f"{(h + 1) % 24:02d}:00")  # [this hour, next hour)
+    outside = (f"{(h + 2) % 24:02d}:00", f"{(h + 3) % 24:02d}:00")
+    assert in_quiet_hours(now, *inside) is True
+    assert in_quiet_hours(now, *outside) is False
 
 
 def test_rings_target_their_own_device() -> None:

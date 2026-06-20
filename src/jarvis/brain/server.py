@@ -25,7 +25,7 @@ from jarvis.brain.heartbeat import HeartbeatScheduler, make_heartbeat_think
 from jarvis.brain.identity import HOUSE, IdentityResolver, load_users
 from jarvis.brain.memory_client import MemoryClient
 from jarvis.brain.proactive import proactive_frames
-from jarvis.brain.scheduler import Ring, Scheduler
+from jarvis.brain.scheduler import Ring, Scheduler, in_quiet_hours
 from jarvis.brain.session import BrainSession, TurnResult
 from jarvis.brain.skills import register_skills
 from jarvis.brain.tracing import Tracer
@@ -133,6 +133,10 @@ class BrainServer:
         # device so an alarm/notification can be routed to the device that set it.
         self._connections: set = set()
         self._device_conns: dict[str, set] = {}
+        # Idle-aware notification timing: devices mid-turn, and notifications held until
+        # the gap (busy clears / quiet hours end). Alarms bypass this.
+        self._busy: set[str] = set()
+        self._pending: dict[str, list] = {}
         # Background-task lane (fire-and-forget): start() returns instantly; the
         # outcome is pushed via the same proactive broadcast the heartbeat uses.
         self._background = BackgroundRunner(
@@ -184,8 +188,8 @@ class BrainServer:
                     )
                     heartbeat = asyncio.create_task(sched.run())
                     print(f"Heartbeat on (every {self._cfg.heartbeat.interval_s:.0f}s).")
+                alarms = asyncio.create_task(self._proactive_loop())
                 if self._cfg.alarm.enabled:
-                    alarms = asyncio.create_task(self._alarm_loop())
                     print("Alarms on.")
                 await asyncio.Future()  # run forever
         finally:
@@ -194,18 +198,20 @@ class BrainServer:
                     t.cancel()
             await self._mcp.aclose()
 
-    async def _alarm_loop(self) -> None:
-        """Tick the scheduler; deliver any rings to the device that set them. Guarded —
-        an alarm failure must never crash the brain."""
+    async def _proactive_loop(self) -> None:
+        """Tick alarms (deliver rings to the setting device) and flush held
+        notifications to devices that are now idle. Guarded — must never crash the brain."""
         import time
 
         while True:
             await asyncio.sleep(max(0.2, self._cfg.alarm.tick_s))
             try:
-                for ring in self._scheduler.tick(time.time()):
-                    await self._deliver_ring(ring)
+                if self._cfg.alarm.enabled:
+                    for ring in self._scheduler.tick(time.time()):
+                        await self._deliver_ring(ring)
+                await self._flush_pending()
             except Exception as exc:  # noqa: BLE001 - proactive work is best-effort
-                print(f"  [alarm] tick skipped: {exc}")
+                print(f"  [proactive] tick skipped: {exc}")
 
     async def _deliver_ring(self, ring: Ring) -> None:
         """Deliver one alarm ring to the device that set it: the tone every cycle, the
@@ -222,6 +228,9 @@ class BrainServer:
         """Push a proactive notification (heartbeat / background completion) to every
         connected intercom — chime + spoken text, and open the mic so the user can reply
         (turn it into a chat). Best-effort; a dead socket is skipped, never fatal."""
+        if self._quiet_now():
+            print(f"  [proactive] heartbeat suppressed (quiet hours): {text}")
+            return
         print(f"  [proactive] notify → {len(self._connections)} intercom(s): {text}")
         await self._deliver_proactive(
             self._connections, text, kind="notification", open_mic=True, speak=True, tone=True
@@ -254,13 +263,44 @@ class BrainServer:
         (if NOTIFY_ALSO_WHATSAPP) on WhatsApp too. Opens the mic so they can reply."""
         await self._notify(text, device_id=device_id, identity=identity, kind="notification", open_mic=True)
 
+    def _quiet_now(self) -> bool:
+        import time
+
+        return in_quiet_hours(
+            time.time(), self._cfg.notify.quiet_start, self._cfg.notify.quiet_end,
+            self._cfg.persona.timezone,
+        )
+
     async def _notify(self, text: str, *, device_id: str = "", identity: str = "",
                       kind: str = "notification", open_mic: bool = True) -> None:
+        # WhatsApp delivery isn't held (a silent text that reaches them when out).
+        if self._cfg.notify.also_whatsapp and identity:
+            await self._notify_whatsapp(identity, text)
+        # Idle-aware: hold a notification if the device is mid-conversation or it's quiet
+        # hours; the proactive tick flushes it once idle / quiet ends. (Alarms bypass —
+        # they come via _deliver_ring.)
+        if device_id and (device_id in self._busy or self._quiet_now()):
+            self._pending.setdefault(device_id, []).append((text, kind, open_mic))
+            print(f"  [proactive] held for device={device_id} (busy/quiet): {text}")
+            return
         conns = self._device_conns.get(device_id) if device_id else self._connections
         sent = await self._deliver_proactive(conns or set(), text, kind=kind, open_mic=open_mic)
         print(f"  [proactive] notify → device={device_id or 'all'} ({sent} conn): {text}")
-        if self._cfg.notify.also_whatsapp and identity:
-            await self._notify_whatsapp(identity, text)
+
+    async def _flush_pending(self) -> None:
+        """Deliver held notifications to devices that are now idle (and not in quiet
+        hours). Called from the proactive tick."""
+        if not self._pending:
+            return
+        quiet = self._quiet_now()
+        for device_id in list(self._pending):
+            if device_id in self._busy or quiet:
+                continue
+            held = self._pending.pop(device_id, [])
+            conns = self._device_conns.get(device_id, set())
+            for text, kind, open_mic in held:
+                await self._deliver_proactive(conns, text, kind=kind, open_mic=open_mic)
+                print(f"  [proactive] flushed → device={device_id}: {text}")
 
     async def _notify_whatsapp(self, identity: str, text: str) -> None:
         """Forward a notification to the user's WhatsApp number(s) via the connector
@@ -370,6 +410,15 @@ class BrainServer:
         return None
 
     async def _run_turn(self, ws, device_id: str, channel: str, conn: dict, msg) -> None:  # noqa: ANN001
+        """Mark the device busy for the turn so notifications hold until the gap; the
+        proactive tick flushes them once it's idle again."""
+        self._busy.add(device_id)
+        try:
+            await self._do_turn(ws, device_id, channel, conn, msg)
+        finally:
+            self._busy.discard(device_id)
+
+    async def _do_turn(self, ws, device_id: str, channel: str, conn: dict, msg) -> None:  # noqa: ANN001
         if isinstance(msg, Utterance):
             text = await asyncio.to_thread(
                 self._stt.transcribe, msg.pcm(), sample_rate=msg.sample_rate
