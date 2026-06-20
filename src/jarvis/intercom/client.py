@@ -14,6 +14,7 @@ factor the shared edge out; for 3a the small duplication keeps the loop stable.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import queue
 import threading
 import uuid
@@ -28,6 +29,7 @@ from jarvis.protocol.messages import (
     BargeIn,
     Cancel,
     Hello,
+    Proactive,
     ReplyAudio,
     ReplyEnd,
     ReplyText,
@@ -72,6 +74,11 @@ class IntercomClient:
                 print(f"pairing rejected: {welcome}")
                 return
             print(f"Paired with brain. Capabilities: {welcome.capabilities}")
+            # One task reads the socket for the whole connection and queues every
+            # message; the turn flow and the idle wait both consume from it. This is
+            # what lets a proactive push (alarm/notification) arrive while idle.
+            inbound: asyncio.Queue = asyncio.Queue()
+            router = asyncio.create_task(self._router(ws, inbound))
             try:
                 with MicStream(
                     self._cfg.audio, sample_rate=self._sr, frame_samples=FRAME_SAMPLES
@@ -79,21 +86,47 @@ class IntercomClient:
                     phrase = self._cfg.wake.keyword.replace("_", " ").title()
                     print(f'\nJarvis is listening. Say "{phrase}".')
                     while True:
-                        await self._one_turn(ws, mic)
+                        await self._idle_then_turn(ws, mic, inbound)
             finally:
+                router.cancel()
                 self._wake.delete()
 
-    async def _one_turn(self, ws, mic: MicStream) -> None:  # noqa: ANN001
+    async def _router(self, ws, inbound: asyncio.Queue) -> None:  # noqa: ANN001
+        """Read the socket for the connection's life; queue every decoded message."""
+        try:
+            async for raw in ws:
+                with contextlib.suppress(Exception):
+                    inbound.put_nowait(decode(raw))
+        except Exception:  # noqa: BLE001 - socket closed
+            pass
+
+    async def _idle_then_turn(self, ws, mic: MicStream, inbound: asyncio.Queue) -> None:  # noqa: ANN001
+        """Wait for the wake word OR a proactive push (alarm/notification); whichever
+        comes first. A proactive plays (and may open the mic for a reply); a wake starts
+        a normal turn."""
         mic.drain()
         self._wake.reset()
         print('● idle — say "Hey Jarvis"')
-        await asyncio.to_thread(self._wait_for_wake, mic)
+        while True:
+            pro = self._take_proactive(inbound)
+            if pro is not None:
+                await self._play_proactive(ws, mic, inbound, pro)
+                mic.drain()
+                self._wake.reset()
+                print('● idle — say "Hey Jarvis"')
+                continue
+            if await asyncio.to_thread(self._wake_batch, mic):
+                break
         print("● wake")
         await self._acknowledge()
         mic.drain()
         print("  listening…")
         pcm = await asyncio.to_thread(self._capture_utterance, mic)
+        await self._converse(ws, mic, inbound, pcm)
 
+    async def _converse(self, ws, mic: MicStream, inbound: asyncio.Queue, pcm: bytes) -> None:  # noqa: ANN001
+        """Run turns until the conversation closes — shared by a wake-started turn and a
+        proactive that opened the mic."""
         while True:
             if not pcm:
                 print("  (nothing said)")
@@ -101,7 +134,7 @@ class IntercomClient:
             turn_id = uuid.uuid4().hex
             await ws.send(encode(Utterance.of(turn_id, self._sr, pcm)))
             state = {"ended": False, "text": ""}
-            interrupted = await self._play_reply(ws, mic, turn_id, state)
+            interrupted = await self._play_reply(ws, mic, inbound, turn_id, state)
             print(f"  jarvis: {state['text']}{'  ⏹' if state['ended'] else ''}")
 
             if interrupted:
@@ -123,14 +156,59 @@ class IntercomClient:
             if not pcm:
                 return
 
-    # --- reply playback + barge-in -----------------------------------------
-    async def _reply_audio(self, ws, turn_id, state):  # noqa: ANN001
-        """Yield reply PCM from the brain until ReplyEnd; record text/ended."""
-        async for raw in ws:
+    def _take_proactive(self, inbound: asyncio.Queue):  # noqa: ANN202
+        """Non-blocking: a Proactive at the head of the queue, else None. Stray
+        non-proactive frames while idle (rare) are dropped."""
+        try:
+            msg = inbound.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+        return msg if isinstance(msg, Proactive) else None
+
+    def _wake_batch(self, mic: MicStream, max_ms: float = 300.0) -> bool:
+        """Process up to ~max_ms of mic frames for the wake word; return True if heard.
+        Short batches so the idle loop can also check for proactive pushes."""
+        frame_ms = FRAME_SAMPLES / self._sr * 1000.0
+        backlog_frames = int(1.5 * self._sr / FRAME_SAMPLES)
+        elapsed = 0.0
+        while elapsed < max_ms:
+            if mic.qsize() > backlog_frames:
+                mic.drain()
+                self._wake.reset()
+                return False
             try:
-                msg = decode(raw)
-            except Exception:
-                continue
+                frame = mic.read(timeout=0.1)
+            except queue.Empty:
+                return False
+            elapsed += frame_ms
+            if self._wake.process(frame):
+                return True
+        return False
+
+    async def _play_proactive(self, ws, mic: MicStream, inbound: asyncio.Queue, pro: Proactive) -> None:  # noqa: ANN001
+        """Play a proactive's audio (tone + spoken text under its 'pa-' turn id); if it
+        asked to open the mic, listen for a reply and carry it into a chat."""
+        print(f"  🔔 {pro.text}")
+        state = {"ended": False, "text": ""}
+        with contextlib.suppress(Exception):
+            await self._audio.play_stream(
+                self._reply_audio(inbound, pro.turn_id, state), sample_rate=self._cfg.tts.sample_rate
+            )
+        if pro.open_mic:
+            mic.drain()
+            print("  …(listening for your reply)")
+            pcm = await asyncio.to_thread(
+                self._capture_utterance, mic, initial_wait_ms=self._cfg.vad.conversation_timeout_ms
+            )
+            if pcm:
+                await self._converse(ws, mic, inbound, pcm)
+
+    # --- reply playback + barge-in -----------------------------------------
+    async def _reply_audio(self, inbound, turn_id, state):  # noqa: ANN001
+        """Yield reply PCM (from the router queue) until ReplyEnd; record text/ended.
+        Used for both a normal turn and a proactive's audio (its 'pa-' turn id)."""
+        while True:
+            msg = await inbound.get()
             if isinstance(msg, Transcript) and msg.turn_id == turn_id:
                 print(f"  you: {msg.text!r}")
             elif isinstance(msg, ReplyAudio) and msg.turn_id == turn_id:
@@ -142,11 +220,13 @@ class IntercomClient:
                 return
             elif isinstance(msg, Cancel) and msg.turn_id == turn_id:
                 return
+            # Frames for another turn id (e.g. a proactive arriving mid-turn) are
+            # dropped for now; idle-aware queuing is the next layer (#3).
 
-    async def _play_reply(self, ws, mic: MicStream, turn_id: str, state: dict) -> bool:  # noqa: ANN001
+    async def _play_reply(self, ws, mic: MicStream, inbound, turn_id: str, state: dict) -> bool:  # noqa: ANN001
         if not self._cfg.vad.bargein_enabled:
             await self._audio.play_stream(
-                self._reply_audio(ws, turn_id, state), sample_rate=self._cfg.tts.sample_rate
+                self._reply_audio(inbound, turn_id, state), sample_rate=self._cfg.tts.sample_rate
             )
             return False
         mic.drain()
@@ -194,7 +274,7 @@ class IntercomClient:
         monitor = monitor_wakeword if wakeword_mode else monitor_vad
         play_task = asyncio.create_task(
             self._audio.play_stream(
-                self._reply_audio(ws, turn_id, state), sample_rate=self._cfg.tts.sample_rate
+                self._reply_audio(inbound, turn_id, state), sample_rate=self._cfg.tts.sample_rate
             )
         )
         mon_task = asyncio.create_task(asyncio.to_thread(monitor))
@@ -214,17 +294,6 @@ class IntercomClient:
         return interrupted.is_set()
 
     # --- local capture (parallel to TurnLoop) ------------------------------
-    def _wait_for_wake(self, mic: MicStream) -> None:
-        backlog_frames = int(1.5 * self._sr / FRAME_SAMPLES)
-        while True:
-            if mic.qsize() > backlog_frames:
-                mic.drain()
-                self._wake.reset()
-                continue
-            frame = mic.read()
-            if self._wake.process(frame):
-                return
-
     def _capture_utterance(self, mic: MicStream, *, initial_wait_ms: float = 8000) -> bytes:
         frame_ms = FRAME_SAMPLES / self._sr * 1000.0
         self._vad.reset()
