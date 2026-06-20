@@ -135,6 +135,7 @@ class Proactive(BaseModel):
     turn_id: str = ""
     kind: str = "notification"  # notification | alarm
     open_mic: bool = False
+    to: str = ""  # for a forwarding connector (e.g. WhatsApp): the recipient address/jid
 
 
 class WhoAreYou(BaseModel):

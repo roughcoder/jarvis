@@ -30,7 +30,7 @@ from jarvis.brain.session import BrainSession
 from jarvis.config import BackgroundConfig
 
 SessionFactory = Callable[[RequestContext], BrainSession]
-Notify = Callable[[str], Awaitable[None]]
+Notify = Callable[[str, str, str], Awaitable[None]]  # (text, identity, device_id)
 
 _BACKGROUND_CAP = "background.run"
 
@@ -45,6 +45,7 @@ class Job:
     id: int
     task: str
     identity: str
+    device_id: str = ""
     status: str = "running"  # running | done | error
     result: str = ""
 
@@ -77,7 +78,7 @@ class BackgroundRunner:
         if self.active >= max(1, self._cfg.max_concurrent):
             return (False, f"already running {self.active} background task(s) — wait for one to finish")
         self._seq += 1
-        job = Job(id=self._seq, task=task, identity=ctx.identity)
+        job = Job(id=self._seq, task=task, identity=ctx.identity, device_id=ctx.device_id)
         self._jobs[job.id] = job
         # Strip the background capability so a background task can't recurse into
         # spawning more background tasks; everything else (its real powers) carries.
@@ -111,6 +112,6 @@ class BackgroundRunner:
     async def _deliver(self, job: Job) -> None:
         print(f"  [background] job #{job.id} {job.status} → notifying: {job.result}")
         try:
-            await self._notify(job.result)
+            await self._notify(job.result, job.identity, job.device_id)
         except Exception as exc:  # noqa: BLE001 - delivery is best-effort
             print(f"  [background] notify failed for job #{job.id}: {exc}")

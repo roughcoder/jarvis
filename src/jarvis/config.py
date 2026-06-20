@@ -528,6 +528,17 @@ class BackgroundConfig(_Base):
     max_rounds: int = 12  # tool-loop rounds for a job (more than a voice turn — it's unattended)
 
 
+class NotifyConfig(_Base):
+    """Notification routing. A notification (background-job result, heartbeat) always
+    goes to the user's device; with `also_whatsapp` it ALSO goes to them on WhatsApp
+    (via the connector, to the number in their `users/<name>.md`) so it reaches them
+    when they're out. Alarms stay device-local regardless."""
+
+    model_config = SettingsConfigDict(env_prefix="NOTIFY_", env_file=".env", extra="ignore")
+
+    also_whatsapp: bool = False
+
+
 class AlarmConfig(_Base):
     """Alarms & timers — scheduled proactive events that fire on the device they were
     set on and REPEAT until acknowledged ('stop'). The sound and the repeat cadence are
@@ -605,6 +616,7 @@ class Config:
         self.mcp = MCPConfig()
         self.heartbeat = HeartbeatConfig()
         self.background = BackgroundConfig()
+        self.notify = NotifyConfig()
         self.alarm = AlarmConfig()
         self.browser = BrowserConfig()
         self.whatsapp = WhatsAppConfig()
@@ -697,6 +709,7 @@ class Config:
             "background.enabled": self.background.enabled,
             "background.max_concurrent": self.background.max_concurrent,
             "background.timeout_s": self.background.timeout_s,
+            "notify.also_whatsapp": self.notify.also_whatsapp,
             "alarm.enabled": self.alarm.enabled,
             "alarm.ring_s": self.alarm.ring_s,
             "alarm.quiet_s": self.alarm.quiet_s,

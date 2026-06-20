@@ -36,6 +36,7 @@ from jarvis.protocol.messages import (
     Cancel,
     Hello,
     Identify,
+    Proactive,
     Reject,
     ReplyAudio,
     ReplyEnd,
@@ -113,7 +114,8 @@ class BrainServer:
         self._registry = build_registry(
             cfg.tools, worker=cfg.worker, remote=cfg.remote, google=cfg.google, browser=cfg.browser
         )
-        users = load_users(cfg.capabilities.users_dir)
+        users = load_users(cfg.capabilities.users_dir)  # dict name -> User
+        self._users = users  # for outbound (WhatsApp) routing
         # MCP servers are connected at startup (async, off the hot path); OAuth
         # servers connect per principal (house + each user) so credentials isolate.
         self._mcp = MCPBridge(cfg.mcp, principals=list(users))
@@ -134,7 +136,7 @@ class BrainServer:
         # Background-task lane (fire-and-forget): start() returns instantly; the
         # outcome is pushed via the same proactive broadcast the heartbeat uses.
         self._background = BackgroundRunner(
-            cfg.background, session_factory=self._make_session, notify=self._broadcast
+            cfg.background, session_factory=self._make_session, notify=self._notify_completion
         )
         if cfg.background.enabled:
             self._registry.register(make_background_tool(self._background))
@@ -246,6 +248,33 @@ class BrainServer:
                     await ws.send(f)
                 n += 1
         return n
+
+    async def _notify_completion(self, text: str, identity: str, device_id: str) -> None:
+        """A background job finished → tell the person who asked: on their device, and
+        (if NOTIFY_ALSO_WHATSAPP) on WhatsApp too. Opens the mic so they can reply."""
+        await self._notify(text, device_id=device_id, identity=identity, kind="notification", open_mic=True)
+
+    async def _notify(self, text: str, *, device_id: str = "", identity: str = "",
+                      kind: str = "notification", open_mic: bool = True) -> None:
+        conns = self._device_conns.get(device_id) if device_id else self._connections
+        sent = await self._deliver_proactive(conns or set(), text, kind=kind, open_mic=open_mic)
+        print(f"  [proactive] notify → device={device_id or 'all'} ({sent} conn): {text}")
+        if self._cfg.notify.also_whatsapp and identity:
+            await self._notify_whatsapp(identity, text)
+
+    async def _notify_whatsapp(self, identity: str, text: str) -> None:
+        """Forward a notification to the user's WhatsApp number(s) via the connector
+        (it sends Proactive(to=number) out through wacli). No-op if they have no number
+        or the connector isn't connected."""
+        user = self._users.get(identity)
+        wa_conns = self._device_conns.get(self._cfg.whatsapp.device_id, set())
+        if not user or not user.whatsapp or not wa_conns:
+            return
+        for number in user.whatsapp:
+            msg = encode(Proactive(text=text, to=number, kind="notification"))
+            for ws in list(wa_conns):
+                with contextlib.suppress(Exception):
+                    await ws.send(msg)
 
     async def _connect_mcp(self) -> None:
         """Connect configured MCP servers and register their tools (best-effort —

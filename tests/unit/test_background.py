@@ -49,7 +49,7 @@ def _runner(cfg=None, *, session: _FakeSession | None = None):  # noqa: ANN001
         seen_ctx.append(ctx)
         return sess
 
-    async def notify(text: str) -> None:
+    async def notify(text: str, identity: str = "", device_id: str = "") -> None:
         notes.append(text)
 
     runner = BackgroundRunner(

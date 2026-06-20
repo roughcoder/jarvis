@@ -19,10 +19,13 @@ import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
+import contextlib
+
 from jarvis.config import Config, WhatsAppConfig
 from jarvis.protocol.messages import (
     Hello,
     Identify,
+    Proactive,
     ReplyEnd,
     ReplyText,
     TextIn,
@@ -74,27 +77,50 @@ class WacliClient:
         await proc.wait()
 
 
-async def handle_message(ws, msg: InboundMessage) -> str:  # noqa: ANN001
-    """Drive ONE inbound message through the brain and return the reply text. Sends
-    an Identify (the sender is the asserted identity) then a TextIn, and collects
-    ReplyText up to ReplyEnd. Pure routing — unit-tested with a fake socket."""
+async def forward_proactive(wacli: "WacliClient", m) -> bool:  # noqa: ANN001
+    """If `m` is a proactive notification addressed to a number, push it OUT via wacli
+    (so a background result / heartbeat reaches the user on WhatsApp). Returns True if it
+    was a (handled) outbound proactive. Pure routing — unit-tested with a fake wacli."""
+    if isinstance(m, Proactive) and m.to:
+        await wacli.send(m.to, m.text)
+        return True
+    return False
+
+
+async def handle_message(ws, inbound, msg: InboundMessage) -> str:  # noqa: ANN001
+    """Drive ONE inbound message through the brain and return the reply text. Sends an
+    Identify (the sender is the asserted identity) then a TextIn, and collects ReplyText
+    up to ReplyEnd from the router queue."""
     turn_id = uuid.uuid4().hex
     await ws.send(encode(Identify(identity=msg.sender)))
     await ws.send(encode(TextIn(turn_id=turn_id, text=msg.text)))
     reply = ""
-    async for raw in ws:
-        m = decode(raw)
+    while True:
+        m = await inbound.get()
         if isinstance(m, ReplyText) and m.turn_id == turn_id:
             reply = m.text
         elif isinstance(m, ReplyEnd) and m.turn_id == turn_id:
-            break
-    return reply
+            return reply
 
 
 class WhatsAppConnector:
     def __init__(self, cfg: Config, *, wacli: WacliClient | None = None) -> None:
         self._cfg = cfg
         self._wacli = wacli or WacliClient(cfg.whatsapp)
+
+    async def _router(self, ws, inbound: asyncio.Queue) -> None:  # noqa: ANN001
+        """Read the brain socket: forward outbound proactives via wacli; queue turn
+        reply frames for handle_message."""
+        try:
+            async for raw in ws:
+                with contextlib.suppress(Exception):
+                    m = decode(raw)
+                    if await forward_proactive(self._wacli, m):
+                        continue
+                    if isinstance(m, (ReplyText, ReplyEnd)):
+                        inbound.put_nowait(m)
+        except Exception:  # noqa: BLE001 - socket closed
+            pass
 
     async def run(self) -> None:
         import websockets
@@ -116,7 +142,12 @@ class WhatsAppConnector:
                 print(f"pairing rejected: {welcome}")
                 return
             print("Paired. Listening for WhatsApp messages…")
-            async for msg in self._wacli.listen():
-                reply = await handle_message(ws, msg)
-                if reply:
-                    await self._wacli.send(msg.sender, reply)
+            inbound: asyncio.Queue = asyncio.Queue()
+            router = asyncio.create_task(self._router(ws, inbound))
+            try:
+                async for msg in self._wacli.listen():
+                    reply = await handle_message(ws, inbound, msg)
+                    if reply:
+                        await self._wacli.send(msg.sender, reply)
+            finally:
+                router.cancel()
