@@ -125,8 +125,16 @@ class Cancel(BaseModel):
 
 
 class Proactive(BaseModel):
+    """Down: a server-initiated message (alarm, background-job result, heartbeat). For a
+    voice device the brain follows this with ReplyAudio frames (tone + spoken text) under
+    the same `turn_id`, then ReplyEnd; text clients just show `text`. `open_mic` asks the
+    intercom to listen for a reply after speaking (turn the notification into a chat)."""
+
     type: Literal["proactive"] = "proactive"
     text: str
+    turn_id: str = ""
+    kind: str = "notification"  # notification | alarm
+    open_mic: bool = False
 
 
 class WhoAreYou(BaseModel):

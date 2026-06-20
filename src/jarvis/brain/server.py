@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import uuid
 
 import websockets
 
@@ -23,6 +24,7 @@ from jarvis.brain.gateway_client import GatewayClient
 from jarvis.brain.heartbeat import HeartbeatScheduler, make_heartbeat_think
 from jarvis.brain.identity import HOUSE, IdentityResolver, load_users
 from jarvis.brain.memory_client import MemoryClient
+from jarvis.brain.proactive import proactive_frames
 from jarvis.brain.scheduler import Ring, Scheduler
 from jarvis.brain.session import BrainSession, TurnResult
 from jarvis.brain.skills import register_skills
@@ -34,7 +36,6 @@ from jarvis.protocol.messages import (
     Cancel,
     Hello,
     Identify,
-    Proactive,
     Reject,
     ReplyAudio,
     ReplyEnd,
@@ -205,31 +206,46 @@ class BrainServer:
                 print(f"  [alarm] tick skipped: {exc}")
 
     async def _deliver_ring(self, ring: Ring) -> None:
-        """Deliver one alarm ring to its device. For now a Proactive text push (the
-        first ring announces the label; repeats re-ping) — the voice tone/TTS layer
-        rides on the same routing."""
-        text = (f"Alarm: {ring.label}." if ring.first else f"Alarm still ringing: {ring.label}.") \
-            if ring.label != "alarm" else ("Your alarm." if ring.first else "Alarm still ringing.")
-        sent = await self._to_device(ring.device_id, encode(Proactive(text=text)))
-        print(f"  [alarm] ring → device={ring.device_id} ({sent} conn): {text}")
-
-    async def _to_device(self, device_id: str, msg: str) -> int:
-        """Send a frame to every open connection for a device; returns how many got it."""
-        n = 0
-        for ws in list(self._device_conns.get(device_id, set())):
-            with contextlib.suppress(Exception):
-                await ws.send(msg)
-                n += 1
-        return n
+        """Deliver one alarm ring to the device that set it: the tone every cycle, the
+        spoken label only on the first ring (so it doesn't repeat the words each time)."""
+        label = ring.label if ring.label != "alarm" else ""
+        text = (f"Alarm: {label}." if label else "Your alarm.") if ring.first else (f"Alarm: {label}." if label else "Alarm.")
+        conns = self._device_conns.get(ring.device_id, set())
+        sent = await self._deliver_proactive(
+            conns, text, kind="alarm", open_mic=False, speak=ring.first, tone=True
+        )
+        print(f"  [alarm] ring → device={ring.device_id} ({sent} conn){' (first)' if ring.first else ''}: {text}")
 
     async def _broadcast(self, text: str) -> None:
-        """Push a proactive message to every connected intercom (heartbeat, §3b).
-        Best-effort per connection; a dead socket is skipped, never fatal."""
-        print(f"  [heartbeat] proactive → {len(self._connections)} intercom(s): {text}")
-        msg = encode(Proactive(text=text))
-        for ws in list(self._connections):
+        """Push a proactive notification (heartbeat / background completion) to every
+        connected intercom — chime + spoken text, and open the mic so the user can reply
+        (turn it into a chat). Best-effort; a dead socket is skipped, never fatal."""
+        print(f"  [proactive] notify → {len(self._connections)} intercom(s): {text}")
+        await self._deliver_proactive(
+            self._connections, text, kind="notification", open_mic=True, speak=True, tone=True
+        )
+
+    async def _deliver_proactive(self, conns, text, *, kind="notification", open_mic=False,  # noqa: ANN001
+                                 speak=True, tone=True) -> int:
+        """Send one proactive delivery (header + tone + spoken audio + end) to a set of
+        connections. The TTS is synthesised once and reused across connections; text
+        clients ignore the audio and just show the header text."""
+        targets = list(conns)
+        if not targets:
+            return 0
+        turn_id = "pa-" + uuid.uuid4().hex[:8]
+        frames = await proactive_frames(
+            self._tts, self._cfg.tts.sample_rate, text, turn_id=turn_id, kind=kind,
+            open_mic=open_mic, speak=speak, tone=tone,
+            sound=self._cfg.alarm.sound, freq=self._cfg.alarm.tone_freq,
+        )
+        n = 0
+        for ws in targets:
             with contextlib.suppress(Exception):
-                await ws.send(msg)
+                for f in frames:
+                    await ws.send(f)
+                n += 1
+        return n
 
     async def _connect_mcp(self) -> None:
         """Connect configured MCP servers and register their tools (best-effort —

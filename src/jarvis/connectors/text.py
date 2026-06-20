@@ -124,9 +124,9 @@ class TextConsole:
                 m = decode(raw)
                 if isinstance(m, Proactive):
                     print(f"\n🔔 {m.text}\n", flush=True)
-                elif isinstance(m, (ReplyText, ReplyEnd, Transcript)):
+                elif isinstance(m, (ReplyText, ReplyEnd, Transcript)) and not m.turn_id.startswith("pa-"):
                     await turn_q.put(m)
-                # ReplyAudio is ignored in text mode
+                # ReplyAudio (and proactive 'pa-' trailing frames) are ignored in text mode
         except Exception:  # noqa: BLE001 - socket closed / shutting down
             pass
 
