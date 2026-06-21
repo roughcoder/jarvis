@@ -31,6 +31,9 @@ uv run jarvis status      # brain reachable? what am I allowed to do?
 uv run jarvis run         # become an intercom
 ```
 
+To run it as a service, use `deploy/systemd/jarvis-intercom.service.template`
+and the install steps in `docs/FLEET.md`.
+
 ## Notes
 - The token is **bound to its device_id**: a leaked Pi token can't impersonate your
   Mac (`authorise_device` rejects a token used from the wrong device).

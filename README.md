@@ -98,3 +98,7 @@ Per-step extras install as each build step is reached, e.g.
   gotchas, invariants (read first; `CLAUDE.md` imports it).
 - **[docs/PHASE2.md](docs/PHASE2.md)** — the Frankfurt migration spec; the
   readiness test is its entry gate.
+- **[docs/FLEET.md](docs/FLEET.md)** — Mac mini / laptop / Pi service deployment,
+  status contract, and update shape.
+- **[docs/SWIFT_TOOLBAR_SPEC.md](docs/SWIFT_TOOLBAR_SPEC.md)** — handoff spec for
+  the separate native macOS menu bar app.

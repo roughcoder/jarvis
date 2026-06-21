@@ -93,6 +93,7 @@ uv run jarvis run --local   # terminal B
 ```bash
 uv run jarvis brain         # terminal A
 uv run jarvis status        # terminal B — reachable? what am I allowed to do?
+uv run jarvis fleet-status --json --no-docker   # operator/toolbar status contract
 uv run jarvis run           # terminal B — connect as an intercom over WebSocket
 ```
 **Pass:** `status` prints identity/scope/capabilities; `run` pairs and behaves like 1.3

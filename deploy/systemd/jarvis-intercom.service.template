@@ -1,0 +1,15 @@
+[Unit]
+Description=Jarvis intercom
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__JARVIS_HOME__
+ExecStart=__UV_BIN__ run jarvis run
+Restart=always
+RestartSec=3
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target

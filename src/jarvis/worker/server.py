@@ -270,7 +270,16 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         return web.json_response({"jobs": [j.public() for j in jobs.recent()]})
 
     async def health(_request: web.Request) -> web.Response:
-        return web.json_response({"ok": True, "agent": cfg.agent})
+        return web.json_response(
+            {
+                "ok": True,
+                "agent": cfg.agent,
+                "workspace": cfg.workspace,
+                "repo_root_configured": bool(cfg.repo_root),
+                "browser_enabled": browser_cfg.enabled,
+                "gui_provider_configured": bool(cfg.peekaboo_ai_providers),
+            }
+        )
 
     app = web.Application()
     app["browser_holder"] = browser_holder  # for clean shutdown in serve()

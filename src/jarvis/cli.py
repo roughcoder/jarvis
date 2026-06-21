@@ -697,44 +697,77 @@ def _cmd_mcp_probe(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_status(_args: argparse.Namespace) -> int:
+def _cmd_status(args: argparse.Namespace) -> int:
     """Device lifecycle (§3): is the brain reachable, and what is THIS device allowed
     to do? Pairs like an intercom (device id + token) and prints the Welcome."""
-    import websockets
+    import json
 
-    from jarvis.protocol.messages import Hello, Reject, Welcome, decode, encode
+    from jarvis.fleet import probe_brain
 
     cfg = load_config()
     url = cfg.intercom.brain_url
 
-    async def go():  # noqa: ANN202
-        async with websockets.connect(url, open_timeout=5) as ws:
-            await ws.send(
-                encode(
-                    Hello(
-                        device_id=cfg.capabilities.device_id,
-                        token=cfg.intercom.token.get_secret_value(),
-                    )
-                )
-            )
-            return decode(await asyncio.wait_for(ws.recv(), 5))
-
+    res = asyncio.run(probe_brain(cfg))
+    if getattr(args, "json", False):
+        print(json.dumps({"brain_url": url, "device_id": cfg.capabilities.device_id, **res}, indent=2))
+        return 0 if res.get("paired") else 1
     print(f"Brain: {url}  (device: {cfg.capabilities.device_id})")
-    try:
-        res = asyncio.run(go())
-    except Exception as exc:  # noqa: BLE001
-        print(f"  ✗ not reachable ({exc}) — is `jarvis brain` running?")
+    if not res.get("reachable"):
+        print(f"  ✗ not reachable ({res.get('error')}) — is `jarvis brain` running?")
         return 1
-    if isinstance(res, Welcome):
+    if res.get("paired"):
         print("  ✓ reachable + paired")
-        print(f"    identity: {res.identity}   scope: {res.scope}")
-        print(f"    capabilities: {', '.join(res.capabilities) or '(none)'}")
+        print(f"    identity: {res.get('identity')}   scope: {res.get('scope')}")
+        print(f"    capabilities: {', '.join(res.get('capabilities') or []) or '(none)'}")
         return 0
-    if isinstance(res, Reject):
-        print(f"  ✗ pairing rejected: {res.reason} (check INTERCOM_TOKEN / BRAIN_DEVICES)")
-        return 1
-    print(f"  ✗ unexpected reply: {res}")
+    print(f"  ✗ pairing rejected: {res.get('error')} (check INTERCOM_TOKEN / BRAIN_DEVICES)")
     return 1
+
+
+def _cmd_fleet_status(args: argparse.Namespace) -> int:
+    """Operator/status surface for the Swift menu bar app."""
+    import json
+
+    from jarvis.fleet import collect_fleet_status
+
+    cfg = load_config()
+    data = asyncio.run(collect_fleet_status(cfg, include_docker=not args.no_docker))
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+        return 0
+
+    pairing = data["intercom"]["pairing"]
+    worker = data["worker"]["probe"]
+    docker = data["docker"]
+    git = data["git"]
+    print(f"Jarvis fleet status for {data['device_id']}")
+    print(f"  brain bind:       {data['brain']['bind']}  auth={'yes' if data['brain']['auth_configured'] else 'no'}")
+    print(
+        "  intercom pairing: "
+        + ("paired" if pairing.get("paired") else f"not paired ({pairing.get('error', 'unknown')})")
+    )
+    if pairing.get("paired"):
+        print(f"    identity/scope: {pairing.get('identity')} / {pairing.get('scope')}")
+    print(
+        "  worker:          "
+        + (
+            f"reachable ({worker.get('health', {}).get('agent', data['worker']['agent'])})"
+            if worker.get("reachable")
+            else f"unreachable ({worker.get('error', 'unknown')})"
+        )
+    )
+    if worker.get("reachable"):
+        jobs = worker.get("jobs", {})
+        print(f"    jobs:           {jobs.get('running', 0)} running / {jobs.get('total', 0)} total")
+    if docker.get("available"):
+        running = sum(1 for s in docker.get("services", []) if s.get("state", "").lower() == "running")
+        print(f"  docker compose:   {running}/{len(docker.get('services', []))} running")
+    else:
+        print(f"  docker compose:   unavailable ({docker.get('error', 'not checked')})")
+    if git.get("available"):
+        dirty = " dirty" if git.get("dirty") else ""
+        print(f"  git:              {git.get('branch')} {git.get('commit')}{dirty}")
+    return 0
 
 
 def _cmd_traces(args: argparse.Namespace) -> int:
@@ -884,7 +917,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_jobs.set_defaults(func=_cmd_jobs)
 
     p_status = sub.add_parser("status", help="Is the brain reachable + what is this device allowed to do?")
+    p_status.add_argument("--json", action="store_true", help="Print machine-readable status")
     p_status.set_defaults(func=_cmd_status)
+
+    p_fleet = sub.add_parser("fleet-status", help="Operator status for local roles + remote peers")
+    p_fleet.add_argument("--json", action="store_true", help="Print machine-readable status for the toolbar app")
+    p_fleet.add_argument("--no-docker", action="store_true", help="Skip docker compose status")
+    p_fleet.set_defaults(func=_cmd_fleet_status)
 
     p_traces = sub.add_parser("traces", help="View recent per-turn pipeline traces")
     p_traces.add_argument("-n", type=int, default=20, help="How many recent traces")
