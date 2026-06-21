@@ -602,6 +602,12 @@ class WhatsAppConfig(_Base):
     device_id: str = "whatsapp"
     token: SecretStr = SecretStr("")  # brain pairing token for this connector
     poll_interval_s: float = 2.0
+    # Access control (like OpenClaw's dmPolicy/allowFrom) — who may message the bot.
+    # "allowlist" (default, deny-by-default): only numbers in allow_from. "open": anyone
+    # (drives the LLM — unsafe). "disabled": ignore all inbound (outbound-only).
+    dm_policy: str = "allowlist"
+    allow_from: str = ""  # CSV of allowed E.164 numbers, e.g. "447921815819,447999246830"
+    text_chunk_limit: int = 4000  # split long replies (WhatsApp message length limit)
 
 
 class Config:

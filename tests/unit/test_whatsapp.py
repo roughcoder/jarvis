@@ -12,8 +12,10 @@ import asyncio
 from jarvis.connectors.whatsapp import (
     InboundMessage,
     _parse_messages,
+    chunk_text,
     forward_proactive,
     handle_message,
+    is_allowed,
 )
 from jarvis.protocol.messages import (
     Identify,
@@ -94,6 +96,27 @@ def test_parse_messages_maps_wacli_schema() -> None:
     assert msgs[0].sender == "447921815819@s.whatsapp.net" and msgs[0].msg_id == "abc"
     assert msgs[0].chat == "447921815819@s.whatsapp.net" and msgs[0].ts == "2026-06-21T10:00:00Z"
     assert _parse_messages({}) == []  # empty/garbage → no rows
+
+
+def test_is_allowed_deny_by_default() -> None:
+    allow = "447921815819, 447999246830"
+    # allowlist (default): only listed numbers, any format
+    assert is_allowed("447921815819@s.whatsapp.net", "allowlist", allow) is True
+    assert is_allowed("+44 7921 815819", "allowlist", allow) is True
+    assert is_allowed("447000000000@s.whatsapp.net", "allowlist", allow) is False
+    assert is_allowed("447921815819", "allowlist", "") is False  # empty list → nobody
+    # open lets anyone; disabled blocks everyone
+    assert is_allowed("447000000000", "open", "") is True
+    assert is_allowed("447921815819", "disabled", allow) is False
+
+
+def test_chunk_text_splits_long_replies() -> None:
+    assert chunk_text("short", 4000) == ["short"]
+    assert chunk_text("", 4000) == []
+    body = "word " * 500  # 2500 chars
+    chunks = chunk_text(body, 1000)
+    assert len(chunks) >= 3 and all(len(c) <= 1000 for c in chunks)
+    assert "".join(c.replace(" ", "") for c in chunks) == body.replace(" ", "")  # no data lost
 
 
 def test_forward_proactive_ignores_non_addressed() -> None:

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -67,6 +68,42 @@ def _now_rfc3339() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _digits(num: str) -> str:
+    """Phone/jid → digits only (drop '@…' suffix, '+', spaces) for allowlist matching."""
+    return re.sub(r"\D", "", (num or "").split("@", 1)[0])
+
+
+def is_allowed(sender: str, policy: str, allow_from: str) -> bool:
+    """Whether an inbound sender may drive a turn (OpenClaw's dmPolicy/allowFrom). Default
+    'allowlist' is deny-by-default: only numbers in `allow_from` (any format) get through."""
+    if policy == "open":
+        return True
+    if policy == "disabled":
+        return False
+    allowed = {_digits(n) for n in allow_from.split(",") if n.strip()}
+    return _digits(sender) in allowed
+
+
+def chunk_text(text: str, limit: int) -> list[str]:
+    """Split a reply into <=limit-char chunks (prefer a newline/space boundary) for
+    WhatsApp's message-length cap. Returns [text] when it already fits."""
+    text = text or ""
+    if limit <= 0 or len(text) <= limit:
+        return [text] if text else []
+    chunks, rest = [], text
+    while len(rest) > limit:
+        cut = rest.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = rest.rfind(" ", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+    if rest:
+        chunks.append(rest)
+    return chunks
+
+
 class WacliClient:
     """Thin wrapper over the `wacli` CLI (wacli.sh)."""
 
@@ -100,13 +137,14 @@ class WacliClient:
             return []
 
     async def send(self, to: str, text: str) -> None:
-        proc = await asyncio.create_subprocess_exec(
-            *self._base(), "send", "text", "--to", to, "--message", text,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        )
-        out, _ = await proc.communicate()
-        if proc.returncode != 0:
-            print(f"  [whatsapp] send to {to} failed: {out.decode('utf-8', 'replace').strip()}")
+        for chunk in chunk_text(text, self._cfg.text_chunk_limit):
+            proc = await asyncio.create_subprocess_exec(
+                *self._base(), "send", "text", "--to", to, "--message", chunk,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await proc.communicate()
+            if proc.returncode != 0:
+                print(f"  [whatsapp] send to {to} failed: {out.decode('utf-8', 'replace').strip()}")
 
 
 async def forward_proactive(wacli: WacliClient, m) -> bool:  # noqa: ANN001
@@ -177,6 +215,7 @@ class WhatsAppConnector:
                 print(f"pairing rejected: {welcome}")
                 return
             print("Paired. Syncing WhatsApp + polling for messages…")
+            wa = self._cfg.whatsapp
             inbound: asyncio.Queue = asyncio.Queue()
             router = asyncio.create_task(self._router(ws, inbound))
             sync = await self._wacli.start_sync()
@@ -191,6 +230,11 @@ class WhatsAppConnector:
                         seen.add(msg.msg_id)
                         if msg.ts:
                             cursor = max(cursor, msg.ts)
+                        # deny-by-default: only allowed numbers drive a turn (don't let a
+                        # stranger texting the line spend LLM/tools).
+                        if not is_allowed(msg.sender, wa.dm_policy, wa.allow_from):
+                            print(f"  [whatsapp] ignored message from non-allowed sender {msg.sender}")
+                            continue
                         reply = await handle_message(ws, inbound, msg)
                         if reply:
                             await self._wacli.send(msg.chat or msg.sender, reply)
