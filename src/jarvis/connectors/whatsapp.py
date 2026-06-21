@@ -214,14 +214,18 @@ class WacliClient:
 
     def _base(self) -> list[str]:
         argv = [self._cfg.wacli_bin]
-        if getattr(self._cfg, "account", ""):
-            argv += ["--account", self._cfg.account]
+        account = getattr(self._cfg, "account", "").strip()
+        if account:
+            argv += ["--account", account]
         return argv
 
     async def start_sync(self):  # noqa: ANN202 - returns the background sync process
-        """Keep the local DB warm (`wacli sync --follow`), so polls see new messages."""
+        """Keep the local DB warm (`wacli sync --follow`), so polls see new messages.
+        stdin is detached to /dev/null: inheriting the connector's closed background
+        stdin makes `wacli sync` see EOF and shut itself straight back down."""
         return await asyncio.create_subprocess_exec(
             *self._base(), "sync", "--follow",
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
 
