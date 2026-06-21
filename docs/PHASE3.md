@@ -424,8 +424,10 @@ user. The identity stack is not deferred to 3d; only its *multiplicity* is.
   WhatsApp self-skips until `wacli` is linked.
 - ✅ **`google` tool (gogcli / Gmail+Calendar).** `tools/google.py`, gated
   `google.read` / `google.send`; `jarvis google-setup`. Self-skips without gogcli.
-- ✅ **`mac-control` (peekaboo).** `see_screen` / `control_mac` worker tools gated
-  `worker.gui`; `jarvis worker --doctor`. Self-skips without peekaboo + perms.
+- ✅ **`mac-control` (peekaboo).** `control_mac` (the autonomous agent) + `look_at_screen`
+  (read-only native vision) worker tools gated `worker.gui`; `jarvis worker --doctor`.
+  Self-skips without peekaboo + perms. (The earlier atomic see/click/type tools were
+  removed — GUI control is agent-only so the model can't bypass it and flail.)
 - ✅ **WS8 polish.** Embedding-based relevance (opt-in `TOOLS_RELEVANCE_MODE=
   embedding`, keyword fallback) + prompt-cache hit/miss in `jarvis traces`
   (cached/prompt tokens via gateway usage; cache-friendly stable prefix).

@@ -37,8 +37,33 @@ extra, lazy-imported; the `worker.browser` capability gates every browser tool
 
 **Tools** (the snapshot → act → read loop): `browser_open(url)` ·
 `browser_snapshot()` (lists interactive elements, each a `[ref]`) · `browser_click(ref)` ·
-`browser_type(ref, text, submit)` · `browser_read()` (page text). Refs are tagged onto the
-DOM (`data-jref`) so a stale ref fails cleanly ("snapshot again"), never mis-clicks.
+`browser_type(ref, text, submit)` · `browser_press(keys, ref?)` (keyboard) ·
+`browser_read()` (page text). Refs are tagged onto the DOM (`data-jref`) so a stale ref
+fails cleanly ("snapshot again"), never mis-clicks.
+
+**Acting like a real user — mouse OR keyboard (general, not site-specific):**
+- **Real pointer clicks** — `browser_click` dispatches a genuine CDP mouse sequence
+  (move → press → release) at the element's centre, not a synthetic DOM `.click()`. Many
+  modern widgets (React-Aria/MUI dropdowns, custom comboboxes) only open on
+  `pointerdown`/`mousedown`; this fires them.
+- **Keyboard** — `browser_press` sends real key events (Enter, Tab, Arrows, Escape,
+  Space…), optionally focusing an element first — for the many widgets that open via
+  keyboard, not click (focus a combobox + ArrowDown).
+
+**Reliability (learned from live runs):**
+- **Dead-connection recovery** — a dropped CDP connection is detected and the browser
+  relaunched + re-navigated once, instead of every call failing.
+- **Wait for client-render** — after load/consent, the host waits for the interactive
+  element count to settle, so a React/Next.js widget (e.g. a Zonal/Guestline booking
+  form) is present before the first snapshot. A click that opens a popover also waits for
+  it to render.
+- **Cookie/consent** — auto-dismisses a consent banner (many widgets won't load until you
+  accept).
+- **Cross-origin iframe traversal** — the snapshot walks the main page **plus every
+  connectable frame** (OOPIFs), tagging global refs; click/type route back into the right
+  frame transparently.
+- **Graceful shutdown / stale-lock clear** — the worker stops Chrome on SIGTERM (no
+  orphans), and a stale profile lock is cleared before launch.
 
 Setup: `uv sync --extra browser` + Google Chrome. Check with the worker
 (`browser_doctor`). Config: `BROWSER_*` in `.env.example`.
@@ -68,13 +93,21 @@ jarvis: The secret code is: ZARK-1fd697f1-QX
         (brain log: browser_open [worker.browser] → browser_read [worker.browser])
 ```
 
-Live integration test: `tests/integration/test_browser_live.py` (open/snapshot/read/click
-on example.com; self-skips without the extra/Chrome).
+Live integration tests (self-skip without the `[browser]` extra/Chrome):
+- `test_browser_live.py` — open/snapshot/read/click on example.com.
+- `test_browser_iframe.py` — cross-origin iframe: list + click an element inside an OOPIF.
+- `test_browser_click.py` — a real pointer click fires pointerdown/mousedown/mouseup.
+- `test_browser_keys.py` — `browser_press` delivers real key events.
 
 ## Known follow-ups
 
+- **Same-origin nested iframes**: cross-origin frames (OOPIFs) are traversed; same-origin
+  iframes (rarer for third-party widgets) aren't yet.
 - **Per-device `browser_default`**: the global `BROWSER_DEFAULT_CONTEXT` is active; a
-  per-device override in the profile front-matter is not wired yet.
+  per-device override in the profile front-matter isn't wired yet.
 - **`device` live-attach**: a `jarvis browser attach-setup` to relaunch the machine's
-  Chrome with the debug port (for "see my current tabs") is not built — `jarvis` context
+  Chrome with the debug port (for "see my current tabs") isn't built — `jarvis` context
   works with zero setup.
+- **Stubborn commercial widgets**: most React-Aria flows work via the pointer/keyboard
+  primitives + the render wait; a given booking widget's final step may still need a
+  bespoke nudge (and real bookings hit login/captcha — the human-handoff wall, by design).

@@ -124,6 +124,14 @@ keeps the original single-process behaviour. The think/speak core is shared
 (`brain/session.py`, `BrainSession`); the edge (mic/wake/VAD/playback) lives in
 `intercom/`.
 
+### Further docs
+- `docs/BROWSER.md` — the browser lane (CDP/nodriver, real pointer + keyboard, iframes,
+  reliability) + the `jarvis text` headless harness.
+- `docs/NOTIFICATIONS.md` — alarms/timers + proactive voice delivery, multi-channel
+  routing, idle-aware timing.
+- `docs/PHASE3.md` — Phase 3 status/spec; `docs/PHASE2.md` — relocation; `docs/PI.md` —
+  room device; `docs/TESTING.md` — how to test each surface.
+
 ## Conventions
 
 - **All config from env**, via `config.py` (pydantic-settings, one class per

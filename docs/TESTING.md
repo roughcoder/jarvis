@@ -114,7 +114,29 @@ uv run jarvis traces -n 10
 **Pass:** per-turn STT/LLM/TTS timings; with caching active the `llm` stage shows
 `cached_tokens`/`prompt_tokens`.
 
-### 1.10 Hot-path / dead-boundary invariant (constraint #2)
+### 1.10 Text console (the headless harness)
+```bash
+uv run jarvis brain                                  # one pane
+uv run jarvis text --once "what's two plus two?"     # another → prints the reply
+uv run jarvis text                                   # interactive REPL (or pipe stdin)
+```
+**Pass:** replies come back with no mic/STT/TTS. Proactive pushes (alarms, background
+results, heartbeat) print `🔔 …` as they arrive, even between turns.
+
+### 1.11 Alarms & proactive notifications
+```bash
+uv run jarvis brain                                  # alarms/notify run here
+# Over voice (jarvis run) or text (jarvis text):
+#   "set a timer for thirty seconds"   → fires + REPEATS until acknowledged
+#   (while ringing) "stop" / "dismiss" → "Alarm off." (no wake word needed on voice)
+#   "in the background, <slow task>, and let me know" → "on it", then a spoken result
+```
+**Pass:** the timer rings on the setting device, repeats on the ring/quiet cadence, and
+"stop" silences it; a background task says "on it" then notifies (and on voice opens the
+mic for a reply). Tune `ALARM_*` / `NOTIFY_*` in `.env`. (How the tone/voice *sound* is
+the one human-verified bit.)
+
+### 1.12 Hot-path / dead-boundary invariant (constraint #2)
 ```bash
 MEMORY_PORT=1 uv run jarvis run --local
 ```
@@ -172,8 +194,9 @@ brew install peekaboo                 # then grant Screen Recording + Accessibil
 uv run jarvis worker --doctor         # → peekaboo_installed: true
 ```
 Grant `worker.gui` in the device profile, then ask Jarvis to **"look at my screen"**
-(`see_screen`) or **"open Safari and …"** (`control_mac`). **Pass:** doctor reports
-ready; the GUI action runs.
+(`look_at_screen`, read-only vision) or **"open Safari and …"** (`control_mac`, the
+autonomous agent — the only way to act on the GUI). **Pass:** doctor reports ready; the
+GUI action runs.
 
 ### 3.4 Room Pi — second device (see docs/PI.md)
 On the brain: add the Pi to `BRAIN_DEVICES`. On the Pi: `uv sync --extra stt --extra
@@ -181,6 +204,17 @@ vad --extra wake`, set `INTERCOM_*` + `CAPS_DEVICE_ID=room-pi`, then `jarvis sta
 and `jarvis run`. **Pass:** the Pi pairs (house scope), reaches STT/TTS/LLM over the
 LAN, and a voice claim ("it's Jules") upgrades scope for that conversation — while
 your Mac, simultaneously, stays Neil with a separate session + memory.
+
+### 3.5 Browser lane — needs the `[browser]` extra + Chrome (see docs/BROWSER.md)
+```bash
+uv sync --extra browser               # installs nodriver
+uv run jarvis worker                  # hosts the browser (BROWSER_HEADLESS=false to watch)
+uv run pytest --run-integration tests/integration/test_browser_*.py   # real Chrome, controlled pages
+```
+Grant `worker.browser` in the device profile, then (voice/text) ask **"open Wikipedia
+and tell me who built Polesden Lacey."** **Pass:** the integration tests go green; Jarvis
+opens a real Chrome, navigates, reads, and answers (it uses the browser rather than
+deferring). Live bookings hit login/captcha — the human-handoff wall, by design.
 
 ---
 
