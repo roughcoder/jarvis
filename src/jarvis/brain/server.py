@@ -121,7 +121,8 @@ class BrainServer:
         self._stt = Transcriber(cfg.stt)
         self._tracer = Tracer(cfg.trace)
         self._registry = build_registry(
-            cfg.tools, worker=cfg.worker, remote=cfg.remote, google=cfg.google, browser=cfg.browser
+            cfg.tools, worker=cfg.worker, remote=cfg.remote, google=cfg.google,
+            browser=cfg.browser, capabilities=cfg.capabilities,
         )
         users = load_users(cfg.capabilities.users_dir)  # dict name -> User
         self._users = users  # for outbound (WhatsApp) routing

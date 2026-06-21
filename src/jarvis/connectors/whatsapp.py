@@ -132,7 +132,8 @@ def add_whatsapp_number(users_dir: str, name: str, number: str) -> str:
     if not path.exists():
         path.write_text(
             f'---\n# {name} — paired via WhatsApp\nwhatsapp: ["{nd}"]\n'
-            f"scope: personal\nhoncho_peer: {slug}\n---\n\n# {name}\n",
+            f"scope: personal\nhoncho_peer: {slug}\n"
+            f"capabilities: [profile.write]\n---\n\n# {name}\n",
             encoding="utf-8",
         )
         return "created"

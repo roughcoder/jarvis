@@ -7,11 +7,19 @@ grant — the capability gate is.
 
 from __future__ import annotations
 
-from jarvis.config import BrowserConfig, GoogleConfig, RemoteConfig, ToolsConfig, WorkerConfig
+from jarvis.config import (
+    BrowserConfig,
+    CapabilityConfig,
+    GoogleConfig,
+    RemoteConfig,
+    ToolsConfig,
+    WorkerConfig,
+)
 from jarvis.tools.base import Tool, ToolError, ToolRegistry
 from jarvis.tools.browser import make_browser_tools
 from jarvis.tools.files import make_files_tools
 from jarvis.tools.google import make_google_tools
+from jarvis.tools.profile import make_profile_tools
 from jarvis.tools.remote import make_remote_tools
 from jarvis.tools.web_search import make_web_search_tool
 from jarvis.tools.worker import make_worker_tools
@@ -26,6 +34,7 @@ def build_registry(
     remote: RemoteConfig | None = None,
     google: GoogleConfig | None = None,
     browser: BrowserConfig | None = None,
+    capabilities: CapabilityConfig | None = None,
     mcp: list[Tool] | None = None,
 ) -> ToolRegistry:
     """Register every tool. `worker` adds the local worker-daemon tools, `remote`
@@ -38,6 +47,9 @@ def build_registry(
     reg.register(make_web_search_tool(cfg))
     for tool in make_files_tools(cfg):
         reg.register(tool)
+    if capabilities is not None:
+        for tool in make_profile_tools(capabilities):
+            reg.register(tool)
     if worker is not None:
         for tool in make_worker_tools(worker):
             reg.register(tool)

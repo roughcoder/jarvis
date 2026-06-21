@@ -35,6 +35,7 @@ from jarvis.brain.dialog import (
 )
 from jarvis.brain.gateway_client import GatewayClient
 from jarvis.brain.memory_client import MemoryClient
+from jarvis.brain.profile import format_facts, read_facts
 from jarvis.brain.tracing import Tracer
 from jarvis.config import Config
 from jarvis.services.tts import InworldTTS
@@ -64,6 +65,17 @@ _BACKGROUND_GUIDANCE = (
     "booking — hand it to run_in_background and tell the user you're on it, rather than "
     "making them wait through it on this turn. You'll report the outcome to them "
     "proactively when it's done. Do it inline only when it's genuinely quick."
+)
+
+_PROFILE_GUIDANCE = (
+    "Remembering personal facts: when the user states a durable, structured fact about "
+    "themselves — email, postal address, phone number, birthday, names of family or pets, "
+    "a standing preference — or asks you to remember something, save it with the `remember` "
+    "tool so you reliably have it next time (it writes to their private profile). Use a "
+    "short stable label (e.g. 'email', 'address') and the value verbatim, then confirm in a "
+    "few words ('Got it — saved your email.'). Don't save fleeting or conversational "
+    "remarks. Use `forget` to remove one, `list_facts` to see what's saved. Saved facts "
+    "appear below under what you know about the user; trust them as authoritative."
 )
 
 _BROWSER_GUIDANCE = (
@@ -407,6 +419,8 @@ class BrainSession:
         parts.append(_AGENCY)  # act-by-default + persistence (stable, cacheable)
         if self._ctx.can("background.run"):
             parts.append(_BACKGROUND_GUIDANCE)
+        if self._ctx.can("profile.write"):
+            parts.append(_PROFILE_GUIDANCE)
         if self._ctx.can("worker.browser"):
             parts.append(_BROWSER_GUIDANCE)
         if self._ctx.can("worker.gui"):
@@ -432,6 +446,14 @@ class BrainSession:
                 "needs personal data or someone's accounts, first ask who you're "
                 "talking to; general questions don't need it."
             )
+        # Saved facts = the authoritative rail (verbatim, user-curated). Inject them
+        # for a known personal speaker, ahead of Honcho's fuzzy summary below.
+        facts = self._saved_facts()
+        if facts:
+            parts.append(
+                "Facts the user has asked you to remember (authoritative — trust these "
+                f"over anything fuzzier):\n{facts}"
+            )
         if memory:
             parts.append(
                 "What you already know about the user (use it naturally only if "
@@ -441,6 +463,14 @@ class BrainSession:
         # stays cacheable. Lets Jarvis answer time/date instantly, no tool needed.
         parts.append(_now_line(self._cfg.persona.timezone))
         return "\n\n".join(parts)
+
+    def _saved_facts(self) -> str:
+        """The speaker's curated facts (local file read, like the memory cache — never a
+        network call on the hot path). Only for a known personal-scope principal."""
+        if self._ctx.scope != "personal" or not self._ctx.identity or self._ctx.identity == "house":
+            return ""
+        path = pathlib.Path(self._cfg.capabilities.users_dir) / f"{self._ctx.identity}.md"
+        return format_facts(read_facts(path))
 
     async def _run_tool_loop(self, messages, model, trace, tool_schemas, result):  # noqa: ANN001
         """Tool-aware completion: let the model call gated tools, feed results
