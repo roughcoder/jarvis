@@ -375,6 +375,37 @@ def _cmd_whatsapp(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_whatsapp_log(args: argparse.Namespace) -> int:
+    """Print the WhatsApp transcript from wacli's local store (both directions)."""
+    import json
+    import subprocess
+
+    cfg = load_config().whatsapp
+    argv = [cfg.wacli_bin]
+    if cfg.account.strip():
+        argv += ["--account", cfg.account.strip()]
+    argv += ["messages", "list", "--json", "--limit", str(args.n)]
+    if args.chat:
+        argv += ["--chat", args.chat]
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=30).stdout
+        msgs = json.loads(out).get("data", {}).get("messages", [])
+    except Exception as exc:  # noqa: BLE001 - wacli missing/not linked
+        print(f"couldn't read WhatsApp log ({exc}). Is wacli linked? `wacli auth status`")
+        return 1
+    if not msgs:
+        print("(no messages)")
+        return 0
+    for m in reversed(msgs):  # wacli returns newest-first; show oldest-first
+        text = (m.get("Text") or m.get("DisplayText") or "").replace("\n", " ")
+        if args.search and args.search.lower() not in text.lower():
+            continue
+        who = "jarvis" if m.get("FromMe") else (m.get("SenderName") or m.get("SenderJID", "")[:16])
+        ts = (m.get("Timestamp") or "")[:19].replace("T", " ")
+        print(f"[{ts}] {who}: {text}")
+    return 0
+
+
 def _cmd_text(args: argparse.Namespace) -> int:
     """Text console: drive the brain from the terminal — no mic/STT/TTS. The dev +
     test harness. `--once` sends one message and prints the reply (scriptable)."""
@@ -887,6 +918,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_whatsapp = sub.add_parser("whatsapp", help="Run the WhatsApp connector (bridge wacli <-> brain, 3b)")
     p_whatsapp.set_defaults(func=_cmd_whatsapp)
+
+    p_walog = sub.add_parser("whatsapp-log", help="Print the WhatsApp transcript from wacli's store")
+    p_walog.add_argument("-n", type=int, default=30, help="how many recent messages to fetch (default 30)")
+    p_walog.add_argument("--chat", default="", help="limit to one chat JID (DM or group)")
+    p_walog.add_argument("--search", default="", help="only show messages containing this text")
+    p_walog.set_defaults(func=_cmd_whatsapp_log)
 
     p_text = sub.add_parser("text", help="Text console: drive the brain from the terminal (no mic/STT/TTS)")
     p_text.add_argument("--once", metavar="MESSAGE", help="Send one message, print the reply, and exit (scriptable)")

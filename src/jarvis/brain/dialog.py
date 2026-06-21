@@ -46,7 +46,12 @@ _MESSAGING_FORMAT = (
     "English — friendly and concise (a few short lines, not an essay). Normal numerals and "
     "dates are fine ('23', 'Friday the 26th'), and you may use WhatsApp formatting (*bold*, "
     "_italic_, a short list) and the occasional emoji where it genuinely fits. Send links as "
-    "plain URLs. No headings, no code fences, no TTS-style [cues]."
+    "plain URLs. No headings, no code fences, no TTS-style [cues]. "
+    "Don't pad replies with filler like 'let me know if you need anything else'. And never "
+    "tell the user to go look something up or do it themselves — if you have a tool for it "
+    "(web search, the browser, etc.), use the tool and give them the actual answer. For "
+    "anything live or specific (train times, opening hours, prices, availability), use the "
+    "browser to fetch the real current value rather than guessing or giving stale figures."
 )
 
 # Conversation control: how the model signals the user is done so the loop can
