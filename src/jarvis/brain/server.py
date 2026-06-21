@@ -219,8 +219,10 @@ class BrainServer:
         label = ring.label if ring.label != "alarm" else ""
         text = (f"Alarm: {label}." if label else "Your alarm.") if ring.first else (f"Alarm: {label}." if label else "Alarm.")
         conns = self._device_conns.get(ring.device_id, set())
+        # open_mic so a ringing alarm listens for the ack right after the tone — you can
+        # just say "stop"/"dismiss", no wake word needed.
         sent = await self._deliver_proactive(
-            conns, text, kind="alarm", open_mic=False, speak=ring.first, tone=True
+            conns, text, kind="alarm", open_mic=True, speak=ring.first, tone=True
         )
         print(f"  [alarm] ring → device={ring.device_id} ({sent} conn){' (first)' if ring.first else ''}: {text}")
 
