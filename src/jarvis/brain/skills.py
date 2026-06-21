@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass
 
 from jarvis.brain.context import RequestContext
+from jarvis.brain.dialog import _now_line
 from jarvis.brain.identity import _parse_front_matter
 from jarvis.config import Config
 from jarvis.tools.base import Tool, ToolRegistry
@@ -88,13 +89,21 @@ async def _run_skill(
     tools = [registry.get(n) for n in skill.allowed_tools]
     schemas = [t.openai_schema() for t in tools if t is not None]
     request = args.get("request") or json.dumps(args)
+    # Skills run in their own sub-loop, so they don't inherit the turn's system
+    # prompt — give them the current date/time too, or "today"/"tomorrow" in a
+    # recipe (e.g. train times) is ambiguous.
+    now = _now_line(cfg.persona.timezone)
+    # Skills are real multi-step tool work (browsing, reading, deciding) — run them on
+    # the strong model so they follow the recipe and reason over results reliably; the
+    # fast model fumbles the steps and ignores recipe specifics (e.g. which site to use).
+    model = cfg.gateway.strong_model
     messages = [
-        {"role": "system", "content": f"{skill.recipe}\n\n{_SKILL_FORMAT}"},
+        {"role": "system", "content": f"{skill.recipe}\n\n{_SKILL_FORMAT}\n\n{now}"},
         {"role": "user", "content": request},
     ]
     for _ in range(max(1, cfg.tools.max_rounds)):
         msg = await gateway.complete_with_tools(
-            messages, model=cfg.gateway.fast_model, tools=schemas or None
+            messages, model=model, tools=schemas or None
         )
         if not msg.tool_calls:
             return msg.content or ""
@@ -121,7 +130,7 @@ async def _run_skill(
             except Exception as exc:  # noqa: BLE001 - a tool error must not break the skill
                 result = f"error: {exc}"
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-    final = await gateway.complete_with_tools(messages, model=cfg.gateway.fast_model, tools=None)
+    final = await gateway.complete_with_tools(messages, model=model, tools=None)
     return final.content or ""
 
 

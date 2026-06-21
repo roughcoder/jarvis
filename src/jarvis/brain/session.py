@@ -32,6 +32,7 @@ from jarvis.brain.dialog import (
     _is_clear_signoff,
     _is_reply_farewell,
     _next_sentence,
+    _now_line,
 )
 from jarvis.brain.gateway_client import GatewayClient
 from jarvis.brain.memory_client import MemoryClient
@@ -148,27 +149,6 @@ _BACKGROUND_FRAMING = (
 )
 
 
-def _now_line(tz_name: str) -> str:
-    """A human 'right now' string injected so Jarvis knows the date/time without
-    a tool or a search. `tz_name` is an IANA name; empty = host local time."""
-    from datetime import datetime
-
-    now = None
-    if tz_name:
-        try:
-            from zoneinfo import ZoneInfo
-
-            now = datetime.now(ZoneInfo(tz_name))
-        except Exception:
-            now = None
-    if now is None:
-        now = datetime.now().astimezone()
-    tz = now.strftime("%Z") or "local time"
-    # e.g. "Right now it's Saturday, 14 June 2026, 8:47 pm BST."
-    return (
-        f"Right now it's {now.strftime('%A, %-d %B %Y')}, "
-        f"{now.strftime('%-I:%M %p').lower()} {tz}."
-    )
 
 
 def _make_heartbeat(sample_rate: int) -> bytes:

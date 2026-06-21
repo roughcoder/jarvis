@@ -10,6 +10,30 @@ from __future__ import annotations
 
 import re
 
+
+def _now_line(tz_name: str) -> str:
+    """A human 'right now' string injected so Jarvis knows the date/time without
+    a tool or a search. `tz_name` is an IANA name; empty = host local time."""
+    from datetime import datetime
+
+    now = None
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+
+            now = datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            now = None
+    if now is None:
+        now = datetime.now().astimezone()
+    tz = now.strftime("%Z") or "local time"
+    # e.g. "Right now it's Saturday, 14 June 2026, 8:47 pm BST."
+    return (
+        f"Right now it's {now.strftime('%A, %-d %B %Y')}, "
+        f"{now.strftime('%-I:%M %p').lower()} {tz}."
+    )
+
+
 # Technical format layer (always present). Personality comes from the soul
 # (SOUL.md); what Jarvis knows about the user comes from memory.
 _VOICE_FORMAT_BASE = (
