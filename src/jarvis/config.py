@@ -603,10 +603,12 @@ class WhatsAppConfig(_Base):
     token: SecretStr = SecretStr("")  # brain pairing token for this connector
     poll_interval_s: float = 2.0
     # Access control (like OpenClaw's dmPolicy/allowFrom) — who may message the bot.
-    # "allowlist" (default, deny-by-default): only numbers in allow_from. "open": anyone
-    # (drives the LLM — unsafe). "disabled": ignore all inbound (outbound-only).
+    # "allowlist" (default, deny-by-default): only numbers in allow_from. "pairing": an
+    # unknown number triggers an admin-approved onboarding (a new user.md is written).
+    # "open": anyone (drives the LLM — unsafe). "disabled": ignore all inbound.
     dm_policy: str = "allowlist"
     allow_from: str = ""  # CSV of allowed E.164 numbers, e.g. "447921815819,447999246830"
+    admin: str = ""  # the number that approves pairings (pairing policy); empty => nobody can
     text_chunk_limit: int = 4000  # split long replies (WhatsApp message length limit)
     # Group behaviour: "ignore" (default — never reply in groups), "mention" (reply only
     # when called out by the trigger name), or "open" (reply to every group message — noisy).

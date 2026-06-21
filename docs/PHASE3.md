@@ -422,6 +422,22 @@ user. The identity stack is not deferred to 3d; only its *multiplicity* is.
   number→user), reply back out. Cold-path heartbeat (`brain/heartbeat.py` +
   `HEARTBEAT.md`) with the silent-completion sentinel + Proactive broadcast. Live
   WhatsApp self-skips until `wacli` is linked.
+  - **Access + groups (deny-by-default).** DMs gated by `WHATSAPP_DM_POLICY`
+    (`allowlist` | `pairing` | `open` | `disabled`); groups gated by
+    `WHATSAPP_GROUP_POLICY` (`ignore` | `mention` | `open`) — under `mention` it
+    replies only when called out by `WHATSAPP_TRIGGER` ("Jarvis, …").
+  - **Remote onboarding (`dm_policy=pairing`).** An unknown DM-er gets a holding
+    reply and the admin (`WHATSAPP_ADMIN`, sole approver, no auto-approve) gets
+    `approve <code> <name>` / `deny <code>`. Approval calls `add_whatsapp_number`,
+    which **creates or merges** `users/<name>.md` (own personal scope + Honcho
+    peer, existing file preserved/idempotent). The brain hot-reloads `users/*.md`
+    on the cold-path tick (`_maybe_reload_users`), so a freshly-paired user is
+    recognised without a restart.
+  - **Channel-aware replies.** The system prompt picks its format by
+    `ctx.channel`: voice gets the spoken rules + TTS cues, messaging surfaces
+    (WhatsApp, the text console) get written prose (`_MESSAGING_FORMAT` — normal
+    numerals/dates, light WhatsApp formatting, no [cues]); open-mic end-detection
+    is voice-only.
 - ✅ **`google` tool (gogcli / Gmail+Calendar).** `tools/google.py`, gated
   `google.read` / `google.send`; `jarvis google-setup`. Self-skips without gogcli.
 - ✅ **`mac-control` (peekaboo).** `control_mac` (the autonomous agent) + `look_at_screen`

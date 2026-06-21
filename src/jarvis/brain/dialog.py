@@ -38,6 +38,17 @@ _VOICE_FORMAT_EXPRESSIVE = (
     "colours what you're saying."
 )
 
+# Messaging channels (WhatsApp, the text console) are read, not heard — so the spoken
+# rules (one breath, numbers as words, TTS [cues]) are wrong here. Write like a person
+# texting: concise, normal numerals/dates, light formatting, the odd emoji if it fits.
+_MESSAGING_FORMAT = (
+    "You're replying in a messaging app, so write to be READ, not spoken. Natural written "
+    "English — friendly and concise (a few short lines, not an essay). Normal numerals and "
+    "dates are fine ('23', 'Friday the 26th'), and you may use WhatsApp formatting (*bold*, "
+    "_italic_, a short list) and the occasional emoji where it genuinely fits. Send links as "
+    "plain URLs. No headings, no code fences, no TTS-style [cues]."
+)
+
 # Conversation control: how the model signals the user is done so the loop can
 # return to PASSIVE (wake word required again). Detected + stripped before TTS.
 _END_INSTRUCTION = (

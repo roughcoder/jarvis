@@ -72,6 +72,15 @@ def _is_alarm_ack(text: str) -> bool:
     return bool(_ALARM_ACK.search(text or ""))
 
 
+def _dir_mtime(users_dir: str) -> float:
+    """Newest mtime among users/*.md (0 if none) — cheap change-detector so a WhatsApp
+    pairing that writes a new user file is picked up live, without a brain restart."""
+    import pathlib
+
+    d = pathlib.Path(users_dir)
+    return max((f.stat().st_mtime for f in d.glob("*.md")), default=0.0) if d.is_dir() else 0.0
+
+
 def _can_bind(host: str, port: int) -> bool:
     """True if (host, port) is free — a fast pre-flight so the brain gives a friendly
     'port in use' message instead of a raw bind traceback after loading models."""
@@ -128,6 +137,7 @@ class BrainServer:
         self._relevance = build_relevance(cfg, self._gateway)  # embedding scorer or None
         # Identity resolution (§5): who is speaking, per utterance.
         self._resolver = IdentityResolver(users)
+        self._users_mtime = _dir_mtime(cfg.capabilities.users_dir)  # for live reload (WhatsApp pairing)
         self._contexts = ContextStore(self._make_session)
         # Open intercom connections (for proactive heartbeat push, §3b). Also indexed by
         # device so an alarm/notification can be routed to the device that set it.
@@ -221,8 +231,21 @@ class BrainServer:
                     for ring in self._scheduler.tick(time.time()):
                         await self._deliver_ring(ring)
                 await self._flush_pending()
+                self._maybe_reload_users()
             except Exception as exc:  # noqa: BLE001 - proactive work is best-effort
                 print(f"  [proactive] tick skipped: {exc}")
+
+    def _maybe_reload_users(self) -> None:
+        """Pick up a newly paired/edited user (e.g. WhatsApp pairing wrote users/alice.md)
+        without a restart: rebuild the resolver + outbound map when the dir changes."""
+        mt = _dir_mtime(self._cfg.capabilities.users_dir)
+        if mt <= self._users_mtime:
+            return
+        self._users_mtime = mt
+        users = load_users(self._cfg.capabilities.users_dir)
+        self._users = users
+        self._resolver = IdentityResolver(users)
+        print(f"  [users] reloaded — {len(users)} principal(s)")
 
     async def _deliver_ring(self, ring: Ring) -> None:
         """Deliver one alarm ring to the device that set it: the tone every cycle, the

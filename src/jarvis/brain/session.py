@@ -25,6 +25,7 @@ from jarvis.brain.context import RequestContext
 from jarvis.brain.dialog import (
     _END_INSTRUCTION,
     _END_RE,
+    _MESSAGING_FORMAT,
     _VOICE_FORMAT_BASE,
     _VOICE_FORMAT_EXPRESSIVE,
     _extract_steering,
@@ -389,12 +390,19 @@ class BrainSession:
         parts = []
         if self._soul:
             parts.append(self._soul)
-        parts.append(
-            _VOICE_FORMAT_EXPRESSIVE
-            if self._cfg.persona.expressive
-            else _VOICE_FORMAT_BASE
-        )
-        if self._cfg.vad.conversation_mode:
+        # Format depends on the surface: voice is heard (spoken rules + TTS cues),
+        # messaging surfaces (WhatsApp, the text console) are read (written prose).
+        if self._ctx.channel == "voice":
+            parts.append(
+                _VOICE_FORMAT_EXPRESSIVE
+                if self._cfg.persona.expressive
+                else _VOICE_FORMAT_BASE
+            )
+        else:
+            parts.append(_MESSAGING_FORMAT)
+        # End-detection only matters for an open-mic voice conversation; on a
+        # messaging surface every inbound message is already a discrete turn.
+        if self._cfg.vad.conversation_mode and self._ctx.channel == "voice":
             parts.append(_END_INSTRUCTION)
         parts.append(_AGENCY)  # act-by-default + persistence (stable, cacheable)
         if self._ctx.can("background.run"):

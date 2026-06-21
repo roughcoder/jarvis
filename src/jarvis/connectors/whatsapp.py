@@ -17,7 +17,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import pathlib
+import random
 import re
+import string
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
@@ -42,6 +46,7 @@ class InboundMessage:
     chat: str = ""  # ChatJID — where to send the reply (the conversation)
     ts: str = ""  # Timestamp (RFC3339) — the poll cursor
     msg_id: str = ""  # MsgID — for dedup across polls
+    name: str = ""  # SenderName (WhatsApp push name) — for the pairing prompt
 
 
 def _parse_messages(obj: dict) -> list[InboundMessage]:
@@ -58,7 +63,7 @@ def _parse_messages(obj: dict) -> list[InboundMessage]:
                 InboundMessage(
                     sender=sender, text=text,
                     chat=m.get("ChatJID") or sender, ts=m.get("Timestamp") or "",
-                    msg_id=m.get("MsgID") or "",
+                    msg_id=m.get("MsgID") or "", name=m.get("SenderName") or "",
                 )
             )
     return out
@@ -82,6 +87,68 @@ def is_allowed(sender: str, policy: str, allow_from: str) -> bool:
         return False
     allowed = {_digits(n) for n in allow_from.split(",") if n.strip()}
     return _digits(sender) in allowed
+
+
+_NAME_OK = re.compile(r"[^a-z0-9_-]")
+
+
+def _slug(name: str) -> str:
+    s = _NAME_OK.sub("_", (name or "").strip().lower().replace(" ", "_")).strip("_")
+    return s[:48] or "user"
+
+
+def parse_admin_cmd(text: str):  # noqa: ANN201 - ('approve'|'deny', code, name) | None
+    """Parse an admin pairing command: 'approve <code> [name]' or 'deny <code>'."""
+    m = re.match(r"\s*(approve|deny)\s+([A-Za-z0-9]{2,12})\s*(.*)$", text or "", re.IGNORECASE)
+    if not m:
+        return None
+    return m.group(1).lower(), m.group(2).upper(), m.group(3).strip()
+
+
+def _user_numbers(users_dir: str) -> set[str]:
+    """Digits of every whatsapp number across users/*.md — seeds the connector's
+    known-user allowlist so a paired user is recognised (incl. after a restart)."""
+    out: set[str] = set()
+    d = pathlib.Path(users_dir)
+    if not d.is_dir():
+        return out
+    for f in d.glob("*.md"):
+        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = re.match(r"\s*whatsapp:\s*\[(.*)\]", line)
+            if m:
+                out |= {_digits(e) for e in m.group(1).split(",") if _digits(e)}
+    return out
+
+
+def add_whatsapp_number(users_dir: str, name: str, number: str) -> str:
+    """Add `number` to users/<slug>.md's whatsapp list. MERGES into an existing file
+    (preserving capabilities/scope/memory/body; idempotent) or creates a fresh personal
+    user. Returns 'created' | 'merged' | 'exists'."""
+    d = pathlib.Path(users_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    slug = _slug(name)
+    path = d / f"{slug}.md"
+    nd = _digits(number) or number.strip()
+    if not path.exists():
+        path.write_text(
+            f'---\n# {name} — paired via WhatsApp\nwhatsapp: ["{nd}"]\n'
+            f"scope: personal\nhoncho_peer: {slug}\n---\n\n# {name}\n",
+            encoding="utf-8",
+        )
+        return "created"
+    text = path.read_text(encoding="utf-8", errors="replace")
+    m = re.search(r"^(whatsapp:\s*)\[(.*)\]\s*$", text, re.MULTILINE)
+    if m:
+        existing = [e.strip().strip("'\"") for e in m.group(2).split(",") if e.strip()]
+        if any(_digits(e) == _digits(number) for e in existing):
+            return "exists"
+        existing.append(nd)
+        new_line = m.group(1) + "[" + ", ".join(f'"{e}"' for e in existing) + "]"
+        path.write_text(text[: m.start()] + new_line + text[m.end():], encoding="utf-8")
+        return "merged"
+    # No whatsapp line — insert one right after the opening front-matter '---'.
+    path.write_text(re.sub(r"(?m)^---\s*$", f'---\nwhatsapp: ["{nd}"]', text, count=1), encoding="utf-8")
+    return "merged"
 
 
 def _is_group(chat: str) -> bool:
@@ -215,6 +282,8 @@ class WhatsAppConnector:
     def __init__(self, cfg: Config, *, wacli: WacliClient | None = None) -> None:
         self._cfg = cfg
         self._wacli = wacli or WacliClient(cfg.whatsapp)
+        self._allowed: set[str] = set()  # digits allowed to DM (allow_from + users + paired)
+        self._pending: dict[str, tuple[str, str, float]] = {}  # code -> (number, name, expiry)
 
     async def _router(self, ws, inbound: asyncio.Queue) -> None:  # noqa: ANN001
         """Read the brain socket: forward outbound proactives via wacli; queue turn
@@ -229,6 +298,62 @@ class WhatsAppConnector:
                         inbound.put_nowait(m)
         except Exception:  # noqa: BLE001 - socket closed
             pass
+
+    async def _handle_dm(self, ws, inbound: asyncio.Queue, msg: InboundMessage) -> None:  # noqa: ANN001
+        """A 1:1 message: admin pairing commands first, then allowed senders get a turn,
+        then (under 'pairing') an unknown sender starts an admin-approved onboarding."""
+        wa = self._cfg.whatsapp
+        admin = _digits(wa.admin)
+        sd = _digits(msg.sender)
+        if admin and sd == admin:
+            cmd = parse_admin_cmd(msg.text)
+            if cmd:
+                await self._do_admin_cmd(*cmd)
+                return
+        if sd in self._allowed:
+            reply = await handle_message(ws, inbound, msg)
+            if reply:
+                await self._wacli.send(msg.chat or msg.sender, reply)
+            return
+        if wa.dm_policy == "pairing":
+            await self._start_pairing(msg)
+            return
+        print(f"  [whatsapp] ignored DM from non-allowed {msg.sender}")
+
+    async def _start_pairing(self, msg: InboundMessage) -> None:
+        self._pending = {c: v for c, v in self._pending.items() if v[2] > time.time()}  # prune
+        code = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+        self._pending[code] = (msg.sender, msg.name or "", time.time() + 3600)
+        who = msg.name or _digits(msg.sender)
+        await self._wacli.send(
+            msg.sender, "Hi! You're not set up with Jarvis yet — I've asked the admin to "
+            "approve you. Hang tight.",
+        )
+        admin = self._cfg.whatsapp.admin
+        if admin:
+            await self._wacli.send(
+                admin, f"📲 {who} ({_digits(msg.sender)}) wants to connect.\n"
+                f"Reply: approve {code} <name>   (or: deny {code})",
+            )
+        print(f"  [whatsapp] pairing requested by {msg.sender} code={code}")
+
+    async def _do_admin_cmd(self, action: str, code: str, name: str) -> None:
+        admin = self._cfg.whatsapp.admin
+        pending = self._pending.pop(code, None)
+        if pending is None or pending[2] < time.time():
+            await self._wacli.send(admin, f"No pending pairing for code {code}.")
+            return
+        number, pname, _ = pending
+        if action == "deny":
+            await self._wacli.send(admin, f"Denied pairing {code}.")
+            await self._wacli.send(number, "Sorry — you weren't approved to use Jarvis.")
+            return
+        final_name = name or pname or "user"
+        result = add_whatsapp_number(self._cfg.capabilities.users_dir, final_name, number)
+        self._allowed.add(_digits(number))  # recognised immediately, no restart
+        await self._wacli.send(admin, f"✓ Added {final_name} ({result}).")
+        await self._wacli.send(number, f"You're all set — welcome, {final_name}! You can talk to Jarvis now.")
+        print(f"  [whatsapp] paired {number} as {final_name} ({result})")
 
     async def run(self) -> None:
         import websockets
@@ -251,6 +376,9 @@ class WhatsAppConnector:
                 return
             print("Paired. Syncing WhatsApp + polling for messages…")
             wa = self._cfg.whatsapp
+            # DM allowlist seed: explicit numbers + everyone already in users/*.md.
+            self._allowed = {_digits(n) for n in wa.allow_from.split(",") if _digits(n)}
+            self._allowed |= _user_numbers(self._cfg.capabilities.users_dir)
             inbound: asyncio.Queue = asyncio.Queue()
             router = asyncio.create_task(self._router(ws, inbound))
             sync = await self._wacli.start_sync()
@@ -265,18 +393,19 @@ class WhatsAppConnector:
                         seen.add(msg.msg_id)
                         if msg.ts:
                             cursor = max(cursor, msg.ts)
-                        # deny-by-default: a DM needs an allowed sender; a group reply
-                        # needs the bot to be called out (see route_inbound).
-                        ok, text = route_inbound(
-                            msg, dm_policy=wa.dm_policy, allow_from=wa.allow_from,
-                            group_policy=wa.group_policy, group_allow=wa.group_allow, trigger=wa.trigger,
-                        )
-                        if not ok:
-                            print(f"  [whatsapp] ignored {msg.sender} in {msg.chat}")
-                            continue
-                        reply = await handle_message(ws, inbound, replace(msg, text=text))
-                        if reply:
-                            await self._wacli.send(msg.chat or msg.sender, reply)
+                        if _is_group(msg.chat):
+                            # groups: reply only when called out (route_inbound).
+                            ok, text = route_inbound(
+                                msg, dm_policy=wa.dm_policy, allow_from=wa.allow_from,
+                                group_policy=wa.group_policy, group_allow=wa.group_allow, trigger=wa.trigger,
+                            )
+                            if not ok:
+                                continue
+                            reply = await handle_message(ws, inbound, replace(msg, text=text))
+                            if reply:
+                                await self._wacli.send(msg.chat, reply)
+                        else:
+                            await self._handle_dm(ws, inbound, msg)  # DM: allowlist + pairing
                     if len(seen) > 1000:  # bound the dedup set
                         seen = set(list(seen)[-500:])
             finally:

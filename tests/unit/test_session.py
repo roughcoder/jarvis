@@ -43,10 +43,10 @@ def test_now_line_handles_named_and_bad_timezone() -> None:
     assert "Right now it's" in _now_line("Not/AZone")
 
 
-def _session() -> BrainSession:
+def _session(channel: str = "voice") -> BrainSession:
     return BrainSession(
         load_config(),
-        RequestContext("dev", "house", "house", frozenset()),
+        RequestContext("dev", "house", "house", frozenset(), channel=channel),
         gateway=None,
         tts=None,
         memory=None,
@@ -66,6 +66,19 @@ def test_system_prompt_includes_now_with_memory() -> None:
     prompt = _session()._system_prompt("likes tea")
     assert "likes tea" in prompt
     assert "Right now it's" in prompt
+
+
+def test_system_prompt_format_is_channel_aware() -> None:
+    # voice is heard → spoken rules (numbers as words, no markdown), with end-detection
+    voice = _session("voice")._system_prompt("")
+    assert "Write for the ear" in voice
+    assert "messaging app" not in voice
+    assert "Ending the conversation" in voice  # open-mic end-detect only on voice
+    # whatsapp is read → written prose, and no open-mic end-detection
+    wa = _session("whatsapp")._system_prompt("")
+    assert "messaging app" in wa
+    assert "Write for the ear" not in wa
+    assert "Ending the conversation" not in wa
 
 
 def test_history_carries_tool_calls_and_results() -> None:

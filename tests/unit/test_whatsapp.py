@@ -12,10 +12,13 @@ import asyncio
 from jarvis.connectors.whatsapp import (
     InboundMessage,
     _parse_messages,
+    _user_numbers,
+    add_whatsapp_number,
     chunk_text,
     forward_proactive,
     handle_message,
     is_allowed,
+    parse_admin_cmd,
     route_inbound,
 )
 from jarvis.protocol.messages import (
@@ -167,3 +170,53 @@ def test_forward_proactive_ignores_non_addressed() -> None:
     assert asyncio.run(forward_proactive(wacli, Proactive(text="device only"))) is False
     assert asyncio.run(forward_proactive(wacli, ReplyText(turn_id="t", text="x"))) is False
     assert wacli.sent == []
+
+
+# --- Remote pairing / onboarding ------------------------------------------
+
+
+def test_parse_admin_cmd() -> None:
+    # approve with a name, deny without, case/space-insensitive; code uppercased
+    assert parse_admin_cmd("approve A1B2 Alice") == ("approve", "A1B2", "Alice")
+    assert parse_admin_cmd("  APPROVE a1b2  Alice Smith ") == ("approve", "A1B2", "Alice Smith")
+    assert parse_admin_cmd("deny A1B2") == ("deny", "A1B2", "")
+    assert parse_admin_cmd("approve A1B2") == ("approve", "A1B2", "")  # name optional
+    # not a command
+    assert parse_admin_cmd("hello there") is None
+    assert parse_admin_cmd("approve") is None  # no code
+    assert parse_admin_cmd("") is None
+
+
+def test_add_whatsapp_number_create_merge_exists(tmp_path) -> None:  # noqa: ANN001
+    d = str(tmp_path)
+    # 1. fresh user → file created with personal scope + own honcho peer
+    assert add_whatsapp_number(d, "Alice", "+44 7000 000001") == "created"
+    alice = (tmp_path / "alice.md").read_text()
+    assert 'whatsapp: ["447000000001"]' in alice
+    assert "scope: personal" in alice and "honcho_peer: alice" in alice
+    # 2. same number again (any format) → idempotent, no change
+    assert add_whatsapp_number(d, "Alice", "447000000001@s.whatsapp.net") == "exists"
+    # 3. a second number for Alice → merged into the existing list, file preserved
+    assert add_whatsapp_number(d, "Alice", "447000000002") == "merged"
+    alice2 = (tmp_path / "alice.md").read_text()
+    assert "447000000001" in alice2 and "447000000002" in alice2
+    assert "scope: personal" in alice2  # everything else preserved
+
+
+def test_add_whatsapp_number_merges_into_existing_file(tmp_path) -> None:  # noqa: ANN001
+    # an existing hand-written user.md (no whatsapp line) → number inserted, body kept
+    f = tmp_path / "bob.md"
+    f.write_text("---\nscope: personal\ncapabilities: [web.search]\n---\n\n# Bob\nLikes trains.\n")
+    assert add_whatsapp_number(str(tmp_path), "Bob", "447000000003") == "merged"
+    out = f.read_text()
+    assert "447000000003" in out
+    assert "capabilities: [web.search]" in out and "Likes trains." in out  # preserved
+
+
+def test_user_numbers_collects_across_files(tmp_path) -> None:  # noqa: ANN001
+    (tmp_path / "alice.md").write_text('---\nwhatsapp: ["447000000001", "447000000002"]\n---\n')
+    (tmp_path / "bob.md").write_text('---\nwhatsapp: ["+44 7000 000003"]\n---\n')
+    (tmp_path / "nobody.md").write_text("---\nscope: house\n---\n")  # no number
+    nums = _user_numbers(str(tmp_path))
+    assert nums == {"447000000001", "447000000002", "447000000003"}
+    assert _user_numbers(str(tmp_path / "missing")) == set()  # absent dir → empty

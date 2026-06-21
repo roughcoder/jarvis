@@ -24,3 +24,6 @@ screen*.png
 
 # browser lane runtime profiles (Chrome user-data dirs)
 jarvis-workspace/browser/
+
+# User principal files hold PII (phone numbers, personal scope) — keep them local
+jarvis-workspace/users/*.md
