@@ -363,56 +363,91 @@ class WhatsAppConnector:
         import websockets
 
         url = self._cfg.intercom.brain_url
+        wa = self._cfg.whatsapp
         print(f"WhatsApp connector → brain {url}")
-        async with websockets.connect(url) as ws:
-            await ws.send(
-                encode(
-                    Hello(
-                        device_id=self._cfg.whatsapp.device_id,
-                        token=self._cfg.whatsapp.token.get_secret_value(),
-                        channel="whatsapp",
-                    )
-                )
-            )
-            welcome = decode(await ws.recv())
-            if not isinstance(welcome, Welcome):
-                print(f"pairing rejected: {welcome}")
-                return
-            print("Paired. Syncing WhatsApp + polling for messages…")
-            wa = self._cfg.whatsapp
-            # DM allowlist seed: explicit numbers + everyone already in users/*.md.
-            self._allowed = {_digits(n) for n in wa.allow_from.split(",") if _digits(n)}
-            self._allowed |= _user_numbers(self._cfg.capabilities.users_dir)
-            inbound: asyncio.Queue = asyncio.Queue()
-            router = asyncio.create_task(self._router(ws, inbound))
-            sync = await self._wacli.start_sync()
-            cursor = _now_rfc3339()  # only react to messages from now on (no history replay)
-            seen: set[str] = set()
-            try:
-                while True:
-                    await asyncio.sleep(max(1.0, self._cfg.whatsapp.poll_interval_s))
-                    for msg in await self._wacli.poll(cursor):
-                        if msg.msg_id and msg.msg_id in seen:
-                            continue
-                        seen.add(msg.msg_id)
-                        if msg.ts:
-                            cursor = max(cursor, msg.ts)
-                        if _is_group(msg.chat):
-                            # groups: reply only when called out (route_inbound).
-                            ok, text = route_inbound(
-                                msg, dm_policy=wa.dm_policy, allow_from=wa.allow_from,
-                                group_policy=wa.group_policy, group_allow=wa.group_allow, trigger=wa.trigger,
+        # State that PERSISTS across brain reconnects: the allowlist, the message
+        # cursor (so a brain restart doesn't replay or drop messages), the dedup
+        # set, and the one long-lived `wacli sync` child (independent of the brain).
+        self._allowed = {_digits(n) for n in wa.allow_from.split(",") if _digits(n)}
+        self._allowed |= _user_numbers(self._cfg.capabilities.users_dir)
+        self._cursor = _now_rfc3339()  # only react to messages from now on (no history replay)
+        self._seen: set[str] = set()
+        sync = await self._wacli.start_sync()
+        try:
+            while True:  # reconnect loop — survive brain restarts/outages
+                try:
+                    async with websockets.connect(url) as ws:
+                        await ws.send(
+                            encode(
+                                Hello(
+                                    device_id=wa.device_id,
+                                    token=wa.token.get_secret_value(),
+                                    channel="whatsapp",
+                                )
                             )
-                            if not ok:
-                                continue
-                            reply = await handle_message(ws, inbound, replace(msg, text=text))
-                            if reply:
-                                await self._wacli.send(msg.chat, reply)
-                        else:
-                            await self._handle_dm(ws, inbound, msg)  # DM: allowlist + pairing
-                    if len(seen) > 1000:  # bound the dedup set
-                        seen = set(list(seen)[-500:])
-            finally:
-                router.cancel()
-                with contextlib.suppress(Exception):
-                    sync.terminate()
+                        )
+                        welcome = decode(await ws.recv())
+                        if not isinstance(welcome, Welcome):
+                            print(f"pairing rejected: {welcome}; retrying in 5s…")
+                            await asyncio.sleep(5)
+                            continue
+                        print("Paired. Syncing WhatsApp + polling for messages…")
+                        inbound: asyncio.Queue = asyncio.Queue()
+                        # Race the reader against the poller: the router ends the moment the
+                        # socket closes (even with no traffic), so we reconnect promptly
+                        # rather than only noticing on the next send.
+                        router = asyncio.create_task(self._router(ws, inbound))
+                        poll = asyncio.create_task(self._poll_loop(ws, inbound))
+                        try:
+                            done, _ = await asyncio.wait(
+                                {router, poll}, return_when=asyncio.FIRST_COMPLETED
+                            )
+                            for t in done:  # surface a real (non-link) error
+                                exc = t.exception()
+                                if exc and not isinstance(
+                                    exc, (OSError, websockets.exceptions.WebSocketException)
+                                ):
+                                    raise exc
+                        finally:
+                            for t in (router, poll):
+                                t.cancel()
+                                with contextlib.suppress(asyncio.CancelledError, Exception):
+                                    await t
+                    print("  [whatsapp] brain link closed; reconnecting in 3s…")
+                    await asyncio.sleep(3)
+                except (OSError, websockets.exceptions.WebSocketException) as exc:
+                    print(f"  [whatsapp] brain link lost ({type(exc).__name__}); reconnecting in 3s…")
+                    await asyncio.sleep(3)
+        finally:
+            with contextlib.suppress(Exception):
+                sync.terminate()
+
+    async def _poll_loop(self, ws, inbound: asyncio.Queue) -> None:  # noqa: ANN001
+        """Poll wacli for new inbound messages and bridge each to the brain. Returns
+        (raises) when the brain link drops so run()'s reconnect loop can re-establish it;
+        cursor/seen live on self so no message is replayed or lost across a reconnect."""
+        wa = self._cfg.whatsapp
+        while True:
+            await asyncio.sleep(max(1.0, wa.poll_interval_s))
+            for msg in await self._wacli.poll(self._cursor):
+                if msg.msg_id and msg.msg_id in self._seen:
+                    continue
+                if _is_group(msg.chat):
+                    # groups: reply only when called out (route_inbound).
+                    ok, text = route_inbound(
+                        msg, dm_policy=wa.dm_policy, allow_from=wa.allow_from,
+                        group_policy=wa.group_policy, group_allow=wa.group_allow, trigger=wa.trigger,
+                    )
+                    if ok:
+                        reply = await handle_message(ws, inbound, replace(msg, text=text))
+                        if reply:
+                            await self._wacli.send(msg.chat, reply)
+                else:
+                    await self._handle_dm(ws, inbound, msg)  # DM: allowlist + pairing
+                # Advance the cursor only AFTER a message is handled, so a brain drop
+                # mid-handle re-delivers it on reconnect rather than silently losing it.
+                self._seen.add(msg.msg_id)
+                if msg.ts:
+                    self._cursor = max(self._cursor, msg.ts)
+            if len(self._seen) > 1000:  # bound the dedup set
+                self._seen = set(list(self._seen)[-500:])
