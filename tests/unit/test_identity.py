@@ -63,6 +63,16 @@ def test_strong_identity_from_whatsapp_number() -> None:
     assert r.confidence == "strong"
 
 
+def test_whatsapp_number_matched_regardless_of_format() -> None:
+    # stored as "+441234567890"; the connector may report any of these — all map to neil.
+    res = _resolver()
+    for asserted in ("441234567890", "+44 1234 567890", "441234567890@s.whatsapp.net"):
+        r = res.resolve(device_id="wa", channel="whatsapp", asserted=asserted)
+        assert r.identity == "neil", asserted
+    # a different number is not Neil
+    assert res.resolve(device_id="wa", channel="whatsapp", asserted="447000000000").identity == HOUSE
+
+
 def test_claimed_identity_on_shared_device() -> None:
     r = _resolver().resolve(device_id="room-pi", channel="voice", utterance="it's Jules, what's on today")
     assert r.identity == "jules"

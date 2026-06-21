@@ -104,6 +104,13 @@ def _as_list(v: object) -> list[str]:
     return []
 
 
+def _norm_wa(num: str) -> str:
+    """Normalise a WhatsApp address to digits only — drop any '@…' jid suffix, '+',
+    spaces, dashes — so a stored number matches whatever format the connector reports
+    (e.g. '447921815819', '+44 7921 815819', '447921815819@s.whatsapp.net')."""
+    return re.sub(r"\D", "", (num or "").split("@", 1)[0])
+
+
 def parse_user(name: str, text: str) -> User:
     fm = _parse_front_matter(text)
     return User(
@@ -141,7 +148,7 @@ class IdentityResolver:
             for d in u.devices:
                 self._by_device[d] = u
             for w in u.whatsapp:
-                self._by_whatsapp[w] = u
+                self._by_whatsapp[_norm_wa(w)] = u
             self._claim_index[u.name.lower()] = u
             for c in u.claims:
                 self._claim_index[c.lower()] = u
@@ -181,9 +188,9 @@ class IdentityResolver:
         """Resolve who's speaking. Order: bound personal device / WhatsApp number
         (strong) → a claim in the utterance or an asserted name (claimed) → the
         device's default, else house (unknown)."""
-        # 1. WhatsApp: the connector asserts the sender's number.
+        # 1. WhatsApp: the connector asserts the sender's number (any format).
         if channel == "whatsapp" and asserted:
-            u = self._by_whatsapp.get(asserted)
+            u = self._by_whatsapp.get(_norm_wa(asserted))
             if u:
                 return Resolution(u.name, u.scope, "strong", u)
         # 2. A personal device bound to exactly one user → strong.
