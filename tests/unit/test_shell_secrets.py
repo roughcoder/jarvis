@@ -32,6 +32,16 @@ def test_run_shell_injects_env_so_commands_can_reference_it() -> None:
     assert "got:yes" in out  # the shell expanded the injected secret by name
 
 
+def test_run_shell_does_not_leak_non_allowlisted_env(monkeypatch) -> None:  # noqa: ANN001
+    """Deny-by-default: a host env secret that wasn't allowlisted must never reach the
+    shell — even with no allowlist, and even when OTHER names are allowlisted."""
+    monkeypatch.setenv("JARVIS_LEAK_TEST", "should-not-appear")
+    out = asyncio.run(run_shell("echo [$JARVIS_LEAK_TEST]", None, 5.0, env=None))
+    assert "should-not-appear" not in out and "[]" in out  # scrubbed: the var is unset
+    out2 = asyncio.run(run_shell("echo [$JARVIS_LEAK_TEST]", None, 5.0, env={"OPENAI_API_KEY": "v"}))
+    assert "should-not-appear" not in out2  # an allowlist of other names doesn't open it up
+
+
 def test_system_prompt_lists_secret_names_only_with_worker_shell() -> None:
     cfg = load_config()
     cfg.worker = WorkerConfig(_env_file=None, shell_secrets="FOO_KEY,BAR_KEY")

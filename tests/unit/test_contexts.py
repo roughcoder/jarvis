@@ -44,6 +44,7 @@ def test_context_store_isolates_and_reuses_sessions() -> None:
     def make(ctx: RequestContext):  # noqa: ANN202 - a stand-in BrainSession
         s = types.SimpleNamespace(ctx=ctx, loaded=0)
         s.load_soul = lambda: setattr(s, "loaded", s.loaded + 1)
+        s.load_soul()  # the real factory (_make_session) loads the soul on creation
         return s
 
     store = ContextStore(make)
@@ -57,5 +58,5 @@ def test_context_store_isolates_and_reuses_sessions() -> None:
     assert s1 is s2
     assert s1 is not s3
     assert len(store) == 2
-    assert s1.loaded == 1  # soul loaded exactly once per session
+    assert s1.loaded == 1  # soul loaded once at creation; reuse doesn't reload
     assert set(store.keys) == {("mac", "neil"), ("mac", "jules")}

@@ -93,7 +93,8 @@ async def handle_message(ws, inbound, msg: InboundMessage) -> str:  # noqa: ANN0
     up to ReplyEnd from the router queue."""
     turn_id = uuid.uuid4().hex
     await ws.send(encode(Identify(identity=msg.sender)))
-    await ws.send(encode(TextIn(turn_id=turn_id, text=msg.text)))
+    # text_only → the brain skips TTS (WhatsApp wants text; no wasted/blocking synthesis).
+    await ws.send(encode(TextIn(turn_id=turn_id, text=msg.text, text_only=True)))
     reply = ""
     while True:
         m = await inbound.get()

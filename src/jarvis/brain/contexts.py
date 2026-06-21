@@ -24,13 +24,12 @@ class ContextStore:
         self._sessions: dict[tuple[str, str], BrainSession] = {}
 
     def get(self, ctx: RequestContext) -> BrainSession:
-        """The session for this `(device, identity)`, created + soul-loaded on first
-        use and reused thereafter."""
+        """The session for this `(device, identity)`, created on first use (the factory
+        loads the soul) and reused thereafter."""
         key = (ctx.device_id, ctx.identity)
         session = self._sessions.get(key)
         if session is None:
-            session = self._make(ctx)
-            session.load_soul()
+            session = self._make(ctx)  # _make_session loads SOUL.md
             self._sessions[key] = session
         return session
 

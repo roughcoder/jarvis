@@ -14,16 +14,28 @@ import time
 import uuid
 
 
+# A model-driven shell runs with ONLY these operational vars from the host env — never
+# the full process environment. Secrets are added explicitly via the WORKER_SHELL_SECRETS
+# allowlist (the `env` arg), so a command can't print a secret that wasn't allowlisted.
+_SAFE_ENV_KEYS = (
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "SHELL", "TZ",
+)
+
+
+def _safe_base_env() -> dict:
+    return {k: os.environ[k] for k in _SAFE_ENV_KEYS if k in os.environ}
+
+
 async def run_shell(cmd: str, cwd: str | None, timeout_s: float, env: dict | None = None) -> str:
-    """Run a command through the shell, capturing stdout+stderr (timeout-bounded).
-    `env` (if given) is layered on top of the inherited environment — used to expose
-    allowlisted secrets ($OPENAI_API_KEY etc.). Never raises — a bad cwd / spawn error
-    comes back as an 'error:' string."""
+    """Run a command through the shell, capturing stdout+stderr (timeout-bounded). Runs
+    with a SCRUBBED baseline env (operational vars only) plus the allowlisted secrets in
+    `env` — deny-by-default, so it can't leak a non-allowlisted host secret. Never raises
+    — a bad cwd / spawn error comes back as an 'error:' string."""
     try:
         proc = await asyncio.create_subprocess_shell(
             cmd,
             cwd=cwd or None,
-            env={**os.environ, **env} if env else None,
+            env={**_safe_base_env(), **(env or {})},
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )

@@ -56,7 +56,9 @@ def test_handle_message_routes_and_returns_reply() -> None:
     reply = asyncio.run(go())
     assert reply == "Hi from the brain."
     assert next(m for m in ws.sent if isinstance(m, Identify)).identity == "+44123"
-    assert next(m for m in ws.sent if isinstance(m, TextIn)).text == "hello"
+    sent = next(m for m in ws.sent if isinstance(m, TextIn))
+    assert sent.text == "hello"
+    assert sent.text_only is True  # WhatsApp wants text — the brain must skip TTS
 
 
 def test_forward_proactive_sends_out_via_wacli() -> None:

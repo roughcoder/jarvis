@@ -313,6 +313,9 @@ class BrainConfig(_Base):
     # impersonate your Mac). The shared pairing_token above stays a fallback.
     # BRAIN_DEVICES='[{"token":"…","device_id":"room-pi"},{"token":"…","device_id":"neil-mac","identity":"neil"}]'
     devices: list[DeviceAuth] = []
+    # No-token auth is open (dev/local). On a NON-loopback bind that's unauthenticated
+    # network access, so the brain refuses to start unless a token is set OR this is on.
+    allow_insecure: bool = False
 
 
 class IntercomConfig(_Base):
@@ -344,6 +347,7 @@ class WorkerConfig(_Base):
     port: int = 8780
     bind_host: str = ""              # daemon bind addr; empty => host
     token: SecretStr = SecretStr("")  # shared pairing token
+    allow_insecure: bool = False     # permit a no-token, non-loopback bind (else refuse to start)
     workspace: str = "jarvis-workspace/worker"  # default cwd for actions/jobs
     # Where the user's git repos live, so a job can name a repo ("polymarket")
     # instead of an absolute path. Empty = names must be absolute paths.
@@ -729,6 +733,17 @@ class Config:
             "whatsapp.wacli_bin": self.whatsapp.wacli_bin,
             "google.gogcli_bin": self.google.gogcli_bin,
         }
+
+
+def is_loopback(host: str) -> bool:
+    """True if `host` only accepts local connections — no token needed to be safe."""
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
+def insecure_bind(host: str, has_token: bool, allow_insecure: bool) -> bool:
+    """True if binding here would be unauthenticated network access (non-loopback +
+    no token) and not explicitly allowed — i.e. the server should refuse to start."""
+    return not is_loopback(host) and not has_token and not allow_insecure
 
 
 def load_config() -> Config:

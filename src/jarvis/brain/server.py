@@ -29,7 +29,7 @@ from jarvis.brain.scheduler import Ring, Scheduler, in_quiet_hours
 from jarvis.brain.session import BrainSession, TurnResult
 from jarvis.brain.skills import register_skills
 from jarvis.brain.tracing import Tracer
-from jarvis.config import Config
+from jarvis.config import Config, insecure_bind
 from jarvis.mcp import MCPBridge
 from jarvis.protocol.messages import (
     BargeIn,
@@ -151,7 +151,7 @@ class BrainServer:
                 self._registry.register(tool)
 
     def _make_session(self, ctx: RequestContext) -> BrainSession:
-        return BrainSession(
+        session = BrainSession(
             self._cfg,
             ctx,
             gateway=self._gateway,
@@ -162,9 +162,20 @@ class BrainServer:
             memory_user=ctx.memory_peer,
             relevance=self._relevance,
         )
+        session.load_soul()  # personality is authoritative for ALL sessions (incl. background)
+        return session
 
     async def serve(self) -> None:
         host, port = self._cfg.brain.host, self._cfg.brain.port
+        b = self._cfg.brain
+        has_token = bool(b.pairing_token.get_secret_value()) or bool(b.devices)
+        if insecure_bind(host, has_token, b.allow_insecure):  # don't expose unauth access on a LAN
+            print(
+                f"\n✗ Refusing to start: brain is bound to {host!r} (non-loopback) with no "
+                "pairing token — that's unauthenticated network access.\n  Set "
+                "BRAIN_PAIRING_TOKEN or BRAIN_DEVICES, or BRAIN_ALLOW_INSECURE=true to override.\n"
+            )
+            return
         if not _can_bind(host, port):  # fail fast, before loading the STT model
             print(
                 f"\n✗ Port {port} is already in use — is another `jarvis brain` "
@@ -216,6 +227,12 @@ class BrainServer:
     async def _deliver_ring(self, ring: Ring) -> None:
         """Deliver one alarm ring to the device that set it: the tone every cycle, the
         spoken label only on the first ring (so it doesn't repeat the words each time)."""
+        # Don't ring into an active reply — the intercom would discard the proactive
+        # frames as a foreign turn. The alarm repeats, so the next ring lands once the
+        # device is idle (between turns, seconds away).
+        if ring.device_id in self._busy:
+            print(f"  [alarm] ring skipped (device busy) device={ring.device_id}")
+            return
         label = ring.label if ring.label != "alarm" else ""
         text = (f"Alarm: {label}." if label else "Your alarm.") if ring.first else (f"Alarm: {label}." if label else "Alarm.")
         conns = self._device_conns.get(ring.device_id, set())

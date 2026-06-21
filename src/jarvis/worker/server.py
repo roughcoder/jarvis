@@ -285,10 +285,19 @@ def make_app(cfg: WorkerConfig) -> web.Application:
 
 
 async def serve(cfg: WorkerConfig) -> None:
+    from jarvis.config import insecure_bind
+
+    bind = cfg.bind_host or cfg.host
+    if insecure_bind(bind, bool(cfg.token.get_secret_value()), cfg.allow_insecure):
+        print(
+            f"\n✗ Refusing to start: worker is bound to {bind!r} (non-loopback) with no "
+            "WORKER_TOKEN — that's unauthenticated access to shell/GUI/browser on this Mac.\n"
+            "  Set WORKER_TOKEN, or WORKER_ALLOW_INSECURE=true to override.\n"
+        )
+        return
     app = make_app(cfg)
     runner = web.AppRunner(app)
     await runner.setup()
-    bind = cfg.bind_host or cfg.host
     site = web.TCPSite(runner, bind, cfg.port)
     await site.start()
     print(f"Worker daemon listening on http://{bind}:{cfg.port} (agent={cfg.agent})")
