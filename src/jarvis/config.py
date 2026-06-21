@@ -598,6 +598,7 @@ class WhatsAppConfig(_Base):
 
     enabled: bool = False
     wacli_bin: str = "wacli"
+    account: str = ""  # wacli named account (--account); empty => wacli's default
     device_id: str = "whatsapp"
     token: SecretStr = SecretStr("")  # brain pairing token for this connector
     poll_interval_s: float = 2.0

@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import asyncio
 
-from jarvis.connectors.whatsapp import InboundMessage, forward_proactive, handle_message
+from jarvis.connectors.whatsapp import (
+    InboundMessage,
+    _parse_messages,
+    forward_proactive,
+    handle_message,
+)
 from jarvis.protocol.messages import (
     Identify,
     Proactive,
@@ -67,6 +72,28 @@ def test_forward_proactive_sends_out_via_wacli() -> None:
     handled = asyncio.run(forward_proactive(wacli, Proactive(text="your table is booked", to="+44123")))
     assert handled is True
     assert wacli.sent == [("+44123", "your table is booked")]
+
+
+def test_parse_messages_maps_wacli_schema() -> None:
+    # mirrors `wacli messages list --json` (data.messages[], PascalCase fields)
+    obj = {
+        "success": True,
+        "data": {
+            "messages": [
+                {"SenderJID": "447921815819@s.whatsapp.net", "ChatJID": "447921815819@s.whatsapp.net",
+                 "MsgID": "abc", "Timestamp": "2026-06-21T10:00:00Z", "FromMe": False, "Text": "hello jarvis"},
+                {"SenderJID": "x@s.whatsapp.net", "MsgID": "own", "FromMe": True, "Text": "my own msg"},
+                {"SenderJID": "y@s.whatsapp.net", "MsgID": "empty", "FromMe": False, "Text": ""},
+                {"SenderJID": "z@s.whatsapp.net", "ChatJID": "z@s.whatsapp.net", "MsgID": "d2",
+                 "Timestamp": "2026-06-21T10:01:00Z", "FromMe": False, "Text": "", "DisplayText": "via display"},
+            ]
+        },
+    }
+    msgs = _parse_messages(obj)
+    assert [m.text for m in msgs] == ["hello jarvis", "via display"]  # own + empty skipped
+    assert msgs[0].sender == "447921815819@s.whatsapp.net" and msgs[0].msg_id == "abc"
+    assert msgs[0].chat == "447921815819@s.whatsapp.net" and msgs[0].ts == "2026-06-21T10:00:00Z"
+    assert _parse_messages({}) == []  # empty/garbage → no rows
 
 
 def test_forward_proactive_ignores_non_addressed() -> None:
