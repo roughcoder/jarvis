@@ -18,7 +18,7 @@ import asyncio
 import contextlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 from jarvis.config import Config, WhatsAppConfig
@@ -82,6 +82,41 @@ def is_allowed(sender: str, policy: str, allow_from: str) -> bool:
         return False
     allowed = {_digits(n) for n in allow_from.split(",") if n.strip()}
     return _digits(sender) in allowed
+
+
+def _is_group(chat: str) -> bool:
+    return (chat or "").endswith("@g.us")
+
+
+def _called_out(text: str, trigger: str) -> tuple[bool, str]:
+    """In a group: is the bot addressed by `trigger` (as a word)? Returns (called,
+    cleaned) where a leading 'Jarvis,' prefix is stripped so the brain gets the request."""
+    t = (trigger or "").strip().lower()
+    if not t:
+        return True, text
+    if not re.search(rf"\b{re.escape(t)}\b", (text or "").lower()):
+        return False, ""
+    cleaned = re.sub(rf"^\s*{re.escape(t)}\b[\s,:.!?-]*", "", text or "", flags=re.IGNORECASE).strip()
+    return True, cleaned or text
+
+
+def route_inbound(
+    msg: "InboundMessage", *, dm_policy: str, allow_from: str,
+    group_policy: str, group_allow: str, trigger: str,
+) -> tuple[bool, str]:
+    """Decide whether to act on an inbound message and with what text. DMs use the
+    sender allowlist; groups use group_policy ('ignore' | 'mention' — only when called
+    out | 'open'), optionally restricted to allowed group JIDs. Pure + unit-tested."""
+    if _is_group(msg.chat):
+        if group_policy == "ignore":
+            return False, ""
+        groups = {g.strip() for g in group_allow.split(",") if g.strip()}
+        if groups and msg.chat not in groups and msg.chat.split("@", 1)[0] not in groups:
+            return False, ""
+        if group_policy == "open":
+            return True, msg.text
+        return _called_out(msg.text, trigger)  # "mention"
+    return is_allowed(msg.sender, dm_policy, allow_from), msg.text
 
 
 def chunk_text(text: str, limit: int) -> list[str]:
@@ -230,12 +265,16 @@ class WhatsAppConnector:
                         seen.add(msg.msg_id)
                         if msg.ts:
                             cursor = max(cursor, msg.ts)
-                        # deny-by-default: only allowed numbers drive a turn (don't let a
-                        # stranger texting the line spend LLM/tools).
-                        if not is_allowed(msg.sender, wa.dm_policy, wa.allow_from):
-                            print(f"  [whatsapp] ignored message from non-allowed sender {msg.sender}")
+                        # deny-by-default: a DM needs an allowed sender; a group reply
+                        # needs the bot to be called out (see route_inbound).
+                        ok, text = route_inbound(
+                            msg, dm_policy=wa.dm_policy, allow_from=wa.allow_from,
+                            group_policy=wa.group_policy, group_allow=wa.group_allow, trigger=wa.trigger,
+                        )
+                        if not ok:
+                            print(f"  [whatsapp] ignored {msg.sender} in {msg.chat}")
                             continue
-                        reply = await handle_message(ws, inbound, msg)
+                        reply = await handle_message(ws, inbound, replace(msg, text=text))
                         if reply:
                             await self._wacli.send(msg.chat or msg.sender, reply)
                     if len(seen) > 1000:  # bound the dedup set

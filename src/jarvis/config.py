@@ -608,6 +608,11 @@ class WhatsAppConfig(_Base):
     dm_policy: str = "allowlist"
     allow_from: str = ""  # CSV of allowed E.164 numbers, e.g. "447921815819,447999246830"
     text_chunk_limit: int = 4000  # split long replies (WhatsApp message length limit)
+    # Group behaviour: "ignore" (default — never reply in groups), "mention" (reply only
+    # when called out by the trigger name), or "open" (reply to every group message — noisy).
+    group_policy: str = "ignore"
+    group_allow: str = ""  # CSV of allowed group JIDs (empty = any group it's added to)
+    trigger: str = "jarvis"  # the name that "calls out" the bot in a group (case-insensitive)
 
 
 class Config:

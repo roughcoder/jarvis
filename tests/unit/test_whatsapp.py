@@ -16,6 +16,7 @@ from jarvis.connectors.whatsapp import (
     forward_proactive,
     handle_message,
     is_allowed,
+    route_inbound,
 )
 from jarvis.protocol.messages import (
     Identify,
@@ -108,6 +109,47 @@ def test_is_allowed_deny_by_default() -> None:
     # open lets anyone; disabled blocks everyone
     assert is_allowed("447000000000", "open", "") is True
     assert is_allowed("447921815819", "disabled", allow) is False
+
+
+def _dm(text="hi", sender="447921815819@s.whatsapp.net"):  # noqa: ANN001, ANN202
+    return InboundMessage(sender=sender, text=text, chat=sender)
+
+
+def _grp(text, sender="447921815819@s.whatsapp.net", chat="123-456@g.us"):  # noqa: ANN001, ANN202
+    return InboundMessage(sender=sender, text=text, chat=chat)
+
+
+def _route(msg, **kw):  # noqa: ANN001, ANN202
+    base = dict(dm_policy="allowlist", allow_from="447921815819",
+                group_policy="ignore", group_allow="", trigger="jarvis")
+    base.update(kw)
+    return route_inbound(msg, **base)
+
+
+def test_route_dm_uses_sender_allowlist() -> None:
+    assert _route(_dm())[0] is True
+    assert _route(_dm(sender="447000000000@s.whatsapp.net"))[0] is False
+
+
+def test_route_group_ignored_by_default() -> None:
+    assert _route(_grp("jarvis what's up"))[0] is False  # group_policy=ignore
+
+
+def test_route_group_mention_only_when_called_out() -> None:
+    # not called out → ignored
+    assert _route(_grp("morning everyone"), group_policy="mention")[0] is False
+    # called out → handled, trigger stripped from the text
+    ok, text = _route(_grp("Jarvis, what's the weather?"), group_policy="mention")
+    assert ok is True and text == "what's the weather?"
+    # trigger mid-sentence still counts; full text passed through
+    ok2, text2 = _route(_grp("can you ask jarvis about trains"), group_policy="mention")
+    assert ok2 is True and "trains" in text2
+
+
+def test_route_group_allowlist_restricts() -> None:
+    msg = _grp("jarvis hi", chat="999-000@g.us")
+    assert _route(msg, group_policy="mention", group_allow="123-456@g.us")[0] is False  # other group
+    assert _route(msg, group_policy="mention", group_allow="999-000@g.us")[0] is True
 
 
 def test_chunk_text_splits_long_replies() -> None:
