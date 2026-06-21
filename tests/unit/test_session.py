@@ -7,6 +7,8 @@ stays stable.
 
 from __future__ import annotations
 
+import asyncio
+
 from jarvis.brain.context import RequestContext
 from jarvis.brain.session import BrainSession, TurnResult, _now_line
 from jarvis.config import load_config
@@ -66,6 +68,70 @@ def test_system_prompt_includes_now_with_memory() -> None:
     prompt = _session()._system_prompt("likes tea")
     assert "likes tea" in prompt
     assert "Right now it's" in prompt
+
+
+def test_initial_model_is_channel_aware() -> None:
+    cfg = load_config()
+    fast, strong = cfg.gateway.fast_model, cfg.gateway.strong_model
+    # voice: short -> fast (latency), long -> strong
+    assert _session("voice")._initial_model("hi") == fast
+    assert _session("voice")._initial_model("x" * 200) == strong
+    # messaging channels aren't TTS-bound -> strong from the start
+    assert _session("whatsapp")._initial_model("hi") == strong
+    assert _session("text")._initial_model("hi") == strong
+
+
+def _drive(agen) -> None:  # noqa: ANN001
+    async def go() -> None:
+        async for _ in agen:
+            pass
+    asyncio.run(go())
+
+
+def test_tool_loop_escalates_fast_to_strong_on_tool_use() -> None:
+    import types
+
+    from jarvis.tools.base import Tool, ToolRegistry
+
+    cfg = load_config()
+    fast, strong = cfg.gateway.fast_model, cfg.gateway.strong_model
+
+    class _TC:
+        def __init__(self) -> None:
+            self.id = "c1"
+            self.function = types.SimpleNamespace(name="ping", arguments="{}")
+
+    class _Msg:
+        def __init__(self, content="", tool_calls=None) -> None:  # noqa: ANN001
+            self.content = content
+            self.tool_calls = tool_calls
+
+    class _Gateway:
+        def __init__(self) -> None:
+            self.models: list[str] = []
+            self._script = [_Msg(tool_calls=[_TC()]), _Msg(content="done")]
+
+        async def complete_with_tools(self, messages, *, model, tools=None, usage_out=None):  # noqa: ANN001
+            self.models.append(model)
+            return self._script.pop(0)
+
+    async def _ping(ctx, args) -> str:  # noqa: ANN001
+        return "ok"
+
+    reg = ToolRegistry()
+    reg.register(Tool(name="ping", description="", parameters={"type": "object", "properties": {}},
+                      required_capability="ping.use", handler=_ping))
+    gw = _Gateway()
+    sess = BrainSession(
+        cfg,
+        RequestContext("dev", "neil", "personal", frozenset({"ping.use"}), channel="voice"),
+        gateway=gw, tts=None, memory=None, tracer=None, registry=reg,
+    )
+    result = TurnResult(reply="", tool_messages=[])
+    _drive(sess._run_tool_loop([], fast, None, [], result))
+    # first call (deciding to use a tool) on fast; after the tool, escalated to strong
+    assert gw.models == [fast, strong]
+    assert result.raw == "done"
 
 
 def test_system_prompt_format_is_channel_aware() -> None:

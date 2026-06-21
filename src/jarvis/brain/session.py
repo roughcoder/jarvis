@@ -108,7 +108,18 @@ _BROWSER_GUIDANCE = (
     "browser window; don't pretend it failed. Only state a time, price, or availability "
     "you have ACTUALLY read off the page with browser_read — if you're not certain you read "
     "the right figure, read again or say you couldn't confirm it; never fill the gap with a "
-    "plausible-sounding guess."
+    "plausible-sounding guess. "
+    "LIVE DATA (train/bus times, opening hours, prices, availability): a web_search snippet "
+    "is stale — NEVER answer from it; open a live source and browser_read the real values "
+    "first. Prefer a simple, server-rendered page you can just READ over a heavy JavaScript "
+    "app that needs a form filled in: blindly pressing Tab/Enter to drive a date-time picker "
+    "(e.g. Trainline) is unreliable — if a result needs form-filling, you usually don't need "
+    "that site at all. For UK train times use realtimetrains.co.uk: it has stable, readable "
+    "URLs and server-rendered tables, e.g. realtimetrains.co.uk/search/detailed/gb-nr:<FROM>/"
+    "to/gb-nr:<TO>/<yyyy-mm-dd>/<HHMM> with three-letter CRS codes (Effingham Junction=EFF, "
+    "Guildford=GLD, London Vauxhall=VXH) — open that and browser_read the board rather than "
+    "wrestling a booking site. Read the actual rows before you answer, and don't claim a "
+    "fact is wrong or right until you've re-read the page."
 )
 
 _GUI_GUIDANCE = (
@@ -238,11 +249,7 @@ class BrainSession:
         `result`. Hot path reads the LOCAL cached representation only (a fast file
         read), never a live memory reasoning call (spec §3.2). Call finalize()
         afterwards (even on barge-in) to detect end + remember."""
-        model = (
-            self._cfg.gateway.strong_model
-            if len(user_text) > 120
-            else self._cfg.gateway.fast_model
-        )
+        model = self._initial_model(user_text)
         memory = self._memory.read_cached_representation(self._memory_user)
         messages = [
             {"role": "system", "content": self._system_prompt(memory)},
@@ -307,11 +314,7 @@ class BrainSession:
         text and plays NO audio (a text client wants ReplyText only). Reuses the tool
         loop, so tools work in text mode — the harness can drive the browser, etc.
         Call finalize() afterwards for end-detection + memory, exactly like respond()."""
-        model = (
-            self._cfg.gateway.strong_model
-            if len(user_text) > 120
-            else self._cfg.gateway.fast_model
-        )
+        model = self._initial_model(user_text)
         memory = self._memory.read_cached_representation(self._memory_user) if self._memory else ""
         messages = [
             {"role": "system", "content": self._system_prompt(memory)},
@@ -476,6 +479,16 @@ class BrainSession:
         path = pathlib.Path(self._cfg.capabilities.users_dir) / f"{self._ctx.identity}.md"
         return format_facts(read_facts(path))
 
+    def _initial_model(self, user_text: str) -> str:
+        """Pick the starting model for a turn. Voice is latency-bound by TTS, so short
+        voice turns use the fast model (and escalate on tool use in the loop). Messaging
+        channels (WhatsApp, the text console) aren't TTS-bound, so they use the strong
+        model from the start for better quality/accuracy. Long prompts always go strong."""
+        g = self._cfg.gateway
+        if self._ctx.channel != "voice" or len(user_text) > 120:
+            return g.strong_model
+        return g.fast_model
+
     async def _run_tool_loop(self, messages, model, trace, tool_schemas, result):  # noqa: ANN001
         """Tool-aware completion: let the model call gated tools, feed results
         back, repeat until it answers. Sets `result.raw` to the final text. While a
@@ -508,6 +521,14 @@ class BrainSession:
             }
             messages.append(assistant_msg)
             result.tool_messages.append(assistant_msg)  # carry into history
+            # Escalate to the strong model once real work (tools) is underway: it
+            # reasons over tool results — a browsed departure board, search hits —
+            # and writes the final answer far more reliably than the fast model,
+            # which tends to fumble multi-step browsing and answer from stale
+            # snippets. Plain no-tool chat stays on fast (this code only runs when
+            # the model chose to call a tool).
+            if model == self._cfg.gateway.fast_model:
+                model = self._cfg.gateway.strong_model
             for tc in msg.tool_calls:
                 n_tools += 1
                 tool = self._registry.get(tc.function.name)
