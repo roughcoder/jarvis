@@ -120,21 +120,22 @@ class BrainServer:
         self._cfg = cfg
         self._stt = Transcriber(cfg.stt)
         self._tracer = Tracer(cfg.trace)
+        # The gateway/tts/memory clients are effectively stateless; share one set
+        # across connections. Per-`(device × user)` state (history/memory peer)
+        # lives in each BrainSession, owned by the ContextStore. Memory is built
+        # before the registry so the profile tools can seed Honcho on save (cold).
+        self._gateway = GatewayClient(cfg.gateway)
+        self._tts = InworldTTS(cfg.tts)
+        self._memory = MemoryClient(cfg.memory)
         self._registry = build_registry(
             cfg.tools, worker=cfg.worker, remote=cfg.remote, google=cfg.google,
-            browser=cfg.browser, capabilities=cfg.capabilities,
+            browser=cfg.browser, capabilities=cfg.capabilities, memory=self._memory,
         )
         users = load_users(cfg.capabilities.users_dir)  # dict name -> User
         self._users = users  # for outbound (WhatsApp) routing
         # MCP servers are connected at startup (async, off the hot path); OAuth
         # servers connect per principal (house + each user) so credentials isolate.
         self._mcp = MCPBridge(cfg.mcp, principals=list(users))
-        # The gateway/tts/memory clients are effectively stateless; share one set
-        # across connections. Per-`(device × user)` state (history/memory peer)
-        # lives in each BrainSession, owned by the ContextStore.
-        self._gateway = GatewayClient(cfg.gateway)
-        self._tts = InworldTTS(cfg.tts)
-        self._memory = MemoryClient(cfg.memory)
         self._relevance = build_relevance(cfg, self._gateway)  # embedding scorer or None
         # Identity resolution (§5): who is speaking, per utterance.
         self._resolver = IdentityResolver(users)

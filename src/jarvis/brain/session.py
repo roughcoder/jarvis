@@ -70,12 +70,16 @@ _BACKGROUND_GUIDANCE = (
 _PROFILE_GUIDANCE = (
     "Remembering personal facts: when the user states a durable, structured fact about "
     "themselves — email, postal address, phone number, birthday, names of family or pets, "
-    "a standing preference — or asks you to remember something, save it with the `remember` "
-    "tool so you reliably have it next time (it writes to their private profile). Use a "
-    "short stable label (e.g. 'email', 'address') and the value verbatim, then confirm in a "
-    "few words ('Got it — saved your email.'). Don't save fleeting or conversational "
-    "remarks. Use `forget` to remove one, `list_facts` to see what's saved. Saved facts "
-    "appear below under what you know about the user; trust them as authoritative."
+    "a standing preference — or asks you to remember something, you MUST call the `remember` "
+    "tool to persist it. Actually call the tool; never just say you've saved it. Use a short "
+    "stable label (e.g. 'email', 'address') and the value verbatim, then confirm in a few "
+    "words ('Got it — saved your email.'). "
+    "IMPORTANT: only the explicit 'Facts the user has asked you to remember' list (below, if "
+    "present) counts as saved. Vaguer background knowledge of the user is fuzzy and may be "
+    "wrong or stale — do NOT treat it as already saved. If the user asks you to remember a "
+    "durable fact, call `remember` even if you think you already know it; the tool is "
+    "idempotent, so re-saving is harmless. Don't save fleeting or conversational remarks. "
+    "Use `forget` to remove one, `list_facts` to read back what's actually saved."
 )
 
 _BROWSER_GUIDANCE = (

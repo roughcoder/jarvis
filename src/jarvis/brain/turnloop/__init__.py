@@ -79,7 +79,7 @@ class TurnLoop:
         # in 3a. The think/speak core is shared with the brain server.
         self._registry = build_registry(
             cfg.tools, worker=cfg.worker, remote=cfg.remote, google=cfg.google,
-            browser=cfg.browser, capabilities=cfg.capabilities,
+            browser=cfg.browser, capabilities=cfg.capabilities, memory=memory,
         )
         users = load_users(cfg.capabilities.users_dir)
         # MCP servers connect at startup (off the hot path); OAuth servers connect

@@ -108,3 +108,60 @@ def test_tool_refuses_house_and_unknown(tmp_path) -> None:  # noqa: ANN001
         assert out.startswith("error:")
     # nothing written
     assert not list(tmp_path.glob("*.md"))
+
+
+# --- seeding Honcho (the authoritative rail mirrors into the fuzzy one) ------
+
+
+class _FakeMemory:
+    def __init__(self, *, boom: bool = False) -> None:
+        self.writes: list = []
+        self.refreshed: list = []
+        self._boom = boom
+
+    async def write_turn(self, user_text, assistant_text, *, user=None) -> None:  # noqa: ANN001
+        if self._boom:
+            raise RuntimeError("honcho down")
+        self.writes.append((user_text, assistant_text, user))
+
+    async def refresh_cache(self, *a, user=None, **k) -> bool:  # noqa: ANN001, ANN002, ANN003
+        self.refreshed.append(user)
+        return True
+
+
+async def _drain() -> None:
+    """Let fire-and-forget seed tasks run to completion."""
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+def test_remember_seeds_honcho_for_the_speakers_peer(tmp_path) -> None:  # noqa: ANN001
+    (tmp_path / "neil.md").write_text(_FILE)
+    mem = _FakeMemory()
+    cfg = CapabilityConfig(users_dir=str(tmp_path))
+
+    async def go() -> None:
+        tools = {t.name: t for t in make_profile_tools(cfg, memory=mem)}
+        await tools["remember"].handler(_ctx(), {"key": "email", "value": "n@x.com"})
+        await _drain()
+
+    asyncio.run(go())
+    assert mem.writes and "email" in mem.writes[0][0] and "n@x.com" in mem.writes[0][0]
+    assert mem.writes[0][2] == "neil"  # scoped to the speaker's peer
+    assert mem.refreshed == ["neil"]
+
+
+def test_seed_failure_never_breaks_the_tool(tmp_path) -> None:  # noqa: ANN001
+    (tmp_path / "neil.md").write_text(_FILE)
+    mem = _FakeMemory(boom=True)
+    cfg = CapabilityConfig(users_dir=str(tmp_path))
+
+    async def go() -> str:
+        tools = {t.name: t for t in make_profile_tools(cfg, memory=mem)}
+        out = await tools["remember"].handler(_ctx(), {"key": "email", "value": "n@x.com"})
+        await _drain()
+        return out
+
+    out = asyncio.run(go())
+    assert "saved" in out.lower()  # fact still saved; Honcho failure swallowed
+    assert read_facts(tmp_path / "neil.md") == {"email": "n@x.com"}

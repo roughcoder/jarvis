@@ -7,6 +7,8 @@ grant — the capability gate is.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from jarvis.config import (
     BrowserConfig,
     CapabilityConfig,
@@ -24,6 +26,9 @@ from jarvis.tools.remote import make_remote_tools
 from jarvis.tools.web_search import make_web_search_tool
 from jarvis.tools.worker import make_worker_tools
 
+if TYPE_CHECKING:
+    from jarvis.brain.memory_client import MemoryClient
+
 __all__ = ["Tool", "ToolError", "ToolRegistry", "build_registry"]
 
 
@@ -35,6 +40,7 @@ def build_registry(
     google: GoogleConfig | None = None,
     browser: BrowserConfig | None = None,
     capabilities: CapabilityConfig | None = None,
+    memory: MemoryClient | None = None,
     mcp: list[Tool] | None = None,
 ) -> ToolRegistry:
     """Register every tool. `worker` adds the local worker-daemon tools, `remote`
@@ -48,7 +54,7 @@ def build_registry(
     for tool in make_files_tools(cfg):
         reg.register(tool)
     if capabilities is not None:
-        for tool in make_profile_tools(capabilities):
+        for tool in make_profile_tools(capabilities, memory=memory):
             reg.register(tool)
     if worker is not None:
         for tool in make_worker_tools(worker):
