@@ -60,36 +60,66 @@ class IntercomClient:
         self._wake.load()
         url = self._cfg.intercom.brain_url
         print(f"Connecting to brain at {url}…")
-        async with websockets.connect(url) as ws:
-            await ws.send(
-                encode(
-                    Hello(
-                        device_id=self._device_id,
-                        token=self._cfg.intercom.token.get_secret_value(),
-                    )
-                )
-            )
-            welcome = decode(await ws.recv())
-            if not isinstance(welcome, Welcome):
-                print(f"pairing rejected: {welcome}")
-                return
-            print(f"Paired with brain. Capabilities: {welcome.capabilities}")
-            # One task reads the socket for the whole connection and queues every
-            # message; the turn flow and the idle wait both consume from it. This is
-            # what lets a proactive push (alarm/notification) arrive while idle.
-            inbound: asyncio.Queue = asyncio.Queue()
-            router = asyncio.create_task(self._router(ws, inbound))
-            try:
-                with MicStream(
-                    self._cfg.audio, sample_rate=self._sr, frame_samples=FRAME_SAMPLES
-                ) as mic:
-                    phrase = self._cfg.wake.keyword.replace("_", " ").title()
-                    print(f'\nJarvis is listening. Say "{phrase}".')
-                    while True:
-                        await self._idle_then_turn(ws, mic, inbound)
-            finally:
-                router.cancel()
-                self._wake.delete()
+        # Models + mic are loaded once and kept open across brain reconnects: a brain
+        # restart must not drop the voice device or re-load Whisper/wake every time.
+        try:
+            with MicStream(
+                self._cfg.audio, sample_rate=self._sr, frame_samples=FRAME_SAMPLES
+            ) as mic:
+                phrase = self._cfg.wake.keyword.replace("_", " ").title()
+                while True:  # reconnect loop — survive brain restarts/outages
+                    try:
+                        async with websockets.connect(url) as ws:
+                            await ws.send(
+                                encode(
+                                    Hello(
+                                        device_id=self._device_id,
+                                        token=self._cfg.intercom.token.get_secret_value(),
+                                    )
+                                )
+                            )
+                            welcome = decode(await ws.recv())
+                            if not isinstance(welcome, Welcome):
+                                print(f"pairing rejected: {welcome}; retrying in 5s…")
+                                await asyncio.sleep(5)
+                                continue
+                            print(f"Paired with brain. Capabilities: {welcome.capabilities}")
+                            print(f'\nJarvis is listening. Say "{phrase}".')
+                            # One task reads the socket for the whole connection and queues
+                            # every message; the turn flow and the idle wait both consume from
+                            # it. This is what lets a proactive push (alarm/notification)
+                            # arrive while idle. Race it against the turn loop so a dropped
+                            # socket is noticed promptly, not only on the next send.
+                            inbound: asyncio.Queue = asyncio.Queue()
+                            router = asyncio.create_task(self._router(ws, inbound))
+                            turns = asyncio.create_task(self._turn_forever(ws, mic, inbound))
+                            try:
+                                done, _ = await asyncio.wait(
+                                    {router, turns}, return_when=asyncio.FIRST_COMPLETED
+                                )
+                                for t in done:  # surface a real (non-link) error
+                                    exc = t.exception()
+                                    if exc and not isinstance(
+                                        exc, (OSError, websockets.exceptions.WebSocketException)
+                                    ):
+                                        raise exc
+                            finally:
+                                for t in (router, turns):
+                                    t.cancel()
+                                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                                        await t
+                        print("  [intercom] brain link closed; reconnecting in 3s…")
+                        await asyncio.sleep(3)
+                    except (OSError, websockets.exceptions.WebSocketException) as exc:
+                        print(f"  [intercom] brain link lost ({type(exc).__name__}); reconnecting in 3s…")
+                        await asyncio.sleep(3)
+        finally:
+            self._wake.delete()
+
+    async def _turn_forever(self, ws, mic, inbound: asyncio.Queue) -> None:  # noqa: ANN001
+        """Run turns for the life of one brain connection (idle → wake → turn, repeat)."""
+        while True:
+            await self._idle_then_turn(ws, mic, inbound)
 
     async def _router(self, ws, inbound: asyncio.Queue) -> None:  # noqa: ANN001
         """Read the socket for the connection's life; queue every decoded message."""

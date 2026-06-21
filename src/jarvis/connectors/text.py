@@ -16,6 +16,7 @@ brain and pairs with the device id + intercom token.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 import uuid
 
@@ -86,18 +87,37 @@ class TextConsole:
             await ws.close()
         return 0
 
+    async def _connect_retry(self, *, announce: bool):  # noqa: ANN202 - returns (ws, Welcome)
+        """Connect to the brain, retrying with backoff so a brain restart/outage doesn't
+        kill the console — mirrors the intercom + whatsapp reconnect behaviour."""
+        while True:
+            try:
+                ws, welcome = await self._connect()
+            except Exception as exc:  # noqa: BLE001 - brain down / not yet up / rejected
+                print(f"  [text] can't reach brain ({type(exc).__name__}); retrying in 3s…")
+                await asyncio.sleep(3)
+                continue
+            if announce:
+                caps = ", ".join(welcome.capabilities) or "(none)"
+                print(
+                    f"jarvis text → {self._cfg.intercom.brain_url}\n"
+                    f"paired as {welcome.identity} ({welcome.scope}); can: {caps}\n"
+                    "Type a message, or Ctrl-D to exit.\n"
+                )
+            else:
+                print("  [text] reconnected.")
+            return ws, welcome
+
     async def repl(self) -> int:
         """Interactive (or piped) REPL. A single router task reads the socket — turn
         replies go to a queue, and Proactive pushes (alarms, background completions,
         heartbeat) print AS THEY ARRIVE, even between turns. That continuous reader is
-        what makes notification delivery work; a turn-only reader would miss them."""
-        ws, welcome = await self._connect()
-        caps = ", ".join(welcome.capabilities) or "(none)"
-        print(
-            f"jarvis text → {self._cfg.intercom.brain_url}\n"
-            f"paired as {welcome.identity} ({welcome.scope}); can: {caps}\n"
-            "Type a message, or Ctrl-D to exit.\n"
-        )
+        what makes notification delivery work; a turn-only reader would miss them.
+
+        The brain link auto-reconnects: each turn races the reader task, so a dropped
+        socket (brain restart) rebuilds the connection and retries the turn rather than
+        hanging or exiting."""
+        ws, _ = await self._connect_retry(announce=True)
         turn_q: asyncio.Queue = asyncio.Queue()
         reader = asyncio.create_task(self._route(ws, turn_q))
         try:
@@ -108,13 +128,32 @@ class TextConsole:
                 text = line.strip()
                 if not text:
                     continue
-                reply, ended = await self._turn(ws, turn_q, text)
-                print(f"jarvis: {reply}")
-                if ended:
-                    print("(conversation ended)")
+                while True:  # retry the turn across reconnects
+                    turn = asyncio.create_task(self._turn(ws, turn_q, text))
+                    done, _ = await asyncio.wait(
+                        {turn, reader}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if turn in done and not turn.exception():
+                        reply, ended = turn.result()
+                        print(f"jarvis: {reply}")
+                        if ended:
+                            print("(conversation ended)")
+                        break
+                    # link dropped (reader ended, or the send raised): rebuild + retry
+                    turn.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await turn
+                    print("  [text] brain link lost; reconnecting…")
+                    reader.cancel()
+                    with contextlib.suppress(Exception):
+                        await ws.close()
+                    ws, _ = await self._connect_retry(announce=False)
+                    turn_q = asyncio.Queue()
+                    reader = asyncio.create_task(self._route(ws, turn_q))
         finally:
             reader.cancel()
-            await ws.close()
+            with contextlib.suppress(Exception):
+                await ws.close()
         return 0
 
     async def _route(self, ws, turn_q: asyncio.Queue) -> None:  # noqa: ANN001
