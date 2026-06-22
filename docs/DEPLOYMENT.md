@@ -31,6 +31,8 @@ impersonate a Mac.
 
 The final user path should avoid clone instructions. `uv` may remain an internal
 implementation detail for the formula while the public surface stays `jarvis`.
+The current runtime formula is `--HEAD` while versioned runtime tarballs are
+prepared.
 
 ## Stable CLI Surface
 
@@ -121,7 +123,7 @@ Mac runtime:
 
 ```bash
 brew update
-brew upgrade jarvis
+brew upgrade --fetch-HEAD jarvis
 jarvis service restart brain
 jarvis service restart worker
 jarvis service restart intercom

@@ -7,18 +7,35 @@ state, personal data, private release assumptions, and local-machine artifacts.
 
 | Area | Status | Required action |
 |---|---|---|
-| Worker job records | Fixed locally | Tracked `jarvis-workspace/worker/jobs/*.json` records were removed. Keep the directory ignored. |
-| User files | Ignored locally | Never track `jarvis-workspace/users/*.md`; they contain personal identity bindings. |
-| OAuth caches | Ignored locally | Keep `jarvis-workspace/.mcp-auth/` ignored and verify no cached token files are tracked. |
-| Browser profile | Ignored locally | Keep `jarvis-workspace/browser/` ignored; Chrome profiles contain cookies, history, and login metadata. |
-| `.env` | Ignored locally | `.env.example` must use placeholders only. No copied local secrets. |
-| Private Homebrew release | Open | Convert `jarvis-app` cask from authenticated private asset URL to public release URL once repo visibility changes. |
-| Runtime package | Open | Add public `jarvis` formula before claiming no-clone installation. |
-| Docs | Open | Replace development-first quickstarts with install-first paths. Keep development instructions separate. |
+| Worker job records | Fixed | Tracked `jarvis-workspace/worker/jobs/*.json` records were removed. Keep the directory ignored. |
+| User files | Guarded | Never track `jarvis-workspace/users/*.md`; they contain personal identity bindings. |
+| OAuth caches | Guarded | Keep `jarvis-workspace/.mcp-auth/` ignored and verify no cached token files are tracked. |
+| Browser profile | Guarded | Keep `jarvis-workspace/browser/` ignored; Chrome profiles contain cookies, history, and login metadata. |
+| `.env` | Guarded | `.env.example` must use placeholders only. No copied local secrets. |
+| Private Homebrew release | Fixed | `jarvis-app` cask uses the public GitHub release download URL, not the release asset API. |
+| Runtime package | Fixed for beta | `jarvis` formula exists. It is currently `--HEAD` until the runtime has versioned tarballs. |
+| Docs | Fixed locally | Install-first deployment docs and a static docs preview site are present. |
+| GitHub Actions | External blocker | All workflows currently fail at `startup_failure` before any job starts, including a no-checkout smoke workflow. This points to GitHub account/repo Actions execution rather than workflow content. |
+| GitHub Pages | External blocker | `docs-site/` and the Pages workflow exist, but Pages is not enabled and cannot deploy until Actions can start jobs. |
 
 ## Required Scans
 
 Run these before changing repository visibility:
+
+```bash
+scripts/verify_public_readiness.sh
+```
+
+The verifier checks the runtime, sibling `jarvis-apple`, and sibling
+`homebrew-infinite-stack` checkouts. Override locations when needed:
+
+```bash
+JARVIS_APP_DIR=/path/to/jarvis-apple \
+JARVIS_TAP_DIR=/path/to/homebrew-infinite-stack \
+scripts/verify_public_readiness.sh
+```
+
+Manual scan primitives:
 
 ```bash
 git status --short
@@ -54,9 +71,11 @@ reviewed before publication.
 
 1. Run the required scans and resolve every non-example hit.
 2. Rotate any secret that ever appeared in git history or local logs.
-3. Convert private GitHub release URLs in the Homebrew cask to public release URLs.
-4. Add CI for Python tests, Swift tests, Homebrew style/audit, and docs build.
-5. Publish public install docs and keep private fleet credentials in local machine
+3. Confirm the Homebrew cask still uses public release download URLs.
+4. Confirm CI workflow files pass `actionlint`, then fix the GitHub Actions
+   account/repo startup issue so remote CI jobs actually run.
+5. Enable GitHub Pages for the runtime repository once Actions can start jobs.
+6. Publish public install docs and keep private fleet credentials in local machine
    state only.
-6. Change repository visibility only after the app, runtime formula, and docs site
+7. Change repository visibility only after the app, runtime formula, and docs site
    no longer depend on private GitHub asset access.
