@@ -240,9 +240,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     async def speak_turn(user_text: str) -> None:
         # Per-turn model routing (spec Step 4): strong for longer asks, else fast.
         model = (
-            cfg.gateway.strong_model
-            if len(user_text) > 120
-            else cfg.gateway.fast_model
+            cfg.gateway.strong_model if len(user_text) > 120 else cfg.gateway.fast_model
         )
         messages = [
             {"role": "system", "content": _VOICE_SYSTEM_PROMPT},
@@ -391,7 +389,9 @@ def _cmd_whatsapp_log(args: argparse.Namespace) -> int:
         out = subprocess.run(argv, capture_output=True, text=True, timeout=30).stdout
         msgs = json.loads(out).get("data", {}).get("messages", [])
     except Exception as exc:  # noqa: BLE001 - wacli missing/not linked
-        print(f"couldn't read WhatsApp log ({exc}). Is wacli linked? `wacli auth status`")
+        print(
+            f"couldn't read WhatsApp log ({exc}). Is wacli linked? `wacli auth status`"
+        )
         return 1
     if not msgs:
         print("(no messages)")
@@ -400,7 +400,11 @@ def _cmd_whatsapp_log(args: argparse.Namespace) -> int:
         text = (m.get("Text") or m.get("DisplayText") or "").replace("\n", " ")
         if args.search and args.search.lower() not in text.lower():
             continue
-        who = "jarvis" if m.get("FromMe") else (m.get("SenderName") or m.get("SenderJID", "")[:16])
+        who = (
+            "jarvis"
+            if m.get("FromMe")
+            else (m.get("SenderName") or m.get("SenderJID", "")[:16])
+        )
         ts = (m.get("Timestamp") or "")[:19].replace("T", " ")
         print(f"[{ts}] {who}: {text}")
     return 0
@@ -463,12 +467,22 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
 
     if args.prune:  # clean up all finished jobs (worktrees + branches)
         try:
-            r = httpx.post(f"{base}/run", json={"action": "cleanup", "args": {"job": ""}}, headers=headers, timeout=30)
+            r = httpx.post(
+                f"{base}/run",
+                json={"action": "cleanup", "args": {"job": ""}},
+                headers=headers,
+                timeout=30,
+            )
             cleaned = r.json().get("cleaned", [])
         except Exception as exc:  # noqa: BLE001
-            print(f"Worker not reachable at {base} ({exc}).\nStart it with: jarvis worker")
+            print(
+                f"Worker not reachable at {base} ({exc}).\nStart it with: jarvis worker"
+            )
             return 1
-        print(f"Cleaned up {len(cleaned)} finished job(s)." + (f" ({', '.join(cleaned)})" if cleaned else ""))
+        print(
+            f"Cleaned up {len(cleaned)} finished job(s)."
+            + (f" ({', '.join(cleaned)})" if cleaned else "")
+        )
         return 0
 
     try:
@@ -484,7 +498,9 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
         return 0
     print(f"Worker jobs at {cfg.worker.base_url}:\n")
     for j in jobs[-args.n :]:
-        clock = datetime.datetime.fromtimestamp(j.get("started", 0)).strftime("%H:%M:%S")
+        clock = datetime.datetime.fromtimestamp(j.get("started", 0)).strftime(
+            "%H:%M:%S"
+        )
         out = (j.get("output") or "").replace("\n", " ")
         if len(out) > 64:
             out = out[:64] + "…"
@@ -493,7 +509,9 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
             f"{j.get('status'):<11} {out}"
         )
         if j.get("branch"):
-            print(f"            └─ branch: {j['branch']}  (review: git -C {j.get('cwd')} diff)")
+            print(
+                f"            └─ branch: {j['branch']}  (review: git -C {j.get('cwd')} diff)"
+            )
         elif j.get("cwd"):
             print(f"            └─ ran in: {j['cwd']}  (git -C {j['cwd']} diff)")
         if j.get("session_id"):
@@ -582,7 +600,7 @@ def _wait_key(prompt: str) -> str:
     if not sys.stdin.isatty():
         line = sys.stdin.readline()
         print()
-        return (line.strip()[:1] or " ")
+        return line.strip()[:1] or " "
     import termios
     import tty
 
@@ -642,9 +660,13 @@ def _cmd_mcp_login(args: argparse.Namespace) -> int:
             provider, _storage, flow = build_oauth_provider(
                 spec, cfg.mcp, interactive=True, user=who
             )
-            client = MCPClient(spec, call_timeout_s=cfg.mcp.call_timeout_s, auth=provider)
+            client = MCPClient(
+                spec, call_timeout_s=cfg.mcp.call_timeout_s, auth=provider
+            )
             try:
-                tools = await asyncio.wait_for(client.connect(), 300)  # human-in-the-loop
+                tools = await asyncio.wait_for(
+                    client.connect(), 300
+                )  # human-in-the-loop
                 state = "authorized" if (flow and flow.opened) else "already authorized"
                 print(f"  ✓ {state} — {len(tools)} tool(s) available")
                 ok += 1
@@ -654,12 +676,20 @@ def _cmd_mcp_login(args: argparse.Namespace) -> int:
                 await client.aclose()
         return ok, skipped
 
-    print(f"Authorizing {total} OAuth MCP server(s). I'll announce each — "
-          "press SPACE when ready and finish the login in your browser.")
+    print(
+        f"Authorizing {total} OAuth MCP server(s). I'll announce each — "
+        "press SPACE when ready and finish the login in your browser."
+    )
     ok, skipped = asyncio.run(run())
     print(f"\n{'─' * 60}")
-    print(f"Done — {ok}/{total} authorized" + (f", {skipped} skipped" if skipped else "") + ".")
-    print(f"Tokens saved to {cfg.mcp.auth_dir}/; the brain refreshes them silently on next start.")
+    print(
+        f"Done — {ok}/{total} authorized"
+        + (f", {skipped} skipped" if skipped else "")
+        + "."
+    )
+    print(
+        f"Tokens saved to {cfg.mcp.auth_dir}/; the brain refreshes them silently on next start."
+    )
     return 0 if ok else 1
 
 
@@ -682,7 +712,10 @@ def _cmd_mcp_probe(args: argparse.Namespace) -> int:
         try:
             tools = await bridge.start()
             # snapshot before aclose resets bridge state
-            return [(t.offered_name, t.server, t.required_capability, t.description) for t in tools]
+            return [
+                (t.offered_name, t.server, t.required_capability, t.description)
+                for t in tools
+            ]
         finally:
             await bridge.aclose()
 
@@ -740,7 +773,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
     res = asyncio.run(probe_brain(cfg))
     if getattr(args, "json", False):
-        print(json.dumps({"brain_url": url, "device_id": cfg.capabilities.device_id, **res}, indent=2))
+        print(
+            json.dumps(
+                {"brain_url": url, "device_id": cfg.capabilities.device_id, **res},
+                indent=2,
+            )
+        )
         return 0 if res.get("paired") else 1
     print(f"Brain: {url}  (device: {cfg.capabilities.device_id})")
     if not res.get("reachable"):
@@ -749,9 +787,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
     if res.get("paired"):
         print("  ✓ reachable + paired")
         print(f"    identity: {res.get('identity')}   scope: {res.get('scope')}")
-        print(f"    capabilities: {', '.join(res.get('capabilities') or []) or '(none)'}")
+        print(
+            f"    capabilities: {', '.join(res.get('capabilities') or []) or '(none)'}"
+        )
         return 0
-    print(f"  ✗ pairing rejected: {res.get('error')} (check INTERCOM_TOKEN / BRAIN_DEVICES)")
+    print(
+        f"  ✗ pairing rejected: {res.get('error')} (check INTERCOM_TOKEN / BRAIN_DEVICES)"
+    )
     return 1
 
 
@@ -772,10 +814,16 @@ def _cmd_fleet_status(args: argparse.Namespace) -> int:
     docker = data["docker"]
     git = data["git"]
     print(f"Jarvis fleet status for {data['device_id']}")
-    print(f"  brain bind:       {data['brain']['bind']}  auth={'yes' if data['brain']['auth_configured'] else 'no'}")
+    print(
+        f"  brain bind:       {data['brain']['bind']}  auth={'yes' if data['brain']['auth_configured'] else 'no'}"
+    )
     print(
         "  intercom pairing: "
-        + ("paired" if pairing.get("paired") else f"not paired ({pairing.get('error', 'unknown')})")
+        + (
+            "paired"
+            if pairing.get("paired")
+            else f"not paired ({pairing.get('error', 'unknown')})"
+        )
     )
     if pairing.get("paired"):
         print(f"    identity/scope: {pairing.get('identity')} / {pairing.get('scope')}")
@@ -789,10 +837,18 @@ def _cmd_fleet_status(args: argparse.Namespace) -> int:
     )
     if worker.get("reachable"):
         jobs = worker.get("jobs", {})
-        print(f"    jobs:           {jobs.get('running', 0)} running / {jobs.get('total', 0)} total")
+        print(
+            f"    jobs:           {jobs.get('running', 0)} running / {jobs.get('total', 0)} total"
+        )
     if docker.get("available"):
-        running = sum(1 for s in docker.get("services", []) if s.get("state", "").lower() == "running")
-        print(f"  docker compose:   {running}/{len(docker.get('services', []))} running")
+        running = sum(
+            1
+            for s in docker.get("services", [])
+            if s.get("state", "").lower() == "running"
+        )
+        print(
+            f"  docker compose:   {running}/{len(docker.get('services', []))} running"
+        )
     else:
         print(f"  docker compose:   unavailable ({docker.get('error', 'not checked')})")
     if git.get("available"):
@@ -833,7 +889,9 @@ def _cmd_traces(args: argparse.Namespace) -> int:
         if kind == "memory":
             # Indented so a cold-path burst is easy to see against the turn it
             # overlaps — useful for telling contention from ambient noise.
-            print(f"  {clock(d)}  memory      mem={s.get('memory', {}).get('ms', 0):.0f}ms (cold path)")
+            print(
+                f"  {clock(d)}  memory      mem={s.get('memory', {}).get('ms', 0):.0f}ms (cold path)"
+            )
             continue
         stt = s.get("stt", {})
         llm = s.get("llm", {})
@@ -851,7 +909,12 @@ def _cmd_traces(args: argparse.Namespace) -> int:
 
 def _cmd_service(args: argparse.Namespace) -> int:
     """Install and control Jarvis services without exposing launchd/systemd internals."""
-    from jarvis.deploy import control_service, install_service, render_service, role_extras
+    from jarvis.deploy import (
+        control_service,
+        install_service,
+        render_service,
+        role_extras,
+    )
 
     if args.service_action == "extras":
         print(" ".join(role_extras(set(args.roles))))
@@ -887,7 +950,9 @@ def _cmd_service(args: argparse.Namespace) -> int:
                 print(f"installed {role} service: {dest}")
         return rc
 
-    result = control_service(args.roles[0], args.service_action, platform_name=args.platform)
+    result = control_service(
+        args.roles[0], args.service_action, platform_name=args.platform
+    )
     if result.stdout:
         print(result.stdout, end="")
     if result.stderr:
@@ -903,7 +968,20 @@ def _cmd_pair(args: argparse.Namespace) -> int:
     if args.json:
         import json
 
-        print(json.dumps({"token": token, "brain_devices_entry": fragment}, indent=2))
+        payload = {"token": token, "brain_devices_entry": fragment}
+        if args.pi_installer:
+            if not args.brain_host:
+                print("--brain-host is required with --pi-installer", file=sys.stderr)
+                return 2
+            payload["pi_installer_command"] = render_pi_installer_command(
+                device_id=args.device_id,
+                token=token,
+                brain_host=args.brain_host,
+                brain_port=args.brain_port,
+                repo=args.repo,
+                ref=args.ref,
+            )
+        print(json.dumps(payload, indent=2))
     elif args.pi_installer:
         if not args.brain_host:
             print("--brain-host is required with --pi-installer", file=sys.stderr)
@@ -930,19 +1008,25 @@ def _cmd_pair(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="jarvis", description="Jarvis voice assistant")
+    parser = argparse.ArgumentParser(
+        prog="jarvis", description="Jarvis voice assistant"
+    )
     parser.add_argument("--version", action="version", version=f"jarvis {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_config = sub.add_parser("config", help="Print resolved configuration (dry-run)")
     p_config.set_defaults(func=_cmd_config)
 
-    p_ping = sub.add_parser("ping-gateway", help="Step 1 gate: test fast + strong routes")
+    p_ping = sub.add_parser(
+        "ping-gateway", help="Step 1 gate: test fast + strong routes"
+    )
     p_ping.add_argument(
         "--prompt",
         default="Reply with exactly one short sentence confirming you are online.",
     )
-    p_ping.add_argument("--route", help="Test a single named route instead of fast+strong")
+    p_ping.add_argument(
+        "--route", help="Test a single named route instead of fast+strong"
+    )
     p_ping.set_defaults(func=_cmd_ping_gateway)
 
     p_say = sub.add_parser("say", help="Step 2 gate: speak text via streaming TTS")
@@ -989,38 +1073,77 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_run.set_defaults(func=_cmd_run)
 
-    p_brain = sub.add_parser("brain", help="Run the brain server intercoms connect to (W4)")
+    p_brain = sub.add_parser(
+        "brain", help="Run the brain server intercoms connect to (W4)"
+    )
     p_brain.set_defaults(func=_cmd_brain)
 
-    p_worker = sub.add_parser("worker", help="Run the worker daemon (deep work + machine control, W3c)")
-    p_worker.add_argument("--doctor", action="store_true", help="Report mac GUI control (peekaboo) readiness and exit")
+    p_worker = sub.add_parser(
+        "worker", help="Run the worker daemon (deep work + machine control, W3c)"
+    )
+    p_worker.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Report mac GUI control (peekaboo) readiness and exit",
+    )
     p_worker.set_defaults(func=_cmd_worker)
 
-    p_whatsapp = sub.add_parser("whatsapp", help="Run the WhatsApp connector (bridge wacli <-> brain, 3b)")
+    p_whatsapp = sub.add_parser(
+        "whatsapp", help="Run the WhatsApp connector (bridge wacli <-> brain, 3b)"
+    )
     p_whatsapp.set_defaults(func=_cmd_whatsapp)
 
-    p_walog = sub.add_parser("whatsapp-log", help="Print the WhatsApp transcript from wacli's store")
-    p_walog.add_argument("-n", type=int, default=30, help="how many recent messages to fetch (default 30)")
-    p_walog.add_argument("--chat", default="", help="limit to one chat JID (DM or group)")
-    p_walog.add_argument("--search", default="", help="only show messages containing this text")
+    p_walog = sub.add_parser(
+        "whatsapp-log", help="Print the WhatsApp transcript from wacli's store"
+    )
+    p_walog.add_argument(
+        "-n",
+        type=int,
+        default=30,
+        help="how many recent messages to fetch (default 30)",
+    )
+    p_walog.add_argument(
+        "--chat", default="", help="limit to one chat JID (DM or group)"
+    )
+    p_walog.add_argument(
+        "--search", default="", help="only show messages containing this text"
+    )
     p_walog.set_defaults(func=_cmd_whatsapp_log)
 
-    p_text = sub.add_parser("text", help="Text console: drive the brain from the terminal (no mic/STT/TTS)")
-    p_text.add_argument("--once", metavar="MESSAGE", help="Send one message, print the reply, and exit (scriptable)")
+    p_text = sub.add_parser(
+        "text", help="Text console: drive the brain from the terminal (no mic/STT/TTS)"
+    )
+    p_text.add_argument(
+        "--once",
+        metavar="MESSAGE",
+        help="Send one message, print the reply, and exit (scriptable)",
+    )
     p_text.set_defaults(func=_cmd_text)
 
-    p_remote = sub.add_parser("remote-setup", help="One-time: create the cloud agent + environment (remote coding)")
+    p_remote = sub.add_parser(
+        "remote-setup",
+        help="One-time: create the cloud agent + environment (remote coding)",
+    )
     p_remote.set_defaults(func=_cmd_remote_setup)
 
-    p_gsetup = sub.add_parser("google-setup", help="One-time: OAuth for the google tool (gogcli)")
+    p_gsetup = sub.add_parser(
+        "google-setup", help="One-time: OAuth for the google tool (gogcli)"
+    )
     p_gsetup.set_defaults(func=_cmd_google_setup)
 
-    p_mcp = sub.add_parser("mcp", help="MCP servers: probe tools, or `mcp login` for OAuth onboarding")
+    p_mcp = sub.add_parser(
+        "mcp", help="MCP servers: probe tools, or `mcp login` for OAuth onboarding"
+    )
     p_mcp.add_argument(
-        "mcp_action", nargs="?", choices=["probe", "login"], default="probe",
+        "mcp_action",
+        nargs="?",
+        choices=["probe", "login"],
+        default="probe",
         help="probe = discover tools (default); login = interactive OAuth for http servers",
     )
-    p_mcp.add_argument("--server", default="", help="login: limit to one server by name")
+    p_mcp.add_argument(
+        "--server", default="", help="login: limit to one server by name"
+    )
     p_mcp.add_argument(
         "--user", default="", help="principal whose credentials to use (default: house)"
     )
@@ -1029,24 +1152,40 @@ def build_parser() -> argparse.ArgumentParser:
     p_jobs = sub.add_parser("jobs", help="List the worker's recent jobs + results")
     p_jobs.add_argument("-n", type=int, default=20, help="How many recent jobs")
     p_jobs.add_argument(
-        "--prune", action="store_true", help="Clean up all finished jobs (worktrees + branches)"
+        "--prune",
+        action="store_true",
+        help="Clean up all finished jobs (worktrees + branches)",
     )
     p_jobs.set_defaults(func=_cmd_jobs)
 
-    p_status = sub.add_parser("status", help="Is the brain reachable + what is this device allowed to do?")
-    p_status.add_argument("--json", action="store_true", help="Print machine-readable status")
+    p_status = sub.add_parser(
+        "status", help="Is the brain reachable + what is this device allowed to do?"
+    )
+    p_status.add_argument(
+        "--json", action="store_true", help="Print machine-readable status"
+    )
     p_status.set_defaults(func=_cmd_status)
 
-    p_fleet = sub.add_parser("fleet-status", help="Operator status for local roles + remote peers")
-    p_fleet.add_argument("--json", action="store_true", help="Print machine-readable status for the toolbar app")
-    p_fleet.add_argument("--no-docker", action="store_true", help="Skip docker compose status")
+    p_fleet = sub.add_parser(
+        "fleet-status", help="Operator status for local roles + remote peers"
+    )
+    p_fleet.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable status for the toolbar app",
+    )
+    p_fleet.add_argument(
+        "--no-docker", action="store_true", help="Skip docker compose status"
+    )
     p_fleet.set_defaults(func=_cmd_fleet_status)
 
     p_traces = sub.add_parser("traces", help="View recent per-turn pipeline traces")
     p_traces.add_argument("-n", type=int, default=20, help="How many recent traces")
     p_traces.set_defaults(func=_cmd_traces)
 
-    p_service = sub.add_parser("service", help="Install/control Jarvis launchd/systemd services")
+    p_service = sub.add_parser(
+        "service", help="Install/control Jarvis launchd/systemd services"
+    )
     p_service.add_argument(
         "service_action",
         choices=["install", "print", "start", "stop", "restart", "status", "extras"],
@@ -1058,23 +1197,59 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["brain", "intercom", "worker"],
         help="Role(s). Control actions accept exactly one role.",
     )
-    p_service.add_argument("--platform", choices=["launchd", "systemd"], help="Override platform detection")
-    p_service.add_argument("--jarvis-bin", help="Jarvis executable path for generated service files")
-    p_service.add_argument("--workdir", help="Working directory for generated service files")
-    p_service.add_argument("--log-dir", help="Log directory for generated service files")
-    p_service.add_argument("--destination", help="Write service file here instead of the platform default")
-    p_service.add_argument("--dry-run", action="store_true", help="Print install output without writing files")
+    p_service.add_argument(
+        "--platform", choices=["launchd", "systemd"], help="Override platform detection"
+    )
+    p_service.add_argument(
+        "--jarvis-bin", help="Jarvis executable path for generated service files"
+    )
+    p_service.add_argument(
+        "--workdir", help="Working directory for generated service files"
+    )
+    p_service.add_argument(
+        "--log-dir", help="Log directory for generated service files"
+    )
+    p_service.add_argument(
+        "--destination", help="Write service file here instead of the platform default"
+    )
+    p_service.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print install output without writing files",
+    )
     p_service.set_defaults(func=_cmd_service)
 
     p_pair = sub.add_parser("pair", help="Issue a per-device pairing token entry")
-    p_pair.add_argument("device_id", help="Device id, e.g. imac-brain, kitchen-pi, neil-laptop")
-    p_pair.add_argument("--identity", default="", help="Optional pinned identity for a personal device")
-    p_pair.add_argument("--json", action="store_true", help="Print machine-readable token + BRAIN_DEVICES entry")
-    p_pair.add_argument("--pi-installer", action="store_true", help="Print copy/paste Raspberry Pi installer commands")
-    p_pair.add_argument("--brain-host", default="", help="Brain hostname for --pi-installer")
-    p_pair.add_argument("--brain-port", default="8700", help="Brain WebSocket port for --pi-installer")
-    p_pair.add_argument("--repo", default="roughcoder/jarvis", help="Runtime repository for --pi-installer")
-    p_pair.add_argument("--ref", default="main", help="Runtime branch/tag/ref for --pi-installer")
+    p_pair.add_argument(
+        "device_id", help="Device id, e.g. imac-brain, kitchen-pi, neil-laptop"
+    )
+    p_pair.add_argument(
+        "--identity", default="", help="Optional pinned identity for a personal device"
+    )
+    p_pair.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable token + BRAIN_DEVICES entry",
+    )
+    p_pair.add_argument(
+        "--pi-installer",
+        action="store_true",
+        help="Print copy/paste Raspberry Pi installer commands",
+    )
+    p_pair.add_argument(
+        "--brain-host", default="", help="Brain hostname for --pi-installer"
+    )
+    p_pair.add_argument(
+        "--brain-port", default="8700", help="Brain WebSocket port for --pi-installer"
+    )
+    p_pair.add_argument(
+        "--repo",
+        default="roughcoder/jarvis",
+        help="Runtime repository for --pi-installer",
+    )
+    p_pair.add_argument(
+        "--ref", default="main", help="Runtime branch/tag/ref for --pi-installer"
+    )
     p_pair.set_defaults(func=_cmd_pair)
 
     return parser

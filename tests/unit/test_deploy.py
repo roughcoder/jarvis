@@ -4,11 +4,22 @@ import json
 
 import pytest
 
-from jarvis.deploy import issue_pairing_entry, render_pi_installer_command, render_service, role_extras
+from jarvis.deploy import (
+    issue_pairing_entry,
+    render_pi_installer_command,
+    render_service,
+    role_extras,
+)
 
 
 def test_role_extras_are_ordered_and_deduplicated() -> None:
-    assert role_extras({"worker", "intercom"}) == ["stt", "vad", "wake", "worker", "browser"]
+    assert role_extras({"worker", "intercom"}) == [
+        "stt",
+        "vad",
+        "wake",
+        "worker",
+        "browser",
+    ]
     assert role_extras({"brain", "worker"}) == [
         "gateway",
         "tts",
@@ -57,6 +68,17 @@ def test_issue_pairing_entry_returns_brain_devices_fragment() -> None:
     assert entry == {"token": token, "device_id": "kitchen-pi"}
 
 
+def test_issue_pairing_entry_json_escapes_values() -> None:
+    token, fragment = issue_pairing_entry('kitchen "pi"', identity='Neil "home"')
+    entry = json.loads(fragment)
+
+    assert entry == {
+        "token": token,
+        "device_id": 'kitchen "pi"',
+        "identity": 'Neil "home"',
+    }
+
+
 def test_render_pi_installer_command_quotes_pairing_values() -> None:
     command = render_pi_installer_command(
         device_id="kitchen pi",
@@ -67,7 +89,10 @@ def test_render_pi_installer_command_quotes_pairing_values() -> None:
         ref="v0.1.0",
     )
 
-    assert "curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.0/scripts/install_pi.sh" in command
+    assert (
+        "curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.0/scripts/install_pi.sh"
+        in command
+    )
     assert "sudo JARVIS_BRAIN_HOST=imac.private JARVIS_BRAIN_PORT=8701" in command
     assert "JARVIS_INTERCOM_TOKEN='tok en'" in command
     assert "JARVIS_DEVICE_ID='kitchen pi'" in command
@@ -75,4 +100,6 @@ def test_render_pi_installer_command_quotes_pairing_values() -> None:
 
 def test_render_pi_installer_command_requires_brain_host() -> None:
     with pytest.raises(ValueError, match="brain_host"):
-        render_pi_installer_command(device_id="kitchen-pi", token="token", brain_host="")
+        render_pi_installer_command(
+            device_id="kitchen-pi", token="token", brain_host=""
+        )

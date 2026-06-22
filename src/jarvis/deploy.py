@@ -7,6 +7,7 @@ without reimplementing launchd/systemd details.
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import secrets
@@ -56,10 +57,10 @@ def role_extras(roles: list[str] | tuple[str, ...] | set[str]) -> list[str]:
 def issue_pairing_entry(device_id: str, *, identity: str = "") -> tuple[str, str]:
     """Return a fresh token and a BRAIN_DEVICES JSON object fragment."""
     token = secrets.token_urlsafe(32)
-    parts = [f'"token":"{token}"', f'"device_id":"{device_id}"']
+    entry = {"token": token, "device_id": device_id}
     if identity:
-        parts.append(f'"identity":"{identity}"')
-    return token, "{" + ",".join(parts) + "}"
+        entry["identity"] = identity
+    return token, json.dumps(entry, separators=(",", ":"))
 
 
 def render_pi_installer_command(
@@ -83,7 +84,9 @@ def render_pi_installer_command(
         "JARVIS_REPO": repo,
         "JARVIS_REF": ref,
     }
-    env = " ".join(f"{key}={shlex.quote(value)}" for key, value in assignments.items() if value)
+    env = " ".join(
+        f"{key}={shlex.quote(value)}" for key, value in assignments.items() if value
+    )
     return "\n".join(
         [
             "curl -fsSL https://raw.githubusercontent.com/"
@@ -153,7 +156,9 @@ def render_service(
     logs = str(Path(log_dir).expanduser() if log_dir else default_log_dir())
     args = ROLE_COMMANDS[role]
     if target == "launchd":
-        arg_xml = "\n".join(f"    <string>{_xml_escape(a)}</string>" for a in [bin_path, *args])
+        arg_xml = "\n".join(
+            f"    <string>{_xml_escape(a)}</string>" for a in [bin_path, *args]
+        )
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -234,7 +239,9 @@ def install_service(
     return paths.destination, text
 
 
-def control_service(role: str, action: str, *, platform_name: str | None = None) -> subprocess.CompletedProcess[str]:
+def control_service(
+    role: str, action: str, *, platform_name: str | None = None
+) -> subprocess.CompletedProcess[str]:
     _validate_role(role)
     target = platform_name or detect_platform()
     if target == "launchd":
@@ -254,7 +261,12 @@ def control_service(role: str, action: str, *, platform_name: str | None = None)
             raise ValueError(f"unsupported service action: {action}")
     elif target == "systemd":
         unit = f"jarvis-{role}.service"
-        verb = {"start": "start", "stop": "stop", "restart": "restart", "status": "status"}[action]
+        verb = {
+            "start": "start",
+            "stop": "stop",
+            "restart": "restart",
+            "status": "status",
+        }[action]
         argv = ["systemctl", verb, unit]
     else:
         raise ValueError(f"unsupported service platform: {target}")
