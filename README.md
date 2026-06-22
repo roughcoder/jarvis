@@ -144,5 +144,5 @@ to the tap.
 Local fallback:
 
 ```bash
-scripts/release_runtime.sh 0.1.3
+scripts/release_runtime.sh 0.1.4
 ```
