@@ -126,6 +126,16 @@ The Pi installer should:
 - install `jarvis-intercom.service`
 - start the service only after pairing succeeds
 
+Preview the command sequence without root or hardware changes:
+
+```bash
+JARVIS_DRY_RUN=1 \
+  JARVIS_BRAIN_HOST=imac.private \
+  JARVIS_INTERCOM_TOKEN=issued-token \
+  JARVIS_DEVICE_ID=kitchen-pi \
+  bash scripts/install_pi.sh
+```
+
 The Pi remains a thin intercom: no LLM keys, no memory keys, no worker/browser
 control, and no personal user files.
 

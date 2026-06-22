@@ -27,10 +27,16 @@ sudo JARVIS_BRAIN_HOST=imac.private \
   JARVIS_INTERCOM_TOKEN=pick-a-long-secret \
   JARVIS_DEVICE_ID=room-pi \
   bash /tmp/install_jarvis_pi.sh
+```
 
-jarvis service print intercom --platform systemd
-jarvis service install intercom
-jarvis service start intercom
+Preview the command sequence without root or hardware changes:
+
+```bash
+JARVIS_DRY_RUN=1 \
+  JARVIS_BRAIN_HOST=imac.private \
+  JARVIS_INTERCOM_TOKEN=pick-a-long-secret \
+  JARVIS_DEVICE_ID=room-pi \
+  bash scripts/install_pi.sh
 ```
 
 The current development fallback is still `uv sync --extra stt --extra vad
