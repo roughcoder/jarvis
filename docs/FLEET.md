@@ -168,6 +168,7 @@ The old device check remains available:
 ```bash
 uv run jarvis status
 uv run jarvis status --json
+uv run jarvis status --json --brain-host imac.private --brain-port 8700
 ```
 
 ## Mac Services

@@ -47,6 +47,7 @@ jarvis service start brain
 jarvis service restart worker
 jarvis service status intercom
 jarvis service extras brain worker
+jarvis status --json --brain-host imac.private
 jarvis pair kitchen-pi --json
 ```
 
@@ -95,8 +96,9 @@ The native app should drive setup in five stages:
 1. **Role choice**: Brain Mac, Laptop, Worker-only Mac, Room Pi helper.
 2. **Prerequisites**: Homebrew, Twingate reachability, microphone permission,
    speaker output, Docker for brain hosts, Chrome/GUI permission for workers.
-3. **Pairing**: Device requests approval from the brain or the app generates a
-   per-device token entry with `jarvis pair`.
+3. **Pairing**: Device checks the configured brain host with
+   `jarvis status --json --brain-host ...`, then requests approval from the
+   brain or the app generates a per-device token entry with `jarvis pair`.
 4. **Service install**: App calls `jarvis service install/start` for the selected
    roles and shows logs on failure.
 5. **Ready state**: App polls `jarvis fleet-status --json` until every selected

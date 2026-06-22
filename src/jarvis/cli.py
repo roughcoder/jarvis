@@ -769,6 +769,10 @@ def _cmd_status(args: argparse.Namespace) -> int:
     from jarvis.fleet import probe_brain
 
     cfg = load_config()
+    if args.brain_host:
+        cfg.intercom.brain_host = args.brain_host
+    if args.brain_port:
+        cfg.intercom.brain_port = int(args.brain_port)
     url = cfg.intercom.brain_url
 
     res = asyncio.run(probe_brain(cfg))
@@ -1163,6 +1167,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_status.add_argument(
         "--json", action="store_true", help="Print machine-readable status"
+    )
+    p_status.add_argument(
+        "--brain-host",
+        default="",
+        help="Override INTERCOM_BRAIN_HOST for this reachability check",
+    )
+    p_status.add_argument(
+        "--brain-port",
+        default="",
+        help="Override INTERCOM_BRAIN_PORT for this reachability check",
     )
     p_status.set_defaults(func=_cmd_status)
 
