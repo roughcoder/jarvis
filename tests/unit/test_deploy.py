@@ -29,6 +29,9 @@ def test_uv_sync_args_for_roles_are_packaged_install_safe() -> None:
     assert uv_sync_args_for_roles({"worker", "intercom"}) == [
         "sync",
         "--no-dev",
+        "--inexact",
+        "--no-install-project",
+        "--no-editable",
         "--extra",
         "stt",
         "--extra",

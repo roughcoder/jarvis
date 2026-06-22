@@ -58,7 +58,7 @@ def role_extras(roles: list[str] | tuple[str, ...] | set[str]) -> list[str]:
 
 def uv_sync_args_for_roles(roles: list[str] | tuple[str, ...] | set[str]) -> list[str]:
     """Return the role-scoped dependency sync arguments for packaged installs."""
-    args = ["sync", "--no-dev"]
+    args = ["sync", "--no-dev", "--inexact", "--no-install-project", "--no-editable"]
     for extra in role_extras(roles):
         args.extend(["--extra", extra])
     return args
