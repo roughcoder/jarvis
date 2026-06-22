@@ -1,9 +1,9 @@
 # Public Repository Readiness
 
-Jarvis can become public only after the repository stops containing deployment
-state, personal data, private release assumptions, and local-machine artifacts.
+Jarvis is public. This document records the gates that keep the public repos
+safe to install from and safe to publish.
 
-## Current Blockers
+## Current Status
 
 | Area | Status | Required action |
 |---|---|---|
@@ -13,9 +13,9 @@ state, personal data, private release assumptions, and local-machine artifacts.
 | Browser profile | Guarded | Keep `jarvis-workspace/browser/` ignored; Chrome profiles contain cookies, history, and login metadata. |
 | `.env` | Guarded | `.env.example` must use placeholders only. No copied local secrets. |
 | Private Homebrew release | Fixed | `jarvis-app` cask uses the public GitHub release download URL, not the release asset API. |
-| Runtime package | Fixed for beta | `jarvis` formula exists. Runtime release automation now creates versioned tarballs and can update the formula; the formula remains `--HEAD` until the first runtime release is published. |
+| Runtime package | Fixed | `jarvis` v0.1.0 is published as a versioned GitHub release tarball and the Homebrew formula uses the public release URL. |
 | Docs | Fixed locally | Install-first deployment docs and a static docs preview site are present. |
-| GitHub Actions | External blocker | All workflows currently fail at `startup_failure` before any job starts, including a no-checkout smoke workflow. This points to GitHub account/repo Actions execution rather than workflow content. |
+| GitHub Actions | Fixed | CI and public-readiness workflows run successfully on public repos. |
 | GitHub Pages | Deferred | Ignore Pages for now. `docs-site/` and a prepared `gh-pages` branch exist, but Pages hosting is not part of the current go-public gate. |
 
 ## Required Scans
@@ -69,14 +69,12 @@ reviewed before publication.
 
 ## Visibility Change Checklist
 
-1. Run the required scans and resolve every non-example hit.
-2. Rotate any secret that ever appeared in git history or local logs.
-3. Confirm the Homebrew cask still uses public release download URLs.
-4. Publish the first runtime release so the `jarvis` formula moves from
-   `--HEAD` only to a versioned tarball URL.
-5. Confirm CI workflow files pass `actionlint`, then fix the GitHub Actions
-   account/repo startup issue so remote CI jobs actually run.
-6. Publish public install docs and keep private fleet credentials in local machine
-   state only.
-7. Change repository visibility only after the app and runtime formula
-   no longer depend on private GitHub asset access.
+Completed:
+
+- Repos are public.
+- Required scans pass through `scripts/verify_public_readiness.sh`.
+- The Homebrew app cask uses public release download URLs.
+- The runtime formula uses a public versioned tarball URL.
+- CI and public-readiness workflows run on GitHub.
+- Public install docs exist; private fleet credentials remain local machine
+  state only.

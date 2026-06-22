@@ -109,14 +109,14 @@ echo "Installing Jarvis runtime"
 if [[ "$DRY_RUN" == "1" ]]; then
   run "$BREW_PATH" list --formula "$RUNTIME_FORMULA"
   if [[ "$DRY_RUN_RUNTIME_INSTALLED" == "1" ]]; then
-    run "$BREW_PATH" upgrade --fetch-HEAD "$RUNTIME_FORMULA"
     run "$BREW_PATH" upgrade "$RUNTIME_FORMULA"
+    run "$BREW_PATH" upgrade --fetch-HEAD "$RUNTIME_FORMULA"
   else
     run "$BREW_PATH" install "$RUNTIME_FORMULA"
     run "$BREW_PATH" install --HEAD "$RUNTIME_FORMULA"
   fi
 elif "$BREW_PATH" list --formula "$RUNTIME_FORMULA" >/dev/null 2>&1; then
-  "$BREW_PATH" upgrade --fetch-HEAD "$RUNTIME_FORMULA" || "$BREW_PATH" upgrade "$RUNTIME_FORMULA" || true
+  "$BREW_PATH" upgrade "$RUNTIME_FORMULA" || "$BREW_PATH" upgrade --fetch-HEAD "$RUNTIME_FORMULA" || true
 else
   "$BREW_PATH" install "$RUNTIME_FORMULA" || "$BREW_PATH" install --HEAD "$RUNTIME_FORMULA"
 fi

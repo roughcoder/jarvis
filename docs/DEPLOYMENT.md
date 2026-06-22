@@ -31,9 +31,8 @@ impersonate a Mac.
 
 The final user path should avoid clone instructions. `uv` may remain an internal
 implementation detail for the formula while the public surface stays `jarvis`.
-The release path can now publish versioned runtime tarballs and update the
-formula; the tap remains `--HEAD` only until the first runtime release is
-published.
+The runtime now publishes versioned tarballs and the tap formula has a stable
+release URL; `--HEAD` remains only as a development fallback.
 
 ## Stable CLI Surface
 

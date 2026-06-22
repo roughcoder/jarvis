@@ -47,8 +47,9 @@ def test_mac_installer_dry_run_models_existing_install_update() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert "+ /tmp/jarvis-test-brew upgrade --fetch-HEAD jarvis" in result.stdout
-    assert "+ /tmp/jarvis-test-brew upgrade jarvis" in result.stdout
+    stable = result.stdout.index("+ /tmp/jarvis-test-brew upgrade jarvis")
+    head = result.stdout.index("+ /tmp/jarvis-test-brew upgrade --fetch-HEAD jarvis")
+    assert stable < head
     assert "+ /tmp/jarvis-test-brew upgrade --cask jarvis-app" in result.stdout
 
 
@@ -65,4 +66,3 @@ def test_mac_installer_dry_run_installs_and_starts_roles() -> None:
     assert "+ jarvis service install worker" in result.stdout
     assert "+ jarvis service start worker" in result.stdout
     assert "+ jarvis service restart worker" in result.stdout
-
