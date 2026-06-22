@@ -897,13 +897,30 @@ def _cmd_service(args: argparse.Namespace) -> int:
 
 def _cmd_pair(args: argparse.Namespace) -> int:
     """Pairing helpers for fleet onboarding."""
-    from jarvis.deploy import issue_pairing_entry
+    from jarvis.deploy import issue_pairing_entry, render_pi_installer_command
 
     token, fragment = issue_pairing_entry(args.device_id, identity=args.identity or "")
     if args.json:
         import json
 
         print(json.dumps({"token": token, "brain_devices_entry": fragment}, indent=2))
+    elif args.pi_installer:
+        if not args.brain_host:
+            print("--brain-host is required with --pi-installer", file=sys.stderr)
+            return 2
+        print("Add this object to BRAIN_DEVICES on the brain:")
+        print(fragment)
+        print("\nRun this on the Raspberry Pi:")
+        print(
+            render_pi_installer_command(
+                device_id=args.device_id,
+                token=token,
+                brain_host=args.brain_host,
+                brain_port=args.brain_port,
+                repo=args.repo,
+                ref=args.ref,
+            )
+        )
     else:
         print(f"Device: {args.device_id}")
         print(f"Token:  {token}")
@@ -1053,6 +1070,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_pair.add_argument("device_id", help="Device id, e.g. imac-brain, kitchen-pi, neil-laptop")
     p_pair.add_argument("--identity", default="", help="Optional pinned identity for a personal device")
     p_pair.add_argument("--json", action="store_true", help="Print machine-readable token + BRAIN_DEVICES entry")
+    p_pair.add_argument("--pi-installer", action="store_true", help="Print copy/paste Raspberry Pi installer commands")
+    p_pair.add_argument("--brain-host", default="", help="Brain hostname for --pi-installer")
+    p_pair.add_argument("--brain-port", default="8700", help="Brain WebSocket port for --pi-installer")
+    p_pair.add_argument("--repo", default="roughcoder/jarvis", help="Runtime repository for --pi-installer")
+    p_pair.add_argument("--ref", default="main", help="Runtime branch/tag/ref for --pi-installer")
     p_pair.set_defaults(func=_cmd_pair)
 
     return parser

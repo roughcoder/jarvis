@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 
-from jarvis.deploy import issue_pairing_entry, render_service, role_extras
+import pytest
+
+from jarvis.deploy import issue_pairing_entry, render_pi_installer_command, render_service, role_extras
 
 
 def test_role_extras_are_ordered_and_deduplicated() -> None:
@@ -53,3 +55,24 @@ def test_issue_pairing_entry_returns_brain_devices_fragment() -> None:
 
     assert len(token) >= 32
     assert entry == {"token": token, "device_id": "kitchen-pi"}
+
+
+def test_render_pi_installer_command_quotes_pairing_values() -> None:
+    command = render_pi_installer_command(
+        device_id="kitchen pi",
+        token="tok en",
+        brain_host="imac.private",
+        brain_port="8701",
+        repo="roughcoder/jarvis",
+        ref="v0.1.0",
+    )
+
+    assert "curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.0/scripts/install_pi.sh" in command
+    assert "sudo JARVIS_BRAIN_HOST=imac.private JARVIS_BRAIN_PORT=8701" in command
+    assert "JARVIS_INTERCOM_TOKEN='tok en'" in command
+    assert "JARVIS_DEVICE_ID='kitchen pi'" in command
+
+
+def test_render_pi_installer_command_requires_brain_host() -> None:
+    with pytest.raises(ValueError, match="brain_host"):
+        render_pi_installer_command(device_id="kitchen-pi", token="token", brain_host="")

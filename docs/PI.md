@@ -9,9 +9,12 @@ code as the Mac, different `.env`.
 Give the Pi its own pairing token bound to a device id + profile:
 
 ```bash
-# .env on the brain
-BRAIN_DEVICES=[{"token":"pick-a-long-secret","device_id":"room-pi"}]
+jarvis pair room-pi --pi-installer --brain-host imac.private
 ```
+
+The command prints the `BRAIN_DEVICES` entry for the brain and a copy/paste
+installer command for the Pi. Add the entry to the brain config before running
+the Pi installer.
 
 `profiles/room-pi.md` already ships a house-scoped profile (web.search, files.read,
 mcp.context7). A shared device stays **house** scope until a speaker confirms who

@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import platform
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -59,6 +60,38 @@ def issue_pairing_entry(device_id: str, *, identity: str = "") -> tuple[str, str
     if identity:
         parts.append(f'"identity":"{identity}"')
     return token, "{" + ",".join(parts) + "}"
+
+
+def render_pi_installer_command(
+    *,
+    device_id: str,
+    token: str,
+    brain_host: str,
+    brain_port: str = "8700",
+    repo: str = "roughcoder/jarvis",
+    ref: str = "main",
+) -> str:
+    """Return copy/paste commands for installing a paired Raspberry Pi intercom."""
+    if not brain_host:
+        raise ValueError("brain_host is required")
+
+    assignments = {
+        "JARVIS_BRAIN_HOST": brain_host,
+        "JARVIS_BRAIN_PORT": brain_port,
+        "JARVIS_INTERCOM_TOKEN": token,
+        "JARVIS_DEVICE_ID": device_id,
+        "JARVIS_REPO": repo,
+        "JARVIS_REF": ref,
+    }
+    env = " ".join(f"{key}={shlex.quote(value)}" for key, value in assignments.items() if value)
+    return "\n".join(
+        [
+            "curl -fsSL https://raw.githubusercontent.com/"
+            f"{shlex.quote(repo)}/{shlex.quote(ref)}/scripts/install_pi.sh "
+            "-o /tmp/install_jarvis_pi.sh",
+            f"sudo {env} bash /tmp/install_jarvis_pi.sh",
+        ]
+    )
 
 
 def detect_platform() -> str:
