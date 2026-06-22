@@ -13,6 +13,7 @@ Environment:
   JARVIS_BRAIN_HOST=imac.example         Brain hostname on the private network.
   JARVIS_BRAIN_PORT=8700                 Brain WebSocket port.
   JARVIS_INTERCOM_TOKEN=...              Token issued by the brain.
+  JARVIS_UV_BIN=/usr/local/bin/uv         uv binary used by installed helpers.
   JARVIS_DRY_RUN=0                       Print commands instead of running.
   JARVIS_DRY_RUN_UV_INSTALLED=0          Dry-run uv install state.
   JARVIS_DRY_RUN_TMP_DIR=/tmp/jarvis-pi  Dry-run temporary directory.
@@ -53,6 +54,7 @@ DEVICE_ID="${JARVIS_DEVICE_ID:-room-pi}"
 BRAIN_HOST="${JARVIS_BRAIN_HOST:-}"
 BRAIN_PORT="${JARVIS_BRAIN_PORT:-8700}"
 INTERCOM_TOKEN="${JARVIS_INTERCOM_TOKEN:-}"
+UV_BIN="${JARVIS_UV_BIN:-/usr/local/bin/uv}"
 
 if [[ -z "$BRAIN_HOST" || -z "$INTERCOM_TOKEN" ]]; then
   echo "Set JARVIS_BRAIN_HOST and JARVIS_INTERCOM_TOKEN before installing." >&2
@@ -65,6 +67,7 @@ run apt-get install -y --no-install-recommends \
   ca-certificates \
   curl \
   tar \
+  rsync \
   python3 \
   python3-venv \
   build-essential \
@@ -123,10 +126,127 @@ else
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$INSTALL_DIR"
-exec /usr/local/bin/uv run jarvis "\$@"
+exec "$UV_BIN" run jarvis "\$@"
 EOF
 fi
 run chmod 0755 /usr/local/bin/jarvis
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  echo "+ write /usr/local/bin/jarvis-pi"
+else
+  cat > /usr/local/bin/jarvis-pi <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+INSTALL_DIR="$INSTALL_DIR"
+REPO="$REPO"
+REF="$REF"
+SERVICE="jarvis-intercom.service"
+UV_BIN="\${JARVIS_UV_BIN:-$UV_BIN}"
+
+usage() {
+  cat <<'PISCRIPT_USAGE'
+Usage: jarvis-pi <command>
+
+Commands:
+  update    Refresh the installed runtime, sync dependencies, and restart intercom
+  restart   Restart the intercom service
+  status    Show systemd service status
+  logs      Follow intercom service logs
+  doctor    Print basic Pi audio/camera/service readiness
+PISCRIPT_USAGE
+}
+
+require_root() {
+  if [[ "\$(id -u)" -ne 0 ]]; then
+    echo "Run as root: sudo jarvis-pi \$1" >&2
+    exit 1
+  fi
+}
+
+doctor() {
+  echo "Jarvis Pi doctor"
+  echo "install_dir: \$INSTALL_DIR"
+  if [[ -r "\$INSTALL_DIR/.env" ]]; then
+    grep -E '^(CAPS_DEVICE_ID|INTERCOM_BRAIN_HOST|INTERCOM_BRAIN_PORT)=' "\$INSTALL_DIR/.env" || true
+  else
+    echo "env: missing or unreadable \$INSTALL_DIR/.env"
+  fi
+
+  if command -v "\$UV_BIN" >/dev/null 2>&1; then
+    "\$UV_BIN" --version
+  else
+    echo "uv: missing at \$UV_BIN"
+  fi
+
+  systemctl is-enabled "\$SERVICE" 2>/dev/null || true
+  systemctl is-active "\$SERVICE" 2>/dev/null || true
+
+  if command -v arecord >/dev/null 2>&1; then
+    arecord -l || true
+  else
+    echo "arecord: missing"
+  fi
+
+  if command -v aplay >/dev/null 2>&1; then
+    aplay -l || true
+  else
+    echo "aplay: missing"
+  fi
+
+  if command -v libcamera-hello >/dev/null 2>&1; then
+    libcamera-hello --list-cameras || true
+  else
+    echo "camera: libcamera-hello not installed"
+  fi
+}
+
+cmd="\${1:-}"
+case "\$cmd" in
+  update)
+    require_root "\$cmd"
+    tmp_dir="\$(mktemp -d)"
+    cleanup() {
+      rm -rf "\$tmp_dir"
+    }
+    trap cleanup EXIT
+    archive="\$tmp_dir/jarvis.tar.gz"
+    source_dir="\$tmp_dir/source"
+    mkdir -p "\$source_dir"
+    curl -fsSL "https://github.com/\$REPO/archive/\$REF.tar.gz" -o "\$archive"
+    tar -xzf "\$archive" --strip-components=1 -C "\$source_dir"
+    rsync -a --delete --exclude .env --exclude .venv --exclude jarvis-workspace "\$source_dir/" "\$INSTALL_DIR/"
+    cd "\$INSTALL_DIR"
+    "\$UV_BIN" sync --no-dev --extra stt --extra vad --extra wake
+    systemctl daemon-reload
+    systemctl restart "\$SERVICE"
+    echo "Jarvis Pi runtime updated and \$SERVICE restarted."
+    ;;
+  restart)
+    require_root "\$cmd"
+    systemctl restart "\$SERVICE"
+    ;;
+  status)
+    systemctl status "\$SERVICE"
+    ;;
+  logs)
+    journalctl -u "\$SERVICE" -f --no-pager
+    ;;
+  doctor)
+    doctor
+    ;;
+  -h|--help|help|"")
+    usage
+    ;;
+  *)
+    echo "Unknown command: \$cmd" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+EOF
+fi
+run chmod 0755 /usr/local/bin/jarvis-pi
 
 run jarvis service install intercom \
   --platform systemd \
@@ -138,3 +258,4 @@ run systemctl enable --now jarvis-intercom.service
 
 echo "Jarvis Pi intercom installed as $DEVICE_ID."
 echo "Check status with: systemctl status jarvis-intercom.service"
+echo "Update later with: sudo jarvis-pi update"

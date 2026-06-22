@@ -44,6 +44,22 @@ The current development fallback is still `uv sync --extra stt --extra vad
 installer or image that hides `uv`, writes local config, pairs the device, and
 installs the systemd unit.
 
+## Updating and checking the Pi
+
+The installer writes a Pi-specific helper:
+
+```bash
+sudo jarvis-pi update
+jarvis-pi status
+jarvis-pi logs
+jarvis-pi doctor
+```
+
+`update` refreshes the runtime from the configured public repository/ref, syncs
+intercom dependencies, reloads systemd, and restarts the intercom service.
+`doctor` prints the configured brain/device, service state, microphone/speaker
+enumeration, and camera listing when `libcamera-hello` is available.
+
 See `docs/DEPLOYMENT.md` for the product install flow.
 
 ## Notes

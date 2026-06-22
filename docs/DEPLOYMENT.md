@@ -120,7 +120,9 @@ The Pi installer should:
 
 - install OS packages for audio, Python runtime support, and systemd service use
 - install the `jarvis` intercom runtime
-- detect microphone, speaker, and optional camera
+- install a `jarvis-pi` helper for update, restart, status, logs, and hardware
+  readiness checks
+- detect microphone, speaker, and optional camera with `jarvis-pi doctor`
 - ask for the brain hostname or discover it on the Twingate/private network
 - show a pairing code on the screen
 - install `jarvis-intercom.service`
@@ -175,12 +177,13 @@ brew upgrade --cask jarvis-app
 Pi runtime:
 
 ```bash
-jarvis-pi update
-systemctl restart jarvis-intercom
+sudo jarvis-pi update
 ```
 
-Until the Pi package exists, the installer should provide an update command that
-refreshes the installed runtime and restarts the service.
+The Pi installer writes `/usr/local/bin/jarvis-pi`; `update` refreshes the
+installed runtime, syncs intercom dependencies, reloads systemd, and restarts
+`jarvis-intercom.service`. `jarvis-pi doctor` prints basic service, audio, and
+camera readiness.
 
 ## Acceptance Gates
 
