@@ -1,0 +1,40 @@
+name: Public readiness
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject tracked runtime/private files
+        run: |
+          set -euo pipefail
+          blocked="$(
+            git ls-files \
+              | grep -E '(^|/)(\.env$|jarvis-workspace/\.mcp-auth/|jarvis-workspace/browser/|jarvis-workspace/users/|jarvis-workspace/worker/jobs/|jarvis-workspace/worker/runs/|\.jsonl$|\.sqlite$|\.db$)' \
+              || true
+          )"
+          if [[ -n "$blocked" ]]; then
+            echo "Tracked files are not public-safe:"
+            echo "$blocked"
+            exit 1
+          fi
+      - name: Broad secret-pattern review
+        run: |
+          set -euo pipefail
+          hits="$(
+            git ls-files \
+              | xargs grep -IlE '(api[_-]?key|secret|token|password|authorization: bearer|sk-[A-Za-z0-9]|ghp_|github_pat_|BEGIN (RSA|OPENSSH|PRIVATE) KEY)' \
+              || true
+          )"
+          echo "$hits" > public-readiness-hits.txt
+          cat public-readiness-hits.txt
+          if grep -E '(^|/)(\.env$|jarvis-workspace/\.mcp-auth/|jarvis-workspace/users/|jarvis-workspace/browser/)' public-readiness-hits.txt; then
+            echo "Secret-pattern hit in blocked runtime/private path."
+            exit 1
+          fi

@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Jarvis Deployment</title>
+    <meta name="description" content="Install and operate Jarvis across Macs and Raspberry Pi intercoms.">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#top" aria-label="Jarvis deployment home">
+        <span class="mark"></span>
+        <span>Jarvis</span>
+      </a>
+      <nav aria-label="Primary navigation">
+        <a href="#install">Install</a>
+        <a href="#fleet">Fleet</a>
+        <a href="#security">Security</a>
+        <a href="#updates">Updates</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Private assistant fleet</p>
+          <h1>Install Jarvis like an appliance.</h1>
+          <p class="lede">
+            A guided deployment path for one brain Mac, worker Macs, laptop
+            intercoms, and Raspberry Pi room devices.
+          </p>
+          <div class="actions">
+            <a class="button primary" href="#install">Start install</a>
+            <a class="button" href="https://github.com/roughcoder/jarvis">View GitHub</a>
+          </div>
+        </div>
+
+        <div class="fleet-visual" aria-label="Jarvis fleet topology">
+          <div class="node brain">
+            <span>iMac</span>
+            <strong>Brain + Worker</strong>
+          </div>
+          <div class="node laptop one">
+            <span>MacBook</span>
+            <strong>Intercom + Worker</strong>
+          </div>
+          <div class="node laptop two">
+            <span>MacBook</span>
+            <strong>Intercom + Worker</strong>
+          </div>
+          <div class="node pi">
+            <span>Room Pi</span>
+            <strong>Intercom</strong>
+          </div>
+          <div class="link l1"></div>
+          <div class="link l2"></div>
+          <div class="link l3"></div>
+          <div class="network-label">private network</div>
+        </div>
+      </section>
+
+      <section id="install" class="band install">
+        <div class="section-heading">
+          <p class="eyebrow">No clone required</p>
+          <h2>One install surface for each device.</h2>
+        </div>
+        <div class="install-grid">
+          <article>
+            <p class="step">01</p>
+            <h3>Install runtime</h3>
+            <code>brew install --HEAD jarvis</code>
+          </article>
+          <article>
+            <p class="step">02</p>
+            <h3>Install app</h3>
+            <code>brew install --cask jarvis-app</code>
+          </article>
+          <article>
+            <p class="step">03</p>
+            <h3>Choose roles</h3>
+            <code>jarvis service install brain worker</code>
+          </article>
+          <article>
+            <p class="step">04</p>
+            <h3>Pair devices</h3>
+            <code>jarvis pair kitchen-pi --json</code>
+          </article>
+        </div>
+      </section>
+
+      <section id="fleet" class="fleet">
+        <div class="section-heading">
+          <p class="eyebrow">Fleet roles</p>
+          <h2>Every machine has a narrow job.</h2>
+        </div>
+        <div class="role-table">
+          <div class="row head"><span>Device</span><span>Roles</span><span>Supervisor</span></div>
+          <div class="row"><span>iMac</span><span>Brain, worker, Docker services</span><span>launchd</span></div>
+          <div class="row"><span>Mac laptop</span><span>Intercom, worker</span><span>launchd</span></div>
+          <div class="row"><span>Raspberry Pi</span><span>Room intercom</span><span>systemd</span></div>
+        </div>
+      </section>
+
+      <section id="security" class="band security">
+        <div class="section-heading">
+          <p class="eyebrow">Public-ready</p>
+          <h2>Secrets stay local. Devices ask to join.</h2>
+        </div>
+        <div class="security-grid">
+          <p>Per-device tokens are bound to device ids.</p>
+          <p>Browser profiles, OAuth caches, user files, and worker jobs are ignored.</p>
+          <p>Repos only go public after the release scan passes.</p>
+        </div>
+      </section>
+
+      <section id="updates" class="updates">
+        <div class="section-heading">
+          <p class="eyebrow">Updates</p>
+          <h2>Brew owns the runtime. The app owns the experience.</h2>
+        </div>
+        <div class="terminal">
+          <span>brew update</span>
+          <span>brew upgrade jarvis</span>
+          <span>brew upgrade --cask jarvis-app</span>
+          <span>jarvis service restart brain</span>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

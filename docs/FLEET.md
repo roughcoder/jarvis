@@ -121,6 +121,19 @@ jarvis fleet-status --json
 The exact `jarvis service ...` commands are the intended interface for the
 formula/bootstrapper. Until they exist, use the launchd templates below directly.
 
+The service command surface now exists for packaged installers:
+
+```bash
+jarvis service install brain
+jarvis service install worker
+jarvis service install intercom
+jarvis service start brain
+jarvis service restart worker
+jarvis service status intercom
+```
+
+Use `jarvis service print <role>` for dry-run inspection and CI validation.
+
 ## Status Contract
 
 The Swift app should poll:

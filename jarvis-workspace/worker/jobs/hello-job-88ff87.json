@@ -1,1 +1,0 @@
-{"id": "88ff875c69c6", "action": "code", "label": "hello-job", "name": "hello-job", "cwd": "jarvis-workspace/worker/runs/hello-job-805e2a", "branch": null, "repo": "", "status": "done", "output": "exec hello-job", "session_id": null, "started": 1781476416.5, "ended": 1781476416.5}

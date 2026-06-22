@@ -21,23 +21,29 @@ Run the brain: `uv run jarvis brain`.
 
 ## On the Pi
 ```bash
-uv sync --extra stt --extra vad --extra wake   # thin edge: no gateway/tts/memory keys
-cp .env.example .env
-# point it at the brain and identify as the room device:
-#   INTERCOM_BRAIN_HOST=<brain-host>     (Tailscale name in Phase 2)
-#   INTERCOM_TOKEN=pick-a-long-secret    (must match this device's BRAIN_DEVICES token)
-#   CAPS_DEVICE_ID=room-pi               (selects profiles/room-pi.md on the brain)
-uv run jarvis status      # brain reachable? what am I allowed to do?
-uv run jarvis run         # become an intercom
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_pi.sh \
+  -o /tmp/install_jarvis_pi.sh
+sudo JARVIS_BRAIN_HOST=imac.private \
+  JARVIS_INTERCOM_TOKEN=pick-a-long-secret \
+  JARVIS_DEVICE_ID=room-pi \
+  bash /tmp/install_jarvis_pi.sh
+
+jarvis service print intercom --platform systemd
+jarvis service install intercom
+jarvis service start intercom
 ```
 
-To run it as a service, use `deploy/systemd/jarvis-intercom.service.template`
-and the install steps in `docs/FLEET.md`.
+The current development fallback is still `uv sync --extra stt --extra vad
+--extra wake` followed by `uv run jarvis run`, but the deployment target is a Pi
+installer or image that hides `uv`, writes local config, pairs the device, and
+installs the systemd unit.
+
+See `docs/DEPLOYMENT.md` for the product install flow.
 
 ## Notes
 - The token is **bound to its device_id**: a leaked Pi token can't impersonate your
   Mac (`authorise_device` rejects a token used from the wrong device).
 - Phase 2 relocation is just changing `INTERCOM_BRAIN_HOST` (+ the brain's
-  `MEMORY_HOST`) to Tailscale hostnames — no code changes.
+  `MEMORY_HOST`) to private-network hostnames — no code changes.
 - A personal device instead pins its owner: `{"token":"…","device_id":"local-mac","identity":"neil"}`,
   or bind the device under `users/neil.md` (`devices: [local-mac]`).

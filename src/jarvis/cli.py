@@ -849,6 +849,69 @@ def _cmd_traces(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_service(args: argparse.Namespace) -> int:
+    """Install and control Jarvis services without exposing launchd/systemd internals."""
+    from jarvis.deploy import control_service, install_service, render_service, role_extras
+
+    if args.service_action == "extras":
+        print(" ".join(role_extras(set(args.roles))))
+        return 0
+
+    if args.service_action in {"print", "install"}:
+        rc = 0
+        for role in args.roles:
+            if args.service_action == "print":
+                print(
+                    render_service(
+                        role,
+                        platform_name=args.platform,
+                        jarvis_bin=args.jarvis_bin,
+                        workdir=args.workdir,
+                        log_dir=args.log_dir,
+                    )
+                )
+                continue
+            dest, text = install_service(
+                role,
+                platform_name=args.platform,
+                jarvis_bin=args.jarvis_bin,
+                workdir=args.workdir,
+                log_dir=args.log_dir,
+                destination=args.destination,
+                dry_run=args.dry_run,
+            )
+            if args.dry_run:
+                print(text)
+                print(f"# would write {dest}")
+            else:
+                print(f"installed {role} service: {dest}")
+        return rc
+
+    result = control_service(args.roles[0], args.service_action, platform_name=args.platform)
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    return result.returncode
+
+
+def _cmd_pair(args: argparse.Namespace) -> int:
+    """Pairing helpers for fleet onboarding."""
+    from jarvis.deploy import issue_pairing_entry
+
+    token, fragment = issue_pairing_entry(args.device_id, identity=args.identity or "")
+    if args.json:
+        import json
+
+        print(json.dumps({"token": token, "brain_devices_entry": fragment}, indent=2))
+    else:
+        print(f"Device: {args.device_id}")
+        print(f"Token:  {token}")
+        print("\nAdd this object to BRAIN_DEVICES on the brain:")
+        print(fragment)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="jarvis", description="Jarvis voice assistant")
     parser.add_argument("--version", action="version", version=f"jarvis {__version__}")
@@ -965,6 +1028,32 @@ def build_parser() -> argparse.ArgumentParser:
     p_traces = sub.add_parser("traces", help="View recent per-turn pipeline traces")
     p_traces.add_argument("-n", type=int, default=20, help="How many recent traces")
     p_traces.set_defaults(func=_cmd_traces)
+
+    p_service = sub.add_parser("service", help="Install/control Jarvis launchd/systemd services")
+    p_service.add_argument(
+        "service_action",
+        choices=["install", "print", "start", "stop", "restart", "status", "extras"],
+        help="install/print render service files; start/stop/restart/status controls one role; extras prints uv extras for roles",
+    )
+    p_service.add_argument(
+        "roles",
+        nargs="+",
+        choices=["brain", "intercom", "worker"],
+        help="Role(s). Control actions accept exactly one role.",
+    )
+    p_service.add_argument("--platform", choices=["launchd", "systemd"], help="Override platform detection")
+    p_service.add_argument("--jarvis-bin", help="Jarvis executable path for generated service files")
+    p_service.add_argument("--workdir", help="Working directory for generated service files")
+    p_service.add_argument("--log-dir", help="Log directory for generated service files")
+    p_service.add_argument("--destination", help="Write service file here instead of the platform default")
+    p_service.add_argument("--dry-run", action="store_true", help="Print install output without writing files")
+    p_service.set_defaults(func=_cmd_service)
+
+    p_pair = sub.add_parser("pair", help="Issue a per-device pairing token entry")
+    p_pair.add_argument("device_id", help="Device id, e.g. imac-brain, kitchen-pi, neil-laptop")
+    p_pair.add_argument("--identity", default="", help="Optional pinned identity for a personal device")
+    p_pair.add_argument("--json", action="store_true", help="Print machine-readable token + BRAIN_DEVICES entry")
+    p_pair.set_defaults(func=_cmd_pair)
 
     return parser
 

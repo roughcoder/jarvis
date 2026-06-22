@@ -96,9 +96,21 @@ Per-step extras install as each build step is reached, e.g.
 
 - **[AGENTS.md](AGENTS.md)** — architecture, hard constraints, conventions,
   gotchas, invariants (read first; `CLAUDE.md` imports it).
+- **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** — install-first deployment path
+  for the iMac brain, Mac workers/intercoms, Raspberry Pi intercoms, Homebrew,
+  pairing, and updates.
+- **[docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md)** — public repository
+  readiness gates and required scans.
 - **[docs/PHASE2.md](docs/PHASE2.md)** — the Frankfurt migration spec; the
   readiness test is its entry gate.
 - **[docs/FLEET.md](docs/FLEET.md)** — Mac mini / laptop / Pi service deployment,
   status contract, and update shape.
 - **[docs/SWIFT_TOOLBAR_SPEC.md](docs/SWIFT_TOOLBAR_SPEC.md)** — handoff spec for
   the separate native macOS menu bar app.
+
+## Deployment Direction
+
+Development uses `uv` directly. Fleet deployment should not require cloning this
+repo or understanding `uv`: install the `jarvis` runtime package, install the
+`jarvis-app` native app, choose roles in the app, pair devices, and let Homebrew
+own runtime/app updates.

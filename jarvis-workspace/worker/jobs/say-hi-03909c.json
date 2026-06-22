@@ -1,1 +1,0 @@
-{"id": "03909c9579af", "action": "code", "label": "say hi", "name": "say-hi", "cwd": "jarvis-workspace/worker/runs/say-hi-229a29", "branch": null, "repo": "", "status": "done", "output": "exec say hi", "session_id": null, "started": 1781475114.9, "ended": 1781475114.9}
