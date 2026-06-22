@@ -66,6 +66,15 @@ installs or upgrades `jarvis`, installs or upgrades `jarvis-app`, clears app
 quarantine while the app is ad-hoc signed, and opens Jarvis. The Setup window
 then owns role choice, local service installation, and pairing.
 
+The bootstrap uses the stable runtime formula by default. Development HEAD
+fallback is opt-in only:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh \
+  -o /tmp/install_jarvis_mac.sh
+JARVIS_ALLOW_HEAD_FALLBACK=1 bash /tmp/install_jarvis_mac.sh
+```
+
 Preview the command sequence without changing a Mac:
 
 ```bash

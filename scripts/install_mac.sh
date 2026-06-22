@@ -17,6 +17,7 @@ Environment:
   JARVIS_START_SERVICES=0                   Start optional roles after install.
   JARVIS_OPEN_APP=1                         Open Jarvis.app after install.
   JARVIS_INSTALL_HOMEBREW=1                 Install Homebrew when missing.
+  JARVIS_ALLOW_HEAD_FALLBACK=0              Fall back to formula HEAD on runtime install failure.
   JARVIS_BREW_PATH=/opt/homebrew/bin/brew   Override brew path.
   JARVIS_DRY_RUN=0                          Print commands instead of running.
   JARVIS_ASSUME_MAC=0                       Skip uname check for tests.
@@ -47,6 +48,7 @@ ROLES="${JARVIS_ROLES:-}"
 START_SERVICES="${JARVIS_START_SERVICES:-0}"
 OPEN_APP="${JARVIS_OPEN_APP:-1}"
 INSTALL_HOMEBREW="${JARVIS_INSTALL_HOMEBREW:-1}"
+ALLOW_HEAD_FALLBACK="${JARVIS_ALLOW_HEAD_FALLBACK:-0}"
 DRY_RUN="${JARVIS_DRY_RUN:-0}"
 DRY_RUN_RUNTIME_INSTALLED="${JARVIS_DRY_RUN_RUNTIME_INSTALLED:-0}"
 DRY_RUN_APP_INSTALLED="${JARVIS_DRY_RUN_APP_INSTALLED:-0}"
@@ -110,15 +112,31 @@ if [[ "$DRY_RUN" == "1" ]]; then
   run "$BREW_PATH" list --formula "$RUNTIME_FORMULA"
   if [[ "$DRY_RUN_RUNTIME_INSTALLED" == "1" ]]; then
     run "$BREW_PATH" upgrade "$RUNTIME_FORMULA"
-    run "$BREW_PATH" upgrade --fetch-HEAD "$RUNTIME_FORMULA"
+    if [[ "$ALLOW_HEAD_FALLBACK" == "1" ]]; then
+      run "$BREW_PATH" upgrade --fetch-HEAD "$RUNTIME_FORMULA"
+    fi
   else
     run "$BREW_PATH" install "$RUNTIME_FORMULA"
-    run "$BREW_PATH" install --HEAD "$RUNTIME_FORMULA"
+    if [[ "$ALLOW_HEAD_FALLBACK" == "1" ]]; then
+      run "$BREW_PATH" install --HEAD "$RUNTIME_FORMULA"
+    fi
   fi
 elif "$BREW_PATH" list --formula "$RUNTIME_FORMULA" >/dev/null 2>&1; then
-  "$BREW_PATH" upgrade "$RUNTIME_FORMULA" || "$BREW_PATH" upgrade --fetch-HEAD "$RUNTIME_FORMULA" || true
+  if ! "$BREW_PATH" upgrade "$RUNTIME_FORMULA"; then
+    if [[ "$ALLOW_HEAD_FALLBACK" == "1" ]]; then
+      "$BREW_PATH" upgrade --fetch-HEAD "$RUNTIME_FORMULA" || true
+    else
+      exit 1
+    fi
+  fi
 else
-  "$BREW_PATH" install "$RUNTIME_FORMULA" || "$BREW_PATH" install --HEAD "$RUNTIME_FORMULA"
+  if ! "$BREW_PATH" install "$RUNTIME_FORMULA"; then
+    if [[ "$ALLOW_HEAD_FALLBACK" == "1" ]]; then
+      "$BREW_PATH" install --HEAD "$RUNTIME_FORMULA"
+    else
+      exit 1
+    fi
+  fi
 fi
 
 echo "Installing Jarvis app"

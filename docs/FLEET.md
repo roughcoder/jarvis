@@ -88,6 +88,10 @@ Reserve `jarvis-app` for the native Mac desktop/menu bar app from
 The tap can still add narrower packages later, such as `jarvis-cli`,
 `jarvis-worker`, or `jarvis-agent`, if the runtime needs to split.
 
+The public Mac bootstrap installs stable formula/cask releases by default.
+Formula HEAD fallback is reserved for development and must be explicitly enabled
+with `JARVIS_ALLOW_HEAD_FALLBACK=1`.
+
 Homebrew should own:
 
 - the `jarvis` command or launcher
