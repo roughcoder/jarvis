@@ -67,6 +67,12 @@ installs or upgrades `jarvis`, installs or upgrades `jarvis-app`, clears app
 quarantine while the app is ad-hoc signed, and opens Jarvis. The Setup window
 then owns role choice, local service installation, and pairing.
 
+Preview the command sequence without changing a Mac:
+
+```bash
+JARVIS_DRY_RUN=1 bash scripts/install_mac.sh
+```
+
 For scripted provisioning, roles can be installed during bootstrap:
 
 ```bash

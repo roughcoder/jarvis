@@ -121,6 +121,12 @@ Fresh Mac install:
 curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
 ```
 
+Preview the bootstrap without changing the machine:
+
+```bash
+JARVIS_DRY_RUN=1 bash scripts/install_mac.sh
+```
+
 ## Runtime Release
 
 Preferred release path: run the `Release` workflow in GitHub Actions with:

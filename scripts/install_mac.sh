@@ -17,10 +17,16 @@ Environment:
   JARVIS_START_SERVICES=0                   Start optional roles after install.
   JARVIS_OPEN_APP=1                         Open Jarvis.app after install.
   JARVIS_INSTALL_HOMEBREW=1                 Install Homebrew when missing.
+  JARVIS_BREW_PATH=/opt/homebrew/bin/brew   Override brew path.
+  JARVIS_DRY_RUN=0                          Print commands instead of running.
+  JARVIS_ASSUME_MAC=0                       Skip uname check for tests.
+  JARVIS_DRY_RUN_RUNTIME_INSTALLED=0        Dry-run runtime install state.
+  JARVIS_DRY_RUN_APP_INSTALLED=0            Dry-run app install state.
 
 Examples:
   curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
   JARVIS_ROLES="intercom worker" JARVIS_START_SERVICES=1 bash install_mac.sh
+  JARVIS_DRY_RUN=1 bash install_mac.sh
 USAGE
 }
 
@@ -29,7 +35,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-if [[ "$(uname -s)" != "Darwin" ]]; then
+if [[ "${JARVIS_ASSUME_MAC:-0}" != "1" && "$(uname -s)" != "Darwin" ]]; then
   echo "install_mac.sh only supports macOS." >&2
   exit 1
 fi
@@ -41,8 +47,25 @@ ROLES="${JARVIS_ROLES:-}"
 START_SERVICES="${JARVIS_START_SERVICES:-0}"
 OPEN_APP="${JARVIS_OPEN_APP:-1}"
 INSTALL_HOMEBREW="${JARVIS_INSTALL_HOMEBREW:-1}"
+DRY_RUN="${JARVIS_DRY_RUN:-0}"
+DRY_RUN_RUNTIME_INSTALLED="${JARVIS_DRY_RUN_RUNTIME_INSTALLED:-0}"
+DRY_RUN_APP_INSTALLED="${JARVIS_DRY_RUN_APP_INSTALLED:-0}"
+
+run() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '+'
+    printf ' %q' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
+}
 
 find_brew() {
+  if [[ -n "${JARVIS_BREW_PATH:-}" ]]; then
+    echo "$JARVIS_BREW_PATH"
+    return 0
+  fi
   if command -v brew >/dev/null 2>&1; then
     command -v brew
     return 0
@@ -62,28 +85,51 @@ if ! BREW_PATH="$(find_brew)"; then
     exit 1
   fi
   echo "Installing Homebrew"
-  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-  BREW_PATH="$(find_brew)"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    run /bin/bash -c "<homebrew install script>"
+    BREW_PATH="${JARVIS_BREW_PATH:-/opt/homebrew/bin/brew}"
+  else
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    BREW_PATH="$(find_brew)"
+  fi
 fi
 
-eval "$("$BREW_PATH" shellenv)"
-BREW_PATH="$(command -v brew)"
+if [[ "$DRY_RUN" != "1" ]]; then
+  eval "$("$BREW_PATH" shellenv)"
+  BREW_PATH="$(command -v brew)"
+fi
 
 echo "Updating Homebrew metadata"
-"$BREW_PATH" update
+run "$BREW_PATH" update
 
 echo "Tapping $TAP"
-"$BREW_PATH" tap "$TAP"
+run "$BREW_PATH" tap "$TAP"
 
 echo "Installing Jarvis runtime"
-if "$BREW_PATH" list --formula "$RUNTIME_FORMULA" >/dev/null 2>&1; then
-  "$BREW_PATH" upgrade "$RUNTIME_FORMULA" || "$BREW_PATH" upgrade --fetch-HEAD "$RUNTIME_FORMULA" || true
+if [[ "$DRY_RUN" == "1" ]]; then
+  run "$BREW_PATH" list --formula "$RUNTIME_FORMULA"
+  if [[ "$DRY_RUN_RUNTIME_INSTALLED" == "1" ]]; then
+    run "$BREW_PATH" upgrade --fetch-HEAD "$RUNTIME_FORMULA"
+    run "$BREW_PATH" upgrade "$RUNTIME_FORMULA"
+  else
+    run "$BREW_PATH" install "$RUNTIME_FORMULA"
+    run "$BREW_PATH" install --HEAD "$RUNTIME_FORMULA"
+  fi
+elif "$BREW_PATH" list --formula "$RUNTIME_FORMULA" >/dev/null 2>&1; then
+  "$BREW_PATH" upgrade --fetch-HEAD "$RUNTIME_FORMULA" || "$BREW_PATH" upgrade "$RUNTIME_FORMULA" || true
 else
   "$BREW_PATH" install "$RUNTIME_FORMULA" || "$BREW_PATH" install --HEAD "$RUNTIME_FORMULA"
 fi
 
 echo "Installing Jarvis app"
-if "$BREW_PATH" list --cask "$APP_CASK" >/dev/null 2>&1; then
+if [[ "$DRY_RUN" == "1" ]]; then
+  run "$BREW_PATH" list --cask "$APP_CASK"
+  if [[ "$DRY_RUN_APP_INSTALLED" == "1" ]]; then
+    run "$BREW_PATH" upgrade --cask "$APP_CASK"
+  else
+    run "$BREW_PATH" install --cask "$APP_CASK"
+  fi
+elif "$BREW_PATH" list --cask "$APP_CASK" >/dev/null 2>&1; then
   "$BREW_PATH" upgrade --cask "$APP_CASK" || true
 else
   "$BREW_PATH" install --cask "$APP_CASK"
@@ -98,16 +144,21 @@ fi
 if [[ -n "$ROLES" ]]; then
   echo "Installing Jarvis services: $ROLES"
   for role in $ROLES; do
-    jarvis service install "$role"
+    run jarvis service install "$role"
     if [[ "$START_SERVICES" == "1" ]]; then
-      jarvis service start "$role" || jarvis service restart "$role"
+      if [[ "$DRY_RUN" == "1" ]]; then
+        run jarvis service start "$role"
+        run jarvis service restart "$role"
+      else
+        jarvis service start "$role" || jarvis service restart "$role"
+      fi
     fi
   done
 fi
 
 if [[ "$OPEN_APP" == "1" ]]; then
   echo "Opening Jarvis"
-  /usr/bin/open -a Jarvis || true
+  run /usr/bin/open -a Jarvis || true
 fi
 
 cat <<NEXT
@@ -126,4 +177,3 @@ Update later with:
   brew upgrade $RUNTIME_FORMULA
   brew upgrade --cask $APP_CASK
 NEXT
-
