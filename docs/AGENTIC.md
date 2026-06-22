@@ -375,8 +375,43 @@ escalation. This is the gap the inner-loop section above describes. **Gap:** the
 gate + its predicate + the bound/escalation policy. **Open:** what defines
 "accepted actionable" (model judgement vs rules)? Where do acceptance criteria
 come from — the work item (P6), or inferred? Is the reviewer in the gate the same
-ensemble as P3, or a cheaper dedicated checker? Tests: discovered (`make test`,
-CI config) or declared per repo?
+ensemble as P3, or a cheaper dedicated checker?
+
+### P13 · Acceptance harness — *exercise the real app* ❌ — the evidence the gate judges
+Role: stage 5/6 (feeds P12). Where P12 *decides*, P13 *gathers the evidence by
+driving the actual application*. It is a **family of harnesses chosen by app-type ×
+the target's capability profile (P2)** — the floor is unit tests; the bar is the
+running app observably doing the new thing.
+
+```python
+class Harness(Protocol):
+    requires: set[str]             # capabilities the target must have (P2)
+    async def exercise(self, ws, scenario) -> Evidence: ...
+    # Evidence = logs + screenshots/UI-snapshot + HTTP responses + exit codes
+
+HARNESSES = {
+  "webapp":  BrowserHarness,   # boot + drive in a browser; assert DOM/console/shots
+  "ios":     SimulatorHarness, # build+run on a simulator; UI snapshot / XCUITest
+  "service": ServiceHarness,   # boot the service; hit endpoints; assert responses
+  "cli":     ProcessHarness,   # run commands; assert stdout/exit
+  "library": TestHarness,      # unit/integration only (no app to drive)
+}
+# selection: detect app-type from the repo, then pick the harness whose
+# `requires` ⊆ target.capabilities — else the work can't be verified *here*.
+```
+
+Today: the **actuators largely exist or are reachable** — the browser lane
+(`browser/`, CDP/nodriver) can drive a webapp; `control_mac`/peekaboo can drive any
+Mac GUI; the worker shell can boot a service and curl it; Apple-platform
+build/run/UI-snapshot tooling is reachable on a Mac target. **What's missing is the
+concept layer:** app-type detection, the harness selection by capability, the
+`Evidence` contract, and wiring evidence into the gate. **Open:** how is app-type
+detected (manifest sniff — `package.json`/`*.xcodeproj`/`Cargo.toml` — vs declared
+in repo config)? For a *UI* change, what is "observably works" — a golden-screenshot
+diff, a model-judged visual check, or an assertion script? Who writes the
+exercise scenario — inferred from the work item, or a stored per-repo smoke script?
+When no reachable target can run the harness, is "unverifiable here" a hard stop or
+a route-elsewhere?
 
 ---
 
@@ -394,18 +429,24 @@ P1 Engine ──┬─> P3 Ensemble        (panel = many engines)
 P2 Target ──┬─> P4 Workspace       (isolate on the chosen target)
             └─> P8 Recipe          (a recipe picks a target)
 P4 Workspace ─> P5 Forge           (land from the worktree)
+P2 Target ──(capability profile)──> P3 Plan routing  (match work to a machine)
+                                └──> P13 Harness      (what can be exercised here)
 P6 Work item ─> P12 Verify         (acceptance criteria come from the item)
 P3 Ensemble ──> P12 Verify         (the review in the gate can be an ensemble)
+P13 Harness ──> P12 Verify         (evidence: app exercised → the gate judges it)
 P12 Verify ───> P8 Recipe          (recipe loops on the verdict: done vs iterate)
-P1+P2+P5+P6 ──> P8 Recipe ──> the inner loop (P12) ──> the cycle ──> P7 Async ──> P8 (iterate)
+P1+P2+P5+P6 ──> P8 Recipe ──> the inner loop (P12←P13) ──> the cycle ──> P7 Async ──> P8 (iterate)
 P11 observes everything; P10 reports it.
 ```
 
-Foundations everything rides on: **P1 Engine** and **P2 Target**. The
-differentiator: **P3 Ensemble** (needs P1). The trust-maker: **P12 Verification
-gate** (the inner loop OpenClaw nails — needs P3+P6+P8). The domain reach:
-**P5 Forge** + **P6 Work item**. Jarvis already owns P4, P7, P9, P10 and most of
-P11 — the expensive, boring half.
+Foundations everything rides on: **P1 Engine** and **P2 Target** (now carrying a
+*capability profile*, so routing and verification both depend on what a machine
+can do). The differentiator: **P3 Ensemble** (needs P1). The trust-makers: **P12
+Verification gate** + **P13 Acceptance harness** — the inner loop OpenClaw nails,
+deepened so it exercises the *real app* (needs P2's profile, P3, P6, P8). The
+domain reach: **P5 Forge** + **P6 Work item**. Jarvis already owns P4, P7, P9, P10
+and most of P11 — and *already has the harness actuators* (browser lane, GUI
+control) — the expensive, boring half.
 
 ---
 
@@ -428,6 +469,17 @@ P11 — the expensive, boring half.
   small declarative recipe schema sits between.
 - **One job model.** Today there are two (brain `BackgroundRunner`, worker
   `JobManager`). A cross-target cycle wants one job identity that spans them.
+- **Verification depth vs reach.** The deepest gate (boot + drive the real app)
+  is also the most capability-hungry, so it's only available where the machine can
+  run that app-type. A change might be *buildable* on one target but only
+  *verifiable* on another (e.g. CI builds anywhere, but the iOS UI check needs a
+  Mac with a simulator). Options: refuse to land unverified, land with a
+  "verified: build-only" caveat, or split execute-here / verify-there across two
+  targets. This is the practical edge of "the skills of the machine matter".
+- **Who writes the exercise scenario.** Driving the app needs *what to do* — a
+  login flow, a tap sequence, an endpoint to hit. Inferred from the work item each
+  run (flexible, flaky) vs a stored per-repo smoke script (stable, maintenance).
+  Probably both: a stored script when present, inference to bootstrap one.
 
 ---
 
@@ -444,7 +496,12 @@ P11 — the expensive, boring half.
   target registry idea on our existing HTTP boundary.
 - **Ours alone:** **P3 Ensemble** — first-class multi-engine fan-out and
   synthesis ("Opus *and* GPT-5.5, combine") — which neither has, and which sits
-  naturally on the LiteLLM gateway Jarvis already routes through.
+  naturally on the LiteLLM gateway Jarvis already routes through. And **P13
+  Acceptance harness** — verification that *exercises the running app* (browser
+  for a webapp, simulator for Swift, boot-and-probe for a service), selected by
+  app-type × the target's capability profile. OpenClaw's loop stops at
+  test/review; ours closes the feedback loop on the real app, gated by the skills
+  of the machine the code lands on.
 
 ---
 
@@ -462,5 +519,11 @@ P11 — the expensive, boring half.
       checker; tests discovered vs declared? (P12)
 - [ ] Inner-loop bound: max_iterations + cost/wall-clock budget values, and the
       escalation message shape when the bound is hit? (P12/P8)
+- [ ] Target capability profile: probed vs declared; how fresh; what's in the
+      vocabulary (toolchains, devices, credentials, resources)? (P2)
+- [ ] Acceptance harness: how is app-type detected; what is "observably works"
+      for a UI change (golden-shot / model-judged / scripted); stored smoke
+      script vs inferred scenario? (P13)
+- [ ] Verification depth vs reach: when a target can build but not exercise an
+      app-type, refuse / caveat / execute-here-verify-there? (P2/P12/P13)
 - [ ] Is the 10-stage cycle the right cut, or are stages missing/merged?
-```
