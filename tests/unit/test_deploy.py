@@ -5,6 +5,7 @@ import json
 import pytest
 
 from jarvis.deploy import (
+    current_release_ref,
     issue_pairing_entry,
     render_pi_installer_command,
     render_service,
@@ -96,6 +97,22 @@ def test_render_pi_installer_command_quotes_pairing_values() -> None:
     assert "sudo JARVIS_BRAIN_HOST=imac.private JARVIS_BRAIN_PORT=8701" in command
     assert "JARVIS_INTERCOM_TOKEN='tok en'" in command
     assert "JARVIS_DEVICE_ID='kitchen pi'" in command
+
+
+def test_render_pi_installer_command_defaults_to_current_release_ref() -> None:
+    command = render_pi_installer_command(
+        device_id="kitchen-pi",
+        token="token",
+        brain_host="imac.private",
+    )
+
+    release_ref = current_release_ref()
+    assert (
+        f"https://raw.githubusercontent.com/roughcoder/jarvis/{release_ref}/scripts/install_pi.sh"
+        in command
+    )
+    assert f"JARVIS_REF={release_ref}" in command
+    assert "JARVIS_REF=main" not in command
 
 
 def test_render_pi_installer_command_requires_brain_host() -> None:

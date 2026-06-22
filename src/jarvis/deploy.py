@@ -18,6 +18,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from jarvis import __version__
+
 
 ROLES = ("brain", "intercom", "worker")
 ROLE_COMMANDS = {
@@ -63,6 +65,11 @@ def issue_pairing_entry(device_id: str, *, identity: str = "") -> tuple[str, str
     return token, json.dumps(entry, separators=(",", ":"))
 
 
+def current_release_ref() -> str:
+    """Return the runtime release tag that matches this installed package."""
+    return f"v{__version__}"
+
+
 def render_pi_installer_command(
     *,
     device_id: str,
@@ -70,19 +77,20 @@ def render_pi_installer_command(
     brain_host: str,
     brain_port: str = "8700",
     repo: str = "roughcoder/jarvis",
-    ref: str = "main",
+    ref: str | None = None,
 ) -> str:
     """Return copy/paste commands for installing a paired Raspberry Pi intercom."""
     if not brain_host:
         raise ValueError("brain_host is required")
 
+    runtime_ref = ref or current_release_ref()
     assignments = {
         "JARVIS_BRAIN_HOST": brain_host,
         "JARVIS_BRAIN_PORT": brain_port,
         "JARVIS_INTERCOM_TOKEN": token,
         "JARVIS_DEVICE_ID": device_id,
         "JARVIS_REPO": repo,
-        "JARVIS_REF": ref,
+        "JARVIS_REF": runtime_ref,
     }
     env = " ".join(
         f"{key}={shlex.quote(value)}" for key, value in assignments.items() if value
@@ -90,7 +98,7 @@ def render_pi_installer_command(
     return "\n".join(
         [
             "curl -fsSL https://raw.githubusercontent.com/"
-            f"{shlex.quote(repo)}/{shlex.quote(ref)}/scripts/install_pi.sh "
+            f"{shlex.quote(repo)}/{shlex.quote(runtime_ref)}/scripts/install_pi.sh "
             "-o /tmp/install_jarvis_pi.sh",
             f"sudo {env} bash /tmp/install_jarvis_pi.sh",
         ]

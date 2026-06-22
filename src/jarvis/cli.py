@@ -1262,7 +1262,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Runtime repository for --pi-installer",
     )
     p_pair.add_argument(
-        "--ref", default="main", help="Runtime branch/tag/ref for --pi-installer"
+        "--ref",
+        default=None,
+        help="Runtime branch/tag/ref for --pi-installer; defaults to this jarvis release tag",
     )
     p_pair.set_defaults(func=_cmd_pair)
 

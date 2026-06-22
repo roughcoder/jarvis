@@ -1,6 +1,7 @@
 import json
 
 from jarvis.cli import main
+from jarvis.deploy import current_release_ref
 
 
 def test_pair_json_can_include_pi_installer_command(capsys) -> None:
@@ -33,6 +34,32 @@ def test_pair_json_can_include_pi_installer_command(capsys) -> None:
         f"JARVIS_INTERCOM_TOKEN={payload['token']}" in payload["pi_installer_command"]
     )
     assert "JARVIS_DEVICE_ID=kitchen-pi" in payload["pi_installer_command"]
+
+
+def test_pair_json_pi_installer_defaults_to_current_release_ref(capsys) -> None:
+    code = main(
+        [
+            "pair",
+            "kitchen-pi",
+            "--json",
+            "--pi-installer",
+            "--brain-host",
+            "imac.private",
+        ]
+    )
+
+    output = capsys.readouterr()
+    payload = json.loads(output.out)
+    release_ref = current_release_ref()
+
+    assert code == 0
+    assert output.err == ""
+    assert (
+        f"https://raw.githubusercontent.com/roughcoder/jarvis/{release_ref}/scripts/install_pi.sh"
+        in payload["pi_installer_command"]
+    )
+    assert f"JARVIS_REF={release_ref}" in payload["pi_installer_command"]
+    assert "JARVIS_REF=main" not in payload["pi_installer_command"]
 
 
 def test_pair_json_pi_installer_requires_brain_host(capsys) -> None:
