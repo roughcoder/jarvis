@@ -114,3 +114,23 @@ Development uses `uv` directly. Fleet deployment should not require cloning this
 repo or understanding `uv`: install the `jarvis` runtime package, install the
 `jarvis-app` native app, choose roles in the app, pair devices, and let Homebrew
 own runtime/app updates.
+
+## Runtime Release
+
+Preferred release path: run the `Release` workflow in GitHub Actions with:
+
+- `version`: the runtime version from `pyproject.toml`
+- `draft`: whether the GitHub release should remain draft
+- `skip_homebrew`: whether to skip the tap update
+
+The workflow builds a `jarvis-<version>.tar.gz` source archive, publishes the
+GitHub Release, uploads release artifacts, and updates
+`roughcoder/homebrew-infinite-stack` when `skip_homebrew` is false. The tap
+update requires a repository secret named `HOMEBREW_TAP_TOKEN` with write access
+to the tap.
+
+Local fallback:
+
+```bash
+scripts/release_runtime.sh 0.1.0
+```

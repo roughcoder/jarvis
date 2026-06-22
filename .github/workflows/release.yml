@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, with or without v prefix"
+        required: true
+        type: string
+      draft:
+        description: "Create the GitHub release as a draft"
+        required: true
+        default: false
+        type: boolean
+      skip_homebrew:
+        description: "Skip updating roughcoder/homebrew-infinite-stack"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build and publish runtime release
+        run: |
+          set -euo pipefail
+          args=("${{ inputs.version }}" "--skip-homebrew")
+          if [[ "${{ inputs.draft }}" == "true" ]]; then
+            args+=("--draft")
+          fi
+          scripts/release_runtime.sh "${args[@]}"
+
+      - name: Upload runtime release artifacts to workflow run
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-runtime-${{ inputs.version }}
+          path: |
+            dist/jarvis-*.tar.gz
+            dist/jarvis-*.tar.gz.sha256
+            dist/runtime-release-notes.md
+
+  update-homebrew:
+    needs: release
+    if: ${{ !inputs.draft && !inputs.skip_homebrew }}
+    runs-on: macos-14
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HOMEBREW_TAP_DIR: ${{ github.workspace }}/homebrew-infinite-stack
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: jarvis
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Check tap token
+        run: |
+          set -euo pipefail
+          if [[ -z "${HOMEBREW_TAP_TOKEN:-}" ]]; then
+            echo "Set HOMEBREW_TAP_TOKEN with write access to roughcoder/homebrew-infinite-stack, or rerun with skip_homebrew=true." >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: roughcoder/homebrew-infinite-stack
+          path: homebrew-infinite-stack
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Configure git author
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Update Homebrew formula
+        working-directory: jarvis
+        run: scripts/update_homebrew_formula.sh "${{ inputs.version }}" "${{ github.repository }}"
+

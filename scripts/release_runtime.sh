@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/release_runtime.sh <version> [--draft] [--skip-homebrew]
+
+Builds a source tarball from the current Jarvis runtime commit, pushes the tag,
+creates or updates a GitHub Release, and optionally updates the Homebrew formula.
+
+Environment:
+  GITHUB_REPOSITORY=owner/repo      Override repository detection.
+  SKIP_HOMEBREW=1                  Do not update the Homebrew formula.
+  HOMEBREW_TAP_DIR=/path/to/tap    Override the local Homebrew tap checkout.
+
+Example:
+  scripts/release_runtime.sh 0.1.0 --draft
+  scripts/release_runtime.sh 0.1.0
+USAGE
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+VERSION="${1:-}"
+if [[ -z "$VERSION" ]]; then
+  usage >&2
+  exit 2
+fi
+shift || true
+
+DRAFT_FLAG=""
+SKIP_HOMEBREW="${SKIP_HOMEBREW:-0}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --draft)
+      DRAFT_FLAG="--draft"
+      ;;
+    --skip-homebrew)
+      SKIP_HOMEBREW=1
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+VERSION="${VERSION#v}"
+TAG="v$VERSION"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DIST_DIR="$ROOT_DIR/dist"
+ASSET_NAME="jarvis-$VERSION.tar.gz"
+ASSET_PATH="$DIST_DIR/$ASSET_NAME"
+cd "$ROOT_DIR"
+
+if ! [[ "$VERSION" =~ ^[0-9]+[.][0-9]+[.][0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+  echo "Version must look like 1.2.3, optionally prefixed with v." >&2
+  exit 2
+fi
+
+PYPROJECT_VERSION="$(python3 - <<'PY'
+import tomllib
+with open("pyproject.toml", "rb") as handle:
+    print(tomllib.load(handle)["project"]["version"])
+PY
+)"
+INIT_VERSION="$(python3 - <<'PY'
+import ast
+tree = ast.parse(open("src/jarvis/__init__.py", encoding="utf-8").read())
+for node in tree.body:
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "__version__":
+                print(ast.literal_eval(node.value))
+                raise SystemExit
+raise SystemExit("__version__ not found")
+PY
+)"
+if [[ "$PYPROJECT_VERSION" != "$VERSION" || "$INIT_VERSION" != "$VERSION" ]]; then
+  echo "Version mismatch: pyproject=$PYPROJECT_VERSION __version__=$INIT_VERSION release=$VERSION" >&2
+  exit 1
+fi
+
+if ! command -v gh >/dev/null 2>&1; then
+  echo "GitHub CLI is required: brew install gh" >&2
+  exit 1
+fi
+
+gh auth status >/dev/null
+
+REPOSITORY="${GITHUB_REPOSITORY:-}"
+if [[ -z "$REPOSITORY" ]]; then
+  REPOSITORY="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+fi
+if [[ -z "$REPOSITORY" ]]; then
+  echo "Could not detect GitHub repository. Set GITHUB_REPOSITORY=owner/repo." >&2
+  exit 1
+fi
+
+if [[ -n "$(git status --porcelain -- . ':(exclude)dist')" ]]; then
+  echo "Working tree has uncommitted source changes. Commit or stash before releasing." >&2
+  git status --short -- . ':(exclude)dist'
+  exit 1
+fi
+
+uv run ruff check src/ tests/
+bash -n scripts/install_pi.sh scripts/verify_public_readiness.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh
+uv run pytest tests/unit -q
+
+rm -rf "$DIST_DIR"
+mkdir -p "$DIST_DIR"
+git archive --format=tar.gz --prefix="jarvis-$VERSION/" -o "$ASSET_PATH" HEAD
+shasum -a 256 "$ASSET_PATH" > "$ASSET_PATH.sha256"
+
+cat > "$DIST_DIR/runtime-release-notes.md" <<NOTES
+# Jarvis Runtime $TAG
+
+Local-first Jarvis runtime and service manager.
+
+## Install
+
+\`\`\`bash
+brew tap roughcoder/infinite-stack
+brew install jarvis
+\`\`\`
+
+## Update
+
+\`\`\`bash
+brew update
+brew upgrade jarvis
+\`\`\`
+NOTES
+
+if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+  git tag -a "$TAG" -m "Release $TAG"
+fi
+
+CURRENT_BRANCH="$(git branch --show-current)"
+git push origin "$CURRENT_BRANCH"
+git push origin "$TAG"
+
+if gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+  gh release upload "$TAG" \
+    "$ASSET_PATH" \
+    "$ASSET_PATH.sha256" \
+    --repo "$REPOSITORY" \
+    --clobber
+else
+  gh release create "$TAG" \
+    "$ASSET_PATH" \
+    "$ASSET_PATH.sha256" \
+    --repo "$REPOSITORY" \
+    --title "Jarvis Runtime $TAG" \
+    --notes-file "$DIST_DIR/runtime-release-notes.md" \
+    $DRAFT_FLAG
+fi
+
+echo "Released $TAG to https://github.com/$REPOSITORY/releases/tag/$TAG"
+
+if [[ -n "$DRAFT_FLAG" ]]; then
+  echo "Skipping Homebrew formula update for draft release $TAG."
+elif [[ "$SKIP_HOMEBREW" == "1" ]]; then
+  echo "Skipping Homebrew formula update because SKIP_HOMEBREW=1."
+else
+  "$ROOT_DIR/scripts/update_homebrew_formula.sh" "$VERSION" "$REPOSITORY"
+fi
+

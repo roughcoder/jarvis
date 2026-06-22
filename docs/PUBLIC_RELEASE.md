@@ -13,7 +13,7 @@ state, personal data, private release assumptions, and local-machine artifacts.
 | Browser profile | Guarded | Keep `jarvis-workspace/browser/` ignored; Chrome profiles contain cookies, history, and login metadata. |
 | `.env` | Guarded | `.env.example` must use placeholders only. No copied local secrets. |
 | Private Homebrew release | Fixed | `jarvis-app` cask uses the public GitHub release download URL, not the release asset API. |
-| Runtime package | Fixed for beta | `jarvis` formula exists. It is currently `--HEAD` until the runtime has versioned tarballs. |
+| Runtime package | Fixed for beta | `jarvis` formula exists. Runtime release automation now creates versioned tarballs and can update the formula; the formula remains `--HEAD` until the first runtime release is published. |
 | Docs | Fixed locally | Install-first deployment docs and a static docs preview site are present. |
 | GitHub Actions | External blocker | All workflows currently fail at `startup_failure` before any job starts, including a no-checkout smoke workflow. This points to GitHub account/repo Actions execution rather than workflow content. |
 | GitHub Pages | Deferred | Ignore Pages for now. `docs-site/` and a prepared `gh-pages` branch exist, but Pages hosting is not part of the current go-public gate. |
@@ -72,9 +72,11 @@ reviewed before publication.
 1. Run the required scans and resolve every non-example hit.
 2. Rotate any secret that ever appeared in git history or local logs.
 3. Confirm the Homebrew cask still uses public release download URLs.
-4. Confirm CI workflow files pass `actionlint`, then fix the GitHub Actions
+4. Publish the first runtime release so the `jarvis` formula moves from
+   `--HEAD` only to a versioned tarball URL.
+5. Confirm CI workflow files pass `actionlint`, then fix the GitHub Actions
    account/repo startup issue so remote CI jobs actually run.
-5. Publish public install docs and keep private fleet credentials in local machine
+6. Publish public install docs and keep private fleet credentials in local machine
    state only.
-6. Change repository visibility only after the app and runtime formula
+7. Change repository visibility only after the app and runtime formula
    no longer depend on private GitHub asset access.
