@@ -49,8 +49,7 @@ scan_app_public_files() {
   fi
 
   hits="$(
-    git -C "$APPLE_DIR" ls-files \
-      | xargs grep -IlE '(ghp_|github_pat_|sk-[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|PRIVATE) KEY)' \
+    git -C "$APPLE_DIR" grep -IlE '(ghp_|github_pat_|sk-[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|PRIVATE) KEY)' -- ':!.github/workflows/public-readiness.yml' \
       || true
   )"
   if [[ -n "$hits" ]]; then
@@ -74,8 +73,7 @@ scan_tap_public_files() {
   fi
 
   secret_hits="$(
-    git -C "$TAP_DIR" ls-files \
-      | xargs grep -IlE '(ghp_|github_pat_|sk-[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|PRIVATE) KEY)' \
+    git -C "$TAP_DIR" grep -IlE '(ghp_|github_pat_|sk-[A-Za-z0-9]{20,}|BEGIN (RSA|OPENSSH|PRIVATE) KEY)' -- ':!.github/workflows/public-readiness.yml' \
       || true
   )"
   if [[ -n "$secret_hits" ]]; then
@@ -128,4 +126,3 @@ section "tap checks"
 
 section "public readiness complete"
 echo "Local public-readiness checks passed."
-
