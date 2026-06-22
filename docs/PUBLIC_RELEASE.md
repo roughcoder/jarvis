@@ -16,7 +16,7 @@ state, personal data, private release assumptions, and local-machine artifacts.
 | Runtime package | Fixed for beta | `jarvis` formula exists. It is currently `--HEAD` until the runtime has versioned tarballs. |
 | Docs | Fixed locally | Install-first deployment docs and a static docs preview site are present. |
 | GitHub Actions | External blocker | All workflows currently fail at `startup_failure` before any job starts, including a no-checkout smoke workflow. This points to GitHub account/repo Actions execution rather than workflow content. |
-| GitHub Pages | External blocker | `docs-site/` and the Pages workflow exist, but Pages is not enabled and cannot deploy until Actions can start jobs. |
+| GitHub Pages | External blocker | `docs-site/` exists and a `gh-pages` branch has been pushed with the static site at branch root. GitHub rejected Pages enablement while the repo is private because the current plan does not support Pages for this repository. |
 
 ## Required Scans
 
@@ -74,7 +74,22 @@ reviewed before publication.
 3. Confirm the Homebrew cask still uses public release download URLs.
 4. Confirm CI workflow files pass `actionlint`, then fix the GitHub Actions
    account/repo startup issue so remote CI jobs actually run.
-5. Enable GitHub Pages for the runtime repository once Actions can start jobs.
+5. Make the runtime repository public or move it to a plan that supports Pages
+   for private repositories, then enable Pages from the prepared `gh-pages`
+   branch:
+
+   ```bash
+   gh api repos/roughcoder/jarvis/pages --method POST --input - <<'JSON'
+   {
+     "build_type": "legacy",
+     "source": {
+       "branch": "gh-pages",
+       "path": "/"
+     }
+   }
+   JSON
+   ```
+
 6. Publish public install docs and keep private fleet credentials in local machine
    state only.
 7. Change repository visibility only after the app, runtime formula, and docs site
