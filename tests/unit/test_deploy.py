@@ -11,6 +11,7 @@ from jarvis.deploy import (
     render_pi_installer_command,
     render_service,
     role_extras,
+    uv_sync_args_for_roles,
 )
 
 
@@ -20,6 +21,23 @@ def test_role_extras_are_ordered_and_deduplicated() -> None:
         "vad",
         "wake",
         "worker",
+        "browser",
+    ]
+
+
+def test_uv_sync_args_for_roles_are_packaged_install_safe() -> None:
+    assert uv_sync_args_for_roles({"worker", "intercom"}) == [
+        "sync",
+        "--no-dev",
+        "--extra",
+        "stt",
+        "--extra",
+        "vad",
+        "--extra",
+        "wake",
+        "--extra",
+        "worker",
+        "--extra",
         "browser",
     ]
     assert role_extras({"brain", "worker"}) == [

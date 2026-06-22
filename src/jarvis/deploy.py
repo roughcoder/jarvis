@@ -56,6 +56,43 @@ def role_extras(roles: list[str] | tuple[str, ...] | set[str]) -> list[str]:
     return out
 
 
+def uv_sync_args_for_roles(roles: list[str] | tuple[str, ...] | set[str]) -> list[str]:
+    """Return the role-scoped dependency sync arguments for packaged installs."""
+    args = ["sync", "--no-dev"]
+    for extra in role_extras(roles):
+        args.extend(["--extra", extra])
+    return args
+
+
+def _find_uv() -> str:
+    candidates = [
+        os.environ.get("UV_BIN", ""),
+        shutil.which("uv") or "",
+        "/opt/homebrew/bin/uv",
+        "/usr/local/bin/uv",
+        "/usr/bin/uv",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    raise FileNotFoundError("uv not found; install Homebrew uv or set UV_BIN")
+
+
+def sync_role_dependencies(
+    roles: list[str] | tuple[str, ...] | set[str],
+    *,
+    cwd: str | Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Sync optional runtime dependencies needed by the selected roles."""
+    args = uv_sync_args_for_roles(roles)
+    return subprocess.run(
+        [_find_uv(), *args],
+        cwd=cwd,
+        check=False,
+        text=True,
+    )
+
+
 def issue_pairing_entry(device_id: str, *, identity: str = "") -> tuple[str, str]:
     """Return a fresh token and a BRAIN_DEVICES JSON object fragment."""
     token = secrets.token_urlsafe(32)

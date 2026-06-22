@@ -918,11 +918,17 @@ def _cmd_service(args: argparse.Namespace) -> int:
         install_service,
         render_service,
         role_extras,
+        sync_role_dependencies,
     )
 
     if args.service_action == "extras":
         print(" ".join(role_extras(set(args.roles))))
         return 0
+
+    if args.service_action == "sync":
+        print("syncing role dependencies: " + " ".join(role_extras(set(args.roles))))
+        result = sync_role_dependencies(args.roles)
+        return result.returncode
 
     if args.service_action in {"print", "install"}:
         rc = 0
@@ -1235,8 +1241,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_service.add_argument(
         "service_action",
-        choices=["install", "print", "start", "stop", "restart", "status", "extras"],
-        help="install/print render service files; start/stop/restart/status controls one role; extras prints uv extras for roles",
+        choices=["install", "print", "start", "stop", "restart", "status", "extras", "sync"],
+        help="install/print render service files; start/stop/restart/status controls one role; extras prints uv extras; sync installs role dependencies",
     )
     p_service.add_argument(
         "roles",

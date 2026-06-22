@@ -162,8 +162,12 @@ elif [[ -d "$HOME/Applications/Jarvis.app" ]]; then
 fi
 
 if [[ -n "$ROLES" ]]; then
+  read -r -a ROLE_ARGS <<< "$ROLES"
+  echo "Syncing Jarvis role dependencies: $ROLES"
+  run jarvis service sync "${ROLE_ARGS[@]}"
+
   echo "Installing Jarvis services: $ROLES"
-  for role in $ROLES; do
+  for role in "${ROLE_ARGS[@]}"; do
     run jarvis service install "$role" --workdir "$WORKDIR"
     if [[ "$START_SERVICES" == "1" ]]; then
       if [[ "$DRY_RUN" == "1" ]]; then
