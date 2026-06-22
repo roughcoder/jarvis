@@ -77,8 +77,10 @@ into stage 1 (iterate on a review, follow-up ticket, learned skill).
 5. **Execute.** Run the engine(s) on the target in the workspace. One engine, or
    **an ensemble in parallel** (panel). Long-running, async, tracked as a job.
 6. **Converge.** If an ensemble ran, **synthesise** the outputs. Run the
-   **self-review loop** — review/test until there are no accepted actionable
-   findings (OpenClaw's issue→PR discipline).
+   **self-correction loop** — exercise the running app via the harness for its
+   type (P13), review, and iterate until there are no accepted actionable
+   findings and the app observably works (OpenClaw's issue→PR discipline, deepened
+   to real-app verification). See "The inner loop" below.
 7. **Land.** **Forge verbs**: commit, push the branch, open the PR, post the
    review — top-level summary and/or inline line-comments / replies.
 8. **Report.** Proactive push back to the surface that asked: "done — PR #N is
@@ -227,28 +229,40 @@ just `fast`/`strong` (`config.py:48`). **Open:** how does a CLI engine stream
 progress vs a model engine returning once? Per-engine timeout/cost ceilings?
 Where do engine credentials live per target?
 
-### P2 · Target — *where it runs* 🟡
-Role: stages 3, 4, 9. A named execution backend. The same HTTP boundary the
-worker already uses, generalised to a registry so routing ("on my personal
-laptop") is a tag.
+### P2 · Target — *where it runs, **and what it can do*** 🟡
+Role: stages 3, 4, 9. A named execution backend, reached over the same HTTP
+boundary the worker already uses — generalised to a registry so routing ("on my
+personal laptop") is a tag. Crucially, **a target is not just a host; it carries a
+capability profile** — the skills of that machine — which decides what work can be
+*routed* there (stage 3) and how the app can be *exercised* there (P13).
 
 ```python
-# config-driven registry
-targets = {
-  "worker":         http://localhost:8782,     # this Mac (default)
-  "personal-laptop": http://laptop.tailnet:8782,
-  "hive":           http://hive.tailnet:8782,   # Phase 2 heavy tier
-  "serverless":     <Modal/Daytona/Claude-Managed-Agents adapter>,
-}
+@dataclass
+class Target:
+    name: str                      # "worker", "personal-laptop", "hive", ...
+    base_url: str                  # http(s) over the network boundary
+    # The machine's skills — DISCOVERED by a probe ("doctor"), not hand-declared:
+    capabilities: set[str]         # {"xcode", "ios-sim", "browser", "docker",
+                                   #  "node", "swift", "python", "gh-auth",
+                                   #  "signing-cert", "gpu", ...}
+    transport: Literal["push", "pull"]   # always-on vs sleeps/disconnects
 ```
 
-Today: the worker daemon is exactly one such target (`worker/server.py`),
-reached over HTTP with a bearer token; the dormant `remote/` lane is a second,
-unfinished one (`remote/client.py`). Phase 2 already plans Tailscale hostnames.
-**Gap:** no registry, no routing, one target only. **Open:** push (brain calls
-target) vs pull (target polls a queue) — pull survives a laptop being asleep/off
-better; how does a result from a transient serverless box get home; how is a
-target's repo set / git identity / credentials provisioned?
+A task declares what it *needs* (`requires={"xcode","ios-sim"}`); the planner
+routes to a target whose `capabilities` satisfy it, or reports *"nothing I can
+reach can build a Swift app"*. The profile is **probed**, the way
+`jarvis worker --doctor` already inspects peekaboo/GUI readiness — extended to
+"is there a browser / Xcode / docker / signing identity here?".
+
+Today: the worker daemon is exactly one such target (`worker/server.py`), reached
+over HTTP with a bearer token, and its `/health` already reports a few
+capabilities (browser enabled, GUI provider configured — `worker/server.py:272`);
+the dormant `remote/` lane is a second, unfinished one (`remote/client.py`). Phase
+2 already plans Tailscale hostnames. **Gap:** no registry, no routing, no
+capability profile/probe, one target only. **Open:** push vs pull (pull survives a
+laptop asleep/off; needed for serverless); how a result from a transient box gets
+home; how a target's repo set / git identity / credentials / toolchains are
+provisioned; how fresh the capability probe must be (boot-time vs per-job).
 
 ### P3 · Ensemble (panel) — *many engines, one answer* ❌ — the differentiator
 Role: stages 5, 6. Fan one task to N engines in parallel, then synthesise. This
