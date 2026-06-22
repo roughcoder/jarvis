@@ -375,6 +375,25 @@ def _cmd_whatsapp(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_trains(args: argparse.Namespace) -> int:
+    """Smoke-test the train_times tool against the live Realtime Trains API."""
+    from jarvis.tools.trains import make_trains_tools
+
+    cfg = load_config()
+    if not cfg.trains.enabled:
+        print("trains not configured — set TRAINS_RTT_USERNAME + TRAINS_RTT_PASSWORD "
+              "in .env (free account at https://api.rtt.io).")
+        return 1
+    tool = make_trains_tools(cfg.trains)[0]
+    call = {"from": args.origin, "to": args.destination, "date": args.date,
+            "arrive_by": args.arrive_by, "depart_after": args.depart_after}
+    from jarvis.brain.context import RequestContext
+
+    ctx = RequestContext("cli", "neil", "personal", frozenset({"web.search"}))
+    print(asyncio.run(tool.handler(ctx, call)))
+    return 0
+
+
 def _cmd_whatsapp_log(args: argparse.Namespace) -> int:
     """Print the WhatsApp transcript from wacli's local store (both directions)."""
     import json
@@ -918,6 +937,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_whatsapp = sub.add_parser("whatsapp", help="Run the WhatsApp connector (bridge wacli <-> brain, 3b)")
     p_whatsapp.set_defaults(func=_cmd_whatsapp)
+
+    p_trains = sub.add_parser("trains", help="Smoke-test the train_times tool (Realtime Trains API)")
+    p_trains.add_argument("origin", help="origin station (name or CRS code)")
+    p_trains.add_argument("destination", help="destination station (name or CRS code)")
+    p_trains.add_argument("--date", default="", help="'today', 'tomorrow', or yyyy-mm-dd")
+    p_trains.add_argument("--arrive-by", dest="arrive_by", default="", help="arrival deadline, e.g. 09:00")
+    p_trains.add_argument("--depart-after", dest="depart_after", default="", help="earliest departure, e.g. 17:30")
+    p_trains.set_defaults(func=_cmd_trains)
 
     p_walog = sub.add_parser("whatsapp-log", help="Print the WhatsApp transcript from wacli's store")
     p_walog.add_argument("-n", type=int, default=30, help="how many recent messages to fetch (default 30)")

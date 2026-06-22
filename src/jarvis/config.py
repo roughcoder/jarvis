@@ -502,6 +502,26 @@ class GoogleConfig(_Base):
     calendar_days: int = 7  # default look-ahead for "upcoming events"
 
 
+class TrainsConfig(_Base):
+    """`train_times` tool — deterministic UK train times via the Realtime Trains
+    Pull API (api.rtt.io), a free personal account. Beats LLM-browsing a departure
+    board: accurate departures/arrivals incl. arrive-by, no scraping. HTTP Basic
+    auth with the RTT username/password. Disabled (the tool isn't registered) until
+    both are set; without it the model falls back to the browser."""
+
+    model_config = SettingsConfigDict(env_prefix="TRAINS_", env_file=".env", extra="ignore")
+
+    rtt_username: str = ""
+    rtt_password: SecretStr = SecretStr("")
+    base_url: str = "https://api.rtt.io/api/v1/json"
+    timeout_s: float = 12.0
+    max_detail_lookups: int = 8  # cap per-service arrival lookups (keep it snappy)
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.rtt_username and self.rtt_password.get_secret_value())
+
+
 class HeartbeatConfig(_Base):
     """Proactive heartbeat (Phase 3b, §9). A COLD-path scheduler: it periodically
     works the HEARTBEAT.md checklist and pushes a Proactive message ONLY when it has
@@ -645,6 +665,7 @@ class Config:
         self.browser = BrowserConfig()
         self.whatsapp = WhatsAppConfig()
         self.google = GoogleConfig()
+        self.trains = TrainsConfig()
 
     def resolved(self) -> dict:
         """Flat, secret-masked view for the dry-run printout (Step 0 gate)."""
@@ -658,6 +679,9 @@ class Config:
             "gateway.api_key": mask(self.gateway.api_key),
             "gateway.fast_model": self.gateway.fast_model,
             "gateway.strong_model": self.gateway.strong_model,
+            "trains.enabled": self.trains.enabled,
+            "trains.rtt_username": self.trains.rtt_username or "<unset>",
+            "trains.rtt_password": mask(self.trains.rtt_password),
             "memory.base_url": self.memory.base_url,
             "memory.api_key": mask(self.memory.api_key),
             "memory.workspace_id": self.memory.workspace_id,
