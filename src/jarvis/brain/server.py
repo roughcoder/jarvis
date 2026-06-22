@@ -129,7 +129,7 @@ class BrainServer:
         self._memory = MemoryClient(cfg.memory)
         self._registry = build_registry(
             cfg.tools, worker=cfg.worker, remote=cfg.remote, google=cfg.google,
-            browser=cfg.browser, capabilities=cfg.capabilities, memory=self._memory, trains=cfg.trains,
+            browser=cfg.browser, capabilities=cfg.capabilities, memory=self._memory,
         )
         users = load_users(cfg.capabilities.users_dir)  # dict name -> User
         self._users = users  # for outbound (WhatsApp) routing

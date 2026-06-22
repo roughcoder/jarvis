@@ -36,7 +36,7 @@ def test_available_for_filters_by_capability(tmp_path) -> None:
     read_only = {t.name for t in reg.available_for(_ctx("files.read"))}
     assert read_only == {"read_file", "list_files"}
     full = {t.name for t in reg.available_for(_ctx("files.read", "files.write", "web.search"))}
-    assert full == {"read_file", "list_files", "write_file", "web_search"}
+    assert full == {"read_file", "list_files", "write_file", "web_search", "fetch_page"}
 
 
 def test_announce_flag_only_on_remote_tools(tmp_path) -> None:

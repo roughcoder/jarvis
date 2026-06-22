@@ -15,16 +15,15 @@ from jarvis.config import (
     GoogleConfig,
     RemoteConfig,
     ToolsConfig,
-    TrainsConfig,
     WorkerConfig,
 )
 from jarvis.tools.base import Tool, ToolError, ToolRegistry
 from jarvis.tools.browser import make_browser_tools
 from jarvis.tools.files import make_files_tools
 from jarvis.tools.google import make_google_tools
+from jarvis.tools.fetch import make_fetch_tools
 from jarvis.tools.profile import make_profile_tools
 from jarvis.tools.remote import make_remote_tools
-from jarvis.tools.trains import make_trains_tools
 from jarvis.tools.web_search import make_web_search_tool
 from jarvis.tools.worker import make_worker_tools
 
@@ -43,7 +42,6 @@ def build_registry(
     browser: BrowserConfig | None = None,
     capabilities: CapabilityConfig | None = None,
     memory: MemoryClient | None = None,
-    trains: TrainsConfig | None = None,
     mcp: list[Tool] | None = None,
 ) -> ToolRegistry:
     """Register every tool. `worker` adds the local worker-daemon tools, `remote`
@@ -56,11 +54,10 @@ def build_registry(
     reg.register(make_web_search_tool(cfg))
     for tool in make_files_tools(cfg):
         reg.register(tool)
+    for tool in make_fetch_tools(cfg):  # generic: fetch a URL as clean text (for skills)
+        reg.register(tool)
     if capabilities is not None:
         for tool in make_profile_tools(capabilities, memory=memory):
-            reg.register(tool)
-    if trains is not None and trains.enabled:
-        for tool in make_trains_tools(trains):
             reg.register(tool)
     if worker is not None:
         for tool in make_worker_tools(worker):
