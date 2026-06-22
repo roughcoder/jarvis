@@ -28,6 +28,36 @@ Everything below lives under AGENTS.md's two constraints:
    the cold/background path and report back proactively. No primitive here may be
    awaited on the hot path.
 
+## Proportionality — the loop chooses the lightest sufficient depth
+
+**The governing principle, and the one that keeps this from being absurd:** the
+cycle below is the *full range* of what the machine can do, **not** what fires on
+every request. Most turns use a thin slice. The loop must always pick the
+**cheapest verification — and the fewest stages — sufficient for this change**,
+and reach for depth only when the change warrants it.
+
+Verification depth scales with the change, not with the machine's ceiling:
+
+| Change | Verification rung (P12/P13) |
+|---|---|
+| typo · docs · config · comment | lint + build only |
+| logic · refactor · internal API | unit + integration tests |
+| feature · UI · public API · data | **exercise the real app** (browser/sim/boot+probe) — the expensive, flaky, opt-in-by-change rung |
+
+The same restraint applies to the rest of the cycle, not just verification:
+
+- **Stages are skippable.** A one-line fix needs no durable work item (P6), no
+  ensemble (P3), no plan step (P3) — Intake → Execute → (cheap verify) → Land.
+  The 10 stages are the *maximal* path; the loop collapses them when it can.
+- **Ensemble is opt-in.** One engine is the default; fan out to a panel only when
+  the stakes justify the latency/cost (a risky review, a wide design space).
+- **Deep app-exercise is opt-in-by-change-type**, and the most expensive thing
+  here — treat it as the rung you climb *to*, never the rung you start on.
+
+Rule of thumb: **a turn should feel as light as the change is small.** If a typo
+fix triggers a simulator boot and a three-model panel, the loop is wrong — not
+because the capability is wrong, but because it failed to be proportional.
+
 ---
 
 ## Part 1 — The complete cycle
