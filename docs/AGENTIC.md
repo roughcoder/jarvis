@@ -65,9 +65,12 @@ into stage 1 (iterate on a review, follow-up ticket, learned skill).
    reading trackers, the repo, and memory to scope it. The work item is the
    anchor a PR will later close, and the thing a human can inspect mid-flight.
 3. **Plan.** Choose **engine(s)** (Opus, GPT-5.5, Codex, Claude, Factory,
-   Cursor…), **target(s)** (this worker, personal laptop, Hive, serverless), and
-   the **recipe** (single build, ensemble review, plan-then-build). For simple
-   commands this is implicit; for complex ones it's an explicit step.
+   Cursor…), **target(s)**, and the **recipe** (single build, ensemble review,
+   plan-then-build). Target choice is **capability-matched**, not free: a Swift
+   build needs a target whose profile has Xcode + a simulator; a webapp E2E needs
+   one with a browser. The plan declares what the work *requires*; routing picks a
+   target that *can* (or reports that none can). For simple commands this is
+   implicit; for complex ones it's an explicit step.
 4. **Provision.** Resolve the chosen target and prepare an **isolated
    workspace** — clone the repo if missing, cut a worktree on a fresh branch.
    Never the user's live checkout.
@@ -100,35 +103,47 @@ before it ever opens a PR* — not "generate once and hope". Zooming into stages
 5–7:
 
 ```
-        ┌─────────────────────── fix & retry ───────────────────────┐
-        ↓                                                            │
-   (5) EXECUTE ──> run tests ──> self-review ──> VERIFICATION GATE ──┤
-   implement/edit   (build,        (a review     are we done?        │
-                    lint, tests)   engine — or    · tests green?      │
-                                   an ensemble)   · review: no        │
-                                                    accepted          │
-                                                    actionable        │
-                                                    findings?         │
-                                                  · acceptance        │
-                                                    criteria met? ────┘
-                                                       │ yes        │ no, but
-                                                       ↓            │ stuck /
-                                                  (7) LAND          │ N exceeded
-                                                                    ↓
-                                                            ESCALATE: report
-                                                            partial work +
-                                                            branch, ask the
-                                                            human (re-enter
-                                                            at Intake)
+        ┌──────────────────────────── fix & retry ───────────────────────────┐
+        ↓                                                                     │
+   (5) EXECUTE ──> EXERCISE THE APP ──> self-review ──> VERIFICATION GATE ────┤
+   implement/edit   via the harness      (a review      are we done?          │
+                    for THIS app-type    engine — or     · build/tests green?  │
+                    on THIS machine:     an ensemble)    · app actually does   │
+                    · webapp → boot +                      the new thing,      │
+                      drive in browser                     observed?           │
+                    · iOS/Swift → run on                  · review: no         │
+                      simulator + UI snap                   accepted           │
+                    · service/API → boot                    actionable         │
+                      + hit endpoints                        findings?         │
+                    · CLI → run + assert                   · acceptance        │
+                    · library → unit/intg                    criteria met? ────┘
+                    (capped by the target's                  │ yes      │ no, but
+                     capability profile)                     ↓          │ stuck /
+                                                        (7) LAND        │ N exceeded
+                                                                        ↓
+                                                                ESCALATE: report
+                                                                partial branch +
+                                                                what's red, ask
+                                                                the human (re-enter
+                                                                at Intake)
 ```
 
 The discipline, made explicit (OpenClaw's coding-agent recipe, generalised):
 
 - **Exit predicate.** Land *only* when the Verification gate (P12) is satisfied:
-  tests/build pass **and** the review surfaces no *accepted actionable* findings
-  **and** the work item's acceptance criteria are met. "Accepted actionable" is
-  load-bearing — a finding the loop judges wrong or out-of-scope is recorded and
-  dismissed, not chased forever.
+  build/tests pass, **the running app was exercised and observably does the new
+  thing**, the review surfaces no *accepted actionable* findings, **and** the work
+  item's acceptance criteria are met. "Accepted actionable" is load-bearing — a
+  finding the loop judges wrong or out-of-scope is recorded and dismissed, not
+  chased forever.
+- **Exercise the real app, not just the unit.** Unit tests are the floor, not the
+  bar. "Make this change to the webapp" is only verified when the loop *boots the
+  webapp and drives it in a browser*; a Swift change when it *runs on a simulator
+  and checks the UI*; a service change when it *boots and the endpoint responds*.
+  The harness is chosen by **app-type × the target's capability profile** (P13,
+  fed by P2) — and what's even *possible* is capped by what the machine can do
+  (no Xcode → no simulator run; no browser → no E2E). This is the deepest
+  feedback loop, and the one a unit-test-only gate misses.
 - **Bounded.** A hard `max_iterations` (and a wall-clock/cost budget). The loop
   must not be able to spin. Hitting the bound is not failure-silent: it
   **escalates** — report the partial branch + what's still failing, and hand back
