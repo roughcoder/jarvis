@@ -404,10 +404,12 @@ P11 — the expensive, boring half.
 
 ## Part 6 — Relationship to OpenClaw & Hermes
 
-- **OpenClaw** contributes the **issue→PR discipline** (P6→P5→P8: durable
-  issue-as-spec, isolated checkout, review-until-clean, one report message) and
-  the **BYO-any-CLI** stance (P1: shell out to codex/claude/opencode). We adopt
-  both.
+- **OpenClaw** contributes the **inner convergence loop** (P12: implement→test→
+  review→fix, *iterate until no accepted actionable findings*, bounded, then
+  land) — the part it nails and the part that makes autonomous work trustworthy —
+  plus the surrounding **issue→PR discipline** (P6→P5→P8: durable issue-as-spec,
+  mandatory isolated checkout, one report message) and the **BYO-any-CLI** stance
+  (P1: shell out to codex/claude/opencode). We adopt all of it.
 - **Hermes** contributes **target-as-a-knob** (P2: local/Docker/SSH/Modal/Daytona
   the same agent, different backend) and **model-agnosticism** (P1). We adopt the
   target registry idea on our existing HTTP boundary.
@@ -426,5 +428,10 @@ P11 — the expensive, boring half.
 - [ ] Recipe representation: markdown, code, or a declarative schema? (P8)
 - [ ] Unify the two job models into one cross-target run identity? (P7/P11)
 - [ ] Engine progress protocol: streaming CLI vs one-shot model? (P1)
+- [ ] Verification gate: what defines "accepted actionable"; where do acceptance
+      criteria come from; is the gate's reviewer the P3 ensemble or a cheaper
+      checker; tests discovered vs declared? (P12)
+- [ ] Inner-loop bound: max_iterations + cost/wall-clock budget values, and the
+      escalation message shape when the bound is hit? (P12/P8)
 - [ ] Is the 10-stage cycle the right cut, or are stages missing/merged?
 ```
