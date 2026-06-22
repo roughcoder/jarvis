@@ -14,6 +14,7 @@ Environment:
   JARVIS_RUNTIME_FORMULA=jarvis             Runtime formula token.
   JARVIS_APP_CASK=jarvis-app                Native app cask token.
   JARVIS_ROLES="brain worker intercom"      Optional roles to install locally.
+  JARVIS_WORKDIR=$HOME/.jarvis              Workdir/config dir for installed services.
   JARVIS_START_SERVICES=0                   Start optional roles after install.
   JARVIS_OPEN_APP=1                         Open Jarvis.app after install.
   JARVIS_INSTALL_HOMEBREW=1                 Install Homebrew when missing.
@@ -45,6 +46,7 @@ TAP="${JARVIS_TAP:-roughcoder/infinite-stack}"
 RUNTIME_FORMULA="${JARVIS_RUNTIME_FORMULA:-jarvis}"
 APP_CASK="${JARVIS_APP_CASK:-jarvis-app}"
 ROLES="${JARVIS_ROLES:-}"
+WORKDIR="${JARVIS_WORKDIR:-$HOME/.jarvis}"
 START_SERVICES="${JARVIS_START_SERVICES:-0}"
 OPEN_APP="${JARVIS_OPEN_APP:-1}"
 INSTALL_HOMEBREW="${JARVIS_INSTALL_HOMEBREW:-1}"
@@ -162,7 +164,7 @@ fi
 if [[ -n "$ROLES" ]]; then
   echo "Installing Jarvis services: $ROLES"
   for role in $ROLES; do
-    run jarvis service install "$role"
+    run jarvis service install "$role" --workdir "$WORKDIR"
     if [[ "$START_SERVICES" == "1" ]]; then
       if [[ "$DRY_RUN" == "1" ]]; then
         run jarvis service start "$role"

@@ -11,6 +11,8 @@ All values load from environment / a local .env file. Nothing is hardcoded.
 
 from __future__ import annotations
 
+import os
+
 from pydantic import BaseModel, SecretStr, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -621,30 +623,33 @@ class Config:
     """Aggregate config. Construct once and pass modules their slice."""
 
     def __init__(self) -> None:
-        self.gateway = GatewayConfig()
-        self.memory = MemoryConfig()
-        self.database = DatabaseConfig()
-        self.tts = TTSConfig()
-        self.stt = STTConfig()
-        self.vad = VADConfig()
-        self.wake = WakeConfig()
-        self.audio = AudioConfig()
-        self.persona = PersonaConfig()
-        self.trace = TraceConfig()
-        self.capabilities = CapabilityConfig()
-        self.tools = ToolsConfig()
-        self.brain = BrainConfig()
-        self.intercom = IntercomConfig()
-        self.worker = WorkerConfig()
-        self.remote = RemoteConfig()
-        self.mcp = MCPConfig()
-        self.heartbeat = HeartbeatConfig()
-        self.background = BackgroundConfig()
-        self.notify = NotifyConfig()
-        self.alarm = AlarmConfig()
-        self.browser = BrowserConfig()
-        self.whatsapp = WhatsAppConfig()
-        self.google = GoogleConfig()
+        env_file = os.environ.get("JARVIS_ENV_FILE") or ".env"
+        source = {"_env_file": env_file}
+
+        self.gateway = GatewayConfig(**source)
+        self.memory = MemoryConfig(**source)
+        self.database = DatabaseConfig(**source)
+        self.tts = TTSConfig(**source)
+        self.stt = STTConfig(**source)
+        self.vad = VADConfig(**source)
+        self.wake = WakeConfig(**source)
+        self.audio = AudioConfig(**source)
+        self.persona = PersonaConfig(**source)
+        self.trace = TraceConfig(**source)
+        self.capabilities = CapabilityConfig(**source)
+        self.tools = ToolsConfig(**source)
+        self.brain = BrainConfig(**source)
+        self.intercom = IntercomConfig(**source)
+        self.worker = WorkerConfig(**source)
+        self.remote = RemoteConfig(**source)
+        self.mcp = MCPConfig(**source)
+        self.heartbeat = HeartbeatConfig(**source)
+        self.background = BackgroundConfig(**source)
+        self.notify = NotifyConfig(**source)
+        self.alarm = AlarmConfig(**source)
+        self.browser = BrowserConfig(**source)
+        self.whatsapp = WhatsAppConfig(**source)
+        self.google = GoogleConfig(**source)
 
     def resolved(self) -> dict:
         """Flat, secret-masked view for the dry-run printout (Step 0 gate)."""

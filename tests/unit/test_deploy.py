@@ -47,6 +47,8 @@ def test_render_launchd_service_uses_jarvis_command_not_uv() -> None:
     assert "<string>brain</string>" in text
     assert "uv" not in text
     assert "com.jarvis.brain" in text
+    assert "<key>JARVIS_ENV_FILE</key>" in text
+    assert "<string>/opt/homebrew/var/jarvis/.env</string>" in text
 
 
 def test_render_systemd_service_for_pi_intercom() -> None:
@@ -59,6 +61,7 @@ def test_render_systemd_service_for_pi_intercom() -> None:
 
     assert "ExecStart=/usr/local/bin/jarvis run" in text
     assert "After=network-online.target sound.target" in text
+    assert 'Environment=JARVIS_ENV_FILE="/opt/jarvis/.env"' in text
 
 
 def test_issue_pairing_entry_returns_brain_devices_fragment() -> None:

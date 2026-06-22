@@ -37,6 +37,24 @@ def test_env_var_overrides_with_prefix(monkeypatch) -> None:
     assert c.base_url == "http://hive.tailnet:9000"
 
 
+def test_config_uses_jarvis_env_file(monkeypatch, tmp_path) -> None:
+    env_file = tmp_path / "service.env"
+    env_file.write_text(
+        "CAPS_DEVICE_ID=laptop-worker\n"
+        "INTERCOM_BRAIN_HOST=imac.private\n"
+        "INTERCOM_TOKEN=paired-token\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    _clean(monkeypatch, "CAPS_DEVICE_ID", "INTERCOM_BRAIN_HOST", "INTERCOM_TOKEN")
+
+    c = Config()
+
+    assert c.capabilities.device_id == "laptop-worker"
+    assert c.intercom.brain_host == "imac.private"
+    assert c.intercom.token.get_secret_value() == "paired-token"
+
+
 def test_database_url_masks_password(monkeypatch) -> None:
     _clean(monkeypatch, "DB_PASSWORD", "DB_HOST")
     c = DatabaseConfig(_env_file=None, password="s3cret", host="localhost")

@@ -65,12 +65,13 @@ def test_mac_installer_dry_run_installs_and_starts_roles() -> None:
     result = run_installer(
         JARVIS_ROLES="brain worker",
         JARVIS_START_SERVICES="1",
+        JARVIS_WORKDIR="/tmp/jarvis-home",
     )
 
     assert result.returncode == 0, result.stderr
-    assert "+ jarvis service install brain" in result.stdout
+    assert "+ jarvis service install brain --workdir /tmp/jarvis-home" in result.stdout
     assert "+ jarvis service start brain" in result.stdout
     assert "+ jarvis service restart brain" in result.stdout
-    assert "+ jarvis service install worker" in result.stdout
+    assert "+ jarvis service install worker --workdir /tmp/jarvis-home" in result.stdout
     assert "+ jarvis service start worker" in result.stdout
     assert "+ jarvis service restart worker" in result.stdout

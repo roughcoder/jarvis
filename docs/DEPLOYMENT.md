@@ -67,6 +67,11 @@ installs or upgrades `jarvis`, installs or upgrades `jarvis-app`, clears app
 quarantine while the app is ad-hoc signed, and opens Jarvis. The Setup window
 then owns role choice, local service installation, and pairing.
 
+Packaged Mac services installed from the app or Mac bootstrap use `~/.jarvis` as
+the service workdir and set `JARVIS_ENV_FILE=~/.jarvis/.env` in launchd. This
+keeps local pairing/provider configuration outside the Homebrew Cellar and
+independent of the app's current directory.
+
 The bootstrap uses the stable runtime formula by default. Development HEAD
 fallback is opt-in only:
 

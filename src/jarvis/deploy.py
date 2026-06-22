@@ -162,6 +162,7 @@ def render_service(
     bin_path = jarvis_bin or default_jarvis_bin()
     cwd = str(Path(workdir).expanduser() if workdir else default_workdir())
     logs = str(Path(log_dir).expanduser() if log_dir else default_log_dir())
+    env_file = str(Path(cwd) / ".env")
     args = ROLE_COMMANDS[role]
     if target == "launchd":
         arg_xml = "\n".join(
@@ -188,6 +189,8 @@ def render_service(
   <dict>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>JARVIS_ENV_FILE</key>
+    <string>{_xml_escape(env_file)}</string>
   </dict>
   <key>StandardOutPath</key>
   <string>{_xml_escape(logs)}/{role}.out.log</string>
@@ -210,6 +213,7 @@ ExecStart={command}
 Restart=always
 RestartSec=3
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=JARVIS_ENV_FILE={_systemd_escape(env_file)}
 
 [Install]
 WantedBy=multi-user.target
@@ -241,6 +245,8 @@ def install_service(
         log_dir=str(paths.log_dir),
     )
     if not dry_run:
+        if workdir:
+            Path(workdir).expanduser().mkdir(parents=True, exist_ok=True)
         paths.log_dir.mkdir(parents=True, exist_ok=True)
         paths.destination.parent.mkdir(parents=True, exist_ok=True)
         paths.destination.write_text(text, encoding="utf-8")
@@ -293,6 +299,10 @@ def _xml_escape(value: str) -> str:
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
+
+
+def _systemd_escape(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _shell_quote(value: str) -> str:
