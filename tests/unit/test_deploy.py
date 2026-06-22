@@ -7,6 +7,7 @@ import pytest
 from jarvis.deploy import (
     current_release_ref,
     issue_pairing_entry,
+    render_mac_config_command,
     render_pi_installer_command,
     render_service,
     role_extras,
@@ -118,8 +119,48 @@ def test_render_pi_installer_command_defaults_to_current_release_ref() -> None:
     assert "JARVIS_REF=main" not in command
 
 
+def test_render_mac_config_command_upserts_service_env_values() -> None:
+    command = render_mac_config_command(
+        device_id="neil laptop",
+        token="tok en",
+        brain_host="imac.private",
+        brain_port="8701",
+        identity="neil",
+        workdir="$HOME/.jarvis",
+    )
+
+    assert 'JARVIS_WORKDIR="${JARVIS_WORKDIR:-$HOME/.jarvis}"' in command
+    assert 'JARVIS_ENV_FILE="$JARVIS_WORKDIR/.env"' in command
+    assert "grep -v -E '^(INTERCOM_BRAIN_HOST|INTERCOM_BRAIN_PORT|INTERCOM_TOKEN|CAPS_DEVICE_ID|CAPS_IDENTITY|CAPS_SCOPE)='" in command
+    assert 'INTERCOM_BRAIN_HOST="imac.private"' in command
+    assert 'INTERCOM_BRAIN_PORT="8701"' in command
+    assert 'INTERCOM_TOKEN="tok en"' in command
+    assert 'CAPS_DEVICE_ID="neil laptop"' in command
+    assert 'CAPS_IDENTITY="neil"' in command
+    assert 'CAPS_SCOPE="personal"' in command
+    assert 'chmod 0600 "$JARVIS_ENV_FILE"' in command
+
+
+def test_render_mac_config_command_defaults_shared_device_identity() -> None:
+    command = render_mac_config_command(
+        device_id="kitchen-mac",
+        token="token",
+        brain_host="imac.private",
+    )
+
+    assert 'CAPS_IDENTITY="house"' in command
+    assert 'CAPS_SCOPE="house"' in command
+
+
 def test_render_pi_installer_command_requires_brain_host() -> None:
     with pytest.raises(ValueError, match="brain_host"):
         render_pi_installer_command(
             device_id="kitchen-pi", token="token", brain_host=""
+        )
+
+
+def test_render_mac_config_command_requires_brain_host() -> None:
+    with pytest.raises(ValueError, match="brain_host"):
+        render_mac_config_command(
+            device_id="neil-laptop", token="token", brain_host=""
         )

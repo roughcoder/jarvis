@@ -104,6 +104,8 @@ The native app should drive setup in five stages:
 3. **Pairing**: Device checks the configured brain host with
    `jarvis status --json --brain-host ...`, then requests approval from the
    brain or the app generates a per-device token entry with `jarvis pair`.
+   Pairing output can include a Mac config command for laptops/workers and a Pi
+   installer command for room intercoms.
 4. **Service install**: App calls `jarvis service install/start` for the selected
    roles and shows logs on failure.
 5. **Ready state**: App polls `jarvis fleet-status --json` until every selected
@@ -160,6 +162,21 @@ JARVIS_DRY_RUN=1 \
 
 The Pi remains a thin intercom: no LLM keys, no memory keys, no worker/browser
 control, and no personal user files.
+
+## Mac Pairing Config
+
+For Mac laptops and worker Macs, the brain can issue one command that writes the
+local intercom pairing config into the same `~/.jarvis/.env` file used by
+packaged services:
+
+```bash
+jarvis pair neil-laptop --mac-config --brain-host imac.private --identity neil
+```
+
+The command prints a `BRAIN_DEVICES` entry for the brain and a copy/paste shell
+snippet for the target Mac. The snippet upserts only the Jarvis pairing keys:
+`INTERCOM_BRAIN_HOST`, `INTERCOM_BRAIN_PORT`, `INTERCOM_TOKEN`,
+`CAPS_DEVICE_ID`, `CAPS_IDENTITY`, and `CAPS_SCOPE`.
 
 ## Network Model
 

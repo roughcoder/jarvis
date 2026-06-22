@@ -105,6 +105,52 @@ def render_pi_installer_command(
     )
 
 
+def render_mac_config_command(
+    *,
+    device_id: str,
+    token: str,
+    brain_host: str,
+    brain_port: str = "8700",
+    identity: str = "",
+    workdir: str = "$HOME/.jarvis",
+) -> str:
+    """Return copy/paste commands for configuring a paired Mac intercom."""
+    if not brain_host:
+        raise ValueError("brain_host is required")
+
+    scope = "personal" if identity else "house"
+    local_identity = identity or "house"
+    env_values = {
+        "INTERCOM_BRAIN_HOST": brain_host,
+        "INTERCOM_BRAIN_PORT": brain_port,
+        "INTERCOM_TOKEN": token,
+        "CAPS_DEVICE_ID": device_id,
+        "CAPS_IDENTITY": local_identity,
+        "CAPS_SCOPE": scope,
+    }
+    managed_keys = "|".join(env_values)
+    managed_block = "\n".join(
+        f"{key}={_dotenv_quote(value)}" for key, value in env_values.items()
+    )
+    return "\n".join(
+        [
+            f'JARVIS_WORKDIR="${{JARVIS_WORKDIR:-{workdir}}}"',
+            'mkdir -p "$JARVIS_WORKDIR"',
+            'JARVIS_ENV_FILE="$JARVIS_WORKDIR/.env"',
+            'JARVIS_TMP_FILE="$(mktemp)"',
+            'touch "$JARVIS_ENV_FILE"',
+            f"grep -v -E '^({managed_keys})=' "
+            '"$JARVIS_ENV_FILE" > "$JARVIS_TMP_FILE" || true',
+            'cat >> "$JARVIS_TMP_FILE" <<\'JARVIS_ENV\'',
+            managed_block,
+            "JARVIS_ENV",
+            'mv "$JARVIS_TMP_FILE" "$JARVIS_ENV_FILE"',
+            'chmod 0600 "$JARVIS_ENV_FILE"',
+            'echo "Jarvis Mac pairing config written to $JARVIS_ENV_FILE"',
+        ]
+    )
+
+
 def detect_platform() -> str:
     system = platform.system().lower()
     if system == "darwin":
@@ -302,6 +348,10 @@ def _xml_escape(value: str) -> str:
 
 
 def _systemd_escape(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _dotenv_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 

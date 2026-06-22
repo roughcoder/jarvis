@@ -966,17 +966,34 @@ def _cmd_service(args: argparse.Namespace) -> int:
 
 def _cmd_pair(args: argparse.Namespace) -> int:
     """Pairing helpers for fleet onboarding."""
-    from jarvis.deploy import issue_pairing_entry, render_pi_installer_command
+    from jarvis.deploy import (
+        issue_pairing_entry,
+        render_mac_config_command,
+        render_pi_installer_command,
+    )
 
     token, fragment = issue_pairing_entry(args.device_id, identity=args.identity or "")
     if args.json:
         import json
 
         payload = {"token": token, "brain_devices_entry": fragment}
-        if args.pi_installer:
+        if args.pi_installer or args.mac_config:
             if not args.brain_host:
-                print("--brain-host is required with --pi-installer", file=sys.stderr)
+                print(
+                    "--brain-host is required with --pi-installer or --mac-config",
+                    file=sys.stderr,
+                )
                 return 2
+        if args.mac_config:
+            payload["mac_config_command"] = render_mac_config_command(
+                device_id=args.device_id,
+                token=token,
+                brain_host=args.brain_host,
+                brain_port=args.brain_port,
+                identity=args.identity or "",
+                workdir=args.mac_workdir,
+            )
+        if args.pi_installer:
             payload["pi_installer_command"] = render_pi_installer_command(
                 device_id=args.device_id,
                 token=token,
@@ -986,23 +1003,39 @@ def _cmd_pair(args: argparse.Namespace) -> int:
                 ref=args.ref,
             )
         print(json.dumps(payload, indent=2))
-    elif args.pi_installer:
+    elif args.pi_installer or args.mac_config:
         if not args.brain_host:
-            print("--brain-host is required with --pi-installer", file=sys.stderr)
+            print(
+                "--brain-host is required with --pi-installer or --mac-config",
+                file=sys.stderr,
+            )
             return 2
         print("Add this object to BRAIN_DEVICES on the brain:")
         print(fragment)
-        print("\nRun this on the Raspberry Pi:")
-        print(
-            render_pi_installer_command(
-                device_id=args.device_id,
-                token=token,
-                brain_host=args.brain_host,
-                brain_port=args.brain_port,
-                repo=args.repo,
-                ref=args.ref,
+        if args.mac_config:
+            print("\nRun this on the Mac intercom/worker:")
+            print(
+                render_mac_config_command(
+                    device_id=args.device_id,
+                    token=token,
+                    brain_host=args.brain_host,
+                    brain_port=args.brain_port,
+                    identity=args.identity or "",
+                    workdir=args.mac_workdir,
+                )
             )
-        )
+        if args.pi_installer:
+            print("\nRun this on the Raspberry Pi:")
+            print(
+                render_pi_installer_command(
+                    device_id=args.device_id,
+                    token=token,
+                    brain_host=args.brain_host,
+                    brain_port=args.brain_port,
+                    repo=args.repo,
+                    ref=args.ref,
+                )
+            )
     else:
         print(f"Device: {args.device_id}")
         print(f"Token:  {token}")
@@ -1251,7 +1284,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print copy/paste Raspberry Pi installer commands",
     )
     p_pair.add_argument(
-        "--brain-host", default="", help="Brain hostname for --pi-installer"
+        "--mac-config",
+        action="store_true",
+        help="Print copy/paste Mac intercom/worker config commands",
+    )
+    p_pair.add_argument(
+        "--brain-host",
+        default="",
+        help="Brain hostname for --pi-installer or --mac-config",
     )
     p_pair.add_argument(
         "--brain-port", default="8700", help="Brain WebSocket port for --pi-installer"
@@ -1265,6 +1305,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--ref",
         default=None,
         help="Runtime branch/tag/ref for --pi-installer; defaults to this jarvis release tag",
+    )
+    p_pair.add_argument(
+        "--mac-workdir",
+        default="$HOME/.jarvis",
+        help="Mac service workdir for --mac-config",
     )
     p_pair.set_defaults(func=_cmd_pair)
 
