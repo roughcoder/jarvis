@@ -112,7 +112,7 @@ fi
 
 section "runtime checks"
 (cd "$ROOT_DIR" && uv run ruff check src/ tests/)
-(cd "$ROOT_DIR" && bash -n scripts/install_pi.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh)
+(cd "$ROOT_DIR" && bash -n scripts/install_mac.sh scripts/install_pi.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh)
 (cd "$ROOT_DIR" && uv run pytest tests/unit -q)
 
 section "app checks"

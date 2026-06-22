@@ -13,8 +13,8 @@ Homebrew packaging, onboarding, pairing, and updates.
 
 | Machine | Roles | Package path | Supervisor |
 |---|---|---|---|
-| iMac | `brain`, `worker`, optional local `intercom`, Docker services | `brew install jarvis` + `brew install --cask jarvis-app` | `launchd` |
-| Mac laptop | `intercom`, `worker` | `brew install jarvis` + `brew install --cask jarvis-app` | `launchd` |
+| iMac | `brain`, `worker`, optional local `intercom`, Docker services | Mac bootstrap + Jarvis Setup | `launchd` |
+| Mac laptop | `intercom`, `worker` | Mac bootstrap + Jarvis Setup | `launchd` |
 | Raspberry Pi | `intercom` | Pi installer / future image | `systemd` |
 
 The iMac brain is the local authority for device pairing. Each device has its own
@@ -53,6 +53,26 @@ jarvis pair kitchen-pi --json
 
 `jarvis service print ...` is the dry, inspectable form used by installers and
 tests. On macOS it renders `launchd` plists; on Linux it renders `systemd` units.
+
+## Mac Bootstrap
+
+Clean Macs should start with one public command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
+```
+
+The bootstrap installs Homebrew if needed, taps `roughcoder/infinite-stack`,
+installs or upgrades `jarvis`, installs or upgrades `jarvis-app`, clears app
+quarantine while the app is ad-hoc signed, and opens Jarvis. The Setup window
+then owns role choice, local service installation, and pairing.
+
+For scripted provisioning, roles can be installed during bootstrap:
+
+```bash
+JARVIS_ROLES="intercom worker" JARVIS_START_SERVICES=1 \
+  bash /tmp/install_jarvis_mac.sh
+```
 
 ## Onboarding Flow
 

@@ -115,6 +115,12 @@ repo or understanding `uv`: install the `jarvis` runtime package, install the
 `jarvis-app` native app, choose roles in the app, pair devices, and let Homebrew
 own runtime/app updates.
 
+Fresh Mac install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
+```
+
 ## Runtime Release
 
 Preferred release path: run the `Release` workflow in GitHub Actions with:
