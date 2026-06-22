@@ -1,12 +1,11 @@
-"""VAD — Silero voice activity detection (spec §4, §5).
+"""VAD — voice activity detection (spec §4, §5).
 
 ONE instance drives two jobs depending on state (spec §5):
   - ACTIVE LISTENING: endpointing (detect when the user has FINISHED talking).
   - SPEAKING: barge-in (detect when the user STARTS talking over Jarvis).
 
-Silero operates on 16kHz mono audio in fixed 512-sample (32ms) frames and
-returns a speech probability [0,1] per frame. Keep streaming frames through the
-same instance; call reset() between independent utterances.
+Backends return a speech probability [0,1] per frame. Keep streaming frames
+through the same instance; call reset() between independent utterances.
 """
 
 from __future__ import annotations
@@ -22,10 +21,22 @@ class SileroVAD:
         self._cfg = cfg
         self._model = None
         self._torch = None
+        self._webrtc = None
 
     def load(self) -> None:
+        if self._cfg.engine == "webrtc":
+            if self._webrtc is not None:
+                return
+            import webrtcvad
+
+            self._webrtc = webrtcvad.Vad(
+                max(0, min(3, int(self._cfg.webrtc_aggressiveness)))
+            )
+            return
+
         if self._model is not None:
             return
+
         import torch
         from silero_vad import load_silero_vad
 
@@ -38,8 +49,11 @@ class SileroVAD:
             self._model.reset_states()
 
     def prob(self, frame_int16: bytes) -> float:
-        """Speech probability for one 512-sample (16kHz, 16-bit mono) frame."""
+        """Speech probability for one 16kHz, 16-bit mono frame."""
         self.load()
+        if self._cfg.engine == "webrtc":
+            return self._webrtc_prob(frame_int16)
+
         import numpy as np
 
         arr = np.frombuffer(frame_int16, dtype=np.int16)
@@ -49,6 +63,19 @@ class SileroVAD:
             )
         tensor = self._torch.from_numpy(arr.astype("float32") / 32768.0)
         return float(self._model(tensor, 16000).item())
+
+    def _webrtc_prob(self, frame_int16: bytes) -> float:
+        # WebRTC VAD accepts 10/20/30ms frames. Jarvis currently captures 32ms
+        # frames for Silero/OpenWakeWord, so evaluate the first valid 30ms slice.
+        sample_rate = 16000
+        valid_lengths = (sample_rate * ms // 1000 * 2 for ms in (30, 20, 10))
+        for byte_len in valid_lengths:
+            if len(frame_int16) >= byte_len:
+                is_speech = self._webrtc.is_speech(
+                    frame_int16[:byte_len], sample_rate
+                )
+                return 1.0 if is_speech else 0.0
+        raise ValueError("WebRTC VAD needs at least 10ms of 16kHz PCM audio")
 
 
 class Endpointer:

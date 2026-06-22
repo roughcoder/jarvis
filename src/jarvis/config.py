@@ -150,10 +150,13 @@ class STTConfig(_Base):
 
 
 class VADConfig(_Base):
-    """Silero VAD (spec §4/§5). One instance drives endpointing AND barge-in."""
+    """Voice activity detection (spec §4/§5). One instance drives endpointing AND barge-in."""
 
     model_config = SettingsConfigDict(env_prefix="VAD_", env_file=".env", extra="ignore")
 
+    # engine: "silero" for Mac accuracy, "webrtc" for lightweight Raspberry Pi installs.
+    engine: str = "silero"
+    webrtc_aggressiveness: int = 2  # 0-3, higher is stricter
     # Tunables exposed from the start (spec §8).
     endpoint_silence_ms: int = 900        # trailing silence -> end of speech
     speech_threshold: float = 0.5         # endpointing sensitivity

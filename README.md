@@ -25,9 +25,11 @@ src/jarvis/
 ```
 
 ## Runtime
-Python is pinned to **3.12** (`.python-version`) via `uv`. The system default
-3.14 lacks wheels for the locked ML stack (torch / ctranslate2). This is a
-runtime-version pin, not a stack substitution — all spec §4 choices stand.
+Development and Homebrew installs use **Python 3.12** (`.python-version`) via
+`uv`. Raspberry Pi installs may use Raspberry Pi OS Bookworm's Python 3.11 so
+Linux wake-word wheels remain installable. The system default 3.14 lacks wheels
+for the locked ML stack (torch / ctranslate2). This is a runtime-version pin,
+not a stack substitution — all spec §4 choices stand.
 
 ## Quickstart
 ```bash

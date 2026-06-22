@@ -9,6 +9,7 @@ uv sync --dev \
   --extra tts \
   --extra stt \
   --extra vad \
+  --extra vad-lite \
   --extra wake \
   --extra memory \
   --extra worker \

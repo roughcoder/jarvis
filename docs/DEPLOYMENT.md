@@ -137,6 +137,8 @@ The Pi installer should:
 
 - install OS packages for audio, Python runtime support, and systemd service use
 - install the `jarvis` intercom runtime
+- use Raspberry Pi OS Python 3.11 plus the lightweight `vad-lite` WebRTC backend
+  instead of the Mac-only Silero/PyTorch VAD stack
 - install a `jarvis-pi` helper for update, restart, status, logs, and hardware
   readiness checks
 - detect microphone, speaker, and optional camera with `jarvis-pi doctor`

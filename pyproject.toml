@@ -1,9 +1,9 @@
 [project]
 name = "jarvis"
-version = "0.1.7"
+version = "0.1.8"
 description = "Jarvis — all-local voice assistant (Phase 1)"
 readme = "README.md"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.11,<3.13"
 dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
@@ -30,6 +30,9 @@ vad = [
     "silero-vad>=5.1",
     "torch>=2.2",
 ]
+vad-lite = [
+    "webrtcvad-wheels>=2.0.14",
+]
 wake = [
     "openwakeword>=0.6",
     "pvporcupine>=3.0",
@@ -43,7 +46,7 @@ worker = [
     "aiohttp>=3.9",
 ]
 # MCP bridge (Phase 3 §6) — the native MCP client. Brain-side only; provides the
-# stdio + streamable-http transports. Pure-Python, fine on the 3.12 pin.
+# stdio + streamable-http transports. Pure-Python, fine on the supported Python range.
 mcp = [
     "mcp>=1.2",
 ]
@@ -57,11 +60,12 @@ browser = [
 jarvis = "jarvis.cli:main"
 
 [tool.uv]
-# The audio / turn-loop tier always runs on the Mac (`hive`); Phase 2 only
-# relocates the Docker services. Restricting resolution to macOS drops a
-# Linux-only, cp312-less openwakeword sub-dependency (tflite-runtime) that we
-# don't use (we run openWakeWord on the ONNX backend).
-environments = ["sys_platform == 'darwin'"]
+# The Mac fleet installs from Homebrew. Room intercoms install the same runtime
+# on Raspberry Pi OS, so the lockfile must resolve for macOS and Linux arm64.
+environments = [
+    "sys_platform == 'darwin'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

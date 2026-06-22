@@ -14,6 +14,7 @@ Environment:
   JARVIS_BRAIN_PORT=8700                 Brain WebSocket port.
   JARVIS_INTERCOM_TOKEN=...              Token issued by the brain.
   JARVIS_UV_BIN=/usr/local/bin/uv         uv binary used by installed helpers.
+  JARVIS_PYTHON_BIN=python3               Python used by uv on Raspberry Pi OS.
   JARVIS_DRY_RUN=0                       Print commands instead of running.
   JARVIS_DRY_RUN_UV_INSTALLED=0          Dry-run uv install state.
   JARVIS_DRY_RUN_TMP_DIR=/tmp/jarvis-pi  Dry-run temporary directory.
@@ -55,6 +56,7 @@ BRAIN_HOST="${JARVIS_BRAIN_HOST:-}"
 BRAIN_PORT="${JARVIS_BRAIN_PORT:-8700}"
 INTERCOM_TOKEN="${JARVIS_INTERCOM_TOKEN:-}"
 UV_BIN="${JARVIS_UV_BIN:-/usr/local/bin/uv}"
+PYTHON_BIN="${JARVIS_PYTHON_BIN:-python3}"
 
 if [[ -z "$BRAIN_HOST" || -z "$INTERCOM_TOKEN" ]]; then
   echo "Set JARVIS_BRAIN_HOST and JARVIS_INTERCOM_TOKEN before installing." >&2
@@ -72,7 +74,8 @@ run apt-get install -y --no-install-recommends \
   python3-venv \
   build-essential \
   portaudio19-dev \
-  libasound2-dev
+  libasound2-dev \
+  alsa-utils
 
 if [[ "$DRY_RUN" == "1" ]]; then
   if [[ "$DRY_RUN_UV_INSTALLED" != "1" ]]; then
@@ -99,14 +102,15 @@ run tar -xzf "$archive" --strip-components=1 -C "$INSTALL_DIR"
 
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "+ cd $INSTALL_DIR"
-  run uv sync --no-dev --extra stt --extra vad --extra wake
+  run env UV_PYTHON="$PYTHON_BIN" UV_LINK_MODE=copy uv sync --no-dev --extra stt --extra vad-lite --extra wake
 else
   cd "$INSTALL_DIR"
-  uv sync --no-dev --extra stt --extra vad --extra wake
+  env UV_PYTHON="$PYTHON_BIN" UV_LINK_MODE=copy uv sync --no-dev --extra stt --extra vad-lite --extra wake
 fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "+ write $INSTALL_DIR/.env"
+  echo "+ set VAD_ENGINE=webrtc"
 else
   cat > "$INSTALL_DIR/.env" <<ENV
 INTERCOM_BRAIN_HOST=$BRAIN_HOST
@@ -115,6 +119,7 @@ INTERCOM_TOKEN=$INTERCOM_TOKEN
 CAPS_DEVICE_ID=$DEVICE_ID
 CAPS_IDENTITY=house
 CAPS_SCOPE=house
+VAD_ENGINE=webrtc
 ENV
 fi
 run chmod 0600 "$INSTALL_DIR/.env"
@@ -126,6 +131,7 @@ else
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$INSTALL_DIR"
+export UV_PYTHON="$PYTHON_BIN"
 exec "$UV_BIN" run jarvis "\$@"
 EOF
 fi
@@ -143,6 +149,7 @@ REPO="$REPO"
 REF="$REF"
 SERVICE="jarvis-intercom.service"
 UV_BIN="\${JARVIS_UV_BIN:-$UV_BIN}"
+PYTHON_BIN="\${JARVIS_PYTHON_BIN:-$PYTHON_BIN}"
 
 usage() {
   cat <<'PISCRIPT_USAGE'
@@ -217,7 +224,7 @@ case "\$cmd" in
     tar -xzf "\$archive" --strip-components=1 -C "\$source_dir"
     rsync -a --delete --exclude .env --exclude .venv --exclude jarvis-workspace "\$source_dir/" "\$INSTALL_DIR/"
     cd "\$INSTALL_DIR"
-    "\$UV_BIN" sync --no-dev --extra stt --extra vad --extra wake
+    env UV_PYTHON="\$PYTHON_BIN" UV_LINK_MODE=copy "\$UV_BIN" sync --no-dev --extra stt --extra vad-lite --extra wake
     systemctl daemon-reload
     systemctl restart "\$SERVICE"
     echo "Jarvis Pi runtime updated and \$SERVICE restarted."

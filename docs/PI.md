@@ -42,10 +42,10 @@ JARVIS_DRY_RUN=1 \
   bash scripts/install_pi.sh
 ```
 
-The current development fallback is still `uv sync --extra stt --extra vad
---extra wake` followed by `uv run jarvis run`, but the deployment target is a Pi
-installer or image that hides `uv`, writes local config, pairs the device, and
-installs the systemd unit.
+The Pi installer uses Raspberry Pi OS Python 3.11 with `UV_PYTHON=python3`,
+installs the `stt`, `vad-lite`, and `wake` extras, writes local config, pairs the
+device, and installs the systemd unit. `vad-lite` uses WebRTC VAD so a room Pi
+does not pull the full PyTorch/Silero stack.
 
 ## Updating and checking the Pi
 

@@ -44,13 +44,15 @@ def test_pi_installer_dry_run_models_intercom_install() -> None:
     assert "+ apt-get update" in result.stdout
     assert "+ apt-get install -y --no-install-recommends" in result.stdout
     assert "rsync" in result.stdout
+    assert "alsa-utils" in result.stdout
     assert "+ env UV_INSTALL_DIR=/usr/local/bin sh -c" in result.stdout
     assert "+ curl -fsSL https://github.com/roughcoder/jarvis/archive/main.tar.gz -o /tmp/jarvis-pi-test/jarvis.tar.gz" in result.stdout
     assert "+ mkdir -p /opt/jarvis-test" in result.stdout
     assert "+ tar -xzf /tmp/jarvis-pi-test/jarvis.tar.gz --strip-components=1 -C /opt/jarvis-test" in result.stdout
     assert "+ cd /opt/jarvis-test" in result.stdout
-    assert "+ uv sync --no-dev --extra stt --extra vad --extra wake" in result.stdout
+    assert "+ env UV_PYTHON=python3 UV_LINK_MODE=copy uv sync --no-dev --extra stt --extra vad-lite --extra wake" in result.stdout
     assert "+ write /opt/jarvis-test/.env" in result.stdout
+    assert "+ set VAD_ENGINE=webrtc" in result.stdout
     assert "+ chmod 0600 /opt/jarvis-test/.env" in result.stdout
     assert "+ write /usr/local/bin/jarvis" in result.stdout
     assert "+ chmod 0755 /usr/local/bin/jarvis" in result.stdout
@@ -67,4 +69,4 @@ def test_pi_installer_dry_run_skips_uv_install_when_present() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "astral.sh/uv/install.sh" not in result.stdout
-    assert "+ uv sync --no-dev --extra stt --extra vad --extra wake" in result.stdout
+    assert "+ env UV_PYTHON=python3 UV_LINK_MODE=copy uv sync --no-dev --extra stt --extra vad-lite --extra wake" in result.stdout
