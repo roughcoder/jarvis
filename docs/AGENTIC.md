@@ -91,6 +91,61 @@ Governing all ten, continuously: the **trust gate** (deny-by-default; "no
 limits" = the owner's full-caps profile on a trusted device) and
 **observability** (what's running, logs, traces, resume handles).
 
+### The inner loop — converge before you land (the part OpenClaw nails)
+
+Stages 5→6 are not a straight line; they are a **bounded self-correction loop**,
+and it is the single most important thing OpenClaw gets right. An autonomous
+build is only trustworthy if it *checks its own work and iterates until clean
+before it ever opens a PR* — not "generate once and hope". Zooming into stages
+5–7:
+
+```
+        ┌─────────────────────── fix & retry ───────────────────────┐
+        ↓                                                            │
+   (5) EXECUTE ──> run tests ──> self-review ──> VERIFICATION GATE ──┤
+   implement/edit   (build,        (a review     are we done?        │
+                    lint, tests)   engine — or    · tests green?      │
+                                   an ensemble)   · review: no        │
+                                                    accepted          │
+                                                    actionable        │
+                                                    findings?         │
+                                                  · acceptance        │
+                                                    criteria met? ────┘
+                                                       │ yes        │ no, but
+                                                       ↓            │ stuck /
+                                                  (7) LAND          │ N exceeded
+                                                                    ↓
+                                                            ESCALATE: report
+                                                            partial work +
+                                                            branch, ask the
+                                                            human (re-enter
+                                                            at Intake)
+```
+
+The discipline, made explicit (OpenClaw's coding-agent recipe, generalised):
+
+- **Exit predicate.** Land *only* when the Verification gate (P12) is satisfied:
+  tests/build pass **and** the review surfaces no *accepted actionable* findings
+  **and** the work item's acceptance criteria are met. "Accepted actionable" is
+  load-bearing — a finding the loop judges wrong or out-of-scope is recorded and
+  dismissed, not chased forever.
+- **Bounded.** A hard `max_iterations` (and a wall-clock/cost budget). The loop
+  must not be able to spin. Hitting the bound is not failure-silent: it
+  **escalates** — report the partial branch + what's still failing, and hand back
+  to the human (re-enter the cycle at Intake). This is the difference between
+  "ran out of time and stopped" and "claimed done when it wasn't".
+- **Isolated.** Every iteration runs in the P4 worktree, never the user's
+  checkout (OpenClaw's mandatory-isolated-checkout rule).
+- **One report, at the end.** The loop runs detached (P7) and emits exactly one
+  completion/failure message with the result + a resume handle (P11) — it does
+  not chatter per iteration (unless it needs to ask a question it genuinely
+  cannot answer alone).
+
+This nested loop sits *inside* the outer cycle. The **outer** loop is
+human-driven (stage 9 handoff: "address the review comments" re-enters at stage
+5); the **inner** loop is autonomous (converge before landing). Both must exist;
+conflating them is what the first draft of this doc got wrong.
+
 ---
 
 ## Part 2 — Two worked traces
@@ -267,6 +322,33 @@ jobs persist with `session_id` captured for `codex resume` (`jobs.py:42,135`);
 surfacing resume by voice. **Open:** how much detail reports back by voice vs
 stays queryable on demand.
 
+### P12 · Verification gate — *the inner loop's exit condition* ❌ — the part OpenClaw nails
+Role: stages 5→6→7 (the inner loop). The component that decides **done vs
+iterate**, and thereby makes autonomous work safe to land. It runs the checks and
+evaluates the exit predicate; the recipe (P8) loops on its verdict.
+
+```python
+@dataclass
+class Verdict:
+    passed: bool                  # land if True
+    tests_ok: bool
+    findings: list[Finding]       # each: accepted? actionable? where?
+    criteria_met: bool            # vs the WorkItem's acceptance criteria
+    iteration: int                # bounded by max_iterations
+    escalate: bool                # bound hit / genuinely stuck → hand to human
+
+async def verify(ws, item, *, review: Engine) -> Verdict: ...
+```
+
+Today: nothing first-class — a coding engine may run tests ad hoc, but there is
+no explicit gate, no "no accepted actionable findings" predicate, no bound, no
+escalation. This is the gap the inner-loop section above describes. **Gap:** the
+gate + its predicate + the bound/escalation policy. **Open:** what defines
+"accepted actionable" (model judgement vs rules)? Where do acceptance criteria
+come from — the work item (P6), or inferred? Is the reviewer in the gate the same
+ensemble as P3, or a cheaper dedicated checker? Tests: discovered (`make test`,
+CI config) or declared per repo?
+
 ---
 
 ## Part 4 — How the bits depend on each other
@@ -283,15 +365,18 @@ P1 Engine ──┬─> P3 Ensemble        (panel = many engines)
 P2 Target ──┬─> P4 Workspace       (isolate on the chosen target)
             └─> P8 Recipe          (a recipe picks a target)
 P4 Workspace ─> P5 Forge           (land from the worktree)
-P6 Work item ─> P5 Forge           (PR closes the item)
-P1+P2+P5+P6 ──> P8 Recipe ──> the cycle ──> P7 Async ──> P8 (iterate)
+P6 Work item ─> P12 Verify         (acceptance criteria come from the item)
+P3 Ensemble ──> P12 Verify         (the review in the gate can be an ensemble)
+P12 Verify ───> P8 Recipe          (recipe loops on the verdict: done vs iterate)
+P1+P2+P5+P6 ──> P8 Recipe ──> the inner loop (P12) ──> the cycle ──> P7 Async ──> P8 (iterate)
 P11 observes everything; P10 reports it.
 ```
 
 Foundations everything rides on: **P1 Engine** and **P2 Target**. The
-differentiator: **P3 Ensemble** (needs P1). The domain reach: **P5 Forge** +
-**P6 Work item**. Jarvis already owns P4, P7, P9, P10 and most of P11 — the
-expensive, boring half.
+differentiator: **P3 Ensemble** (needs P1). The trust-maker: **P12 Verification
+gate** (the inner loop OpenClaw nails — needs P3+P6+P8). The domain reach:
+**P5 Forge** + **P6 Work item**. Jarvis already owns P4, P7, P9, P10 and most of
+P11 — the expensive, boring half.
 
 ---
 
