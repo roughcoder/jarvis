@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - name: Sync test environment
-        run: uv sync --dev --extra gateway --extra tts --extra worker --extra mcp
+        run: scripts/sync_runtime_check_env.sh
       - name: Lint
         run: uv run ruff check src/ tests/
       - name: Unit tests

@@ -112,15 +112,16 @@ fi
 
 section "shell lint"
 if command -v shellcheck >/dev/null 2>&1; then
-  (cd "$ROOT_DIR" && shellcheck scripts/install_mac.sh scripts/install_pi.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh scripts/verify_public_readiness.sh)
+  (cd "$ROOT_DIR" && shellcheck scripts/install_mac.sh scripts/install_pi.sh scripts/sync_runtime_check_env.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh scripts/verify_public_readiness.sh)
   (cd "$APPLE_DIR" && shellcheck scripts/install_latest.sh scripts/release_github.sh scripts/build_release.sh scripts/update_homebrew_cask.sh)
 else
   echo "shellcheck not installed; skipping shell lint"
 fi
 
 section "runtime checks"
+"$ROOT_DIR/scripts/sync_runtime_check_env.sh"
 (cd "$ROOT_DIR" && uv run ruff check src/ tests/)
-(cd "$ROOT_DIR" && bash -n scripts/install_mac.sh scripts/install_pi.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh)
+(cd "$ROOT_DIR" && bash -n scripts/install_mac.sh scripts/install_pi.sh scripts/sync_runtime_check_env.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh)
 (cd "$ROOT_DIR" && uv run pytest tests/unit -q)
 
 section "app checks"

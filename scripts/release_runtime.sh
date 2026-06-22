@@ -108,8 +108,9 @@ if [[ -n "$(git status --porcelain -- . ':(exclude)dist')" ]]; then
   exit 1
 fi
 
+"$ROOT_DIR/scripts/sync_runtime_check_env.sh"
 uv run ruff check src/ tests/
-bash -n scripts/install_pi.sh scripts/verify_public_readiness.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh
+bash -n scripts/install_pi.sh scripts/sync_runtime_check_env.sh scripts/verify_public_readiness.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh
 uv run pytest tests/unit -q
 
 rm -rf "$DIST_DIR"
@@ -142,7 +143,11 @@ if ! git rev-parse "$TAG" >/dev/null 2>&1; then
 fi
 
 CURRENT_BRANCH="$(git branch --show-current)"
-git push origin "$CURRENT_BRANCH"
+if [[ -n "$CURRENT_BRANCH" ]]; then
+  git push origin "$CURRENT_BRANCH"
+else
+  echo "Detached HEAD: skipping branch push; ensure the release commit is already reachable from origin."
+fi
 git push origin "$TAG"
 
 if gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
@@ -170,4 +175,3 @@ elif [[ "$SKIP_HOMEBREW" == "1" ]]; then
 else
   "$ROOT_DIR/scripts/update_homebrew_formula.sh" "$VERSION" "$REPOSITORY"
 fi
-
