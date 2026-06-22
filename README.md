@@ -9,7 +9,7 @@ changing env vars only.
 ## Two hard constraints (spec §3)
 1. **Everything talks over a network boundary**, even on localhost. Hosts/ports
    are env-driven (`GATEWAY_HOST`, `MEMORY_HOST`, `DB_HOST`, …). No in-process
-   shortcuts. Phase 2 = swap those vars to Tailscale hostnames.
+   shortcuts. Phase 2 = swap those vars to Twingate/private-network hostnames.
 2. **The hot path never blocks on a memory write.** Hot path reads a *local
    cache*; memory writes + background reasoning are fire-and-forget cold path.
 
@@ -105,7 +105,7 @@ Per-step extras install as each build step is reached, e.g.
   readiness gates and required scans.
 - **[docs/PHASE2.md](docs/PHASE2.md)** — the Frankfurt migration spec; the
   readiness test is its entry gate.
-- **[docs/FLEET.md](docs/FLEET.md)** — Mac mini / laptop / Pi service deployment,
+- **[docs/FLEET.md](docs/FLEET.md)** — iMac / laptop / Pi service deployment,
   status contract, and update shape.
 - **[docs/SWIFT_TOOLBAR_SPEC.md](docs/SWIFT_TOOLBAR_SPEC.md)** — handoff spec for
   the separate native macOS menu bar app.
