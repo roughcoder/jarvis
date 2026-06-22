@@ -64,6 +64,63 @@ The Swift menu bar app targets installed/service mode. Day-to-day coding should
 stay manual unless you are specifically testing the toolbar or the launchd
 lifecycle.
 
+## Homebrew Runtime Install
+
+Mac runtime distribution should live in the Homebrew tap repository
+`roughcoder/homebrew-infinite-stack`. Homebrew exposes that as the tap
+`roughcoder/infinite-stack`:
+
+```bash
+brew tap roughcoder/infinite-stack
+brew install jarvis
+```
+
+Use `jarvis` for the runtime package: the brain, worker, intercom, CLI/runtime
+bootstrapper, and service templates.
+
+Reserve `jarvis-app` for the native Mac desktop/menu bar app from
+`roughcoder/jarvis-apple`. That keeps the Homebrew names aligned with the split:
+
+| Package | Owns |
+|---|---|
+| `jarvis-app` | Native macOS desktop/menu bar app |
+| `jarvis` | Brain, workers, intercoms, CLI/runtime bootstrapper |
+
+The tap can still add narrower packages later, such as `jarvis-cli`,
+`jarvis-worker`, or `jarvis-agent`, if the runtime needs to split.
+
+Homebrew should own:
+
+- the `jarvis` command or launcher
+- runtime support files
+- launchd service templates
+- upgradeable package metadata
+
+Homebrew should not own:
+
+- `.env` secrets
+- pairing tokens
+- device role choice
+- device/user profile contents
+- worker repo roots
+- Docker service state
+
+Those remain local machine configuration. A Mac mini, laptop, and future Mac
+desktop install the same formula but enable different roles.
+
+Example role setup after installing the formula:
+
+```bash
+jarvis service install brain
+jarvis service install worker
+jarvis service install intercom
+jarvis service start brain
+jarvis fleet-status --json
+```
+
+The exact `jarvis service ...` commands are the intended interface for the
+formula/bootstrapper. Until they exist, use the launchd templates below directly.
+
 ## Status Contract
 
 The Swift app should poll:
