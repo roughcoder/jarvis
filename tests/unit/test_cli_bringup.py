@@ -1,5 +1,6 @@
 import json
 
+from jarvis import __version__
 from jarvis.cli import main
 
 
@@ -194,3 +195,44 @@ def test_bringup_summary_output_writes_summary_file(capsys, tmp_path) -> None:
 
     assert code == 0
     assert repeated["file_count"] == 1
+
+
+def test_bringup_summary_expect_current_release_rejects_old_evidence(
+    capsys, tmp_path
+) -> None:
+    old_version = "0.0.1"
+    assert old_version != __version__
+    (tmp_path / "old.json").write_text(
+        json.dumps(
+            {
+                "jarvis_version": old_version,
+                "release_ref": f"v{old_version}",
+                "platform": "launchd",
+                "roles": ["brain"],
+                "packages": {"jarvis": {"ok": True}},
+                "services": {"brain": {"ok": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = main(
+        [
+            "bringup-summary",
+            str(tmp_path),
+            "--json",
+            "--expect-current-release",
+        ]
+    )
+
+    output = capsys.readouterr()
+    payload = json.loads(output.out)
+
+    assert code == 1
+    assert payload["expected_version"] == __version__
+    assert payload["expected_release_ref"] == f"v{__version__}"
+    assert f"expected Jarvis version {__version__}, found: {old_version}" in payload["issues"]
+    assert (
+        f"expected Jarvis release ref v{__version__}, found: v{old_version}"
+        in payload["issues"]
+    )

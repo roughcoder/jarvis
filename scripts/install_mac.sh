@@ -238,6 +238,7 @@ fi
 
 cat <<'NEXT'
   jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence \
-    --expect-role brain --expect-role worker --expect-role intercom --min-files 4 \
+    --expect-role brain --expect-role worker --expect-role intercom \
+    --expect-current-release --min-files 4 \
     --output ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json
 NEXT

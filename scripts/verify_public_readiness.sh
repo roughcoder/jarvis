@@ -187,7 +187,7 @@ scan_docs_preview() {
       git -C "$ROOT_DIR" grep -q -- '--pi-installer --brain-host imac.private' -- docs-site/index.html || echo "docs-site/index.html missing release-style Pi pairing command"
       git -C "$ROOT_DIR" grep -q -- '--brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence' -- docs-site/index.html || echo "docs-site/index.html missing brain host in bring-up evidence command"
       git -C "$ROOT_DIR" grep -q -- '--output ~/Desktop/jarvis-bringup-evidence' -- docs-site/index.html || echo "docs-site/index.html missing bring-up evidence output command"
-      git -C "$ROOT_DIR" grep -q -- '--min-files 4 --output ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json' -- docs-site/index.html || echo "docs-site/index.html missing bring-up summary output command"
+      git -C "$ROOT_DIR" grep -q -- '--expect-current-release --min-files 4 --output ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json' -- docs-site/index.html || echo "docs-site/index.html missing current-release bring-up summary output command"
       git -C "$ROOT_DIR" grep -q 'sudo jarvis-pi update' -- docs-site/index.html || echo "docs-site/index.html missing Pi update command"
       git -C "$ROOT_DIR" grep -q 'actions/deploy-pages@v4' -- .github/workflows/pages.yml || echo ".github/workflows/pages.yml missing Pages deploy action"
     } || true

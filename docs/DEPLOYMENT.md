@@ -151,7 +151,7 @@ ship a prebuilt image.
 Target flow:
 
 ```bash
-JARVIS_REF=v0.1.18
+JARVIS_REF=v0.1.19
 curl -fsSL "https://raw.githubusercontent.com/roughcoder/jarvis/$JARVIS_REF/scripts/install_pi.sh" \
   -o /tmp/install_jarvis_pi.sh
 sudo JARVIS_BRAIN_HOST=imac.private \

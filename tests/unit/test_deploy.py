@@ -320,6 +320,48 @@ def test_summarize_bringup_evidence_flags_mixed_versions_and_refs(tmp_path) -> N
     assert "mixed Jarvis release refs in evidence: v0.1.15, v0.1.16" in summary["issues"]
 
 
+def test_summarize_bringup_evidence_flags_unexpected_version_and_ref(tmp_path) -> None:
+    (tmp_path / "imac.json").write_text(
+        json.dumps(
+            {
+                "jarvis_version": "0.1.16",
+                "release_ref": "v0.1.16",
+                "platform": "launchd",
+                "roles": ["brain", "worker"],
+                "packages": {"jarvis": {"ok": True}, "jarvis-app": {"ok": True}},
+                "services": {"brain": {"ok": True}, "worker": {"ok": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "pi.json").write_text(
+        json.dumps(
+            {
+                "jarvis_version": "0.1.16",
+                "release_ref": "v0.1.16",
+                "platform": "systemd",
+                "roles": ["intercom"],
+                "packages": {"brew": {"available": False, "reason": "brew not found"}},
+                "services": {"intercom": {"ok": True}},
+                "brain_status": {"reachable": True, "paired": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = summarize_bringup_evidence(
+        tmp_path,
+        expected_version="0.1.17",
+        expected_release_ref="v0.1.17",
+    )
+
+    assert summary["ok"] is False
+    assert summary["versions_seen"] == ["0.1.16"]
+    assert summary["release_refs_seen"] == ["v0.1.16"]
+    assert "expected Jarvis version 0.1.17, found: 0.1.16" in summary["issues"]
+    assert "expected Jarvis release ref v0.1.17, found: v0.1.16" in summary["issues"]
+
+
 def test_issue_pairing_entry_returns_brain_devices_fragment() -> None:
     token, fragment = issue_pairing_entry("kitchen-pi")
     entry = json.loads(fragment)

@@ -550,6 +550,8 @@ def summarize_bringup_evidence(
     path: str | Path,
     *,
     expected_roles: list[str] | tuple[str, ...] | set[str] = (),
+    expected_version: str = "",
+    expected_release_ref: str = "",
     min_files: int = 0,
 ) -> dict[str, object]:
     """Summarize redacted bring-up JSON files without copying raw command output."""
@@ -641,16 +643,36 @@ def summarize_bringup_evidence(
         issues.append(
             "mixed Jarvis versions in evidence: " + ", ".join(sorted(versions_seen))
         )
+    if expected_version:
+        if not versions_seen:
+            issues.append(f"missing expected Jarvis version evidence: {expected_version}")
+        elif versions_seen != {expected_version}:
+            issues.append(
+                "expected Jarvis version "
+                f"{expected_version}, found: {', '.join(sorted(versions_seen))}"
+            )
     if len(release_refs_seen) > 1:
         issues.append(
             "mixed Jarvis release refs in evidence: " + ", ".join(sorted(release_refs_seen))
         )
+    if expected_release_ref:
+        if not release_refs_seen:
+            issues.append(
+                f"missing expected Jarvis release ref evidence: {expected_release_ref}"
+            )
+        elif release_refs_seen != {expected_release_ref}:
+            issues.append(
+                "expected Jarvis release ref "
+                f"{expected_release_ref}, found: {', '.join(sorted(release_refs_seen))}"
+            )
 
     return {
         "path": str(target),
         "ok": not issues,
         "file_count": len(entries),
         "expected_roles": list(expected_roles),
+        "expected_version": expected_version,
+        "expected_release_ref": expected_release_ref,
         "roles_seen": [role for role in ROLES if role in roles_seen],
         "platforms_seen": sorted(platforms_seen),
         "versions_seen": sorted(versions_seen),

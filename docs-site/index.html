@@ -65,7 +65,7 @@
       <section class="release-strip" aria-label="Current public releases">
         <div>
           <span>Runtime</span>
-          <strong>jarvis 0.1.18</strong>
+          <strong>jarvis 0.1.19</strong>
         </div>
         <div>
           <span>macOS app</span>
@@ -73,7 +73,7 @@
         </div>
         <div>
           <span>Pi installer</span>
-          <strong>JARVIS_REF=v0.1.18</strong>
+          <strong>JARVIS_REF=v0.1.19</strong>
         </div>
       </section>
 
@@ -147,7 +147,7 @@
           </article>
           <article>
             <span>3</span>
-            <p>Issue the Pi installer from the iMac and run the generated command on the Pi. It must include JARVIS_REF=v0.1.18.</p>
+            <p>Issue the Pi installer from the iMac and run the generated command on the Pi. It must include JARVIS_REF=v0.1.19.</p>
           </article>
           <article>
             <span>4</span>
@@ -192,7 +192,7 @@
           <span>brew upgrade jarvis</span>
           <span>jarvis service sync brain worker intercom</span>
           <span>jarvis bringup --json --role brain --role worker --role intercom --hardware --brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence</span>
-          <span>jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence --expect-role brain --expect-role worker --expect-role intercom --min-files 4 --output ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json</span>
+          <span>jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence --expect-role brain --expect-role worker --expect-role intercom --expect-current-release --min-files 4 --output ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json</span>
           <span>brew upgrade --cask jarvis-app</span>
           <span>sudo jarvis-pi update</span>
         </div>

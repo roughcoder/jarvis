@@ -950,11 +950,21 @@ def _cmd_bringup_summary(args: argparse.Namespace) -> int:
     """Summarize a folder of redacted physical bring-up evidence files."""
     import json
 
+    from jarvis import __version__
     from jarvis.deploy import summarize_bringup_evidence
+    from jarvis.deploy import current_release_ref
+
+    expected_version = args.expect_version or ""
+    expected_release_ref = args.expect_release_ref or ""
+    if args.expect_current_release:
+        expected_version = __version__
+        expected_release_ref = current_release_ref()
 
     data = summarize_bringup_evidence(
         args.path,
         expected_roles=args.expected_roles or (),
+        expected_version=expected_version,
+        expected_release_ref=expected_release_ref,
         min_files=args.min_files,
     )
     output_path: str | None = None
@@ -1490,6 +1500,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         choices=["brain", "intercom", "worker"],
         help="Require at least one evidence file containing this role; repeatable",
+    )
+    p_bringup_summary.add_argument(
+        "--expect-version",
+        default="",
+        help="Require every evidence file to report this Jarvis runtime version",
+    )
+    p_bringup_summary.add_argument(
+        "--expect-release-ref",
+        default="",
+        help="Require every evidence file to report this Jarvis release ref",
+    )
+    p_bringup_summary.add_argument(
+        "--expect-current-release",
+        action="store_true",
+        help="Require evidence to match this installed Jarvis version and release tag",
     )
     p_bringup_summary.add_argument(
         "--min-files",

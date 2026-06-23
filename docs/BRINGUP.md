@@ -27,7 +27,8 @@ single summary gate:
 
 ```bash
 jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence \
-  --expect-role brain --expect-role worker --expect-role intercom --min-files 4 \
+  --expect-role brain --expect-role worker --expect-role intercom \
+  --expect-current-release --min-files 4 \
   --output ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json
 ```
 
@@ -90,7 +91,7 @@ on the private network.
    jarvis pair kitchen-pi --json --pi-installer --brain-host imac.private
    ```
 
-   Run the generated command on the Pi. It must include `JARVIS_REF=v0.1.18`.
+   Run the generated command on the Pi. It must include `JARVIS_REF=v0.1.19`.
    Then on the Pi:
 
    ```bash
@@ -106,7 +107,8 @@ on the private network.
    jarvis bringup --json --role brain --role worker --role intercom --hardware \
      --brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence
    jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence \
-     --expect-role brain --expect-role worker --expect-role intercom --min-files 4 \
+     --expect-role brain --expect-role worker --expect-role intercom \
+     --expect-current-release --min-files 4 \
      --output ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json
    ```
 
@@ -240,7 +242,7 @@ jarvis pair kitchen-pi --json --pi-installer --brain-host imac.private
 ```
 
 Run the generated Pi installer command on the Pi. It should include a release tag
-such as `JARVIS_REF=v0.1.18`, not a development-only `main` ref.
+such as `JARVIS_REF=v0.1.19`, not a development-only `main` ref.
 
 Proof:
 
@@ -310,5 +312,6 @@ Deployment readiness is physically proven only after:
 - one app update succeeds through the cask or in-app Homebrew updater
 - one Pi update succeeds through `sudo jarvis-pi update`
 - `jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence --expect-role brain
-  --expect-role worker --expect-role intercom --min-files 4 --output
+  --expect-role worker --expect-role intercom --expect-current-release
+  --min-files 4 --output
   ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json` passes
