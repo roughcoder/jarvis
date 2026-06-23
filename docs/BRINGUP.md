@@ -27,10 +27,12 @@ single summary gate:
 
 ```bash
 jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence \
-  --expect-role brain --expect-role worker --expect-role intercom --min-files 4
+  --expect-role brain --expect-role worker --expect-role intercom --min-files 4 \
+  --output ~/Desktop/jarvis-bringup-evidence
 ```
 
-Use `--json` when saving the final acceptance summary for automation.
+This writes `jarvis-fleet-summary.json` in the evidence folder. Add `--json` if
+you want the same summary printed to stdout for automation.
 
 ## iMac Brain
 
@@ -137,7 +139,7 @@ jarvis pair kitchen-pi --json --pi-installer --brain-host imac.private
 ```
 
 Run the generated Pi installer command on the Pi. It should include a release tag
-such as `JARVIS_REF=v0.1.11`, not a development-only `main` ref.
+such as `JARVIS_REF=v0.1.12`, not a development-only `main` ref.
 
 Proof:
 
@@ -204,5 +206,5 @@ Deployment readiness is physically proven only after:
 - one app update succeeds through the cask or in-app Homebrew updater
 - one Pi update succeeds through `sudo jarvis-pi update`
 - `jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence --expect-role brain
-  --expect-role worker --expect-role intercom --min-files 4` passes against the
-  collected redacted evidence files
+  --expect-role worker --expect-role intercom --min-files 4 --output
+  ~/Desktop/jarvis-bringup-evidence` passes and writes `jarvis-fleet-summary.json`

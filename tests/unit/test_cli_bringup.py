@@ -138,3 +138,58 @@ def test_bringup_summary_json_returns_nonzero_for_missing_role(capsys, tmp_path)
     assert payload["ok"] is False
     assert "missing expected role evidence: worker" in payload["issues"]
     assert "expected at least 2 evidence file(s), found 1" in payload["issues"]
+
+
+def test_bringup_summary_output_writes_summary_file(capsys, tmp_path) -> None:
+    (tmp_path / "imac.json").write_text(
+        json.dumps(
+            {
+                "jarvis_version": "0.1.test",
+                "release_ref": "v0.1.test",
+                "platform": "launchd",
+                "roles": ["brain", "worker", "intercom"],
+                "packages": {"jarvis": {"ok": True}, "jarvis-app": {"ok": True}},
+                "services": {
+                    "brain": {"ok": True},
+                    "worker": {"ok": True},
+                    "intercom": {"ok": True},
+                },
+                "hardware": {"audio": {"ok": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = main(
+        [
+            "bringup-summary",
+            str(tmp_path),
+            "--json",
+            "--expect-role",
+            "brain",
+            "--expect-role",
+            "worker",
+            "--expect-role",
+            "intercom",
+            "--min-files",
+            "1",
+            "--output",
+            str(tmp_path),
+        ]
+    )
+
+    output = capsys.readouterr()
+    payload = json.loads(output.out)
+    summary_path = tmp_path / "jarvis-fleet-summary.json"
+    saved = json.loads(summary_path.read_text(encoding="utf-8"))
+
+    assert code == 0
+    assert payload["summary_path"] == str(summary_path)
+    assert saved == payload
+    assert saved["file_count"] == 1
+
+    code = main(["bringup-summary", str(tmp_path), "--json", "--min-files", "1"])
+    repeated = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert repeated["file_count"] == 1

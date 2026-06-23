@@ -472,6 +472,8 @@ def summarize_bringup_evidence(
         if not isinstance(data, dict):
             issues.append(f"{file}: evidence root is not an object")
             continue
+        if _is_bringup_summary(data):
+            continue
 
         roles = [str(role) for role in data.get("roles", []) if isinstance(role, str)]
         roles_seen.update(roles)
@@ -550,6 +552,16 @@ def _only_missing_brew(value: object) -> bool:
         return False
     report = value.get("brew")
     return isinstance(report, dict) and report.get("available") is False
+
+
+def _is_bringup_summary(value: dict[str, object]) -> bool:
+    return (
+        "entries" in value
+        and "file_count" in value
+        and "issues" in value
+        and "roles_seen" in value
+        and "roles" not in value
+    )
 
 
 def _hardware_summary_ok(value: object) -> bool:

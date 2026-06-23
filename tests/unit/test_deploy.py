@@ -209,6 +209,41 @@ def test_summarize_bringup_evidence_accepts_pi_without_brew(tmp_path) -> None:
     assert summary["entries"][0]["brain_paired"] is True
 
 
+def test_summarize_bringup_evidence_ignores_previous_summary_files(tmp_path) -> None:
+    (tmp_path / "imac.json").write_text(
+        json.dumps(
+            {
+                "jarvis_version": "0.1.test",
+                "release_ref": "v0.1.test",
+                "platform": "launchd",
+                "roles": ["brain"],
+                "packages": {"jarvis": {"ok": True}},
+                "services": {"brain": {"ok": True}},
+                "hardware": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "jarvis-fleet-summary.json").write_text(
+        json.dumps(
+            {
+                "path": str(tmp_path),
+                "ok": True,
+                "file_count": 1,
+                "roles_seen": ["brain"],
+                "entries": [],
+                "issues": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = summarize_bringup_evidence(tmp_path)
+
+    assert summary["file_count"] == 1
+    assert summary["roles_seen"] == ["brain"]
+
+
 def test_issue_pairing_entry_returns_brain_devices_fragment() -> None:
     token, fragment = issue_pairing_entry("kitchen-pi")
     entry = json.loads(fragment)

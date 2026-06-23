@@ -956,6 +956,11 @@ def _cmd_bringup_summary(args: argparse.Namespace) -> int:
         expected_roles=args.expected_roles or (),
         min_files=args.min_files,
     )
+    output_path: str | None = None
+    if args.output:
+        output_path = _resolve_bringup_summary_path(args.output)
+        data["summary_path"] = output_path
+        _write_bringup_summary(data, output_path)
     if args.json:
         print(json.dumps(data, indent=2, sort_keys=True))
         return 0 if data["ok"] else 1
@@ -985,9 +990,33 @@ def _cmd_bringup_summary(args: argparse.Namespace) -> int:
         print("\nIssues:")
         for issue in issues:
             print(f"  - {issue}")
+        if output_path:
+            print(f"\nSummary: {output_path}")
         return 1
+    if output_path:
+        print(f"\nSummary: {output_path}")
     print("\nAll summarized evidence checks passed.")
     return 0
+
+
+def _resolve_bringup_summary_path(output: str) -> str:
+    """Return a summary file path from a chosen file or directory."""
+    from pathlib import Path
+
+    target = Path(output).expanduser()
+    path = target if target.suffix.lower() == ".json" else target / "jarvis-fleet-summary.json"
+    return str(path)
+
+
+def _write_bringup_summary(data: dict[str, object], output_path: str) -> str:
+    """Write summary JSON to the resolved output path."""
+    import json
+    from pathlib import Path
+
+    path = Path(output_path).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return str(path)
 
 
 def _cmd_traces(args: argparse.Namespace) -> int:
@@ -1437,6 +1466,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Require at least this many valid evidence files",
+    )
+    p_bringup_summary.add_argument(
+        "--output",
+        default="",
+        help=(
+            "Write the summary JSON to this .json file, or to "
+            "jarvis-fleet-summary.json when a directory is provided"
+        ),
     )
     p_bringup_summary.set_defaults(func=_cmd_bringup_summary)
 
