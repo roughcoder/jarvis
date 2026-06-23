@@ -49,7 +49,7 @@ run() {
     printf ' %q' "$@"
     printf '\n'
   else
-    "$@"
+    "$@" </dev/null
   fi
 }
 
@@ -81,13 +81,13 @@ if ! BREW_PATH="$(find_brew)"; then
     run /bin/bash -c "<homebrew install script>"
     BREW_PATH="${JARVIS_BREW_PATH:-/opt/homebrew/bin/brew}"
   else
-    NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
     BREW_PATH="$(find_brew)"
   fi
 fi
 
 if [[ "$DRY_RUN" != "1" ]]; then
-  eval "$("$BREW_PATH" shellenv)"
+  eval "$("$BREW_PATH" shellenv </dev/null)"
   BREW_PATH="$(command -v brew)"
 fi
 
@@ -98,23 +98,23 @@ echo "Trusting Jarvis Homebrew entries"
 if [[ "$DRY_RUN" == "1" ]]; then
   run "$BREW_PATH" trust --formula "$TAP/$RUNTIME_FORMULA"
   run "$BREW_PATH" trust --cask "$TAP/$APP_CASK"
-elif "$BREW_PATH" help trust >/dev/null 2>&1; then
-  "$BREW_PATH" trust --formula "$TAP/$RUNTIME_FORMULA" || true
-  "$BREW_PATH" trust --cask "$TAP/$APP_CASK" || true
+elif "$BREW_PATH" help trust >/dev/null 2>&1 </dev/null; then
+  run "$BREW_PATH" trust --formula "$TAP/$RUNTIME_FORMULA" || true
+  run "$BREW_PATH" trust --cask "$TAP/$APP_CASK" || true
 fi
 
 echo "Installing Jarvis runtime"
 if [[ "$DRY_RUN" == "1" ]]; then
   run "$BREW_PATH" install "$RUNTIME_FORMULA"
 else
-  "$BREW_PATH" install "$RUNTIME_FORMULA" || "$BREW_PATH" upgrade "$RUNTIME_FORMULA"
+  run "$BREW_PATH" install "$RUNTIME_FORMULA" || run "$BREW_PATH" upgrade "$RUNTIME_FORMULA"
 fi
 
 echo "Installing Jarvis app"
 if [[ "$DRY_RUN" == "1" ]]; then
   run "$BREW_PATH" install --cask "$APP_CASK"
 else
-  "$BREW_PATH" install --cask "$APP_CASK" || "$BREW_PATH" upgrade --cask "$APP_CASK" || true
+  run "$BREW_PATH" install --cask "$APP_CASK" || run "$BREW_PATH" upgrade --cask "$APP_CASK" || true
 fi
 
 echo "Preparing Jarvis workdir"
