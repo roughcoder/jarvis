@@ -151,18 +151,58 @@ jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence \
 
 Preferred release path: run the `Release` workflow in GitHub Actions with:
 
-- `version`: the runtime version from `pyproject.toml`
 - `draft`: whether the GitHub release should remain draft
 - `skip_homebrew`: whether to skip the tap update
 
-The workflow builds a `jarvis-<version>.tar.gz` source archive, publishes the
-GitHub Release, uploads release artifacts, and updates
-`roughcoder/homebrew-infinite-stack` when `skip_homebrew` is false. The tap
-update requires a repository secret named `HOMEBREW_TAP_TOKEN` with write access
-to the tap.
+The workflow computes the runtime version automatically from Conventional
+Commits (based on the latest `vX.Y.Z` tag), then builds a
+`jarvis-<version>.tar.gz` source archive, publishes the GitHub Release, uploads
+release artifacts, and updates `roughcoder/homebrew-infinite-stack` when
+`skip_homebrew` is false.
+
+Workflow inputs are now limited to:
+
+- `draft`: whether the GitHub release should remain draft
+- `skip_homebrew`: whether to skip the tap update
+
+Versioning rules:
+
+- `feat(...)` increments minor
+- `fix(...)`, `chore(...)`, `docs(...)`, `style(...)`, `refactor(...)`,
+  `test(...)`, `perf(...)`, `build(...)`, `ci(...)`, `revert(...)` increment patch
+- `!` in the subject or `BREAKING CHANGE:` in the body increments major
+
+The tap update requires a repository secret named `HOMEBREW_TAP_TOKEN` with write
+access to the tap.
+
+If your branch contains any non-Conventional Commit messages, they can be
+ignored during version calculation by default; set
+`JARVIS_IGNORE_NON_CONVENTIONAL_COMMITS=0` for strict behavior.
 
 Local fallback:
 
 ```bash
 scripts/release_runtime.sh 0.1.5
+```
+
+## Conventional Commits (local)
+
+Install the local commit hook once:
+
+```bash
+scripts/install_commit_hook.sh
+```
+
+Commits must be in Conventional Commit format, for example:
+
+```text
+feat: add new runtime installer check
+```
+
+This is enforced in CI and by the local commit hook.
+
+Quick local check to verify your branch before release:
+
+```bash
+scripts/check_conventional_commits.sh $(git describe --tags --abbrev=0) HEAD
 ```

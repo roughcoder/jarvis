@@ -7,6 +7,33 @@ on:
   workflow_dispatch:
 
 jobs:
+  conventional-commits:
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check conventional commits
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base_ref="${{ github.event.pull_request.base.sha }}"
+            head_ref="${{ github.event.pull_request.head.sha }}"
+          else
+            base_ref="${{ github.event.before }}"
+            head_ref="${{ github.sha }}"
+          fi
+
+          if [[ -z "$base_ref" || "$base_ref" == "0000000000000000000000000000000000000000" ]]; then
+            echo "No base commit for comparison; skipping convention check."
+            exit 0
+          fi
+
+          scripts/check_conventional_commits.sh "$base_ref" "$head_ref"
+
   python:
     runs-on: macos-14
     steps:

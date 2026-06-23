@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+  echo "commit-msg hook requires the commit message file path." >&2
+  exit 1
+fi
+
+message_file="$1"
+subject="$(sed -n '1p' "$message_file" | tr -d '\r' | sed 's/[[:space:]]\+$//')"
+
+if [[ -z "$subject" ]]; then
+  echo "Conventional commit check failed: empty commit message subject." >&2
+  exit 1
+fi
+
+if ! printf '%s\n' "$subject" | grep -Eq '^[a-z]+(\([^)]+\))?(!)?:[[:space:]]+.+$'; then
+  echo "Conventional commit check failed: invalid commit message subject." >&2
+  echo "  $subject" >&2
+  echo "Expected: <type>(<scope>)?: <description>" >&2
+  echo "Allowed types: feat, fix, chore, docs, style, refactor, test, perf, build, ci, revert" >&2
+  exit 1
+fi
+
+type="$(printf '%s' "$subject" | sed -E 's/^([a-z]+)(\([^)]+\))?(!)?:[[:space:]]+.+$/\1/')"
+
+case "$type" in
+  feat|fix|chore|docs|style|refactor|test|perf|build|ci|revert)
+    ;;
+  *)
+    echo "Conventional commit check failed: invalid type '${type}' in subject." >&2
+    echo "  $subject" >&2
+    echo "Allowed types: feat, fix, chore, docs, style, refactor, test, perf, build, ci, revert" >&2
+    exit 1
+    ;;
+esac

@@ -3,10 +3,6 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Release version, with or without v prefix"
-        required: true
-        type: string
       draft:
         description: "Create the GitHub release as a draft"
         required: true
@@ -23,6 +19,8 @@ permissions:
 
 jobs:
   release:
+    outputs:
+      release-version: ${{ steps.compute-version.outputs.release_version }}
     runs-on: macos-14
     env:
       GH_TOKEN: ${{ github.token }}
@@ -34,10 +32,18 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
+      - name: Compute next version
+        id: compute-version
+        run: |
+          set -euo pipefail
+          version="$(scripts/compute_next_release_version.sh)"
+          echo "release_version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Computed release version: ${version}"
+
       - name: Build and publish runtime release
         run: |
           set -euo pipefail
-          args=("${{ inputs.version }}" "--skip-homebrew")
+          args=("${{ steps.compute-version.outputs.release_version }}" "--skip-homebrew")
           if [[ "${{ inputs.draft }}" == "true" ]]; then
             args+=("--draft")
           fi
@@ -46,7 +52,7 @@ jobs:
       - name: Upload runtime release artifacts to workflow run
         uses: actions/upload-artifact@v4
         with:
-          name: jarvis-runtime-${{ inputs.version }}
+          name: jarvis-runtime-${{ steps.compute-version.outputs.release_version }}
           path: |
             dist/jarvis-*.tar.gz
             dist/jarvis-*.tar.gz.sha256
@@ -88,5 +94,4 @@ jobs:
 
       - name: Update Homebrew formula
         working-directory: jarvis
-        run: scripts/update_homebrew_formula.sh "${{ inputs.version }}" "${{ github.repository }}"
-
+        run: scripts/update_homebrew_formula.sh "${{ needs.release.outputs.release-version }}" "${{ github.repository }}"
