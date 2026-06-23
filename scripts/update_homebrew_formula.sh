@@ -117,6 +117,8 @@ else
   text.sub!(/^  url "[^"]+"$/, %(  url "#{public_url}"\n  sha256 "#{sha256}"))
 end
 
+text.gsub!(/^  revision \d+\n/, "")
+
 text.sub!(
   /      The formula currently tracks HEAD while the runtime public release and\n      versioned tarball flow are being prepared\.\n/,
   ""
@@ -164,4 +166,3 @@ if [[ "$FORMULA_CHANGED" -eq 1 ]]; then
 else
   echo "Validated $TAP_NAME/$FORMULA_TOKEN for $TAG."
 fi
-
