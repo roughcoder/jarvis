@@ -71,11 +71,15 @@ Mac runtime distribution should live in the Homebrew tap repository
 `roughcoder/infinite-stack`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.21/scripts/install_mac.sh | bash
+brew tap roughcoder/infinite-stack
+brew trust --formula roughcoder/infinite-stack/jarvis
+brew trust --cask roughcoder/infinite-stack/jarvis-app
+brew install jarvis
+brew install --cask jarvis-app
 ```
 
-Use `jarvis` for the runtime package: the brain, worker, intercom, CLI/runtime
-bootstrapper, and service templates.
+Use `jarvis` for the runtime package: the brain, worker, intercom, CLI/runtime,
+and service templates.
 
 Reserve `jarvis-app` for the native Mac desktop/menu bar app from
 `roughcoder/jarvis-apple`. That keeps the Homebrew names aligned with the split:
@@ -83,14 +87,13 @@ Reserve `jarvis-app` for the native Mac desktop/menu bar app from
 | Package | Owns |
 |---|---|
 | `jarvis-app` | Native macOS desktop/menu bar app |
-| `jarvis` | Brain, workers, intercoms, CLI/runtime bootstrapper |
+| `jarvis` | Brain, workers, intercoms, CLI/runtime |
 
 The tap can still add narrower packages later, such as `jarvis-cli`,
 `jarvis-worker`, or `jarvis-agent`, if the runtime needs to split.
 
-The public Mac bootstrap installs stable formula/cask releases by default.
-Formula HEAD fallback is reserved for development and must be explicitly enabled
-with `JARVIS_ALLOW_HEAD_FALLBACK=1`.
+Mac installs use stable formula/cask releases by default. Formula HEAD installs
+are reserved for runtime development and should not be used for fleet bring-up.
 
 Homebrew should own:
 
@@ -123,7 +126,7 @@ jarvis fleet-status --json
 ```
 
 The exact `jarvis service ...` commands are the intended interface for the
-formula/bootstrapper and app:
+formula and app:
 
 ```bash
 jarvis service install brain

@@ -121,16 +121,7 @@ repo or understanding `uv`: install the `jarvis` runtime package, install the
 `jarvis-app` native app, choose roles in the app, pair devices, and let Homebrew
 own runtime/app updates.
 
-Fresh Mac install:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.21/scripts/install_mac.sh | bash
-```
-
-The bootstrap taps `roughcoder/infinite-stack` and, on Homebrew versions with tap
-trust enforcement, trusts only the `jarvis` formula and `jarvis-app` cask.
-
-Manual Homebrew installs should use the same entry-specific trust path:
+Fresh Mac install with Homebrew:
 
 ```bash
 brew tap roughcoder/infinite-stack
@@ -138,12 +129,14 @@ brew trust --formula roughcoder/infinite-stack/jarvis
 brew trust --cask roughcoder/infinite-stack/jarvis-app
 brew install jarvis
 brew install --cask jarvis-app
+/usr/bin/xattr -dr com.apple.quarantine /Applications/Jarvis.app
+open -a Jarvis
 ```
 
-Preview the bootstrap without changing the machine:
+Clean uninstall for fresh end-to-end testing:
 
 ```bash
-JARVIS_DRY_RUN=1 bash scripts/install_mac.sh
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/uninstall_mac.sh | bash
 ```
 
 Physical bring-up evidence:

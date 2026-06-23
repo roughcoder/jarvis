@@ -170,9 +170,6 @@ scan_docs_preview() {
     {
       git -C "$ROOT_DIR" grep -nE 'brew install --HEAD jarvis|jarvis pair [^<[:space:]]+[[:space:]]+--json</code>|Tailscale|Mac mini' -- docs-site README.md docs/DEPLOYMENT.md docs/FLEET.md docs/PI.md
       git -C "$ROOT_DIR" grep -n 'raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_pi.sh' -- docs/DEPLOYMENT.md docs/PI.md docs/BRINGUP.md docs/FLEET.md
-      git -C "$ROOT_DIR" grep -n 'raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh' -- README.md docs/DEPLOYMENT.md docs/BRINGUP.md docs/FLEET.md docs-site/index.html
-      git -C "$APPLE_DIR" grep -n 'raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh' -- README.md
-      git -C "$TAP_DIR" grep -n 'raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh' -- README.md
     } || true
   )"
   if [[ -n "$stale_patterns" ]]; then
@@ -183,11 +180,12 @@ scan_docs_preview() {
 
   missing_patterns="$(
     {
-      git -C "$ROOT_DIR" grep -q 'scripts/install_mac.sh | bash' -- docs-site/index.html || echo "docs-site/index.html missing Mac bootstrap command"
-      git -C "$ROOT_DIR" grep -q "raw.githubusercontent.com/roughcoder/jarvis/v$RUNTIME_VERSION/scripts/install_mac.sh" -- docs-site/index.html || echo "docs-site/index.html missing release-pinned Mac bootstrap URL"
-      git -C "$ROOT_DIR" grep -q "raw.githubusercontent.com/roughcoder/jarvis/v$RUNTIME_VERSION/scripts/install_mac.sh" -- README.md docs/DEPLOYMENT.md docs/BRINGUP.md docs/FLEET.md || echo "runtime docs missing current release-pinned Mac bootstrap URL"
-      git -C "$APPLE_DIR" grep -q "raw.githubusercontent.com/roughcoder/jarvis/v$RUNTIME_VERSION/scripts/install_mac.sh" -- README.md || echo "app docs missing current release-pinned Mac bootstrap URL"
-      git -C "$TAP_DIR" grep -q "raw.githubusercontent.com/roughcoder/jarvis/v$RUNTIME_VERSION/scripts/install_mac.sh" -- README.md || echo "tap docs missing current release-pinned Mac bootstrap URL"
+      git -C "$ROOT_DIR" grep -q 'brew install jarvis' -- README.md docs/DEPLOYMENT.md docs/BRINGUP.md docs/FLEET.md docs-site/index.html || echo "runtime docs missing Homebrew runtime install command"
+      git -C "$ROOT_DIR" grep -q 'brew install --cask jarvis-app' -- README.md docs/DEPLOYMENT.md docs/BRINGUP.md docs/FLEET.md docs-site/index.html || echo "runtime docs missing Homebrew app install command"
+      git -C "$APPLE_DIR" grep -q 'brew install jarvis' -- README.md || echo "app docs missing Homebrew runtime install command"
+      git -C "$APPLE_DIR" grep -q 'brew install --cask jarvis-app' -- README.md || echo "app docs missing Homebrew app install command"
+      git -C "$TAP_DIR" grep -q 'brew install jarvis' -- README.md || echo "tap docs missing Homebrew runtime install command"
+      git -C "$TAP_DIR" grep -q 'brew install --cask jarvis-app' -- README.md || echo "tap docs missing Homebrew app install command"
       git -C "$ROOT_DIR" grep -q "jarvis $RUNTIME_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current runtime release"
       git -C "$ROOT_DIR" grep -q "jarvis-app $APP_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current app release"
       git -C "$ROOT_DIR" grep -q "JARVIS_REF=v$RUNTIME_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current Pi release ref"
@@ -246,7 +244,7 @@ fi
 
 section "shell lint"
 if command -v shellcheck >/dev/null 2>&1; then
-  (cd "$ROOT_DIR" && shellcheck scripts/install_mac.sh scripts/install_pi.sh scripts/sync_runtime_check_env.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh scripts/verify_public_readiness.sh)
+  (cd "$ROOT_DIR" && shellcheck scripts/uninstall_mac.sh scripts/install_pi.sh scripts/sync_runtime_check_env.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh scripts/verify_public_readiness.sh)
   (cd "$APPLE_DIR" && shellcheck scripts/install_latest.sh scripts/release_github.sh scripts/build_release.sh scripts/update_homebrew_cask.sh)
 else
   echo "shellcheck not installed; skipping shell lint"
@@ -255,7 +253,7 @@ fi
 section "runtime checks"
 "$ROOT_DIR/scripts/sync_runtime_check_env.sh"
 (cd "$ROOT_DIR" && uv run ruff check src/ tests/)
-(cd "$ROOT_DIR" && bash -n scripts/install_mac.sh scripts/install_pi.sh scripts/sync_runtime_check_env.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh)
+(cd "$ROOT_DIR" && bash -n scripts/uninstall_mac.sh scripts/install_pi.sh scripts/sync_runtime_check_env.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh)
 (cd "$ROOT_DIR" && uv run pytest tests/unit -q)
 
 section "app checks"

@@ -13,8 +13,8 @@ Homebrew packaging, onboarding, pairing, and updates.
 
 | Machine | Roles | Package path | Supervisor |
 |---|---|---|---|
-| iMac | `brain`, `worker`, optional local `intercom`, Docker services | Mac bootstrap + Jarvis Setup | `launchd` |
-| Mac laptop | `intercom`, `worker` | Mac bootstrap + Jarvis Setup | `launchd` |
+| iMac | `brain`, `worker`, optional local `intercom`, Docker services | Homebrew + Jarvis Setup | `launchd` |
+| Mac laptop | `intercom`, `worker` | Homebrew + Jarvis Setup | `launchd` |
 | Raspberry Pi | `intercom` | Pi installer / future image | `systemd` |
 
 The iMac brain is the local authority for device pairing. Each device has its own
@@ -54,21 +54,9 @@ jarvis pair kitchen-pi --json
 `jarvis service print ...` is the dry, inspectable form used by installers and
 tests. On macOS it renders `launchd` plists; on Linux it renders `systemd` units.
 
-## Mac Bootstrap
+## Mac Install
 
-Clean Macs should start with one public command:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.21/scripts/install_mac.sh | bash
-```
-
-The bootstrap installs Homebrew if needed, taps `roughcoder/infinite-stack`,
-installs or upgrades `jarvis`, installs or upgrades `jarvis-app`, clears app
-quarantine while the app is ad-hoc signed, and opens Jarvis. The Setup window
-then owns role choice, local service installation, and pairing.
-
-If a machine is installed manually instead of through the bootstrap, trust only
-the two Jarvis entries before installing:
+Homebrew is the canonical install and update surface once Homebrew exists:
 
 ```bash
 brew tap roughcoder/infinite-stack
@@ -76,33 +64,23 @@ brew trust --formula roughcoder/infinite-stack/jarvis
 brew trust --cask roughcoder/infinite-stack/jarvis-app
 brew install jarvis
 brew install --cask jarvis-app
+/usr/bin/xattr -dr com.apple.quarantine /Applications/Jarvis.app
+open -a Jarvis
 ```
 
-Packaged Mac services installed from the app or Mac bootstrap use `~/.jarvis` as
+The Setup window then owns role choice, local service installation, and pairing.
+
+Packaged Mac services installed from the app use `~/.jarvis` as
 the service workdir and set `JARVIS_ENV_FILE=~/.jarvis/.env` in launchd. This
 keeps local pairing/provider configuration outside the Homebrew Cellar and
 independent of the app's current directory.
 
-The bootstrap uses the stable runtime formula by default. Development HEAD
-fallback is opt-in only:
+Clean uninstall for fresh end-to-end testing removes launchd services, local
+state, logs, app preferences, the Homebrew cask, and the Homebrew runtime. It
+does not touch local source checkouts:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.21/scripts/install_mac.sh \
-  -o /tmp/install_jarvis_mac.sh
-JARVIS_ALLOW_HEAD_FALLBACK=1 bash /tmp/install_jarvis_mac.sh
-```
-
-Preview the command sequence without changing a Mac:
-
-```bash
-JARVIS_DRY_RUN=1 bash scripts/install_mac.sh
-```
-
-For scripted provisioning, roles can be installed during bootstrap:
-
-```bash
-JARVIS_ROLES="intercom worker" JARVIS_START_SERVICES=1 \
-  bash /tmp/install_jarvis_mac.sh
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/uninstall_mac.sh | bash
 ```
 
 ## Onboarding Flow
@@ -124,11 +102,11 @@ The native app should drive setup in five stages:
 
 Current fresh-fleet sequence:
 
-1. On the iMac, run the Mac bootstrap and choose **Brain Mac** in Setup.
+1. On the iMac, install with Homebrew and choose **Brain Mac** in Setup.
 2. Install/start the selected services from Setup. When **Brain Mac** roles are
    selected, Setup writes `BRAIN_HOST=0.0.0.0` and issued `BRAIN_DEVICES`
    entries into `~/.jarvis/.env`.
-3. On each laptop, run the same Mac bootstrap and choose **Laptop** in Setup.
+3. On each laptop, install with Homebrew and choose **Laptop** in Setup.
    Use the iMac Setup window's **Issue Token** action and copy the Mac config
    command onto the laptop before installing services.
 4. For each room Pi, issue a token from the iMac Setup window and run the copied
