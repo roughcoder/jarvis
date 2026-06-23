@@ -945,6 +945,51 @@ def _write_bringup_evidence(data: dict[str, object], output: str) -> str:
     return str(path)
 
 
+def _cmd_bringup_summary(args: argparse.Namespace) -> int:
+    """Summarize a folder of redacted physical bring-up evidence files."""
+    import json
+
+    from jarvis.deploy import summarize_bringup_evidence
+
+    data = summarize_bringup_evidence(
+        args.path,
+        expected_roles=args.expected_roles or (),
+        min_files=args.min_files,
+    )
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+        return 0 if data["ok"] else 1
+
+    print(f"Jarvis bring-up summary: {data['path']}")
+    print(f"  files:        {data['file_count']}")
+    print(f"  versions:     {', '.join(data['versions_seen']) or '(none)'}")
+    print(f"  platforms:    {', '.join(data['platforms_seen']) or '(none)'}")
+    print(f"  roles:        {', '.join(data['roles_seen']) or '(none)'}")
+    for entry in data.get("entries", []):
+        if not isinstance(entry, dict):
+            continue
+        checks = [
+            "packages" if entry.get("packages_ok") else "packages!",
+            "services" if entry.get("services_ok") else "services!",
+        ]
+        if entry.get("hardware_checked"):
+            checks.append("hardware" if entry.get("hardware_ok") else "hardware!")
+        if entry.get("brain_checked"):
+            checks.append("brain" if entry.get("brain_paired") else "brain!")
+        print(
+            f"  - {entry.get('platform', 'unknown')} "
+            f"{','.join(entry.get('roles', []) or ['none'])}: {', '.join(checks)}"
+        )
+    issues = data.get("issues", [])
+    if issues:
+        print("\nIssues:")
+        for issue in issues:
+            print(f"  - {issue}")
+        return 1
+    print("\nAll summarized evidence checks passed.")
+    return 0
+
+
 def _cmd_traces(args: argparse.Namespace) -> int:
     """View recent per-turn pipeline traces (STT/LLM/TTS/memory timings)."""
     import json
@@ -1366,6 +1411,34 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_bringup.set_defaults(func=_cmd_bringup)
+
+    p_bringup_summary = sub.add_parser(
+        "bringup-summary", help="Summarize redacted physical bring-up evidence files"
+    )
+    p_bringup_summary.add_argument(
+        "path",
+        help="Evidence JSON file or directory created by `jarvis bringup --output`",
+    )
+    p_bringup_summary.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable summary",
+    )
+    p_bringup_summary.add_argument(
+        "--expect-role",
+        dest="expected_roles",
+        action="append",
+        default=None,
+        choices=["brain", "intercom", "worker"],
+        help="Require at least one evidence file containing this role; repeatable",
+    )
+    p_bringup_summary.add_argument(
+        "--min-files",
+        type=int,
+        default=0,
+        help="Require at least this many valid evidence files",
+    )
+    p_bringup_summary.set_defaults(func=_cmd_bringup_summary)
 
     p_traces = sub.add_parser("traces", help="View recent per-turn pipeline traces")
     p_traces.add_argument("-n", type=int, default=20, help="How many recent traces")

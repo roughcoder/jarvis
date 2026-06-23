@@ -14,6 +14,7 @@ from jarvis.deploy import (
     render_service,
     role_extras,
     service_control_argv,
+    summarize_bringup_evidence,
     uv_sync_args_for_roles,
 )
 
@@ -138,6 +139,74 @@ def test_collect_bringup_evidence_redacts_and_filters_roles() -> None:
     assert data["hardware"]["microphones"]["ok"] is True
     assert data["hardware"]["speakers"]["ok"] is True
     assert data["hardware"]["cameras"]["available"] is False
+
+
+def test_summarize_bringup_evidence_flags_missing_expected_roles(tmp_path) -> None:
+    (tmp_path / "imac.json").write_text(
+        json.dumps(
+            {
+                "jarvis_version": "0.1.test",
+                "release_ref": "v0.1.test",
+                "platform": "launchd",
+                "roles": ["brain", "worker"],
+                "packages": {
+                    "jarvis": {"ok": True},
+                    "jarvis-app": {"ok": True},
+                },
+                "services": {
+                    "brain": {"ok": True},
+                    "worker": {"ok": True},
+                },
+                "hardware": {"audio": {"ok": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = summarize_bringup_evidence(
+        tmp_path,
+        expected_roles=["brain", "worker", "intercom"],
+        min_files=2,
+    )
+
+    assert summary["ok"] is False
+    assert summary["file_count"] == 1
+    assert summary["roles_seen"] == ["brain", "worker"]
+    assert "missing expected role evidence: intercom" in summary["issues"]
+    assert "expected at least 2 evidence file(s), found 1" in summary["issues"]
+
+
+def test_summarize_bringup_evidence_accepts_pi_without_brew(tmp_path) -> None:
+    (tmp_path / "pi.json").write_text(
+        json.dumps(
+            {
+                "jarvis_version": "0.1.test",
+                "release_ref": "v0.1.test",
+                "platform": "systemd",
+                "roles": ["intercom"],
+                "packages": {"brew": {"available": False, "reason": "brew not found"}},
+                "services": {"intercom": {"ok": True}},
+                "hardware": {
+                    "microphones": {"ok": True},
+                    "speakers": {"ok": True},
+                    "cameras": {"available": False, "ok": False},
+                },
+                "brain_status": {"reachable": True, "paired": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = summarize_bringup_evidence(
+        tmp_path,
+        expected_roles=["intercom"],
+        min_files=1,
+    )
+
+    assert summary["ok"] is True
+    assert summary["entries"][0]["packages_ok"] is True
+    assert summary["entries"][0]["hardware_ok"] is True
+    assert summary["entries"][0]["brain_paired"] is True
 
 
 def test_issue_pairing_entry_returns_brain_devices_fragment() -> None:

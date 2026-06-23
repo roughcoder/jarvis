@@ -440,6 +440,133 @@ def collect_bringup_evidence(
     return evidence
 
 
+def summarize_bringup_evidence(
+    path: str | Path,
+    *,
+    expected_roles: list[str] | tuple[str, ...] | set[str] = (),
+    min_files: int = 0,
+) -> dict[str, object]:
+    """Summarize redacted bring-up JSON files without copying raw command output."""
+    for role in expected_roles:
+        _validate_role(role)
+
+    target = Path(path).expanduser()
+    files = [target] if target.is_file() else sorted(target.glob("*.json"))
+    entries: list[dict[str, object]] = []
+    issues: list[str] = []
+    roles_seen: set[str] = set()
+    platforms_seen: set[str] = set()
+    versions_seen: set[str] = set()
+
+    if not target.exists():
+        issues.append(f"evidence path does not exist: {target}")
+    if target.is_dir() and not files:
+        issues.append(f"no JSON evidence files found in {target}")
+
+    for file in files:
+        try:
+            data = json.loads(file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            issues.append(f"{file}: could not read evidence JSON: {exc}")
+            continue
+        if not isinstance(data, dict):
+            issues.append(f"{file}: evidence root is not an object")
+            continue
+
+        roles = [str(role) for role in data.get("roles", []) if isinstance(role, str)]
+        roles_seen.update(roles)
+        platform_name = str(data.get("platform", "unknown"))
+        platforms_seen.add(platform_name)
+        version = str(data.get("jarvis_version", "unknown"))
+        versions_seen.add(version)
+
+        services = data.get("services", {})
+        service_ok = _reports_ok(services)
+        packages = data.get("packages", {})
+        package_ok = _reports_ok(packages) or (
+            platform_name == "systemd" and _only_missing_brew(packages)
+        )
+        hardware = data.get("hardware", {})
+        hardware_checked = isinstance(hardware, dict) and bool(hardware)
+        hardware_ok = _hardware_summary_ok(hardware)
+        brain_status = data.get("brain_status", {})
+        brain_checked = isinstance(brain_status, dict) and bool(brain_status)
+        brain_paired = bool(brain_status.get("paired")) if isinstance(brain_status, dict) else False
+        brain_reachable = bool(brain_status.get("reachable")) if isinstance(brain_status, dict) else False
+
+        if not package_ok:
+            issues.append(f"{file.name}: package checks need attention")
+        if not service_ok:
+            issues.append(f"{file.name}: service checks need attention")
+        if brain_checked and not brain_paired:
+            state = "reachable but unpaired" if brain_reachable else "unreachable"
+            issues.append(f"{file.name}: brain check is {state}")
+
+        entries.append(
+            {
+                "file": str(file),
+                "platform": platform_name,
+                "jarvis_version": version,
+                "release_ref": data.get("release_ref", "unknown"),
+                "roles": roles,
+                "packages_ok": package_ok,
+                "services_ok": service_ok,
+                "hardware_checked": hardware_checked,
+                "hardware_ok": hardware_ok,
+                "brain_checked": brain_checked,
+                "brain_reachable": brain_reachable,
+                "brain_paired": brain_paired,
+            }
+        )
+
+    for role in expected_roles:
+        if role not in roles_seen:
+            issues.append(f"missing expected role evidence: {role}")
+    if min_files and len(entries) < min_files:
+        issues.append(f"expected at least {min_files} evidence file(s), found {len(entries)}")
+
+    return {
+        "path": str(target),
+        "ok": not issues,
+        "file_count": len(entries),
+        "expected_roles": list(expected_roles),
+        "roles_seen": [role for role in ROLES if role in roles_seen],
+        "platforms_seen": sorted(platforms_seen),
+        "versions_seen": sorted(versions_seen),
+        "entries": entries,
+        "issues": issues,
+    }
+
+
+def _reports_ok(value: object) -> bool:
+    if not isinstance(value, dict) or not value:
+        return False
+    reports = [report for report in value.values() if isinstance(report, dict)]
+    return bool(reports) and all(bool(report.get("ok")) for report in reports)
+
+
+def _only_missing_brew(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {"brew"}:
+        return False
+    report = value.get("brew")
+    return isinstance(report, dict) and report.get("available") is False
+
+
+def _hardware_summary_ok(value: object) -> bool:
+    if not isinstance(value, dict) or not value:
+        return False
+    reports = [report for report in value.values() if isinstance(report, dict)]
+    if not reports:
+        return False
+    required = [
+        report
+        for name, report in value.items()
+        if isinstance(report, dict) and name in {"audio", "microphones", "speakers"}
+    ]
+    checked = required or reports
+    return all(bool(report.get("ok")) for report in checked)
+
+
 def _validate_role(role: str) -> None:
     if role not in ROLES:
         raise ValueError(f"unknown role {role!r}; expected one of {', '.join(ROLES)}")

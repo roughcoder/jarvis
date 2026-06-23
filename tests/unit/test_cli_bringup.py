@@ -98,3 +98,43 @@ def test_bringup_output_writes_timestamped_evidence_file(
     assert saved == payload
     assert evidence_path.name.startswith("jarvis-bringup-")
     assert evidence_path.name.endswith(".json")
+
+
+def test_bringup_summary_json_returns_nonzero_for_missing_role(capsys, tmp_path) -> None:
+    (tmp_path / "imac.json").write_text(
+        json.dumps(
+            {
+                "jarvis_version": "0.1.test",
+                "release_ref": "v0.1.test",
+                "platform": "launchd",
+                "roles": ["brain"],
+                "packages": {"jarvis": {"ok": True}, "jarvis-app": {"ok": True}},
+                "services": {"brain": {"ok": True}},
+                "hardware": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = main(
+        [
+            "bringup-summary",
+            str(tmp_path),
+            "--json",
+            "--expect-role",
+            "brain",
+            "--expect-role",
+            "worker",
+            "--min-files",
+            "2",
+        ]
+    )
+
+    output = capsys.readouterr()
+    payload = json.loads(output.out)
+
+    assert code == 1
+    assert output.err == ""
+    assert payload["ok"] is False
+    assert "missing expected role evidence: worker" in payload["issues"]
+    assert "expected at least 2 evidence file(s), found 1" in payload["issues"]

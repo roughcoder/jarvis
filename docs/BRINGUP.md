@@ -22,6 +22,16 @@ output with the machine name in each filename, for example `imac-install.txt`,
 `laptop-neil-worker.txt`, and `kitchen-pi-doctor.txt`. Do not commit these
 files; they may contain hostnames or local machine details.
 
+After copying all `jarvis-bringup-*.json` files into the session folder, run a
+single summary gate:
+
+```bash
+jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence \
+  --expect-role brain --expect-role worker --expect-role intercom --min-files 4
+```
+
+Use `--json` when saving the final acceptance summary for automation.
+
 ## iMac Brain
 
 Install:
@@ -127,7 +137,7 @@ jarvis pair kitchen-pi --json --pi-installer --brain-host imac.private
 ```
 
 Run the generated Pi installer command on the Pi. It should include a release tag
-such as `JARVIS_REF=v0.1.10`, not a development-only `main` ref.
+such as `JARVIS_REF=v0.1.11`, not a development-only `main` ref.
 
 Proof:
 
@@ -193,3 +203,6 @@ Deployment readiness is physically proven only after:
 - one runtime update succeeds on a Mac through Homebrew
 - one app update succeeds through the cask or in-app Homebrew updater
 - one Pi update succeeds through `sudo jarvis-pi update`
+- `jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence --expect-role brain
+  --expect-role worker --expect-role intercom --min-files 4` passes against the
+  collected redacted evidence files

@@ -110,7 +110,7 @@
           </article>
           <article>
             <span>Evidence</span>
-            <p>Use Collect Evidence in Setup or run jarvis bringup with an output folder to save a redacted proof file per device.</p>
+            <p>Use Collect Evidence in Setup or run jarvis bringup with an output folder, then summarize the folder as the fleet acceptance gate.</p>
           </article>
         </div>
       </section>
@@ -150,6 +150,7 @@
           <span>brew upgrade jarvis</span>
           <span>jarvis service sync brain worker intercom</span>
           <span>jarvis bringup --json --hardware --output ~/Desktop/jarvis-bringup-evidence</span>
+          <span>jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence --expect-role brain --expect-role worker --expect-role intercom --min-files 4</span>
           <span>brew upgrade --cask jarvis-app</span>
           <span>sudo jarvis-pi update</span>
         </div>
