@@ -144,14 +144,16 @@ else
   echo "$FORMULA_TOKEN is already up to date for $TAG."
 fi
 
-if ! brew --repo "$TAP_NAME" >/dev/null 2>&1; then
-  brew tap "$TAP_NAME" "$TAP_DIR" --custom-remote
+BREW_TAP_REMOTE_URL="file://$TAP_DIR"
+BREW_TAP_REPO="$(brew --repo "$TAP_NAME" 2>/dev/null || true)"
+if [[ -z "$BREW_TAP_REPO" || ! -d "$BREW_TAP_REPO/.git" ]]; then
+  brew tap "$TAP_NAME" "$BREW_TAP_REMOTE_URL" --custom-remote
+  BREW_TAP_REPO="$(brew --repo "$TAP_NAME")"
 fi
 
-BREW_TAP_REPO="$(brew --repo "$TAP_NAME")"
 BREW_TAP_REMOTE="$(git -C "$BREW_TAP_REPO" remote get-url origin 2>/dev/null || true)"
-if [[ "$BREW_TAP_REMOTE" != "$TAP_DIR" ]]; then
-  git -C "$BREW_TAP_REPO" remote set-url origin "$TAP_DIR"
+if [[ "$BREW_TAP_REMOTE" != "$BREW_TAP_REMOTE_URL" ]]; then
+  git -C "$BREW_TAP_REPO" remote set-url origin "$BREW_TAP_REMOTE_URL"
 fi
 git -C "$BREW_TAP_REPO" pull --ff-only
 
