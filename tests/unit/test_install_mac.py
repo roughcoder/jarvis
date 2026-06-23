@@ -42,6 +42,7 @@ def test_mac_installer_dry_run_models_fresh_install() -> None:
     assert "Use Jarvis Setup > Collect Evidence and Summarize Evidence" in result.stdout
     assert "jarvis bringup --json --role brain --role worker --role intercom --hardware" in result.stdout
     assert "jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence" in result.stdout
+    assert "--output ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json" in result.stdout
 
 
 def test_mac_installer_dry_run_models_existing_install_update() -> None:
