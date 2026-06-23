@@ -90,7 +90,7 @@ on the private network.
    jarvis pair kitchen-pi --json --pi-installer --brain-host imac.private
    ```
 
-   Run the generated command on the Pi. It must include `JARVIS_REF=v0.1.17`.
+   Run the generated command on the Pi. It must include `JARVIS_REF=v0.1.18`.
    Then on the Pi:
 
    ```bash
@@ -240,7 +240,7 @@ jarvis pair kitchen-pi --json --pi-installer --brain-host imac.private
 ```
 
 Run the generated Pi installer command on the Pi. It should include a release tag
-such as `JARVIS_REF=v0.1.17`, not a development-only `main` ref.
+such as `JARVIS_REF=v0.1.18`, not a development-only `main` ref.
 
 Proof:
 

@@ -101,9 +101,9 @@ scan_docs_preview() {
   missing_patterns="$(
     {
       git -C "$ROOT_DIR" grep -q 'scripts/install_mac.sh | bash' -- docs-site/index.html || echo "docs-site/index.html missing Mac bootstrap command"
-      git -C "$ROOT_DIR" grep -q 'jarvis 0.1.17' -- docs-site/index.html || echo "docs-site/index.html missing current runtime release"
+      git -C "$ROOT_DIR" grep -q 'jarvis 0.1.18' -- docs-site/index.html || echo "docs-site/index.html missing current runtime release"
       git -C "$ROOT_DIR" grep -q 'jarvis-app 0.2.22' -- docs-site/index.html || echo "docs-site/index.html missing current app release"
-      git -C "$ROOT_DIR" grep -q 'JARVIS_REF=v0.1.17' -- docs-site/index.html || echo "docs-site/index.html missing current Pi release ref"
+      git -C "$ROOT_DIR" grep -q 'JARVIS_REF=v0.1.18' -- docs-site/index.html || echo "docs-site/index.html missing current Pi release ref"
       git -C "$ROOT_DIR" grep -q 'Fresh fleet runbook' -- docs-site/index.html || echo "docs-site/index.html missing fresh fleet runbook section"
       git -C "$ROOT_DIR" grep -q 'brew trust --formula roughcoder/infinite-stack/jarvis' -- README.md docs/DEPLOYMENT.md || echo "runtime docs missing entry-specific formula trust command"
       git -C "$ROOT_DIR" grep -q 'brew trust --cask roughcoder/infinite-stack/jarvis-app' -- README.md docs/DEPLOYMENT.md || echo "runtime docs missing entry-specific cask trust command"
