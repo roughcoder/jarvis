@@ -108,6 +108,10 @@
             <span>Room Pi</span>
             <p>Run the generated release-pinned Pi installer and verify audio, camera, and systemd with jarvis-pi doctor.</p>
           </article>
+          <article>
+            <span>Evidence</span>
+            <p>Use Collect Evidence in Setup or run jarvis bringup with an output folder to save a redacted proof file per device.</p>
+          </article>
         </div>
       </section>
 
@@ -145,6 +149,7 @@
           <span>brew update</span>
           <span>brew upgrade jarvis</span>
           <span>jarvis service sync brain worker intercom</span>
+          <span>jarvis bringup --json --hardware --output ~/Desktop/jarvis-bringup-evidence</span>
           <span>brew upgrade --cask jarvis-app</span>
           <span>sudo jarvis-pi update</span>
         </div>

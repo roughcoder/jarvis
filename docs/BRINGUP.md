@@ -4,8 +4,9 @@ Use this checklist when the physical machines are available. It records the
 evidence needed to prove the fresh install, pairing, service, update, and
 hardware paths across the fleet.
 
-GitHub Pages is deliberately out of scope for the current gate. The prepared
-`docs-site/` preview must stay accurate, but hosting is deferred.
+The static deployment preview lives in `docs-site/` and is published by the
+GitHub Pages workflow from `main`. Keep the preview aligned with this checklist
+whenever install, pairing, update, or evidence commands change.
 
 ## Evidence Folder
 

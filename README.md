@@ -103,6 +103,8 @@ Per-step extras install as each build step is reached, e.g.
   pairing, and updates.
 - **[docs/BRINGUP.md](docs/BRINGUP.md)** — physical fleet acceptance checklist
   for iMac, laptop, Raspberry Pi, private-network, and update proof.
+- **[docs-site/](docs-site/)** — static deployment preview published by the
+  GitHub Pages workflow from `main`.
 - **[docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md)** — public repository
   readiness gates and required scans.
 - **[docs/PHASE2.md](docs/PHASE2.md)** — the Frankfurt migration spec; the
