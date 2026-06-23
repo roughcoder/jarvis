@@ -207,6 +207,7 @@ Deployment readiness is physically proven only after:
 - one clean Pi install completes from a generated release-pinned command
 - all selected services survive a restart
 - all device pairing checks pass over the private network
+- every evidence file reports the same `jarvis_version` and `release_ref`
 - one runtime update succeeds on a Mac through Homebrew
 - one app update succeeds through the cask or in-app Homebrew updater
 - one Pi update succeeds through `sudo jarvis-pi update`

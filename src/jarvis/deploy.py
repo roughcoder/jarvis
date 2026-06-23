@@ -563,6 +563,7 @@ def summarize_bringup_evidence(
     roles_seen: set[str] = set()
     platforms_seen: set[str] = set()
     versions_seen: set[str] = set()
+    release_refs_seen: set[str] = set()
 
     if not target.exists():
         issues.append(f"evidence path does not exist: {target}")
@@ -587,6 +588,8 @@ def summarize_bringup_evidence(
         platforms_seen.add(platform_name)
         version = str(data.get("jarvis_version", "unknown"))
         versions_seen.add(version)
+        release_ref = str(data.get("release_ref", "unknown"))
+        release_refs_seen.add(release_ref)
 
         services = data.get("services", {})
         service_ok = _reports_ok(services)
@@ -615,7 +618,7 @@ def summarize_bringup_evidence(
                 "file": str(file),
                 "platform": platform_name,
                 "jarvis_version": version,
-                "release_ref": data.get("release_ref", "unknown"),
+                "release_ref": release_ref,
                 "roles": roles,
                 "packages_ok": package_ok,
                 "services_ok": service_ok,
@@ -632,6 +635,14 @@ def summarize_bringup_evidence(
             issues.append(f"missing expected role evidence: {role}")
     if min_files and len(entries) < min_files:
         issues.append(f"expected at least {min_files} evidence file(s), found {len(entries)}")
+    if len(versions_seen) > 1:
+        issues.append(
+            "mixed Jarvis versions in evidence: " + ", ".join(sorted(versions_seen))
+        )
+    if len(release_refs_seen) > 1:
+        issues.append(
+            "mixed Jarvis release refs in evidence: " + ", ".join(sorted(release_refs_seen))
+        )
 
     return {
         "path": str(target),
@@ -641,6 +652,7 @@ def summarize_bringup_evidence(
         "roles_seen": [role for role in ROLES if role in roles_seen],
         "platforms_seen": sorted(platforms_seen),
         "versions_seen": sorted(versions_seen),
+        "release_refs_seen": sorted(release_refs_seen),
         "entries": entries,
         "issues": issues,
     }

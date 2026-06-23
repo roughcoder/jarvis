@@ -969,6 +969,7 @@ def _cmd_bringup_summary(args: argparse.Namespace) -> int:
     print(f"Jarvis bring-up summary: {data['path']}")
     print(f"  files:        {data['file_count']}")
     print(f"  versions:     {', '.join(data['versions_seen']) or '(none)'}")
+    print(f"  release refs: {', '.join(data.get('release_refs_seen', [])) or '(none)'}")
     print(f"  platforms:    {', '.join(data['platforms_seen']) or '(none)'}")
     print(f"  roles:        {', '.join(data['roles_seen']) or '(none)'}")
     for entry in data.get("entries", []):
