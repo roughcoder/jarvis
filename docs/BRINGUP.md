@@ -28,11 +28,11 @@ single summary gate:
 ```bash
 jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence \
   --expect-role brain --expect-role worker --expect-role intercom --min-files 4 \
-  --output ~/Desktop/jarvis-bringup-evidence
+  --output ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json
 ```
 
-This writes `jarvis-fleet-summary.json` in the evidence folder. Add `--json` if
-you want the same summary printed to stdout for automation.
+This writes the fleet summary JSON into the evidence folder. Add `--json` if you
+want the same summary printed to stdout for automation.
 
 ## iMac Brain
 
@@ -210,4 +210,4 @@ Deployment readiness is physically proven only after:
 - one Pi update succeeds through `sudo jarvis-pi update`
 - `jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence --expect-role brain
   --expect-role worker --expect-role intercom --min-files 4 --output
-  ~/Desktop/jarvis-bringup-evidence` passes and writes `jarvis-fleet-summary.json`
+  ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json` passes
