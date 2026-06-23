@@ -34,6 +34,104 @@ jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence \
 This writes the fleet summary JSON into the evidence folder. Add `--json` if you
 want the same summary printed to stdout for automation.
 
+## Fresh Fleet Runbook
+
+Use this order for the first clean fleet: one iMac brain, two Mac laptops, and
+one room Pi. Replace `imac.private`, laptop ids, and Pi ids with the names used
+on the private network.
+
+1. **iMac first**
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
+   ```
+
+   In Jarvis Setup, choose **Brain Mac**, set the private-network host
+   (`imac.private`), install services, and keep Setup open for token issuing.
+   Confirm:
+
+   ```bash
+   jarvis --version
+   brew list --formula --versions jarvis
+   brew list --cask --versions jarvis-app
+   jarvis fleet-status --json
+   ```
+
+2. **Issue both laptop pairings from the iMac**
+
+   ```bash
+   jarvis pair neil-laptop --mac-config --brain-host imac.private --identity neil
+   jarvis pair second-laptop --mac-config --brain-host imac.private --identity neil
+   ```
+
+   Use the generated Mac config command on each laptop. The Setup window's
+   **Issue Token** and **Copy Mac Config** buttons produce the same command.
+
+3. **Bring up each laptop**
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
+   ```
+
+   Paste that laptop's generated Mac config command, choose **Laptop** in Setup,
+   run **Check Brain**, run **Check Worker**, then install services. Capture
+   evidence:
+
+   ```bash
+   jarvis bringup --json --role intercom --role worker --hardware \
+     --brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence
+   ```
+
+4. **Issue and run the Pi installer**
+
+   From the iMac:
+
+   ```bash
+   jarvis pair kitchen-pi --json --pi-installer --brain-host imac.private
+   ```
+
+   Run the generated command on the Pi. It must include `JARVIS_REF=v0.1.17`.
+   Then on the Pi:
+
+   ```bash
+   jarvis-pi doctor
+   jarvis-pi status
+   jarvis bringup --json --role intercom --platform systemd --hardware \
+     --brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence
+   ```
+
+5. **Collect iMac evidence and summarize**
+
+   ```bash
+   jarvis bringup --json --role brain --role worker --role intercom --hardware \
+     --output ~/Desktop/jarvis-bringup-evidence
+   jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence \
+     --expect-role brain --expect-role worker --expect-role intercom --min-files 4 \
+     --output ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json
+   ```
+
+6. **Prove updates**
+
+   On one Mac:
+
+   ```bash
+   brew update
+   brew upgrade jarvis
+   jarvis service sync brain worker intercom
+   brew upgrade --cask jarvis-app
+   ```
+
+   On the Pi:
+
+   ```bash
+   sudo jarvis-pi update
+   ```
+
+   For update proof, create a fresh evidence folder or archive the pre-update
+   JSON files before collecting new evidence. Re-run `jarvis bringup-summary ...`
+   against only the newest evidence files. The summary should report one runtime
+   version and one release ref across every evidence file.
+
 ## iMac Brain
 
 Install:
