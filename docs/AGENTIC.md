@@ -10,9 +10,10 @@ is the complete cycle, including them.
 
 > The north-star use: *"review PR 27 on `<repo>` with Opus and GPT-5.5, combine,
 > and write the replies in the PR"* — or *"take the Linear ticket, build the
-> feature on my personal laptop, raise the PR, tell me when it's up"* — said out
-> loud to Jarvis on the TV, run unattended, picked up locally later. These are
-> not features; they are *programs* run on the machine this doc specifies.
+> feature on my personal laptop, raise the PR, tell me when it's up"* — said to
+> Jarvis over any control surface (a voice intercom on a Mac or Pi, WhatsApp, a
+> text console), run unattended, picked up locally later. These are not features;
+> they are *programs* run on the machine this doc specifies.
 
 ## Honour the two hard constraints
 
@@ -127,8 +128,9 @@ into stage 1 (iterate on a review, follow-up ticket, learned skill).
 
 **The stages, in words:**
 
-1. **Intake.** A request lands on a *control surface* (TV voice, WhatsApp, text
-   console). Identity and trust are resolved → a `RequestContext` with a
+1. **Intake.** A request lands on a *control surface* — a channel on a device: a
+   voice intercom (Mac, Pi), WhatsApp, or a text console. Identity and trust are
+   resolved (the *device* carries the trust tier) → a `RequestContext` with a
    capability set. A request may be precise ("review PR 27") or vague ("sort out
    the flaky tests") — vagueness is resolved in Frame, not refused.
 2. **Frame.** Turn intent into a **durable work item**: a GitHub issue, a Linear
@@ -249,7 +251,7 @@ conflating them is what the first draft of this doc got wrong.
 
 | Stage | What happens | Primitive |
 |---|---|---|
-| Intake | TV voice; owner on trusted device → full caps | Control surface, Trust gate |
+| Intake | voice intercom (Mac/Pi); owner on a trusted device → full caps | Control surface, Trust gate |
 | Frame | Work item *is* the existing PR; fetch its diff + thread | Work item, Forge verbs |
 | Plan | engine = `panel([opus, gpt-5.5])`, synth = strong; target = worker; recipe = review | Engine, Ensemble, Target, Recipe |
 | Provision | (review-only) checkout the PR head in a worktree for context | Workspace |
@@ -467,8 +469,10 @@ an owner full-caps profile + new caps (`panel.run`, `forge.write`, `target.*`,
 draft-then-confirm? Per-target ceilings (laptop = full, a shared box = read-only)?
 
 ### P10 · Control surface — *command from anywhere* ✅
-Role: stages 1, 8. Voice/TV, WhatsApp, text console. Today: strong — `src/jarvis/intercom/`,
-`src/jarvis/connectors/whatsapp/`, `src/jarvis/connectors/text.py`. No gap for this capability.
+Role: stages 1, 8. A channel on a device: a voice intercom (Mac, Pi), WhatsApp, a
+text console — each a different surface, the device carrying the trust tier (P9).
+Today: strong — `src/jarvis/intercom/`, `src/jarvis/connectors/whatsapp/`,
+`src/jarvis/connectors/text.py`. No gap for this capability.
 
 ### P11 · Observability — *trust & recovery* 🟡
 Role: stages 8, 10. "What's running", logs, traces, **resume** handles. Today:
@@ -677,3 +681,59 @@ P0), P7 cross-target recovery, and the not-yet-enforceable forge gate (I4).
 - [ ] Verification depth vs reach: when a target can build but not exercise an
       app-type, refuse / caveat / execute-here-verify-there? (P2/P12/P13)
 - [ ] Is the 10-stage cycle the right cut, or are stages missing/merged?
+
+---
+
+## Appendix — source links (OpenClaw & Hermes)
+
+Where the prior-art in this doc comes from. ✓ = fetched/read during research;
+~ = seen in search results only, not independently verified. Community links are
+third-party write-ups — useful orientation, accuracy not guaranteed.
+
+### OpenClaw — official
+- ✓ Docs home — https://docs.openclaw.ai/
+- ✓ Concept: agent workspace (AGENTS.md/SOUL.md/MEMORY.md model) —
+  https://docs.openclaw.ai/concepts/agent-workspace
+- ✓ GitHub repo — https://github.com/openclaw/openclaw
+- ✓ **coding-agent skill** (the issue→PR loop; codex/claude/opencode as
+  background workers; isolated-checkout rule) —
+  https://github.com/openclaw/openclaw/blob/main/skills/coding-agent/SKILL.md
+- ✓ Repo AGENTS.md — https://github.com/openclaw/openclaw/blob/main/AGENTS.md
+
+### OpenClaw — community / ecosystem
+- ~ claw-orchestrator — run Claude Code, Codex, Gemini, Cursor Agent, custom CLIs
+  as one runtime (relevant to P1 Engine BYO-CLI) —
+  https://github.com/Enderfga/claw-orchestrator
+- ~ awesome-openclaw-skills · coding-agents-and-ides —
+  https://github.com/VoltAgent/awesome-openclaw-skills/blob/main/categories/coding-agents-and-ides.md
+- ~ openclaw-code-agent — https://github.com/goldmar/openclaw-code-agent
+- ~ openclaw-workspace (Claude Code skill for the workspace files) —
+  https://github.com/win4r/openclaw-workspace
+- ~ AgentHandover (observe-and-teach for OpenClaw/Claude/Codex) —
+  https://github.com/sandroandric/AgentHandover
+- ~ coding-agent skill mirror — https://playbooks.com/skills/openclaw/skills/coding-agent
+
+### Hermes (Nous Research) — official
+- ✓ Docs home — https://hermes-agent.nousresearch.com/docs/
+- ✓ Product landing — https://hermes-agent.nousresearch.com/
+- ✓ GitHub repo — https://github.com/NousResearch/hermes-agent
+- ✓ **Tools & toolsets** (terminal/process/patch/execute_code, browser_*,
+  cronjob, delegate_task subagents, MCP) —
+  https://hermes-agent.nousresearch.com/docs/user-guide/features/tools
+- ✓ Configuration (6 terminal backends: local/Docker/SSH/Singularity/Modal/Daytona) —
+  https://hermes-agent.nousresearch.com/docs/user-guide/configuration/
+- ~ Configuration source on GitHub —
+  https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/configuration.md
+
+### Hermes — community
+- ~ hermes-agent-docs (comprehensive third-party docs, v0.2.0) —
+  https://github.com/mudrii/hermes-agent-docs
+- ~ Hermes vs OpenClaw vs GoClaw comparison (dev.to) —
+  https://dev.to/truongpx396/hermes-agent-the-self-improving-agent-framework-and-how-it-compares-to-openclaw-goclaw-22mc
+- ~ Hermes Agent multi-agent setup guide (codersera) —
+  https://codersera.com/blog/hermes-agent-guide-to-multi-agent-ai-setup/
+- ~ Hermes Agent overview (dsebastien.net) — https://www.dsebastien.net/hermes-agent/
+
+> Note: some figures quoted by page-summarisers during research (GitHub star/commit
+> counts) looked inflated and were **not** trusted; the architecture above relies on
+> the qualitative, cross-corroborated content of the ✓ sources, not those metrics.
