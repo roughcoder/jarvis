@@ -59,7 +59,7 @@ tests. On macOS it renders `launchd` plists; on Linux it renders `systemd` units
 Clean Macs should start with one public command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.19/scripts/install_mac.sh | bash
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.20/scripts/install_mac.sh | bash
 ```
 
 The bootstrap installs Homebrew if needed, taps `roughcoder/infinite-stack`,
@@ -87,7 +87,7 @@ The bootstrap uses the stable runtime formula by default. Development HEAD
 fallback is opt-in only:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.19/scripts/install_mac.sh \
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.20/scripts/install_mac.sh \
   -o /tmp/install_jarvis_mac.sh
 JARVIS_ALLOW_HEAD_FALLBACK=1 bash /tmp/install_jarvis_mac.sh
 ```
@@ -151,7 +151,7 @@ ship a prebuilt image.
 Target flow:
 
 ```bash
-JARVIS_REF=v0.1.19
+JARVIS_REF=v0.1.20
 curl -fsSL "https://raw.githubusercontent.com/roughcoder/jarvis/$JARVIS_REF/scripts/install_pi.sh" \
   -o /tmp/install_jarvis_pi.sh
 sudo JARVIS_BRAIN_HOST=imac.private \

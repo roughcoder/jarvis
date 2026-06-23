@@ -44,7 +44,7 @@ on the private network.
 1. **iMac first**
 
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.19/scripts/install_mac.sh | bash
+   curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.20/scripts/install_mac.sh | bash
    ```
 
    In Jarvis Setup, choose **Brain Mac**, set the private-network host
@@ -71,7 +71,7 @@ on the private network.
 3. **Bring up each laptop**
 
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.19/scripts/install_mac.sh | bash
+   curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.20/scripts/install_mac.sh | bash
    ```
 
    Paste that laptop's generated Mac config command, choose **Laptop** in Setup,
@@ -91,7 +91,7 @@ on the private network.
    jarvis pair kitchen-pi --json --pi-installer --brain-host imac.private
    ```
 
-   Run the generated command on the Pi. It must include `JARVIS_REF=v0.1.19`.
+   Run the generated command on the Pi. It must include `JARVIS_REF=v0.1.20`.
    Then on the Pi:
 
    ```bash
@@ -139,7 +139,7 @@ on the private network.
 Install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.19/scripts/install_mac.sh | bash
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.20/scripts/install_mac.sh | bash
 ```
 
 Jarvis Setup on the brain Mac can write `BRAIN_HOST=0.0.0.0` and issued device
@@ -188,7 +188,7 @@ Pass criteria:
 Install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.19/scripts/install_mac.sh | bash
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.20/scripts/install_mac.sh | bash
 ```
 
 On the iMac, issue a laptop token from Setup or:
@@ -242,7 +242,7 @@ jarvis pair kitchen-pi --json --pi-installer --brain-host imac.private
 ```
 
 Run the generated Pi installer command on the Pi. It should include a release tag
-such as `JARVIS_REF=v0.1.19`, not a development-only `main` ref.
+such as `JARVIS_REF=v0.1.20`, not a development-only `main` ref.
 
 Proof:
 

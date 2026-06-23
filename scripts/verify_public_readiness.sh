@@ -80,6 +80,14 @@ PY
     echo "Runtime formula URL mismatch: expected $expected_formula_url, found $formula_url"
     exit 1
   fi
+  if ! git -C "$ROOT_DIR" grep -q "REF=\"\${JARVIS_REF:-v$RUNTIME_VERSION}\"" -- scripts/install_pi.sh; then
+    echo "Pi installer default JARVIS_REF must match v$RUNTIME_VERSION."
+    exit 1
+  fi
+  if ! git -C "$ROOT_DIR" grep -q "JARVIS_REF=v$RUNTIME_VERSION" -- scripts/install_pi.sh; then
+    echo "Pi installer usage text must show the current release ref."
+    exit 1
+  fi
 
   if ! git -C "$TAP_DIR" grep -q "version \"$APP_VERSION\"" -- Casks/jarvis-app.rb; then
     echo "App cask version could not be verified: $APP_VERSION"
