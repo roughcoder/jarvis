@@ -183,7 +183,7 @@ Local fallback:
 
 ```bash
 scripts/compute_next_release_version.sh   # dry-run candidate version from commit history
-scripts/release_runtime.sh 0.2.0         # explicit release when needed
+scripts/release_runtime.sh <version>      # explicit release when needed
 ```
 
 ## Conventional Commits (local)
