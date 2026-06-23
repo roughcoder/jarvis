@@ -13,7 +13,7 @@ safe to install from and safe to publish.
 | Browser profile | Guarded | Keep `jarvis-workspace/browser/` ignored; Chrome profiles contain cookies, history, and login metadata. |
 | `.env` | Guarded | `.env.example` must use placeholders only. No copied local secrets. |
 | Private Homebrew release | Fixed | `jarvis-app` cask uses the public GitHub release download URL, not the release asset API. |
-| Runtime package | Fixed | `jarvis` v0.1.15 is published as a versioned GitHub release tarball and the Homebrew formula uses the public release URL. |
+| Runtime package | Fixed | `jarvis` v0.1.16 is published as a versioned GitHub release tarball and the Homebrew formula uses the public release URL. |
 | Docs | Fixed locally | Install-first deployment docs and a static docs preview site are present. |
 | GitHub Actions | Fixed | CI and public-readiness workflows run successfully on public repos. |
 | GitHub Pages | Fixed locally | `docs-site/` is published by the `Deploy docs preview` workflow using GitHub Pages Actions. |

@@ -201,10 +201,30 @@ doctor() {
     echo "aplay: missing"
   fi
 
-  if command -v libcamera-hello >/dev/null 2>&1; then
+  if command -v rpicam-hello >/dev/null 2>&1; then
+    rpicam-hello --list-cameras || true
+  elif command -v libcamera-hello >/dev/null 2>&1; then
     libcamera-hello --list-cameras || true
   else
-    echo "camera: libcamera-hello not installed"
+    echo "camera: rpicam-hello/libcamera-hello not installed"
+  fi
+
+  found_display=0
+  if command -v vcgencmd >/dev/null 2>&1; then
+    vcgencmd display_power || true
+    found_display=1
+  fi
+  if [[ -e /dev/fb0 ]]; then
+    echo "display: framebuffer /dev/fb0 present"
+    found_display=1
+  fi
+  if compgen -G "/dev/dri/card*" >/dev/null; then
+    echo "display: DRM devices"
+    ls -1 /dev/dri/card* || true
+    found_display=1
+  fi
+  if [[ "\$found_display" -eq 0 ]]; then
+    echo "display: no framebuffer or DRM card detected"
   fi
 }
 

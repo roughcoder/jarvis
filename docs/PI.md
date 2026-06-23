@@ -71,7 +71,8 @@ jarvis-pi doctor
 `update` refreshes the runtime from the configured public repository/ref, syncs
 intercom dependencies, reloads systemd, and restarts the intercom service.
 `doctor` prints the configured brain/device, service state, microphone/speaker
-enumeration, and camera listing when `libcamera-hello` is available.
+enumeration, display interface hints, and camera listing when `rpicam-hello`
+or legacy `libcamera-hello` is available.
 
 See `docs/DEPLOYMENT.md` for the product install flow.
 

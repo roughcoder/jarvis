@@ -76,3 +76,13 @@ def test_pi_installer_dry_run_skips_uv_install_when_present() -> None:
     assert result.returncode == 0, result.stderr
     assert "astral.sh/uv/install.sh" not in result.stdout
     assert "+ env UV_PYTHON=python3 UV_LINK_MODE=copy uv sync --no-dev --extra stt --extra vad-lite --extra wake" in result.stdout
+
+
+def test_pi_helper_doctor_checks_bookworm_camera_and_display() -> None:
+    source = INSTALLER.read_text(encoding="utf-8")
+
+    assert "rpicam-hello --list-cameras" in source
+    assert "libcamera-hello --list-cameras" in source
+    assert "vcgencmd display_power" in source
+    assert "/dev/fb0" in source
+    assert "/dev/dri/card*" in source

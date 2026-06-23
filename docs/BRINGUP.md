@@ -142,7 +142,7 @@ jarvis pair kitchen-pi --json --pi-installer --brain-host imac.private
 ```
 
 Run the generated Pi installer command on the Pi. It should include a release tag
-such as `JARVIS_REF=v0.1.15`, not a development-only `main` ref.
+such as `JARVIS_REF=v0.1.16`, not a development-only `main` ref.
 
 Proof:
 
@@ -163,8 +163,10 @@ Pass criteria:
 - `jarvis-pi doctor` shows the expected `CAPS_DEVICE_ID`,
   `INTERCOM_BRAIN_HOST`, and `INTERCOM_BRAIN_PORT`.
 - `arecord -l` and `aplay -l` list the expected microphone and speaker.
-- `libcamera-hello --list-cameras` lists the camera when the camera package is
-  installed and hardware is attached.
+- `rpicam-hello --list-cameras` or legacy `libcamera-hello --list-cameras`
+  lists the camera when the camera tool is installed and hardware is attached.
+- `jarvis-pi doctor` reports a framebuffer, DRM card, or `vcgencmd`
+  display-power result for the attached screen.
 - `jarvis-intercom.service` is enabled and active after the matching
   `BRAIN_DEVICES` entry is present on the iMac.
 - Pi updates are one command:

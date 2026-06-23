@@ -745,10 +745,19 @@ def _hardware_evidence(
 ) -> dict[str, object]:
     checks: dict[str, list[str]] = {}
     if platform_name == "systemd":
+        camera_tool = "rpicam-hello" if which("rpicam-hello") else "libcamera-hello"
         checks = {
             "microphones": ["arecord", "-l"],
             "speakers": ["aplay", "-l"],
-            "cameras": ["libcamera-hello", "--list-cameras"],
+            "cameras": [camera_tool, "--list-cameras"],
+            "display": [
+                "sh",
+                "-c",
+                "if command -v vcgencmd >/dev/null 2>&1; then vcgencmd display_power; "
+                "elif [ -e /dev/fb0 ]; then echo 'framebuffer: /dev/fb0 present'; "
+                "elif ls /dev/dri/card* >/dev/null 2>&1; then ls -1 /dev/dri/card*; "
+                "else echo 'display: no framebuffer or DRM card detected' >&2; exit 1; fi",
+            ],
         }
     elif platform_name == "launchd":
         checks = {

@@ -119,7 +119,11 @@ def test_collect_bringup_evidence_redacts_and_filters_roles() -> None:
         )
 
     def fake_which(name: str) -> str | None:
-        return f"/usr/bin/{name}" if name in {"brew", "arecord", "aplay"} else None
+        return (
+            f"/usr/bin/{name}"
+            if name in {"brew", "arecord", "aplay", "rpicam-hello", "sh"}
+            else None
+        )
 
     data = collect_bringup_evidence(
         ["intercom"],
@@ -139,7 +143,9 @@ def test_collect_bringup_evidence_redacts_and_filters_roles() -> None:
     assert "systemctl" in calls[2]
     assert data["hardware"]["microphones"]["ok"] is True
     assert data["hardware"]["speakers"]["ok"] is True
-    assert data["hardware"]["cameras"]["available"] is False
+    assert data["hardware"]["cameras"]["argv"] == ["rpicam-hello", "--list-cameras"]
+    assert data["hardware"]["cameras"]["ok"] is True
+    assert data["hardware"]["display"]["ok"] is True
 
 
 def test_summarize_bringup_evidence_flags_missing_expected_roles(tmp_path) -> None:

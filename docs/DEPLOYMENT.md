@@ -241,8 +241,8 @@ sudo jarvis-pi update
 
 The Pi installer writes `/usr/local/bin/jarvis-pi`; `update` refreshes the
 installed runtime, syncs intercom dependencies, reloads systemd, and restarts
-`jarvis-intercom.service`. `jarvis-pi doctor` prints basic service, audio, and
-camera readiness.
+`jarvis-intercom.service`. `jarvis-pi doctor` prints basic service, audio,
+display, and camera readiness.
 
 ## Acceptance Gates
 
