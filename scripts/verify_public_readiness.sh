@@ -87,8 +87,10 @@ scan_docs_preview() {
   section "docs preview scan"
   local stale_patterns missing_patterns
   stale_patterns="$(
-    git -C "$ROOT_DIR" grep -nE 'brew install --HEAD jarvis|jarvis pair [^<[:space:]]+[[:space:]]+--json</code>|Tailscale|Mac mini' -- docs-site README.md docs/DEPLOYMENT.md docs/FLEET.md docs/PI.md \
-      || true
+    {
+      git -C "$ROOT_DIR" grep -nE 'brew install --HEAD jarvis|jarvis pair [^<[:space:]]+[[:space:]]+--json</code>|Tailscale|Mac mini' -- docs-site README.md docs/DEPLOYMENT.md docs/FLEET.md docs/PI.md
+      git -C "$ROOT_DIR" grep -n 'raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_pi.sh' -- docs/DEPLOYMENT.md docs/PI.md docs/BRINGUP.md docs/FLEET.md
+    } || true
   )"
   if [[ -n "$stale_patterns" ]]; then
     echo "Stale deployment preview/docs patterns found:"

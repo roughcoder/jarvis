@@ -7,7 +7,8 @@ Usage: install_pi.sh
 
 Environment:
   JARVIS_REPO=roughcoder/jarvis          GitHub repository to install from.
-  JARVIS_REF=main                        Branch, tag, or commit.
+  JARVIS_REF=main                        Branch, tag, or commit. Generated pairing
+                                         commands set this to the current release tag.
   JARVIS_INSTALL_DIR=/opt/jarvis         Install directory.
   JARVIS_DEVICE_ID=room-pi               Device id for this Pi.
   JARVIS_BRAIN_HOST=imac.example         Brain hostname on the private network.

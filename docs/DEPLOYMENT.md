@@ -151,11 +151,13 @@ ship a prebuilt image.
 Target flow:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_pi.sh \
+JARVIS_REF=v0.1.17
+curl -fsSL "https://raw.githubusercontent.com/roughcoder/jarvis/$JARVIS_REF/scripts/install_pi.sh" \
   -o /tmp/install_jarvis_pi.sh
 sudo JARVIS_BRAIN_HOST=imac.private \
   JARVIS_INTERCOM_TOKEN=issued-token \
   JARVIS_DEVICE_ID=kitchen-pi \
+  JARVIS_REF="$JARVIS_REF" \
   bash /tmp/install_jarvis_pi.sh
 ```
 
