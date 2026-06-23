@@ -162,6 +162,9 @@ scan_docs_preview() {
     {
       git -C "$ROOT_DIR" grep -nE 'brew install --HEAD jarvis|jarvis pair [^<[:space:]]+[[:space:]]+--json</code>|Tailscale|Mac mini' -- docs-site README.md docs/DEPLOYMENT.md docs/FLEET.md docs/PI.md
       git -C "$ROOT_DIR" grep -n 'raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_pi.sh' -- docs/DEPLOYMENT.md docs/PI.md docs/BRINGUP.md docs/FLEET.md
+      git -C "$ROOT_DIR" grep -n 'raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh' -- README.md docs/DEPLOYMENT.md docs/BRINGUP.md docs/FLEET.md docs-site/index.html
+      git -C "$APPLE_DIR" grep -n 'raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh' -- README.md
+      git -C "$TAP_DIR" grep -n 'raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh' -- README.md
     } || true
   )"
   if [[ -n "$stale_patterns" ]]; then
@@ -173,6 +176,7 @@ scan_docs_preview() {
   missing_patterns="$(
     {
       git -C "$ROOT_DIR" grep -q 'scripts/install_mac.sh | bash' -- docs-site/index.html || echo "docs-site/index.html missing Mac bootstrap command"
+      git -C "$ROOT_DIR" grep -q "raw.githubusercontent.com/roughcoder/jarvis/v$RUNTIME_VERSION/scripts/install_mac.sh" -- docs-site/index.html || echo "docs-site/index.html missing release-pinned Mac bootstrap URL"
       git -C "$ROOT_DIR" grep -q "jarvis $RUNTIME_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current runtime release"
       git -C "$ROOT_DIR" grep -q "jarvis-app $APP_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current app release"
       git -C "$ROOT_DIR" grep -q "JARVIS_REF=v$RUNTIME_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current Pi release ref"

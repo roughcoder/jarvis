@@ -71,7 +71,7 @@ Mac runtime distribution should live in the Homebrew tap repository
 `roughcoder/infinite-stack`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.19/scripts/install_mac.sh | bash
 ```
 
 Use `jarvis` for the runtime package: the brain, worker, intercom, CLI/runtime

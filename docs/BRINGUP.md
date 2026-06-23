@@ -44,7 +44,7 @@ on the private network.
 1. **iMac first**
 
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
+   curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.19/scripts/install_mac.sh | bash
    ```
 
    In Jarvis Setup, choose **Brain Mac**, set the private-network host
@@ -71,7 +71,7 @@ on the private network.
 3. **Bring up each laptop**
 
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
+   curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.19/scripts/install_mac.sh | bash
    ```
 
    Paste that laptop's generated Mac config command, choose **Laptop** in Setup,
@@ -139,7 +139,7 @@ on the private network.
 Install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.19/scripts/install_mac.sh | bash
 ```
 
 Jarvis Setup on the brain Mac can write `BRAIN_HOST=0.0.0.0` and issued device
@@ -188,7 +188,7 @@ Pass criteria:
 Install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.19/scripts/install_mac.sh | bash
 ```
 
 On the iMac, issue a laptop token from Setup or:
