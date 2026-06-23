@@ -94,6 +94,16 @@ fi
 echo "Tapping $TAP"
 run "$BREW_PATH" tap "$TAP"
 
+echo "Updating $TAP"
+if [[ "$DRY_RUN" == "1" ]]; then
+  run /usr/bin/git -C "<homebrew tap repo>" pull --ff-only
+else
+  TAP_REPO="$("$BREW_PATH" --repo "$TAP" </dev/null)"
+  if [[ -n "$TAP_REPO" && -d "$TAP_REPO/.git" ]]; then
+    run /usr/bin/git -C "$TAP_REPO" pull --ff-only
+  fi
+fi
+
 echo "Trusting Jarvis Homebrew entries"
 if [[ "$DRY_RUN" == "1" ]]; then
   run "$BREW_PATH" trust --formula "$TAP/$RUNTIME_FORMULA"

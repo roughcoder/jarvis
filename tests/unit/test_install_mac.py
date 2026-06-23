@@ -33,6 +33,7 @@ def test_mac_installer_dry_run_models_fresh_install() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "+ /tmp/jarvis-test-brew tap roughcoder/infinite-stack" in result.stdout
+    assert "+ /usr/bin/git -C \\<homebrew\\ tap\\ repo\\> pull --ff-only" in result.stdout
     assert "+ /tmp/jarvis-test-brew trust --formula roughcoder/infinite-stack/jarvis" in result.stdout
     assert "+ /tmp/jarvis-test-brew trust --cask roughcoder/infinite-stack/jarvis-app" in result.stdout
     assert "+ /tmp/jarvis-test-brew install jarvis" in result.stdout
@@ -62,6 +63,10 @@ printf '%s\\n' "$*" >> {log}
 case "$1" in
   shellenv)
     printf 'export PATH=%q:$PATH\\n' {tmp_path}
+    exit 0
+    ;;
+  --repo)
+    printf '%s\\n' {tmp_path}
     exit 0
     ;;
   help)
