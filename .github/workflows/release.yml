@@ -32,6 +32,11 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
+      - name: Configure git author
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
       - name: Compute next version
         id: compute-version
         run: |
@@ -39,6 +44,9 @@ jobs:
           version="$(scripts/compute_next_release_version.sh)"
           echo "release_version=${version}" >> "$GITHUB_OUTPUT"
           echo "Computed release version: ${version}"
+
+      - name: Sync runtime version metadata
+        run: scripts/sync_runtime_version.sh "${{ steps.compute-version.outputs.release_version }}" --commit
 
       - name: Build and publish runtime release
         run: |
