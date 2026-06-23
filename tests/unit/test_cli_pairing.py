@@ -123,6 +123,8 @@ def test_pair_json_can_apply_brain_config(capsys, tmp_path) -> None:
             "--apply-brain-config",
             "--env-file",
             str(env_file),
+            "--brain-bind-host",
+            "0.0.0.0",
         ]
     )
 
@@ -130,13 +132,16 @@ def test_pair_json_can_apply_brain_config(capsys, tmp_path) -> None:
     payload = json.loads(output.out)
     entry = json.loads(payload["brain_devices_entry"])
     saved = env_file.read_text(encoding="utf-8")
-    saved_value = saved.split("=", 1)[1].strip().strip('"').replace('\\"', '"')
+    saved_value = next(
+        line.split("=", 1)[1] for line in saved.splitlines() if line.startswith("BRAIN_DEVICES=")
+    ).strip().strip('"').replace('\\"', '"')
 
     assert code == 0
     assert output.err == ""
     assert payload["brain_config_path"] == str(env_file)
     assert payload["brain_devices_count"] == 1
     assert json.loads(saved_value) == [entry]
+    assert 'BRAIN_HOST="0.0.0.0"' in saved
 
 
 def test_pair_validates_brain_host_before_apply_brain_config(capsys, tmp_path) -> None:

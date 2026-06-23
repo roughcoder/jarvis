@@ -1150,7 +1150,11 @@ def _cmd_pair(args: argparse.Namespace) -> int:
     brain_devices_count: int | None = None
     if args.apply_brain_config:
         try:
-            devices = upsert_brain_device_entry(args.env_file, fragment)
+            devices = upsert_brain_device_entry(
+                args.env_file,
+                fragment,
+                brain_bind_host=args.brain_bind_host,
+            )
         except ValueError as exc:
             print(f"Could not update brain config: {exc}", file=sys.stderr)
             return 2
@@ -1596,6 +1600,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--env-file",
         default="~/.jarvis/.env",
         help="Brain dotenv file to update with --apply-brain-config",
+    )
+    p_pair.add_argument(
+        "--brain-bind-host",
+        default="",
+        help="Also set BRAIN_HOST in --env-file, for example 0.0.0.0 on a brain Mac",
     )
     p_pair.set_defaults(func=_cmd_pair)
 

@@ -14,10 +14,10 @@ jarvis pair room-pi --pi-installer --brain-host imac.private
 
 The command prints the `BRAIN_DEVICES` entry for the brain and a copy/paste
 installer command for the Pi. In the macOS app this is the Setup window's
-**Issue Token** flow; when **Brain Mac** roles are selected the app writes the
-brain config entry automatically. **Copy Entry** still copies the entry for
-inspection or manual recovery, and **Copy Pi Command** copies the release-pinned
-Pi installer command.
+**Issue Token** flow; when **Brain Mac** roles are selected the app writes
+`BRAIN_HOST=0.0.0.0` and the brain config entry automatically. **Copy Entry**
+still copies the entry for inspection or manual recovery, and **Copy Pi Command**
+copies the release-pinned Pi installer command.
 
 `profiles/room-pi.md` already ships a house-scoped profile (web.search, files.read,
 mcp.context7). A shared device stays **house** scope until a speaker confirms who

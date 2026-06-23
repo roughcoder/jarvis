@@ -280,6 +280,21 @@ def test_upsert_brain_device_entry_writes_env_file(tmp_path) -> None:
     assert oct(env_file.stat().st_mode & 0o777) == "0o600"
 
 
+def test_upsert_brain_device_entry_can_set_bind_host(tmp_path) -> None:
+    env_file = tmp_path / ".env"
+
+    devices = upsert_brain_device_entry(
+        env_file,
+        '{"token":"tok","device_id":"kitchen-pi"}',
+        brain_bind_host="0.0.0.0",
+    )
+
+    text = env_file.read_text(encoding="utf-8")
+    assert devices == [{"token": "tok", "device_id": "kitchen-pi"}]
+    assert 'BRAIN_HOST="0.0.0.0"\n' in text
+    assert "BRAIN_DEVICES=" in text
+
+
 def test_upsert_brain_device_entry_preserves_other_env_and_replaces_device(
     tmp_path,
 ) -> None:
