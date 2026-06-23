@@ -61,7 +61,13 @@ def test_pi_installer_dry_run_models_intercom_install() -> None:
     assert "+ jarvis service install intercom --platform systemd --jarvis-bin /usr/local/bin/jarvis --workdir /opt/jarvis-test" in result.stdout
     assert "+ systemctl daemon-reload" in result.stdout
     assert "+ systemctl enable --now jarvis-intercom.service" in result.stdout
+    assert "Check hardware with: jarvis-pi doctor" in result.stdout
     assert "Update later with: sudo jarvis-pi update" in result.stdout
+    assert "Physical bring-up evidence:" in result.stdout
+    assert (
+        "jarvis bringup --json --role intercom --platform systemd --hardware \\\n"
+        "    --brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence"
+    ) in result.stdout
 
 
 def test_pi_installer_dry_run_skips_uv_install_when_present() -> None:
