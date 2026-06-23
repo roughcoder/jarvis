@@ -9,7 +9,6 @@ Cleanly removes Jarvis installed artifacts from this Mac while leaving local
 source checkouts alone. This is intended for fresh end-to-end install testing.
 
 Environment:
-  JARVIS_TAP=roughcoder/infinite-stack      Homebrew tap name.
   JARVIS_RUNTIME_FORMULA=jarvis             Runtime formula token.
   JARVIS_APP_CASK=jarvis-app                Native app cask token.
   JARVIS_WORKDIR=$HOME/.jarvis              Runtime workdir/config dir.
@@ -39,7 +38,6 @@ if [[ "${JARVIS_ASSUME_MAC:-0}" != "1" && "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
-TAP="${JARVIS_TAP:-roughcoder/infinite-stack}"
 RUNTIME_FORMULA="${JARVIS_RUNTIME_FORMULA:-jarvis}"
 APP_CASK="${JARVIS_APP_CASK:-jarvis-app}"
 WORKDIR="${JARVIS_WORKDIR:-$HOME/.jarvis}"
@@ -145,13 +143,7 @@ cat <<NEXT
 
 Jarvis uninstall complete.
 
-Local source checkouts were not touched. To reinstall with Homebrew:
+Local source checkouts were not touched. To reinstall Jarvis:
 
-  brew tap $TAP
-  brew trust --formula $TAP/$RUNTIME_FORMULA
-  brew trust --cask $TAP/$APP_CASK
-  brew install $RUNTIME_FORMULA
-  brew install --cask $APP_CASK
-  /usr/bin/xattr -dr com.apple.quarantine /Applications/Jarvis.app
-  open -a Jarvis
+  curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
 NEXT

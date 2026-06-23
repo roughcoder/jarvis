@@ -45,8 +45,7 @@ def test_mac_uninstaller_dry_run_removes_services_state_and_packages() -> None:
     assert "+ /tmp/jarvis-test-brew uninstall --formula jarvis" in result.stdout
     assert "+ rm -rf /Applications/Jarvis.app" in result.stdout
     assert "Local source checkouts were not touched." in result.stdout
-    assert "brew install jarvis" in result.stdout
-    assert "brew install --cask jarvis-app" in result.stdout
+    assert "scripts/install_mac.sh | bash" in result.stdout
 
 
 def test_mac_uninstaller_can_keep_homebrew_packages() -> None:
