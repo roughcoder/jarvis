@@ -108,7 +108,12 @@ def issue_pairing_entry(device_id: str, *, identity: str = "") -> tuple[str, str
     return token, json.dumps(entry, separators=(",", ":"))
 
 
-def upsert_brain_device_entry(env_file: str | Path, entry_json: str) -> list[dict[str, str]]:
+def upsert_brain_device_entry(
+    env_file: str | Path,
+    entry_json: str,
+    *,
+    brain_bind_host: str = "",
+) -> list[dict[str, str]]:
     """Upsert one BRAIN_DEVICES entry into a dotenv file and return all entries."""
     entry = _parse_brain_device_entry(entry_json)
     path = Path(env_file).expanduser()
@@ -124,6 +129,10 @@ def upsert_brain_device_entry(env_file: str | Path, entry_json: str) -> list[dic
     serialized = json.dumps(devices, separators=(",", ":"))
     updated_line = f"BRAIN_DEVICES={_dotenv_quote(serialized)}\n"
     updated = _replace_dotenv_key(lines, "BRAIN_DEVICES", updated_line)
+    if brain_bind_host:
+        updated = _replace_dotenv_key(
+            updated, "BRAIN_HOST", f"BRAIN_HOST={_dotenv_quote(brain_bind_host)}\n"
+        )
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(updated), encoding="utf-8")

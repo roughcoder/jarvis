@@ -42,8 +42,8 @@ Install:
 curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
 ```
 
-Jarvis Setup on the brain Mac can write issued device entries into
-`~/.jarvis/.env` automatically. Manual equivalent:
+Jarvis Setup on the brain Mac can write `BRAIN_HOST=0.0.0.0` and issued device
+entries into `~/.jarvis/.env` automatically. Manual equivalent:
 
 ```bash
 BRAIN_HOST=0.0.0.0
@@ -55,8 +55,9 @@ Use Jarvis Setup:
 1. Choose **Brain Mac**.
 2. Set the private-network brain hostname, for example `imac.private`.
 3. Install services.
-4. Issue tokens for each laptop and Pi. The app writes the `BRAIN_DEVICES`
-   entry to `~/.jarvis/.env` when **Brain Mac** roles are selected.
+4. Issue tokens for each laptop and Pi. The app writes `BRAIN_HOST=0.0.0.0`
+   and the `BRAIN_DEVICES` entry to `~/.jarvis/.env` when **Brain Mac** roles
+   are selected.
 
 Proof:
 
@@ -141,7 +142,7 @@ jarvis pair kitchen-pi --json --pi-installer --brain-host imac.private
 ```
 
 Run the generated Pi installer command on the Pi. It should include a release tag
-such as `JARVIS_REF=v0.1.14`, not a development-only `main` ref.
+such as `JARVIS_REF=v0.1.15`, not a development-only `main` ref.
 
 Proof:
 
