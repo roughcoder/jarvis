@@ -185,6 +185,9 @@ scan_docs_preview() {
     {
       git -C "$ROOT_DIR" grep -q 'scripts/install_mac.sh | bash' -- docs-site/index.html || echo "docs-site/index.html missing Mac bootstrap command"
       git -C "$ROOT_DIR" grep -q "raw.githubusercontent.com/roughcoder/jarvis/v$RUNTIME_VERSION/scripts/install_mac.sh" -- docs-site/index.html || echo "docs-site/index.html missing release-pinned Mac bootstrap URL"
+      git -C "$ROOT_DIR" grep -q "raw.githubusercontent.com/roughcoder/jarvis/v$RUNTIME_VERSION/scripts/install_mac.sh" -- README.md docs/DEPLOYMENT.md docs/BRINGUP.md docs/FLEET.md || echo "runtime docs missing current release-pinned Mac bootstrap URL"
+      git -C "$APPLE_DIR" grep -q "raw.githubusercontent.com/roughcoder/jarvis/v$RUNTIME_VERSION/scripts/install_mac.sh" -- README.md || echo "app docs missing current release-pinned Mac bootstrap URL"
+      git -C "$TAP_DIR" grep -q "raw.githubusercontent.com/roughcoder/jarvis/v$RUNTIME_VERSION/scripts/install_mac.sh" -- README.md || echo "tap docs missing current release-pinned Mac bootstrap URL"
       git -C "$ROOT_DIR" grep -q "jarvis $RUNTIME_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current runtime release"
       git -C "$ROOT_DIR" grep -q "jarvis-app $APP_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current app release"
       git -C "$ROOT_DIR" grep -q "JARVIS_REF=v$RUNTIME_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current Pi release ref"
