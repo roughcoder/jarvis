@@ -182,10 +182,13 @@ scan_docs_preview() {
     {
       git -C "$ROOT_DIR" grep -q 'brew install jarvis' -- README.md docs/DEPLOYMENT.md docs/BRINGUP.md docs/FLEET.md docs-site/index.html || echo "runtime docs missing Homebrew runtime install command"
       git -C "$ROOT_DIR" grep -q 'brew install --cask jarvis-app' -- README.md docs/DEPLOYMENT.md docs/BRINGUP.md docs/FLEET.md docs-site/index.html || echo "runtime docs missing Homebrew app install command"
+      git -C "$ROOT_DIR" grep -q 'curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/uninstall_mac.sh | bash' -- README.md docs/DEPLOYMENT.md docs-site/index.html || echo "runtime docs missing public Mac clean-reset command"
       git -C "$APPLE_DIR" grep -q 'brew install jarvis' -- README.md || echo "app docs missing Homebrew runtime install command"
       git -C "$APPLE_DIR" grep -q 'brew install --cask jarvis-app' -- README.md || echo "app docs missing Homebrew app install command"
+      git -C "$APPLE_DIR" grep -q 'curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/uninstall_mac.sh | bash' -- README.md || echo "app docs missing public Mac clean-reset command"
       git -C "$TAP_DIR" grep -q 'brew install jarvis' -- README.md || echo "tap docs missing Homebrew runtime install command"
       git -C "$TAP_DIR" grep -q 'brew install --cask jarvis-app' -- README.md || echo "tap docs missing Homebrew app install command"
+      git -C "$TAP_DIR" grep -q 'curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/uninstall_mac.sh | bash' -- README.md || echo "tap docs missing public Mac clean-reset command"
       git -C "$ROOT_DIR" grep -q "jarvis $RUNTIME_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current runtime release"
       git -C "$ROOT_DIR" grep -q "jarvis-app $APP_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current app release"
       git -C "$ROOT_DIR" grep -q "JARVIS_REF=v$RUNTIME_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current Pi release ref"
