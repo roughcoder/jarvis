@@ -127,6 +127,9 @@ Fresh Mac install:
 curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
 ```
 
+The bootstrap taps `roughcoder/infinite-stack` and, on Homebrew versions with tap
+trust enforcement, trusts only the `jarvis` formula and `jarvis-app` cask.
+
 Preview the bootstrap without changing the machine:
 
 ```bash

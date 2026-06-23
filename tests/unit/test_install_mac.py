@@ -34,6 +34,8 @@ def test_mac_installer_dry_run_models_fresh_install() -> None:
     assert result.returncode == 0, result.stderr
     assert "+ /tmp/jarvis-test-brew update" in result.stdout
     assert "+ /tmp/jarvis-test-brew tap roughcoder/infinite-stack" in result.stdout
+    assert "+ /tmp/jarvis-test-brew trust --formula roughcoder/infinite-stack/jarvis" in result.stdout
+    assert "+ /tmp/jarvis-test-brew trust --cask roughcoder/infinite-stack/jarvis-app" in result.stdout
     assert "+ /tmp/jarvis-test-brew install jarvis" in result.stdout
     assert "--HEAD jarvis" not in result.stdout
     assert "+ /tmp/jarvis-test-brew install --cask jarvis-app" in result.stdout

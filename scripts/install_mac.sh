@@ -109,6 +109,15 @@ run "$BREW_PATH" update
 echo "Tapping $TAP"
 run "$BREW_PATH" tap "$TAP"
 
+echo "Trusting Jarvis Homebrew entries"
+if [[ "$DRY_RUN" == "1" ]]; then
+  run "$BREW_PATH" trust --formula "$TAP/$RUNTIME_FORMULA"
+  run "$BREW_PATH" trust --cask "$TAP/$APP_CASK"
+elif "$BREW_PATH" help trust >/dev/null 2>&1; then
+  "$BREW_PATH" trust --formula "$TAP/$RUNTIME_FORMULA" || true
+  "$BREW_PATH" trust --cask "$TAP/$APP_CASK" || true
+fi
+
 echo "Installing Jarvis runtime"
 if [[ "$DRY_RUN" == "1" ]]; then
   run "$BREW_PATH" list --formula "$RUNTIME_FORMULA"
