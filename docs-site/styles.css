@@ -261,8 +261,40 @@ h3 {
 .band,
 .fleet,
 .onboarding,
+.runbook,
 .updates {
   padding: clamp(64px, 9vw, 130px) clamp(18px, 5vw, 72px);
+}
+
+.release-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in oklch, var(--panel), transparent 4%);
+}
+
+.release-strip div {
+  padding: 22px clamp(18px, 5vw, 72px);
+  border-right: 1px solid var(--line);
+}
+
+.release-strip div:last-child {
+  border-right: 0;
+}
+
+.release-strip span {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.release-strip strong {
+  font-size: clamp(1rem, 2vw, 1.35rem);
 }
 
 .band {
@@ -344,6 +376,57 @@ code {
   color: var(--muted);
   font-size: 1.05rem;
   line-height: 1.45;
+}
+
+.runbook {
+  background: color-mix(in oklch, var(--panel), transparent 8%);
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.runbook-list {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0;
+  border: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.runbook-list article {
+  min-height: 230px;
+  padding: 24px;
+  border-right: 1px solid var(--line);
+}
+
+.runbook-list article:last-child {
+  border-right: 0;
+}
+
+.runbook-list span {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  margin-bottom: 22px;
+  border: 1px solid var(--ink);
+  background: color-mix(in oklch, var(--amber), white 78%);
+  font-weight: 800;
+}
+
+.runbook-list p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 1.03rem;
+  line-height: 1.48;
+}
+
+.text-link {
+  display: inline-flex;
+  margin-top: 24px;
+  color: var(--steel);
+  font-weight: 760;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 5px;
 }
 
 .row {
@@ -440,6 +523,8 @@ code {
 
   .install-grid,
   .flow,
+  .release-strip,
+  .runbook-list,
   .security-grid {
     grid-template-columns: 1fr;
   }
@@ -447,6 +532,17 @@ code {
   .install-grid article {
     border-right: 0;
     border-bottom: 1px solid color-mix(in oklch, var(--paper), transparent 65%);
+  }
+
+  .release-strip div,
+  .runbook-list article {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .release-strip div:last-child,
+  .runbook-list article:last-child {
+    border-bottom: 0;
   }
 
   .row {

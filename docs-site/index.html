@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Jarvis Deployment</title>
     <meta name="description" content="Install and operate Jarvis across Macs and Raspberry Pi intercoms.">
-    <link rel="stylesheet" href="styles.css?v=20260623-topology">
+    <link rel="stylesheet" href="styles.css?v=20260623-runbook">
   </head>
   <body>
     <header class="topbar">
@@ -16,6 +16,7 @@
       <nav aria-label="Primary navigation">
         <a href="#install">Install</a>
         <a href="#onboarding">Onboarding</a>
+        <a href="#runbook">Runbook</a>
         <a href="#fleet">Fleet</a>
         <a href="#security">Security</a>
         <a href="#updates">Updates</a>
@@ -58,6 +59,21 @@
           <div class="link l2"></div>
           <div class="link l3"></div>
           <div class="network-label">private network</div>
+        </div>
+      </section>
+
+      <section class="release-strip" aria-label="Current public releases">
+        <div>
+          <span>Runtime</span>
+          <strong>jarvis 0.1.17</strong>
+        </div>
+        <div>
+          <span>macOS app</span>
+          <strong>jarvis-app 0.2.22</strong>
+        </div>
+        <div>
+          <span>Pi installer</span>
+          <strong>JARVIS_REF=v0.1.17</strong>
         </div>
       </section>
 
@@ -113,6 +129,32 @@
             <p>Use Collect Evidence in Setup or run jarvis bringup with an output folder, then summarize the folder as the fleet acceptance gate.</p>
           </article>
         </div>
+      </section>
+
+      <section id="runbook" class="runbook">
+        <div class="section-heading">
+          <p class="eyebrow">Fresh fleet runbook</p>
+          <h2>Bring devices up in the order the brain expects.</h2>
+        </div>
+        <div class="runbook-list">
+          <article>
+            <span>1</span>
+            <p>Install the iMac first, choose Brain Mac, set the private-network host, install services, and keep Setup open for issuing tokens.</p>
+          </article>
+          <article>
+            <span>2</span>
+            <p>Issue one Mac config command per laptop from the iMac, paste it on that laptop, choose Laptop, check brain and worker, then install services.</p>
+          </article>
+          <article>
+            <span>3</span>
+            <p>Issue the Pi installer from the iMac and run the generated command on the Pi. It must include JARVIS_REF=v0.1.17.</p>
+          </article>
+          <article>
+            <span>4</span>
+            <p>Collect evidence on every device, summarize at least four files, then prove one Mac runtime update, one app update, and one Pi update.</p>
+          </article>
+        </div>
+        <a class="text-link" href="https://github.com/roughcoder/jarvis/blob/main/docs/BRINGUP.md">Open full bring-up checklist</a>
       </section>
 
       <section id="fleet" class="fleet">
