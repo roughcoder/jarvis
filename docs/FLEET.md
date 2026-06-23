@@ -76,6 +76,8 @@ brew trust --formula roughcoder/infinite-stack/jarvis
 brew trust --cask roughcoder/infinite-stack/jarvis-app
 brew install jarvis
 brew install --cask jarvis-app
+/usr/bin/xattr -dr com.apple.quarantine /Applications/Jarvis.app
+open -a Jarvis
 ```
 
 Use `jarvis` for the runtime package: the brain, worker, intercom, CLI/runtime,
