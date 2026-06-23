@@ -67,6 +67,17 @@ installs or upgrades `jarvis`, installs or upgrades `jarvis-app`, clears app
 quarantine while the app is ad-hoc signed, and opens Jarvis. The Setup window
 then owns role choice, local service installation, and pairing.
 
+If a machine is installed manually instead of through the bootstrap, trust only
+the two Jarvis entries before installing:
+
+```bash
+brew tap roughcoder/infinite-stack
+brew trust --formula roughcoder/infinite-stack/jarvis
+brew trust --cask roughcoder/infinite-stack/jarvis-app
+brew install jarvis
+brew install --cask jarvis-app
+```
+
 Packaged Mac services installed from the app or Mac bootstrap use `~/.jarvis` as
 the service workdir and set `JARVIS_ENV_FILE=~/.jarvis/.env` in launchd. This
 keeps local pairing/provider configuration outside the Homebrew Cellar and

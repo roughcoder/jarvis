@@ -130,6 +130,16 @@ curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/inst
 The bootstrap taps `roughcoder/infinite-stack` and, on Homebrew versions with tap
 trust enforcement, trusts only the `jarvis` formula and `jarvis-app` cask.
 
+Manual Homebrew installs should use the same entry-specific trust path:
+
+```bash
+brew tap roughcoder/infinite-stack
+brew trust --formula roughcoder/infinite-stack/jarvis
+brew trust --cask roughcoder/infinite-stack/jarvis-app
+brew install jarvis
+brew install --cask jarvis-app
+```
+
 Preview the bootstrap without changing the machine:
 
 ```bash

@@ -99,6 +99,12 @@ scan_docs_preview() {
   missing_patterns="$(
     {
       git -C "$ROOT_DIR" grep -q 'scripts/install_mac.sh | bash' -- docs-site/index.html || echo "docs-site/index.html missing Mac bootstrap command"
+      git -C "$ROOT_DIR" grep -q 'brew trust --formula roughcoder/infinite-stack/jarvis' -- README.md docs/DEPLOYMENT.md || echo "runtime docs missing entry-specific formula trust command"
+      git -C "$ROOT_DIR" grep -q 'brew trust --cask roughcoder/infinite-stack/jarvis-app' -- README.md docs/DEPLOYMENT.md || echo "runtime docs missing entry-specific cask trust command"
+      git -C "$APPLE_DIR" grep -q 'brew trust --formula roughcoder/infinite-stack/jarvis' -- README.md || echo "app docs missing entry-specific formula trust command"
+      git -C "$APPLE_DIR" grep -q 'brew trust --cask roughcoder/infinite-stack/jarvis-app' -- README.md || echo "app docs missing entry-specific cask trust command"
+      git -C "$TAP_DIR" grep -q 'brew trust --formula roughcoder/infinite-stack/jarvis' -- README.md || echo "tap docs missing entry-specific formula trust command"
+      git -C "$TAP_DIR" grep -q 'brew trust --cask roughcoder/infinite-stack/jarvis-app' -- README.md || echo "tap docs missing entry-specific cask trust command"
       git -C "$ROOT_DIR" grep -q 'jarvis service sync brain worker intercom' -- docs-site/index.html || echo "docs-site/index.html missing role sync command"
       git -C "$ROOT_DIR" grep -q -- '--pi-installer --brain-host imac.private' -- docs-site/index.html || echo "docs-site/index.html missing release-style Pi pairing command"
       git -C "$ROOT_DIR" grep -q -- '--output ~/Desktop/jarvis-bringup-evidence' -- docs-site/index.html || echo "docs-site/index.html missing bring-up evidence output command"
