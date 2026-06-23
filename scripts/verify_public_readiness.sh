@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEV_DIR="$(cd "$ROOT_DIR/.." && pwd)"
 APPLE_DIR="${JARVIS_APP_DIR:-$DEV_DIR/jarvis-apple}"
 TAP_DIR="${JARVIS_TAP_DIR:-$DEV_DIR/homebrew-infinite-stack}"
+RUNTIME_VERSION=""
+APP_VERSION=""
 
 section() {
   printf '\n==> %s\n' "$1"
@@ -15,6 +17,76 @@ require_dir() {
   local label="$2"
   if [[ ! -d "$path/.git" ]]; then
     echo "$label checkout not found at $path" >&2
+    exit 1
+  fi
+}
+
+load_release_versions() {
+  RUNTIME_VERSION="$(
+    python3 - <<'PY'
+import tomllib
+with open("pyproject.toml", "rb") as handle:
+    print(tomllib.load(handle)["project"]["version"])
+PY
+  )"
+  APP_VERSION="$(
+    sed -nE 's/^[[:space:]]*version "([^"]+)".*/\1/p' "$TAP_DIR/Casks/jarvis-app.rb" | head -n 1
+  )"
+  if [[ -z "$RUNTIME_VERSION" || -z "$APP_VERSION" ]]; then
+    echo "Could not derive runtime/app versions for public-readiness checks." >&2
+    exit 1
+  fi
+}
+
+scan_release_manifests() {
+  section "release manifest scan"
+  local init_version lock_version formula_url expected_formula_url
+
+  init_version="$(
+    python3 - <<'PY'
+import ast
+tree = ast.parse(open("src/jarvis/__init__.py", encoding="utf-8").read())
+for node in tree.body:
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "__version__":
+                print(ast.literal_eval(node.value))
+                raise SystemExit
+raise SystemExit("__version__ not found")
+PY
+  )"
+  lock_version="$(
+    python3 - <<'PY'
+import tomllib
+with open("uv.lock", "rb") as handle:
+    packages = tomllib.load(handle)["package"]
+for package in packages:
+    if package.get("name") == "jarvis" and package.get("source", {}).get("editable") == ".":
+        print(package["version"])
+        raise SystemExit
+raise SystemExit("editable jarvis package not found in uv.lock")
+PY
+  )"
+  if [[ "$init_version" != "$RUNTIME_VERSION" || "$lock_version" != "$RUNTIME_VERSION" ]]; then
+    echo "Runtime version mismatch: pyproject=$RUNTIME_VERSION __version__=$init_version uv.lock=$lock_version"
+    exit 1
+  fi
+
+  expected_formula_url="https://github.com/roughcoder/jarvis/releases/download/v$RUNTIME_VERSION/jarvis-$RUNTIME_VERSION.tar.gz"
+  formula_url="$(
+    sed -nE 's/^[[:space:]]*url "([^"]+)".*/\1/p' "$TAP_DIR/Formula/jarvis.rb" | head -n 1
+  )"
+  if [[ "$formula_url" != "$expected_formula_url" ]]; then
+    echo "Runtime formula URL mismatch: expected $expected_formula_url, found $formula_url"
+    exit 1
+  fi
+
+  if ! git -C "$TAP_DIR" grep -q "version \"$APP_VERSION\"" -- Casks/jarvis-app.rb; then
+    echo "App cask version could not be verified: $APP_VERSION"
+    exit 1
+  fi
+  if ! git -C "$TAP_DIR" grep -q 'https://github.com/roughcoder/jarvis-apple/releases/download/v#{version}/Jarvis-macos.zip' -- Casks/jarvis-app.rb; then
+    echo "App cask must use the public GitHub release download URL."
     exit 1
   fi
 }
@@ -101,9 +173,9 @@ scan_docs_preview() {
   missing_patterns="$(
     {
       git -C "$ROOT_DIR" grep -q 'scripts/install_mac.sh | bash' -- docs-site/index.html || echo "docs-site/index.html missing Mac bootstrap command"
-      git -C "$ROOT_DIR" grep -q 'jarvis 0.1.18' -- docs-site/index.html || echo "docs-site/index.html missing current runtime release"
-      git -C "$ROOT_DIR" grep -q 'jarvis-app 0.2.22' -- docs-site/index.html || echo "docs-site/index.html missing current app release"
-      git -C "$ROOT_DIR" grep -q 'JARVIS_REF=v0.1.18' -- docs-site/index.html || echo "docs-site/index.html missing current Pi release ref"
+      git -C "$ROOT_DIR" grep -q "jarvis $RUNTIME_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current runtime release"
+      git -C "$ROOT_DIR" grep -q "jarvis-app $APP_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current app release"
+      git -C "$ROOT_DIR" grep -q "JARVIS_REF=v$RUNTIME_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current Pi release ref"
       git -C "$ROOT_DIR" grep -q 'Fresh fleet runbook' -- docs-site/index.html || echo "docs-site/index.html missing fresh fleet runbook section"
       git -C "$ROOT_DIR" grep -q 'brew trust --formula roughcoder/infinite-stack/jarvis' -- README.md docs/DEPLOYMENT.md || echo "runtime docs missing entry-specific formula trust command"
       git -C "$ROOT_DIR" grep -q 'brew trust --cask roughcoder/infinite-stack/jarvis-app' -- README.md docs/DEPLOYMENT.md || echo "runtime docs missing entry-specific cask trust command"
@@ -130,6 +202,7 @@ scan_docs_preview() {
 require_dir "$ROOT_DIR" "Jarvis runtime"
 require_dir "$APPLE_DIR" "Jarvis app"
 require_dir "$TAP_DIR" "Homebrew tap"
+load_release_versions
 
 section "clean worktrees"
 git -C "$ROOT_DIR" status --short
@@ -141,6 +214,7 @@ if [[ -n "$(git -C "$ROOT_DIR" status --short)" || -n "$(git -C "$APPLE_DIR" sta
   exit 1
 fi
 
+scan_release_manifests
 scan_runtime_public_files
 scan_app_public_files
 scan_tap_public_files
