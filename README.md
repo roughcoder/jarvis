@@ -101,6 +101,8 @@ Per-step extras install as each build step is reached, e.g.
 - **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** — install-first deployment path
   for the iMac brain, Mac workers/intercoms, Raspberry Pi intercoms, Homebrew,
   pairing, and updates.
+- **[docs/BRINGUP.md](docs/BRINGUP.md)** — physical fleet acceptance checklist
+  for iMac, laptop, Raspberry Pi, private-network, and update proof.
 - **[docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md)** — public repository
   readiness gates and required scans.
 - **[docs/PHASE2.md](docs/PHASE2.md)** — the Frankfurt migration spec; the
