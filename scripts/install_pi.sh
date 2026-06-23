@@ -265,4 +265,12 @@ run systemctl enable --now jarvis-intercom.service
 
 echo "Jarvis Pi intercom installed as $DEVICE_ID."
 echo "Check status with: systemctl status jarvis-intercom.service"
+echo "Check hardware with: jarvis-pi doctor"
 echo "Update later with: sudo jarvis-pi update"
+cat <<NEXT
+
+Physical bring-up evidence:
+  mkdir -p ~/Desktop/jarvis-bringup-evidence
+  jarvis bringup --json --role intercom --platform systemd --hardware \\
+    --brain-host $BRAIN_HOST --output ~/Desktop/jarvis-bringup-evidence
+NEXT

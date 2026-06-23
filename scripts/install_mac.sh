@@ -200,4 +200,27 @@ Update later with:
   brew update
   brew upgrade $RUNTIME_FORMULA
   brew upgrade --cask $APP_CASK
+
+Physical bring-up evidence:
+  mkdir -p ~/Desktop/jarvis-bringup-evidence
+  Use Jarvis Setup > Collect Evidence and Summarize Evidence, or run:
+NEXT
+
+if [[ -n "$ROLES" ]]; then
+  printf '  jarvis bringup --json'
+  for role in "${ROLE_ARGS[@]}"; do
+    printf ' --role %q' "$role"
+  done
+  printf ' --hardware --output ~/Desktop/jarvis-bringup-evidence\n'
+else
+  cat <<'NEXT'
+  jarvis bringup --json --role brain --role worker --role intercom --hardware \
+    --output ~/Desktop/jarvis-bringup-evidence
+NEXT
+fi
+
+cat <<'NEXT'
+  jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence \
+    --expect-role brain --expect-role worker --expect-role intercom --min-files 4 \
+    --output ~/Desktop/jarvis-bringup-evidence
 NEXT

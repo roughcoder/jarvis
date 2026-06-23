@@ -38,6 +38,10 @@ def test_mac_installer_dry_run_models_fresh_install() -> None:
     assert "--HEAD jarvis" not in result.stdout
     assert "+ /tmp/jarvis-test-brew install --cask jarvis-app" in result.stdout
     assert "open -a Jarvis" not in result.stdout
+    assert "Physical bring-up evidence:" in result.stdout
+    assert "Use Jarvis Setup > Collect Evidence and Summarize Evidence" in result.stdout
+    assert "jarvis bringup --json --role brain --role worker --role intercom --hardware" in result.stdout
+    assert "jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence" in result.stdout
 
 
 def test_mac_installer_dry_run_models_existing_install_update() -> None:
@@ -76,3 +80,4 @@ def test_mac_installer_dry_run_installs_and_starts_roles() -> None:
     assert "+ jarvis service install worker --workdir /tmp/jarvis-home" in result.stdout
     assert "+ jarvis service start worker" in result.stdout
     assert "+ jarvis service restart worker" in result.stdout
+    assert "jarvis bringup --json --role brain --role worker --hardware --output ~/Desktop/jarvis-bringup-evidence" in result.stdout
