@@ -40,15 +40,17 @@ Verification depth scales with the change, not with the machine's ceiling:
 
 | Change | Verification rung (P12/P13) |
 |---|---|
-| typo · docs · config · comment | lint + build only |
-| logic · refactor · internal API | unit + integration tests |
+| docs · comment | doc lint / spell / link-check **if configured** (no build) |
+| config | config validation, or lint/build if the config feeds one |
+| code: logic · refactor · internal API | unit + integration tests |
 | feature · UI · public API · data | **exercise the real app** (browser/sim/boot+probe) — the expensive, flaky, opt-in-by-change rung |
 
 The same restraint applies to the rest of the cycle, not just verification:
 
 - **Stages are skippable.** A one-line fix needs no durable work item (P6), no
-  ensemble (P3), no plan step (P3) — Intake → Execute → (cheap verify) → Land.
-  The 10 stages are the *maximal* path; the loop collapses them when it can.
+  ensemble (P3), no explicit stage 3 Plan step — Intake → Execute → (cheap verify)
+  → Land. The 10 stages are the *maximal* path; the loop collapses them when it
+  can.
 - **Ensemble is opt-in.** One engine is the default; fan out to a panel only when
   the stakes justify the latency/cost (a risky review, a wide design space).
 - **Deep app-exercise is opt-in-by-change-type**, and the most expensive thing
@@ -57,6 +59,45 @@ The same restraint applies to the rest of the cycle, not just verification:
 Rule of thumb: **a turn should feel as light as the change is small.** If a typo
 fix triggers a simulator boot and a three-model panel, the loop is wrong — not
 because the capability is wrong, but because it failed to be proportional.
+
+## Safety invariants (hard rules, not tensions)
+
+Some boundaries are safety-critical and must be settled *before* implementation,
+not parked as open tensions. These are invariants the design must hold:
+
+- **I1 · Isolation is absolute; cleanup only deletes worker-owned paths.** No
+  engine ever edits a user-supplied path *in place*, and cleanup must only ever
+  remove paths the worker created. A git input → a fresh worktree+branch off
+  HEAD. A **non-git input → copied into worker-owned scratch, or refused** —
+  never run in place. ⚠️ *The current worker violates this:* a non-git `repo`
+  runs in place (`src/jarvis/worker/actions.py:191-192`) and cleanup then
+  `rmtree`s that path because `branch` is `None`
+  (`src/jarvis/worker/actions.py:206-211`) — it can delete the user's own
+  directory. This is a **P0 bug to fix**, and the invariant that prevents its
+  whole class. (See P4.)
+- **I2 · Panels are read-only unless every engine is independently isolated.** A
+  multi-engine ensemble (P3) may run engines concurrently against the **same**
+  workspace *only* when they are read-only (e.g. model review of a diff).
+  **Writing** CLI engines in a panel each get their **own worktree/branch**, and
+  convergence must define an explicit **merge or selection** strategy — never N
+  writers racing on one tree. (See P3.)
+- **I3 · Authority ≠ machine capability.** A target's *resources/toolchains*
+  (Xcode, browser, docker — doctor-probed) are a different axis from
+  *principal-bound credentials and write authority* (who `gh` is authenticated
+  as, which signing identity, whether this request may push). Resources come from
+  the machine (P2); authority comes from the trust gate and the request's
+  principal (P9). A laptop having `gh` installed never implies it may write as
+  you. (See P2, P9.)
+- **I4 · Public forge writes default to draft-then-confirm.** Voice/text-
+  originated **public** writes — pushing a shared branch, opening a PR, posting PR
+  comments/reviews — require an explicit `forge.write.public` capability **and**,
+  by default, a draft-then-confirm step before the write lands. Autonomous public
+  writes are opt-in per (principal × repo), decided up front — not a late policy
+  knob. Private/local actions (worktree commits, local branches) stay autonomous.
+  (See P5, P9.)
+
+The north-star example ("write the replies in the PR" unattended) is therefore a
+*configured* exception to I4, granted ahead of time — not the default.
 
 ---
 
@@ -102,10 +143,13 @@ into stage 1 (iterate on a review, follow-up ticket, learned skill).
    target that *can* (or reports that none can). For simple commands this is
    implicit; for complex ones it's an explicit step.
 4. **Provision.** Resolve the chosen target and prepare an **isolated
-   workspace** — clone the repo if missing, cut a worktree on a fresh branch.
-   Never the user's live checkout.
+   workspace** — clone the repo if missing, cut a worktree on a fresh branch off
+   HEAD: never the user's live checkout. A non-git input is **copied into
+   worker-owned scratch**, never run in place (invariant I1; see P4).
 5. **Execute.** Run the engine(s) on the target in the workspace. One engine, or
    **an ensemble in parallel** (panel). Long-running, async, tracked as a job.
+   Writing engines in a panel must each get their own isolated worktree
+   (invariant I2) — only read-only review may share one workspace.
 6. **Converge.** If an ensemble ran, **synthesise** the outputs. Run the
    **self-correction loop** — exercise the running app via the harness for its
    type (P13), review, and iterate until there are no accepted actionable
@@ -181,12 +225,16 @@ The discipline, made explicit (OpenClaw's coding-agent recipe, generalised):
   **escalates** — report the partial branch + what's still failing, and hand back
   to the human (re-enter the cycle at Intake). This is the difference between
   "ran out of time and stopped" and "claimed done when it wasn't".
-- **Isolated.** Every iteration runs in the P4 worktree, never the user's
-  checkout (OpenClaw's mandatory-isolated-checkout rule).
-- **One report, at the end.** The loop runs detached (P7) and emits exactly one
-  completion/failure message with the result + a resume handle (P11) — it does
-  not chatter per iteration (unless it needs to ask a question it genuinely
-  cannot answer alone).
+- **Isolated.** Every iteration runs in the P4 isolated workspace, never the
+  user's live tree (OpenClaw's mandatory-isolated-checkout rule). For a git repo
+  that's a fresh worktree off HEAD; a non-git dir gets a scratch copy or an
+  accepted-risk note (see P4) — never edited in place under the loop.
+- **One terminal report.** The loop runs detached (P7) and emits exactly one
+  *terminal* completion/failure message with the result + a resume handle (P11)
+  — with, for long jobs, optional *coarse* progress updates (e.g. "still going,
+  on iteration 3"). What it must not do is chatter per iteration, or interrupt
+  unless it needs to ask a question it genuinely cannot answer alone. (Whether
+  coarse progress is push or pull is the P7/P11 open question.)
 
 This nested loop sits *inside* the outer cycle. The **outer** loop is
 human-driven (stage 9 handoff: "address the review comments" re-enters at stage
@@ -252,8 +300,8 @@ class Engine(Protocol):
 ```
 
 Today: gateway is already model-as-a-parameter — `GatewayClient.complete(
-messages, model="…")` (`brain/gateway_client/__init__.py:33-45`); the worker
-shells codex/claude via `code_argv()` (`worker/actions.py:138-143`). **Gap:** no
+messages, model="…")` (`src/jarvis/brain/gateway_client/__init__.py:33-45`); the worker
+shells codex/claude via `code_argv()` (`src/jarvis/worker/actions.py:138-143`). **Gap:** no
 common interface; only codex+claude wired; no Factory/Cursor; model routes are
 just `fast`/`strong` (`config.py:48`). **Open:** how does a CLI engine stream
 progress vs a model engine returning once? Per-engine timeout/cost ceilings?
@@ -271,23 +319,32 @@ capability profile** — the skills of that machine — which decides what work 
 class Target:
     name: str                      # "worker", "personal-laptop", "hive", ...
     base_url: str                  # http(s) over the network boundary
-    # The machine's skills — DISCOVERED by a probe ("doctor"), not hand-declared:
+    # MACHINE RESOURCES only — DISCOVERED by a probe ("doctor"), not authority:
     capabilities: set[str]         # {"xcode", "ios-sim", "browser", "docker",
-                                   #  "node", "swift", "python", "gh-auth",
-                                   #  "signing-cert", "gpu", ...}
+                                   #  "node", "swift", "python", "gpu", ...}
     transport: Literal["push", "pull"]   # always-on vs sleeps/disconnects
 ```
+
+**Invariant I3 — resources are not authority.** `capabilities` answers only *"can
+this machine run that?"*. It must NOT contain credentials or write authority —
+*which* GitHub principal `gh` is logged in as, *which* signing identity is present,
+*whether this request may push*. A laptop can have `gh` installed yet be
+authenticated as the wrong person, or hold a signing cert that this request must
+not use. Those are **principal-bound** and resolved by the trust gate (P9) per
+request, never inferred from a machine probe.
 
 A task declares what it *needs* (`requires={"xcode","ios-sim"}`); the planner
 routes to a target whose `capabilities` satisfy it, or reports *"nothing I can
 reach can build a Swift app"*. The profile is **probed**, the way
 `jarvis worker --doctor` already inspects peekaboo/GUI readiness — extended to
-"is there a browser / Xcode / docker / signing identity here?".
+"is there a browser / Xcode / docker here?". *Credential presence* may also be
+probed, but is only ever a routing *hint*; the authority to use it still comes
+from P9.
 
-Today: the worker daemon is exactly one such target (`worker/server.py`), reached
+Today: the worker daemon is exactly one such target (`src/jarvis/worker/server.py`), reached
 over HTTP with a bearer token, and its `/health` already reports a few
-capabilities (browser enabled, GUI provider configured — `worker/server.py:272`);
-the dormant `remote/` lane is a second, unfinished one (`remote/client.py`). Phase
+capabilities (browser enabled, GUI provider configured — `src/jarvis/worker/server.py:272`);
+the dormant `src/jarvis/remote/` lane is a second, unfinished one (`src/jarvis/remote/client.py`). Phase
 2 already plans Tailscale hostnames. **Gap:** no registry, no routing, no
 capability profile/probe, one target only. **Open:** push vs pull (pull survives a
 laptop asleep/off; needed for serverless); how a result from a transient box gets
@@ -300,22 +357,43 @@ is the bit *neither OpenClaw nor Hermes has first-class*, and it's small over th
 gateway we already have.
 
 ```python
-async def panel(task, engines: list[Engine], *, synth: Engine) -> Result:
-    drafts = await asyncio.gather(*(e.run(task, ws) for e in engines))
+# READ-ONLY panel (e.g. multi-model review of a diff) — may share one ws:
+async def review_panel(task, engines, *, synth, ws) -> Result:
+    drafts = await asyncio.gather(*(e.run(task, ws) for e in engines))  # no writes
     return await synth.run(combine_prompt(task, drafts), ws)
+
+# WRITING panel (CLI engines that edit files) — each engine its OWN worktree,
+# then an explicit converge step picks/merges. NEVER N writers on one tree (I2):
+async def build_panel(task, engines, *, converge, base) -> Result:
+    branches = await asyncio.gather(*(e.run(task, ws=worktree_of(base, e)) for e in engines))
+    return await converge(branches)            # select-best or merge — explicit
 ```
 
-Today: nothing — one model per call. **Gap:** the whole primitive. **Open:** is
-synthesis a model call, a deterministic merge, or a vote? Do ensemble members
-see each other's drafts (debate) or stay blind (independent)? How are
-disagreements surfaced to the user vs resolved silently?
+**Invariant I2** governs this: concurrent engines may share a workspace *only*
+when read-only. Writing engines are isolated per worktree/branch and convergence
+must be an explicit selection/merge — never a race.
 
-### P4 · Workspace — *isolation* ✅
+Today: nothing — one model per call. **Gap:** the whole primitive. **Open:**
+synthesis as model call vs deterministic merge vs vote; for the writing panel,
+select-best vs three-way merge; ensemble members blind (independent, decorrelates
+error) vs debate (sees others' drafts); how disagreements surface to the user.
+
+### P4 · Workspace — *isolation* ✅ (git) · ❌ (non-git — P0 bug)
 Role: stages 4, 9. Clone, worktree, branch, scratch dir; the branch is the
-handoff unit. Today: strong and done — `prepare_worktree`, `clone_repo`,
-`resolve_repo`, `cleanup_job` (`worker/actions.py:169-213`). **Open (minor):**
-worktrees on a *remote* target — same code, but who cleans up; cross-target
-caching of clones.
+handoff unit. Today: **for a git repo, isolation is strong and done** — a fresh
+worktree on a new branch off HEAD, never the live checkout (`prepare_worktree`,
+`clone_repo`, `resolve_repo`, `cleanup_job` — `src/jarvis/worker/actions.py:169-213`).
+
+⚠️ **P0 — non-git inputs are unsafe today (violates invariant I1).** A non-git
+`repo` is run **in place** (`prepare_worktree` returns the dir as-is —
+`src/jarvis/worker/actions.py:191-192`), the job's `cwd` is set to that real
+directory (`src/jarvis/worker/server.py:200`), and on cleanup the `repo and branch
+and cwd` guard fails (`branch` is `None`) so it falls through to
+`shutil.rmtree(cwd)` (`src/jarvis/worker/actions.py:206-211`) — **deleting the
+user's own directory**. Fix (the invariant): a non-git input must be **copied into
+worker-owned scratch** (or refused), the job runs on the copy, and cleanup may
+only ever remove worker-owned paths. **Open (minor):** worktrees on a *remote*
+target — same code, but who cleans up; cross-target caching of clones.
 
 ### P5 · Forge verbs — *land the work* 🟡
 Role: stages 2, 7. First-class VCS/forge actions: branch, commit, push, **open
@@ -327,9 +405,19 @@ forge.fetch_pr(repo, n) / forge.diff(...) / forge.push(branch)
 forge.open_pr(...) / forge.comment(...) / forge.review(summary, inline=[...])
 ```
 
-Today: `gh` is present and used for clone (`actions.py:176`); a coding engine
-*can* git from inside a job, but there are **no first-class verbs** for
-push/PR/review/comment. **Gap:** the verb set + a `forge.*` capability. **Open:**
+**Invariant I4 — public writes are gated and draft-by-default.** Forge verbs split
+by blast radius: *private/local* (worktree commit, local branch) are autonomous;
+*public* (push a shared branch, open a PR, post a comment/review) require the
+`forge.write.public` capability **and** a draft-then-confirm step by default.
+Autonomous public writes are opt-in per (principal × repo), set ahead of time —
+the north-star "write the replies in the PR" is exactly such a pre-granted
+exception, not the default path.
+
+Today: `gh` is present and used for clone (`src/jarvis/worker/actions.py:176`); a
+coding engine *can* git from inside a job, but there are **no first-class verbs**
+for push/PR/review/comment, and **no `forge.write.public` gate** — so I4 is not yet
+enforceable. **Gap:** the verb set + the split `forge.write.local` /
+`forge.write.public` capabilities + the draft/confirm flow. **Open:**
 inline review comments need file+line anchoring against the diff — done by the
 synth step or a dedicated tool? Autonomous-write vs draft-then-confirm (a
 trust-gate policy, see P9).
@@ -338,25 +426,33 @@ trust-gate policy, see P9).
 Role: stages 2, 7, 9. The unit you *decide from* and anchor a PR to — GitHub
 issue, **Linear** ticket, Jira. OpenClaw's "issue as durable spec" pattern.
 
-Today: jobs are ephemeral (`worker/jobs.py`); no spec/ticket abstraction. Linear
+Today: jobs are ephemeral (`src/jarvis/worker/jobs.py`); no spec/ticket abstraction. Linear
 is reachable only as raw MCP tools. **Gap:** a `WorkItem` abstraction + tracker
 connectors (GitHub issues native via `gh`; Linear/Jira via the existing MCP
 client). **Open:** does Jarvis *create* tickets or only consume them? How does a
 ticket map to a job and back (status sync: building → in-review)? One canonical
 tracker or many?
 
-### P7 · Async lifecycle — *on it → detached → report back* ✅
+### P7 · Async lifecycle — *on it → detached → report back* 🟡
 Role: stages 5, 8. Say "on it" now, run detached with the asker's caps, track,
-report the outcome proactively. Today: strong — `BackgroundRunner`
-(`brain/background.py`) + `JobManager` persistence (`worker/jobs.py`) +
-`proactive.py`. **Open:** unify the brain's `BackgroundRunner` jobs with the
-worker's `JobManager` jobs into one job view across targets; progress updates
-mid-job (not just final), for very long runs.
+report the outcome proactively. Today: the *dispatch + report* half is strong —
+`BackgroundRunner` (`src/jarvis/brain/background.py`) + `proactive.py`; and the
+*worker* persists its jobs to disk and reloads them after a restart
+(`src/jarvis/worker/jobs.py`). **But recovery across the brain/worker split is
+not there**, and for unattended engineering work it's core, not polish:
+- The brain's `BackgroundRunner` keeps jobs **in memory only**
+  (`src/jarvis/brain/background.py:64`) — a brain restart loses the job and its
+  pending proactive report; the work is orphaned.
+- There are **two job models** (brain in-memory + worker on-disk) with **no shared
+  run id**, so a cross-target run can't be tracked, resumed, or reported as one
+  thing. **Gap:** a single persisted cross-target run identity + brain-restart
+  recovery of in-flight jobs. **Open:** coarse progress updates mid-job (push vs
+  pull — ties to P11).
 
 ### P8 · Recipe / orchestration — *the programs* 🟡
 Role: stages 3, 6. Compose engines/targets/forge into named flows: ensemble
 review, issue→PR loop, plan-then-build. Today: skills exist as markdown recipes
-(`brain/skills.py`) but run a **single strong model** in a tool loop
+(`src/jarvis/brain/skills.py`) but run a **single strong model** in a tool loop
 (`skills.py:99`) — no ensemble, no engine/target awareness. **Gap:** recipes
 that can drive P1–P6. **Open:** are recipes still markdown (self-authorable, the
 current strength) or code for the complex ones? How does a recipe express "fan
@@ -365,14 +461,14 @@ out then converge" declaratively?
 ### P9 · Trust gate — *no limits, safely* ✅
 Role: all stages. Deny-by-default per (device×user); "no limits" = the owner's
 full-caps profile on a trusted device, gate intact for everyone else. Today:
-strong — `brain/capabilities.py`, per-device profile front-matter. **Gap (small):**
+strong — `src/jarvis/brain/capabilities.py`, per-device profile front-matter. **Gap (small):**
 an owner full-caps profile + new caps (`panel.run`, `forge.write`, `target.*`,
 `workitem.*`). **Open:** is forge-*write* always allowed for the owner, or
 draft-then-confirm? Per-target ceilings (laptop = full, a shared box = read-only)?
 
 ### P10 · Control surface — *command from anywhere* ✅
-Role: stages 1, 8. Voice/TV, WhatsApp, text console. Today: strong — `intercom/`,
-`connectors/whatsapp/`, `connectors/text.py`. No gap for this capability.
+Role: stages 1, 8. Voice/TV, WhatsApp, text console. Today: strong — `src/jarvis/intercom/`,
+`src/jarvis/connectors/whatsapp/`, `src/jarvis/connectors/text.py`. No gap for this capability.
 
 ### P11 · Observability — *trust & recovery* 🟡
 Role: stages 8, 10. "What's running", logs, traces, **resume** handles. Today:
@@ -431,7 +527,7 @@ HARNESSES = {
 ```
 
 Today: the **actuators largely exist or are reachable** — the browser lane
-(`browser/`, CDP/nodriver) can drive a webapp; `control_mac`/peekaboo can drive any
+(`src/jarvis/browser/`, CDP/nodriver) can drive a webapp; `control_mac`/peekaboo can drive any
 Mac GUI; the worker shell can boot a service and curl it; Apple-platform
 build/run/UI-snapshot tooling is reachable on a Mac target. **What's missing is the
 concept layer:** app-type detection, the harness selection by capability, the
@@ -450,17 +546,21 @@ a route-elsewhere?
 Build order falls out of the dependency graph, but the *doc's* job is the whole
 cycle, not the build. The dependencies:
 
+(P# = primitive; "stage N" = a step of the Part 1 cycle. They are different axes —
+a primitive serves one or more stages. The graph below relates primitives and the
+few stage dependencies they feed.)
+
 ```
 P9 trust gate ─── governs ──> everything
-P10 surfaces ──── feed ─────> P1 intake/report
+P10 surfaces ──── feed ─────> stage 1 Intake (builds the RequestContext) + stage 8 Report
 
 P1 Engine ──┬─> P3 Ensemble        (panel = many engines)
             └─> P8 Recipe          (a recipe picks engines)
 P2 Target ──┬─> P4 Workspace       (isolate on the chosen target)
             └─> P8 Recipe          (a recipe picks a target)
 P4 Workspace ─> P5 Forge           (land from the worktree)
-P2 Target ──(capability profile)──> P3 Plan routing  (match work to a machine)
-                                └──> P13 Harness      (what can be exercised here)
+P2 Target ──(capability profile)──> stage 3 Plan routing (match work to a machine)
+                                └──> P13 Harness          (what can be exercised here)
 P6 Work item ─> P12 Verify         (acceptance criteria come from the item)
 P3 Ensemble ──> P12 Verify         (the review in the gate can be an ensemble)
 P13 Harness ──> P12 Verify         (evidence: app exercised → the gate judges it)
@@ -474,9 +574,11 @@ Foundations everything rides on: **P1 Engine** and **P2 Target** (now carrying a
 can do). The differentiator: **P3 Ensemble** (needs P1). The trust-makers: **P12
 Verification gate** + **P13 Acceptance harness** — the inner loop OpenClaw nails,
 deepened so it exercises the *real app* (needs P2's profile, P3, P6, P8). The
-domain reach: **P5 Forge** + **P6 Work item**. Jarvis already owns P4, P7, P9, P10
-and most of P11 — and *already has the harness actuators* (browser lane, GUI
-control) — the expensive, boring half.
+domain reach: **P5 Forge** + **P6 Work item**. Jarvis already owns the expensive,
+boring half — P9, P10, P4-for-git, the dispatch/report half of P7, most of P11 —
+and *already has the harness actuators* (browser lane, GUI control). But three of
+those carry safety/recovery debt the invariants flag: P4 non-git isolation (I1,
+P0), P7 cross-target recovery, and the not-yet-enforceable forge gate (I4).
 
 ---
 
@@ -486,19 +588,20 @@ control) — the expensive, boring half.
   (target leases work off a queue) survives laptops that sleep/disconnect and is
   the only sane model for serverless. Probably: push for always-on targets, pull
   for transient ones — but that splits the Target interface.
-- **Autonomy vs confirmation at the Land stage.** "No limits" argues for
-  autonomous forge writes; a misheard command argues for draft-then-confirm on
-  irreversible/public actions. The existing background lane already encodes
-  "you've consented by asking" for read/build; *public writes* (PR comments,
-  pushes to shared branches) may deserve a separate policy bit.
+- *(Autonomy vs confirmation at Land is no longer an open tension — it's settled
+  as invariant **I4**: public writes are gated + draft-by-default, autonomy is
+  pre-granted per principal×repo. What remains is the **UX** of the confirm step,
+  not whether it exists.)*
 - **Ensemble: blind vs debate.** Independent drafts are simpler and decorrelate
   errors; a debate round can catch more but costs latency and can collapse to
   groupthink. Likely a recipe-level choice, not a fixed rule.
 - **Recipes: markdown vs code.** Markdown keeps self-authoring (a real Jarvis
   strength); the fan-out/converge shape may not express cleanly in prose. Maybe a
   small declarative recipe schema sits between.
-- **One job model.** Today there are two (brain `BackgroundRunner`, worker
-  `JobManager`). A cross-target cycle wants one job identity that spans them.
+- **One job model (now core, not tidy-up).** Two job stores today (brain
+  in-memory `BackgroundRunner`, worker on-disk `JobManager`) with no shared id —
+  this is the P7 recovery gap, a prerequisite for trustworthy unattended runs, not
+  a cosmetic merge.
 - **Verification depth vs reach.** The deepest gate (boot + drive the real app)
   is also the most capability-hungry, so it's only available where the machine can
   run that app-type. A change might be *buildable* on one target but only
@@ -535,14 +638,31 @@ control) — the expensive, boring half.
 
 ---
 
+## Settled as invariants (no longer open)
+
+- **I1** Isolation absolute; non-git inputs copied to worker-owned scratch or
+  refused; cleanup deletes only worker-owned paths. → **P0 fix outstanding** in
+  `src/jarvis/worker/actions.py` (see P4).
+- **I2** Panels read-only on a shared workspace; writing engines isolated
+  per-worktree with explicit converge. (P3)
+- **I3** Machine resources (probed) ≠ principal-bound authority (trust gate). (P2/P9)
+- **I4** Public forge writes gated (`forge.write.public`) + draft-by-default;
+  autonomy pre-granted per principal×repo. (P5/P9)
+
+## Action items (code, not just doc)
+
+- [ ] **P0:** make non-git worker jobs copy-into-scratch (or refuse) and scope
+      cleanup to worker-owned paths — `src/jarvis/worker/actions.py`
+      `prepare_worktree`/`cleanup_job`, `src/jarvis/worker/server.py` code action.
+
 ## Open questions log (fill as we go)
 
 - [ ] Push vs pull (or both) for the Target interface? (P2)
-- [ ] Forge writes: autonomous vs draft-then-confirm policy, and where it's set? (P5/P9)
+- [ ] I4 confirm-step UX: how a voice/WhatsApp draft-then-confirm actually feels. (P5)
 - [ ] WorkItem: consume-only or also create? Canonical tracker or many? (P6)
 - [ ] Ensemble synthesis: model / merge / vote, and blind vs debate? (P3)
 - [ ] Recipe representation: markdown, code, or a declarative schema? (P8)
-- [ ] Unify the two job models into one cross-target run identity? (P7/P11)
+- [ ] Cross-target run identity + brain-restart recovery shape? (P7/P11)
 - [ ] Engine progress protocol: streaming CLI vs one-shot model? (P1)
 - [ ] Verification gate: what defines "accepted actionable"; where do acceptance
       criteria come from; is the gate's reviewer the P3 ensemble or a cheaper
