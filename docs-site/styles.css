@@ -74,6 +74,10 @@ nav a {
   text-decoration: none;
 }
 
+nav a:hover {
+  color: var(--ink);
+}
+
 .hero {
   display: grid;
   grid-template-columns: minmax(0, 0.9fr) minmax(360px, 1.1fr);
@@ -256,6 +260,7 @@ h3 {
 
 .band,
 .fleet,
+.onboarding,
 .updates {
   padding: clamp(64px, 9vw, 130px) clamp(18px, 5vw, 72px);
 }
@@ -309,6 +314,36 @@ code {
 
 .role-table {
   border-top: 1px solid var(--line);
+}
+
+.flow {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.flow article {
+  min-height: 190px;
+  padding: 24px;
+  border: 1px solid var(--line);
+  background: color-mix(in oklch, var(--panel), transparent 12%);
+}
+
+.flow span {
+  display: block;
+  margin-bottom: 18px;
+  color: var(--steel);
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.flow p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 1.05rem;
+  line-height: 1.45;
 }
 
 .row {
@@ -372,7 +407,39 @@ code {
     min-height: 480px;
   }
 
+  .fleet-visual::before {
+    inset: 44px 34px;
+  }
+
+  .node {
+    width: 170px;
+  }
+
+  .one {
+    top: 8%;
+    left: 9%;
+  }
+
+  .two {
+    top: 18%;
+    right: 9%;
+  }
+
+  .brain {
+    top: 44%;
+  }
+
+  .pi {
+    bottom: 8%;
+    left: 12%;
+  }
+
+  .link {
+    display: none;
+  }
+
   .install-grid,
+  .flow,
   .security-grid {
     grid-template-columns: 1fr;
   }

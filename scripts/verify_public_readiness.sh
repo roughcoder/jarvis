@@ -83,6 +83,34 @@ scan_tap_public_files() {
   fi
 }
 
+scan_docs_preview() {
+  section "docs preview scan"
+  local stale_patterns missing_patterns
+  stale_patterns="$(
+    git -C "$ROOT_DIR" grep -nE 'brew install --HEAD jarvis|jarvis pair [^<[:space:]]+[[:space:]]+--json</code>|Tailscale|Mac mini' -- docs-site README.md docs/DEPLOYMENT.md docs/FLEET.md docs/PI.md \
+      || true
+  )"
+  if [[ -n "$stale_patterns" ]]; then
+    echo "Stale deployment preview/docs patterns found:"
+    echo "$stale_patterns"
+    exit 1
+  fi
+
+  missing_patterns="$(
+    {
+      git -C "$ROOT_DIR" grep -q 'scripts/install_mac.sh | bash' -- docs-site/index.html || echo "docs-site/index.html missing Mac bootstrap command"
+      git -C "$ROOT_DIR" grep -q 'jarvis service sync brain worker intercom' -- docs-site/index.html || echo "docs-site/index.html missing role sync command"
+      git -C "$ROOT_DIR" grep -q -- '--pi-installer --brain-host imac.private' -- docs-site/index.html || echo "docs-site/index.html missing release-style Pi pairing command"
+      git -C "$ROOT_DIR" grep -q 'sudo jarvis-pi update' -- docs-site/index.html || echo "docs-site/index.html missing Pi update command"
+    } || true
+  )"
+  if [[ -n "$missing_patterns" ]]; then
+    echo "Deployment preview is missing required install/update guidance:"
+    echo "$missing_patterns"
+    exit 1
+  fi
+}
+
 require_dir "$ROOT_DIR" "Jarvis runtime"
 require_dir "$APPLE_DIR" "Jarvis app"
 require_dir "$TAP_DIR" "Homebrew tap"
@@ -100,6 +128,7 @@ fi
 scan_runtime_public_files
 scan_app_public_files
 scan_tap_public_files
+scan_docs_preview
 
 section "workflow lint"
 if command -v actionlint >/dev/null 2>&1; then

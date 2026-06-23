@@ -15,6 +15,7 @@
       </a>
       <nav aria-label="Primary navigation">
         <a href="#install">Install</a>
+        <a href="#onboarding">Onboarding</a>
         <a href="#fleet">Fleet</a>
         <a href="#security">Security</a>
         <a href="#updates">Updates</a>
@@ -28,7 +29,7 @@
           <h1>Install Jarvis like an appliance.</h1>
           <p class="lede">
             A guided deployment path for one brain Mac, worker Macs, laptop
-            intercoms, and Raspberry Pi room devices.
+            intercoms, and Raspberry Pi room devices on a private network.
           </p>
           <div class="actions">
             <a class="button primary" href="#install">Start install</a>
@@ -68,23 +69,44 @@
         <div class="install-grid">
           <article>
             <p class="step">01</p>
-            <h3>Install runtime</h3>
-            <code>brew install --HEAD jarvis</code>
+            <h3>Run Mac bootstrap</h3>
+            <code>curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash</code>
           </article>
           <article>
             <p class="step">02</p>
-            <h3>Install app</h3>
-            <code>brew install --cask jarvis-app</code>
+            <h3>Choose a profile</h3>
+            <code>Setup -> Brain Mac, Laptop, Worker, or Room Pi</code>
           </article>
           <article>
             <p class="step">03</p>
-            <h3>Choose roles</h3>
-            <code>jarvis service install brain worker</code>
+            <h3>Install services</h3>
+            <code>jarvis service sync brain worker intercom</code>
           </article>
           <article>
             <p class="step">04</p>
             <h3>Pair devices</h3>
-            <code>jarvis pair kitchen-pi --json</code>
+            <code>jarvis pair kitchen-pi --json --pi-installer --brain-host imac.private</code>
+          </article>
+        </div>
+      </section>
+
+      <section id="onboarding" class="onboarding">
+        <div class="section-heading">
+          <p class="eyebrow">Onboarding</p>
+          <h2>Setup turns each machine into one known role set.</h2>
+        </div>
+        <div class="flow">
+          <article>
+            <span>iMac</span>
+            <p>Install runtime and app, choose Brain Mac, then issue per-device tokens.</p>
+          </article>
+          <article>
+            <span>Laptops</span>
+            <p>Choose Laptop, paste the generated Mac config, then install intercom and worker services.</p>
+          </article>
+          <article>
+            <span>Room Pi</span>
+            <p>Run the generated release-pinned Pi installer and verify audio, camera, and systemd with jarvis-pi doctor.</p>
           </article>
         </div>
       </section>
@@ -108,9 +130,9 @@
           <h2>Secrets stay local. Devices ask to join.</h2>
         </div>
         <div class="security-grid">
-          <p>Per-device tokens are bound to device ids.</p>
+          <p>Per-device tokens are bound to device ids and issued from the brain Mac.</p>
           <p>Browser profiles, OAuth caches, user files, and worker jobs are ignored.</p>
-          <p>Repos only go public after the release scan passes.</p>
+          <p>Repos stay public-ready only when CI and public-readiness checks pass.</p>
         </div>
       </section>
 
@@ -122,8 +144,9 @@
         <div class="terminal">
           <span>brew update</span>
           <span>brew upgrade jarvis</span>
+          <span>jarvis service sync brain worker intercom</span>
           <span>brew upgrade --cask jarvis-app</span>
-          <span>jarvis service restart brain</span>
+          <span>sudo jarvis-pi update</span>
         </div>
       </section>
     </main>
