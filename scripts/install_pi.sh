@@ -7,7 +7,7 @@ Usage: install_pi.sh
 
 Environment:
   JARVIS_REPO=roughcoder/jarvis          GitHub repository to install from.
-  JARVIS_REF=v0.1.20                     Branch, tag, or commit. Defaults to the
+  JARVIS_REF=v0.1.21                     Branch, tag, or commit. Defaults to the
                                          current release tag.
   JARVIS_INSTALL_DIR=/opt/jarvis         Install directory.
   JARVIS_DEVICE_ID=room-pi               Device id for this Pi.
@@ -50,7 +50,7 @@ if [[ "$DRY_RUN" != "1" && "$(id -u)" -ne 0 ]]; then
 fi
 
 REPO="${JARVIS_REPO:-roughcoder/jarvis}"
-REF="${JARVIS_REF:-v0.1.20}"
+REF="${JARVIS_REF:-v0.1.21}"
 INSTALL_DIR="${JARVIS_INSTALL_DIR:-/opt/jarvis}"
 DEVICE_ID="${JARVIS_DEVICE_ID:-room-pi}"
 BRAIN_HOST="${JARVIS_BRAIN_HOST:-}"

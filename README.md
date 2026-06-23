@@ -124,7 +124,7 @@ own runtime/app updates.
 Fresh Mac install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.20/scripts/install_mac.sh | bash
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/v0.1.21/scripts/install_mac.sh | bash
 ```
 
 The bootstrap taps `roughcoder/infinite-stack` and, on Homebrew versions with tap

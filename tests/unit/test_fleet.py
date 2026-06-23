@@ -8,7 +8,7 @@ import json
 import pytest
 
 from jarvis.config import Config, WorkerConfig
-from jarvis.fleet import collect_fleet_status, probe_worker
+from jarvis.fleet import collect_fleet_status, docker_compose_status, probe_worker
 
 
 def test_collect_fleet_status_shape_has_no_tokens(monkeypatch) -> None:
@@ -69,3 +69,15 @@ def test_probe_worker_reads_health_and_jobs(tmp_path) -> None:
     assert data["health"]["ok"] is True
     assert data["health"]["browser_enabled"] is True
     assert data["jobs"] == {"total": 0, "running": 0, "recent": []}
+
+
+def test_docker_compose_status_is_neutral_without_compose_project(tmp_path) -> None:
+    data = docker_compose_status(str(tmp_path))
+
+    assert data == {
+        "available": False,
+        "configured": False,
+        "status": "not_configured",
+        "detail": "No local Docker compose project found.",
+        "services": [],
+    }

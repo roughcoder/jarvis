@@ -12,6 +12,7 @@ import json
 import os
 import platform
 import subprocess
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -153,6 +154,14 @@ def git_status(cwd: str) -> dict[str, Any]:
 
 
 def docker_compose_status(cwd: str) -> dict[str, Any]:
+    if not _has_compose_file(cwd):
+        return {
+            "available": False,
+            "configured": False,
+            "status": "not_configured",
+            "detail": "No local Docker compose project found.",
+            "services": [],
+        }
     try:
         result = _run(["docker", "compose", "ps", "--format", "json"], cwd=cwd, timeout=4.0)
     except FileNotFoundError:
@@ -176,6 +185,7 @@ def docker_compose_status(cwd: str) -> dict[str, Any]:
                     continue
     return {
         "available": True,
+        "configured": True,
         "services": [
             {
                 "name": s.get("Service") or s.get("Name") or s.get("name") or "",
@@ -185,6 +195,19 @@ def docker_compose_status(cwd: str) -> dict[str, Any]:
             for s in services
         ],
     }
+
+
+def _has_compose_file(cwd: str) -> bool:
+    root = Path(cwd)
+    return any(
+        (root / name).is_file()
+        for name in (
+            "compose.yaml",
+            "compose.yml",
+            "docker-compose.yaml",
+            "docker-compose.yml",
+        )
+    )
 
 
 async def collect_fleet_status(
