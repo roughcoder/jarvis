@@ -142,7 +142,7 @@ jarvis pair kitchen-pi --json --pi-installer --brain-host imac.private
 ```
 
 Run the generated Pi installer command on the Pi. It should include a release tag
-such as `JARVIS_REF=v0.1.16`, not a development-only `main` ref.
+such as `JARVIS_REF=v0.1.17`, not a development-only `main` ref.
 
 Proof:
 
