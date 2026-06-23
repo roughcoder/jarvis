@@ -49,7 +49,8 @@ def test_mac_installer_can_open_app() -> None:
     result = run_installer(JARVIS_OPEN_APP="1")
 
     assert result.returncode == 0, result.stderr
-    assert "+ /usr/bin/open -a Jarvis" in result.stdout
+    assert "+ /usr/bin/open /Applications/Jarvis.app" in result.stdout
+    assert "open -a Jarvis" not in result.stdout
 
 
 def test_mac_installer_does_not_let_brew_consume_piped_script(tmp_path: Path) -> None:

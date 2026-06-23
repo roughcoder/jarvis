@@ -53,6 +53,18 @@ run() {
   fi
 }
 
+installed_app_path() {
+  if [[ -d "/Applications/Jarvis.app" ]]; then
+    echo "/Applications/Jarvis.app"
+    return 0
+  fi
+  if [[ -d "$HOME/Applications/Jarvis.app" ]]; then
+    echo "$HOME/Applications/Jarvis.app"
+    return 0
+  fi
+  return 1
+}
+
 find_brew() {
   if [[ -n "${JARVIS_BREW_PATH:-}" ]]; then
     echo "$JARVIS_BREW_PATH"
@@ -143,7 +155,13 @@ fi
 
 if [[ "$OPEN_APP" == "1" ]]; then
   echo "Opening Jarvis"
-  run /usr/bin/open -a Jarvis || true
+  if [[ "$DRY_RUN" == "1" ]]; then
+    run /usr/bin/open /Applications/Jarvis.app || true
+  elif APP_PATH="$(installed_app_path)"; then
+    run /usr/bin/open "$APP_PATH" || true
+  else
+    echo "Jarvis app was installed, but no app bundle was found to open." >&2
+  fi
 fi
 
 cat <<NEXT
