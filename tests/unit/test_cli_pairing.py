@@ -110,3 +110,53 @@ def test_pair_json_mac_config_requires_brain_host(capsys) -> None:
     assert code == 2
     assert output.out == ""
     assert "--brain-host is required with --pi-installer or --mac-config" in output.err
+
+
+def test_pair_json_can_apply_brain_config(capsys, tmp_path) -> None:
+    env_file = tmp_path / ".env"
+
+    code = main(
+        [
+            "pair",
+            "kitchen-pi",
+            "--json",
+            "--apply-brain-config",
+            "--env-file",
+            str(env_file),
+        ]
+    )
+
+    output = capsys.readouterr()
+    payload = json.loads(output.out)
+    entry = json.loads(payload["brain_devices_entry"])
+    saved = env_file.read_text(encoding="utf-8")
+    saved_value = saved.split("=", 1)[1].strip().strip('"').replace('\\"', '"')
+
+    assert code == 0
+    assert output.err == ""
+    assert payload["brain_config_path"] == str(env_file)
+    assert payload["brain_devices_count"] == 1
+    assert json.loads(saved_value) == [entry]
+
+
+def test_pair_validates_brain_host_before_apply_brain_config(capsys, tmp_path) -> None:
+    env_file = tmp_path / ".env"
+
+    code = main(
+        [
+            "pair",
+            "kitchen-pi",
+            "--json",
+            "--pi-installer",
+            "--apply-brain-config",
+            "--env-file",
+            str(env_file),
+        ]
+    )
+
+    output = capsys.readouterr()
+
+    assert code == 2
+    assert output.out == ""
+    assert "--brain-host is required with --pi-installer or --mac-config" in output.err
+    assert not env_file.exists()

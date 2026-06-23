@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import os
 import sys
+from pathlib import Path
 
 from jarvis import __version__
 from jarvis.config import load_config
@@ -1134,20 +1135,34 @@ def _cmd_pair(args: argparse.Namespace) -> int:
         issue_pairing_entry,
         render_mac_config_command,
         render_pi_installer_command,
+        upsert_brain_device_entry,
     )
 
+    if (args.pi_installer or args.mac_config) and not args.brain_host:
+        print(
+            "--brain-host is required with --pi-installer or --mac-config",
+            file=sys.stderr,
+        )
+        return 2
+
     token, fragment = issue_pairing_entry(args.device_id, identity=args.identity or "")
+    brain_config_path = ""
+    brain_devices_count: int | None = None
+    if args.apply_brain_config:
+        try:
+            devices = upsert_brain_device_entry(args.env_file, fragment)
+        except ValueError as exc:
+            print(f"Could not update brain config: {exc}", file=sys.stderr)
+            return 2
+        brain_config_path = str(Path(args.env_file).expanduser())
+        brain_devices_count = len(devices)
     if args.json:
         import json
 
         payload = {"token": token, "brain_devices_entry": fragment}
-        if args.pi_installer or args.mac_config:
-            if not args.brain_host:
-                print(
-                    "--brain-host is required with --pi-installer or --mac-config",
-                    file=sys.stderr,
-                )
-                return 2
+        if brain_config_path:
+            payload["brain_config_path"] = brain_config_path
+            payload["brain_devices_count"] = brain_devices_count
         if args.mac_config:
             payload["mac_config_command"] = render_mac_config_command(
                 device_id=args.device_id,
@@ -1168,13 +1183,15 @@ def _cmd_pair(args: argparse.Namespace) -> int:
             )
         print(json.dumps(payload, indent=2))
     elif args.pi_installer or args.mac_config:
-        if not args.brain_host:
+        if brain_config_path:
             print(
-                "--brain-host is required with --pi-installer or --mac-config",
-                file=sys.stderr,
+                f"Updated BRAIN_DEVICES in {brain_config_path} "
+                f"({brain_devices_count} configured device(s))."
             )
-            return 2
-        print("Add this object to BRAIN_DEVICES on the brain:")
+        if brain_config_path:
+            print("Applied this object to BRAIN_DEVICES on the brain:")
+        else:
+            print("Add this object to BRAIN_DEVICES on the brain:")
         print(fragment)
         if args.mac_config:
             print("\nRun this on the Mac intercom/worker:")
@@ -1203,7 +1220,15 @@ def _cmd_pair(args: argparse.Namespace) -> int:
     else:
         print(f"Device: {args.device_id}")
         print(f"Token:  {token}")
-        print("\nAdd this object to BRAIN_DEVICES on the brain:")
+        if brain_config_path:
+            print(
+                f"\nUpdated BRAIN_DEVICES in {brain_config_path} "
+                f"({brain_devices_count} configured device(s))."
+            )
+        if brain_config_path:
+            print("\nApplied this object to BRAIN_DEVICES on the brain:")
+        else:
+            print("\nAdd this object to BRAIN_DEVICES on the brain:")
         print(fragment)
     return 0
 
@@ -1561,6 +1586,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--mac-workdir",
         default="$HOME/.jarvis",
         help="Mac service workdir for --mac-config",
+    )
+    p_pair.add_argument(
+        "--apply-brain-config",
+        action="store_true",
+        help="Upsert the issued device entry into BRAIN_DEVICES in --env-file",
+    )
+    p_pair.add_argument(
+        "--env-file",
+        default="~/.jarvis/.env",
+        help="Brain dotenv file to update with --apply-brain-config",
     )
     p_pair.set_defaults(func=_cmd_pair)
 
