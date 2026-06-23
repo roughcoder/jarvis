@@ -131,6 +131,12 @@ Preview the bootstrap without changing the machine:
 JARVIS_DRY_RUN=1 bash scripts/install_mac.sh
 ```
 
+Physical bring-up evidence:
+
+```bash
+jarvis bringup --json --role brain --role worker --role intercom --hardware
+```
+
 ## Runtime Release
 
 Preferred release path: run the `Release` workflow in GitHub Actions with:

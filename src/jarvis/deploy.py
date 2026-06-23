@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import secrets
 import shlex
 import shutil
@@ -17,6 +18,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from jarvis import __version__
 
@@ -40,6 +42,10 @@ class ServicePaths:
     platform_name: str
     destination: Path
     log_dir: Path
+
+
+CommandRunner = Callable[[list[str], float], subprocess.CompletedProcess[str]]
+Which = Callable[[str], str | None]
 
 
 def role_extras(roles: list[str] | tuple[str, ...] | set[str]) -> list[str]:
@@ -339,6 +345,17 @@ def install_service(
 def control_service(
     role: str, action: str, *, platform_name: str | None = None
 ) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        service_control_argv(role, action, platform_name=platform_name),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def service_control_argv(
+    role: str, action: str, *, platform_name: str | None = None
+) -> list[str]:
     _validate_role(role)
     target = platform_name or detect_platform()
     if target == "launchd":
@@ -367,12 +384,163 @@ def control_service(
         argv = ["systemctl", verb, unit]
     else:
         raise ValueError(f"unsupported service platform: {target}")
-    return subprocess.run(argv, capture_output=True, text=True, check=False)
+    return argv
+
+
+def collect_bringup_evidence(
+    roles: list[str] | tuple[str, ...] | set[str],
+    *,
+    include_hardware: bool = False,
+    platform_name: str | None = None,
+    runner: CommandRunner | None = None,
+    which: Which | None = None,
+) -> dict[str, object]:
+    """Collect read-only deployment evidence for a physical fleet bring-up."""
+    ordered_roles = [role for role in ROLES if role in set(roles)]
+    for role in roles:
+        _validate_role(role)
+
+    target = platform_name or detect_platform()
+    run = runner or _run_command
+    find = which or shutil.which
+    evidence: dict[str, object] = {
+        "jarvis_version": __version__,
+        "release_ref": current_release_ref(),
+        "platform": target,
+        "roles": ordered_roles,
+        "role_extras": role_extras(set(ordered_roles)),
+        "jarvis_bin": default_jarvis_bin(),
+        "packages": {},
+        "services": {},
+        "hardware": {},
+    }
+
+    packages: dict[str, object] = {}
+    brew = find("brew")
+    if brew:
+        packages["jarvis"] = _command_report(
+            [brew, "list", "--formula", "--versions", "jarvis"], runner=run
+        )
+        packages["jarvis-app"] = _command_report(
+            [brew, "list", "--cask", "--versions", "jarvis-app"], runner=run
+        )
+    else:
+        packages["brew"] = {"available": False, "reason": "brew not found"}
+    evidence["packages"] = packages
+
+    evidence["services"] = {
+        role: _command_report(
+            service_control_argv(role, "status", platform_name=target), runner=run
+        )
+        for role in ordered_roles
+    }
+
+    if include_hardware:
+        evidence["hardware"] = _hardware_evidence(target, runner=run, which=find)
+    return evidence
 
 
 def _validate_role(role: str) -> None:
     if role not in ROLES:
         raise ValueError(f"unknown role {role!r}; expected one of {', '.join(ROLES)}")
+
+
+def _run_command(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout,
+    )
+
+
+def _command_report(
+    argv: list[str],
+    *,
+    runner: CommandRunner,
+    timeout: float = 15.0,
+) -> dict[str, object]:
+    try:
+        result = runner(argv, timeout)
+    except FileNotFoundError as exc:
+        return {
+            "argv": argv,
+            "available": False,
+            "returncode": 127,
+            "stdout": "",
+            "stderr": str(exc),
+            "ok": False,
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "argv": argv,
+            "available": True,
+            "returncode": 124,
+            "stdout": _redact_text((exc.stdout or "") if isinstance(exc.stdout, str) else ""),
+            "stderr": _redact_text((exc.stderr or "") if isinstance(exc.stderr, str) else "command timed out"),
+            "ok": False,
+        }
+
+    return {
+        "argv": argv,
+        "available": True,
+        "returncode": result.returncode,
+        "stdout": _redact_text(result.stdout),
+        "stderr": _redact_text(result.stderr),
+        "ok": result.returncode == 0,
+    }
+
+
+def _hardware_evidence(
+    platform_name: str,
+    *,
+    runner: CommandRunner,
+    which: Which,
+) -> dict[str, object]:
+    checks: dict[str, list[str]] = {}
+    if platform_name == "systemd":
+        checks = {
+            "microphones": ["arecord", "-l"],
+            "speakers": ["aplay", "-l"],
+            "cameras": ["libcamera-hello", "--list-cameras"],
+        }
+    elif platform_name == "launchd":
+        checks = {
+            "audio": ["system_profiler", "SPAudioDataType"],
+            "cameras": ["system_profiler", "SPCameraDataType"],
+        }
+
+    out: dict[str, object] = {}
+    for name, argv in checks.items():
+        if which(argv[0]):
+            out[name] = _command_report(argv, runner=runner, timeout=25.0)
+        else:
+            out[name] = {
+                "argv": argv,
+                "available": False,
+                "returncode": 127,
+                "stdout": "",
+                "stderr": f"{argv[0]} not found",
+                "ok": False,
+            }
+    return out
+
+
+def _redact_text(value: str, *, limit: int = 4000) -> str:
+    text = value[:limit]
+    patterns = [
+        re.compile(r"(?i)(token|secret|password|api[_-]?key|authorization)(\s*[:=]\s*)([^\s,}]+)"),
+        re.compile(r'(?i)("(?:token|secret|password|api[_-]?key|authorization)"\s*:\s*)"[^"]*"'),
+    ]
+    for pattern in patterns:
+        if pattern.pattern.startswith('(?i)("'):
+            text = pattern.sub('\\1"[redacted]"', text)
+        else:
+            text = pattern.sub(r"\1\2[redacted]", text)
+    if len(value) > limit:
+        text += "\n[truncated]"
+    return text
 
 
 def _xml_escape(value: str) -> str:

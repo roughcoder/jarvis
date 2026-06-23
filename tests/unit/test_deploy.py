@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import json
+import subprocess
 
 import pytest
 
 from jarvis.deploy import (
+    collect_bringup_evidence,
     current_release_ref,
     issue_pairing_entry,
     render_mac_config_command,
     render_pi_installer_command,
     render_service,
     role_extras,
+    service_control_argv,
     uv_sync_args_for_roles,
 )
 
@@ -84,6 +87,57 @@ def test_render_systemd_service_for_pi_intercom() -> None:
     assert "ExecStart=/usr/local/bin/jarvis run" in text
     assert "After=network-online.target sound.target" in text
     assert 'Environment=JARVIS_ENV_FILE="/opt/jarvis/.env"' in text
+
+
+def test_service_control_argv_uses_platform_supervisors() -> None:
+    assert service_control_argv("intercom", "status", platform_name="systemd") == [
+        "systemctl",
+        "status",
+        "jarvis-intercom.service",
+    ]
+    assert service_control_argv("worker", "restart", platform_name="launchd")[:3] == [
+        "launchctl",
+        "kickstart",
+        "-k",
+    ]
+
+
+def test_collect_bringup_evidence_redacts_and_filters_roles() -> None:
+    calls: list[list[str]] = []
+
+    def fake_runner(
+        argv: list[str], _timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout='token="secret-value"\n{"password":"hidden-value"}\njarvis 0.1.8\n',
+            stderr="",
+        )
+
+    def fake_which(name: str) -> str | None:
+        return f"/usr/bin/{name}" if name in {"brew", "arecord", "aplay"} else None
+
+    data = collect_bringup_evidence(
+        ["intercom"],
+        include_hardware=True,
+        platform_name="systemd",
+        runner=fake_runner,
+        which=fake_which,
+    )
+
+    assert data["roles"] == ["intercom"]
+    assert data["role_extras"] == ["stt", "vad", "wake"]
+    assert set(data["services"]) == {"intercom"}
+    assert data["packages"]["jarvis"]["ok"] is True
+    assert "secret-value" not in json.dumps(data)
+    assert "hidden-value" not in json.dumps(data)
+    assert '"password":"[redacted]"' in data["packages"]["jarvis"]["stdout"]
+    assert "systemctl" in calls[2]
+    assert data["hardware"]["microphones"]["ok"] is True
+    assert data["hardware"]["speakers"]["ok"] is True
+    assert data["hardware"]["cameras"]["available"] is False
 
 
 def test_issue_pairing_entry_returns_brain_devices_fragment() -> None:

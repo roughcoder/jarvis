@@ -44,6 +44,7 @@ Use Jarvis Setup:
 Proof:
 
 ```bash
+jarvis bringup --json --role brain --role worker --role intercom --hardware
 jarvis --version
 brew list --formula --versions jarvis
 brew list --cask --versions jarvis-app
@@ -88,6 +89,7 @@ Run the generated Mac config command on the laptop, then use Jarvis Setup:
 Proof:
 
 ```bash
+jarvis bringup --json --role intercom --role worker --hardware --brain-host imac.private
 jarvis --version
 jarvis status --json --brain-host imac.private
 jarvis worker --doctor
@@ -125,6 +127,7 @@ such as `JARVIS_REF=v0.1.8`, not a development-only `main` ref.
 Proof:
 
 ```bash
+jarvis bringup --json --role intercom --platform systemd --hardware --brain-host imac.private
 jarvis-pi doctor
 jarvis-pi status
 systemctl is-enabled jarvis-intercom.service
@@ -134,6 +137,7 @@ journalctl -u jarvis-intercom.service -n 80 --no-pager
 
 Pass criteria:
 
+- `jarvis bringup --json ...` is valid JSON and contains no raw token values.
 - `jarvis-pi doctor` shows the expected `CAPS_DEVICE_ID`,
   `INTERCOM_BRAIN_HOST`, and `INTERCOM_BRAIN_PORT`.
 - `arecord -l` and `aplay -l` list the expected microphone and speaker.

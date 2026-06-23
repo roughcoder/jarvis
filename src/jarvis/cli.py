@@ -861,6 +861,63 @@ def _cmd_fleet_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bringup(args: argparse.Namespace) -> int:
+    """Collect redacted deployment evidence for physical fleet bring-up."""
+    import json
+
+    from jarvis.deploy import collect_bringup_evidence
+    from jarvis.fleet import probe_brain
+
+    cfg = load_config()
+    if args.brain_host:
+        cfg.intercom.brain_host = args.brain_host
+    if args.brain_port:
+        cfg.intercom.brain_port = int(args.brain_port)
+
+    roles = args.roles or ["brain", "intercom", "worker"]
+    data = collect_bringup_evidence(
+        roles,
+        include_hardware=args.hardware,
+        platform_name=args.platform,
+    )
+    if args.check_brain or args.brain_host:
+        data["brain_status"] = {
+            "brain_url": cfg.intercom.brain_url,
+            "device_id": cfg.capabilities.device_id,
+            **asyncio.run(probe_brain(cfg)),
+        }
+
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+        return 0
+
+    print(f"Jarvis bring-up evidence ({data['platform']})")
+    print(f"  version:      {data['jarvis_version']} ({data['release_ref']})")
+    print(f"  roles:        {', '.join(data['roles']) or '(none)'}")
+    print(f"  extras:       {', '.join(data['role_extras']) or '(none)'}")
+    packages = data.get("packages", {})
+    if isinstance(packages, dict):
+        for name, report in packages.items():
+            if isinstance(report, dict):
+                status = "ok" if report.get("ok") else "check"
+                detail = (report.get("stdout") or report.get("stderr") or "").strip()
+                print(f"  package {name}: {status}" + (f" ({detail})" if detail else ""))
+    services = data.get("services", {})
+    if isinstance(services, dict):
+        for role, report in services.items():
+            if isinstance(report, dict):
+                print(f"  service {role}: {'ok' if report.get('ok') else 'check'}")
+    brain = data.get("brain_status")
+    if isinstance(brain, dict):
+        if brain.get("paired"):
+            print(f"  brain:        paired at {brain.get('brain_url')}")
+        elif brain.get("reachable"):
+            print(f"  brain:        reachable but unpaired at {brain.get('brain_url')}")
+        else:
+            print(f"  brain:        unreachable at {brain.get('brain_url')}")
+    return 0
+
+
 def _cmd_traces(args: argparse.Namespace) -> int:
     """View recent per-turn pipeline traces (STT/LLM/TTS/memory timings)."""
     import json
@@ -1231,6 +1288,49 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-docker", action="store_true", help="Skip docker compose status"
     )
     p_fleet.set_defaults(func=_cmd_fleet_status)
+
+    p_bringup = sub.add_parser(
+        "bringup", help="Collect redacted deployment bring-up evidence"
+    )
+    p_bringup.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable bring-up evidence",
+    )
+    p_bringup.add_argument(
+        "--role",
+        dest="roles",
+        action="append",
+        default=None,
+        choices=["brain", "intercom", "worker"],
+        help="Role to check; repeat for multiple roles (default: all roles)",
+    )
+    p_bringup.add_argument(
+        "--platform",
+        choices=["launchd", "systemd"],
+        help="Override platform detection",
+    )
+    p_bringup.add_argument(
+        "--hardware",
+        action="store_true",
+        help="Include local microphone, speaker, and camera listings where available",
+    )
+    p_bringup.add_argument(
+        "--check-brain",
+        action="store_true",
+        help="Probe configured brain reachability and pairing",
+    )
+    p_bringup.add_argument(
+        "--brain-host",
+        default="",
+        help="Override INTERCOM_BRAIN_HOST and probe brain reachability",
+    )
+    p_bringup.add_argument(
+        "--brain-port",
+        default="",
+        help="Override INTERCOM_BRAIN_PORT for brain reachability",
+    )
+    p_bringup.set_defaults(func=_cmd_bringup)
 
     p_traces = sub.add_parser("traces", help="View recent per-turn pipeline traces")
     p_traces.add_argument("-n", type=int, default=20, help="How many recent traces")

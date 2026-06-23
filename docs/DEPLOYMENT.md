@@ -248,5 +248,7 @@ camera readiness.
 - The app can install, start, stop, update, and diagnose selected local roles.
 - A new device cannot join the fleet without brain approval or a generated
   per-device token entry.
+- `jarvis bringup --json` can collect redacted install, package, service,
+  hardware, and pairing evidence on each physical device.
 - Public repositories contain no personal user files, OAuth caches, browser
   profiles, worker job records, real tokens, or private release-only assumptions.
