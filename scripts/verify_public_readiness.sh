@@ -180,22 +180,16 @@ scan_docs_preview() {
 
   missing_patterns="$(
     {
-      git -C "$ROOT_DIR" grep -q 'brew install jarvis' -- README.md docs/DEPLOYMENT.md docs/BRINGUP.md docs/FLEET.md docs-site/index.html || echo "runtime docs missing Homebrew runtime install command"
-      git -C "$ROOT_DIR" grep -q 'brew install --cask jarvis-app' -- README.md docs/DEPLOYMENT.md docs/BRINGUP.md docs/FLEET.md docs-site/index.html || echo "runtime docs missing Homebrew app install command"
+      git -C "$ROOT_DIR" grep -q 'curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash' -- README.md docs/DEPLOYMENT.md docs/BRINGUP.md docs/FLEET.md docs-site/index.html || echo "runtime docs missing public Mac install command"
       git -C "$ROOT_DIR" grep -q 'curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/uninstall_mac.sh | bash' -- README.md docs/DEPLOYMENT.md docs-site/index.html || echo "runtime docs missing public Mac clean-reset command"
-      git -C "$APPLE_DIR" grep -q 'brew install jarvis' -- README.md || echo "app docs missing Homebrew runtime install command"
-      git -C "$APPLE_DIR" grep -q 'brew install --cask jarvis-app' -- README.md || echo "app docs missing Homebrew app install command"
+      git -C "$APPLE_DIR" grep -q 'curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash' -- README.md || echo "app docs missing public Mac install command"
       git -C "$APPLE_DIR" grep -q 'curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/uninstall_mac.sh | bash' -- README.md || echo "app docs missing public Mac clean-reset command"
-      git -C "$TAP_DIR" grep -q 'brew install jarvis' -- README.md || echo "tap docs missing Homebrew runtime install command"
-      git -C "$TAP_DIR" grep -q 'brew install --cask jarvis-app' -- README.md || echo "tap docs missing Homebrew app install command"
+      git -C "$TAP_DIR" grep -q 'curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash' -- README.md || echo "tap docs missing public Mac install command"
       git -C "$TAP_DIR" grep -q 'curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/uninstall_mac.sh | bash' -- README.md || echo "tap docs missing public Mac clean-reset command"
       git -C "$ROOT_DIR" grep -q "jarvis $RUNTIME_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current runtime release"
       git -C "$ROOT_DIR" grep -q "jarvis-app $APP_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current app release"
       git -C "$ROOT_DIR" grep -q "JARVIS_REF=v$RUNTIME_VERSION" -- docs-site/index.html || echo "docs-site/index.html missing current Pi release ref"
       git -C "$ROOT_DIR" grep -q 'Fresh fleet runbook' -- docs-site/index.html || echo "docs-site/index.html missing fresh fleet runbook section"
-      git -C "$ROOT_DIR" grep -q 'brew trust --formula roughcoder/infinite-stack/jarvis' -- README.md docs/DEPLOYMENT.md docs/FLEET.md docs-site/index.html || echo "runtime docs missing entry-specific formula trust command"
-      git -C "$ROOT_DIR" grep -q 'brew trust --cask roughcoder/infinite-stack/jarvis-app' -- README.md docs/DEPLOYMENT.md docs/FLEET.md docs-site/index.html || echo "runtime docs missing entry-specific cask trust command"
-      git -C "$ROOT_DIR" grep -q '/usr/bin/xattr -dr com.apple.quarantine /Applications/Jarvis.app' -- README.md docs/DEPLOYMENT.md docs/BRINGUP.md docs/FLEET.md docs-site/index.html || echo "runtime docs missing quarantine-removal command"
       git -C "$APPLE_DIR" grep -q 'brew trust --formula roughcoder/infinite-stack/jarvis' -- README.md || echo "app docs missing entry-specific formula trust command"
       git -C "$APPLE_DIR" grep -q 'brew trust --cask roughcoder/infinite-stack/jarvis-app' -- README.md || echo "app docs missing entry-specific cask trust command"
       git -C "$TAP_DIR" grep -q 'brew trust --formula roughcoder/infinite-stack/jarvis' -- README.md || echo "tap docs missing entry-specific formula trust command"
@@ -248,7 +242,7 @@ fi
 
 section "shell lint"
 if command -v shellcheck >/dev/null 2>&1; then
-  (cd "$ROOT_DIR" && shellcheck scripts/uninstall_mac.sh scripts/install_pi.sh scripts/sync_runtime_check_env.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh scripts/verify_public_readiness.sh)
+  (cd "$ROOT_DIR" && shellcheck scripts/install_mac.sh scripts/uninstall_mac.sh scripts/install_pi.sh scripts/sync_runtime_check_env.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh scripts/verify_public_readiness.sh)
   (cd "$APPLE_DIR" && shellcheck scripts/install_latest.sh scripts/release_github.sh scripts/build_release.sh scripts/update_homebrew_cask.sh)
 else
   echo "shellcheck not installed; skipping shell lint"
@@ -257,7 +251,7 @@ fi
 section "runtime checks"
 "$ROOT_DIR/scripts/sync_runtime_check_env.sh"
 (cd "$ROOT_DIR" && uv run ruff check src/ tests/)
-(cd "$ROOT_DIR" && bash -n scripts/uninstall_mac.sh scripts/install_pi.sh scripts/sync_runtime_check_env.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh)
+(cd "$ROOT_DIR" && bash -n scripts/install_mac.sh scripts/uninstall_mac.sh scripts/install_pi.sh scripts/sync_runtime_check_env.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh)
 (cd "$ROOT_DIR" && uv run pytest tests/unit -q)
 
 section "app checks"

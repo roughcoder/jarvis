@@ -121,17 +121,14 @@ repo or understanding `uv`: install the `jarvis` runtime package, install the
 `jarvis-app` native app, choose roles in the app, pair devices, and let Homebrew
 own runtime/app updates.
 
-Fresh Mac install with Homebrew:
+Fresh Mac install:
 
 ```bash
-brew tap roughcoder/infinite-stack
-brew trust --formula roughcoder/infinite-stack/jarvis
-brew trust --cask roughcoder/infinite-stack/jarvis-app
-brew install jarvis
-brew install --cask jarvis-app
-/usr/bin/xattr -dr com.apple.quarantine /Applications/Jarvis.app
-open -a Jarvis
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
 ```
+
+The installer uses Homebrew internally, prepares `~/.jarvis`, clears app
+quarantine while Jarvis is ad-hoc signed, and opens the app.
 
 Clean uninstall for fresh end-to-end testing:
 

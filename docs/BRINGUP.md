@@ -44,16 +44,8 @@ on the private network.
 1. **iMac first**
 
    ```bash
-   brew tap roughcoder/infinite-stack
-   brew trust --formula roughcoder/infinite-stack/jarvis
-   brew trust --cask roughcoder/infinite-stack/jarvis-app
-   brew install jarvis
-   brew install --cask jarvis-app
-   /usr/bin/xattr -dr com.apple.quarantine /Applications/Jarvis.app
-   open -a Jarvis
+   curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
    ```
-
-   For a totally fresh Mac, install Homebrew first using the official Homebrew installer, then run the Homebrew commands above.
 
    In Jarvis Setup, choose **Brain Mac**, set the private-network host
    (`imac.private`), install services, and keep Setup open for token issuing.
@@ -79,16 +71,8 @@ on the private network.
 3. **Bring up each laptop**
 
    ```bash
-   brew tap roughcoder/infinite-stack
-   brew trust --formula roughcoder/infinite-stack/jarvis
-   brew trust --cask roughcoder/infinite-stack/jarvis-app
-   brew install jarvis
-   brew install --cask jarvis-app
-   /usr/bin/xattr -dr com.apple.quarantine /Applications/Jarvis.app
-   open -a Jarvis
+   curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
    ```
-
-   For a totally fresh Mac, install Homebrew first using the official Homebrew installer, then run the Homebrew commands above.
 
    Paste that laptop's generated Mac config command, choose **Laptop** in Setup,
    run **Check Brain**, run **Check Worker**, then install services. Capture
@@ -155,13 +139,7 @@ on the private network.
 Install:
 
 ```bash
-brew tap roughcoder/infinite-stack
-brew trust --formula roughcoder/infinite-stack/jarvis
-brew trust --cask roughcoder/infinite-stack/jarvis-app
-brew install jarvis
-brew install --cask jarvis-app
-/usr/bin/xattr -dr com.apple.quarantine /Applications/Jarvis.app
-open -a Jarvis
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
 ```
 
 Jarvis Setup on the brain Mac can write `BRAIN_HOST=0.0.0.0` and issued device
@@ -210,13 +188,7 @@ Pass criteria:
 Install:
 
 ```bash
-brew tap roughcoder/infinite-stack
-brew trust --formula roughcoder/infinite-stack/jarvis
-brew trust --cask roughcoder/infinite-stack/jarvis-app
-brew install jarvis
-brew install --cask jarvis-app
-/usr/bin/xattr -dr com.apple.quarantine /Applications/Jarvis.app
-open -a Jarvis
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
 ```
 
 On the iMac, issue a laptop token from Setup or:

@@ -19,4 +19,4 @@ jobs:
       - name: Unit tests
         run: uv run pytest tests/unit -q
       - name: Installer syntax
-        run: bash -n scripts/uninstall_mac.sh scripts/install_pi.sh
+        run: bash -n scripts/install_mac.sh scripts/uninstall_mac.sh scripts/install_pi.sh

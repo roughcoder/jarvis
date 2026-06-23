@@ -56,19 +56,15 @@ tests. On macOS it renders `launchd` plists; on Linux it renders `systemd` units
 
 ## Mac Install
 
-Homebrew is the canonical install and update surface once Homebrew exists:
+The public Mac install surface is one command:
 
 ```bash
-brew tap roughcoder/infinite-stack
-brew trust --formula roughcoder/infinite-stack/jarvis
-brew trust --cask roughcoder/infinite-stack/jarvis-app
-brew install jarvis
-brew install --cask jarvis-app
-/usr/bin/xattr -dr com.apple.quarantine /Applications/Jarvis.app
-open -a Jarvis
+curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/install_mac.sh | bash
 ```
 
-The Setup window then owns role choice, local service installation, and pairing.
+The installer uses Homebrew internally, prepares `~/.jarvis`, clears app
+quarantine while Jarvis is ad-hoc signed, and opens Jarvis. The Setup window
+then owns role choice, local service installation, and pairing.
 
 Packaged Mac services installed from the app use `~/.jarvis` as
 the service workdir and set `JARVIS_ENV_FILE=~/.jarvis/.env` in launchd. This

@@ -110,7 +110,7 @@ fi
 
 "$ROOT_DIR/scripts/sync_runtime_check_env.sh"
 uv run ruff check src/ tests/
-bash -n scripts/install_pi.sh scripts/sync_runtime_check_env.sh scripts/verify_public_readiness.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh
+bash -n scripts/install_mac.sh scripts/uninstall_mac.sh scripts/install_pi.sh scripts/sync_runtime_check_env.sh scripts/verify_public_readiness.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh
 uv run pytest tests/unit -q
 
 rm -rf "$DIST_DIR"
