@@ -210,7 +210,7 @@ h3 {
 
 .two {
   right: 10%;
-  top: 18%;
+  top: 12%;
 }
 
 .pi {
@@ -452,5 +452,32 @@ code {
   .row {
     grid-template-columns: 1fr;
     gap: 6px;
+  }
+}
+
+@media (max-width: 520px) {
+  .fleet-visual {
+    display: grid;
+    gap: 12px;
+    min-height: auto;
+    padding: 18px;
+  }
+
+  .fleet-visual::before,
+  .fleet-visual .link {
+    display: none;
+  }
+
+  .node {
+    position: static;
+    width: 100%;
+    transform: none;
+    padding: 15px 16px;
+  }
+
+  .network-label {
+    position: static;
+    justify-self: end;
+    margin-top: 2px;
   }
 }
