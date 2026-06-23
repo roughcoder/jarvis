@@ -114,8 +114,9 @@ The native app should drive setup in five stages:
 Current fresh-fleet sequence:
 
 1. On the iMac, run the Mac bootstrap and choose **Brain Mac** in Setup.
-2. Set `BRAIN_HOST=0.0.0.0` and the generated `BRAIN_DEVICES` entries in
-   `~/.jarvis/.env`, then install/start the selected services from Setup.
+2. Set `BRAIN_HOST=0.0.0.0` in `~/.jarvis/.env`, then install/start the
+   selected services from Setup. When **Brain Mac** roles are selected, Setup
+   writes issued `BRAIN_DEVICES` entries into the same env file.
 3. On each laptop, run the same Mac bootstrap and choose **Laptop** in Setup.
    Use the iMac Setup window's **Issue Token** action and copy the Mac config
    command onto the laptop before installing services.
@@ -188,8 +189,9 @@ packaged services:
 jarvis pair neil-laptop --mac-config --brain-host imac.private --identity neil
 ```
 
-The command prints a `BRAIN_DEVICES` entry for the brain and a copy/paste shell
-snippet for the target Mac. The snippet upserts only the Jarvis pairing keys:
+The command can write a `BRAIN_DEVICES` entry to the brain env file with
+`--apply-brain-config`. It also prints a copy/paste shell snippet for the target
+Mac. The snippet upserts only the Jarvis pairing keys:
 `INTERCOM_BRAIN_HOST`, `INTERCOM_BRAIN_PORT`, `INTERCOM_TOKEN`,
 `CAPS_DEVICE_ID`, `CAPS_IDENTITY`, and `CAPS_SCOPE`.
 

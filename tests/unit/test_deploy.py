@@ -15,6 +15,7 @@ from jarvis.deploy import (
     role_extras,
     service_control_argv,
     summarize_bringup_evidence,
+    upsert_brain_device_entry,
     uv_sync_args_for_roles,
 )
 
@@ -261,6 +262,52 @@ def test_issue_pairing_entry_json_escapes_values() -> None:
         "device_id": 'kitchen "pi"',
         "identity": 'Neil "home"',
     }
+
+
+def test_upsert_brain_device_entry_writes_env_file(tmp_path) -> None:
+    env_file = tmp_path / ".env"
+    entry = '{"token":"tok","device_id":"kitchen-pi","identity":"house"}'
+
+    devices = upsert_brain_device_entry(env_file, entry)
+
+    assert devices == [
+        {"token": "tok", "device_id": "kitchen-pi", "identity": "house"}
+    ]
+    text = env_file.read_text(encoding="utf-8")
+    assert text.startswith("BRAIN_DEVICES=")
+    value = text.split("=", 1)[1].strip().strip('"').replace('\\"', '"')
+    assert json.loads(value) == devices
+    assert oct(env_file.stat().st_mode & 0o777) == "0o600"
+
+
+def test_upsert_brain_device_entry_preserves_other_env_and_replaces_device(
+    tmp_path,
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "BRAIN_HOST=0.0.0.0",
+                'BRAIN_DEVICES="[{\\"token\\":\\"old\\",\\"device_id\\":\\"kitchen-pi\\"},{\\"token\\":\\"mac\\",\\"device_id\\":\\"laptop\\"}]"',
+                "MEMORY_HOST=localhost",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    devices = upsert_brain_device_entry(
+        env_file, '{"token":"new","device_id":"kitchen-pi"}'
+    )
+
+    assert devices == [
+        {"token": "mac", "device_id": "laptop"},
+        {"token": "new", "device_id": "kitchen-pi"},
+    ]
+    text = env_file.read_text(encoding="utf-8")
+    assert "BRAIN_HOST=0.0.0.0\n" in text
+    assert "MEMORY_HOST=localhost\n" in text
+    assert text.count("BRAIN_DEVICES=") == 1
 
 
 def test_render_pi_installer_command_quotes_pairing_values() -> None:

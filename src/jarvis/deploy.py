@@ -108,6 +108,103 @@ def issue_pairing_entry(device_id: str, *, identity: str = "") -> tuple[str, str
     return token, json.dumps(entry, separators=(",", ":"))
 
 
+def upsert_brain_device_entry(env_file: str | Path, entry_json: str) -> list[dict[str, str]]:
+    """Upsert one BRAIN_DEVICES entry into a dotenv file and return all entries."""
+    entry = _parse_brain_device_entry(entry_json)
+    path = Path(env_file).expanduser()
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True) if path.exists() else []
+    devices = _read_brain_devices(lines)
+    devices = [
+        device
+        for device in devices
+        if str(device.get("device_id", "")) != entry["device_id"]
+    ]
+    devices.append(entry)
+
+    serialized = json.dumps(devices, separators=(",", ":"))
+    updated_line = f"BRAIN_DEVICES={_dotenv_quote(serialized)}\n"
+    updated = _replace_dotenv_key(lines, "BRAIN_DEVICES", updated_line)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(updated), encoding="utf-8")
+    path.chmod(0o600)
+    return devices
+
+
+def _parse_brain_device_entry(entry_json: str) -> dict[str, str]:
+    try:
+        raw = json.loads(entry_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError("brain device entry must be valid JSON") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("brain device entry must be a JSON object")
+    token = raw.get("token")
+    device_id = raw.get("device_id")
+    if not isinstance(token, str) or not token:
+        raise ValueError("brain device entry requires a token")
+    if not isinstance(device_id, str) or not device_id:
+        raise ValueError("brain device entry requires a device_id")
+    entry = {"token": token, "device_id": device_id}
+    identity = raw.get("identity")
+    if isinstance(identity, str) and identity:
+        entry["identity"] = identity
+    return entry
+
+
+def _read_brain_devices(lines: list[str]) -> list[dict[str, str]]:
+    value = ""
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("#") or not stripped.startswith("BRAIN_DEVICES="):
+            continue
+        value = line.split("=", 1)[1].strip()
+    if not value:
+        return []
+    try:
+        raw = json.loads(_dotenv_unquote(value))
+    except json.JSONDecodeError as exc:
+        raise ValueError("existing BRAIN_DEVICES is not valid JSON") from exc
+    if not isinstance(raw, list):
+        raise ValueError("existing BRAIN_DEVICES must be a JSON array")
+    devices: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("existing BRAIN_DEVICES entries must be JSON objects")
+        devices.append(_parse_brain_device_entry(json.dumps(item)))
+    return devices
+
+
+def _replace_dotenv_key(lines: list[str], key: str, new_line: str) -> list[str]:
+    replaced = False
+    updated: list[str] = []
+    prefix = f"{key}="
+    for line in lines:
+        stripped = line.lstrip()
+        if not stripped.startswith("#") and stripped.startswith(prefix):
+            if not replaced:
+                if updated and not updated[-1].endswith(("\n", "\r")):
+                    updated[-1] += "\n"
+                updated.append(new_line)
+                replaced = True
+            continue
+        updated.append(line)
+    if not replaced:
+        if updated and not updated[-1].endswith(("\n", "\r")):
+            updated[-1] += "\n"
+        updated.append(new_line)
+    return updated
+
+
+def _dotenv_unquote(value: str) -> str:
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        quote = text[0]
+        text = text[1:-1]
+        if quote == '"':
+            text = text.replace('\\"', '"').replace("\\\\", "\\")
+    return text
+
+
 def current_release_ref() -> str:
     """Return the runtime release tag that matches this installed package."""
     return f"v{__version__}"
