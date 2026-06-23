@@ -217,14 +217,22 @@ NEXT
 
 if [[ -n "$ROLES" ]]; then
   printf '  jarvis bringup --json'
+  NEEDS_BRAIN_HOST=0
   for role in "${ROLE_ARGS[@]}"; do
     printf ' --role %q' "$role"
+    if [[ "$role" == "intercom" ]]; then
+      NEEDS_BRAIN_HOST=1
+    fi
   done
-  printf ' --hardware --output ~/Desktop/jarvis-bringup-evidence\n'
+  printf ' --hardware'
+  if [[ "$NEEDS_BRAIN_HOST" == "1" ]]; then
+    printf ' --brain-host imac.private'
+  fi
+  printf ' --output ~/Desktop/jarvis-bringup-evidence\n'
 else
   cat <<'NEXT'
   jarvis bringup --json --role brain --role worker --role intercom --hardware \
-    --output ~/Desktop/jarvis-bringup-evidence
+    --brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence
 NEXT
 fi
 

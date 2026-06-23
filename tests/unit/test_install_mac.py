@@ -84,3 +84,13 @@ def test_mac_installer_dry_run_installs_and_starts_roles() -> None:
     assert "+ jarvis service start worker" in result.stdout
     assert "+ jarvis service restart worker" in result.stdout
     assert "jarvis bringup --json --role brain --role worker --hardware --output ~/Desktop/jarvis-bringup-evidence" in result.stdout
+
+
+def test_mac_installer_bringup_hint_includes_brain_host_for_intercom() -> None:
+    result = run_installer(JARVIS_ROLES="intercom worker")
+
+    assert result.returncode == 0, result.stderr
+    assert (
+        "jarvis bringup --json --role intercom --role worker --hardware "
+        "--brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence"
+    ) in result.stdout

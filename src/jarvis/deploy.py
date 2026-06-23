@@ -609,6 +609,8 @@ def summarize_bringup_evidence(
             issues.append(f"{file.name}: package checks need attention")
         if not service_ok:
             issues.append(f"{file.name}: service checks need attention")
+        if "intercom" in roles and not brain_checked:
+            issues.append(f"{file.name}: intercom evidence is missing brain pairing check")
         if brain_checked and not brain_paired:
             state = "reachable but unpaired" if brain_reachable else "unreachable"
             issues.append(f"{file.name}: brain check is {state}")

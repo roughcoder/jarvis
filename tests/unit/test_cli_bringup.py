@@ -155,6 +155,7 @@ def test_bringup_summary_output_writes_summary_file(capsys, tmp_path) -> None:
                     "intercom": {"ok": True},
                 },
                 "hardware": {"audio": {"ok": True}},
+                "brain_status": {"reachable": True, "paired": True},
             }
         ),
         encoding="utf-8",

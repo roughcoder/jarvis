@@ -104,7 +104,7 @@ on the private network.
 
    ```bash
    jarvis bringup --json --role brain --role worker --role intercom --hardware \
-     --output ~/Desktop/jarvis-bringup-evidence
+     --brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence
    jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence \
      --expect-role brain --expect-role worker --expect-role intercom --min-files 4 \
      --output ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json
@@ -161,7 +161,7 @@ Proof:
 
 ```bash
 jarvis bringup --json --role brain --role worker --role intercom --hardware \
-  --output ~/Desktop/jarvis-bringup-evidence
+  --brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence
 jarvis --version
 brew list --formula --versions jarvis
 brew list --cask --versions jarvis-app

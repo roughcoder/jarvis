@@ -113,6 +113,7 @@ scan_docs_preview() {
       git -C "$TAP_DIR" grep -q 'brew trust --cask roughcoder/infinite-stack/jarvis-app' -- README.md || echo "tap docs missing entry-specific cask trust command"
       git -C "$ROOT_DIR" grep -q 'jarvis service sync brain worker intercom' -- docs-site/index.html || echo "docs-site/index.html missing role sync command"
       git -C "$ROOT_DIR" grep -q -- '--pi-installer --brain-host imac.private' -- docs-site/index.html || echo "docs-site/index.html missing release-style Pi pairing command"
+      git -C "$ROOT_DIR" grep -q -- '--brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence' -- docs-site/index.html || echo "docs-site/index.html missing brain host in bring-up evidence command"
       git -C "$ROOT_DIR" grep -q -- '--output ~/Desktop/jarvis-bringup-evidence' -- docs-site/index.html || echo "docs-site/index.html missing bring-up evidence output command"
       git -C "$ROOT_DIR" grep -q -- '--min-files 4 --output ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json' -- docs-site/index.html || echo "docs-site/index.html missing bring-up summary output command"
       git -C "$ROOT_DIR" grep -q 'sudo jarvis-pi update' -- docs-site/index.html || echo "docs-site/index.html missing Pi update command"

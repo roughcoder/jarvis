@@ -216,6 +216,37 @@ def test_summarize_bringup_evidence_accepts_pi_without_brew(tmp_path) -> None:
     assert summary["entries"][0]["brain_paired"] is True
 
 
+def test_summarize_bringup_evidence_requires_intercom_brain_check(tmp_path) -> None:
+    (tmp_path / "laptop.json").write_text(
+        json.dumps(
+            {
+                "jarvis_version": "0.1.test",
+                "release_ref": "v0.1.test",
+                "platform": "launchd",
+                "roles": ["intercom", "worker"],
+                "packages": {
+                    "jarvis": {"ok": True},
+                    "jarvis-app": {"ok": True},
+                },
+                "services": {
+                    "intercom": {"ok": True},
+                    "worker": {"ok": True},
+                },
+                "hardware": {"audio": {"ok": True}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = summarize_bringup_evidence(tmp_path)
+
+    assert summary["ok"] is False
+    assert (
+        "laptop.json: intercom evidence is missing brain pairing check"
+        in summary["issues"]
+    )
+
+
 def test_summarize_bringup_evidence_ignores_previous_summary_files(tmp_path) -> None:
     (tmp_path / "imac.json").write_text(
         json.dumps(
