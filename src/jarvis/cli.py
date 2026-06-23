@@ -887,6 +887,8 @@ def _cmd_bringup(args: argparse.Namespace) -> int:
             **asyncio.run(probe_brain(cfg)),
         }
 
+    output_path = _write_bringup_evidence(data, args.output) if args.output else None
+
     if args.json:
         print(json.dumps(data, indent=2, sort_keys=True))
         return 0
@@ -915,7 +917,32 @@ def _cmd_bringup(args: argparse.Namespace) -> int:
             print(f"  brain:        reachable but unpaired at {brain.get('brain_url')}")
         else:
             print(f"  brain:        unreachable at {brain.get('brain_url')}")
+    if output_path:
+        print(f"  evidence:     {output_path}")
     return 0
+
+
+def _write_bringup_evidence(data: dict[str, object], output: str) -> str:
+    """Write evidence JSON to a chosen file or generated file inside a directory."""
+    import json
+    import re
+    import socket
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    target = Path(output).expanduser()
+    if target.suffix.lower() == ".json":
+        path = target
+    else:
+        timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%SZ")
+        hostname = re.sub(r"[^A-Za-z0-9_.-]+", "-", socket.gethostname()).strip("-")
+        roles = "-".join(str(role) for role in data.get("roles", []) or ["none"])
+        path = target / f"jarvis-bringup-{hostname or 'machine'}-{roles}-{timestamp}.json"
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data["evidence_path"] = str(path)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return str(path)
 
 
 def _cmd_traces(args: argparse.Namespace) -> int:
@@ -1329,6 +1356,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--brain-port",
         default="",
         help="Override INTERCOM_BRAIN_PORT for brain reachability",
+    )
+    p_bringup.add_argument(
+        "--output",
+        default="",
+        help=(
+            "Write redacted JSON evidence to this .json file, or create a "
+            "timestamped file when a directory is provided"
+        ),
     )
     p_bringup.set_defaults(func=_cmd_bringup)
 

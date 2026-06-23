@@ -134,7 +134,8 @@ JARVIS_DRY_RUN=1 bash scripts/install_mac.sh
 Physical bring-up evidence:
 
 ```bash
-jarvis bringup --json --role brain --role worker --role intercom --hardware
+jarvis bringup --json --role brain --role worker --role intercom --hardware \
+  --output ~/Desktop/jarvis-bringup-evidence
 ```
 
 ## Runtime Release

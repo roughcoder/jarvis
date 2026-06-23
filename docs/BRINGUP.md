@@ -15,9 +15,11 @@ Create one local evidence folder per bring-up session:
 mkdir -p ~/Desktop/jarvis-bringup-evidence
 ```
 
-Save command output with the machine name in each filename, for example:
-`imac-install.txt`, `laptop-neil-worker.txt`, and `kitchen-pi-doctor.txt`.
-Do not commit these files; they may contain hostnames or local machine details.
+Use `jarvis bringup --output ~/Desktop/jarvis-bringup-evidence` to save a
+timestamped redacted JSON proof file on each device. Save any extra command
+output with the machine name in each filename, for example `imac-install.txt`,
+`laptop-neil-worker.txt`, and `kitchen-pi-doctor.txt`. Do not commit these
+files; they may contain hostnames or local machine details.
 
 ## iMac Brain
 
@@ -44,7 +46,8 @@ Use Jarvis Setup:
 Proof:
 
 ```bash
-jarvis bringup --json --role brain --role worker --role intercom --hardware
+jarvis bringup --json --role brain --role worker --role intercom --hardware \
+  --output ~/Desktop/jarvis-bringup-evidence
 jarvis --version
 brew list --formula --versions jarvis
 brew list --cask --versions jarvis-app
@@ -89,7 +92,8 @@ Run the generated Mac config command on the laptop, then use Jarvis Setup:
 Proof:
 
 ```bash
-jarvis bringup --json --role intercom --role worker --hardware --brain-host imac.private
+jarvis bringup --json --role intercom --role worker --hardware \
+  --brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence
 jarvis --version
 jarvis status --json --brain-host imac.private
 jarvis worker --doctor
@@ -122,12 +126,13 @@ jarvis pair kitchen-pi --json --pi-installer --brain-host imac.private
 ```
 
 Run the generated Pi installer command on the Pi. It should include a release tag
-such as `JARVIS_REF=v0.1.8`, not a development-only `main` ref.
+such as `JARVIS_REF=v0.1.10`, not a development-only `main` ref.
 
 Proof:
 
 ```bash
-jarvis bringup --json --role intercom --platform systemd --hardware --brain-host imac.private
+jarvis bringup --json --role intercom --platform systemd --hardware \
+  --brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence
 jarvis-pi doctor
 jarvis-pi status
 systemctl is-enabled jarvis-intercom.service
@@ -137,7 +142,8 @@ journalctl -u jarvis-intercom.service -n 80 --no-pager
 
 Pass criteria:
 
-- `jarvis bringup --json ...` is valid JSON and contains no raw token values.
+- `jarvis bringup --json --output ...` is valid JSON, saves a timestamped
+  evidence file, and contains no raw token values.
 - `jarvis-pi doctor` shows the expected `CAPS_DEVICE_ID`,
   `INTERCOM_BRAIN_HOST`, and `INTERCOM_BRAIN_PORT`.
 - `arecord -l` and `aplay -l` list the expected microphone and speaker.
