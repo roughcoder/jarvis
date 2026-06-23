@@ -182,7 +182,8 @@ ignored during version calculation by default; set
 Local fallback:
 
 ```bash
-scripts/release_runtime.sh 0.1.5
+scripts/compute_next_release_version.sh   # dry-run candidate version from commit history
+scripts/release_runtime.sh 0.2.0         # explicit release when needed
 ```
 
 ## Conventional Commits (local)
@@ -206,3 +207,12 @@ Quick local check to verify your branch before release:
 ```bash
 scripts/check_conventional_commits.sh $(git describe --tags --abbrev=0) HEAD
 ```
+
+Manual release smoke test (recommended for this repo):
+
+1. Make sure the repo version is what you expect in both `pyproject.toml` and
+   `src/jarvis/__init__.py`.
+2. Run `scripts/compute_next_release_version.sh` and confirm the number matches
+   your intended bump (`feat` => minor, patch set only when no `feat`).
+3. Trigger `Release` with `skip_homebrew: true` and `draft: true` to validate the
+   computed release output and artifact packaging without touching your tap.
