@@ -1248,6 +1248,40 @@ def _cmd_pair(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_setup(args: argparse.Namespace) -> int:
+    """Read, apply, and validate packaged setup state for the macOS app."""
+    import json
+
+    from jarvis.setup import apply_setup, read_setup, validate_setup
+
+    if args.setup_action == "read":
+        print(json.dumps(read_setup(args.env_file), indent=2, sort_keys=True))
+        return 0
+    if args.setup_action == "apply":
+        try:
+            payload = json.loads(sys.stdin.read() or "{}")
+            result = apply_setup(args.env_file, payload)
+        except (json.JSONDecodeError, ValueError) as exc:
+            print(f"Could not apply setup: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    result = validate_setup(args.env_file, args.roles or [])
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result["ok"] else 1
+
+
+def _cmd_whatsapp_auth(args: argparse.Namespace) -> int:
+    """Run WhatsApp QR auth through wacli and return redacted JSON output."""
+    import json
+
+    from jarvis.setup import whatsapp_auth
+
+    result = whatsapp_auth(wacli_bin=args.wacli_bin, account=args.account)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result["ok"] else int(result.get("returncode") or 1)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jarvis", description="Jarvis voice assistant"
@@ -1333,6 +1367,14 @@ def build_parser() -> argparse.ArgumentParser:
         "whatsapp", help="Run the WhatsApp connector (bridge wacli <-> brain, 3b)"
     )
     p_whatsapp.set_defaults(func=_cmd_whatsapp)
+
+    p_whatsapp_auth = sub.add_parser(
+        "whatsapp-auth", help="Authenticate wacli and return QR/progress output as JSON"
+    )
+    p_whatsapp_auth.add_argument("--json", action="store_true", help="Print JSON output")
+    p_whatsapp_auth.add_argument("--wacli-bin", default="wacli", help="wacli executable")
+    p_whatsapp_auth.add_argument("--account", default="", help="Optional wacli account")
+    p_whatsapp_auth.set_defaults(func=_cmd_whatsapp_auth)
 
     p_walog = sub.add_parser(
         "whatsapp-log", help="Print the WhatsApp transcript from wacli's store"
@@ -1443,7 +1485,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="roles",
         action="append",
         default=None,
-        choices=["brain", "intercom", "worker"],
+        choices=["brain", "intercom", "worker", "whatsapp"],
         help="Role to check; repeat for multiple roles (default: all roles)",
     )
     p_bringup.add_argument(
@@ -1498,7 +1540,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="expected_roles",
         action="append",
         default=None,
-        choices=["brain", "intercom", "worker"],
+        choices=["brain", "intercom", "worker", "whatsapp"],
         help="Require at least one evidence file containing this role; repeatable",
     )
     p_bringup_summary.add_argument(
@@ -1547,7 +1589,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_service.add_argument(
         "roles",
         nargs="+",
-        choices=["brain", "intercom", "worker"],
+        choices=["brain", "intercom", "worker", "whatsapp"],
         help="Role(s). Control actions accept exactly one role.",
     )
     p_service.add_argument(
@@ -1633,6 +1675,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also set BRAIN_HOST in --env-file, for example 0.0.0.0 on a brain Mac",
     )
     p_pair.set_defaults(func=_cmd_pair)
+
+    p_setup = sub.add_parser(
+        "setup", help="Read/apply/validate packaged setup state for Jarvis.app"
+    )
+    p_setup.add_argument(
+        "setup_action",
+        choices=["read", "apply", "validate"],
+        help="read current state, apply JSON from stdin, or validate selected roles",
+    )
+    p_setup.add_argument(
+        "--env-file",
+        default="~/.jarvis/.env",
+        help="Dotenv file to read or update",
+    )
+    p_setup.add_argument(
+        "--role",
+        dest="roles",
+        action="append",
+        default=[],
+        choices=["brain", "intercom", "worker", "whatsapp"],
+        help="Role to validate; repeatable",
+    )
+    p_setup.add_argument("--json", action="store_true", help="Accepted for app symmetry")
+    p_setup.set_defaults(func=_cmd_setup)
 
     return parser
 

@@ -23,16 +23,18 @@ from typing import Callable
 from jarvis import __version__
 
 
-ROLES = ("brain", "intercom", "worker")
+ROLES = ("brain", "intercom", "worker", "whatsapp")
 ROLE_COMMANDS = {
     "brain": ["brain"],
     "intercom": ["run"],
     "worker": ["worker"],
+    "whatsapp": ["whatsapp"],
 }
 ROLE_EXTRAS = {
     "brain": ["gateway", "tts", "stt", "vad", "wake", "memory", "mcp"],
     "intercom": ["stt", "vad", "wake"],
     "worker": ["worker", "browser"],
+    "whatsapp": [],
 }
 
 

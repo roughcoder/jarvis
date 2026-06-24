@@ -21,7 +21,7 @@ from jarvis.deploy import (
 
 
 def test_role_extras_are_ordered_and_deduplicated() -> None:
-    assert role_extras({"worker", "intercom"}) == [
+    assert role_extras({"worker", "intercom", "whatsapp"}) == [
         "stt",
         "vad",
         "wake",
@@ -76,6 +76,19 @@ def test_render_launchd_service_uses_jarvis_command_not_uv() -> None:
     assert "com.jarvis.brain" in text
     assert "<key>JARVIS_ENV_FILE</key>" in text
     assert "<string>/opt/homebrew/var/jarvis/.env</string>" in text
+
+
+def test_render_launchd_service_supports_whatsapp() -> None:
+    text = render_service(
+        "whatsapp",
+        platform_name="launchd",
+        jarvis_bin="/opt/homebrew/bin/jarvis",
+        workdir="/Users/example/.jarvis",
+    )
+
+    assert "com.jarvis.whatsapp" in text
+    assert "<string>whatsapp</string>" in text
+    assert "<string>/Users/example/.jarvis/.env</string>" in text
 
 
 def test_render_systemd_service_for_pi_intercom() -> None:

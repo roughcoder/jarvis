@@ -26,6 +26,7 @@ SERVICE_LABELS = {
     "brain": "com.jarvis.brain",
     "intercom": "com.jarvis.intercom",
     "worker": "com.jarvis.worker",
+    "whatsapp": "com.jarvis.whatsapp",
 }
 
 
