@@ -163,7 +163,24 @@ brew fetch --formula --force "$TAP_NAME/$FORMULA_TOKEN"
 
 if [[ "$FORMULA_CHANGED" -eq 1 ]]; then
   CURRENT_BRANCH="$(git -C "$TAP_DIR" branch --show-current)"
-  git -C "$TAP_DIR" push origin "$CURRENT_BRANCH"
+  PUSH_ATTEMPTS="${HOMEBREW_PUSH_ATTEMPTS:-3}"
+  PUSHED=0
+  for attempt in $(seq 1 "$PUSH_ATTEMPTS"); do
+    if git -C "$TAP_DIR" push origin "$CURRENT_BRANCH"; then
+      PUSHED=1
+      break
+    fi
+    if [[ "$attempt" -eq "$PUSH_ATTEMPTS" ]]; then
+      break
+    fi
+    echo "Tap push failed; rebasing on origin/$CURRENT_BRANCH and retrying ($attempt/$PUSH_ATTEMPTS)." >&2
+    git -C "$TAP_DIR" fetch origin "$CURRENT_BRANCH"
+    git -C "$TAP_DIR" rebase "origin/$CURRENT_BRANCH"
+  done
+  if [[ "$PUSHED" -ne 1 ]]; then
+    echo "Could not push Homebrew tap update after $PUSH_ATTEMPTS attempt(s)." >&2
+    exit 1
+  fi
   echo "Updated $TAP_NAME/$FORMULA_TOKEN to $TAG."
 else
   echo "Validated $TAP_NAME/$FORMULA_TOKEN for $TAG."
