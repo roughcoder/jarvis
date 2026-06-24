@@ -52,6 +52,13 @@ def read_setup(env_file: str | Path) -> dict[str, Any]:
         },
         "roles": roles,
         "providers": {
+            "ai_provider": values.get("AI_PROVIDER", "openai"),
+            "ai_model": values.get("AI_MODEL", "gpt-5.5"),
+            "stt_provider": values.get("STT_PROVIDER", "local"),
+            "tts_provider": values.get("TTS_PROVIDER", "inworld"),
+            "web_search_provider": values.get("WEB_SEARCH_PROVIDER", "tavily"),
+            "mac_control_provider": values.get("MAC_CONTROL_PROVIDER", "openai"),
+            "mac_control_model": values.get("MAC_CONTROL_MODEL", values.get("WORKER_PEEKABOO_AGENT_MODEL", "gpt-5.5")),
             "has_anthropic_api_key": bool(values.get("ANTHROPIC_API_KEY")),
             "has_gemini_api_key": bool(values.get("GEMINI_API_KEY")),
             "has_openai_api_key": bool(values.get("OPENAI_API_KEY")),
@@ -112,6 +119,13 @@ def apply_setup(env_file: str | Path, payload: dict[str, Any]) -> dict[str, Any]
         "CAPS_PROFILES_DIR": values.get("CAPS_PROFILES_DIR", "jarvis-workspace/profiles"),
         "CAPS_USERS_DIR": values.get("CAPS_USERS_DIR", "jarvis-workspace/users"),
         "GATEWAY_ROOM": room,
+        "AI_PROVIDER": str(providers.get("ai_provider") or values.get("AI_PROVIDER") or "openai"),
+        "AI_MODEL": str(providers.get("ai_model") or values.get("AI_MODEL") or "gpt-5.5"),
+        "STT_PROVIDER": str(providers.get("stt_provider") or values.get("STT_PROVIDER") or "local"),
+        "TTS_PROVIDER": str(providers.get("tts_provider") or values.get("TTS_PROVIDER") or "inworld"),
+        "WEB_SEARCH_PROVIDER": str(providers.get("web_search_provider") or values.get("WEB_SEARCH_PROVIDER") or "tavily"),
+        "MAC_CONTROL_PROVIDER": str(providers.get("mac_control_provider") or values.get("MAC_CONTROL_PROVIDER") or "openai"),
+        "MAC_CONTROL_MODEL": str(providers.get("mac_control_model") or values.get("MAC_CONTROL_MODEL") or "gpt-5.5"),
     }
 
     if "brain" in roles:
@@ -145,9 +159,9 @@ def apply_setup(env_file: str | Path, payload: dict[str, Any]) -> dict[str, Any]
             "WORKER_REPO_ROOT": str(worker.get("repo_root") or values.get("WORKER_REPO_ROOT") or ""),
             "WORKER_AGENT": str(worker.get("agent") or values.get("WORKER_AGENT") or "codex"),
             "WORKER_SHELL_SECRETS": str(worker.get("shell_secrets") or values.get("WORKER_SHELL_SECRETS") or ""),
-            "WORKER_PEEKABOO_AI_PROVIDERS": str(worker.get("peekaboo_ai_providers") or values.get("WORKER_PEEKABOO_AI_PROVIDERS") or ""),
+            "WORKER_PEEKABOO_AI_PROVIDERS": str(worker.get("peekaboo_ai_providers") or providers.get("mac_control_provider") or values.get("WORKER_PEEKABOO_AI_PROVIDERS") or ""),
             "WORKER_PEEKABOO_OPENAI_BASE_URL": str(worker.get("peekaboo_openai_base_url") or values.get("WORKER_PEEKABOO_OPENAI_BASE_URL") or ""),
-            "WORKER_PEEKABOO_AGENT_MODEL": str(worker.get("peekaboo_agent_model") or values.get("WORKER_PEEKABOO_AGENT_MODEL") or "gpt-5.5"),
+            "WORKER_PEEKABOO_AGENT_MODEL": str(worker.get("peekaboo_agent_model") or providers.get("mac_control_model") or values.get("WORKER_PEEKABOO_AGENT_MODEL") or "gpt-5.5"),
         }
     if "whatsapp" in roles:
         wa_token = _device_token(values, str(whatsapp.get("device_id") or values.get("WHATSAPP_DEVICE_ID") or "whatsapp"))
@@ -185,10 +199,10 @@ def apply_setup(env_file: str | Path, payload: dict[str, Any]) -> dict[str, Any]
 
     merged = {**values, **updates}
     _write_dotenv(path, updates)
-    user_path = _write_admin_user(workdir, merged, admin_slug, admin, device_id)
+    user_path = _write_admin_user(workdir, merged, admin_slug, admin, device_id) if "brain" in roles else None
     return {
         "env_file": str(path),
-        "user_file": str(user_path),
+        "user_file": str(user_path) if user_path else "",
         "roles": roles,
         "changed_keys": sorted(updates),
     }

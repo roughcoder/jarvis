@@ -57,8 +57,23 @@ for node in ast.parse(path.read_text(encoding='utf-8')).body:
 raise SystemExit('__version__ not found')
 PY
 )"
+LOCK_VERSION="$(python3 - <<'PY'
+import tomllib
+from pathlib import Path
 
-if [[ "$PYPROJECT_VERSION" == "$VERSION" && "$INIT_VERSION" == "$VERSION" ]]; then
+with open("uv.lock", "rb") as handle:
+    lock = tomllib.load(handle)
+
+for package in lock.get("package", []):
+    if package.get("name") == "jarvis" and package.get("source", {}).get("editable") == ".":
+        print(package["version"])
+        raise SystemExit
+
+raise SystemExit("editable jarvis package not found in uv.lock")
+PY
+)"
+
+if [[ "$PYPROJECT_VERSION" == "$VERSION" && "$INIT_VERSION" == "$VERSION" && "$LOCK_VERSION" == "$VERSION" ]]; then
   echo "Runtime version metadata already at $VERSION."
   if [[ "$COMMIT" -eq 0 ]]; then
     exit 0
@@ -81,11 +96,23 @@ def replace_first(path, pattern):
 
 replace_first('pyproject.toml', r'(^version\s*=\s*)"[^"]+"')
 replace_first('src/jarvis/__init__.py', r'(^__version__\s*=\s*)"[^"]+"')
+
+lock_path = Path('uv.lock')
+lock_data = lock_path.read_text(encoding='utf-8')
+lock_data, count = re.subn(
+    r'(\[\[package\]\]\nname = "jarvis"\nversion = )"[^"]+"(\nsource = \{ editable = "\." \})',
+    lambda m: f'{m.group(1)}"{version}"{m.group(2)}',
+    lock_data,
+    count=1,
+)
+if count != 1:
+    raise SystemExit('Failed to update uv.lock')
+lock_path.write_text(lock_data, encoding='utf-8')
 PY
 
 if [[ "$COMMIT" -eq 1 ]]; then
-  if [[ -n "$(git status --porcelain pyproject.toml src/jarvis/__init__.py)" ]]; then
-    git add pyproject.toml src/jarvis/__init__.py
+  if [[ -n "$(git status --porcelain pyproject.toml src/jarvis/__init__.py uv.lock)" ]]; then
+    git add pyproject.toml src/jarvis/__init__.py uv.lock
     git commit -m "chore(version): sync runtime metadata to $VERSION"
     echo "Committed runtime version bump to $VERSION."
   else
