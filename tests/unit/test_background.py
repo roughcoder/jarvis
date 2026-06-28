@@ -179,8 +179,10 @@ class _Msg:
 class _Gateway:
     def __init__(self, scripted: list[_Msg]) -> None:
         self._s, self.calls = scripted, 0
+        self.messages: list[list[dict]] = []
 
     async def complete_with_tools(self, messages, *, model=None, tools=None, usage_out=None):  # noqa: ANN001
+        self.messages.append(messages)
         m = self._s[self.calls]
         self.calls += 1
         return m
@@ -203,3 +205,25 @@ def test_run_task_executes_tools_then_summarises(tmp_path) -> None:
     assert out == "Done — I saved the note for you."
     assert (tmp_path / "n.md").read_text() == "ok"  # the tool really ran
     assert session._history == []  # background work never touches the live conversation
+
+
+def test_run_task_excludes_and_strips_voice_mode_markers() -> None:
+    gateway = _Gateway([
+        _Msg(content="Done. [[VOICE_MODE:stay:mode_enter]] [[CONVERSATION:open:mode_enter]] [[END]]"),
+    ])
+    session = BrainSession(
+        load_config(),
+        RequestContext("dev", "neil", "personal", frozenset(), channel="voice"),
+        gateway=gateway,
+        tts=None,
+        memory=None,
+        tracer=None,
+        registry=build_registry(ToolsConfig(_env_file=None)),
+    )
+
+    out = asyncio.run(session.run_task("summarise the thing", max_rounds=1))
+
+    assert out == "Done."
+    system_prompt = gateway.messages[0][0]["content"]
+    assert "Voice mode:" not in system_prompt
+    assert "[[CONVERSATION:" not in system_prompt

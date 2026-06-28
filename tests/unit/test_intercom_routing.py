@@ -130,6 +130,40 @@ def test_queued_proactive_returns_mode_exit_state() -> None:
     assert state["continue_listening"] is False
 
 
+def test_queued_proactive_preserves_stay_state_for_passive_playback() -> None:
+    c = _client()
+    q: asyncio.Queue = asyncio.Queue()
+    ws = _WS()
+    mic = _Mic()
+    q.put_nowait(Proactive(text="notification", turn_id="pa-3", open_mic=True))
+    active_state = {
+        "ended": False,
+        "text": "Working session",
+        "continue_listening": True,
+        "voice_mode": "stay",
+        "close_reason": "stay_mode",
+    }
+
+    async def fake_play(*_args):  # noqa: ANN002
+        return {
+            "ended": False,
+            "text": "notification",
+            "continue_listening": False,
+            "voice_mode": "default",
+            "close_reason": "",
+        }
+
+    c._play_proactive = fake_play  # type: ignore[method-assign]
+
+    async def go() -> dict | None:
+        return await c._play_queued_proactive(ws, mic, q, active_state)
+
+    state = asyncio.run(go())
+    assert state == active_state
+    assert state is not active_state
+    assert mic.drained == 1
+
+
 def test_reply_audio_yields_pcm_and_records_state() -> None:
     c = _client()
     q: asyncio.Queue = asyncio.Queue()

@@ -424,8 +424,9 @@ class BrainSession:
         asker, so it runs with their capabilities and never more. Uses the strong
         model (off the hot path, quality over latency)."""
         memory = self._memory.read_cached_representation(self._memory_user) if self._memory else ""
+        system_prompt = self._system_prompt(memory, include_voice_controls=False)
         messages = [
-            {"role": "system", "content": f"{self._system_prompt(memory)}\n\n{_BACKGROUND_FRAMING}"},
+            {"role": "system", "content": f"{system_prompt}\n\n{_BACKGROUND_FRAMING}"},
             {"role": "user", "content": task},
         ]
         model = self._cfg.gateway.strong_model
@@ -444,7 +445,7 @@ class BrainSession:
                 messages, model=model, tools=tool_schemas or None
             )
             if not msg.tool_calls:
-                return _END_RE.sub(" ", msg.content or "").strip()
+                return self._clean_reply(msg.content or "")
             messages.append({
                 "role": "assistant",
                 "content": msg.content or "",
@@ -477,7 +478,7 @@ class BrainSession:
         final = await gateway.complete_with_tools(messages, model=model, tools=None)
         return self._clean_reply(final.content or "")
 
-    def _system_prompt(self, memory: str) -> str:
+    def _system_prompt(self, memory: str, *, include_voice_controls: bool = True) -> str:
         """Soul (who Jarvis is) + format + memory (what he knows about you)."""
         parts = []
         if self._soul:
@@ -494,7 +495,7 @@ class BrainSession:
             parts.append(_MESSAGING_FORMAT)
         # End-detection only matters for an open-mic voice conversation; on a
         # messaging surface every inbound message is already a discrete turn.
-        if self._cfg.vad.conversation_mode and self._ctx.channel == "voice":
+        if include_voice_controls and self._cfg.vad.conversation_mode and self._ctx.channel == "voice":
             parts.append(_END_INSTRUCTION)
             parts.append(voice_mode_instruction(self._voice_mode))
         parts.append(_AGENCY)  # act-by-default + persistence (stable, cacheable)
