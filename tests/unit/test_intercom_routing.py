@@ -80,16 +80,54 @@ def test_stay_mode_can_play_queued_proactive_between_silence_windows() -> None:
         assert mic_arg is mic
         assert inbound_arg is q
         seen.append(pro.text)
+        return {
+            "ended": False,
+            "text": "alarm",
+            "continue_listening": True,
+            "voice_mode": "stay",
+            "close_reason": "",
+        }
 
     c._play_proactive = fake_play  # type: ignore[method-assign]
 
-    async def go() -> bool:
+    async def go() -> dict | None:
         return await c._play_queued_proactive(ws, mic, q)
 
-    assert asyncio.run(go()) is True
+    state = asyncio.run(go())
+    assert state is not None
+    assert state["voice_mode"] == "stay"
+    assert state["continue_listening"] is True
     assert seen == ["alarm"]
     assert mic.drained == 1
-    assert asyncio.run(go()) is False
+    assert asyncio.run(go()) is None
+
+
+def test_queued_proactive_returns_mode_exit_state() -> None:
+    c = _client()
+    q: asyncio.Queue = asyncio.Queue()
+    ws = _WS()
+    mic = _Mic()
+    q.put_nowait(Proactive(text="notification", turn_id="pa-2", open_mic=True))
+
+    async def fake_play(*_args):  # noqa: ANN002
+        return {
+            "ended": True,
+            "text": "Okay, exiting stay mode.",
+            "continue_listening": False,
+            "voice_mode": "default",
+            "close_reason": "mode_exit",
+        }
+
+    c._play_proactive = fake_play  # type: ignore[method-assign]
+
+    async def go() -> dict | None:
+        return await c._play_queued_proactive(ws, mic, q)
+
+    state = asyncio.run(go())
+    assert state is not None
+    assert state["ended"] is True
+    assert state["voice_mode"] == "default"
+    assert state["continue_listening"] is False
 
 
 def test_reply_audio_yields_pcm_and_records_state() -> None:

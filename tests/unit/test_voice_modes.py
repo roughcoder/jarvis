@@ -140,7 +140,8 @@ def test_alarm_tools_force_voice_turn_closed() -> None:
                         "function": {"name": "set_alarm", "arguments": "{}"},
                     }
                 ],
-            }
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "Alarm set for seven."},
         ],
     )
 
@@ -165,7 +166,8 @@ def test_alarm_tools_do_not_exit_stay_mode() -> None:
                         "function": {"name": "set_alarm", "arguments": "{}"},
                     }
                 ],
-            }
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "Alarm set for seven."},
         ],
     )
 
@@ -175,6 +177,32 @@ def test_alarm_tools_do_not_exit_stay_mode() -> None:
     assert result.continue_listening is True
     assert result.voice_mode == STAY_MODE
     assert result.close_reason == "stay_mode"
+
+
+def test_failed_alarm_tool_keeps_voice_turn_open_for_clarification() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(
+        raw="What time should I set it for? [[CONVERSATION:open:clarification_needed]]",
+        tool_messages=[
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "set_alarm", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "error: tell me when"},
+        ],
+    )
+
+    sess.finalize("set an alarm", result)
+
+    assert result.ended is False
+    assert result.continue_listening is True
+    assert result.close_reason == "clarification_needed"
 
 
 def test_local_voice_action_ignores_requests() -> None:

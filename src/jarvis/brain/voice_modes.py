@@ -170,8 +170,30 @@ def tool_names(tool_messages: list) -> set[str]:
     return names
 
 
+def tool_result_text(tool_messages: list, tool_name: str) -> str:
+    """Return the first result text for a named tool call, or empty if absent."""
+    pending_ids: set[str] = set()
+    for msg in tool_messages or []:
+        for call in msg.get("tool_calls") or []:
+            fn = (call.get("function") or {}).get("name")
+            if fn == tool_name and call.get("id"):
+                pending_ids.add(str(call["id"]))
+        if msg.get("role") == "tool" and msg.get("tool_call_id") in pending_ids:
+            return str(msg.get("content") or "")
+    return ""
+
+
+def tool_completes_successfully(tool_messages: list, tool_names_to_check: set[str]) -> bool:
+    names = tool_names(tool_messages)
+    for name in names & tool_names_to_check:
+        result = tool_result_text(tool_messages, name).strip().lower()
+        if result and not result.startswith("error"):
+            return True
+    return False
+
+
 def tool_completes_voice_turn(tool_messages: list) -> bool:
-    return bool(tool_names(tool_messages) & _TASK_COMPLETE_TOOLS)
+    return tool_completes_successfully(tool_messages, _TASK_COMPLETE_TOOLS)
 
 
 def voice_mode_instruction(mode: str) -> str:
