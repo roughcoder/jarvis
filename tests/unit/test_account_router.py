@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from jarvis.brain.account_adapters import FakeAccountAdapter
-from jarvis.brain.account_router import AccountRouter
+from jarvis.brain.account_router import AccountRouter, classify_email_recipient
 from jarvis.brain.accounts import AccountBinding
 from jarvis.brain.context import RequestContext
 from jarvis.brain.identity import HOUSE
@@ -116,3 +116,21 @@ def test_router_dispatches_calendar_events_to_calendar_adapter() -> None:
     assert out == "events"
     assert [call.operation for call in adapter.calls] == ["calendar.list_events"]
     assert adapter.calls[0].payload["days"] == 3
+
+
+def test_recipient_class_is_derived_from_binding_metadata() -> None:
+    binding = AccountBinding(
+        name="house-email",
+        principal=HOUSE,
+        kind="email",
+        provider="fake",
+        grants=frozenset({"email.send"}),
+        email="house@example.invalid",
+        household_recipients=frozenset({"jules@example.invalid"}),
+        known_recipients=frozenset({"school@example.invalid"}),
+    )
+
+    assert classify_email_recipient(binding, "house@example.invalid") == "self"
+    assert classify_email_recipient(binding, "JULES@example.invalid") == "household"
+    assert classify_email_recipient(binding, "school@example.invalid") == "known"
+    assert classify_email_recipient(binding, "external@example.invalid") == "external"

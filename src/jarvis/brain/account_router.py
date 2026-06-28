@@ -121,6 +121,19 @@ class AccountRouter:
         return await adapter.list_events(binding, days=days)
 
 
+def classify_email_recipient(binding: AccountBinding, recipient: str) -> str:
+    recipient_norm = (recipient or "").strip().lower()
+    if not recipient_norm:
+        return "external"
+    if binding.email and recipient_norm == binding.email.strip().lower():
+        return "self"
+    if recipient_norm in {item.lower() for item in binding.household_recipients}:
+        return "household"
+    if recipient_norm in {item.lower() for item in binding.known_recipients}:
+        return "known"
+    return "external"
+
+
 def _policy_text(decision: AccountPolicyDecision) -> str:
     if decision.mode == DENY:
         return f"error: account policy denied this request ({decision.reason})"
