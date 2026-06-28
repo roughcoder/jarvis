@@ -1140,6 +1140,41 @@ def _cmd_service(args: argparse.Namespace) -> int:
     return result.returncode
 
 
+def _cmd_mic(args: argparse.Namespace) -> int:
+    """Operator shortcut for this machine's intercom listener."""
+    from jarvis.deploy import control_service
+
+    def run(action: str, *, emit: bool = True):
+        result = control_service("intercom", action, platform_name=args.platform)
+        if emit and result.stdout:
+            print(result.stdout, end="")
+        if emit and result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
+        return result
+
+    if args.mic_action == "off":
+        disable = run("disable")
+        stop = run("stop", emit=False)
+        if disable.returncode == 0 or stop.returncode == 0:
+            print("Jarvis mic/listener off: intercom disabled and stopped.")
+            return 0
+        if stop.stdout:
+            print(stop.stdout, end="")
+        if stop.stderr:
+            print(stop.stderr, end="", file=sys.stderr)
+        return stop.returncode or disable.returncode
+
+    if args.mic_action == "on":
+        enable = run("enable")
+        start = run("start")
+        if enable.returncode == 0 and start.returncode == 0:
+            print("Jarvis mic/listener on: intercom enabled and started.")
+            return 0
+        return start.returncode or enable.returncode
+
+    return run("status").returncode
+
+
 def _cmd_pair(args: argparse.Namespace) -> int:
     """Pairing helpers for fleet onboarding."""
     from jarvis.deploy import (
@@ -1578,13 +1613,37 @@ def build_parser() -> argparse.ArgumentParser:
     p_traces.add_argument("-n", type=int, default=20, help="How many recent traces")
     p_traces.set_defaults(func=_cmd_traces)
 
+    p_mic = sub.add_parser(
+        "mic", help="Turn this machine's intercom microphone listener on/off"
+    )
+    p_mic.add_argument(
+        "mic_action",
+        choices=["off", "on", "status"],
+        help="off disables/stops the intercom; on enables/starts it",
+    )
+    p_mic.add_argument(
+        "--platform", choices=["launchd", "systemd"], help="Override platform detection"
+    )
+    p_mic.set_defaults(func=_cmd_mic)
+
     p_service = sub.add_parser(
         "service", help="Install/control Jarvis launchd/systemd services"
     )
     p_service.add_argument(
         "service_action",
-        choices=["install", "print", "start", "stop", "restart", "status", "extras", "sync"],
-        help="install/print render service files; start/stop/restart/status controls one role; extras prints uv extras; sync installs role dependencies",
+        choices=[
+            "install",
+            "print",
+            "start",
+            "stop",
+            "restart",
+            "status",
+            "enable",
+            "disable",
+            "extras",
+            "sync",
+        ],
+        help="install/print render service files; start/stop/restart/status/enable/disable controls one role; extras prints uv extras; sync installs role dependencies",
     )
     p_service.add_argument(
         "roles",

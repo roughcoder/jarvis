@@ -479,6 +479,10 @@ def service_control_argv(
             argv = ["launchctl", "kickstart", "-k", service]
         elif action == "status":
             argv = ["launchctl", "print", service]
+        elif action == "enable":
+            argv = ["launchctl", "enable", service]
+        elif action == "disable":
+            argv = ["launchctl", "disable", service]
         else:
             raise ValueError(f"unsupported service action: {action}")
     elif target == "systemd":
@@ -488,6 +492,8 @@ def service_control_argv(
             "stop": "stop",
             "restart": "restart",
             "status": "status",
+            "enable": "enable",
+            "disable": "disable",
         }[action]
         argv = ["systemctl", verb, unit]
     else:

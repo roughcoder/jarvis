@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 
 import pytest
@@ -114,6 +115,16 @@ def test_service_control_argv_uses_platform_supervisors() -> None:
         "launchctl",
         "kickstart",
         "-k",
+    ]
+    assert service_control_argv("intercom", "disable", platform_name="launchd") == [
+        "launchctl",
+        "disable",
+        f"gui/{os.getuid()}/com.jarvis.intercom",
+    ]
+    assert service_control_argv("intercom", "enable", platform_name="systemd") == [
+        "systemctl",
+        "enable",
+        "jarvis-intercom.service",
     ]
 
 

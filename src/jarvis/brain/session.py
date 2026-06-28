@@ -137,6 +137,14 @@ _GUI_GUIDANCE = (
     "rather than driving a browser by hand. Use each app's exact name ('Google Chrome')."
 )
 
+_INTERCOM_CAMERA_GUIDANCE = (
+    "This intercom has a camera. When the user asks what they are holding, showing, "
+    "wearing, pointing at, or what is in front of the device, call `take_photo` and "
+    "answer from the captured image. If they ask whether you have a camera, say yes: "
+    "you can take a fresh photo from this room device when needed. Do not claim you "
+    "cannot see when `take_photo` is available."
+)
+
 
 _BACKGROUND_FRAMING = (
     "You are completing this task in the BACKGROUND — the user has already been told "
@@ -429,6 +437,8 @@ class BrainSession:
             parts.append(_BROWSER_GUIDANCE)
         if self._ctx.can("worker.gui"):
             parts.append(_GUI_GUIDANCE)
+        if self._ctx.can("intercom.camera"):
+            parts.append(_INTERCOM_CAMERA_GUIDANCE)
         if self._ctx.can("worker.shell") and self._cfg.worker.shell_secrets:
             names = ", ".join(
                 n.strip() for n in self._cfg.worker.shell_secrets.split(",") if n.strip()

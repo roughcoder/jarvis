@@ -60,3 +60,21 @@ def test_context_store_isolates_and_reuses_sessions() -> None:
     assert len(store) == 2
     assert s1.loaded == 1  # soul loaded once at creation; reuse doesn't reload
     assert set(store.keys) == {("mac", "neil"), ("mac", "jules")}
+
+
+def test_context_store_rebuilds_when_capabilities_change() -> None:
+    def make(ctx: RequestContext):  # noqa: ANN202 - a stand-in BrainSession
+        return types.SimpleNamespace(_ctx=ctx)
+
+    store = ContextStore(make)
+    before = RequestContext("pi", "alice", "personal", frozenset({"web.search"}))
+    after = RequestContext(
+        "pi", "alice", "personal", frozenset({"web.search", "intercom.camera"})
+    )
+
+    s1 = store.get(before)
+    s2 = store.get(after)
+
+    assert s1 is not s2
+    assert s2._ctx.can("intercom.camera")
+    assert len(store) == 1
