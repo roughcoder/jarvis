@@ -245,6 +245,14 @@ def classify_voice_turn(
             reason="stay_mode",
         )
 
+    if requested_mode == STAY_MODE and control.conversation == "open" and not default_user_closed:
+        return VoiceStateTransition(
+            mode=STAY_MODE,
+            ended=False,
+            continue_listening=True,
+            reason=control.reason or "mode_enter",
+        )
+
     if tool_completes_voice_turn(tool_messages):
         return VoiceStateTransition(
             mode=DEFAULT_MODE,

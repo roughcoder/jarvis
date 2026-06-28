@@ -236,6 +236,37 @@ def test_alarm_tools_force_voice_turn_closed() -> None:
     assert result.close_reason == "task_complete"
 
 
+def test_stay_mode_marker_overrides_task_complete_tool_backstop() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(
+        raw=(
+            "Alarm set for seven. "
+            "[[VOICE_MODE:stay:mode_enter]] [[CONVERSATION:open:mode_enter]]"
+        ),
+        tool_messages=[
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "set_alarm", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "Alarm set for seven."},
+        ],
+    )
+
+    sess.finalize("stay with me and set an alarm for seven", result)
+
+    assert result.reply == "Alarm set for seven."
+    assert result.ended is False
+    assert result.continue_listening is True
+    assert result.voice_mode == STAY_MODE
+    assert result.close_reason == "mode_enter"
+
+
 def test_alarm_tools_do_not_exit_stay_mode() -> None:
     sess = _session(STAY_MODE)
     result = TurnResult(

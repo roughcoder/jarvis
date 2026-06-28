@@ -213,9 +213,15 @@ class IntercomClient:
         """Run turns until the conversation closes — shared by a wake-started turn and a
         proactive that opened the mic."""
         conversation_started = False
+        active_voice_mode = "default"
         while True:
             if not pcm:
                 print("  (nothing said)")
+                if conversation_started and active_voice_mode == "stay":
+                    self._panel.set("listening")
+                    pcm = await asyncio.to_thread(self._capture_utterance, mic)
+                    self._panel.set("thinking")
+                    continue
                 if conversation_started:
                     with contextlib.suppress(Exception):
                         await ws.send(encode(ConversationIdle(reason="timeout")))
@@ -231,6 +237,7 @@ class IntercomClient:
                 "close_reason": "",
             }
             interrupted = await self._play_reply(ws, mic, inbound, turn_id, state)
+            active_voice_mode = state["voice_mode"]
             print(f"  jarvis: {state['text']}{'  ⏹' if state['ended'] else ''}")
 
             if interrupted:
