@@ -1,54 +1,68 @@
-"""Email/calendar tools — Jarvis's own Google account via `gogcli` (Phase 3 §6).
+"""Email/calendar tools — Jarvis's own house account via account adapters.
 
-A thin client like `worker.py`: it shells out to the local `gogcli` binary (which
-holds its own OAuth token from `jarvis google-setup`) and never embeds provider
-credentials. The tool surface is provider-neutral: mail and calendar actions are
-gated by `email.*` / `calendar.*` capabilities even though this adapter currently
-uses Google underneath. Every call is timeout-bounded so the hot path can't hang.
-With the binary absent the tools still register but report "not set up".
+The visible tool surface is provider-neutral. The first provider adapter is
+OpenClaw `gogcli`, which holds its own OAuth state from `jarvis google-setup`
+and is selected behind the account router.
 """
 
 from __future__ import annotations
 
-import asyncio
-import shutil
 from typing import Any
 
+from jarvis.brain.account_adapters import GogcliAccountAdapter
+from jarvis.brain.account_router import AccountRouter
+from jarvis.brain.accounts import AccountBinding
 from jarvis.brain.context import RequestContext
+from jarvis.brain.identity import HOUSE
 from jarvis.config import GoogleConfig
 from jarvis.tools.base import Tool
 
 
-def make_google_tools(cfg: GoogleConfig) -> list[Tool]:
-    async def run(args: list[str], *, enabled: str) -> str:
-        if not shutil.which(cfg.gogcli_bin):
-            return "google isn't set up yet — run `jarvis google-setup` first."
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                cfg.gogcli_bin,
-                "--plain",
-                "--no-input",
-                f"--enable-commands-exact={enabled}",
-                *args,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-            )
-            out, _ = await asyncio.wait_for(proc.communicate(), cfg.timeout_s)
-        except TimeoutError:
-            return "error: google timed out"
-        except Exception as exc:  # noqa: BLE001
-            return f"error: couldn't run google ({exc})"
-        text = (out or b"").decode("utf-8", "replace").strip()
-        return text or "(no output)"
+def _house_email_binding() -> AccountBinding:
+    return AccountBinding(
+        name="house-gogcli-email",
+        principal=HOUSE,
+        kind="email",
+        provider="gogcli",
+        grants=frozenset({"email.read", "email.draft", "email.send"}),
+    )
+
+
+def _house_calendar_binding() -> AccountBinding:
+    return AccountBinding(
+        name="house-gogcli-calendar",
+        principal=HOUSE,
+        kind="calendar",
+        provider="gogcli",
+        grants=frozenset({"calendar.freebusy", "calendar.read"}),
+    )
+
+
+def make_google_tools(
+    cfg: GoogleConfig,
+    *,
+    router: AccountRouter | None = None,
+    email_binding: AccountBinding | None = None,
+    calendar_binding: AccountBinding | None = None,
+) -> list[Tool]:
+    if router is None:
+        adapter = GogcliAccountAdapter(cfg)
+        router = AccountRouter(
+            email_adapters={"gogcli": adapter},
+            calendar_adapters={"gogcli": adapter},
+        )
+    email_binding = email_binding or _house_email_binding()
+    calendar_binding = calendar_binding or _house_calendar_binding()
 
     async def search_email(ctx: RequestContext, args: dict[str, Any]) -> str:
         query = (args.get("query") or "").strip()
         if not query:
             return "error: need a search query"
-        return await run(["gmail", "search", "--query", query], enabled="gmail.search")
+        return await router.search_email(ctx, email_binding, query)
 
     async def upcoming_events(ctx: RequestContext, args: dict[str, Any]) -> str:
-        days = str(args.get("days") or cfg.calendar_days)
-        return await run(["calendar", "events", "--days", days], enabled="calendar.events")
+        days = int(args.get("days") or cfg.calendar_days)
+        return await router.list_events(ctx, calendar_binding, days=days)
 
     async def send_email(ctx: RequestContext, args: dict[str, Any]) -> str:
         to = (args.get("to") or "").strip()
@@ -56,9 +70,10 @@ def make_google_tools(cfg: GoogleConfig) -> list[Tool]:
         body = (args.get("body") or "").strip()
         if not (to and body):
             return "error: an email needs a recipient and a body"
-        return await run(
-            ["gmail", "send", "--to", to, "--subject", subject, "--body", body],
-            enabled="gmail.send",
+        return await router.send_email(
+            ctx,
+            email_binding,
+            {"to": to, "subject": subject, "body": body},
         )
 
     obj = "object"
@@ -66,7 +81,11 @@ def make_google_tools(cfg: GoogleConfig) -> list[Tool]:
         Tool(
             "search_email",
             "Search Jarvis's email (the house account) and return matching messages.",
-            {"type": obj, "properties": {"query": {"type": "string"}}, "required": ["query"]},
+            {
+                "type": obj,
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
             "email.read",
             search_email,
             announce=True,

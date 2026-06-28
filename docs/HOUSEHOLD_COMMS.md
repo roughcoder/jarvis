@@ -241,9 +241,9 @@ tool names and capabilities should remain provider-neutral.
 3. Add an account policy evaluator that returns `allow`, `draft`, `confirm`, or
    `deny`, with unit tests for every row in the capability matrix.
 4. Introduce `CalendarAdapter` and `EmailAdapter` protocols plus a fake adapter
-   for hermetic tests.
+   for hermetic tests. Done for the current account router slice.
 5. Port the current `gogcli` operations into the adapter shape for the house
-   account.
+   account. Done for search email, upcoming events, and guarded send.
 6. Add onboarding state for WhatsApp: pending grant, provider/setup method,
    verification probe, success, revocation.
 7. Add Google and Microsoft delegated adapters with least-privilege OAuth grant
@@ -275,3 +275,17 @@ The first executable slice adds:
 The `draft` mode is currently used to downgrade email send requests when the
 account grants draft authority but not send authority. The upcoming adapter/tool
 slice will turn that decision into saved provider drafts.
+
+## Adapter Router
+
+The second executable slice adds:
+
+- `EmailAdapter` and `CalendarAdapter` protocols;
+- a hermetic `FakeAccountAdapter` for policy/router tests;
+- a `GogcliAccountAdapter` for the existing house Google account operations;
+- an `AccountRouter` that checks policy before dispatching to any provider; and
+- provider-neutral tool wiring for `search_email`, `upcoming_events`, and
+  guarded `send_email`.
+
+Until confirmation/audit handling exists, `send_email` returns a confirmation
+requirement for external sends instead of executing the provider send call.
