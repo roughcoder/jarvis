@@ -235,7 +235,8 @@ tool names and capabilities should remain provider-neutral.
 ## Implementation Plan
 
 1. Finish the provider-neutral capability rename for the existing house account
-   adapter. Keep `openclaw/gogcli` as the Google implementation detail.
+   adapter. Keep `openclaw/gogcli` as the Google implementation detail. Done in
+   the first household comms PR.
 2. Add an account binding store and parser for user profile binding references.
 3. Add an account policy evaluator that returns `allow`, `draft`, `confirm`, or
    `deny`, with unit tests for every row in the capability matrix.
@@ -259,3 +260,18 @@ tool names and capabilities should remain provider-neutral.
 - Keep live provider tests opt-in and self-skipping without credentials.
 - Verify public readiness so no tokens, mailbox content, calendar ids, or real
   household details land in tracked files.
+
+## Runtime Foundation
+
+The first executable slice adds:
+
+- user profile fields for `calendar_accounts`, `email_accounts`, and
+  `household_visibility`;
+- ignored private account metadata under `jarvis-workspace/.accounts`;
+- an account binding parser that rejects token-like fields; and
+- a provider-neutral policy evaluator that returns `allow`, `draft`, `confirm`,
+  or `deny` for the current capability matrix.
+
+The `draft` mode is currently used to downgrade email send requests when the
+account grants draft authority but not send authority. The upcoming adapter/tool
+slice will turn that decision into saved provider drafts.
