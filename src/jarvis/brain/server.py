@@ -29,6 +29,7 @@ from jarvis.brain.scheduler import Ring, Scheduler, in_quiet_hours
 from jarvis.brain.session import BrainSession, TurnResult
 from jarvis.brain.skills import register_skills
 from jarvis.brain.tracing import Tracer
+from jarvis.brain.voice_modes import DEFAULT_MODE, STAY_MODE, normalize_mode
 from jarvis.config import Config, insecure_bind
 from jarvis.mcp import MCPBridge
 from jarvis.protocol.messages import (
@@ -529,7 +530,26 @@ class BrainServer:
         if channel != "voice":
             return
         conn["asserted"] = conn.get("base_asserted", "")
-        conn["voice_mode"] = "default"
+        conn["voice_mode"] = DEFAULT_MODE
+
+    @staticmethod
+    def _alarm_ack_reply_end(turn_id: str, channel: str, conn: dict) -> ReplyEnd:
+        mode = normalize_mode(conn.get("voice_mode")) if channel == "voice" else DEFAULT_MODE
+        if mode == STAY_MODE:
+            return ReplyEnd(
+                turn_id=turn_id,
+                ended=False,
+                continue_listening=True,
+                voice_mode=STAY_MODE,
+                close_reason="alarm_ack",
+            )
+        return ReplyEnd(
+            turn_id=turn_id,
+            ended=True,
+            continue_listening=False,
+            voice_mode=DEFAULT_MODE,
+            close_reason="alarm_ack",
+        )
 
     async def _do_turn(self, ws, device_id: str, channel: str, conn: dict, msg) -> None:  # noqa: ANN001
         if isinstance(msg, Utterance):
@@ -556,20 +576,13 @@ class BrainServer:
                 with contextlib.suppress(Exception):
                     async for pcm in self._tts.synthesize_stream(reply):
                         await ws.send(encode(ReplyAudio.of(turn_id, pcm)))
+            end = self._alarm_ack_reply_end(turn_id, channel, conn)
             with contextlib.suppress(Exception):
                 await ws.send(encode(ReplyText(turn_id=turn_id, text=reply)))
-                await ws.send(
-                    encode(
-                        ReplyEnd(
-                            turn_id=turn_id,
-                            ended=True,
-                            continue_listening=False,
-                            voice_mode="default",
-                            close_reason="alarm_ack",
-                        )
-                    )
-                )
-            self._reset_voice_conversation(channel, conn)
+                await ws.send(encode(end))
+            conn["voice_mode"] = end.voice_mode
+            if end.ended:
+                self._reset_voice_conversation(channel, conn)
             return
         # Resolve WHO this utterance is from (claim detection needs the transcript),
         # then route to that principal's session. A spoken claim sticks for the rest
