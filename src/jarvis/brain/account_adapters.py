@@ -180,7 +180,11 @@ class GogcliAccountAdapter:
         return "error: gogcli free/busy is not wired yet"
 
     async def list_events(self, binding: AccountBinding, *, days: int) -> str:
-        return await self._run(binding, ["calendar", "events", "--days", str(days)], enabled="calendar.events")
+        args = ["calendar", "events"]
+        if binding.calendar_id.strip():
+            args.append(binding.calendar_id.strip())
+        args.extend(["--days", str(days)])
+        return await self._run(binding, args, enabled="calendar.events")
 
     async def create_event(self, binding: AccountBinding, event: dict[str, Any], *, send_updates: bool) -> str:
         return "error: gogcli calendar writes are not wired yet"
