@@ -581,9 +581,10 @@ def _cmd_google_setup(_args: argparse.Namespace) -> int:
         print(f"{cfg.google.gogcli_bin!r} not found — install gogcli, then re-run.")
         return 1
     account = (getattr(_args, "account", "") or os.environ.get("GOG_ACCOUNT", "")).strip()
-    auth_cmd = [cfg.google.gogcli_bin, "auth", "login"]
-    if account:
-        auth_cmd = [cfg.google.gogcli_bin, "--account", account, "auth", "login"]
+    if not account:
+        print("Set GOG_ACCOUNT or pass `jarvis google-setup --account <email-or-alias>`.")
+        return 1
+    auth_cmd = [cfg.google.gogcli_bin, "auth", "add", account, "--services", "gmail,calendar"]
     print("Launching gogcli auth (a browser window will open)…")
     try:
         code = subprocess.run(auth_cmd).returncode
@@ -1482,7 +1483,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_gsetup.add_argument(
         "--account",
         default="",
-        help="Optional gogcli account alias to authenticate and store in the house bindings.",
+        help="gogcli account email or existing alias to authenticate and store in the house bindings.",
     )
     p_gsetup.set_defaults(func=_cmd_google_setup)
 

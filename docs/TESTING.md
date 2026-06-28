@@ -184,8 +184,8 @@ number resolves to a user via `users/<name>.md` (`whatsapp:` binding).
 ### 3.2 email/calendar tool — needs `gogcli` + OAuth
 ```bash
 # install gogcli, then:
-uv run jarvis google-setup           # browser OAuth for the house account
-# or, for a named gog account:
+uv run jarvis google-setup --account house@example.com
+# or use a gog account alias that already resolves, for example:
 uv run jarvis google-setup --account house
 ```
 The setup command creates private metadata files under
