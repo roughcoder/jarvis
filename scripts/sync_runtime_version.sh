@@ -113,7 +113,14 @@ PY
 if [[ "$COMMIT" -eq 1 ]]; then
   if [[ -n "$(git status --porcelain pyproject.toml src/jarvis/__init__.py uv.lock)" ]]; then
     git add pyproject.toml src/jarvis/__init__.py uv.lock
-    git commit -m "chore(version): sync runtime metadata to $VERSION"
+    git commit \
+      -m "chore(version): sync runtime metadata to $VERSION" \
+      -m "Constraint: release tags must point at committed runtime metadata." \
+      -m "Directive: keep automated version commits out of user-facing release notes." \
+      -m "Confidence: high" \
+      -m "Scope-risk: narrow" \
+      -m "Tested: scripts/sync_runtime_version.sh verified pyproject.toml, src/jarvis/__init__.py, and uv.lock." \
+      -m "Release-note: skip"
     echo "Committed runtime version bump to $VERSION."
   else
     echo "No version metadata changes to commit."

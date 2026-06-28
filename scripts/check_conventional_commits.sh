@@ -40,6 +40,7 @@ for commit in "${commits[@]}"; do
     echo "Invalid commit message format: $commit" >&2
     echo "  $subject" >&2
     echo "Expected conventional commit format: type(scope)?: subject" >&2
+    echo "Optional release trailers: Release-note:, Env:, Breaking Change:" >&2
     exit 3
   fi
 
@@ -51,6 +52,7 @@ for commit in "${commits[@]}"; do
       echo "Invalid commit type '$type' in $commit" >&2
       echo "  $subject" >&2
       echo "Allowed types: feat, fix, chore, docs, style, refactor, test, perf, build, ci, revert" >&2
+      echo "Optional release trailers: Release-note:, Env:, Breaking Change:" >&2
       exit 3
       ;;
   esac

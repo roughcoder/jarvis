@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""Generate Jarvis runtime release notes from commits.
+
+Commit messages are the source of truth. Conventional Commit type/scope gives
+the broad category, while trailers carry user-facing detail:
+
+  Release-note: Added wake-word barge-in tuning to the room intercom.
+  Env: JARVIS_FOO_TIMEOUT added; set to seconds before enabling foo.
+
+If OPENAI_API_KEY and JARVIS_RELEASE_NOTES_MODEL are present, the script asks an
+AI model to rewrite the gathered facts into polished notes. Otherwise it emits a
+deterministic markdown summary from the same facts.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import textwrap
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+CONVENTIONAL_RE = re.compile(
+    r"^(?P<type>[a-z]+)(?:\((?P<scope>[^)]+)\))?(?P<breaking>!)?:\s+(?P<title>.+)$"
+)
+TRAILER_RE = re.compile(r"^(?P<key>[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z0-9-]+)?):\s*(?P<value>.*)$")
+ENV_KEY_RE = re.compile(r"^\s*(?:export\s+)?([A-Z][A-Z0-9_]+)\s*=")
+RELEASABLE_TYPES = {
+    "feat",
+    "fix",
+    "perf",
+    "refactor",
+    "docs",
+    "build",
+    "ci",
+    "chore",
+    "test",
+    "style",
+    "revert",
+}
+DEFAULT_BASE_URL = "https://api.openai.com/v1"
+
+
+@dataclass
+class CommitInfo:
+    sha: str
+    subject: str
+    body: str
+    type: str = "other"
+    scope: str = ""
+    title: str = ""
+    breaking: bool = False
+    trailers: dict[str, list[str]] = field(default_factory=dict)
+
+    @property
+    def release_notes(self) -> list[str]:
+        return [
+            value
+            for value in self.trailers.get("release-note", [])
+            if value.strip().lower() not in {"skip", "none", "n/a", "na"}
+        ]
+
+    @property
+    def env_notes(self) -> list[str]:
+        notes: list[str] = []
+        for key in ("env", "env-change", "env-note"):
+            notes.extend(self.trailers.get(key, []))
+        return notes
+
+    @property
+    def breaking_notes(self) -> list[str]:
+        notes: list[str] = []
+        for key in ("breaking change", "breaking-change"):
+            notes.extend(self.trailers.get(key, []))
+        return notes
+
+
+def run_git(args: list[str], *, check: bool = True) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if check and result.returncode != 0:
+        raise SystemExit(result.stderr.strip() or f"git {' '.join(args)} failed")
+    return result.stdout
+
+
+def latest_semver_tag() -> str:
+    tags = run_git(["tag", "--list", "v[0-9]*.[0-9]*.[0-9]*", "--sort=-v:refname"]).splitlines()
+    return tags[0] if tags else ""
+
+
+def parse_trailers(message: str) -> dict[str, list[str]]:
+    trailers: dict[str, list[str]] = {}
+    for line in message.splitlines()[1:]:
+        match = TRAILER_RE.match(line.strip())
+        if not match:
+            continue
+        key = match.group("key").strip().lower()
+        trailers.setdefault(key, []).append(match.group("value").strip())
+    return trailers
+
+
+def parse_commit(sha: str, message: str) -> CommitInfo:
+    subject = message.splitlines()[0].strip() if message.splitlines() else ""
+    match = CONVENTIONAL_RE.match(subject)
+    info = CommitInfo(sha=sha, subject=subject, body=message, trailers=parse_trailers(message))
+    if match:
+        info.type = match.group("type")
+        info.scope = match.group("scope") or ""
+        info.title = match.group("title").strip()
+        info.breaking = bool(match.group("breaking"))
+    if info.breaking_notes:
+        info.breaking = True
+    return info
+
+
+def load_commits(base_tag: str, head_ref: str) -> list[CommitInfo]:
+    commits: list[CommitInfo] = []
+    commit_range = f"{base_tag}..{head_ref}" if base_tag else head_ref
+    for sha in run_git(["log", "--no-merges", "--format=%H", commit_range]).splitlines():
+        message = run_git(["log", "--format=%B", "-n", "1", sha])
+        commit = parse_commit(sha, message)
+        if commit.subject.startswith("chore(version): sync runtime metadata"):
+            continue
+        commits.append(commit)
+    return commits
+
+
+def env_keys_at(ref: str) -> set[str]:
+    data = run_git(["show", f"{ref}:.env.example"], check=False)
+    return {match.group(1) for line in data.splitlines() if (match := ENV_KEY_RE.match(line))}
+
+
+def env_diff(base_tag: str, head_ref: str) -> dict[str, list[str]]:
+    before = env_keys_at(base_tag) if base_tag else set()
+    after = env_keys_at(head_ref)
+    return {
+        "added": sorted(after - before),
+        "removed": sorted(before - after),
+    }
+
+
+def note_for(commit: CommitInfo) -> str:
+    if commit.release_notes:
+        return "; ".join(commit.release_notes)
+    if commit.title:
+        scope = f"{commit.scope}: " if commit.scope else ""
+        return f"{scope}{commit.title}"
+    return commit.subject
+
+
+def grouped_notes(commits: list[CommitInfo]) -> dict[str, list[str]]:
+    groups = {
+        "features": [],
+        "fixes": [],
+        "performance": [],
+        "other": [],
+        "breaking": [],
+        "env": [],
+    }
+    for commit in commits:
+        if commit.type not in RELEASABLE_TYPES and not commit.release_notes:
+            continue
+        note = note_for(commit)
+        if commit.breaking:
+            detail = "; ".join(commit.breaking_notes) or note
+            groups["breaking"].append(detail)
+        if commit.env_notes:
+            groups["env"].extend(commit.env_notes)
+        if commit.release_notes or commit.type in {"feat", "fix", "perf"}:
+            if commit.type == "feat":
+                groups["features"].append(note)
+            elif commit.type == "fix":
+                groups["fixes"].append(note)
+            elif commit.type == "perf":
+                groups["performance"].append(note)
+            elif commit.release_notes:
+                groups["other"].append(note)
+    return groups
+
+
+def facts_payload(version: str, tag: str, base_tag: str, commits: list[CommitInfo], env_changes: dict[str, list[str]]) -> dict[str, object]:
+    return {
+        "version": version,
+        "tag": tag,
+        "base_tag": base_tag,
+        "summary": grouped_notes(commits),
+        "env_diff": env_changes,
+        "commits": [
+            {
+                "sha": commit.sha[:12],
+                "subject": commit.subject,
+                "type": commit.type,
+                "scope": commit.scope,
+                "release_notes": commit.release_notes,
+                "env_notes": commit.env_notes,
+                "breaking": commit.breaking,
+                "breaking_notes": commit.breaking_notes,
+            }
+            for commit in commits
+        ],
+    }
+
+
+def bullet_lines(items: list[str]) -> list[str]:
+    return [f"- {item}" for item in dict.fromkeys(item for item in items if item.strip())]
+
+
+def deterministic_notes(payload: dict[str, object]) -> str:
+    tag = str(payload["tag"])
+    summary = payload["summary"]
+    assert isinstance(summary, dict)
+    env_changes = payload["env_diff"]
+    assert isinstance(env_changes, dict)
+
+    lines = [
+        f"# Jarvis Runtime {tag}",
+        "",
+        "Local-first Jarvis runtime and service manager.",
+        "",
+    ]
+
+    sections = [
+        ("Breaking Changes", summary.get("breaking", [])),
+        ("Changed", summary.get("features", [])),
+        ("Fixed", summary.get("fixes", [])),
+        ("Performance", summary.get("performance", [])),
+        ("Other Changes", summary.get("other", [])),
+    ]
+    for title, values in sections:
+        bullets = bullet_lines(list(values))
+        if bullets:
+            lines.extend([f"## {title}", "", *bullets, ""])
+
+    env_lines: list[str] = []
+    added = list(env_changes.get("added", []))
+    removed = list(env_changes.get("removed", []))
+    if added:
+        env_lines.append("New env vars: " + ", ".join(f"`{key}`" for key in added) + ".")
+    if removed:
+        env_lines.append("Removed env vars: " + ", ".join(f"`{key}`" for key in removed) + ".")
+    env_lines.extend(list(summary.get("env", [])))
+    lines.extend(["## Environment", ""])
+    lines.extend(bullet_lines(env_lines) or ["- No env changes detected."])
+    lines.append("")
+
+    lines.extend(
+        [
+            "## Install",
+            "",
+            "```bash",
+            "brew tap roughcoder/infinite-stack",
+            "brew install jarvis",
+            "```",
+            "",
+            "## Update",
+            "",
+            "```bash",
+            "brew update",
+            "brew upgrade jarvis",
+            "```",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def ai_enabled(mode: str) -> bool:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    model = os.environ.get("JARVIS_RELEASE_NOTES_MODEL")
+    if mode == "never":
+        return False
+    if mode == "always" and (not api_key or not model):
+        raise SystemExit("AI release notes require OPENAI_API_KEY and JARVIS_RELEASE_NOTES_MODEL.")
+    return bool(api_key and model)
+
+
+def ai_notes(payload: dict[str, object]) -> str:
+    api_key = os.environ["OPENAI_API_KEY"]
+    model = os.environ["JARVIS_RELEASE_NOTES_MODEL"]
+    base_url = os.environ.get("OPENAI_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+    fallback = deterministic_notes(payload)
+    prompt = textwrap.dedent(
+        """
+        Write concise GitHub release notes for Jarvis Runtime from the JSON facts.
+        Use only the facts provided; do not invent features, fixes, dates, or env vars.
+        Required sections, in this order:
+        - H1 title: Jarvis Runtime <tag>
+        - Changed
+        - Fixed
+        - Environment
+        - Install
+        - Update
+        Include Breaking Changes before Changed only when present.
+        Environment must explicitly say whether env vars are new, removed, need changing,
+        or that no env changes were detected.
+        Keep Homebrew install/update commands exactly as provided by the fallback notes.
+        """
+    ).strip()
+    body = json.dumps(
+        {
+            "model": model,
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {"facts": payload, "fallback_notes": fallback},
+                        indent=2,
+                        sort_keys=True,
+                    ),
+                },
+            ],
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    timeout = float(os.environ.get("JARVIS_RELEASE_NOTES_TIMEOUT", "45"))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        content = data["choices"][0]["message"]["content"].strip()
+        if not content:
+            raise ValueError("empty AI release notes response")
+        return content + "\n"
+    except (urllib.error.URLError, KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
+        if os.environ.get("JARVIS_RELEASE_NOTES_AI", "auto").lower() == "always":
+            raise SystemExit(f"AI release notes failed: {exc}") from exc
+        print(f"AI release notes unavailable, using deterministic fallback: {exc}", file=sys.stderr)
+        return fallback
+
+
+def build_notes(version: str, base_tag: str, head_ref: str, ai_mode: str) -> str:
+    tag = f"v{version.lstrip('v')}"
+    commits = load_commits(base_tag, head_ref)
+    payload = facts_payload(version.lstrip("v"), tag, base_tag, commits, env_diff(base_tag, head_ref))
+    if ai_enabled(ai_mode):
+        return ai_notes(payload)
+    return deterministic_notes(payload)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Generate Jarvis runtime release notes.")
+    parser.add_argument("--version", required=True, help="Release version, with or without v prefix.")
+    parser.add_argument("--base-tag", default="", help="Previous vX.Y.Z tag. Defaults to latest SemVer tag.")
+    parser.add_argument("--head", default="HEAD", help="Git ref to release. Defaults to HEAD.")
+    parser.add_argument("--output", required=True, type=Path, help="Markdown output path.")
+    parser.add_argument(
+        "--ai",
+        choices=("auto", "always", "never"),
+        default=os.environ.get("JARVIS_RELEASE_NOTES_AI", "auto").lower(),
+        help="Use AI when configured, require AI, or never use AI.",
+    )
+    args = parser.parse_args()
+    base_tag = args.base_tag or latest_semver_tag()
+    notes = build_notes(args.version, base_tag, args.head, args.ai)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(notes, encoding="utf-8")
+    print(f"Wrote release notes to {args.output} from {base_tag}..{args.head}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

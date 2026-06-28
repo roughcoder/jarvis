@@ -109,7 +109,7 @@ if [[ -n "$(git status --porcelain -- . ':(exclude)dist')" ]]; then
 fi
 
 "$ROOT_DIR/scripts/sync_runtime_check_env.sh"
-uv run ruff check src/ tests/
+uv run ruff check src/ tests/ scripts/generate_release_notes.py
 bash -n scripts/install_mac.sh scripts/uninstall_mac.sh scripts/install_pi.sh scripts/sync_runtime_check_env.sh scripts/verify_public_readiness.sh scripts/release_runtime.sh scripts/update_homebrew_formula.sh
 uv run pytest tests/unit -q
 
@@ -118,25 +118,9 @@ mkdir -p "$DIST_DIR"
 git archive --format=tar.gz --prefix="jarvis-$VERSION/" -o "$ASSET_PATH" HEAD
 shasum -a 256 "$ASSET_PATH" > "$ASSET_PATH.sha256"
 
-cat > "$DIST_DIR/runtime-release-notes.md" <<NOTES
-# Jarvis Runtime $TAG
-
-Local-first Jarvis runtime and service manager.
-
-## Install
-
-\`\`\`bash
-brew tap roughcoder/infinite-stack
-brew install jarvis
-\`\`\`
-
-## Update
-
-\`\`\`bash
-brew update
-brew upgrade jarvis
-\`\`\`
-NOTES
+uv run python scripts/generate_release_notes.py \
+  --version "$VERSION" \
+  --output "$DIST_DIR/runtime-release-notes.md"
 
 if ! git rev-parse "$TAG" >/dev/null 2>&1; then
   git tag -a "$TAG" -m "Release $TAG"
@@ -156,6 +140,10 @@ if gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
     "$ASSET_PATH.sha256" \
     --repo "$REPOSITORY" \
     --clobber
+  gh release edit "$TAG" \
+    --repo "$REPOSITORY" \
+    --title "Jarvis Runtime $TAG" \
+    --notes-file "$DIST_DIR/runtime-release-notes.md"
 else
   gh release create "$TAG" \
     "$ASSET_PATH" \

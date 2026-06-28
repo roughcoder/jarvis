@@ -42,7 +42,7 @@ jobs:
       - name: Sync test environment
         run: scripts/sync_runtime_check_env.sh
       - name: Lint
-        run: uv run ruff check src/ tests/
+        run: uv run ruff check src/ tests/ scripts/generate_release_notes.py
       - name: Unit tests
         run: uv run pytest tests/unit -q
       - name: Installer syntax

@@ -137,6 +137,11 @@ keeps the original single-process behaviour. The think/speak core is shared
 - **All config from env**, via `config.py` (pydantic-settings, one class per
   concern). Add a field there + an `.env.example` line; never hardcode hosts,
   ports, keys, or model names. `jarvis config` must keep working.
+- **Release notes come from commit messages.** Use Conventional Commits for the
+  subject, then add trailers when the change matters to users or operators:
+  `Release-note: <user-facing change>`, `Env: <new/changed/removed env var and
+  action needed>`, and `Breaking Change: <migration impact>`. Use
+  `Release-note: skip` only for mechanical commits such as version metadata.
 - **Lint with `uv run ruff check src/`** before committing. Keep comments at the
   density of the surrounding code; explain *why*, not *what*.
 - **Latency is the product.** Felt speed = STT + time-to-first-token + TTS-start.
