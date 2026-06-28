@@ -110,7 +110,7 @@ Secrets to put in `.env` (gitignored): `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
 | `jarvis whatsapp` | run the WhatsApp connector (bridge wacli ↔ brain, 3b) |
 | `jarvis text [--once MSG]` | text console: drive the brain from the terminal (no mic/STT/TTS); the headless dev + test harness |
 | `jarvis status` | is the brain reachable + what is this device allowed to do? (§3) |
-| `jarvis google-setup` | one-time OAuth for the google tool (gogcli) |
+| `jarvis google-setup` | one-time OAuth for the current house email/calendar adapter (gogcli) |
 | `jarvis jobs [-n N] [--prune]` | list worker jobs (name, status, branch, `codex resume`); `--prune` cleans finished |
 | `jarvis remote-setup` | one-time: create the cloud agent + environment for the (dormant) remote lane |
 | `jarvis mcp` | probe configured MCP servers: discover their tools + the capability each needs |

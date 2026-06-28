@@ -9,16 +9,18 @@
 #   - files.write / worker.code  → no writing files or kicking off coding jobs
 #   - skills.author              → can run skills, not author new ones
 #
-# Personal accounts stay per-identity in ignored user files. google.* here is the
-# shared house account; move it to user files if that is too broad for a fleet.
+# Personal accounts stay per-identity in ignored user files. email.* / calendar.*
+# here are the shared house account; move them to user files if that is too broad
+# for a fleet.
 capabilities:
   - web.search
   - files.read
   - worker.browser
   - background.run
   - alarms.set
-  - google.read
-  - google.send
+  - email.read
+  - email.send
+  - calendar.read
   - profile.write
   - skills.run
   - mcp.context7
@@ -27,11 +29,11 @@ capabilities:
 # whatsapp — the WhatsApp channel
 
 The remote-channel ceiling: it can browse the web, research, run background
-tasks, set alarms, use the house Google account, read workspace files, use
+tasks, set alarms, use the house email/calendar account, read workspace files, use
 public-doc MCP (context7), and remember personal facts. It cannot run shell,
 drive the Mac's screen, write files, or author skills from here.
 
 `worker.browser` and `background.run` need the worker daemon running
 (`jarvis worker`); without it those tools return "worker unreachable" rather than
-acting. `google.*` is Jarvis's own (house) Google account, shared by every paired
-user on this channel — narrow it (move google to user files) if that's too broad.
+acting. `email.*` / `calendar.*` are Jarvis's own house account, shared by every paired
+user on this channel — narrow them (move those grants to user files) if that's too broad.

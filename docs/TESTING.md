@@ -181,13 +181,13 @@ uv run jarvis whatsapp
 number resolves to a user via `users/<name>.md` (`whatsapp:` binding).
 `uv run pytest --run-integration tests/integration/test_whatsapp_live.py` stops skipping.
 
-### 3.2 google tool — needs `gogcli` + OAuth
+### 3.2 email/calendar tool — needs `gogcli` + OAuth
 ```bash
 # install gogcli, then:
 uv run jarvis google-setup           # browser OAuth for the house account
 ```
 **Pass:** ask **"What's on my calendar this week?"** → `upcoming_events` runs (tool log
-`[google.read]`). `send_email` only fires with `google.send` granted.
+`[calendar.read]`). `send_email` only fires with `email.send` granted.
 
 ### 3.3 mac-control — needs peekaboo + permissions
 ```bash

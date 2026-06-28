@@ -107,6 +107,8 @@ Per-step extras install as each build step is reached, e.g.
   GitHub Pages workflow from `main`.
 - **[docs/PUBLIC_RELEASE.md](docs/PUBLIC_RELEASE.md)** — public repository
   readiness gates and required scans.
+- **[docs/HOUSEHOLD_COMMS.md](docs/HOUSEHOLD_COMMS.md)** — provider-neutral
+  household email/calendar permissions, onboarding, and adapter plan.
 - **[docs/PHASE2.md](docs/PHASE2.md)** — the Frankfurt migration spec; the
   readiness test is its entry gate.
 - **[docs/FLEET.md](docs/FLEET.md)** — iMac / laptop / Pi service deployment,

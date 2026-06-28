@@ -163,7 +163,7 @@ filesystem. A tool with no granted capability does not run, single-principal or 
 | `files` | fs-safe pattern (root-bounded read/list/write) | ✅ built |
 | `worker.*` | coding/shell/screenshot dispatch → worker daemon (§8) | ✅ built |
 | `remote.*` | cloud coding → Claude Managed Agents (§8) | ✅ built, dormant |
-| `google` | gogcli — Jarvis's own Gmail + Calendar | ⏸ deferred (OAuth) |
+| `email/calendar` | provider-neutral surface; current adapter is gogcli for Jarvis's house Gmail + Calendar | ✅ built |
 
 **MCP bridge (✅ built):** a native MCP client (`mcp/`, isolation-first — imports
 nothing from the brain) + a profile-gated **work bundle**. Each configured server
@@ -438,8 +438,9 @@ user. The identity stack is not deferred to 3d; only its *multiplicity* is.
     (WhatsApp, the text console) get written prose (`_MESSAGING_FORMAT` — normal
     numerals/dates, light WhatsApp formatting, no [cues]); open-mic end-detection
     is voice-only.
-- ✅ **`google` tool (gogcli / Gmail+Calendar).** `tools/google.py`, gated
-  `google.read` / `google.send`; `jarvis google-setup`. Self-skips without gogcli.
+- ✅ **Email/calendar tool (current adapter: gogcli / Gmail+Calendar).**
+  `tools/google.py`, gated by provider-neutral `email.read`, `email.send`, and
+  `calendar.read`; `jarvis google-setup`. Self-skips without gogcli.
 - ✅ **`mac-control` (peekaboo).** `control_mac` (the autonomous agent) + `look_at_screen`
   (read-only native vision) worker tools gated `worker.gui`; `jarvis worker --doctor`.
   Self-skips without peekaboo + perms. (The earlier atomic see/click/type tools were

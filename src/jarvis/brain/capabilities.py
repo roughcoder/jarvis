@@ -24,7 +24,7 @@ class CapabilityError(PermissionError):
 
 def require(ctx: RequestContext, capability: str) -> None:
     """Gate a capability-bearing action. Raises CapabilityError if not granted."""
-    if capability not in ctx.capabilities:
+    if not ctx.can(capability):
         raise CapabilityError(
             f"capability {capability!r} not granted "
             f"(identity={ctx.identity!r}, device={ctx.device_id!r})"
