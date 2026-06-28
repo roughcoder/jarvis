@@ -49,3 +49,37 @@ def test_empty_args_validated() -> None:
     tools = {t.name: t for t in make_google_tools(GoogleConfig(_env_file=None))}
     assert "need a search query" in asyncio.run(tools["search_email"].handler(_ctx("email.read"), {}))
     assert "recipient" in asyncio.run(tools["send_email"].handler(_ctx("email.send"), {"to": "x"}))
+
+
+def test_gog_invocation_is_noninteractive_and_allowlisted(monkeypatch) -> None:  # noqa: ANN001
+    calls: list[tuple[str, ...]] = []
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"ok", b""
+
+    async def fake_exec(*argv, stdout=None, stderr=None):  # noqa: ANN001
+        calls.append(tuple(argv))
+        return FakeProc()
+
+    monkeypatch.setattr("jarvis.tools.google.shutil.which", lambda _bin: "/usr/bin/gog")
+    monkeypatch.setattr("jarvis.tools.google.asyncio.create_subprocess_exec", fake_exec)
+    tools = {t.name: t for t in make_google_tools(GoogleConfig(_env_file=None, gogcli_bin="gog"))}
+
+    out = asyncio.run(tools["upcoming_events"].handler(_ctx("calendar.read"), {"days": 2}))
+
+    assert out == "ok"
+    assert calls == [
+        (
+            "gog",
+            "--plain",
+            "--no-input",
+            "--enable-commands-exact=calendar.events",
+            "calendar",
+            "events",
+            "--days",
+            "2",
+        )
+    ]

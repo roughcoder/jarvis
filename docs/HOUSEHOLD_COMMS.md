@@ -53,6 +53,13 @@ not raw provider APIs or a large MCP server surface. MCP remains acceptable for
 future providers, but any MCP-backed account must still pass through the same
 domain policy layer.
 
+OpenClaw's `gogcli` is the right first Google adapter rather than a temporary
+hack. It already gives Jarvis the properties this design needs: account aliases,
+stable JSON/plain output, a machine-readable schema, non-interactive execution,
+exact command allow-lists, and safety switches such as blocking Gmail sends.
+Jarvis should keep wrapping it behind the provider-neutral email/calendar tools
+instead of importing Google SDKs directly in the brain.
+
 OpenClaw and Hermes both separate model/provider/runtime concerns from user
 workflows. Jarvis should keep that separation: the model asks for an email or
 calendar action; the account router chooses a principal, provider adapter, and
@@ -196,6 +203,9 @@ class EmailAdapter:
 Provider mappings:
 
 - Google/Gmail/Workspace:
+  - Use `openclaw/gogcli` as the first adapter implementation. Invoke it with
+    non-interactive, stable-output flags and the smallest exact command
+    allow-list for the domain operation being performed.
   - Calendar event writes use Calendar API events with `sendUpdates` when
     attendees must be notified.
   - Mail send should request the narrow Gmail send scope where possible.
@@ -230,7 +240,7 @@ tool names and capabilities should remain provider-neutral.
 ## Implementation Plan
 
 1. Finish the provider-neutral capability rename for the existing house account
-   adapter. Keep `gogcli` as an implementation detail.
+   adapter. Keep `openclaw/gogcli` as the Google implementation detail.
 2. Add an account binding store and parser for user profile binding references.
 3. Add an account policy evaluator that returns `allow`, `draft`, `confirm`, or
    `deny`, with unit tests for every row in the capability matrix.
