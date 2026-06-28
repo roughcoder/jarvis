@@ -280,6 +280,19 @@ def test_cancelled_explicit_mode_exit_updates_connection_state() -> None:
     assert conn["voice_mode"] == DEFAULT_MODE
 
 
+def test_cancelled_marker_parsed_by_finalize_updates_connection_state() -> None:
+    sess = _session(STAY_MODE)
+    conn = {"asserted": "neil", "base_asserted": "", "voice_mode": STAY_MODE}
+    result = TurnResult(raw="Okay. [[VOICE_MODE:default:mode_exit]] [[CONVERSATION:closed:mode_exit]]")
+
+    sess.finalize("exit stay mode", result)
+    BrainServer._apply_cancelled_turn_result("voice", conn, result)
+
+    assert result.close_reason == "mode_exit"
+    assert conn["asserted"] == ""
+    assert conn["voice_mode"] == DEFAULT_MODE
+
+
 def test_turn_result_state_preserves_open_stay_connection() -> None:
     conn = {"asserted": "neil", "base_asserted": "", "voice_mode": DEFAULT_MODE}
     result = TurnResult(ended=False, voice_mode=STAY_MODE)
