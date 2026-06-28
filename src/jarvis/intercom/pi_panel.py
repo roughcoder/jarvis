@@ -267,18 +267,25 @@ class PiPanel:
 def _configure_fullscreen_root(root, *, geometry: str = "") -> None:  # noqa: ANN001
     root.title("Jarvis")
     root.configure(bg="#05070a")
-    # labwc/Xwayland can leave Tk's fullscreen hint decorated with a title bar.
-    # Make the panel borderless but let the compositor choose the output bounds.
-    with suppress(Exception):
-        root.overrideredirect(True)
     if geometry:
         # On multi-output Pi desktops, Tk may report the whole virtual desktop.
         # Let operators pin the panel to the DSI output, e.g. 800x480+0+0.
         with suppress(Exception):
+            root.overrideredirect(True)
+        with suppress(Exception):
             root.geometry(geometry)
     else:
+        # Ask the window manager for fullscreen sizing first. Then make Tk
+        # borderless and pin the window to the reported screen size so
+        # override-redirect sessions do not fall back to a tiny default window.
         with suppress(Exception):
             root.attributes("-fullscreen", True)
+        with suppress(Exception):
+            root.update_idletasks()
+        with suppress(Exception):
+            root.overrideredirect(True)
+        with suppress(Exception):
+            root.geometry(f"{root.winfo_screenwidth()}x{root.winfo_screenheight()}+0+0")
     with suppress(Exception):
         root.lift()
     with suppress(Exception):
