@@ -89,6 +89,34 @@ def test_google_tools_load_house_bindings_from_account_store(tmp_path, monkeypat
     assert calls
 
 
+def test_configured_missing_house_binding_fails_closed(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_exec(*argv, stdout=None, stderr=None):  # noqa: ANN001
+        calls.append(tuple(argv))
+        raise AssertionError("provider should not run")
+
+    monkeypatch.setattr("jarvis.brain.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
+    monkeypatch.setattr("jarvis.brain.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    reg = build_registry(
+        ToolsConfig(_env_file=None),
+        google=GoogleConfig(_env_file=None, gogcli_bin="gog"),
+        accounts=AccountConfig(_env_file=None, bindings_dir=str(tmp_path / ".accounts")),
+    )
+
+    out = asyncio.run(
+        reg.execute(
+            _ctx("email.send"),
+            "send_email",
+            {"to": "family@example.invalid", "subject": "Hi", "body": "Hello"},
+            timeout_s=2,
+        )
+    )
+
+    assert "account policy denied" in out
+    assert calls == []
+
+
 def test_missing_binary_reports_not_set_up() -> None:
     cfg = GoogleConfig(_env_file=None, gogcli_bin="gogcli-does-not-exist")
     tools = {t.name: t for t in make_google_tools(cfg)}
