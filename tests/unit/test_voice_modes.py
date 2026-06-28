@@ -115,6 +115,19 @@ def test_default_mode_stays_open_on_explicit_open_marker() -> None:
     assert result.voice_mode == DEFAULT_MODE
 
 
+def test_signoff_closes_even_when_model_marks_open() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(raw="No problem. [[CONVERSATION:open:followup_expected]]")
+
+    sess.finalize("no thanks, that's all", result)
+
+    assert result.reply == "No problem."
+    assert result.ended is True
+    assert result.continue_listening is False
+    assert result.close_reason == "user_closed"
+    assert result.voice_mode == DEFAULT_MODE
+
+
 def test_stay_mode_keeps_listening_after_short_answer() -> None:
     sess = _session(STAY_MODE)
     result = TurnResult(raw="Yep, it's sunny.")
@@ -234,3 +247,14 @@ def test_voice_conversation_reset_clears_temporary_identity_and_mode() -> None:
 
     assert conn["asserted"] == ""
     assert conn["voice_mode"] == DEFAULT_MODE
+
+
+def test_alarm_ack_preserves_stay_mode() -> None:
+    conn = {"voice_mode": STAY_MODE}
+
+    end = BrainServer._alarm_ack_reply_end("t1", "voice", conn)
+
+    assert end.ended is False
+    assert end.continue_listening is True
+    assert end.voice_mode == STAY_MODE
+    assert end.close_reason == "alarm_ack"

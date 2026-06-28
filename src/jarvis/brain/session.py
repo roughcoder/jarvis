@@ -357,7 +357,7 @@ class BrainSession:
                 result.continue_listening = False
                 result.close_reason = "task_complete"
                 mode = DEFAULT_MODE
-            elif control.conversation == "open":
+            elif control.conversation == "open" and not explicit_close:
                 result.ended = False
                 result.continue_listening = True
                 result.close_reason = control.reason or "followup_expected"
@@ -365,7 +365,7 @@ class BrainSession:
                 result.ended = True
                 result.continue_listening = False
                 if explicit_close or should_soft_close_default(user_text):
-                    result.close_reason = control.reason or "user_closed"
+                    result.close_reason = "user_closed" if explicit_close else control.reason or "user_closed"
                 else:
                     result.close_reason = control.reason or "default_complete"
                 mode = DEFAULT_MODE
