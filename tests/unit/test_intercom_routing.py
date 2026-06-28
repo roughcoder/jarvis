@@ -42,6 +42,14 @@ class _WS:
         self.sent.append(item)
 
 
+class _Mic:
+    def __init__(self) -> None:
+        self.drained = 0
+
+    def drain(self) -> None:
+        self.drained += 1
+
+
 def _client() -> IntercomClient:
     return IntercomClient(
         load_config(), audio=_Stub(), vad=_Stub(), wake=_Stub(), hardware=_Hardware()
@@ -57,6 +65,31 @@ def test_take_proactive_spots_a_proactive_else_none() -> None:
     assert got is not None and got.text == "tea's ready" and got.open_mic is True
     q.put_nowait(ReplyText(turn_id="x", text="stray"))
     assert c._take_proactive(q) is None  # a stray non-proactive while idle is dropped
+
+
+def test_stay_mode_can_play_queued_proactive_between_silence_windows() -> None:
+    c = _client()
+    q: asyncio.Queue = asyncio.Queue()
+    ws = _WS()
+    mic = _Mic()
+    seen: list[str] = []
+    q.put_nowait(Proactive(text="alarm", turn_id="pa-1", open_mic=True))
+
+    async def fake_play(ws_arg, mic_arg, inbound_arg, pro):  # noqa: ANN001
+        assert ws_arg is ws
+        assert mic_arg is mic
+        assert inbound_arg is q
+        seen.append(pro.text)
+
+    c._play_proactive = fake_play  # type: ignore[method-assign]
+
+    async def go() -> bool:
+        return await c._play_queued_proactive(ws, mic, q)
+
+    assert asyncio.run(go()) is True
+    assert seen == ["alarm"]
+    assert mic.drained == 1
+    assert asyncio.run(go()) is False
 
 
 def test_reply_audio_yields_pcm_and_records_state() -> None:
