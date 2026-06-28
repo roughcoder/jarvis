@@ -33,7 +33,7 @@ class FakeRoot:
         self.calls.append(("focus_force", args, kwargs))
 
 
-def test_pi_panel_window_is_borderless_and_screen_sized() -> None:
+def test_pi_panel_window_is_borderless_and_fullscreen_by_default() -> None:
     root = FakeRoot()
 
     _configure_fullscreen_root(root)
@@ -43,3 +43,13 @@ def test_pi_panel_window_is_borderless_and_screen_sized() -> None:
     assert ("overrideredirect", (True,), {}) in root.calls
     assert ("attributes", ("-fullscreen", True), {}) in root.calls
     assert not any(call[0] == "geometry" for call in root.calls)
+
+
+def test_pi_panel_window_can_pin_geometry_for_dsi_panel() -> None:
+    root = FakeRoot()
+
+    _configure_fullscreen_root(root, geometry="800x480+0+0")
+
+    assert ("overrideredirect", (True,), {}) in root.calls
+    assert ("geometry", ("800x480+0+0",), {}) in root.calls
+    assert not any(call[0] == "attributes" for call in root.calls)

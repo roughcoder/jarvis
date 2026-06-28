@@ -80,7 +80,7 @@ class PiPanel:
         except Exception as exc:  # noqa: BLE001
             print(f"  [pi-panel] couldn't open display: {exc}")
             return
-        _configure_fullscreen_root(root)
+        _configure_fullscreen_root(root, geometry=self._cfg.pi_panel_geometry)
         canvas = tk.Canvas(root, bg="#05070a", highlightthickness=0)
         canvas.pack(fill="both", expand=True)
 
@@ -264,15 +264,21 @@ class PiPanel:
             self._stop.set()
 
 
-def _configure_fullscreen_root(root) -> None:  # noqa: ANN001
+def _configure_fullscreen_root(root, *, geometry: str = "") -> None:  # noqa: ANN001
     root.title("Jarvis")
     root.configure(bg="#05070a")
     # labwc/Xwayland can leave Tk's fullscreen hint decorated with a title bar.
     # Make the panel borderless but let the compositor choose the output bounds.
     with suppress(Exception):
         root.overrideredirect(True)
-    with suppress(Exception):
-        root.attributes("-fullscreen", True)
+    if geometry:
+        # On multi-output Pi desktops, Tk may report the whole virtual desktop.
+        # Let operators pin the panel to the DSI output, e.g. 800x480+0+0.
+        with suppress(Exception):
+            root.geometry(geometry)
+    else:
+        with suppress(Exception):
+            root.attributes("-fullscreen", True)
     with suppress(Exception):
         root.lift()
     with suppress(Exception):

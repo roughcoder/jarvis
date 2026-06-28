@@ -99,6 +99,8 @@ For mini screens, set:
 ```bash
 INTERCOM_DEVICE_PI_PANEL=auto
 INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S=25
+# Optional on multi-output desktop sessions, for example Pironman DSI + HDMI:
+INTERCOM_DEVICE_PI_PANEL_GEOMETRY=800x480+0+0
 ```
 
 When a display session is available, the intercom starts PiPanel: a small
@@ -108,7 +110,9 @@ while listening, shifts while thinking, and animates while Jarvis speaks. Tappin
 the screen rotates through `EyesView`, status, camera, and debug views;
 long-press returns to the eyes. The camera view shows local camera readiness and
 can run a bounded test capture on the Pi without exposing any provider keys on
-the device. Pis without a display simply do not advertise `display` and do not
+the device. `INTERCOM_DEVICE_PI_PANEL_GEOMETRY` pins the panel to a specific
+Tk geometry when a compositor exposes the Pi screen and HDMI as one virtual
+desktop. Pis without a display simply do not advertise `display` and do not
 start the panel.
 
 Existing installs using `INTERCOM_DEVICE_EYES` and
