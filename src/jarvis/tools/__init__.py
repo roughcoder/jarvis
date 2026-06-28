@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from jarvis.config import (
     BrowserConfig,
+    AccountConfig,
     CapabilityConfig,
     GoogleConfig,
     RemoteConfig,
@@ -39,6 +40,7 @@ def build_registry(
     worker: WorkerConfig | None = None,
     remote: RemoteConfig | None = None,
     google: GoogleConfig | None = None,
+    accounts: AccountConfig | None = None,
     browser: BrowserConfig | None = None,
     capabilities: CapabilityConfig | None = None,
     memory: MemoryClient | None = None,
@@ -70,7 +72,7 @@ def build_registry(
         for tool in make_remote_tools(remote):
             reg.register(tool)
     if google is not None:
-        for tool in make_google_tools(google):
+        for tool in make_google_tools(google, accounts=accounts):
             reg.register(tool)
     for tool in mcp or []:
         reg.register(tool)

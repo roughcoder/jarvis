@@ -270,6 +270,8 @@ class AccountConfig(_Base):
 
     bindings_dir: str = "jarvis-workspace/.accounts"
     audit_path: str = "jarvis-workspace/.accounts/audit.jsonl"
+    house_email_binding: str = "house-email"
+    house_calendar_binding: str = "house-calendar"
 
 
 class ToolsConfig(_Base):
@@ -769,6 +771,8 @@ class Config:
             ),
             "accounts.bindings_dir": self.accounts.bindings_dir,
             "accounts.audit_path": self.accounts.audit_path,
+            "accounts.house_email_binding": self.accounts.house_email_binding,
+            "accounts.house_calendar_binding": self.accounts.house_calendar_binding,
             "tools.files_root": self.tools.files_root,
             "tools.websearch_provider": self.tools.websearch_provider,
             "tools.websearch_api_key": mask(self.tools.websearch_api_key),

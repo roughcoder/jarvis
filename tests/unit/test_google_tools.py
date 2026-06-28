@@ -9,7 +9,7 @@ from jarvis.brain.account_router import AccountRouter
 from jarvis.brain.accounts import AccountBinding
 from jarvis.brain.identity import HOUSE
 from jarvis.brain.context import RequestContext
-from jarvis.config import GoogleConfig, ToolsConfig
+from jarvis.config import AccountConfig, GoogleConfig, ToolsConfig
 from jarvis.tools import build_registry
 from jarvis.tools.google import make_google_tools
 
@@ -46,6 +46,47 @@ def test_google_tools_registered_and_gated() -> None:
     assert "upcoming_events" in calendar_read
     assert "send_email" not in email_read  # send is the separate email.send capability
     assert "send_email" in {t.name for t in reg.available_for(_ctx("email.send"))}
+
+
+def test_google_tools_load_house_bindings_from_account_store(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    calls: list[tuple[str, ...]] = []
+
+    class FakeProc:
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"sent", b""
+
+    async def fake_exec(*argv, stdout=None, stderr=None):  # noqa: ANN001
+        calls.append(tuple(argv))
+        return FakeProc()
+
+    store = tmp_path / ".accounts" / HOUSE
+    store.mkdir(parents=True)
+    (store / "house-email.json").write_text(
+        (
+            '{"kind":"email","provider":"gogcli","grants":["email.send"],'
+            '"household_recipients":["family@example.invalid"]}'
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("jarvis.brain.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
+    monkeypatch.setattr("jarvis.brain.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    reg = build_registry(
+        ToolsConfig(_env_file=None),
+        google=GoogleConfig(_env_file=None, gogcli_bin="gog"),
+        accounts=AccountConfig(_env_file=None, bindings_dir=str(tmp_path / ".accounts")),
+    )
+
+    out = asyncio.run(
+        reg.execute(
+            _ctx("email.send"),
+            "send_email",
+            {"to": "family@example.invalid", "subject": "Hi", "body": "Hello"},
+            timeout_s=2,
+        )
+    )
+
+    assert out == "sent"
+    assert calls
 
 
 def test_missing_binary_reports_not_set_up() -> None:
