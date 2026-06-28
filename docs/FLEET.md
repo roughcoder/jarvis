@@ -260,6 +260,8 @@ INTERCOM_DEVICE_CAMERA_TIMEOUT_S=8
 INTERCOM_DEVICE_CAMERA_WARMUP_MS=300
 INTERCOM_DEVICE_PI_PANEL=auto
 INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S=25
+# Pin PiPanel to the 4.3-inch Pironman DSI panel if HDMI is also active.
+INTERCOM_DEVICE_PI_PANEL_GEOMETRY=800x480+0+0
 ```
 
 Brain Mac:
@@ -325,9 +327,11 @@ Pi screens are optional hardware. The SunFounder Pironman 5 Pro Max screen is a
 4.3-inch 800x480 MIPI DSI touch display. Keep `INTERCOM_DEVICE_PI_PANEL=auto`
 until the systemd service has a real display session (`DISPLAY` or
 `WAYLAND_DISPLAY`); forcing PiPanel on a headless unit can make the UI probe
-fail. Grant `intercom.display` only on profiles for Pis that actually have a
-working screen. Existing `INTERCOM_DEVICE_EYES` values remain supported as
-legacy aliases.
+fail. If HDMI is also active, set
+`INTERCOM_DEVICE_PI_PANEL_GEOMETRY=800x480+0+0` so the panel does not size itself
+against the combined virtual desktop. Grant `intercom.display` only on profiles
+for Pis that actually have a working screen. Existing `INTERCOM_DEVICE_EYES`
+values remain supported as legacy aliases.
 
 Post-update smoke:
 

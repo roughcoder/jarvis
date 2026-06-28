@@ -57,16 +57,19 @@ def test_pi_panel_env_names_configure_panel(monkeypatch) -> None:
         monkeypatch,
         "INTERCOM_DEVICE_PI_PANEL",
         "INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S",
+        "INTERCOM_DEVICE_PI_PANEL_GEOMETRY",
         "INTERCOM_DEVICE_EYES",
         "INTERCOM_DEVICE_EYES_SLEEP_AFTER_S",
     )
     monkeypatch.setenv("INTERCOM_DEVICE_PI_PANEL", "true")
     monkeypatch.setenv("INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S", "12")
+    monkeypatch.setenv("INTERCOM_DEVICE_PI_PANEL_GEOMETRY", "800x480+0+0")
 
     c = IntercomDeviceConfig(_env_file=None)
 
     assert c.pi_panel_setting == "true"
     assert c.pi_panel_sleep_s == 12.0
+    assert c.pi_panel_geometry == "800x480+0+0"
 
 
 def test_legacy_eyes_env_still_configures_pi_panel(monkeypatch) -> None:
@@ -74,6 +77,7 @@ def test_legacy_eyes_env_still_configures_pi_panel(monkeypatch) -> None:
         monkeypatch,
         "INTERCOM_DEVICE_PI_PANEL",
         "INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S",
+        "INTERCOM_DEVICE_PI_PANEL_GEOMETRY",
         "INTERCOM_DEVICE_EYES",
         "INTERCOM_DEVICE_EYES_SLEEP_AFTER_S",
     )
