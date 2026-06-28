@@ -196,7 +196,10 @@ class TurnLoop:
                 print("  (nothing said)")
                 return
             trace = self._tracer.turn(
-                room=self._cfg.gateway.room, speaker=self._asserted or "house"
+                room=self._cfg.gateway.room,
+                speaker=self._asserted or "house",
+                channel="voice",
+                device_id=self._cfg.capabilities.device_id,
             )
             secs = len(pcm) / 2 / self._sr
             trace.start("stt")
@@ -212,7 +215,13 @@ class TurnLoop:
             ctx = self._resolve(text)
             if ctx.confidence == "claimed" and ctx.identity != HOUSE:
                 self._asserted = ctx.identity
-            trace.set(speaker=ctx.identity)
+            trace.set(
+                speaker=ctx.identity,
+                channel=ctx.channel,
+                device_id=ctx.device_id,
+                scope=ctx.scope,
+                confidence=ctx.confidence,
+            )
             session = self._store.get(ctx)
 
             # THINKING/SPEAKING — the session does the work (hot path reads the

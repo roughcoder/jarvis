@@ -321,6 +321,9 @@ class BrainConfig(_Base):
     # No-token auth is open (dev/local). On a NON-loopback bind that's unauthenticated
     # network access, so the brain refuses to start unless a token is set OR this is on.
     allow_insecure: bool = False
+    # Intercoms send captured utterances as JSON/base64 PCM. Long utterances can exceed
+    # websockets' 1 MiB default frame cap, so keep the server receive limit explicit.
+    websocket_max_size: int = 8 * 1024 * 1024
 
 
 class IntercomConfig(_Base):
@@ -338,6 +341,28 @@ class IntercomConfig(_Base):
     @property
     def brain_url(self) -> str:
         return f"ws://{self.brain_host}:{self.brain_port}"
+
+
+class IntercomDeviceConfig(_Base):
+    """Optional local hardware on a thin intercom.
+
+    These are resources on the edge device, not authority grants. The brain only
+    exposes matching tools when the device profile grants the capability AND the
+    intercom advertises live hardware at pairing.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="INTERCOM_DEVICE_", env_file=".env", extra="ignore")
+
+    # "auto" probes the Pi camera stack; "true"/"false" force advertisement.
+    camera: str = "auto"
+    camera_bin: str = ""  # explicit rpicam-still/libcamera-still path; empty => probe PATH
+    camera_width: int = 1280
+    camera_height: int = 720
+    camera_timeout_s: float = 8.0
+    camera_warmup_ms: int = 300
+    # "auto" starts the eyes UI only when a display session is available.
+    eyes: str = "auto"
+    eyes_sleep_after_s: float = 25.0
 
 
 class WorkerConfig(_Base):
@@ -643,6 +668,7 @@ class Config:
         self.tools = ToolsConfig(**source)
         self.brain = BrainConfig(**source)
         self.intercom = IntercomConfig(**source)
+        self.intercom_device = IntercomDeviceConfig(**source)
         self.worker = WorkerConfig(**source)
         self.remote = RemoteConfig(**source)
         self.mcp = MCPConfig(**source)
@@ -716,12 +742,16 @@ class Config:
             "brain.host": self.brain.host,
             "brain.port": self.brain.port,
             "brain.pairing_token": mask(self.brain.pairing_token),
+            "brain.websocket_max_size": self.brain.websocket_max_size,
             "brain.devices": (
                 ", ".join(f"{d.device_id}->{d.identity or 'house'}" for d in self.brain.devices)
                 or "<none — shared token>"
             ),
             "intercom.brain_url": self.intercom.brain_url,
             "intercom.token": mask(self.intercom.token),
+            "intercom_device.camera": self.intercom_device.camera,
+            "intercom_device.camera_bin": self.intercom_device.camera_bin or "<auto>",
+            "intercom_device.eyes": self.intercom_device.eyes,
             "worker.base_url": self.worker.base_url,
             "worker.token": mask(self.worker.token),
             "worker.agent": self.worker.agent,

@@ -5,15 +5,15 @@ Language-neutral message schemas so a Python intercom (now) and a native client
 with a `type` discriminator; audio PCM travels base64-encoded inside them (simple
 and uniform for 3a — a binary-frame fast path is a later optimisation).
 
-  up   (intercom -> brain): Hello, Utterance, BargeIn, TextIn
+  up   (intercom -> brain): Hello, Utterance, BargeIn, TextIn, DeviceResponse
   down (brain -> intercom): Welcome / Reject, ReplyAudio, ReplyText, ReplyEnd,
-                            Cancel, Proactive
+                            Cancel, Proactive, DeviceRequest
 """
 
 from __future__ import annotations
 
 import base64
-from typing import Annotated, Literal, Union
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, Field, TypeAdapter
 
@@ -31,6 +31,10 @@ class Hello(BaseModel):
     # confirmed). `channel` distinguishes voice/whatsapp/etc. for the resolver.
     identity: str = ""
     channel: str = "voice"
+    # Live resources on the intercom, e.g. ["camera", "display"]. These do not
+    # grant authority by themselves; the brain intersects them with the device
+    # profile before exposing tools.
+    hardware: list[str] = Field(default_factory=list)
 
 
 class Identify(BaseModel):
@@ -68,6 +72,20 @@ class TextIn(BaseModel):
     # A text client (the terminal console, scripted tests) wants ReplyText only —
     # the brain skips TTS for the turn, so no audio stack / TTS key is needed.
     text_only: bool = False
+
+
+class DeviceResponse(BaseModel):
+    """Up: response to a bounded device-local action requested by the brain.
+
+    Result payloads are action-specific. For `capture_photo`, result contains
+    `image_b64`, `mime_type`, and optional capture metadata.
+    """
+
+    type: Literal["device_response"] = "device_response"
+    request_id: str
+    ok: bool
+    result: dict[str, Any] = Field(default_factory=dict)
+    error: str = ""
 
 
 # --- down: brain -> intercom -----------------------------------------------
@@ -148,10 +166,19 @@ class WhoAreYou(BaseModel):
     prompt: str = "Who am I talking to?"
 
 
+class DeviceRequest(BaseModel):
+    """Down: ask the intercom to perform a tightly-scoped local hardware action."""
+
+    type: Literal["device_request"] = "device_request"
+    request_id: str
+    action: str
+    args: dict[str, Any] = Field(default_factory=dict)
+
+
 Message = Union[
-    Hello, Utterance, BargeIn, TextIn, Identify,
+    Hello, Utterance, BargeIn, TextIn, Identify, DeviceResponse,
     Welcome, Reject, ReplyAudio, ReplyText, ReplyEnd, Cancel, Proactive, WhoAreYou,
-    Transcript,
+    Transcript, DeviceRequest,
 ]
 _ADAPTER: TypeAdapter = TypeAdapter(Annotated[Message, Field(discriminator="type")])
 

@@ -23,6 +23,25 @@ copies the release-pinned Pi installer command.
 mcp.context7). A shared device stays **house** scope until a speaker confirms who
 they are by voice ("it's Jules") — then that conversation gets their personal scope.
 
+For multiple Pis, give each physical unit its own device id and profile file, for
+example `profiles/kitchen-pi.md` and `profiles/hallway-pi.md`. Grant optional
+hardware only on the Pis that actually have it:
+
+```yaml
+---
+capabilities:
+  - web.search
+  - files.read
+  - intercom.camera   # enables take_photo when this Pi advertises a camera
+  - intercom.display  # enables the local eyes UI when this Pi has a screen
+---
+```
+
+The grant alone is not enough: at pairing the intercom also advertises live
+hardware (`camera`, `display`). The brain exposes `take_photo` only when both
+the profile grants `intercom.camera` and that connected device advertised a
+camera. That keeps Pis without cameras from seeing camera tools.
+
 Run the brain through the app Setup window or `jarvis service start brain`.
 
 ## On the Pi
@@ -58,6 +77,34 @@ pull the full PyTorch/Silero stack.
 The service starts immediately after the token-bound `.env` file is written.
 If the brain has not yet been given the matching `BRAIN_DEVICES` entry, the
 service will keep restarting until the brain accepts the device.
+
+### Camera and eyes
+
+Camera capture uses the Raspberry Pi camera tools on the intercom itself:
+`rpicam-still` first, then legacy `libcamera-still`. Configure it with:
+
+```bash
+INTERCOM_DEVICE_CAMERA=auto
+INTERCOM_DEVICE_CAMERA_WIDTH=1280
+INTERCOM_DEVICE_CAMERA_HEIGHT=720
+```
+
+With `intercom.camera` in that Pi's profile, a prompt such as "Hey Jarvis, what
+am I holding?" lets the brain call `take_photo`; the Pi returns a JPEG over the
+WebSocket and Jarvis answers with the configured vision model. No photo provider
+keys live on the Pi.
+
+For mini screens, set:
+
+```bash
+INTERCOM_DEVICE_EYES=auto
+INTERCOM_DEVICE_EYES_SLEEP_AFTER_S=25
+```
+
+When a display session is available, the intercom starts a small full-screen eyes
+renderer. The eyes idle, close after the sleep timeout, open on "Hey Jarvis",
+focus while listening, shift while thinking, and animate while Jarvis speaks.
+Pis without a display simply do not advertise `display` and do not start the UI.
 
 ## Updating and checking the Pi
 

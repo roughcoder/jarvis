@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import pathlib
+import time
 from collections.abc import Awaitable, Callable
 
 from jarvis.config import Config, HeartbeatConfig
@@ -41,9 +42,12 @@ def is_silent(text: str, sentinel: str) -> bool:
 def make_heartbeat_think(cfg: Config) -> Callable[[], Awaitable[str]]:
     """The default `think`: read HEARTBEAT.md and ask the model whether anything is
     worth saying (returns the sentinel when not). Built around the gateway client."""
-    from jarvis.brain.gateway_client import GatewayClient
+    from jarvis.brain.gateway_client import GatewayClient, LLMAttribution
 
     gateway = GatewayClient(cfg.gateway)
+    heartbeat_gateway = gateway.with_attribution(
+        LLMAttribution(kind="heartbeat", channel="system", speaker="heartbeat")
+    )
 
     async def think() -> str:
         path = pathlib.Path(cfg.heartbeat.path)
@@ -54,7 +58,7 @@ def make_heartbeat_think(cfg: Config) -> Callable[[], Awaitable[str]]:
             {"role": "system", "content": _HEARTBEAT_PROMPT.format(sentinel=cfg.heartbeat.sentinel)},
             {"role": "user", "content": checklist},
         ]
-        return await gateway.complete(messages, model=cfg.gateway.fast_model)
+        return await heartbeat_gateway.complete(messages, model=cfg.gateway.fast_model)
 
     return think
 
@@ -66,15 +70,35 @@ class HeartbeatScheduler:
         *,
         think: Callable[[], Awaitable[str]],
         broadcast: Callable[[str], Awaitable[None]],
+        tracer=None,  # noqa: ANN001 - optional Tracer; heartbeat stays pure in tests
+        room: str = "",
     ) -> None:
         self._cfg = cfg
         self._think = think
         self._broadcast = broadcast
+        self._tracer = tracer
+        self._room = room
 
     async def tick(self) -> str | None:
         """Run one check; broadcast + return the message if meaningful, else None."""
+        t0 = time.perf_counter()
         text = await self._think()
-        if is_silent(text, self._cfg.sentinel):
+        silent = is_silent(text, self._cfg.sentinel)
+        if self._tracer is not None:
+            trace = self._tracer.turn(
+                room=self._room,
+                speaker="heartbeat",
+                channel="system",
+                kind="heartbeat",
+            )
+            trace.stage(
+                "llm",
+                (time.perf_counter() - t0) * 1000,
+                emitted=not silent,
+                chars=len((text or "").strip()),
+            )
+            self._tracer.emit(trace)
+        if silent:
             return None
         await self._broadcast(text.strip())
         return text.strip()

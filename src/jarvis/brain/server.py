@@ -34,6 +34,8 @@ from jarvis.mcp import MCPBridge
 from jarvis.protocol.messages import (
     BargeIn,
     Cancel,
+    DeviceRequest,
+    DeviceResponse,
     Hello,
     Identify,
     Proactive,
@@ -53,6 +55,7 @@ from jarvis.services.tts import InworldTTS
 from jarvis.tools import build_registry
 from jarvis.tools.alarm import make_alarm_tools
 from jarvis.tools.background import make_background_tool
+from jarvis.tools.intercom import make_intercom_tools
 from jarvis.tools.mcp import make_mcp_tools
 from jarvis.tools.selection import build_relevance
 
@@ -66,6 +69,11 @@ _ALARM_ACK = re.compile(
     r"got it|okay|ok|alright|thanks)\b",
     re.IGNORECASE,
 )
+
+_HARDWARE_CAPS = {
+    "intercom.camera": "camera",
+    "intercom.display": "display",
+}
 
 
 def _is_alarm_ack(text: str) -> bool:
@@ -145,6 +153,7 @@ class BrainServer:
         # device so an alarm/notification can be routed to the device that set it.
         self._connections: set = set()
         self._device_conns: dict[str, set] = {}
+        self._conn_meta: dict = {}
         # Idle-aware notification timing: devices mid-turn, and notifications held until
         # the gap (busy clears / quiet hours end). Alarms bypass this.
         self._busy: set[str] = set()
@@ -156,6 +165,8 @@ class BrainServer:
         )
         if cfg.background.enabled:
             self._registry.register(make_background_tool(self._background))
+        for tool in make_intercom_tools(self._request_device_action):
+            self._registry.register(tool)
         # Alarms & timers: the scheduler fires rings on the device that set them.
         self._scheduler = Scheduler()
         if cfg.alarm.enabled:
@@ -201,13 +212,17 @@ class BrainServer:
         heartbeat: asyncio.Task | None = None
         alarms: asyncio.Task | None = None
         try:
-            async with websockets.serve(self._handle, host, port):
+            async with websockets.serve(
+                self._handle, host, port, max_size=self._cfg.brain.websocket_max_size
+            ):
                 print(f"Brain listening on ws://{host}:{port}")
                 if self._cfg.heartbeat.enabled:
                     sched = HeartbeatScheduler(
                         self._cfg.heartbeat,
                         think=make_heartbeat_think(self._cfg),
                         broadcast=self._broadcast,
+                        tracer=self._tracer,
+                        room=self._cfg.gateway.room,
                     )
                     heartbeat = asyncio.create_task(sched.run())
                     print(f"Heartbeat on (every {self._cfg.heartbeat.interval_s:.0f}s).")
@@ -373,7 +388,13 @@ class BrainServer:
         return authorise_device(self._cfg.brain, hello.device_id, hello.token)
 
     def _resolve(
-        self, device_id: str, channel: str, asserted: str, utterance: str, device_default: str = HOUSE
+        self,
+        device_id: str,
+        channel: str,
+        asserted: str,
+        utterance: str,
+        device_default: str = HOUSE,
+        hardware: set[str] | None = None,
     ) -> RequestContext:
         """Resolve who's speaking for this device/channel/utterance (§5) and build
         the per-utterance RequestContext (device profile + the speaker's grants)."""
@@ -383,7 +404,16 @@ class BrainServer:
         )
         caps_cfg = self._cfg.capabilities.model_copy(update={"device_id": device_id})
         ctx = context_for_resolution(caps_cfg, resolution)
+        ctx = self._with_live_hardware(ctx, hardware or set())
         return dataclasses.replace(ctx, channel=channel)
+
+    @staticmethod
+    def _with_live_hardware(ctx: RequestContext, hardware: set[str]) -> RequestContext:
+        caps = set(ctx.capabilities)
+        for cap, required_hardware in _HARDWARE_CAPS.items():
+            if cap in caps and required_hardware not in hardware:
+                caps.remove(cap)
+        return dataclasses.replace(ctx, capabilities=frozenset(caps))
 
     async def _handle(self, ws) -> None:  # noqa: ANN001
         try:
@@ -406,8 +436,16 @@ class BrainServer:
         # of the conversation. Re-resolved per utterance (claims need the transcript).
         # `device_default` is the device's pinned principal (a personal device) — used
         # only when nobody is otherwise identified.
-        conn = {"asserted": first.identity, "device_default": device_default or HOUSE}
-        base = self._resolve(device_id, channel, conn["asserted"], "", conn["device_default"])
+        hardware = {h.strip().lower() for h in first.hardware if h.strip()}
+        conn = {
+            "asserted": first.identity,
+            "device_default": device_default or HOUSE,
+            "hardware": hardware,
+            "waiters": {},
+        }
+        base = self._resolve(
+            device_id, channel, conn["asserted"], "", conn["device_default"], hardware
+        )
         await ws.send(
             encode(
                 Welcome(
@@ -415,10 +453,15 @@ class BrainServer:
                 )
             )
         )
-        print(f"intercom paired: device={device_id} channel={channel} identity={base.identity}")
+        hw = ",".join(sorted(hardware)) or "none"
+        print(
+            f"intercom paired: device={device_id} channel={channel} "
+            f"identity={base.identity} hardware={hw}"
+        )
 
         self._connections.add(ws)  # eligible for proactive heartbeat push
         self._device_conns.setdefault(device_id, set()).add(ws)  # for device-routed alarms
+        self._conn_meta[ws] = conn
         turn: asyncio.Task | None = None
         try:
             async for raw in ws:
@@ -432,12 +475,20 @@ class BrainServer:
                 elif isinstance(msg, Identify):
                     if msg.identity:  # explicit claim from a non-voice client
                         conn["asserted"] = msg.identity
+                elif isinstance(msg, DeviceResponse):
+                    fut = conn["waiters"].pop(msg.request_id, None)
+                    if fut is not None and not fut.done():
+                        fut.set_result(msg)
                 elif isinstance(msg, BargeIn):
                     turn = await self._cancel(turn)
                     with contextlib.suppress(Exception):
                         await ws.send(encode(Cancel(turn_id=msg.turn_id)))
         finally:
             self._connections.discard(ws)
+            self._conn_meta.pop(ws, None)
+            for fut in list(conn.get("waiters", {}).values()):
+                if not fut.done():
+                    fut.set_exception(ConnectionError("intercom disconnected"))
             conns = self._device_conns.get(device_id)
             if conns is not None:
                 conns.discard(ws)
@@ -494,11 +545,24 @@ class BrainServer:
         # Resolve WHO this utterance is from (claim detection needs the transcript),
         # then route to that principal's session. A spoken claim sticks for the rest
         # of the conversation.
-        ctx = self._resolve(device_id, channel, conn["asserted"], text, conn["device_default"])
+        ctx = self._resolve(
+            device_id,
+            channel,
+            conn["asserted"],
+            text,
+            conn["device_default"],
+            conn.get("hardware", set()),
+        )
         if ctx.confidence == "claimed" and ctx.identity != HOUSE:
             conn["asserted"] = ctx.identity
         session = self._contexts.get(ctx)
-        trace = self._tracer.turn(room=self._cfg.gateway.room, speaker=ctx.identity)
+        trace = self._tracer.turn(
+            room=self._cfg.gateway.room,
+            speaker=ctx.identity,
+            channel=ctx.channel,
+            device_id=ctx.device_id,
+        )
+        trace.set(scope=ctx.scope, confidence=ctx.confidence)
         result = TurnResult()
         try:
             if text_only:  # text console / scripted test — reply text only, no TTS
@@ -515,6 +579,30 @@ class BrainServer:
         with contextlib.suppress(Exception):
             await ws.send(encode(ReplyText(turn_id=turn_id, text=result.reply)))
             await ws.send(encode(ReplyEnd(turn_id=turn_id, ended=result.ended)))
+
+    async def _request_device_action(
+        self, ctx: RequestContext, action: str, args: dict, timeout_s: float
+    ) -> dict:
+        conns = list(self._device_conns.get(ctx.device_id, set()))
+        if not conns:
+            raise RuntimeError(f"device {ctx.device_id!r} is not connected")
+        ws = conns[0]
+        meta = self._conn_meta.get(ws)
+        if meta is None:
+            raise RuntimeError(f"device {ctx.device_id!r} has no active control channel")
+        request_id = uuid.uuid4().hex
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        meta["waiters"][request_id] = fut
+        try:
+            await ws.send(encode(DeviceRequest(request_id=request_id, action=action, args=args)))
+            resp = await asyncio.wait_for(fut, timeout=max(1.0, timeout_s))
+        except Exception:
+            meta["waiters"].pop(request_id, None)
+            raise
+        if not resp.ok:
+            raise RuntimeError(resp.error or f"{action} failed")
+        return dict(resp.result)
 
 
 async def serve(cfg: Config) -> None:

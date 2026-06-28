@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 from jarvis.brain.context import RequestContext
 from jarvis.brain.dialog import _now_line
+from jarvis.brain.gateway_client import LLMAttribution
 from jarvis.brain.identity import _parse_front_matter
 from jarvis.config import Config
 from jarvis.tools.base import Tool, ToolRegistry
@@ -141,7 +142,17 @@ def _skill_tool(skill: Skill, *, gateway, registry: ToolRegistry, cfg: Config) -
     )
 
     async def handler(ctx: RequestContext, args: dict) -> str:
-        return await _run_skill(skill, ctx, args, gateway=gateway, registry=registry, cfg=cfg)
+        g = gateway
+        if hasattr(gateway, "with_attribution"):
+            g = gateway.with_attribution(
+                LLMAttribution(
+                    kind="skill",
+                    channel=ctx.channel,
+                    speaker=ctx.identity,
+                    device_id=ctx.device_id,
+                )
+            )
+        return await _run_skill(skill, ctx, args, gateway=g, registry=registry, cfg=cfg)
 
     return Tool(
         skill.name,

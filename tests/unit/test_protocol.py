@@ -10,6 +10,8 @@ import pytest
 
 from jarvis.protocol.messages import (
     BargeIn,
+    DeviceRequest,
+    DeviceResponse,
     Hello,
     ReplyAudio,
     ReplyEnd,
@@ -44,6 +46,8 @@ def test_reply_audio_pcm_round_trip() -> None:
         Hello(device_id="kitchen-pi", token="x"),
         BargeIn(turn_id="t2"),
         TextIn(turn_id="t3", text="hello"),
+        DeviceRequest(request_id="r1", action="capture_photo", args={"width": 640}),
+        DeviceResponse(request_id="r1", ok=True, result={"image_b64": "abc"}),
         Welcome(identity="house", scope="house", capabilities=["web.search"]),
         ReplyEnd(turn_id="t4", ended=True),
     ],

@@ -27,3 +27,7 @@ jarvis-workspace/browser/
 
 # User principal files hold PII (phone numbers, personal scope) — keep them local
 jarvis-workspace/users/*.md
+
+# Local fleet/operator notes can contain hostnames, Tailscale IPs, phone numbers,
+# private account choices, and setup history.
+docs/private/

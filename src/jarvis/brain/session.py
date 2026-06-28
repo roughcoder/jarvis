@@ -34,7 +34,7 @@ from jarvis.brain.dialog import (
     _next_sentence,
     _now_line,
 )
-from jarvis.brain.gateway_client import GatewayClient
+from jarvis.brain.gateway_client import GatewayClient, LLMAttribution
 from jarvis.brain.memory_client import MemoryClient
 from jarvis.brain.profile import format_facts, read_facts
 from jarvis.brain.tracing import Tracer
@@ -221,6 +221,22 @@ class BrainSession:
             self._soul = path.read_text(encoding="utf-8").strip()
             print(f"Soul loaded from {path} ({len(self._soul)} chars).")
 
+    def _gateway_for(self, *, kind: str = "turn"):  # noqa: ANN202
+        """Return the gateway with per-context LiteLLM attribution when supported.
+
+        Tests often pass simple fake gateways; they intentionally don't need to
+        implement attribution.
+        """
+        attr = LLMAttribution(
+            kind=kind,
+            channel=self._ctx.channel,
+            speaker=self._ctx.identity,
+            device_id=self._ctx.device_id,
+        )
+        if hasattr(self._gateway, "with_attribution"):
+            return self._gateway.with_attribution(attr)
+        return self._gateway
+
     # --- the think/speak core ----------------------------------------------
     async def respond(
         self, user_text: str, trace, result: TurnResult
@@ -269,7 +285,7 @@ class BrainSession:
                 yield pcm  # result.raw set inside _stream_speech's finally
         else:
             trace.start("llm")
-            raw = await self._gateway.complete(messages, model=model)
+            raw = await self._gateway_for().complete(messages, model=model)
             trace.end("llm", model=model, chars=len(raw or ""), memory=bool(memory))
             result.raw = raw
             async for pcm in self._tts_source(_END_RE.sub(" ", raw or "").strip(), trace):
@@ -318,7 +334,7 @@ class BrainSession:
         else:
             if trace is not None:
                 trace.start("llm")
-            raw = await self._gateway.complete(messages, model=model)
+            raw = await self._gateway_for().complete(messages, model=model)
             if trace is not None:
                 trace.end("llm", model=model, chars=len(raw or ""), memory=bool(memory))
             result.raw = raw
@@ -346,8 +362,9 @@ class BrainSession:
                 extra_keywords=self._server_keywords,
             )
         tool_schemas = [t.openai_schema() for t in sorted(offered, key=lambda t: t.name)]
+        gateway = self._gateway_for(kind="background")
         for _ in range(max(1, max_rounds)):
-            msg = await self._gateway.complete_with_tools(
+            msg = await gateway.complete_with_tools(
                 messages, model=model, tools=tool_schemas or None
             )
             if not msg.tool_calls:
@@ -369,11 +386,11 @@ class BrainSession:
                 tool_result = await self._execute_call(tc)
                 self._log_tool_call(tool, tc, tool_result)
                 if tool is not None and tool.produces_image and not tool_result.startswith("error"):
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": "(screen captured — image below)"})
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": "(image captured — image below)"})
                     messages.append({
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": "This is the current screen:"},
+                            {"type": "text", "text": "This is the captured image:"},
                             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{tool_result}"}},
                         ],
                     })
@@ -381,7 +398,7 @@ class BrainSession:
                 else:
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result})
         # Out of rounds — force a final summary with no further tool calls.
-        final = await self._gateway.complete_with_tools(messages, model=model, tools=None)
+        final = await gateway.complete_with_tools(messages, model=model, tools=None)
         return _END_RE.sub(" ", final.content or "").strip()
 
     def _system_prompt(self, memory: str) -> str:
@@ -479,8 +496,9 @@ class BrainSession:
         t0 = time.perf_counter()
         n_tools = 0
         usage: dict = {}
+        gateway = self._gateway_for()
         for _ in range(max(1, self._cfg.tools.max_rounds)):
-            msg = await self._gateway.complete_with_tools(
+            msg = await gateway.complete_with_tools(
                 messages, model=model, tools=tool_schemas, usage_out=usage
             )
             if not msg.tool_calls:
@@ -531,13 +549,13 @@ class BrainSession:
                     # tool call as text, then hand the image to the model as a user
                     # message so it can SEE it, and switch to the vision route. The
                     # image is NOT carried into long-term history (it's large).
-                    ack = {"role": "tool", "tool_call_id": tc.id, "content": "(screen captured — image below)"}
+                    ack = {"role": "tool", "tool_call_id": tc.id, "content": "(image captured — image below)"}
                     messages.append(ack)
                     result.tool_messages.append(ack)
                     messages.append({
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": "This is the current screen:"},
+                            {"type": "text", "text": "This is the captured image:"},
                             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{tool_result}"}},
                         ],
                     })
@@ -547,7 +565,7 @@ class BrainSession:
                     messages.append(tool_msg)
                     result.tool_messages.append(tool_msg)  # carry into history
         # Out of tool rounds — force a final answer with no further tool calls.
-        msg = await self._gateway.complete_with_tools(messages, model=model, tools=None, usage_out=usage)
+        msg = await gateway.complete_with_tools(messages, model=model, tools=None, usage_out=usage)
         result.raw = msg.content or ""
         self._record_llm(trace, t0, model, result.raw, n_tools, usage)
 
@@ -675,9 +693,12 @@ class BrainSession:
             if refreshed:
                 ms = (time.perf_counter() - t0) * 1000
                 mt = self._tracer.turn(
-                    room=self._cfg.gateway.room, speaker=self._cfg.gateway.speaker
+                    room=self._cfg.gateway.room,
+                    speaker=self._ctx.identity,
+                    channel=self._ctx.channel,
+                    device_id=self._ctx.device_id,
+                    kind="memory",
                 )
-                mt.set(kind="memory")
                 mt.stage("memory", ms)
                 self._tracer.emit(mt)
         except Exception as exc:  # noqa: BLE001 - memory must never break a turn
@@ -720,11 +741,12 @@ class BrainSession:
         full: list[str] = []
         steering: str | None = None
         usage: dict = {}
+        gateway = self._gateway_for()
 
         async def sentences() -> AsyncIterator[str]:
             nonlocal first_tok, llm_done
             buf = ""
-            async for delta in self._gateway.stream(messages, model=model, usage_out=usage):
+            async for delta in gateway.stream(messages, model=model, usage_out=usage):
                 if first_tok is None:
                     first_tok = time.perf_counter()
                 full.append(delta)

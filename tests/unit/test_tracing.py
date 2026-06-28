@@ -13,7 +13,7 @@ from jarvis.brain.tracing import Tracer, TurnTrace, _summary
 
 
 def test_turntrace_accumulates_stages_events_and_meta() -> None:
-    t = TurnTrace(room="kitchen", speaker="neil")
+    t = TurnTrace(room="kitchen", speaker="neil", channel="whatsapp", device_id="whatsapp")
     t.start("stt")
     t.end("stt", chars=10)
     t.stage("llm", 123.4, model="fast")
@@ -21,6 +21,8 @@ def test_turntrace_accumulates_stages_events_and_meta() -> None:
     t.set(kind="turn")
 
     assert t.data["room"] == "kitchen"
+    assert t.data["channel"] == "whatsapp"
+    assert t.data["device_id"] == "whatsapp"
     assert t.data["stages"]["stt"]["chars"] == 10
     assert t.data["stages"]["llm"]["ms"] == 123.4
     assert t.data["stages"]["llm"]["model"] == "fast"
@@ -58,6 +60,8 @@ def test_emit_disabled_writes_nothing(tmp_path) -> None:
 def test_summary_renders_stage_breakdown() -> None:
     d = {
         "kind": "turn",
+        "channel": "whatsapp",
+        "speaker": "neil",
         "stages": {
             "stt": {"ms": 800},
             "llm": {"ms": 1200, "model": "fast"},
@@ -67,6 +71,7 @@ def test_summary_renders_stage_breakdown() -> None:
         "total_ms": 2600,
     }
     s = _summary(d)
+    assert "whatsapp:neil" in s
     assert "stt=800ms" in s
     assert "llm[fast]=1200ms" in s
     assert "tts[Ashley]=600ms" in s

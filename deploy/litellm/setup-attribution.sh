@@ -8,8 +8,8 @@
 #   Team         = household           -> "jarvis"
 #   Internal User= device / service    -> "jarvis-default", "honcho-memory"
 #   Virtual Key  = component (alias)    -> "jarvis-voice", "honcho-memory"
-#   End User     = speaker (per request, set by the client: "family" -> name)
-#   Tag          = room (per request)
+#   End User     = resolved speaker/call owner (neil, alice, heartbeat; family fallback)
+#   Tag          = room + Jarvis call dimensions (kind, channel, speaker, device)
 #
 # Usage: GATEWAY_API_KEY=sk-... ./deploy/litellm/setup-attribution.sh
 set -euo pipefail

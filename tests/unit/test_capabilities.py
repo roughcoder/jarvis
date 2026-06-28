@@ -16,6 +16,7 @@ from jarvis.brain.capabilities import (
     resolve_capabilities,
 )
 from jarvis.brain.context import RequestContext
+from jarvis.brain.server import BrainServer
 from jarvis.config import CapabilityConfig
 
 
@@ -110,3 +111,18 @@ def test_build_request_context_carries_identity_and_caps(tmp_path) -> None:
     assert ctx.scope == "personal"
     assert ctx.can("web.search")
     assert not ctx.can("files.write")
+
+
+def test_live_hardware_filters_intercom_caps() -> None:
+    ctx = RequestContext(
+        "kitchen-pi",
+        "house",
+        "house",
+        frozenset({"web.search", "intercom.camera", "intercom.display"}),
+    )
+
+    with_camera = BrainServer._with_live_hardware(ctx, {"camera"})
+    assert with_camera.capabilities == frozenset({"web.search", "intercom.camera"})
+
+    without_hardware = BrainServer._with_live_hardware(ctx, set())
+    assert without_hardware.capabilities == frozenset({"web.search"})

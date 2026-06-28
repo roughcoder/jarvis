@@ -20,6 +20,7 @@ import websockets
 
 from jarvis import __version__
 from jarvis.config import Config
+from jarvis.intercom.hardware import IntercomHardware
 from jarvis.protocol.messages import Hello, Reject, Welcome, decode, encode
 
 SERVICE_LABELS = {
@@ -56,6 +57,7 @@ async def probe_brain(cfg: Config, *, timeout_s: float = 5.0) -> dict[str, Any]:
                     Hello(
                         device_id=cfg.capabilities.device_id,
                         token=cfg.intercom.token.get_secret_value(),
+                        hardware=IntercomHardware(cfg.intercom_device).capabilities(),
                     )
                 )
             )

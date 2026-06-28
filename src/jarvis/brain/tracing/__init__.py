@@ -22,7 +22,15 @@ from jarvis.config import TraceConfig
 class TurnTrace:
     """Accumulates timings/metadata for one turn. Cheap; no I/O until emit."""
 
-    def __init__(self, *, room: str, speaker: str) -> None:
+    def __init__(
+        self,
+        *,
+        room: str,
+        speaker: str,
+        channel: str = "voice",
+        device_id: str = "",
+        kind: str = "turn",
+    ) -> None:
         self._t0 = time.perf_counter()
         self._starts: dict[str, float] = {}
         # Wall-clock start so turn and cold-path (memory) traces can be lined up
@@ -30,8 +38,11 @@ class TurnTrace:
         # cold-path/deriver burst (contention) vs ambient noise.
         self.data: dict = {
             "ts": round(time.time(), 3),
+            "kind": kind,
             "room": room,
             "speaker": speaker,
+            "channel": channel,
+            "device_id": device_id,
             "stages": {},
             "events": [],
         }
@@ -61,8 +72,18 @@ class Tracer:
         self._cfg = cfg
         self._lock = threading.Lock()
 
-    def turn(self, *, room: str, speaker: str) -> TurnTrace:
-        return TurnTrace(room=room, speaker=speaker)
+    def turn(
+        self,
+        *,
+        room: str,
+        speaker: str,
+        channel: str = "voice",
+        device_id: str = "",
+        kind: str = "turn",
+    ) -> TurnTrace:
+        return TurnTrace(
+            room=room, speaker=speaker, channel=channel, device_id=device_id, kind=kind
+        )
 
     def emit(self, trace: TurnTrace) -> None:
         trace.data["total_ms"] = round(trace.total_ms(), 1)
@@ -82,6 +103,10 @@ def _summary(d: dict) -> str:
     """Compact one-line console summary of a turn trace."""
     s = d.get("stages", {})
     parts = [f"⟐ {d.get('kind', 'turn')}"]
+    channel = d.get("channel")
+    speaker = d.get("speaker")
+    if channel or speaker:
+        parts.append(f"{channel or '?'}:{speaker or '?'}")
     if "stt" in s:
         parts.append(f"stt={s['stt']['ms']:.0f}ms")
     if "llm" in s:

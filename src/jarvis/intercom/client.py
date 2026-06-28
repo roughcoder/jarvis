@@ -23,11 +23,15 @@ import websockets
 
 from jarvis.config import Config
 from jarvis.intercom.audio import AudioIO, MicStream
+from jarvis.intercom.eyes import EyeDisplay
+from jarvis.intercom.hardware import IntercomHardware
 from jarvis.intercom.vad import Endpointer, SileroVAD
 from jarvis.intercom.wake import WakeWord
 from jarvis.protocol.messages import (
     BargeIn,
     Cancel,
+    DeviceRequest,
+    DeviceResponse,
     Hello,
     Proactive,
     ReplyAudio,
@@ -45,12 +49,21 @@ FRAME_SAMPLES = 512
 
 class IntercomClient:
     def __init__(
-        self, cfg: Config, *, audio: AudioIO, vad: SileroVAD, wake: WakeWord
+        self,
+        cfg: Config,
+        *,
+        audio: AudioIO,
+        vad: SileroVAD,
+        wake: WakeWord,
+        hardware: IntercomHardware | None = None,
+        eyes: EyeDisplay | None = None,
     ) -> None:
         self._cfg = cfg
         self._audio = audio
         self._vad = vad
         self._wake = wake
+        self._hardware = hardware or IntercomHardware(cfg.intercom_device)
+        self._eyes = eyes or EyeDisplay(cfg.intercom_device)
         self._sr = cfg.audio.sample_rate
         self._device_id = cfg.capabilities.device_id
 
@@ -58,7 +71,11 @@ class IntercomClient:
         print("Loading models…")
         self._vad.load()
         self._wake.load()
+        self._eyes.start()
         url = self._cfg.intercom.brain_url
+        hardware = self._hardware.capabilities()
+        if hardware:
+            print(f"Local intercom hardware: {', '.join(hardware)}")
         print(f"Connecting to brain at {url}…")
         # Models + mic are loaded once and kept open across brain reconnects: a brain
         # restart must not drop the voice device or re-load Whisper/wake every time.
@@ -75,6 +92,7 @@ class IntercomClient:
                                     Hello(
                                         device_id=self._device_id,
                                         token=self._cfg.intercom.token.get_secret_value(),
+                                        hardware=hardware,
                                     )
                                 )
                             )
@@ -114,6 +132,7 @@ class IntercomClient:
                         print(f"  [intercom] brain link lost ({type(exc).__name__}); reconnecting in 3s…")
                         await asyncio.sleep(3)
         finally:
+            self._eyes.stop()
             self._wake.delete()
 
     async def _turn_forever(self, ws, mic, inbound: asyncio.Queue) -> None:  # noqa: ANN001
@@ -126,9 +145,22 @@ class IntercomClient:
         try:
             async for raw in ws:
                 with contextlib.suppress(Exception):
-                    inbound.put_nowait(decode(raw))
+                    msg = decode(raw)
+                    if isinstance(msg, DeviceRequest):
+                        asyncio.create_task(self._handle_device_request(ws, msg))
+                    else:
+                        inbound.put_nowait(msg)
         except Exception:  # noqa: BLE001 - socket closed
             pass
+
+    async def _handle_device_request(self, ws, msg: DeviceRequest) -> None:  # noqa: ANN001
+        try:
+            result = await self._hardware.handle(msg.action, msg.args)
+            resp = DeviceResponse(request_id=msg.request_id, ok=True, result=result)
+        except Exception as exc:  # noqa: BLE001 - return failure over protocol
+            resp = DeviceResponse(request_id=msg.request_id, ok=False, error=str(exc))
+        with contextlib.suppress(Exception):
+            await ws.send(encode(resp))
 
     async def _idle_then_turn(self, ws, mic: MicStream, inbound: asyncio.Queue) -> None:  # noqa: ANN001
         """Wait for the wake word OR a proactive push (alarm/notification); whichever
@@ -137,6 +169,7 @@ class IntercomClient:
         mic.drain()
         self._wake.reset()
         print('● idle — say "Hey Jarvis"')
+        self._eyes.set("idle")
         while True:
             pro = self._take_proactive(inbound)
             if pro is not None:
@@ -148,10 +181,13 @@ class IntercomClient:
             if await asyncio.to_thread(self._wake_batch, mic):
                 break
         print("● wake")
+        self._eyes.set("awake")
         await self._acknowledge()
         mic.drain()
         print("  listening…")
+        self._eyes.set("listening")
         pcm = await asyncio.to_thread(self._capture_utterance, mic)
+        self._eyes.set("thinking")
         await self._converse(ws, mic, inbound, pcm)
 
     async def _converse(self, ws, mic: MicStream, inbound: asyncio.Queue, pcm: bytes) -> None:  # noqa: ANN001
@@ -169,7 +205,9 @@ class IntercomClient:
 
             if interrupted:
                 print("⊘ interrupted — listening…")
+                self._eyes.set("listening")
                 pcm = await asyncio.to_thread(self._capture_utterance, mic)
+                self._eyes.set("thinking")
                 continue
             if state["ended"]:
                 print('  …(conversation closed — say "Hey Jarvis")')
@@ -178,11 +216,13 @@ class IntercomClient:
                 return
             mic.drain()
             print("  …(listening — keep talking, or stay quiet to sleep)")
+            self._eyes.set("listening")
             pcm = await asyncio.to_thread(
                 self._capture_utterance,
                 mic,
                 initial_wait_ms=self._cfg.vad.conversation_timeout_ms,
             )
+            self._eyes.set("thinking")
             if not pcm:
                 return
 
@@ -219,18 +259,22 @@ class IntercomClient:
         """Play a proactive's audio (tone + spoken text under its 'pa-' turn id); if it
         asked to open the mic, listen for a reply and carry it into a chat."""
         print(f"  🔔 {pro.text}")
+        self._eyes.set("awake")
         state = {"ended": False, "text": ""}
         with contextlib.suppress(Exception):
+            self._eyes.set("speaking")
             await self._audio.play_stream(
                 self._reply_audio(inbound, pro.turn_id, state), sample_rate=self._cfg.tts.sample_rate
             )
         if pro.open_mic:
             mic.drain()
             print("  …(listening for your reply)")
+            self._eyes.set("listening")
             pcm = await asyncio.to_thread(
                 self._capture_utterance, mic, initial_wait_ms=self._cfg.vad.conversation_timeout_ms
             )
             if pcm:
+                self._eyes.set("thinking")
                 await self._converse(ws, mic, inbound, pcm)
 
     # --- reply playback + barge-in -----------------------------------------
@@ -255,6 +299,7 @@ class IntercomClient:
 
     async def _play_reply(self, ws, mic: MicStream, inbound, turn_id: str, state: dict) -> bool:  # noqa: ANN001
         if not self._cfg.vad.bargein_enabled:
+            self._eyes.set("speaking")
             await self._audio.play_stream(
                 self._reply_audio(inbound, turn_id, state), sample_rate=self._cfg.tts.sample_rate
             )
@@ -302,6 +347,7 @@ class IntercomClient:
                     speech_ms = 0.0
 
         monitor = monitor_wakeword if wakeword_mode else monitor_vad
+        self._eyes.set("speaking")
         play_task = asyncio.create_task(
             self._audio.play_stream(
                 self._reply_audio(inbound, turn_id, state), sample_rate=self._cfg.tts.sample_rate

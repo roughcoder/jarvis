@@ -113,10 +113,11 @@ desktop install the same formula but enable different roles.
 Example role setup after installing the formula without the app:
 
 ```bash
-jarvis service sync brain worker intercom
+jarvis service sync brain worker intercom whatsapp
 jarvis service install brain
 jarvis service install worker
 jarvis service install intercom
+jarvis service install whatsapp
 jarvis service start brain
 jarvis fleet-status --json
 ```
@@ -131,6 +132,7 @@ jarvis service install intercom
 jarvis service start brain
 jarvis service restart worker
 jarvis service status intercom
+jarvis service status whatsapp
 ```
 
 Use `jarvis service print <role>` for dry-run inspection and CI validation.
@@ -223,6 +225,117 @@ jarvis-pi logs
 
 The Pi remains a thin intercom: pairing token only, no provider credentials.
 
+On newer Raspberry Pi OS / Debian releases, the system Python may be newer than
+Jarvis supports. Pin the installer to a compatible managed Python when needed:
+
+```bash
+sudo uv python install 3.11
+sudo JARVIS_PYTHON_BIN=3.11 ... bash /tmp/install_jarvis_pi.sh
+```
+
+Some USB microphones only expose 44.1/48 kHz in hardware while Jarvis captures
+16 kHz for wake/VAD/STT. Use ALSA's `plug` layer for capture resampling rather
+than binding Jarvis directly to the raw `hw:*` device. A minimal Pi
+`/etc/asound.conf` shape is:
+
+```conf
+pcm.!default {
+    type asym
+    playback.pcm "plughw:CARD=vc4hdmi0,DEV=0"
+    capture.pcm "plughw:CARD=Device,DEV=0"
+}
+
+ctl.!default {
+    type hw
+    card Device
+}
+```
+
+When the brain is reached over Tailscale, harden the Pi systemd unit so Jarvis
+does not start before the tailnet route to the brain exists. The important parts
+are:
+
+```ini
+[Unit]
+After=network-online.target tailscaled.service sound.target
+Wants=network-online.target tailscaled.service
+
+[Service]
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 120); do /usr/bin/nc -z -w 2 <brain-tailscale-ip> 8700 && exit 0; sleep 2; done; echo "Jarvis brain not reachable" >&2; exit 1'
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+```
+
+Verify after a reboot with:
+
+```bash
+sudo systemctl status jarvis-intercom.service
+sudo journalctl -u jarvis-intercom.service -b --no-pager
+ss -tanp | grep ':8700'
+```
+
+The healthy log line is:
+
+```text
+Paired with brain.
+Jarvis is listening.
+```
+
+## WhatsApp Connector
+
+The WhatsApp connector is a boundary service around `wacli`. It runs on the
+brain host or another Mac that can reach the brain WebSocket. It holds only a
+brain pairing token and the local `wacli` linked-device state; provider keys stay
+on the brain/gateway side.
+
+Install and authenticate `wacli` first:
+
+```bash
+brew tap openclaw/tap
+brew trust --formula openclaw/tap/wacli
+brew install wacli
+wacli auth --qr-format terminal
+```
+
+Scan the QR from WhatsApp's **Linked devices** screen. Then enable the Jarvis
+role:
+
+```bash
+jarvis pair whatsapp --apply-brain-config --env-file "$HOME/.jarvis/.env" --brain-bind-host 0.0.0.0 --json
+jarvis service sync whatsapp
+jarvis service install whatsapp --workdir "$HOME/.jarvis" --jarvis-bin /opt/homebrew/bin/jarvis
+jarvis service start whatsapp
+```
+
+Recommended access policy:
+
+```dotenv
+WHATSAPP_ENABLED=true
+WHATSAPP_DEVICE_ID=whatsapp
+WHATSAPP_DM_POLICY=pairing
+WHATSAPP_ADMIN=<admin-number-digits>
+WHATSAPP_GROUP_POLICY=ignore
+WHATSAPP_TRIGGER=jarvis
+```
+
+With `WHATSAPP_DM_POLICY=pairing`, numbers already listed in
+`jarvis-workspace/users/*.md` under `whatsapp: [...]` can message Jarvis
+directly. Unknown senders receive a holding reply and the admin receives an
+approval command.
+
+Useful checks:
+
+```bash
+wacli doctor
+jarvis service status whatsapp
+tail -f "$HOME/Library/Logs/Jarvis/whatsapp.out.log" "$HOME/Library/Logs/Jarvis/whatsapp.err.log"
+lsof -nP -iTCP:8700
+```
+
+`wacli doctor` may report `locked_by_other_process` while the Jarvis service is
+running because `wacli sync --follow` owns the store lock. That is expected.
+
 ## Network Binding
 
 For an iMac brain reachable by other devices:
@@ -250,10 +363,11 @@ The installed update path should stay boring:
 ```bash
 brew update
 brew upgrade jarvis
-jarvis service sync brain worker intercom
+jarvis service sync brain worker intercom whatsapp
 jarvis service restart brain
 jarvis service restart worker
 jarvis service restart intercom
+jarvis service restart whatsapp
 ```
 
 The app Setup window's **Update Runtime** action performs the same role-scoped

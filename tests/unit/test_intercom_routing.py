@@ -12,11 +12,14 @@ import asyncio
 from jarvis.config import load_config
 from jarvis.intercom.client import IntercomClient
 from jarvis.protocol.messages import (
+    DeviceRequest,
+    DeviceResponse,
     Proactive,
     ReplyAudio,
     ReplyEnd,
     ReplyText,
     Transcript,
+    decode,
 )
 
 
@@ -24,8 +27,25 @@ class _Stub:  # audio/vad/wake aren't touched by the routing methods under test
     pass
 
 
+class _Hardware:
+    async def handle(self, action, args):  # noqa: ANN001
+        assert action == "capture_photo"
+        assert args == {"reason": "test"}
+        return {"image_b64": "JPEG"}
+
+
+class _WS:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send(self, item: str) -> None:
+        self.sent.append(item)
+
+
 def _client() -> IntercomClient:
-    return IntercomClient(load_config(), audio=_Stub(), vad=_Stub(), wake=_Stub())
+    return IntercomClient(
+        load_config(), audio=_Stub(), vad=_Stub(), wake=_Stub(), hardware=_Hardware()
+    )
 
 
 def test_take_proactive_spots_a_proactive_else_none() -> None:
@@ -72,3 +92,21 @@ def test_reply_audio_works_for_proactive_turn_id() -> None:
         return [pcm async for pcm in c._reply_audio(q, "pa-9", {"ended": False, "text": ""})]
 
     assert asyncio.run(go()) == [b"tone", b"talk"]
+
+
+def test_device_request_returns_device_response() -> None:
+    c = _client()
+    ws = _WS()
+
+    async def go() -> DeviceResponse:
+        await c._handle_device_request(
+            ws, DeviceRequest(request_id="r1", action="capture_photo", args={"reason": "test"})
+        )
+        assert ws.sent
+        msg = decode(ws.sent[0])
+        assert isinstance(msg, DeviceResponse)
+        return msg
+
+    got = asyncio.run(go())
+    assert got.ok is True
+    assert got.result["image_b64"] == "JPEG"

@@ -6,7 +6,7 @@ are deterministic regardless of the developer's local secrets.
 
 from __future__ import annotations
 
-from jarvis.config import Config, DatabaseConfig, GatewayConfig, MemoryConfig
+from jarvis.config import BrainConfig, Config, DatabaseConfig, GatewayConfig, MemoryConfig
 
 
 def _clean(monkeypatch, *names: str) -> None:
@@ -27,6 +27,10 @@ def test_base_url_is_computed_from_host_port(monkeypatch) -> None:
     _clean(monkeypatch, "MEMORY_HOST", "MEMORY_PORT")
     c = MemoryConfig(_env_file=None, host="frankfurt", port=8123)
     assert c.base_url == "http://frankfurt:8123"
+
+
+def test_brain_websocket_limit_allows_long_utterances() -> None:
+    assert BrainConfig(_env_file=None).websocket_max_size == 8 * 1024 * 1024
 
 
 def test_env_var_overrides_with_prefix(monkeypatch) -> None:

@@ -8,10 +8,58 @@ route name), so switching fast<->strong is config, not code (spec Step 1).
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 
 from openai import AsyncOpenAI
 
 from jarvis.config import GatewayConfig
+
+
+@dataclass(frozen=True)
+class LLMAttribution:
+    """Per-request LiteLLM attribution.
+
+    LiteLLM stores OpenAI's `user` as End User and `metadata.tags` as request
+    tags, so keep the values short and filter-friendly.
+    """
+
+    kind: str = "turn"  # turn | heartbeat | background | skill | ping | ...
+    channel: str = "voice"  # voice | whatsapp | text | system | ...
+    speaker: str = ""  # resolved person; empty/house falls back to cfg.speaker
+    device_id: str = ""
+
+
+class _AttributedGateway:
+    def __init__(self, base: "GatewayClient", attribution: LLMAttribution) -> None:
+        self._base = base
+        self._attribution = attribution
+
+    async def complete(self, messages: list[dict], *, model: str | None = None) -> str:
+        return await self._base.complete(messages, model=model, attribution=self._attribution)
+
+    async def stream(
+        self, messages: list[dict], *, model: str | None = None, usage_out: dict | None = None
+    ) -> AsyncIterator[str]:
+        async for delta in self._base.stream(
+            messages, model=model, usage_out=usage_out, attribution=self._attribution
+        ):
+            yield delta
+
+    async def complete_with_tools(
+        self,
+        messages: list[dict],
+        *,
+        model: str | None = None,
+        tools: list[dict] | None = None,
+        usage_out: dict | None = None,
+    ):
+        return await self._base.complete_with_tools(
+            messages, model=model, tools=tools, usage_out=usage_out,
+            attribution=self._attribution,
+        )
+
+    async def embed(self, texts: list[str], *, model: str | None = None) -> list[list[float]]:
+        return await self._base.embed(texts, model=model, attribution=self._attribution)
 
 
 class GatewayClient:
@@ -27,25 +75,60 @@ class GatewayClient:
             timeout=cfg.request_timeout_s,
         )
         self._speaker = cfg.speaker  # End User attribution (who's talking)
-        # Room attached as a LiteLLM tag so multi-instance traffic is separable.
-        self._extra_body = {"metadata": {"tags": [f"room:{cfg.room}"]}}
 
     def _resolve(self, model: str | None) -> str:
         # Default to the fast route; callers pass cfg.strong_model when needed.
         return model or self._cfg.fast_model
 
-    async def complete(self, messages: list[dict], *, model: str | None = None) -> str:
+    def with_attribution(self, attribution: LLMAttribution) -> _AttributedGateway:
+        return _AttributedGateway(self, attribution)
+
+    def _end_user(self, attribution: LLMAttribution | None) -> str:
+        speaker = (attribution.speaker if attribution else "").strip()
+        return speaker if speaker and speaker != "house" else self._speaker
+
+    def _extra_body(self, attribution: LLMAttribution | None) -> dict:
+        meta = {
+            "jarvis_kind": (attribution.kind if attribution else "turn"),
+            "jarvis_channel": (attribution.channel if attribution else "voice"),
+            "jarvis_speaker": self._end_user(attribution),
+            "jarvis_room": self._cfg.room,
+        }
+        if attribution and attribution.device_id:
+            meta["jarvis_device"] = attribution.device_id
+        tags = [
+            f"room:{self._cfg.room}",
+            f"kind:{meta['jarvis_kind']}",
+            f"channel:{meta['jarvis_channel']}",
+            f"speaker:{meta['jarvis_speaker']}",
+        ]
+        if attribution and attribution.device_id:
+            tags.append(f"device:{attribution.device_id}")
+        return {"metadata": {**meta, "tags": tags}}
+
+    async def complete(
+        self,
+        messages: list[dict],
+        *,
+        model: str | None = None,
+        attribution: LLMAttribution | None = None,
+    ) -> str:
         """Non-streaming completion. `model` is a LiteLLM route name."""
         resp = await self._client.chat.completions.create(
             model=self._resolve(model),
             messages=messages,  # type: ignore[arg-type]
-            user=self._speaker,
-            extra_body=self._extra_body,
+            user=self._end_user(attribution),
+            extra_body=self._extra_body(attribution),
         )
         return resp.choices[0].message.content or ""
 
     async def stream(
-        self, messages: list[dict], *, model: str | None = None, usage_out: dict | None = None
+        self,
+        messages: list[dict],
+        *,
+        model: str | None = None,
+        usage_out: dict | None = None,
+        attribution: LLMAttribution | None = None,
     ) -> AsyncIterator[str]:
         """Streaming completion: yields text deltas for time-to-first-token. When
         `usage_out` is given, request usage and fill it with prompt-cache stats from
@@ -54,8 +137,8 @@ class GatewayClient:
             "model": self._resolve(model),
             "messages": messages,
             "stream": True,
-            "user": self._speaker,
-            "extra_body": self._extra_body,
+            "user": self._end_user(attribution),
+            "extra_body": self._extra_body(attribution),
         }
         if usage_out is not None:
             kwargs["stream_options"] = {"include_usage": True}
@@ -76,6 +159,7 @@ class GatewayClient:
         model: str | None = None,
         tools: list[dict] | None = None,
         usage_out: dict | None = None,
+        attribution: LLMAttribution | None = None,
     ):
         """One tool-aware completion. Returns the assistant message (which carries
         `.content` and `.tool_calls`) so the caller can run the tool loop. Tools
@@ -84,8 +168,8 @@ class GatewayClient:
         kwargs: dict = {
             "model": self._resolve(model),
             "messages": messages,
-            "user": self._speaker,
-            "extra_body": self._extra_body,
+            "user": self._end_user(attribution),
+            "extra_body": self._extra_body(attribution),
         }
         if tools:
             kwargs["tools"] = tools
@@ -94,10 +178,19 @@ class GatewayClient:
             usage_out.update(_usage_dict(getattr(resp, "usage", None)))
         return resp.choices[0].message
 
-    async def embed(self, texts: list[str], *, model: str | None = None) -> list[list[float]]:
+    async def embed(
+        self,
+        texts: list[str],
+        *,
+        model: str | None = None,
+        attribution: LLMAttribution | None = None,
+    ) -> list[list[float]]:
         """Embed texts via the LiteLLM embeddings route (optional tool-relevance scorer)."""
         resp = await self._client.embeddings.create(
-            model=model or self._cfg.embed_model, input=texts
+            model=model or self._cfg.embed_model,
+            input=texts,
+            user=self._end_user(attribution),
+            extra_body=self._extra_body(attribution),
         )
         return [d.embedding for d in resp.data]
 
