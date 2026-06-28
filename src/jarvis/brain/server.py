@@ -570,7 +570,7 @@ class BrainServer:
 
     @staticmethod
     def _apply_cancelled_turn_result(channel: str, conn: dict, result: TurnResult) -> None:
-        if result.close_reason not in {"mode_enter", "mode_exit", "user_closed"}:
+        if result.close_reason not in {"mode_enter", "mode_exit"}:
             return
         BrainServer._apply_turn_result(channel, conn, result)
 
