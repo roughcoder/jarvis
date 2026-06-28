@@ -155,3 +155,49 @@ def test_send_email_requires_confirmation_before_gogcli(monkeypatch) -> None:  #
 
     assert "confirmation required" in out
     assert calls == []
+
+
+def test_send_email_passes_household_recipient_policy_to_gogcli(monkeypatch) -> None:  # noqa: ANN001
+    calls: list[tuple[str, ...]] = []
+
+    class FakeProc:
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"sent", b""
+
+    async def fake_exec(*argv, stdout=None, stderr=None):  # noqa: ANN001
+        calls.append(tuple(argv))
+        return FakeProc()
+
+    monkeypatch.setattr("jarvis.brain.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
+    monkeypatch.setattr("jarvis.brain.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    tools = {t.name: t for t in make_google_tools(GoogleConfig(_env_file=None, gogcli_bin="gog"))}
+
+    out = asyncio.run(
+        tools["send_email"].handler(
+            _ctx("email.send"),
+            {
+                "to": "family@example.invalid",
+                "subject": "Hi",
+                "body": "Hello",
+                "recipient_class": "household",
+            },
+        )
+    )
+
+    assert out == "sent"
+    assert calls == [
+        (
+            "gog",
+            "--plain",
+            "--no-input",
+            "--enable-commands-exact=gmail.send",
+            "gmail",
+            "send",
+            "--to",
+            "family@example.invalid",
+            "--subject",
+            "Hi",
+            "--body",
+            "Hello",
+        )
+    ]

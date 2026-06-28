@@ -70,10 +70,12 @@ def make_google_tools(
         body = (args.get("body") or "").strip()
         if not (to and body):
             return "error: an email needs a recipient and a body"
+        recipient_class = (args.get("recipient_class") or "external").strip()
         return await router.send_email(
             ctx,
             email_binding,
             {"to": to, "subject": subject, "body": body},
+            recipient_class=recipient_class,
         )
 
     obj = "object"
@@ -108,6 +110,14 @@ def make_google_tools(
                     "to": {"type": "string"},
                     "subject": {"type": "string"},
                     "body": {"type": "string"},
+                    "recipient_class": {
+                        "type": "string",
+                        "enum": ["self", "household", "known", "external"],
+                        "description": (
+                            "Recipient relationship. Use household/known only when the "
+                            "user explicitly identifies the recipient that way; default to external."
+                        ),
+                    },
                 },
                 "required": ["to", "body"],
             },
