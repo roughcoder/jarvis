@@ -30,6 +30,7 @@ from jarvis.brain.memory_client import MemoryClient
 from jarvis.brain.session import BrainSession, TurnResult
 from jarvis.brain.skills import register_skills
 from jarvis.brain.tracing import Tracer
+from jarvis.brain.voice_modes import DEFAULT_MODE, STAY_MODE
 from jarvis.config import Config
 from jarvis.intercom.audio import AudioIO, MicStream
 from jarvis.intercom.vad import Endpointer, SileroVAD
@@ -94,6 +95,8 @@ class TurnLoop:
         self._resolver = IdentityResolver(users)
         self._store = ContextStore(self._make_session)
         self._asserted = "" if cfg.capabilities.identity == "house" else cfg.capabilities.identity
+        self._base_asserted = self._asserted
+        self._voice_mode = DEFAULT_MODE
         self.state = State.PASSIVE
 
     def _make_session(self, ctx: RequestContext) -> BrainSession:
@@ -111,6 +114,10 @@ class TurnLoop:
             utterance=utterance,
         )
         return context_for_resolution(self._cfg.capabilities, resolution)
+
+    def _reset_voice_conversation(self) -> None:
+        self._asserted = self._base_asserted
+        self._voice_mode = DEFAULT_MODE
 
     # --- blocking frame loops (run via to_thread) --------------------------
     def _wait_for_wake(self, mic: MicStream) -> None:
@@ -195,6 +202,7 @@ class TurnLoop:
         while True:
             if not pcm:
                 print("  (nothing said)")
+                self._reset_voice_conversation()
                 return
             trace = self._tracer.turn(
                 room=self._cfg.gateway.room,
@@ -224,6 +232,7 @@ class TurnLoop:
                 confidence=ctx.confidence,
             )
             session = self._store.get(ctx)
+            session.set_voice_mode(self._voice_mode)
 
             # THINKING/SPEAKING — the session does the work (hot path reads the
             # LOCAL memory cache only); _speak_with_bargein plays the PCM and
@@ -235,6 +244,7 @@ class TurnLoop:
             )
             # finalize() runs even after a barge-in: result.raw is what was said.
             session.finalize(text, result)
+            self._voice_mode = result.voice_mode
             reply, ended = result.reply, result.ended
             print(f"  jarvis: {reply}{'  ⏹' if ended else ''}")
             if interrupted:
@@ -250,26 +260,37 @@ class TurnLoop:
             if not reply:
                 if ended:
                     print('  …(conversation closed — say "Hey Jarvis")')
+                    self._reset_voice_conversation()
                 return
 
             # Normal completion. If the user signed off, close the conversation
             # and return to PASSIVE (wake word required again).
             if ended:
                 print('  …(conversation closed — say "Hey Jarvis")')
+                self._reset_voice_conversation()
                 return
             # Conversation mode: keep listening briefly so the user can continue
             # without the wake word. Silence past the window drops to PASSIVE.
-            if not self._cfg.vad.conversation_mode:
+            if not self._cfg.vad.conversation_mode or not result.continue_listening:
+                self._reset_voice_conversation()
                 return
             self.state = State.ACTIVE
             mic.drain()  # discard Jarvis's own reply tail before listening
-            print("  …(listening — keep talking, or stay quiet to sleep)")
-            pcm = await asyncio.to_thread(
-                self._capture_utterance,
-                mic,
-                initial_wait_ms=self._cfg.vad.conversation_timeout_ms,
-            )
-            if not pcm:
+            while True:
+                if self._voice_mode == STAY_MODE:
+                    print("  …(stay mode — listening)")
+                else:
+                    print("  …(listening — keep talking, or stay quiet to sleep)")
+                pcm = await asyncio.to_thread(
+                    self._capture_utterance,
+                    mic,
+                    initial_wait_ms=self._cfg.vad.conversation_timeout_ms,
+                )
+                if pcm:
+                    break
+                if self._voice_mode == STAY_MODE:
+                    continue
+                self._reset_voice_conversation()
                 return  # conversation went idle → PASSIVE (wake word required)
 
     async def _acknowledge(self) -> None:

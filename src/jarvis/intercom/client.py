@@ -30,6 +30,7 @@ from jarvis.intercom.wake import WakeWord
 from jarvis.protocol.messages import (
     BargeIn,
     Cancel,
+    ConversationIdle,
     DeviceRequest,
     DeviceResponse,
     Hello,
@@ -207,7 +208,13 @@ class IntercomClient:
                 return
             turn_id = uuid.uuid4().hex
             await ws.send(encode(Utterance.of(turn_id, self._sr, pcm)))
-            state = {"ended": False, "text": ""}
+            state = {
+                "ended": False,
+                "text": "",
+                "continue_listening": False,
+                "voice_mode": "default",
+                "close_reason": "",
+            }
             interrupted = await self._play_reply(ws, mic, inbound, turn_id, state)
             print(f"  jarvis: {state['text']}{'  ⏹' if state['ended'] else ''}")
 
@@ -220,18 +227,27 @@ class IntercomClient:
             if state["ended"]:
                 print('  …(conversation closed — say "Hey Jarvis")')
                 return
-            if not self._cfg.vad.conversation_mode:
+            if not self._cfg.vad.conversation_mode or not state["continue_listening"]:
                 return
             mic.drain()
-            print("  …(listening — keep talking, or stay quiet to sleep)")
-            self._panel.set("listening")
-            pcm = await asyncio.to_thread(
-                self._capture_utterance,
-                mic,
-                initial_wait_ms=self._cfg.vad.conversation_timeout_ms,
-            )
-            self._panel.set("thinking")
-            if not pcm:
+            while True:
+                if state["voice_mode"] == "stay":
+                    print("  …(stay mode — listening)")
+                else:
+                    print("  …(listening — keep talking, or stay quiet to sleep)")
+                self._panel.set("listening")
+                pcm = await asyncio.to_thread(
+                    self._capture_utterance,
+                    mic,
+                    initial_wait_ms=self._cfg.vad.conversation_timeout_ms,
+                )
+                self._panel.set("thinking")
+                if pcm:
+                    break
+                if state["voice_mode"] == "stay":
+                    continue
+                with contextlib.suppress(Exception):
+                    await ws.send(encode(ConversationIdle(reason="timeout")))
                 return
 
     def _take_proactive(self, inbound: asyncio.Queue):  # noqa: ANN202
@@ -268,7 +284,13 @@ class IntercomClient:
         asked to open the mic, listen for a reply and carry it into a chat."""
         print(f"  🔔 {pro.text}")
         self._panel.set("awake")
-        state = {"ended": False, "text": ""}
+        state = {
+            "ended": False,
+            "text": "",
+            "continue_listening": False,
+            "voice_mode": "default",
+            "close_reason": "",
+        }
         with contextlib.suppress(Exception):
             self._panel.set("speaking")
             await self._audio.play_stream(
@@ -299,6 +321,9 @@ class IntercomClient:
                 state["text"] = msg.text
             elif isinstance(msg, ReplyEnd) and msg.turn_id == turn_id:
                 state["ended"] = msg.ended
+                state["continue_listening"] = msg.continue_listening
+                state["voice_mode"] = msg.voice_mode
+                state["close_reason"] = msg.close_reason
                 return
             elif isinstance(msg, Cancel) and msg.turn_id == turn_id:
                 return

@@ -181,6 +181,7 @@ def test_system_prompt_format_is_channel_aware() -> None:
     assert "Write for the ear" in voice
     assert "messaging app" not in voice
     assert "Ending the conversation" in voice  # open-mic end-detect only on voice
+    assert "Voice mode: default" in voice
     # whatsapp is read → written prose, and no open-mic end-detection
     wa = _session("whatsapp")._system_prompt("")
     assert "messaging app" in wa

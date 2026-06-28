@@ -68,14 +68,23 @@ def test_reply_audio_yields_pcm_and_records_state() -> None:
         ReplyAudio.of("zz", b"\xff"),  # other turn id → ignored
         ReplyText(turn_id="t1", text="hi there"),
         ReplyAudio.of("t1", b"\x03\x04"),
-        ReplyEnd(turn_id="t1", ended=True),
+        ReplyEnd(
+            turn_id="t1",
+            ended=False,
+            continue_listening=True,
+            voice_mode="stay",
+            close_reason="mode_enter",
+        ),
     ]:
         q.put_nowait(m)
 
     async def go() -> list[bytes]:
         state = {"ended": False, "text": ""}
         chunks = [pcm async for pcm in c._reply_audio(q, "t1", state)]
-        assert state["text"] == "hi there" and state["ended"] is True
+        assert state["text"] == "hi there"
+        assert state["ended"] is False
+        assert state["continue_listening"] is True
+        assert state["voice_mode"] == "stay"
         return chunks
 
     assert asyncio.run(go()) == [b"\x01\x02", b"\x03\x04"]  # only this turn's audio

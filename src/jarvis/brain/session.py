@@ -38,6 +38,17 @@ from jarvis.brain.gateway_client import GatewayClient, LLMAttribution
 from jarvis.brain.memory_client import MemoryClient
 from jarvis.brain.profile import format_facts, read_facts
 from jarvis.brain.tracing import Tracer
+from jarvis.brain.voice_modes import (
+    DEFAULT_MODE,
+    STAY_MODE,
+    local_voice_action,
+    normalize_mode,
+    parse_voice_control,
+    should_soft_close_default,
+    strip_voice_controls,
+    tool_completes_voice_turn,
+    voice_mode_instruction,
+)
 from jarvis.config import Config
 from jarvis.services.tts import InworldTTS
 from jarvis.tools.base import ToolRegistry
@@ -183,6 +194,9 @@ class TurnResult:
     raw: str = ""  # reply incl. any [[END]] marker (may be partial on barge-in)
     reply: str = ""  # spoken/stored reply (marker stripped); set by finalize()
     ended: bool = False  # conversation closed; set by finalize()
+    continue_listening: bool = False  # voice edge should capture another utterance
+    voice_mode: str = DEFAULT_MODE  # active voice mode after this turn
+    close_reason: str = ""  # task_complete | user_closed | mode_enter | mode_exit | ...
     # The turn's tool calls + results (assistant tool_calls then tool messages),
     # kept so the NEXT turn knows what was done (e.g. a job id it just created).
     tool_messages: list = field(default_factory=list)
@@ -222,6 +236,10 @@ class BrainSession:
         self._history: list[dict] = []  # rolling shared conversation context
         self._cold_tasks: set[asyncio.Task] = set()
         self._heartbeat_pcm: bytes | None = None  # cached tool-search pulse
+        self._voice_mode = DEFAULT_MODE
+
+    def set_voice_mode(self, mode: str) -> None:
+        self._voice_mode = normalize_mode(mode)
 
     def load_soul(self) -> None:
         path = pathlib.Path(self._cfg.persona.soul_path)
@@ -253,6 +271,20 @@ class BrainSession:
         `result`. Hot path reads the LOCAL cached representation only (a fast file
         read), never a live memory reasoning call (spec §3.2). Call finalize()
         afterwards (even on barge-in) to detect end + remember."""
+        if self._ctx.channel == "voice":
+            action = local_voice_action(user_text, self._voice_mode)
+            if action is not None:
+                self._voice_mode = action.mode
+                result.raw = action.reply
+                result.reply = action.reply
+                result.voice_mode = action.mode
+                result.ended = action.ended
+                result.continue_listening = action.continue_listening
+                result.close_reason = action.reason
+                async for pcm in self._tts_source(action.reply, trace):
+                    yield pcm
+                return
+
         model = self._initial_model(user_text)
         memory = self._memory.read_cached_representation(self._memory_user)
         messages = [
@@ -286,7 +318,7 @@ class BrainSession:
             # streaming TTFT is unchanged.
             async for pcm in self._run_tool_loop(messages, model, trace, tool_schemas, result):
                 yield pcm
-            async for pcm in self._tts_source(_END_RE.sub(" ", result.raw or "").strip(), trace):
+            async for pcm in self._tts_source(self._clean_reply(result.raw), trace):
                 yield pcm
         elif self._cfg.gateway.stream:
             async for pcm in self._stream_speech(messages, model, trace, result):
@@ -296,19 +328,55 @@ class BrainSession:
             raw = await self._gateway_for().complete(messages, model=model)
             trace.end("llm", model=model, chars=len(raw or ""), memory=bool(memory))
             result.raw = raw
-            async for pcm in self._tts_source(_END_RE.sub(" ", raw or "").strip(), trace):
+            async for pcm in self._tts_source(self._clean_reply(raw), trace):
                 yield pcm
 
     def finalize(self, user_text: str, result: TurnResult) -> None:
         """End-detection + remember + cold-path. Safe to call after a barge-in —
         `result.raw` is what was actually said."""
         raw = result.raw or ""
-        result.reply = _END_RE.sub(" ", raw).strip()  # never store the marker
-        result.ended = self._cfg.vad.conversation_mode and (
-            bool(_END_RE.search(raw))
-            or _is_clear_signoff(user_text)
-            or _is_reply_farewell(raw)
-        )
+        result.reply = self._clean_reply(raw)  # never store control markers
+        result.voice_mode = normalize_mode(result.voice_mode or self._voice_mode)
+        is_voice = self._ctx.channel == "voice" and self._cfg.vad.conversation_mode
+        if is_voice and not result.close_reason:
+            control = parse_voice_control(raw)
+            mode = normalize_mode(control.mode or self._voice_mode)
+            explicit_close = (
+                bool(_END_RE.search(raw))
+                or _is_clear_signoff(user_text)
+                or _is_reply_farewell(raw)
+            )
+            if tool_completes_voice_turn(result.tool_messages):
+                result.ended = True
+                result.continue_listening = False
+                result.close_reason = "task_complete"
+                mode = DEFAULT_MODE
+            elif mode == STAY_MODE:
+                result.ended = control.conversation == "closed" or explicit_close
+                result.continue_listening = not result.ended
+                result.close_reason = control.reason or ("user_closed" if result.ended else "stay_mode")
+                if result.ended:
+                    mode = DEFAULT_MODE
+            elif control.conversation == "open":
+                result.ended = False
+                result.continue_listening = True
+                result.close_reason = control.reason or "followup_expected"
+            else:
+                result.ended = True
+                result.continue_listening = False
+                if explicit_close or should_soft_close_default(user_text):
+                    result.close_reason = control.reason or "user_closed"
+                else:
+                    result.close_reason = control.reason or "default_complete"
+                mode = DEFAULT_MODE
+            result.voice_mode = mode
+        elif is_voice:
+            result.voice_mode = normalize_mode(result.voice_mode)
+        else:
+            result.ended = False
+            result.continue_listening = False
+            result.voice_mode = DEFAULT_MODE
+        self._voice_mode = result.voice_mode
         self._remember(user_text, result)
         if result.reply:
             self._fire_cold_path(user_text, result.reply)
@@ -346,7 +414,7 @@ class BrainSession:
             if trace is not None:
                 trace.end("llm", model=model, chars=len(raw or ""), memory=bool(memory))
             result.raw = raw
-        return _END_RE.sub(" ", result.raw or "").strip()
+        return self._clean_reply(result.raw)
 
     async def run_task(self, task: str, *, max_rounds: int) -> str:
         """Headless agentic execution for the background lane (fire-and-forget): run
@@ -407,7 +475,7 @@ class BrainSession:
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result})
         # Out of rounds — force a final summary with no further tool calls.
         final = await gateway.complete_with_tools(messages, model=model, tools=None)
-        return _END_RE.sub(" ", final.content or "").strip()
+        return self._clean_reply(final.content or "")
 
     def _system_prompt(self, memory: str) -> str:
         """Soul (who Jarvis is) + format + memory (what he knows about you)."""
@@ -428,6 +496,7 @@ class BrainSession:
         # messaging surface every inbound message is already a discrete turn.
         if self._cfg.vad.conversation_mode and self._ctx.channel == "voice":
             parts.append(_END_INSTRUCTION)
+            parts.append(voice_mode_instruction(self._voice_mode))
         parts.append(_AGENCY)  # act-by-default + persistence (stable, cacheable)
         if self._ctx.can("background.run"):
             parts.append(_BACKGROUND_GUIDANCE)
@@ -485,6 +554,10 @@ class BrainSession:
             return ""
         path = pathlib.Path(self._cfg.capabilities.users_dir) / f"{self._ctx.identity}.md"
         return format_facts(read_facts(path))
+
+    @staticmethod
+    def _clean_reply(text: str) -> str:
+        return strip_voice_controls(_END_RE.sub(" ", text or "")).strip()
 
     def _initial_model(self, user_text: str) -> str:
         """Pick the starting model for a turn. Voice is latency-bound by TTS, so short
@@ -776,7 +849,7 @@ class BrainSession:
             async for sent in sentences():
                 if steering is None:  # capture the leading directive once
                     steering, sent = _extract_steering(sent)
-                tts_text = _END_RE.sub(" ", sent).strip()  # never speak the marker
+                tts_text = self._clean_reply(sent)  # never speak control markers
                 if not tts_text:
                     continue
                 if steering:
