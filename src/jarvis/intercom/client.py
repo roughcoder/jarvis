@@ -232,8 +232,8 @@ class IntercomClient:
             state = {
                 "ended": False,
                 "text": "",
-                "continue_listening": False,
-                "voice_mode": "default",
+                "continue_listening": active_voice_mode == "stay",
+                "voice_mode": active_voice_mode,
                 "close_reason": "",
             }
             interrupted = await self._play_reply(ws, mic, inbound, turn_id, state)

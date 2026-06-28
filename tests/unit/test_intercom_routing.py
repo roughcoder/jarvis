@@ -265,6 +265,44 @@ def test_interrupted_stay_mode_silence_keeps_listening_without_idle() -> None:
     assert replies == 2
 
 
+def test_interrupted_stay_mode_without_reply_end_preserves_active_mode() -> None:
+    c = _client()
+    q: asyncio.Queue = asyncio.Queue()
+    ws = _WS()
+    mic = _Mic()
+    captures = iter([b"question", b"", b"exit stay mode"])
+    replies = 0
+
+    async def fake_play(*args):  # noqa: ANN002
+        nonlocal replies
+        replies += 1
+        state = args[4]
+        if replies == 1:
+            state["voice_mode"] = "stay"
+            state["continue_listening"] = True
+            return False
+        if replies == 2:
+            return True
+        state["ended"] = True
+        state["voice_mode"] = "default"
+        state["continue_listening"] = False
+        state["close_reason"] = "mode_exit"
+        return False
+
+    c._play_reply = fake_play  # type: ignore[method-assign]
+    c._capture_utterance = lambda *_args, **_kwargs: next(captures)  # type: ignore[method-assign]
+
+    async def go() -> dict | None:
+        return await c._converse(ws, mic, q, b"start stay")
+
+    state = asyncio.run(go())
+    sent = [decode(item) for item in ws.sent]
+    assert state is not None
+    assert state["close_reason"] == "mode_exit"
+    assert not any(isinstance(item, ConversationIdle) for item in sent)
+    assert replies == 3
+
+
 def test_device_request_returns_device_response() -> None:
     c = _client()
     ws = _WS()
