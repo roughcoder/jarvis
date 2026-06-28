@@ -57,6 +57,25 @@ def _session(channel: str = "voice") -> BrainSession:
     )
 
 
+def test_system_prompt_mentions_camera_when_available() -> None:
+    sess = BrainSession(
+        load_config(),
+        RequestContext(
+            "pi", "alice", "personal", frozenset({"intercom.camera"}), channel="voice"
+        ),
+        gateway=None,
+        tts=None,
+        memory=None,
+        tracer=None,
+        registry=None,
+    )
+
+    prompt = sess._system_prompt("")
+
+    assert "This intercom has a camera" in prompt
+    assert "take_photo" in prompt
+
+
 def test_system_prompt_injects_now_last() -> None:
     prompt = _session()._system_prompt("")
     assert "Right now it's" in prompt

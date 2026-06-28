@@ -28,7 +28,10 @@ class ContextStore:
         loads the soul) and reused thereafter."""
         key = (ctx.device_id, ctx.identity)
         session = self._sessions.get(key)
-        if session is None:
+        # Profiles can change while the brain is running (new hardware grants, user
+        # pairing, channel/scope changes). A BrainSession stores its RequestContext,
+        # so reusing one with stale capabilities would keep old tool access.
+        if session is None or getattr(session, "_ctx", ctx) != ctx:
             session = self._make(ctx)  # _make_session loads SOUL.md
             self._sessions[key] = session
         return session
