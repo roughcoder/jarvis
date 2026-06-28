@@ -128,6 +128,8 @@ def local_voice_action(user_text: str, active_mode: str = DEFAULT_MODE) -> Local
     if not text or _REQUEST_CUE.search(text):
         return None
     if _EXIT_STAY.search(text):
+        if not _is_pure_voice_control(text, _EXIT_STAY):
+            return None
         return LocalVoiceAction(
             reply="Okay, exiting stay mode.",
             mode=DEFAULT_MODE,
@@ -136,6 +138,8 @@ def local_voice_action(user_text: str, active_mode: str = DEFAULT_MODE) -> Local
             reason="mode_exit",
         )
     if _HARD_EXIT.search(text):
+        if not _is_pure_voice_control(text, _HARD_EXIT):
+            return None
         reply = "Bye." if "bye" in text or "goodnight" in text or "good night" in text else "Okay, going to sleep."
         return LocalVoiceAction(
             reply=reply,
@@ -145,6 +149,8 @@ def local_voice_action(user_text: str, active_mode: str = DEFAULT_MODE) -> Local
             reason="user_closed",
         )
     if _ACTIVATE_STAY.search(text):
+        if not _is_pure_voice_control(text, _ACTIVATE_STAY):
+            return None
         return LocalVoiceAction(
             reply="Okay, I'll stay with you.",
             mode=STAY_MODE,
@@ -226,3 +232,9 @@ def _norm(text: str) -> str:
     text = (text or "").lower().replace("'", "")
     text = re.sub(r"[^\w\s]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_pure_voice_control(text: str, pattern: re.Pattern[str]) -> bool:
+    remainder = pattern.sub(" ", text)
+    remainder = re.sub(r"\b(hey|jarvis|please|ok|okay|and|then)\b", " ", remainder)
+    return not re.sub(r"\s+", " ", remainder).strip()
