@@ -207,6 +207,9 @@ def test_failed_alarm_tool_keeps_voice_turn_open_for_clarification() -> None:
 
 def test_local_voice_action_ignores_requests() -> None:
     assert local_voice_action("bye, can you set a timer") is None
+    assert local_voice_action("stay with me and set an alarm for seven") is None
+    assert local_voice_action("keep listening and turn on the lights") is None
+    assert local_voice_action("please stay with me") is not None
 
 
 def test_reply_end_carries_voice_mode_metadata() -> None:
