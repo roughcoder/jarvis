@@ -29,15 +29,6 @@ def test_google_tools_registered_and_gated() -> None:
     assert "send_email" in {t.name for t in reg.available_for(_ctx("email.send"))}
 
 
-def test_legacy_google_capability_aliases_still_work() -> None:
-    reg = build_registry(ToolsConfig(_env_file=None), google=GoogleConfig(_env_file=None))
-
-    legacy_read = {t.name for t in reg.available_for(_ctx("google.read"))}
-    assert {"search_email", "upcoming_events"} <= legacy_read
-    assert "send_email" not in legacy_read
-    assert "send_email" in {t.name for t in reg.available_for(_ctx("google.send"))}
-
-
 def test_missing_binary_reports_not_set_up() -> None:
     cfg = GoogleConfig(_env_file=None, gogcli_bin="gogcli-does-not-exist")
     tools = {t.name: t for t in make_google_tools(cfg)}

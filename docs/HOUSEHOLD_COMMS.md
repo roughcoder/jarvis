@@ -111,11 +111,6 @@ The current Google-backed house account tool already uses `email.read`,
 `email.send`, and `calendar.read`; future provider work should extend this
 matrix rather than adding provider-named capabilities.
 
-Compatibility note: older private profiles may still grant `google.read` or
-`google.send`. Jarvis treats those as aliases for the matching provider-neutral
-capabilities during the migration, but new profiles should use the generic
-capability names above.
-
 ## Policy Gates
 
 Every account action is decided from:
