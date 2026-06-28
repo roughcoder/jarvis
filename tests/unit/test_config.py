@@ -6,7 +6,15 @@ are deterministic regardless of the developer's local secrets.
 
 from __future__ import annotations
 
-from jarvis.config import BrainConfig, Config, DatabaseConfig, GatewayConfig, IntercomConfig, MemoryConfig
+from jarvis.config import (
+    BrainConfig,
+    Config,
+    DatabaseConfig,
+    GatewayConfig,
+    IntercomConfig,
+    IntercomDeviceConfig,
+    MemoryConfig,
+)
 
 
 def _clean(monkeypatch, *names: str) -> None:
@@ -42,6 +50,40 @@ def test_websocket_keepalive_tolerates_slow_pi_event_loop() -> None:
     assert intercom.websocket_max_size == brain.websocket_max_size
     assert intercom.websocket_ping_interval_s == brain.websocket_ping_interval_s
     assert intercom.websocket_ping_timeout_s == brain.websocket_ping_timeout_s
+
+
+def test_pi_panel_env_names_configure_panel(monkeypatch) -> None:
+    _clean(
+        monkeypatch,
+        "INTERCOM_DEVICE_PI_PANEL",
+        "INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S",
+        "INTERCOM_DEVICE_EYES",
+        "INTERCOM_DEVICE_EYES_SLEEP_AFTER_S",
+    )
+    monkeypatch.setenv("INTERCOM_DEVICE_PI_PANEL", "true")
+    monkeypatch.setenv("INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S", "12")
+
+    c = IntercomDeviceConfig(_env_file=None)
+
+    assert c.pi_panel_setting == "true"
+    assert c.pi_panel_sleep_s == 12.0
+
+
+def test_legacy_eyes_env_still_configures_pi_panel(monkeypatch) -> None:
+    _clean(
+        monkeypatch,
+        "INTERCOM_DEVICE_PI_PANEL",
+        "INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S",
+        "INTERCOM_DEVICE_EYES",
+        "INTERCOM_DEVICE_EYES_SLEEP_AFTER_S",
+    )
+    monkeypatch.setenv("INTERCOM_DEVICE_EYES", "false")
+    monkeypatch.setenv("INTERCOM_DEVICE_EYES_SLEEP_AFTER_S", "9")
+
+    c = IntercomDeviceConfig(_env_file=None)
+
+    assert c.pi_panel_setting == "false"
+    assert c.pi_panel_sleep_s == 9.0
 
 
 def test_env_var_overrides_with_prefix(monkeypatch) -> None:

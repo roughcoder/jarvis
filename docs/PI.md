@@ -33,7 +33,7 @@ capabilities:
   - web.search
   - files.read
   - intercom.camera   # enables take_photo when this Pi advertises a camera
-  - intercom.display  # enables the local eyes UI when this Pi has a screen
+  - intercom.display  # lets the brain recognize this Pi's display capability
 ---
 ```
 
@@ -78,7 +78,7 @@ The service starts immediately after the token-bound `.env` file is written.
 If the brain has not yet been given the matching `BRAIN_DEVICES` entry, the
 service will keep restarting until the brain accepts the device.
 
-### Camera and eyes
+### Camera and PiPanel
 
 Camera capture uses the Raspberry Pi camera tools on the intercom itself:
 `rpicam-still` first, then legacy `libcamera-still`. Configure it with:
@@ -97,14 +97,23 @@ keys live on the Pi.
 For mini screens, set:
 
 ```bash
-INTERCOM_DEVICE_EYES=auto
-INTERCOM_DEVICE_EYES_SLEEP_AFTER_S=25
+INTERCOM_DEVICE_PI_PANEL=auto
+INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S=25
 ```
 
-When a display session is available, the intercom starts a small full-screen eyes
-renderer. The eyes idle, close after the sleep timeout, open on "Hey Jarvis",
-focus while listening, shift while thinking, and animate while Jarvis speaks.
-Pis without a display simply do not advertise `display` and do not start the UI.
+When a display session is available, the intercom starts PiPanel: a small
+full-screen touchscreen shell for Raspberry Pi intercoms. The default view is
+`EyesView`, which idles, sleeps after the timeout, opens on "Hey Jarvis", focuses
+while listening, shifts while thinking, and animates while Jarvis speaks. Tapping
+the screen rotates through `EyesView`, status, camera, and debug views;
+long-press returns to the eyes. The camera view shows local camera readiness and
+can run a bounded test capture on the Pi without exposing any provider keys on
+the device. Pis without a display simply do not advertise `display` and do not
+start the panel.
+
+Existing installs using `INTERCOM_DEVICE_EYES` and
+`INTERCOM_DEVICE_EYES_SLEEP_AFTER_S` keep working as legacy aliases, but new Pi
+setups should use the PiPanel names.
 
 ## Updating and checking the Pi
 

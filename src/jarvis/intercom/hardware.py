@@ -36,7 +36,7 @@ class IntercomHardware:
         caps: list[str] = []
         if _enabled(self._cfg.camera, auto=bool(self._camera_bin)):
             caps.append("camera")
-        if _enabled(self._cfg.eyes, auto=self.display_available()):
+        if _enabled(self._cfg.pi_panel_setting, auto=self.display_available()):
             caps.append("display")
         return caps
 
@@ -52,6 +52,12 @@ class IntercomHardware:
         import asyncio
 
         return await asyncio.to_thread(self._capture_photo_sync, args or {})
+
+    def camera_available(self) -> bool:
+        return bool(self._find_camera_bin())
+
+    def capture_photo_sync(self, args: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._capture_photo_sync(args or {})
 
     def _find_camera_bin(self) -> str:
         if self._cfg.camera_bin:
