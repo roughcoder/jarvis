@@ -22,6 +22,9 @@ devices: [neil-mac]
 whatsapp: ["+441234567890"]
 claims: ["it's neil", "neil here"]
 capabilities: [mcp.notion, mcp.linear]
+calendar_accounts: [neil-calendar]
+email_accounts: [neil-mail]
+household_visibility: availability
 scope: personal
 honcho_peer: neil
 ---
@@ -47,6 +50,9 @@ def test_parse_user_front_matter() -> None:
     assert u.devices == frozenset({"neil-mac"})
     assert "+441234567890" in u.whatsapp
     assert u.capabilities == frozenset({"mcp.notion", "mcp.linear"})
+    assert u.calendar_accounts == ("neil-calendar",)
+    assert u.email_accounts == ("neil-mail",)
+    assert u.household_visibility == "availability"
     assert u.scope == "personal"
     assert u.peer == "neil"
 

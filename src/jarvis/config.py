@@ -258,6 +258,20 @@ class CapabilityConfig(_Base):
     default_capabilities: str = ""
 
 
+class AccountConfig(_Base):
+    """Household email/calendar account binding metadata.
+
+    User profile front-matter may reference bindings by name. The binding files
+    themselves live in a gitignored store and contain provider/account metadata,
+    never model-visible OAuth tokens.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="ACCOUNTS_", env_file=".env", extra="ignore")
+
+    bindings_dir: str = "jarvis-workspace/.accounts"
+    audit_path: str = "jarvis-workspace/.accounts/audit.jsonl"
+
+
 class ToolsConfig(_Base):
     """Tool layer (Phase 3 §6). Provider keys live brain-side only."""
 
@@ -683,6 +697,7 @@ class Config:
         self.persona = PersonaConfig(**source)
         self.trace = TraceConfig(**source)
         self.capabilities = CapabilityConfig(**source)
+        self.accounts = AccountConfig(**source)
         self.tools = ToolsConfig(**source)
         self.brain = BrainConfig(**source)
         self.intercom = IntercomConfig(**source)
@@ -751,6 +766,8 @@ class Config:
             "capabilities.default_capabilities": (
                 self.capabilities.default_capabilities or "<none — deny-by-default>"
             ),
+            "accounts.bindings_dir": self.accounts.bindings_dir,
+            "accounts.audit_path": self.accounts.audit_path,
             "tools.files_root": self.tools.files_root,
             "tools.websearch_provider": self.tools.websearch_provider,
             "tools.websearch_api_key": mask(self.tools.websearch_api_key),

@@ -41,6 +41,9 @@ class User:
     whatsapp: frozenset[str] = frozenset()
     claims: tuple[str, ...] = ()  # extra claim phrases, lowercased
     capabilities: frozenset[str] = frozenset()
+    calendar_accounts: tuple[str, ...] = ()
+    email_accounts: tuple[str, ...] = ()
+    household_visibility: str = ""
     scope: str = "personal"
     honcho_peer: str = ""
 
@@ -119,6 +122,9 @@ def parse_user(name: str, text: str) -> User:
         whatsapp=frozenset(_as_list(fm.get("whatsapp"))),
         claims=tuple(c.lower() for c in _as_list(fm.get("claims"))),
         capabilities=frozenset(_as_list(fm.get("capabilities"))),
+        calendar_accounts=tuple(_as_list(fm.get("calendar_accounts"))),
+        email_accounts=tuple(_as_list(fm.get("email_accounts"))),
+        household_visibility=str(fm.get("household_visibility") or ""),
         scope=str(fm.get("scope") or "personal"),
         honcho_peer=str(fm.get("honcho_peer") or ""),
     )

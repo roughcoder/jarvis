@@ -15,7 +15,7 @@ section() {
 require_dir() {
   local path="$1"
   local label="$2"
-  if [[ ! -d "$path/.git" ]]; then
+  if ! git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "$label checkout not found at $path" >&2
     exit 1
   fi
@@ -104,7 +104,7 @@ scan_runtime_public_files() {
   local blocked
   blocked="$(
     git -C "$ROOT_DIR" ls-files \
-      | grep -E '(^|/)(\.env$|jarvis-workspace/\.mcp-auth/|jarvis-workspace/browser/|jarvis-workspace/users/|jarvis-workspace/worker/jobs/|jarvis-workspace/worker/runs/|\.jsonl$|\.sqlite$|\.db$)' \
+      | grep -E '(^|/)(\.env$|jarvis-workspace/\.mcp-auth/|jarvis-workspace/\.accounts/|jarvis-workspace/browser/|jarvis-workspace/users/|jarvis-workspace/worker/jobs/|jarvis-workspace/worker/runs/|\.jsonl$|\.sqlite$|\.db$)' \
       || true
   )"
   if [[ -n "$blocked" ]]; then
