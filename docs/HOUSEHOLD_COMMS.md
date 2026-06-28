@@ -89,8 +89,9 @@ example `jarvis-workspace/.accounts/<principal>/<binding>.json`, or a later
 Keychain/vault backend. The public profile only says which bindings exist and
 which Jarvis capabilities the user grants.
 
-`jarvis google-setup` creates the default house bindings after successful gogcli
-OAuth. Existing binding files are preserved. For manual migration, create:
+`jarvis google-setup --account <email-or-alias>` creates the default house
+bindings after successful gogcli OAuth. Existing binding files are preserved.
+For manual migration, create:
 
 `jarvis-workspace/.accounts/house/house-email.json`
 
@@ -115,9 +116,9 @@ OAuth. Existing binding files are preserved. For manual migration, create:
 }
 ```
 
-Omit `account` to use gogcli's default account, or set it to the alias passed to
-`jarvis google-setup --account <alias>`. These files are metadata only; OAuth
-tokens stay in gogcli state and must not be copied into the binding store.
+Set `account` to the email or existing gog alias passed to
+`jarvis google-setup --account <email-or-alias>`. These files are metadata only;
+OAuth tokens stay in gogcli state and must not be copied into the binding store.
 
 ## Capability Model
 
