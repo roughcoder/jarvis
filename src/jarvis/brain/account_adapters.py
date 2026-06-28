@@ -111,7 +111,19 @@ class GogcliAccountAdapter:
     def __init__(self, cfg: GoogleConfig) -> None:
         self.cfg = cfg
 
-    async def _run(self, args: list[str], *, enabled: str) -> str:
+    def _account_args(self, binding: AccountBinding) -> list[str]:
+        account = binding.account.strip()
+        if not account:
+            credential_ref = binding.credential_ref.strip()
+            if credential_ref.startswith("gogcli:"):
+                account = credential_ref.split(":", 1)[1].strip()
+            elif ":" not in credential_ref:
+                account = credential_ref
+        if not account:
+            return []
+        return ["--account", account]
+
+    async def _run(self, binding: AccountBinding, args: list[str], *, enabled: str) -> str:
         if not shutil.which(self.cfg.gogcli_bin):
             return "google isn't set up yet — run `jarvis google-setup` first."
         try:
@@ -119,6 +131,7 @@ class GogcliAccountAdapter:
                 self.cfg.gogcli_bin,
                 "--plain",
                 "--no-input",
+                *self._account_args(binding),
                 f"--enable-commands-exact={enabled}",
                 *args,
                 stdout=asyncio.subprocess.PIPE,
@@ -136,7 +149,7 @@ class GogcliAccountAdapter:
         args = ["gmail", "search", "--query", query]
         if max_results is not None:
             args.extend(["--max-results", str(max_results)])
-        return await self._run(args, enabled="gmail.search")
+        return await self._run(binding, args, enabled="gmail.search")
 
     async def get_message(self, binding: AccountBinding, message_id: str, *, body_mode: str = "summary") -> str:
         return "error: gogcli message fetch is not wired yet"
@@ -146,6 +159,7 @@ class GogcliAccountAdapter:
 
     async def send(self, binding: AccountBinding, message: dict[str, Any]) -> str:
         return await self._run(
+            binding,
             [
                 "gmail",
                 "send",
@@ -166,7 +180,7 @@ class GogcliAccountAdapter:
         return "error: gogcli free/busy is not wired yet"
 
     async def list_events(self, binding: AccountBinding, *, days: int) -> str:
-        return await self._run(["calendar", "events", "--days", str(days)], enabled="calendar.events")
+        return await self._run(binding, ["calendar", "events", "--days", str(days)], enabled="calendar.events")
 
     async def create_event(self, binding: AccountBinding, event: dict[str, Any], *, send_updates: bool) -> str:
         return "error: gogcli calendar writes are not wired yet"

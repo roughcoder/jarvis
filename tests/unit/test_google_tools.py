@@ -64,6 +64,7 @@ def test_google_tools_load_house_bindings_from_account_store(tmp_path, monkeypat
     (store / "house-email.json").write_text(
         (
             '{"kind":"email","provider":"gogcli","grants":["email.send"],'
+            '"account":"house",'
             '"household_recipients":["family@example.invalid"]}'
         ),
         encoding="utf-8",
@@ -86,7 +87,8 @@ def test_google_tools_load_house_bindings_from_account_store(tmp_path, monkeypat
     )
 
     assert out == "sent"
-    assert calls
+    assert "--account" in calls[0]
+    assert calls[0][calls[0].index("--account") + 1] == "house"
 
 
 def test_configured_missing_house_binding_fails_closed(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -160,6 +162,56 @@ def test_gog_invocation_is_noninteractive_and_allowlisted(monkeypatch) -> None: 
             "events",
             "--days",
             "2",
+        )
+    ]
+
+
+def test_gog_invocation_selects_account_from_credential_ref(monkeypatch) -> None:  # noqa: ANN001
+    calls: list[tuple[str, ...]] = []
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"ok", b""
+
+    async def fake_exec(*argv, stdout=None, stderr=None):  # noqa: ANN001
+        calls.append(tuple(argv))
+        return FakeProc()
+
+    monkeypatch.setattr("jarvis.brain.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
+    monkeypatch.setattr("jarvis.brain.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    binding = AccountBinding(
+        name="school-email",
+        principal=HOUSE,
+        kind="email",
+        provider="gogcli",
+        credential_ref="gogcli:school",
+        grants=frozenset({"email.read"}),
+    )
+    tools = {
+        t.name: t
+        for t in make_google_tools(
+            GoogleConfig(_env_file=None, gogcli_bin="gog"),
+            email_binding=binding,
+        )
+    }
+
+    out = asyncio.run(tools["search_email"].handler(_ctx("email.read"), {"query": "term"}))
+
+    assert out == "ok"
+    assert calls == [
+        (
+            "gog",
+            "--plain",
+            "--no-input",
+            "--account",
+            "school",
+            "--enable-commands-exact=gmail.search",
+            "gmail",
+            "search",
+            "--query",
+            "term",
         )
     ]
 
@@ -244,6 +296,7 @@ def test_send_email_passes_household_recipient_policy_to_gogcli(monkeypatch) -> 
         principal=HOUSE,
         kind="email",
         provider="gogcli",
+        account="house",
         grants=frozenset({"email.send"}),
         household_recipients=frozenset({"family@example.invalid"}),
     )
@@ -272,6 +325,8 @@ def test_send_email_passes_household_recipient_policy_to_gogcli(monkeypatch) -> 
             "gog",
             "--plain",
             "--no-input",
+            "--account",
+            "house",
             "--enable-commands-exact=gmail.send",
             "gmail",
             "send",
