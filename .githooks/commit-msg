@@ -19,6 +19,7 @@ if ! printf '%s\n' "$subject" | grep -Eq '^[a-z]+(\([^)]+\))?(!)?:[[:space:]]+.+
   echo "  $subject" >&2
   echo "Expected: <type>(<scope>)?: <description>" >&2
   echo "Allowed types: feat, fix, chore, docs, style, refactor, test, perf, build, ci, revert" >&2
+  echo "Release trailers: Release-note:, Env:, Breaking Change:" >&2
   exit 1
 fi
 
@@ -31,6 +32,7 @@ case "$type" in
     echo "Conventional commit check failed: invalid type '${type}' in subject." >&2
     echo "  $subject" >&2
     echo "Allowed types: feat, fix, chore, docs, style, refactor, test, perf, build, ci, revert" >&2
+    echo "Release trailers: Release-note:, Env:, Breaking Change:" >&2
     exit 1
     ;;
 esac

@@ -25,6 +25,10 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GITHUB_REPOSITORY: ${{ github.repository }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL || 'https://api.openai.com/v1' }}
+      JARVIS_RELEASE_NOTES_MODEL: ${{ vars.JARVIS_RELEASE_NOTES_MODEL || secrets.JARVIS_RELEASE_NOTES_MODEL }}
+      JARVIS_RELEASE_NOTES_AI: auto
     steps:
       - uses: actions/checkout@v4
         with:

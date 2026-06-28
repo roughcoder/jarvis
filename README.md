@@ -160,6 +160,15 @@ Commits (based on the latest `vX.Y.Z` tag), then builds a
 release artifacts, and updates `roughcoder/homebrew-infinite-stack` when
 `skip_homebrew` is false.
 
+Release notes are generated from commits in the release range. The generator
+uses commit subjects for categorisation, commit trailers for user-facing detail,
+and `.env.example` diffs for newly added or removed env vars. If
+`OPENAI_API_KEY` and the repository variable `JARVIS_RELEASE_NOTES_MODEL` are
+configured, the workflow asks an AI model to polish the notes; otherwise it
+publishes the deterministic summary from the same facts. Set
+`JARVIS_RELEASE_NOTES_AI=always` when you want release creation to fail instead
+of falling back.
+
 Workflow inputs are now limited to:
 
 - `draft`: whether the GitHub release should remain draft
@@ -178,6 +187,20 @@ access to the tap.
 If your branch contains any non-Conventional Commit messages, they can be
 ignored during version calculation by default; set
 `JARVIS_IGNORE_NON_CONVENTIONAL_COMMITS=0` for strict behavior.
+
+Release-note trailers:
+
+```text
+feat(intercom): route room devices independently
+
+Release-note: Added per-room intercom routing for multi-device homes.
+Env: JARVIS_ROOM_ID added; set this on each room device before enabling routing.
+```
+
+Use `Release-note:` for changes worth mentioning, `Env:` for new/changed/removed
+configuration and the action required, and `Breaking Change:` for migration
+impact. Use `Release-note: skip` only for mechanical commits that should not
+appear in user-facing notes.
 
 Local fallback:
 
