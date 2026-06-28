@@ -1155,7 +1155,7 @@ def _cmd_mic(args: argparse.Namespace) -> int:
     if args.mic_action == "off":
         disable = run("disable")
         stop = run("stop", emit=False)
-        if disable.returncode == 0 or stop.returncode == 0:
+        if disable.returncode == 0 and stop.returncode == 0:
             print("Jarvis mic/listener off: intercom disabled and stopped.")
             return 0
         if stop.stdout:
