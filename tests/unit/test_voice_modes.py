@@ -332,6 +332,16 @@ def test_cancelled_partial_reply_preserves_connection_state() -> None:
     assert conn["voice_mode"] == STAY_MODE
 
 
+def test_cancelled_user_closed_preserves_connection_state() -> None:
+    conn = {"asserted": "neil", "base_asserted": "", "voice_mode": STAY_MODE}
+    result = TurnResult(ended=True, voice_mode=DEFAULT_MODE, close_reason="user_closed")
+
+    BrainServer._apply_cancelled_turn_result("voice", conn, result)
+
+    assert conn["asserted"] == "neil"
+    assert conn["voice_mode"] == STAY_MODE
+
+
 def test_cancelled_explicit_mode_exit_updates_connection_state() -> None:
     conn = {"asserted": "neil", "base_asserted": "", "voice_mode": STAY_MODE}
     result = TurnResult(ended=True, voice_mode=DEFAULT_MODE, close_reason="mode_exit")
