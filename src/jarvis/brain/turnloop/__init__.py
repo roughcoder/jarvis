@@ -30,7 +30,7 @@ from jarvis.brain.memory_client import MemoryClient
 from jarvis.brain.session import BrainSession, TurnResult
 from jarvis.brain.skills import register_skills
 from jarvis.brain.tracing import Tracer
-from jarvis.brain.voice_modes import DEFAULT_MODE, STAY_MODE
+from jarvis.brain.voice_modes import DEFAULT_MODE, STAY_MODE, cancelled_voice_transition
 from jarvis.config import Config
 from jarvis.intercom.audio import AudioIO, MicStream
 from jarvis.intercom.vad import Endpointer, SileroVAD
@@ -119,10 +119,14 @@ class TurnLoop:
         self._voice_mode = DEFAULT_MODE
 
     def _apply_cancelled_turn_result(self, result: TurnResult) -> None:
-        if result.close_reason not in {"mode_enter", "mode_exit"}:
+        transition = cancelled_voice_transition(
+            voice_mode=result.voice_mode,
+            close_reason=result.close_reason,
+        )
+        if transition is None:
             return
-        self._voice_mode = result.voice_mode
-        if result.close_reason == "mode_exit":
+        self._voice_mode = transition.mode
+        if transition.reset_conversation:
             self._reset_voice_conversation()
 
     # --- blocking frame loops (run via to_thread) --------------------------

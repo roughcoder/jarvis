@@ -135,6 +135,19 @@ def test_default_mode_stays_open_on_explicit_open_marker() -> None:
     assert result.voice_mode == DEFAULT_MODE
 
 
+def test_default_mode_soft_close_overrides_open_marker() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(raw="No problem. [[CONVERSATION:open:followup_expected]]")
+
+    sess.finalize("thanks", result)
+
+    assert result.reply == "No problem."
+    assert result.ended is True
+    assert result.continue_listening is False
+    assert result.close_reason == "user_closed"
+    assert result.voice_mode == DEFAULT_MODE
+
+
 def test_signoff_closes_even_when_model_marks_open() -> None:
     sess = _session(DEFAULT_MODE)
     result = TurnResult(raw="No problem. [[CONVERSATION:open:followup_expected]]")
@@ -169,6 +182,19 @@ def test_stay_mode_keeps_listening_after_short_answer() -> None:
     assert result.ended is False
     assert result.continue_listening is True
     assert result.voice_mode == STAY_MODE
+
+
+def test_stay_mode_ignores_generic_closed_marker() -> None:
+    sess = _session(STAY_MODE)
+    result = TurnResult(raw="Done. [[CONVERSATION:closed:task_complete]]")
+
+    sess.finalize("what time is it", result)
+
+    assert result.reply == "Done."
+    assert result.ended is False
+    assert result.continue_listening is True
+    assert result.voice_mode == STAY_MODE
+    assert result.close_reason == "stay_mode"
 
 
 def test_alarm_tools_force_voice_turn_closed() -> None:
