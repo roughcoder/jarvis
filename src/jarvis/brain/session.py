@@ -337,8 +337,9 @@ class BrainSession:
         raw = result.raw or ""
         result.reply = self._clean_reply(raw)  # never store control markers
         result.voice_mode = normalize_mode(result.voice_mode or self._voice_mode)
-        is_voice = self._ctx.channel == "voice" and self._cfg.vad.conversation_mode
-        if is_voice and not result.close_reason:
+        is_voice_channel = self._ctx.channel == "voice"
+        is_open_mic_voice = is_voice_channel and self._cfg.vad.conversation_mode
+        if is_open_mic_voice and not result.close_reason:
             control = parse_voice_control(raw)
             mode = normalize_mode(control.mode or self._voice_mode)
             explicit_close = (
@@ -370,8 +371,13 @@ class BrainSession:
                     result.close_reason = control.reason or "default_complete"
                 mode = DEFAULT_MODE
             result.voice_mode = mode
-        elif is_voice:
+        elif is_open_mic_voice:
             result.voice_mode = normalize_mode(result.voice_mode)
+        elif is_voice_channel:
+            result.ended = True
+            result.continue_listening = False
+            result.close_reason = result.close_reason or "conversation_disabled"
+            result.voice_mode = DEFAULT_MODE
         else:
             result.ended = False
             result.continue_listening = False
