@@ -38,6 +38,7 @@ def test_attribution_uses_resolved_person_and_filter_tags() -> None:
     assert meta["jarvis_channel"] == "whatsapp"
     assert meta["jarvis_speaker"] == "neil"
     assert meta["jarvis_device"] == "whatsapp"
+    assert meta["user_id"] == "neil"
     assert meta["tags"] == [
         "room:kitchen",
         "kind:turn",
@@ -45,6 +46,10 @@ def test_attribution_uses_resolved_person_and_filter_tags() -> None:
         "speaker:neil",
         "device:whatsapp",
     ]
+    assert c._extra_headers(attr) == {
+        "x-litellm-end-user-id": "neil",
+        "x-litellm-tags": "room:kitchen,kind:turn,channel:whatsapp,speaker:neil,device:whatsapp",
+    }
 
 
 def test_house_falls_back_to_family_and_heartbeat_is_explicit() -> None:

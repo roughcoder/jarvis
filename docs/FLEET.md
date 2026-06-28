@@ -225,6 +225,120 @@ jarvis-pi logs
 
 The Pi remains a thin intercom: pairing token only, no provider credentials.
 
+## Runtime Update Runbook
+
+Update the fleet in dependency order: brain host first, linked Macs next, room
+Pis last. The brain owns pairing, LiteLLM, memory, WhatsApp, and tool execution,
+so linked devices should reconnect to an already-upgraded brain.
+
+Preflight:
+
+```bash
+gh release view vX.Y.Z --repo roughcoder/jarvis
+brew update
+brew info roughcoder/infinite-stack/jarvis
+jarvis --version
+JARVIS_ENV_FILE=~/.jarvis/.env jarvis config
+JARVIS_ENV_FILE=~/.jarvis/.env jarvis fleet-status --json
+```
+
+Check new envs before restarting services. For the v0.4 hardware/WebSocket
+upgrade, these keys are supported and safe to omit when defaults are acceptable:
+
+```bash
+BRAIN_WEBSOCKET_MAX_SIZE=8388608
+BRAIN_WEBSOCKET_PING_INTERVAL_S=20
+BRAIN_WEBSOCKET_PING_TIMEOUT_S=60
+INTERCOM_WEBSOCKET_MAX_SIZE=8388608
+INTERCOM_WEBSOCKET_PING_INTERVAL_S=20
+INTERCOM_WEBSOCKET_PING_TIMEOUT_S=60
+INTERCOM_DEVICE_CAMERA=auto
+INTERCOM_DEVICE_CAMERA_BIN=
+INTERCOM_DEVICE_CAMERA_WIDTH=1280
+INTERCOM_DEVICE_CAMERA_HEIGHT=720
+INTERCOM_DEVICE_CAMERA_TIMEOUT_S=8
+INTERCOM_DEVICE_CAMERA_WARMUP_MS=300
+INTERCOM_DEVICE_EYES=auto
+INTERCOM_DEVICE_EYES_SLEEP_AFTER_S=25
+```
+
+Brain Mac:
+
+```bash
+brew upgrade roughcoder/infinite-stack/jarvis
+JARVIS_ENV_FILE=~/.jarvis/.env jarvis service sync brain worker whatsapp
+JARVIS_ENV_FILE=~/.jarvis/.env jarvis service restart brain
+sleep 8
+JARVIS_ENV_FILE=~/.jarvis/.env jarvis service restart worker
+JARVIS_ENV_FILE=~/.jarvis/.env jarvis service restart whatsapp
+JARVIS_ENV_FILE=~/.jarvis/.env jarvis ping-gateway --route fast
+JARVIS_ENV_FILE=~/.jarvis/.env jarvis ping-gateway --route strong
+JARVIS_ENV_FILE=~/.jarvis/.env jarvis fleet-status --json
+```
+
+If the Homebrew wrapper reports recursive `uv run`, repair the installed venv
+and rerun the version check:
+
+```bash
+cd /opt/homebrew/Cellar/jarvis/X.Y.Z/libexec
+/opt/homebrew/opt/uv/bin/uv sync --no-dev
+jarvis --version
+```
+
+If launchd gets stuck after a brain restart, recover cleanly instead of stacking
+restarts:
+
+```bash
+uid=$(id -u)
+plist="$HOME/Library/LaunchAgents/com.jarvis.brain.plist"
+launchctl bootout "gui/$uid" "$plist" 2>/dev/null || true
+lsof -ti tcp:8700 | xargs kill 2>/dev/null || true
+launchctl bootstrap "gui/$uid" "$plist"
+launchctl kickstart -k "gui/$uid/com.jarvis.brain"
+launchctl print "gui/$uid/com.jarvis.brain"
+lsof -nP -iTCP:8700 -sTCP:LISTEN
+```
+
+Linked Macs:
+
+```bash
+brew update
+brew upgrade roughcoder/infinite-stack/jarvis
+JARVIS_ENV_FILE=~/.jarvis/.env jarvis service sync worker intercom
+JARVIS_ENV_FILE=~/.jarvis/.env jarvis service restart worker
+sleep 3
+JARVIS_ENV_FILE=~/.jarvis/.env jarvis service restart intercom
+JARVIS_ENV_FILE=~/.jarvis/.env jarvis fleet-status --json --no-docker
+```
+
+Room Pis:
+
+```bash
+ssh alice@<tailscale-ip> 'sudo jarvis-pi update && jarvis-pi status && jarvis-pi doctor'
+```
+
+If a Pi is offline in Tailscale, do not continue the Pi step from the brain Mac.
+Ask for a physical power/network check, then retry SSH when Tailscale reports the
+host online.
+
+Pi screens are optional hardware. The SunFounder Pironman 5 Pro Max screen is a
+4.3-inch 800x480 MIPI DSI display. Keep `INTERCOM_DEVICE_EYES=auto` until the
+systemd service has a real display session (`DISPLAY` or `WAYLAND_DISPLAY`);
+forcing eyes on a headless unit can make the UI probe fail. Grant
+`intercom.display` only on profiles for Pis that actually have a working screen.
+
+Post-update smoke:
+
+```bash
+JARVIS_ENV_FILE=~/.jarvis/.env jarvis text --once "Smoke test after upgrade: reply with only OK."
+JARVIS_ENV_FILE=~/.jarvis/.env jarvis traces -n 10
+```
+
+In LiteLLM spend logs, Jarvis turns should be filterable by request tags:
+`kind:turn`, `channel:text` or `channel:whatsapp`, `speaker:<person>`, and
+`device:<device_id>`. Heartbeats should show `end_user=heartbeat` and tags
+`kind:heartbeat`, `channel:system`, `speaker:heartbeat`.
+
 On newer Raspberry Pi OS / Debian releases, the system Python may be newer than
 Jarvis supports. Pin the installer to a compatible managed Python when needed:
 

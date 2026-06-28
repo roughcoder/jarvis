@@ -19,8 +19,9 @@ from jarvis.config import GatewayConfig
 class LLMAttribution:
     """Per-request LiteLLM attribution.
 
-    LiteLLM stores OpenAI's `user` as End User and `metadata.tags` as request
-    tags, so keep the values short and filter-friendly.
+    LiteLLM stores request tags in spend logs and supports an explicit
+    `x-litellm-end-user-id` header for the End User column, so keep the values
+    short and filter-friendly.
     """
 
     kind: str = "turn"  # turn | heartbeat | background | skill | ping | ...
@@ -87,24 +88,39 @@ class GatewayClient:
         speaker = (attribution.speaker if attribution else "").strip()
         return speaker if speaker and speaker != "house" else self._speaker
 
-    def _extra_body(self, attribution: LLMAttribution | None) -> dict:
-        meta = {
-            "jarvis_kind": (attribution.kind if attribution else "turn"),
-            "jarvis_channel": (attribution.channel if attribution else "voice"),
-            "jarvis_speaker": self._end_user(attribution),
-            "jarvis_room": self._cfg.room,
-        }
-        if attribution and attribution.device_id:
-            meta["jarvis_device"] = attribution.device_id
+    def _tags(self, attribution: LLMAttribution | None) -> list[str]:
+        kind = attribution.kind if attribution else "turn"
+        channel = attribution.channel if attribution else "voice"
+        end_user = self._end_user(attribution)
         tags = [
             f"room:{self._cfg.room}",
-            f"kind:{meta['jarvis_kind']}",
-            f"channel:{meta['jarvis_channel']}",
-            f"speaker:{meta['jarvis_speaker']}",
+            f"kind:{kind}",
+            f"channel:{channel}",
+            f"speaker:{end_user}",
         ]
         if attribution and attribution.device_id:
             tags.append(f"device:{attribution.device_id}")
+        return tags
+
+    def _extra_body(self, attribution: LLMAttribution | None) -> dict:
+        end_user = self._end_user(attribution)
+        meta = {
+            "jarvis_kind": (attribution.kind if attribution else "turn"),
+            "jarvis_channel": (attribution.channel if attribution else "voice"),
+            "jarvis_speaker": end_user,
+            "jarvis_room": self._cfg.room,
+            "user_id": end_user,
+        }
+        if attribution and attribution.device_id:
+            meta["jarvis_device"] = attribution.device_id
+        tags = self._tags(attribution)
         return {"metadata": {**meta, "tags": tags}}
+
+    def _extra_headers(self, attribution: LLMAttribution | None) -> dict:
+        return {
+            "x-litellm-end-user-id": self._end_user(attribution),
+            "x-litellm-tags": ",".join(self._tags(attribution)),
+        }
 
     async def complete(
         self,
@@ -119,6 +135,7 @@ class GatewayClient:
             messages=messages,  # type: ignore[arg-type]
             user=self._end_user(attribution),
             extra_body=self._extra_body(attribution),
+            extra_headers=self._extra_headers(attribution),
         )
         return resp.choices[0].message.content or ""
 
@@ -139,6 +156,7 @@ class GatewayClient:
             "stream": True,
             "user": self._end_user(attribution),
             "extra_body": self._extra_body(attribution),
+            "extra_headers": self._extra_headers(attribution),
         }
         if usage_out is not None:
             kwargs["stream_options"] = {"include_usage": True}
@@ -170,6 +188,7 @@ class GatewayClient:
             "messages": messages,
             "user": self._end_user(attribution),
             "extra_body": self._extra_body(attribution),
+            "extra_headers": self._extra_headers(attribution),
         }
         if tools:
             kwargs["tools"] = tools
@@ -191,6 +210,7 @@ class GatewayClient:
             input=texts,
             user=self._end_user(attribution),
             extra_body=self._extra_body(attribution),
+            extra_headers=self._extra_headers(attribution),
         )
         return [d.embedding for d in resp.data]
 
