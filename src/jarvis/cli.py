@@ -572,6 +572,7 @@ def _cmd_remote_setup(_args: argparse.Namespace) -> int:
 
 def _cmd_google_setup(_args: argparse.Namespace) -> int:
     """One-time OAuth for the current house email/calendar adapter via gogcli."""
+    import json
     import shutil
     import subprocess
 
@@ -579,11 +580,42 @@ def _cmd_google_setup(_args: argparse.Namespace) -> int:
     if not shutil.which(cfg.google.gogcli_bin):
         print(f"{cfg.google.gogcli_bin!r} not found — install gogcli, then re-run.")
         return 1
+    account = (getattr(_args, "account", "") or os.environ.get("GOG_ACCOUNT", "")).strip()
+    auth_cmd = [cfg.google.gogcli_bin, "auth", "login"]
+    if account:
+        auth_cmd = [cfg.google.gogcli_bin, "--account", account, "auth", "login"]
     print("Launching gogcli auth (a browser window will open)…")
     try:
-        return subprocess.run([cfg.google.gogcli_bin, "auth", "login"]).returncode
+        code = subprocess.run(auth_cmd).returncode
     except KeyboardInterrupt:
         return 1
+    if code != 0:
+        return code
+
+    root = Path(cfg.accounts.bindings_dir) / "house"
+    root.mkdir(parents=True, exist_ok=True)
+    common = {"provider": "gogcli"}
+    if account:
+        common["account"] = account
+    bindings = {
+        cfg.accounts.house_email_binding: {
+            **common,
+            "kind": "email",
+            "grants": ["email.read", "email.draft", "email.send"],
+        },
+        cfg.accounts.house_calendar_binding: {
+            **common,
+            "kind": "calendar",
+            "grants": ["calendar.freebusy", "calendar.read"],
+            "calendar_id": "primary",
+        },
+    }
+    for name, data in bindings.items():
+        path = root / f"{name}.json"
+        if not path.exists():
+            path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            print(f"Wrote {path}")
+    return 0
 
 
 def _cmd_mcp(args: argparse.Namespace) -> int:
@@ -1446,6 +1478,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_gsetup = sub.add_parser(
         "google-setup", help="One-time: OAuth for the house email/calendar adapter (gogcli)"
+    )
+    p_gsetup.add_argument(
+        "--account",
+        default="",
+        help="Optional gogcli account alias to authenticate and store in the house bindings.",
     )
     p_gsetup.set_defaults(func=_cmd_google_setup)
 
