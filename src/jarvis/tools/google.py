@@ -17,6 +17,8 @@ from jarvis.brain.identity import HOUSE
 from jarvis.config import AccountConfig, GoogleConfig
 from jarvis.tools.base import Tool
 
+_MAX_CALENDAR_DAYS = 366
+
 
 def _house_email_binding() -> AccountBinding:
     return AccountBinding(
@@ -66,7 +68,9 @@ def make_google_tools(
         return await router.search_email(ctx, email_binding, query)
 
     async def upcoming_events(ctx: RequestContext, args: dict[str, Any]) -> str:
-        days = int(args.get("days") or cfg.calendar_days)
+        days = _parse_days(args.get("days"), default=cfg.calendar_days)
+        if isinstance(days, str):
+            return days
         return await router.list_events(ctx, calendar_binding, days=days)
 
     async def send_email(ctx: RequestContext, args: dict[str, Any]) -> str:
@@ -137,6 +141,22 @@ def _configured_house_binding(
     except AccountBindingError:
         return _closed_house_binding(name=name, kind=kind)
     return binding if binding.kind == kind else _closed_house_binding(name=name, kind=kind)
+
+
+def _parse_days(value: Any, *, default: int) -> int | str:
+    if value is None or value == "":
+        value = default
+    if isinstance(value, bool):
+        return "error: days must be a positive integer"
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        return "error: days must be a positive integer"
+    if days < 1:
+        return "error: days must be a positive integer"
+    if days > _MAX_CALENDAR_DAYS:
+        return f"error: days must be at most {_MAX_CALENDAR_DAYS}"
+    return days
 
 
 def _closed_house_binding(*, name: str, kind: str) -> AccountBinding:

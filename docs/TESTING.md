@@ -185,7 +185,15 @@ number resolves to a user via `users/<name>.md` (`whatsapp:` binding).
 ```bash
 # install gogcli, then:
 uv run jarvis google-setup           # browser OAuth for the house account
+# or, for a named gog account:
+uv run jarvis google-setup --account house
 ```
+The setup command creates private metadata files under
+`jarvis-workspace/.accounts/house/house-email.json` and
+`jarvis-workspace/.accounts/house/house-calendar.json`. Re-run it after
+upgrading from an older install that authenticated gogcli but has no account
+binding files yet. Existing binding files are preserved.
+
 **Pass:** ask **"What's on my calendar this week?"** → `upcoming_events` runs (tool log
 `[calendar.read]`). `send_email` only fires with `email.send` granted.
 
