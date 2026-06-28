@@ -1,10 +1,11 @@
-"""Google tools — Jarvis's own Gmail + Calendar via `gogcli` (Phase 3 §6).
+"""Email/calendar tools — Jarvis's own Google account via `gogcli` (Phase 3 §6).
 
 A thin client like `worker.py`: it shells out to the local `gogcli` binary (which
 holds its own OAuth token from `jarvis google-setup`) and never embeds provider
-credentials. Read actions are gated `google.read`; sending mail is the separate,
-more dangerous `google.send`. Every call is timeout-bounded so the hot path can't
-hang. With the binary absent the tools still register but report "not set up".
+credentials. The tool surface is provider-neutral: mail and calendar actions are
+gated by `email.*` / `calendar.*` capabilities even though this adapter currently
+uses Google underneath. Every call is timeout-bounded so the hot path can't hang.
+With the binary absent the tools still register but report "not set up".
 """
 
 from __future__ import annotations
@@ -57,24 +58,24 @@ def make_google_tools(cfg: GoogleConfig) -> list[Tool]:
     return [
         Tool(
             "search_email",
-            "Search Jarvis's Gmail (the house account) and return matching messages.",
+            "Search Jarvis's email (the house account) and return matching messages.",
             {"type": obj, "properties": {"query": {"type": "string"}}, "required": ["query"]},
-            "google.read",
+            "email.read",
             search_email,
             announce=True,
         ),
         Tool(
             "upcoming_events",
-            "List upcoming Google Calendar events for the next few days.",
+            "List upcoming calendar events for the next few days.",
             {"type": obj, "properties": {"days": {"type": "integer", "description": "Look-ahead window."}}},
-            "google.read",
+            "calendar.read",
             upcoming_events,
             announce=True,
         ),
         Tool(
             "send_email",
-            "Send an email from Jarvis's Gmail (the house account). Use only when the "
-            "user clearly asks to send a message.",
+            "Send an email from Jarvis's house account. Use only when the user clearly "
+            "asks to send a message.",
             {
                 "type": obj,
                 "properties": {
@@ -84,7 +85,7 @@ def make_google_tools(cfg: GoogleConfig) -> list[Tool]:
                 },
                 "required": ["to", "body"],
             },
-            "google.send",
+            "email.send",
             send_email,
             announce=True,
         ),

@@ -536,10 +536,12 @@ class MCPConfig(_Base):
 
 
 class GoogleConfig(_Base):
-    """`google` tool (Phase 3 §6) — Jarvis's OWN Gmail + Calendar (the house
-    account), via the `gogcli` CLI. A thin client like the worker: it shells out to
-    a local, separately-authenticated binary; provider credentials never live in the
-    tool. `jarvis google-setup` does the one-time OAuth."""
+    """Current email/calendar adapter (Phase 3 §6): Jarvis's OWN Gmail + Calendar
+    house account, via the `gogcli` CLI. The registered tool capabilities are
+    provider-neutral (`email.*` / `calendar.*`); this config is only the adapter
+    wiring. A thin client like the worker: it shells out to a local,
+    separately-authenticated binary; provider credentials never live in the tool.
+    `jarvis google-setup` does the one-time OAuth."""
 
     model_config = SettingsConfigDict(env_prefix="GOOGLE_", env_file=".env", extra="ignore")
 

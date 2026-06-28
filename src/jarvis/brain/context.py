@@ -13,6 +13,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+_LEGACY_CAPABILITY_ALIASES = {
+    # Pre-household-comms profiles used provider-named grants. Keep them working
+    # while public examples and new profiles move to provider-neutral grants.
+    "email.read": frozenset({"google.read"}),
+    "calendar.read": frozenset({"google.read"}),
+    "email.send": frozenset({"google.send"}),
+}
+
+
 @dataclass(frozen=True)
 class RequestContext:
     device_id: str  # which intercom/device the request arrived from
@@ -25,7 +34,9 @@ class RequestContext:
     peer: str = ""  # memory principal (Honcho peer); empty => derive from identity
 
     def can(self, capability: str) -> bool:
-        return capability in self.capabilities
+        return capability in self.capabilities or bool(
+            _LEGACY_CAPABILITY_ALIASES.get(capability, frozenset()) & self.capabilities
+        )
 
     @property
     def memory_peer(self) -> str:

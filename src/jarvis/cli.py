@@ -571,7 +571,7 @@ def _cmd_remote_setup(_args: argparse.Namespace) -> int:
 
 
 def _cmd_google_setup(_args: argparse.Namespace) -> int:
-    """One-time OAuth for the `google` tool (Jarvis's own Gmail/Calendar via gogcli)."""
+    """One-time OAuth for the current house email/calendar adapter via gogcli."""
     import shutil
     import subprocess
 
@@ -1445,7 +1445,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_remote.set_defaults(func=_cmd_remote_setup)
 
     p_gsetup = sub.add_parser(
-        "google-setup", help="One-time: OAuth for the google tool (gogcli)"
+        "google-setup", help="One-time: OAuth for the house email/calendar adapter (gogcli)"
     )
     p_gsetup.set_defaults(func=_cmd_google_setup)
 

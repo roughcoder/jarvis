@@ -10,8 +10,9 @@ capabilities:
   - worker.shell
   - skills.run
   - skills.author
-  - google.read
-  - google.send
+  - email.read
+  - email.send
+  - calendar.read
   - worker.gui
   - worker.browser
   - background.run
