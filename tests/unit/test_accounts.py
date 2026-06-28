@@ -58,6 +58,8 @@ def test_load_account_binding_from_private_json(tmp_path) -> None:  # noqa: ANN0
                 "calendar_id": "primary",
                 "credential_ref": "gogcli:neil",
                 "household_visibility": "availability",
+                "household_recipients": ["jules@example.invalid"],
+                "known_recipients": ["school@example.invalid"],
             }
         )
     )
@@ -70,6 +72,8 @@ def test_load_account_binding_from_private_json(tmp_path) -> None:  # noqa: ANN0
     assert binding.provider == "gogcli"
     assert binding.grants == frozenset({"calendar.freebusy", "calendar.read"})
     assert binding.household_visibility == "availability"
+    assert binding.household_recipients == frozenset({"jules@example.invalid"})
+    assert binding.known_recipients == frozenset({"school@example.invalid"})
 
 
 def test_load_account_bindings_can_filter_by_kind(tmp_path) -> None:  # noqa: ANN001

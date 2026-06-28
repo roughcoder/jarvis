@@ -170,7 +170,21 @@ def test_send_email_passes_household_recipient_policy_to_gogcli(monkeypatch) -> 
 
     monkeypatch.setattr("jarvis.brain.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
     monkeypatch.setattr("jarvis.brain.account_adapters.asyncio.create_subprocess_exec", fake_exec)
-    tools = {t.name: t for t in make_google_tools(GoogleConfig(_env_file=None, gogcli_bin="gog"))}
+    binding = AccountBinding(
+        name="house-email",
+        principal=HOUSE,
+        kind="email",
+        provider="gogcli",
+        grants=frozenset({"email.send"}),
+        household_recipients=frozenset({"family@example.invalid"}),
+    )
+    tools = {
+        t.name: t
+        for t in make_google_tools(
+            GoogleConfig(_env_file=None, gogcli_bin="gog"),
+            email_binding=binding,
+        )
+    }
 
     out = asyncio.run(
         tools["send_email"].handler(
@@ -179,7 +193,6 @@ def test_send_email_passes_household_recipient_policy_to_gogcli(monkeypatch) -> 
                 "to": "family@example.invalid",
                 "subject": "Hi",
                 "body": "Hello",
-                "recipient_class": "household",
             },
         )
     )

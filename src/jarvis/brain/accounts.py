@@ -71,6 +71,8 @@ class AccountBinding:
     calendar_id: str = ""
     credential_ref: str = ""
     household_visibility: str = ""
+    household_recipients: frozenset[str] = field(default_factory=frozenset)
+    known_recipients: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True)
@@ -163,6 +165,8 @@ def parse_account_binding(name: str, principal: str, data: dict[str, Any]) -> Ac
         calendar_id=_flat_scalar(data.get("calendar_id"), key="calendar_id"),
         credential_ref=_flat_scalar(data.get("credential_ref"), key="credential_ref"),
         household_visibility=_flat_scalar(data.get("household_visibility"), key="household_visibility"),
+        household_recipients=_string_set(data.get("household_recipients"), key="household_recipients"),
+        known_recipients=_string_set(data.get("known_recipients"), key="known_recipients"),
     )
 
 
