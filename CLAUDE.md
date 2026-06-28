@@ -10,5 +10,7 @@ Quick reminders:
   ports, keys, or model names.
 - Release notes are generated from commit messages. Put user-facing detail in
   trailers: `Release-note:`, `Env:`, and `Breaking Change:`.
+- Runtime releases are GitHub Actions only; never run
+  `scripts/release_runtime.sh` locally.
 - Honour the two hard constraints in AGENTS.md (network boundary everywhere;
   the hot path never blocks on a memory write).

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -108,3 +109,18 @@ Release-note: skip
     )
 
     assert release_notes.grouped_notes([commit])["other"] == []
+
+
+def test_release_runtime_refuses_local_publish(monkeypatch) -> None:
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+    monkeypatch.delenv("GITHUB_WORKFLOW", raising=False)
+
+    result = subprocess.run(
+        [str(ROOT / "scripts" / "release_runtime.sh"), "9.9.9"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "must be published by the GitHub Actions" in result.stderr
