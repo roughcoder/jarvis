@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import pathlib
 import random
 import re
 import string
@@ -37,6 +36,8 @@ from jarvis.protocol.messages import (
     decode,
     encode,
 )
+from jarvis.users import add_whatsapp_number as _add_whatsapp_number
+from jarvis.users import user_whatsapp_numbers
 
 
 @dataclass(frozen=True)
@@ -89,14 +90,6 @@ def is_allowed(sender: str, policy: str, allow_from: str) -> bool:
     return _digits(sender) in allowed
 
 
-_NAME_OK = re.compile(r"[^a-z0-9_-]")
-
-
-def _slug(name: str) -> str:
-    s = _NAME_OK.sub("_", (name or "").strip().lower().replace(" ", "_")).strip("_")
-    return s[:48] or "user"
-
-
 def parse_admin_cmd(text: str):  # noqa: ANN201 - ('approve'|'deny', code, name) | None
     """Parse an admin pairing command: 'approve <code> [name]' or 'deny <code>'."""
     m = re.match(r"\s*(approve|deny)\s+([A-Za-z0-9]{2,12})\s*(.*)$", text or "", re.IGNORECASE)
@@ -106,50 +99,13 @@ def parse_admin_cmd(text: str):  # noqa: ANN201 - ('approve'|'deny', code, name)
 
 
 def _user_numbers(users_dir: str) -> set[str]:
-    """Digits of every whatsapp number across users/*.md — seeds the connector's
-    known-user allowlist so a paired user is recognised (incl. after a restart)."""
-    out: set[str] = set()
-    d = pathlib.Path(users_dir)
-    if not d.is_dir():
-        return out
-    for f in d.glob("*.md"):
-        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
-            m = re.match(r"\s*whatsapp:\s*\[(.*)\]", line)
-            if m:
-                out |= {_digits(e) for e in m.group(1).split(",") if _digits(e)}
-    return out
+    """Compatibility wrapper for the shared user profile store."""
+    return user_whatsapp_numbers(users_dir)
 
 
 def add_whatsapp_number(users_dir: str, name: str, number: str) -> str:
-    """Add `number` to users/<slug>.md's whatsapp list. MERGES into an existing file
-    (preserving capabilities/scope/memory/body; idempotent) or creates a fresh personal
-    user. Returns 'created' | 'merged' | 'exists'."""
-    d = pathlib.Path(users_dir)
-    d.mkdir(parents=True, exist_ok=True)
-    slug = _slug(name)
-    path = d / f"{slug}.md"
-    nd = _digits(number) or number.strip()
-    if not path.exists():
-        path.write_text(
-            f'---\n# {name} — paired via WhatsApp\nwhatsapp: ["{nd}"]\n'
-            f"scope: personal\nhoncho_peer: {slug}\n"
-            f"capabilities: [profile.write]\n---\n\n# {name}\n",
-            encoding="utf-8",
-        )
-        return "created"
-    text = path.read_text(encoding="utf-8", errors="replace")
-    m = re.search(r"^(whatsapp:\s*)\[(.*)\]\s*$", text, re.MULTILINE)
-    if m:
-        existing = [e.strip().strip("'\"") for e in m.group(2).split(",") if e.strip()]
-        if any(_digits(e) == _digits(number) for e in existing):
-            return "exists"
-        existing.append(nd)
-        new_line = m.group(1) + "[" + ", ".join(f'"{e}"' for e in existing) + "]"
-        path.write_text(text[: m.start()] + new_line + text[m.end():], encoding="utf-8")
-        return "merged"
-    # No whatsapp line — insert one right after the opening front-matter '---'.
-    path.write_text(re.sub(r"(?m)^---\s*$", f'---\nwhatsapp: ["{nd}"]', text, count=1), encoding="utf-8")
-    return "merged"
+    """Compatibility wrapper for the shared user profile store."""
+    return _add_whatsapp_number(users_dir, name, number)
 
 
 def _is_group(chat: str) -> bool:

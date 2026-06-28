@@ -20,10 +20,10 @@ import pathlib
 import re
 from dataclasses import dataclass
 
-from jarvis.brain.context import RequestContext
+from jarvis.runtime import RequestContext
 from jarvis.brain.dialog import _now_line
 from jarvis.brain.gateway_client import LLMAttribution
-from jarvis.brain.identity import _parse_front_matter
+from jarvis.users import parse_front_matter
 from jarvis.config import Config
 from jarvis.tools.base import Tool, ToolRegistry
 
@@ -53,7 +53,7 @@ class Skill:
 
 
 def parse_skill(name: str, text: str) -> Skill:
-    fm = _parse_front_matter(text)
+    fm = parse_front_matter(text)
     body = re.sub(r"^\s*---\s*\n.*?\n---\s*\n?", "", text, count=1, flags=re.DOTALL).strip()
 
     def _list(key: str) -> list[str]:

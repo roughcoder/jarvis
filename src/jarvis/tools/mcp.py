@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from jarvis.brain.context import RequestContext
+from jarvis.runtime import RequestContext
 from jarvis.mcp.bridge import MCPBridge
 from jarvis.tools.base import Tool
 

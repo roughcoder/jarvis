@@ -21,7 +21,7 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
-from jarvis.brain.context import RequestContext
+from jarvis.runtime import RequestContext
 from jarvis.brain.dialog import (
     _END_INSTRUCTION,
     _END_RE,
@@ -36,7 +36,7 @@ from jarvis.brain.dialog import (
 )
 from jarvis.brain.gateway_client import GatewayClient, LLMAttribution
 from jarvis.brain.memory_client import MemoryClient
-from jarvis.brain.profile import format_facts, read_facts
+from jarvis.users import format_facts, read_facts
 from jarvis.brain.tracing import Tracer
 from jarvis.brain.voice_modes import (
     DEFAULT_MODE,

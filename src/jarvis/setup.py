@@ -13,9 +13,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from jarvis.brain.identity import _parse_front_matter
-from jarvis.brain.profile import remember_fact
 from jarvis.deploy import ROLES
+from jarvis.users import parse_front_matter, read_facts, remember_fact
 
 
 SECRET_KEYS = {
@@ -296,7 +295,7 @@ def _write_admin_user(workdir: Path, values: dict[str, str], admin_slug: str, ad
     users_dir.mkdir(parents=True, exist_ok=True)
     path = users_dir / f"{admin_slug}.md"
     text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else f"# {admin.get('name') or admin_slug}\n"
-    fm = _parse_front_matter(text)
+    fm = parse_front_matter(text)
     devices = _as_list(fm.get("devices"))
     if device_id not in devices:
         devices.append(device_id)
@@ -338,10 +337,10 @@ def _read_admin(values: dict[str, str], users_dir: Path) -> dict[str, Any]:
     title = re.search(r"^#\s+(.+)$", text, re.MULTILINE)
     if title:
         out["name"] = title.group(1).strip()
-    facts = dict(re.findall(r"^- ([^:]+):\s*(.*)$", text, flags=re.MULTILINE))
+    facts = read_facts(path)
     out["email"] = facts.get("email", "")
     out["phone"] = facts.get("phone", "")
-    fm = _parse_front_matter(text)
+    fm = parse_front_matter(text)
     whatsapps = _as_list(fm.get("whatsapp"))
     if whatsapps and not out["whatsapp_admin"]:
         out["whatsapp_admin"] = whatsapps[0]

@@ -12,21 +12,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import pathlib
-from typing import TYPE_CHECKING
+from typing import Any
 
-from jarvis.brain.context import RequestContext
-from jarvis.brain.profile import forget_fact, read_facts, remember_fact
 from jarvis.config import CapabilityConfig
+from jarvis.runtime import RequestContext
 from jarvis.tools.base import Tool
-
-if TYPE_CHECKING:
-    from jarvis.brain.memory_client import MemoryClient
+from jarvis.users import forget_fact, read_facts, remember_fact
 
 _CAP = "profile.write"
 
 
 def make_profile_tools(
-    capabilities: CapabilityConfig, *, memory: MemoryClient | None = None
+    capabilities: CapabilityConfig, *, memory: Any | None = None
 ) -> list[Tool]:
     users_dir = capabilities.users_dir
     _seed_tasks: set[asyncio.Task] = set()  # hold refs so cold seeds aren't GC'd

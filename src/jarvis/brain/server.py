@@ -18,7 +18,7 @@ import websockets
 
 from jarvis.brain.background import BackgroundRunner
 from jarvis.brain.capabilities import context_for_resolution
-from jarvis.brain.context import RequestContext
+from jarvis.runtime import RequestContext
 from jarvis.brain.contexts import ContextStore
 from jarvis.brain.gateway_client import GatewayClient
 from jarvis.brain.heartbeat import HeartbeatScheduler, make_heartbeat_think

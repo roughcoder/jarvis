@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from jarvis.brain.context import RequestContext
+from jarvis.runtime import RequestContext
 from jarvis.config import RemoteConfig
 from jarvis.remote.client import RemoteClient
 from jarvis.tools.base import Tool

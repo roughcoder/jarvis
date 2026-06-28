@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from jarvis.brain.context import RequestContext
+from jarvis.runtime import RequestContext
 from jarvis.brain.session import BrainSession
 
 

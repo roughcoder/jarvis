@@ -10,7 +10,7 @@ from __future__ import annotations
 import pathlib
 from typing import Any
 
-from jarvis.brain.context import RequestContext
+from jarvis.runtime import RequestContext
 from jarvis.config import ToolsConfig
 from jarvis.tools.base import Tool, ToolError
 
