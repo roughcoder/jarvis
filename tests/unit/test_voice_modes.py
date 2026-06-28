@@ -32,9 +32,11 @@ class _TTS:
         yield text.encode()
 
 
-def _session(mode: str = DEFAULT_MODE) -> BrainSession:
+def _session(mode: str = DEFAULT_MODE, *, conversation_mode: bool = True) -> BrainSession:
+    cfg = load_config()
+    cfg.vad.conversation_mode = conversation_mode
     sess = BrainSession(
-        load_config(),
+        cfg,
         RequestContext("dev", "house", "house", frozenset(), channel="voice"),
         gateway=_Gateway(),
         tts=_TTS(),
@@ -125,6 +127,18 @@ def test_signoff_closes_even_when_model_marks_open() -> None:
     assert result.ended is True
     assert result.continue_listening is False
     assert result.close_reason == "user_closed"
+    assert result.voice_mode == DEFAULT_MODE
+
+
+def test_voice_turn_closes_when_conversation_mode_disabled() -> None:
+    sess = _session(STAY_MODE, conversation_mode=False)
+    result = TurnResult(raw="It's seven o'clock.")
+
+    sess.finalize("what time is it", result)
+
+    assert result.ended is True
+    assert result.continue_listening is False
+    assert result.close_reason == "conversation_disabled"
     assert result.voice_mode == DEFAULT_MODE
 
 
