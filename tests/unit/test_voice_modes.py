@@ -291,6 +291,24 @@ def test_alarm_ack_preserves_stay_mode() -> None:
     assert end.close_reason == "alarm_ack"
 
 
+def test_empty_voice_transcript_closes_and_resets_mode() -> None:
+    end = BrainServer._empty_transcript_reply_end("t1", "voice")
+
+    assert end.ended is True
+    assert end.continue_listening is False
+    assert end.voice_mode == DEFAULT_MODE
+    assert end.close_reason == "empty_transcript"
+
+
+def test_empty_text_transcript_remains_open_message_boundary() -> None:
+    end = BrainServer._empty_transcript_reply_end("t1", "whatsapp")
+
+    assert end.ended is False
+    assert end.continue_listening is False
+    assert end.voice_mode == DEFAULT_MODE
+    assert end.close_reason == ""
+
+
 def test_cancelled_partial_reply_preserves_connection_state() -> None:
     conn = {"asserted": "neil", "base_asserted": "", "voice_mode": STAY_MODE}
     result = TurnResult(ended=True, voice_mode=DEFAULT_MODE, close_reason="default_complete")

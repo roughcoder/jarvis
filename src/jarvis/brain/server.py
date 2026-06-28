@@ -552,6 +552,18 @@ class BrainServer:
         )
 
     @staticmethod
+    def _empty_transcript_reply_end(turn_id: str, channel: str) -> ReplyEnd:
+        if channel == "voice":
+            return ReplyEnd(
+                turn_id=turn_id,
+                ended=True,
+                continue_listening=False,
+                voice_mode=DEFAULT_MODE,
+                close_reason="empty_transcript",
+            )
+        return ReplyEnd(turn_id=turn_id, ended=False)
+
+    @staticmethod
     def _apply_turn_result(channel: str, conn: dict, result: TurnResult) -> None:
         conn["voice_mode"] = result.voice_mode
         if result.ended:
@@ -572,7 +584,10 @@ class BrainServer:
             text = msg.text
         turn_id = msg.turn_id
         if not text:
-            await ws.send(encode(ReplyEnd(turn_id=turn_id, ended=False)))
+            end = self._empty_transcript_reply_end(turn_id, channel)
+            await ws.send(encode(end))
+            if end.ended:
+                self._reset_voice_conversation(channel, conn)
             return
         print(f"  you: {text!r}")
         with contextlib.suppress(Exception):  # let the intercom print what was heard
