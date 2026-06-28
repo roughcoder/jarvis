@@ -34,6 +34,7 @@ from jarvis.mcp import MCPBridge
 from jarvis.protocol.messages import (
     BargeIn,
     Cancel,
+    ConversationIdle,
     DeviceRequest,
     DeviceResponse,
     Hello,
@@ -444,8 +445,10 @@ class BrainServer:
         hardware = {h.strip().lower() for h in first.hardware if h.strip()}
         conn = {
             "asserted": first.identity,
+            "base_asserted": first.identity if channel != "voice" else "",
             "device_default": device_default or HOUSE,
             "hardware": hardware,
+            "voice_mode": "default",
             "waiters": {},
         }
         base = self._resolve(
@@ -477,6 +480,8 @@ class BrainServer:
                 if isinstance(msg, (Utterance, TextIn)):
                     turn = await self._cancel(turn)
                     turn = asyncio.create_task(self._run_turn(ws, device_id, channel, conn, msg))
+                elif isinstance(msg, ConversationIdle):
+                    self._reset_voice_conversation(channel, conn)
                 elif isinstance(msg, Identify):
                     if msg.identity:  # explicit claim from a non-voice client
                         conn["asserted"] = msg.identity
@@ -518,6 +523,13 @@ class BrainServer:
         finally:
             self._busy.discard(device_id)
 
+    @staticmethod
+    def _reset_voice_conversation(channel: str, conn: dict) -> None:
+        if channel != "voice":
+            return
+        conn["asserted"] = conn.get("base_asserted", "")
+        conn["voice_mode"] = "default"
+
     async def _do_turn(self, ws, device_id: str, channel: str, conn: dict, msg) -> None:  # noqa: ANN001
         if isinstance(msg, Utterance):
             text = await asyncio.to_thread(
@@ -545,7 +557,18 @@ class BrainServer:
                         await ws.send(encode(ReplyAudio.of(turn_id, pcm)))
             with contextlib.suppress(Exception):
                 await ws.send(encode(ReplyText(turn_id=turn_id, text=reply)))
-                await ws.send(encode(ReplyEnd(turn_id=turn_id, ended=False)))
+                await ws.send(
+                    encode(
+                        ReplyEnd(
+                            turn_id=turn_id,
+                            ended=True,
+                            continue_listening=False,
+                            voice_mode="default",
+                            close_reason="alarm_ack",
+                        )
+                    )
+                )
+            self._reset_voice_conversation(channel, conn)
             return
         # Resolve WHO this utterance is from (claim detection needs the transcript),
         # then route to that principal's session. A spoken claim sticks for the rest
@@ -561,6 +584,7 @@ class BrainServer:
         if ctx.confidence == "claimed" and ctx.identity != HOUSE:
             conn["asserted"] = ctx.identity
         session = self._contexts.get(ctx)
+        session.set_voice_mode(conn.get("voice_mode", "default"))
         trace = self._tracer.turn(
             room=self._cfg.gateway.room,
             speaker=ctx.identity,
@@ -583,7 +607,20 @@ class BrainServer:
         self._tracer.emit(trace)
         with contextlib.suppress(Exception):
             await ws.send(encode(ReplyText(turn_id=turn_id, text=result.reply)))
-            await ws.send(encode(ReplyEnd(turn_id=turn_id, ended=result.ended)))
+            await ws.send(
+                encode(
+                    ReplyEnd(
+                        turn_id=turn_id,
+                        ended=result.ended,
+                        continue_listening=result.continue_listening,
+                        voice_mode=result.voice_mode,
+                        close_reason=result.close_reason,
+                    )
+                )
+            )
+        conn["voice_mode"] = result.voice_mode
+        if result.ended:
+            self._reset_voice_conversation(channel, conn)
 
     async def _request_device_action(
         self, ctx: RequestContext, action: str, args: dict, timeout_s: float

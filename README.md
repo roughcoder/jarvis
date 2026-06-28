@@ -87,6 +87,8 @@ Per-step extras install as each build step is reached, e.g.
 
 - Conversation mode (follow-ups without re-waking) + voice-controlled ending
   (model `[[END]]` + deterministic sign-off net + reply-farewell backstop)
+- Voice modes: default short-task behavior plus stay mode for persistent spoken
+  sessions until an explicit exit
 - Soul (`SOUL.md` personality) + shared conversation context
 - Emotional speech (Inworld TTS-2 steering) and **streamed sentence-by-sentence
   replies** (lower time-to-first-audio)
@@ -111,6 +113,8 @@ Per-step extras install as each build step is reached, e.g.
   readiness test is its entry gate.
 - **[docs/FLEET.md](docs/FLEET.md)** — iMac / laptop / Pi service deployment,
   status contract, and update shape.
+- **[docs/VOICE_MODES.md](docs/VOICE_MODES.md)** — default vs stay mode, exit
+  behavior, and temporary identity lifetime for voice conversations.
 - **[docs/SWIFT_TOOLBAR_SPEC.md](docs/SWIFT_TOOLBAR_SPEC.md)** — handoff spec for
   the separate native macOS menu bar app.
 

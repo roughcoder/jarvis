@@ -1,0 +1,206 @@
+"""Voice-mode policy for spoken Jarvis conversations.
+
+Modes are a voice-only layer above ordinary turn state. Default mode closes
+aggressively unless a turn explicitly asks to keep the mic open; stay mode keeps
+the mic open until an explicit exit.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import re
+
+
+DEFAULT_MODE = "default"
+STAY_MODE = "stay"
+KNOWN_MODES = frozenset({DEFAULT_MODE, STAY_MODE})
+
+
+@dataclass(frozen=True)
+class VoiceModeProfile:
+    name: str
+    listening_policy: str
+    exit_policy: str
+    identity_scope: str
+    prompt_style: str
+
+
+PROFILES = {
+    DEFAULT_MODE: VoiceModeProfile(
+        name=DEFAULT_MODE,
+        listening_policy="explicit_or_brief_followup",
+        exit_policy="default_closed",
+        identity_scope="conversation",
+        prompt_style="short_task",
+    ),
+    STAY_MODE: VoiceModeProfile(
+        name=STAY_MODE,
+        listening_policy="persistent",
+        exit_policy="explicit_only",
+        identity_scope="mode",
+        prompt_style="open_conversation",
+    ),
+}
+
+_REQUEST_CUE = re.compile(
+    r"\b(tell|what|whats|how|why|when|where|who|which|show|give|explain|"
+    r"recommend|suggest|find|search|list|define|describe|help|can you|could you)\b"
+)
+_MODE_CONTROL_RE = re.compile(
+    r"\s*\[\[\s*(?P<kind>conversation|voice_mode)\s*:"
+    r"\s*(?P<value>[a-z_ -]+?)\s*(?::\s*(?P<reason>[a-z_ -]+?)\s*)?\]\]\s*",
+    re.IGNORECASE,
+)
+_ACTIVATE_STAY = re.compile(
+    r"\b("
+    r"(go|switch|put|come) (in|into|to) stay mode|"
+    r"start stay mode|stay mode|stay with me|stick around|keep listening|"
+    r"lets chat|let us chat|chat for a bit|hang around|hang out|"
+    r"dont go to sleep yet|do not go to sleep yet"
+    r")\b"
+)
+_EXIT_STAY = re.compile(
+    r"\b("
+    r"exit stay mode|leave stay mode|stop stay mode|default mode|"
+    r"go back to default|back to default"
+    r")\b"
+)
+_HARD_EXIT = re.compile(
+    r"\b("
+    r"stop listening|go to sleep|go to bed|goodbye|bye bye|bye|goodnight|"
+    r"good night|that'?s enough|that is enough|that'?s all|that is all|"
+    r"we'?re done|we are done|i'?m done|i am done"
+    r")\b"
+)
+_SOFT_CLOSE = re.compile(
+    r"^(thanks|thank you|cheers|ok|okay|cool|great|nice one|perfect|brilliant|"
+    r"lovely|all good|no thanks|nothing else)[.! ]*$",
+    re.IGNORECASE,
+)
+_TASK_COMPLETE_TOOLS = frozenset({"set_alarm", "cancel_alarm", "list_alarms"})
+
+
+@dataclass(frozen=True)
+class VoiceControl:
+    conversation: str | None = None  # open | closed
+    reason: str = ""
+    mode: str | None = None
+
+
+@dataclass(frozen=True)
+class LocalVoiceAction:
+    reply: str
+    mode: str
+    ended: bool
+    continue_listening: bool
+    reason: str
+
+
+def normalize_mode(mode: str | None) -> str:
+    mode = (mode or DEFAULT_MODE).strip().lower().replace("-", "_")
+    return mode if mode in KNOWN_MODES else DEFAULT_MODE
+
+
+def strip_voice_controls(text: str) -> str:
+    return _MODE_CONTROL_RE.sub(" ", text or "").strip()
+
+
+def parse_voice_control(text: str) -> VoiceControl:
+    conversation = None
+    reason = ""
+    mode = None
+    for match in _MODE_CONTROL_RE.finditer(text or ""):
+        kind = match.group("kind").lower()
+        value = (match.group("value") or "").strip().lower().replace("-", "_")
+        marker_reason = (match.group("reason") or "").strip().lower().replace("-", "_")
+        if kind == "conversation" and value in {"open", "closed"}:
+            conversation = value
+            reason = marker_reason
+        elif kind == "voice_mode" and value in KNOWN_MODES:
+            mode = value
+            reason = marker_reason or reason
+    return VoiceControl(conversation=conversation, reason=reason, mode=mode)
+
+
+def local_voice_action(user_text: str, active_mode: str = DEFAULT_MODE) -> LocalVoiceAction | None:
+    """Return a pre-LLM action for unambiguous voice control, else None."""
+    text = _norm(user_text)
+    if not text or _REQUEST_CUE.search(text):
+        return None
+    if _EXIT_STAY.search(text):
+        return LocalVoiceAction(
+            reply="Okay, exiting stay mode.",
+            mode=DEFAULT_MODE,
+            ended=True,
+            continue_listening=False,
+            reason="mode_exit",
+        )
+    if _HARD_EXIT.search(text):
+        reply = "Bye." if "bye" in text or "goodnight" in text or "good night" in text else "Okay, going to sleep."
+        return LocalVoiceAction(
+            reply=reply,
+            mode=DEFAULT_MODE,
+            ended=True,
+            continue_listening=False,
+            reason="user_closed",
+        )
+    if _ACTIVATE_STAY.search(text):
+        return LocalVoiceAction(
+            reply="Okay, I'll stay with you.",
+            mode=STAY_MODE,
+            ended=False,
+            continue_listening=True,
+            reason="mode_enter",
+        )
+    return None
+
+
+def should_soft_close_default(user_text: str) -> bool:
+    text = _norm(user_text)
+    return bool(text and not _REQUEST_CUE.search(text) and _SOFT_CLOSE.match(text))
+
+
+def tool_names(tool_messages: list) -> set[str]:
+    names: set[str] = set()
+    for msg in tool_messages or []:
+        for call in msg.get("tool_calls") or []:
+            fn = (call.get("function") or {}).get("name")
+            if fn:
+                names.add(str(fn))
+    return names
+
+
+def tool_completes_voice_turn(tool_messages: list) -> bool:
+    return bool(tool_names(tool_messages) & _TASK_COMPLETE_TOOLS)
+
+
+def voice_mode_instruction(mode: str) -> str:
+    mode = normalize_mode(mode)
+    if mode == STAY_MODE:
+        return (
+            "Voice mode: stay. This is a spoken, persistent session. Keep the "
+            "conversation open until the user explicitly exits stay mode or says "
+            "a hard stop such as 'stop listening', 'go to sleep', or 'bye'. Do "
+            "not close just because the answer was short or the user says thanks. "
+            "Append [[CONVERSATION:open:stay_mode]] unless they explicitly exit; "
+            "on exit append [[VOICE_MODE:default:mode_exit]] and "
+            "[[CONVERSATION:closed:mode_exit]]."
+        )
+    return (
+        "Voice mode: default. This is spoken household use, not chat. Prefer a "
+        "short complete answer, then close the mic after completed commands "
+        "(alarms, timers, reminders), time/weather/simple factual answers, and "
+        "polite endings such as thanks, bye, or that's all. Keep listening only "
+        "when the user is clearly exploring, planning, troubleshooting, or asking "
+        "a multi-step question. Append exactly one conversation marker at the end: "
+        "[[CONVERSATION:closed:task_complete]] when the turn is complete, or "
+        "[[CONVERSATION:open:followup_expected]] when a real follow-up is expected. "
+        "If the user asks for stay mode, append [[VOICE_MODE:stay:mode_enter]] "
+        "and [[CONVERSATION:open:mode_enter]]."
+    )
+
+
+def _norm(text: str) -> str:
+    text = (text or "").lower().replace("'", "")
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()

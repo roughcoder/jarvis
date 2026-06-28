@@ -5,7 +5,8 @@ Language-neutral message schemas so a Python intercom (now) and a native client
 with a `type` discriminator; audio PCM travels base64-encoded inside them (simple
 and uniform for 3a — a binary-frame fast path is a later optimisation).
 
-  up   (intercom -> brain): Hello, Utterance, BargeIn, TextIn, DeviceResponse
+  up   (intercom -> brain): Hello, Utterance, BargeIn, TextIn, ConversationIdle,
+                            DeviceResponse
   down (brain -> intercom): Welcome / Reject, ReplyAudio, ReplyText, ReplyEnd,
                             Cancel, Proactive, DeviceRequest
 """
@@ -63,6 +64,17 @@ class Utterance(BaseModel):
 class BargeIn(BaseModel):
     type: Literal["barge_in"] = "barge_in"
     turn_id: str
+
+
+class ConversationIdle(BaseModel):
+    """Up: a voice follow-up window timed out on the edge without another utterance.
+
+    The brain uses this to end connection-scoped state such as temporary identity
+    claims. Stay mode does not send this while it remains active.
+    """
+
+    type: Literal["conversation_idle"] = "conversation_idle"
+    reason: str = "timeout"
 
 
 class TextIn(BaseModel):
@@ -135,6 +147,9 @@ class ReplyEnd(BaseModel):
     type: Literal["reply_end"] = "reply_end"
     turn_id: str
     ended: bool = False
+    continue_listening: bool = False
+    voice_mode: str = "default"
+    close_reason: str = ""
 
 
 class Cancel(BaseModel):
@@ -176,7 +191,7 @@ class DeviceRequest(BaseModel):
 
 
 Message = Union[
-    Hello, Utterance, BargeIn, TextIn, Identify, DeviceResponse,
+    Hello, Utterance, BargeIn, ConversationIdle, TextIn, Identify, DeviceResponse,
     Welcome, Reject, ReplyAudio, ReplyText, ReplyEnd, Cancel, Proactive, WhoAreYou,
     Transcript, DeviceRequest,
 ]
