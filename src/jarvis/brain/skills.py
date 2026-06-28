@@ -20,10 +20,10 @@ import pathlib
 import re
 from dataclasses import dataclass
 
+from jarvis.frontmatter import parse_front_matter
 from jarvis.runtime import RequestContext
 from jarvis.brain.dialog import _now_line
 from jarvis.brain.gateway_client import LLMAttribution
-from jarvis.users import parse_front_matter
 from jarvis.config import Config
 from jarvis.tools.base import Tool, ToolRegistry
 

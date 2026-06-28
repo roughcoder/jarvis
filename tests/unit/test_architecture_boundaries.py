@@ -42,3 +42,13 @@ def test_setup_uses_user_store_not_brain_internals() -> None:
         if module.startswith("jarvis.brain.") and _rel == setup.name
     ]
     assert offenders == []
+
+
+def test_skills_do_not_import_user_profile_store() -> None:
+    skills = SRC / "brain" / "skills.py"
+    offenders = [
+        module
+        for _rel, module in _imports_under(skills.parent)
+        if module == "jarvis.users" and _rel == "brain/skills.py"
+    ]
+    assert offenders == []
