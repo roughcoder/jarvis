@@ -20,12 +20,16 @@ from jarvis.tools.base import Tool
 
 
 def make_google_tools(cfg: GoogleConfig) -> list[Tool]:
-    async def run(args: list[str]) -> str:
+    async def run(args: list[str], *, enabled: str) -> str:
         if not shutil.which(cfg.gogcli_bin):
             return "google isn't set up yet — run `jarvis google-setup` first."
         try:
             proc = await asyncio.create_subprocess_exec(
-                cfg.gogcli_bin, *args,
+                cfg.gogcli_bin,
+                "--plain",
+                "--no-input",
+                f"--enable-commands-exact={enabled}",
+                *args,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             )
             out, _ = await asyncio.wait_for(proc.communicate(), cfg.timeout_s)
@@ -40,11 +44,11 @@ def make_google_tools(cfg: GoogleConfig) -> list[Tool]:
         query = (args.get("query") or "").strip()
         if not query:
             return "error: need a search query"
-        return await run(["gmail", "search", "--query", query])
+        return await run(["gmail", "search", "--query", query], enabled="gmail.search")
 
     async def upcoming_events(ctx: RequestContext, args: dict[str, Any]) -> str:
         days = str(args.get("days") or cfg.calendar_days)
-        return await run(["calendar", "list", "--days", days])
+        return await run(["calendar", "events", "--days", days], enabled="calendar.events")
 
     async def send_email(ctx: RequestContext, args: dict[str, Any]) -> str:
         to = (args.get("to") or "").strip()
@@ -52,7 +56,10 @@ def make_google_tools(cfg: GoogleConfig) -> list[Tool]:
         body = (args.get("body") or "").strip()
         if not (to and body):
             return "error: an email needs a recipient and a body"
-        return await run(["gmail", "send", "--to", to, "--subject", subject, "--body", body])
+        return await run(
+            ["gmail", "send", "--to", to, "--subject", subject, "--body", body],
+            enabled="gmail.send",
+        )
 
     obj = "object"
     return [
