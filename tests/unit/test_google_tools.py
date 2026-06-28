@@ -132,6 +132,20 @@ def test_empty_args_validated() -> None:
     assert "recipient" in asyncio.run(tools["send_email"].handler(_ctx("email.send"), {"to": "x"}))
 
 
+def test_upcoming_events_validates_days() -> None:
+    tools = {t.name: t for t in make_google_tools(GoogleConfig(_env_file=None))}
+
+    assert "days must be a positive integer" in asyncio.run(
+        tools["upcoming_events"].handler(_ctx("calendar.read"), {"days": "tomorrow"})
+    )
+    assert "days must be a positive integer" in asyncio.run(
+        tools["upcoming_events"].handler(_ctx("calendar.read"), {"days": 0})
+    )
+    assert "days must be at most 366" in asyncio.run(
+        tools["upcoming_events"].handler(_ctx("calendar.read"), {"days": 367})
+    )
+
+
 def test_gog_invocation_is_noninteractive_and_allowlisted(monkeypatch) -> None:  # noqa: ANN001
     calls: list[tuple[str, ...]] = []
 
