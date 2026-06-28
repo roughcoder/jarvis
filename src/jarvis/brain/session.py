@@ -41,12 +41,11 @@ from jarvis.brain.tracing import Tracer
 from jarvis.brain.voice_modes import (
     DEFAULT_MODE,
     STAY_MODE,
+    classify_voice_turn,
     local_voice_action,
     normalize_mode,
-    parse_voice_control,
-    should_soft_close_default,
     strip_voice_controls,
-    tool_completes_voice_turn,
+    voice_disabled_transition,
     voice_mode_instruction,
 )
 from jarvis.config import Config
@@ -351,44 +350,30 @@ class BrainSession:
         is_voice_channel = self._ctx.channel == "voice"
         is_open_mic_voice = is_voice_channel and self._cfg.vad.conversation_mode
         if is_open_mic_voice and not result.close_reason:
-            control = parse_voice_control(raw)
-            mode = normalize_mode(control.mode or self._voice_mode)
             explicit_close = (
                 bool(_END_RE.search(raw))
                 or _is_clear_signoff(user_text)
                 or _is_reply_farewell(raw)
             )
-            if mode == STAY_MODE:
-                result.ended = control.conversation == "closed" or explicit_close
-                result.continue_listening = not result.ended
-                result.close_reason = control.reason or ("user_closed" if result.ended else "stay_mode")
-                if result.ended:
-                    mode = DEFAULT_MODE
-            elif tool_completes_voice_turn(result.tool_messages):
-                result.ended = True
-                result.continue_listening = False
-                result.close_reason = "task_complete"
-                mode = DEFAULT_MODE
-            elif control.conversation == "open" and not explicit_close:
-                result.ended = False
-                result.continue_listening = True
-                result.close_reason = control.reason or "followup_expected"
-            else:
-                result.ended = True
-                result.continue_listening = False
-                if explicit_close or should_soft_close_default(user_text):
-                    result.close_reason = "user_closed" if explicit_close else control.reason or "user_closed"
-                else:
-                    result.close_reason = control.reason or "default_complete"
-                mode = DEFAULT_MODE
-            result.voice_mode = mode
+            transition = classify_voice_turn(
+                active_mode=self._voice_mode,
+                raw_reply=raw,
+                user_text=user_text,
+                tool_messages=result.tool_messages,
+                explicit_close=explicit_close,
+            )
+            result.ended = transition.ended
+            result.continue_listening = transition.continue_listening
+            result.close_reason = transition.reason
+            result.voice_mode = transition.mode
         elif is_open_mic_voice:
             result.voice_mode = normalize_mode(result.voice_mode)
         elif is_voice_channel:
-            result.ended = True
-            result.continue_listening = False
-            result.close_reason = result.close_reason or "conversation_disabled"
-            result.voice_mode = DEFAULT_MODE
+            transition = voice_disabled_transition()
+            result.ended = transition.ended
+            result.continue_listening = transition.continue_listening
+            result.close_reason = result.close_reason or transition.reason
+            result.voice_mode = transition.mode
         else:
             result.ended = False
             result.continue_listening = False

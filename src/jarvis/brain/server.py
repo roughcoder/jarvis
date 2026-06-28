@@ -29,7 +29,13 @@ from jarvis.brain.scheduler import Ring, Scheduler, in_quiet_hours
 from jarvis.brain.session import BrainSession, TurnResult
 from jarvis.brain.skills import register_skills
 from jarvis.brain.tracing import Tracer
-from jarvis.brain.voice_modes import DEFAULT_MODE, STAY_MODE, normalize_mode
+from jarvis.brain.voice_modes import (
+    DEFAULT_MODE,
+    alarm_ack_transition,
+    cancelled_voice_transition,
+    empty_transcript_transition,
+    voice_result_transition,
+)
 from jarvis.config import Config, insecure_bind
 from jarvis.mcp import MCPBridge
 from jarvis.protocol.messages import (
@@ -534,46 +540,50 @@ class BrainServer:
 
     @staticmethod
     def _alarm_ack_reply_end(turn_id: str, channel: str, conn: dict) -> ReplyEnd:
-        mode = normalize_mode(conn.get("voice_mode")) if channel == "voice" else DEFAULT_MODE
-        if mode == STAY_MODE:
-            return ReplyEnd(
-                turn_id=turn_id,
-                ended=False,
-                continue_listening=True,
-                voice_mode=STAY_MODE,
-                close_reason="alarm_ack",
-            )
+        active_mode = conn.get("voice_mode") if channel == "voice" else DEFAULT_MODE
+        transition = alarm_ack_transition(active_mode)
         return ReplyEnd(
             turn_id=turn_id,
-            ended=True,
-            continue_listening=False,
-            voice_mode=DEFAULT_MODE,
-            close_reason="alarm_ack",
+            ended=transition.ended,
+            continue_listening=transition.continue_listening,
+            voice_mode=transition.mode,
+            close_reason=transition.reason,
         )
 
     @staticmethod
     def _empty_transcript_reply_end(turn_id: str, channel: str) -> ReplyEnd:
-        if channel == "voice":
-            return ReplyEnd(
-                turn_id=turn_id,
-                ended=True,
-                continue_listening=False,
-                voice_mode=DEFAULT_MODE,
-                close_reason="empty_transcript",
-            )
-        return ReplyEnd(turn_id=turn_id, ended=False)
+        transition = empty_transcript_transition(channel)
+        return ReplyEnd(
+            turn_id=turn_id,
+            ended=transition.ended,
+            continue_listening=transition.continue_listening,
+            voice_mode=transition.mode,
+            close_reason=transition.reason,
+        )
 
     @staticmethod
     def _apply_turn_result(channel: str, conn: dict, result: TurnResult) -> None:
-        conn["voice_mode"] = result.voice_mode
-        if result.ended:
+        transition = voice_result_transition(
+            ended=result.ended,
+            voice_mode=result.voice_mode,
+            continue_listening=result.continue_listening,
+            close_reason=result.close_reason,
+        )
+        conn["voice_mode"] = transition.mode
+        if transition.reset_conversation:
             BrainServer._reset_voice_conversation(channel, conn)
 
     @staticmethod
     def _apply_cancelled_turn_result(channel: str, conn: dict, result: TurnResult) -> None:
-        if result.close_reason not in {"mode_enter", "mode_exit"}:
+        transition = cancelled_voice_transition(
+            voice_mode=result.voice_mode,
+            close_reason=result.close_reason,
+        )
+        if transition is None:
             return
-        BrainServer._apply_turn_result(channel, conn, result)
+        conn["voice_mode"] = transition.mode
+        if transition.reset_conversation:
+            BrainServer._reset_voice_conversation(channel, conn)
 
     async def _do_turn(self, ws, device_id: str, channel: str, conn: dict, msg) -> None:  # noqa: ANN001
         if isinstance(msg, Utterance):

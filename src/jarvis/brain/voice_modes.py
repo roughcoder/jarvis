@@ -96,6 +96,15 @@ class LocalVoiceAction:
     reason: str
 
 
+@dataclass(frozen=True)
+class VoiceStateTransition:
+    mode: str
+    ended: bool
+    continue_listening: bool
+    reason: str
+    reset_conversation: bool = False
+
+
 def normalize_mode(mode: str | None) -> str:
     mode = (mode or DEFAULT_MODE).strip().lower().replace("-", "_")
     return mode if mode in KNOWN_MODES else DEFAULT_MODE
@@ -200,6 +209,142 @@ def tool_completes_successfully(tool_messages: list, tool_names_to_check: set[st
 
 def tool_completes_voice_turn(tool_messages: list) -> bool:
     return tool_completes_successfully(tool_messages, _TASK_COMPLETE_TOOLS)
+
+
+def classify_voice_turn(
+    *,
+    active_mode: str,
+    raw_reply: str,
+    user_text: str,
+    tool_messages: list,
+    explicit_close: bool,
+) -> VoiceStateTransition:
+    """Decide the post-turn voice lifecycle from one policy surface."""
+    active_mode = normalize_mode(active_mode)
+    control = parse_voice_control(raw_reply)
+    requested_mode = normalize_mode(control.mode or active_mode)
+    soft_close = should_soft_close_default(user_text)
+    user_closed = explicit_close or soft_close
+
+    if active_mode == STAY_MODE and requested_mode == STAY_MODE:
+        stay_exit = user_closed or (
+            control.conversation == "closed" and control.reason in {"mode_exit", "user_closed"}
+        )
+        if stay_exit:
+            return VoiceStateTransition(
+                mode=DEFAULT_MODE,
+                ended=True,
+                continue_listening=False,
+                reason="user_closed" if user_closed else control.reason,
+                reset_conversation=True,
+            )
+        return VoiceStateTransition(
+            mode=STAY_MODE,
+            ended=False,
+            continue_listening=True,
+            reason="stay_mode",
+        )
+
+    if tool_completes_voice_turn(tool_messages):
+        return VoiceStateTransition(
+            mode=DEFAULT_MODE,
+            ended=True,
+            continue_listening=False,
+            reason="task_complete",
+            reset_conversation=True,
+        )
+
+    if control.conversation == "open" and not user_closed:
+        return VoiceStateTransition(
+            mode=requested_mode,
+            ended=False,
+            continue_listening=True,
+            reason=control.reason or "followup_expected",
+        )
+
+    return VoiceStateTransition(
+        mode=DEFAULT_MODE,
+        ended=True,
+        continue_listening=False,
+        reason="user_closed" if user_closed else control.reason or "default_complete",
+        reset_conversation=True,
+    )
+
+
+def voice_disabled_transition() -> VoiceStateTransition:
+    return VoiceStateTransition(
+        mode=DEFAULT_MODE,
+        ended=True,
+        continue_listening=False,
+        reason="conversation_disabled",
+        reset_conversation=True,
+    )
+
+
+def voice_result_transition(
+    *,
+    ended: bool,
+    voice_mode: str,
+    continue_listening: bool,
+    close_reason: str,
+) -> VoiceStateTransition:
+    return VoiceStateTransition(
+        mode=normalize_mode(voice_mode),
+        ended=ended,
+        continue_listening=continue_listening,
+        reason=close_reason,
+        reset_conversation=ended,
+    )
+
+
+def cancelled_voice_transition(
+    *,
+    voice_mode: str,
+    close_reason: str,
+) -> VoiceStateTransition | None:
+    if close_reason not in {"mode_enter", "mode_exit"}:
+        return None
+    return VoiceStateTransition(
+        mode=normalize_mode(voice_mode),
+        ended=close_reason == "mode_exit",
+        continue_listening=close_reason == "mode_enter",
+        reason=close_reason,
+        reset_conversation=close_reason == "mode_exit",
+    )
+
+
+def alarm_ack_transition(active_mode: str) -> VoiceStateTransition:
+    mode = normalize_mode(active_mode)
+    if mode == STAY_MODE:
+        return VoiceStateTransition(
+            mode=STAY_MODE,
+            ended=False,
+            continue_listening=True,
+            reason="alarm_ack",
+        )
+    return VoiceStateTransition(
+        mode=DEFAULT_MODE,
+        ended=True,
+        continue_listening=False,
+        reason="alarm_ack",
+        reset_conversation=True,
+    )
+
+
+def empty_transcript_transition(channel: str) -> VoiceStateTransition:
+    if channel == "voice":
+        return VoiceStateTransition(
+            mode=DEFAULT_MODE,
+            ended=True,
+            continue_listening=False,
+            reason="empty_transcript",
+            reset_conversation=True,
+        )
+    return VoiceStateTransition(mode=DEFAULT_MODE, ended=False, continue_listening=False, reason="")
+
+
+def should_emit_idle_after_empty_capture(conversation_started: bool) -> bool:
+    return conversation_started
 
 
 def voice_mode_instruction(mode: str) -> str:
