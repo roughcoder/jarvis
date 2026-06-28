@@ -224,10 +224,10 @@ def classify_voice_turn(
     control = parse_voice_control(raw_reply)
     requested_mode = normalize_mode(control.mode or active_mode)
     soft_close = should_soft_close_default(user_text)
-    user_closed = explicit_close or soft_close
+    default_user_closed = explicit_close or soft_close
 
     if active_mode == STAY_MODE and requested_mode == STAY_MODE:
-        stay_exit = user_closed or (
+        stay_exit = explicit_close or (
             control.conversation == "closed" and control.reason in {"mode_exit", "user_closed"}
         )
         if stay_exit:
@@ -235,7 +235,7 @@ def classify_voice_turn(
                 mode=DEFAULT_MODE,
                 ended=True,
                 continue_listening=False,
-                reason="user_closed" if user_closed else control.reason,
+                reason="user_closed" if explicit_close else control.reason,
                 reset_conversation=True,
             )
         return VoiceStateTransition(
@@ -254,7 +254,7 @@ def classify_voice_turn(
             reset_conversation=True,
         )
 
-    if control.conversation == "open" and not user_closed:
+    if control.conversation == "open" and not default_user_closed:
         return VoiceStateTransition(
             mode=requested_mode,
             ended=False,
@@ -266,7 +266,7 @@ def classify_voice_turn(
         mode=DEFAULT_MODE,
         ended=True,
         continue_listening=False,
-        reason="user_closed" if user_closed else control.reason or "default_complete",
+        reason="user_closed" if default_user_closed else control.reason or "default_complete",
         reset_conversation=True,
     )
 
@@ -341,10 +341,6 @@ def empty_transcript_transition(channel: str) -> VoiceStateTransition:
             reset_conversation=True,
         )
     return VoiceStateTransition(mode=DEFAULT_MODE, ended=False, continue_listening=False, reason="")
-
-
-def should_emit_idle_after_empty_capture(conversation_started: bool) -> bool:
-    return conversation_started
 
 
 def voice_mode_instruction(mode: str) -> str:

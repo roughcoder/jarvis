@@ -197,6 +197,19 @@ def test_stay_mode_ignores_generic_closed_marker() -> None:
     assert result.close_reason == "stay_mode"
 
 
+def test_stay_mode_keeps_listening_after_soft_acknowledgement() -> None:
+    sess = _session(STAY_MODE)
+    result = TurnResult(raw="No problem. [[CONVERSATION:open:stay_mode]]")
+
+    sess.finalize("thanks", result)
+
+    assert result.reply == "No problem."
+    assert result.ended is False
+    assert result.continue_listening is True
+    assert result.voice_mode == STAY_MODE
+    assert result.close_reason == "stay_mode"
+
+
 def test_alarm_tools_force_voice_turn_closed() -> None:
     sess = _session(DEFAULT_MODE)
     result = TurnResult(
