@@ -12,6 +12,7 @@ import asyncio
 from jarvis.config import load_config
 from jarvis.intercom.client import IntercomClient
 from jarvis.protocol.messages import (
+    ConversationIdle,
     DeviceRequest,
     DeviceResponse,
     Proactive,
@@ -206,6 +207,26 @@ def test_reply_audio_works_for_proactive_turn_id() -> None:
         return [pcm async for pcm in c._reply_audio(q, "pa-9", {"ended": False, "text": ""})]
 
     assert asyncio.run(go()) == [b"tone", b"talk"]
+
+
+def test_interrupted_silence_sends_conversation_idle() -> None:
+    c = _client()
+    q: asyncio.Queue = asyncio.Queue()
+    ws = _WS()
+    mic = _Mic()
+
+    async def fake_play(*_args):  # noqa: ANN002
+        return True
+
+    c._play_reply = fake_play  # type: ignore[method-assign]
+    c._capture_utterance = lambda *_args, **_kwargs: b""  # type: ignore[method-assign]
+
+    async def go() -> dict | None:
+        return await c._converse(ws, mic, q, b"hello")
+
+    assert asyncio.run(go()) is None
+    sent = [decode(item) for item in ws.sent]
+    assert any(isinstance(item, ConversationIdle) and item.reason == "timeout" for item in sent)
 
 
 def test_device_request_returns_device_response() -> None:

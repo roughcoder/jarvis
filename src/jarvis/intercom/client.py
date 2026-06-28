@@ -213,12 +213,17 @@ class IntercomClient:
     async def _converse(self, ws, mic: MicStream, inbound: asyncio.Queue, pcm: bytes) -> dict | None:  # noqa: ANN001
         """Run turns until the conversation closes — shared by a wake-started turn and a
         proactive that opened the mic."""
+        conversation_started = False
         while True:
             if not pcm:
                 print("  (nothing said)")
+                if conversation_started:
+                    with contextlib.suppress(Exception):
+                        await ws.send(encode(ConversationIdle(reason="timeout")))
                 return None
             turn_id = uuid.uuid4().hex
             await ws.send(encode(Utterance.of(turn_id, self._sr, pcm)))
+            conversation_started = True
             state = {
                 "ended": False,
                 "text": "",
