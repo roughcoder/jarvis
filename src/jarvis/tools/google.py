@@ -9,13 +9,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from jarvis.brain.account_adapters import GogcliAccountAdapter
-from jarvis.brain.account_router import AccountRouter, classify_email_recipient
-from jarvis.brain.accounts import AccountBinding, AccountBindingError, load_account_binding
-from jarvis.brain.context import RequestContext
-from jarvis.brain.identity import HOUSE
+from jarvis.account_adapters import GogcliAccountAdapter
+from jarvis.account_router import AccountRouter, classify_email_recipient
+from jarvis.accounts import AccountBinding, AccountBindingError, load_account_binding
+from jarvis.runtime import RequestContext
 from jarvis.config import AccountConfig, GoogleConfig
 from jarvis.tools.base import Tool
+from jarvis.users import HOUSE
 
 _MAX_CALENDAR_DAYS = 366
 

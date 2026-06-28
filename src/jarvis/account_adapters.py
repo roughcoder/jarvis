@@ -12,7 +12,7 @@ import shutil
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from jarvis.brain.accounts import AccountBinding
+from jarvis.accounts import AccountBinding
 from jarvis.config import GoogleConfig
 
 

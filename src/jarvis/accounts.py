@@ -14,8 +14,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from jarvis.brain.context import RequestContext
-from jarvis.brain.identity import HOUSE
+from jarvis.runtime import RequestContext
+from jarvis.users import HOUSE
 
 ALLOW = "allow"
 DRAFT = "draft"

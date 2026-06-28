@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import asyncio
 
-from jarvis.brain.account_adapters import FakeAccountAdapter
-from jarvis.brain.account_router import AccountRouter
-from jarvis.brain.accounts import AccountBinding
-from jarvis.brain.identity import HOUSE
-from jarvis.brain.context import RequestContext
+from jarvis.account_adapters import FakeAccountAdapter
+from jarvis.account_router import AccountRouter
+from jarvis.accounts import AccountBinding
 from jarvis.config import AccountConfig, GoogleConfig, ToolsConfig
+from jarvis.runtime import RequestContext
 from jarvis.tools import build_registry
 from jarvis.tools.google import make_google_tools
+from jarvis.users import HOUSE
 
 
 def _ctx(
@@ -69,8 +69,8 @@ def test_google_tools_load_house_bindings_from_account_store(tmp_path, monkeypat
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr("jarvis.brain.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
-    monkeypatch.setattr("jarvis.brain.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("jarvis.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
+    monkeypatch.setattr("jarvis.account_adapters.asyncio.create_subprocess_exec", fake_exec)
     reg = build_registry(
         ToolsConfig(_env_file=None),
         google=GoogleConfig(_env_file=None, gogcli_bin="gog"),
@@ -98,8 +98,8 @@ def test_configured_missing_house_binding_fails_closed(tmp_path, monkeypatch) ->
         calls.append(tuple(argv))
         raise AssertionError("provider should not run")
 
-    monkeypatch.setattr("jarvis.brain.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
-    monkeypatch.setattr("jarvis.brain.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("jarvis.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
+    monkeypatch.setattr("jarvis.account_adapters.asyncio.create_subprocess_exec", fake_exec)
     reg = build_registry(
         ToolsConfig(_env_file=None),
         google=GoogleConfig(_env_file=None, gogcli_bin="gog"),
@@ -159,8 +159,8 @@ def test_gog_invocation_is_noninteractive_and_allowlisted(monkeypatch) -> None: 
         calls.append(tuple(argv))
         return FakeProc()
 
-    monkeypatch.setattr("jarvis.brain.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
-    monkeypatch.setattr("jarvis.brain.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("jarvis.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
+    monkeypatch.setattr("jarvis.account_adapters.asyncio.create_subprocess_exec", fake_exec)
     tools = {t.name: t for t in make_google_tools(GoogleConfig(_env_file=None, gogcli_bin="gog"))}
 
     out = asyncio.run(tools["upcoming_events"].handler(_ctx("calendar.read"), {"days": 2}))
@@ -193,8 +193,8 @@ def test_gog_invocation_uses_bound_calendar_id(monkeypatch) -> None:  # noqa: AN
         calls.append(tuple(argv))
         return FakeProc()
 
-    monkeypatch.setattr("jarvis.brain.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
-    monkeypatch.setattr("jarvis.brain.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("jarvis.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
+    monkeypatch.setattr("jarvis.account_adapters.asyncio.create_subprocess_exec", fake_exec)
     binding = AccountBinding(
         name="school-calendar",
         principal=HOUSE,
@@ -245,8 +245,8 @@ def test_gog_invocation_selects_account_from_credential_ref(monkeypatch) -> None
         calls.append(tuple(argv))
         return FakeProc()
 
-    monkeypatch.setattr("jarvis.brain.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
-    monkeypatch.setattr("jarvis.brain.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("jarvis.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
+    monkeypatch.setattr("jarvis.account_adapters.asyncio.create_subprocess_exec", fake_exec)
     binding = AccountBinding(
         name="school-email",
         principal=HOUSE,
@@ -329,8 +329,8 @@ def test_send_email_requires_confirmation_before_gogcli(monkeypatch) -> None:  #
         calls.append(tuple(argv))
         return FakeProc()
 
-    monkeypatch.setattr("jarvis.brain.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
-    monkeypatch.setattr("jarvis.brain.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("jarvis.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
+    monkeypatch.setattr("jarvis.account_adapters.asyncio.create_subprocess_exec", fake_exec)
     tools = {t.name: t for t in make_google_tools(GoogleConfig(_env_file=None, gogcli_bin="gog"))}
 
     out = asyncio.run(
@@ -355,8 +355,8 @@ def test_send_email_passes_household_recipient_policy_to_gogcli(monkeypatch) -> 
         calls.append(tuple(argv))
         return FakeProc()
 
-    monkeypatch.setattr("jarvis.brain.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
-    monkeypatch.setattr("jarvis.brain.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("jarvis.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
+    monkeypatch.setattr("jarvis.account_adapters.asyncio.create_subprocess_exec", fake_exec)
     binding = AccountBinding(
         name="house-email",
         principal=HOUSE,

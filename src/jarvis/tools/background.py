@@ -8,9 +8,14 @@ voice turn stays fast while the real work happens detached (see brain/background
 
 from __future__ import annotations
 
-from jarvis.brain.background import BackgroundRunner
-from jarvis.brain.context import RequestContext
+from typing import Protocol
+
+from jarvis.runtime import RequestContext
 from jarvis.tools.base import Tool
+
+
+class BackgroundRunner(Protocol):
+    def start(self, ctx: RequestContext, task: str) -> tuple[bool, str]: ...
 
 
 def make_background_tool(runner: BackgroundRunner) -> Tool:

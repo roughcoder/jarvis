@@ -19,38 +19,33 @@ This module imports nothing heavy and is pure logic, so it's fully unit-testable
 
 from __future__ import annotations
 
-import pathlib
 import re
 from dataclasses import dataclass, field
 
-HOUSE = "house"
+from jarvis.users import (
+    HOUSE,
+    User,
+    load_users,
+    normalize_whatsapp,
+    parse_front_matter,
+    parse_user,
+)
 
-_FRONT_MATTER = re.compile(r"^\s*---\s*\n(.*?)\n---\s*(?:\n|$)", re.DOTALL)
-_INLINE_LIST = re.compile(r"^\[(.*)\]$")
+__all__ = [
+    "HOUSE",
+    "IdentityResolver",
+    "Resolution",
+    "User",
+    "_parse_front_matter",
+    "load_users",
+    "parse_user",
+]
+
 # "it's Jules" / "this is Neil" / "I'm Jules" / "speaking is Neil"
 _CLAIM_RE = re.compile(
     r"\b(?:it'?s|this is|i'?m|i am|speaking|you'?re speaking (?:to|with))\s+([a-z][a-z'’.\- ]{0,30})",
     re.IGNORECASE,
 )
-
-
-@dataclass(frozen=True)
-class User:
-    name: str
-    devices: frozenset[str] = frozenset()
-    whatsapp: frozenset[str] = frozenset()
-    claims: tuple[str, ...] = ()  # extra claim phrases, lowercased
-    capabilities: frozenset[str] = frozenset()
-    calendar_accounts: tuple[str, ...] = ()
-    email_accounts: tuple[str, ...] = ()
-    household_visibility: str = ""
-    scope: str = "personal"
-    honcho_peer: str = ""
-
-    @property
-    def peer(self) -> str:
-        return self.honcho_peer or self.name
-
 
 @dataclass(frozen=True)
 class Resolution:
@@ -65,80 +60,15 @@ class Resolution:
 
 
 def _parse_front_matter(text: str) -> dict[str, object]:
-    """Minimal front-matter parser: `key: scalar`, `key: [a, b]`, and block lists
-    (`key:` then `  - item`). No nesting — the users schema is deliberately flat."""
-    m = _FRONT_MATTER.match(text)
-    if not m:
-        return {}
-    out: dict[str, object] = {}
-    lines = m.group(1).splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        i += 1
-        if not line.strip() or line.lstrip().startswith("#") or ":" not in line:
-            continue
-        if line[0].isspace():  # stray indented line outside a block — skip
-            continue
-        key, _, rest = line.partition(":")
-        key = key.strip()
-        rest = rest.strip()
-        if not rest:  # block list: consume following "  - item" lines
-            items: list[str] = []
-            while i < len(lines) and (lines[i].lstrip().startswith("-") or not lines[i].strip()):
-                item = lines[i].lstrip()
-                i += 1
-                if item.startswith("-"):
-                    items.append(item[1:].strip().strip("'\""))
-            out[key] = items
-        elif _INLINE_LIST.match(rest):
-            inner = _INLINE_LIST.match(rest).group(1)
-            out[key] = [x.strip().strip("'\"") for x in inner.split(",") if x.strip()]
-        else:
-            out[key] = rest.strip("'\"")
-    return out
-
-
-def _as_list(v: object) -> list[str]:
-    if isinstance(v, list):
-        return [str(x) for x in v]
-    if v:
-        return [str(v)]
-    return []
+    """Compatibility wrapper for older imports."""
+    return parse_front_matter(text)
 
 
 def _norm_wa(num: str) -> str:
     """Normalise a WhatsApp address to digits only — drop any '@…' jid suffix, '+',
     spaces, dashes — so a stored number matches whatever format the connector reports
     (e.g. '447921815819', '+44 7921 815819', '447921815819@s.whatsapp.net')."""
-    return re.sub(r"\D", "", (num or "").split("@", 1)[0])
-
-
-def parse_user(name: str, text: str) -> User:
-    fm = _parse_front_matter(text)
-    return User(
-        name=name,
-        devices=frozenset(_as_list(fm.get("devices"))),
-        whatsapp=frozenset(_as_list(fm.get("whatsapp"))),
-        claims=tuple(c.lower() for c in _as_list(fm.get("claims"))),
-        capabilities=frozenset(_as_list(fm.get("capabilities"))),
-        calendar_accounts=tuple(_as_list(fm.get("calendar_accounts"))),
-        email_accounts=tuple(_as_list(fm.get("email_accounts"))),
-        household_visibility=str(fm.get("household_visibility") or ""),
-        scope=str(fm.get("scope") or "personal"),
-        honcho_peer=str(fm.get("honcho_peer") or ""),
-    )
-
-
-def load_users(users_dir: str) -> dict[str, User]:
-    """Load every `users/<name>.md`. Missing dir => no users (house-only)."""
-    path = pathlib.Path(users_dir)
-    if not path.is_dir():
-        return {}
-    users: dict[str, User] = {}
-    for f in sorted(path.glob("*.md")):
-        users[f.stem] = parse_user(f.stem, f.read_text(encoding="utf-8"))
-    return users
+    return normalize_whatsapp(num)
 
 
 class IdentityResolver:

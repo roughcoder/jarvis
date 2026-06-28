@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import asyncio
 
-from jarvis.brain.account_adapters import FakeAccountAdapter
-from jarvis.brain.account_router import AccountRouter, classify_email_recipient
-from jarvis.brain.accounts import AccountBinding
-from jarvis.brain.context import RequestContext
-from jarvis.brain.identity import HOUSE
+from jarvis.account_adapters import FakeAccountAdapter
+from jarvis.account_router import AccountRouter, classify_email_recipient
+from jarvis.accounts import AccountBinding
+from jarvis.runtime import RequestContext
+from jarvis.users import HOUSE
 
 
 def _ctx(

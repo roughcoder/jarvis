@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from jarvis.brain.accounts import (
+from jarvis.accounts import (
     ALLOW,
     CONFIRM,
     DRAFT,
@@ -15,8 +15,8 @@ from jarvis.brain.accounts import (
     load_account_binding,
     load_account_bindings,
 )
-from jarvis.brain.context import RequestContext
-from jarvis.brain.identity import HOUSE
+from jarvis.runtime import RequestContext
+from jarvis.users import HOUSE
 
 
 def _ctx(

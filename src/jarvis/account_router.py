@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from jarvis.brain.account_adapters import CalendarAdapter, EmailAdapter
-from jarvis.brain.accounts import (
+from jarvis.account_adapters import CalendarAdapter, EmailAdapter
+from jarvis.accounts import (
     ALLOW,
     CONFIRM,
     DENY,
@@ -16,7 +16,7 @@ from jarvis.brain.accounts import (
     AccountPolicyRequest,
     decide_account_policy,
 )
-from jarvis.brain.context import RequestContext
+from jarvis.runtime import RequestContext
 
 
 @dataclass(frozen=True)

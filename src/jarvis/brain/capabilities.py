@@ -11,24 +11,21 @@ else from a configured CSV default, else **empty** (everything denied).
 
 from __future__ import annotations
 
-import pathlib
 import re
+from pathlib import Path
 
-from jarvis.brain.context import RequestContext
 from jarvis.config import CapabilityConfig
+from jarvis.runtime import CapabilityError, RequestContext, require
 
-
-class CapabilityError(PermissionError):
-    """Raised when a request lacks a required capability (deny-by-default)."""
-
-
-def require(ctx: RequestContext, capability: str) -> None:
-    """Gate a capability-bearing action. Raises CapabilityError if not granted."""
-    if not ctx.can(capability):
-        raise CapabilityError(
-            f"capability {capability!r} not granted "
-            f"(identity={ctx.identity!r}, device={ctx.device_id!r})"
-        )
+__all__ = [
+    "CapabilityError",
+    "RequestContext",
+    "build_request_context",
+    "context_for_resolution",
+    "parse_profile_capabilities",
+    "require",
+    "resolve_capabilities",
+]
 
 
 # --- profile parsing -------------------------------------------------------
@@ -74,7 +71,7 @@ def parse_profile_capabilities(text: str) -> set[str]:
 
 def resolve_capabilities(cfg: CapabilityConfig) -> set[str]:
     """Capabilities for this device: profile file if present, else CSV default."""
-    path = pathlib.Path(cfg.profiles_dir) / f"{cfg.device_id}.md"
+    path = Path(cfg.profiles_dir) / f"{cfg.device_id}.md"
     if path.exists():
         return parse_profile_capabilities(path.read_text(encoding="utf-8"))
     return {c.strip() for c in cfg.default_capabilities.split(",") if c.strip()}

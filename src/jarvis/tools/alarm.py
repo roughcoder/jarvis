@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import time
 
-from jarvis.brain.context import RequestContext
-from jarvis.brain.scheduler import Alarm, Scheduler, due_from
+from jarvis.runtime import RequestContext
 from jarvis.config import Config
+from jarvis.scheduling import Alarm, Scheduler, due_from
 from jarvis.tools.base import Tool
 
 _CAP = "alarms.set"
