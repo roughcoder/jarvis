@@ -48,6 +48,17 @@ from jarvis.protocol.messages import (
 FRAME_SAMPLES = 512
 
 
+def _is_passive_proactive_state(state: dict | None) -> bool:
+    """Default proactive ReplyEnd metadata should not close an active conversation."""
+    return bool(
+        state
+        and state.get("ended") is False
+        and state.get("continue_listening") is False
+        and state.get("voice_mode") == "default"
+        and not state.get("close_reason")
+    )
+
+
 class IntercomClient:
     def __init__(
         self,
@@ -199,13 +210,13 @@ class IntercomClient:
         self._panel.set("thinking")
         await self._converse(ws, mic, inbound, pcm)
 
-    async def _converse(self, ws, mic: MicStream, inbound: asyncio.Queue, pcm: bytes) -> None:  # noqa: ANN001
+    async def _converse(self, ws, mic: MicStream, inbound: asyncio.Queue, pcm: bytes) -> dict | None:  # noqa: ANN001
         """Run turns until the conversation closes — shared by a wake-started turn and a
         proactive that opened the mic."""
         while True:
             if not pcm:
                 print("  (nothing said)")
-                return
+                return None
             turn_id = uuid.uuid4().hex
             await ws.send(encode(Utterance.of(turn_id, self._sr, pcm)))
             state = {
@@ -226,16 +237,16 @@ class IntercomClient:
                 continue
             if state["ended"]:
                 print('  …(conversation closed — say "Hey Jarvis")')
-                return
+                return state
             if not self._cfg.vad.conversation_mode or not state["continue_listening"]:
-                return
+                return state
             mic.drain()
             while True:
-                proactive_state = await self._play_queued_proactive(ws, mic, inbound)
+                proactive_state = await self._play_queued_proactive(ws, mic, inbound, state)
                 if proactive_state is not None:
                     state.update(proactive_state)
                     if state["ended"] or not state["continue_listening"]:
-                        return
+                        return state
                     continue
                 if state["voice_mode"] == "stay":
                     print("  …(stay mode — listening)")
@@ -254,14 +265,22 @@ class IntercomClient:
                     continue
                 with contextlib.suppress(Exception):
                     await ws.send(encode(ConversationIdle(reason="timeout")))
-                return
+                return state
 
-    async def _play_queued_proactive(self, ws, mic: MicStream, inbound: asyncio.Queue) -> dict | None:  # noqa: ANN001
+    async def _play_queued_proactive(  # noqa: ANN001
+        self,
+        ws,
+        mic: MicStream,
+        inbound: asyncio.Queue,
+        active_state: dict | None = None,
+    ) -> dict | None:
         pro = self._take_proactive(inbound)
         if pro is None:
             return None
         state = await self._play_proactive(ws, mic, inbound, pro)
         mic.drain()
+        if active_state and _is_passive_proactive_state(state):
+            return dict(active_state)
         return state
 
     def _take_proactive(self, inbound: asyncio.Queue):  # noqa: ANN202
@@ -319,7 +338,9 @@ class IntercomClient:
             )
             if pcm:
                 self._panel.set("thinking")
-                await self._converse(ws, mic, inbound, pcm)
+                nested_state = await self._converse(ws, mic, inbound, pcm)
+                if nested_state is not None:
+                    return nested_state
         return state
 
     # --- reply playback + barge-in -----------------------------------------
