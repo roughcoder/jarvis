@@ -11,6 +11,26 @@ from __future__ import annotations
 import re
 
 
+def _date_label(dt) -> str:  # noqa: ANN001
+    return dt.strftime("%A, %-d %B %Y")
+
+
+def _relative_date_map(now) -> str:  # noqa: ANN001
+    from datetime import timedelta
+
+    tomorrow = now + timedelta(days=1)
+    in_two_days = now + timedelta(days=2)
+    upcoming = "; ".join(
+        f"{(now + timedelta(days=days)).strftime('%A')}={(now + timedelta(days=days)).strftime('%-d %B')}"
+        for days in range(1, 15)
+    )
+    return (
+        "Relative date map for memory recall: "
+        f"today={_date_label(now)}; tomorrow={_date_label(tomorrow)}; "
+        f"in two days={_date_label(in_two_days)}; next two weeks: {upcoming}."
+    )
+
+
 def _now_line(tz_name: str) -> str:
     """A human 'right now' string injected so Jarvis knows the date/time without
     a tool or a search. `tz_name` is an IANA name; empty = host local time."""
@@ -27,10 +47,11 @@ def _now_line(tz_name: str) -> str:
     if now is None:
         now = datetime.now().astimezone()
     tz = now.strftime("%Z") or "local time"
-    # e.g. "Right now it's Saturday, 14 June 2026, 8:47 pm BST."
+    # Keep the volatile temporal grounding last in the prompt. It lets the model
+    # match "in two days" / "next Friday" to remembered dated commitments.
     return (
-        f"Right now it's {now.strftime('%A, %-d %B %Y')}, "
-        f"{now.strftime('%-I:%M %p').lower()} {tz}."
+        f"Right now it's {_date_label(now)}, {now.strftime('%-I:%M %p').lower()} {tz}. "
+        f"{_relative_date_map(now)}"
     )
 
 
@@ -43,7 +64,10 @@ _VOICE_FORMAT_BASE = (
     "for anything near now; give a full date only when it's far off or genuinely "
     "needed, and keep it light ('the seventeenth', not 'June the seventeenth, "
     "twenty twenty-six'). Write numbers as words ('twenty-three', not '23'). "
-    "Never use markdown, bullet points, headings, emoji, or special characters."
+    "Use the current relative-date map to match questions like 'tomorrow', 'in "
+    "two days', 'this Friday', or 'next Tuesday' against remembered weekday or "
+    "dated commitments. Never use markdown, bullet points, headings, emoji, or "
+    "special characters."
 )
 _VOICE_FORMAT_EXPRESSIVE = (
     _VOICE_FORMAT_BASE + "\n\n"

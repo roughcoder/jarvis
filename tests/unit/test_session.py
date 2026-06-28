@@ -8,7 +8,9 @@ stays stable.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 
+from jarvis.brain.dialog import _relative_date_map
 from jarvis.brain.context import RequestContext
 from jarvis.brain.session import BrainSession, TurnResult, _now_line
 from jarvis.config import load_config
@@ -37,6 +39,19 @@ def test_now_line_has_weekday_and_clock() -> None:
     assert line.startswith("Right now it's ")
     assert any(d in line for d in _DAYS)
     assert ("am" in line) or ("pm" in line)
+    assert "Relative date map for memory recall" in line
+    assert "tomorrow=" in line
+    assert "in two days=" in line
+    assert "next two weeks:" in line
+
+
+def test_relative_date_map_covers_upcoming_weekdays() -> None:
+    line = _relative_date_map(datetime(2026, 6, 28, 20, 47))
+    assert "today=Sunday, 28 June 2026" in line
+    assert "tomorrow=Monday, 29 June 2026" in line
+    assert "in two days=Tuesday, 30 June 2026" in line
+    assert "Friday=3 July" in line
+    assert "Tuesday=7 July" in line
 
 
 def test_now_line_handles_named_and_bad_timezone() -> None:
@@ -87,6 +102,13 @@ def test_system_prompt_includes_now_with_memory() -> None:
     prompt = _session()._system_prompt("likes tea")
     assert "likes tea" in prompt
     assert "Right now it's" in prompt
+
+
+def test_system_prompt_tells_voice_to_ground_relative_dates() -> None:
+    prompt = _session("voice")._system_prompt("needs to bring the PE kit on Monday")
+    assert "questions like 'tomorrow', 'in two days'" in prompt
+    assert "'this Friday', or 'next Tuesday'" in prompt
+    assert "remembered weekday or dated commitments" in prompt
 
 
 def test_initial_model_is_channel_aware() -> None:
