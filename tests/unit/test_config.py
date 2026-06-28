@@ -130,4 +130,6 @@ def test_resolved_never_leaks_secrets() -> None:
     assert r["gateway.api_key"] in {"<set>", "<unset>"}
     assert r["memory.api_key"] in {"<set>", "<unset>"}
     assert r["tts.api_key"] in {"<set>", "<unset>"}
+    assert r["accounts.house_email_binding"] == "house-email"
+    assert r["accounts.house_calendar_binding"] == "house-calendar"
     assert "****" in r["database.url"]

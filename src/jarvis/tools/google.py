@@ -11,10 +11,10 @@ from typing import Any
 
 from jarvis.brain.account_adapters import GogcliAccountAdapter
 from jarvis.brain.account_router import AccountRouter, classify_email_recipient
-from jarvis.brain.accounts import AccountBinding
+from jarvis.brain.accounts import AccountBinding, AccountBindingError, load_account_binding
 from jarvis.brain.context import RequestContext
 from jarvis.brain.identity import HOUSE
-from jarvis.config import GoogleConfig
+from jarvis.config import AccountConfig, GoogleConfig
 from jarvis.tools.base import Tool
 
 
@@ -41,6 +41,7 @@ def _house_calendar_binding() -> AccountBinding:
 def make_google_tools(
     cfg: GoogleConfig,
     *,
+    accounts: AccountConfig | None = None,
     router: AccountRouter | None = None,
     email_binding: AccountBinding | None = None,
     calendar_binding: AccountBinding | None = None,
@@ -51,8 +52,12 @@ def make_google_tools(
             email_adapters={"gogcli": adapter},
             calendar_adapters={"gogcli": adapter},
         )
-    email_binding = email_binding or _house_email_binding()
-    calendar_binding = calendar_binding or _house_calendar_binding()
+    email_binding = email_binding or _configured_house_binding(
+        accounts, name=getattr(accounts, "house_email_binding", ""), kind="email"
+    ) or _house_email_binding()
+    calendar_binding = calendar_binding or _configured_house_binding(
+        accounts, name=getattr(accounts, "house_calendar_binding", ""), kind="calendar"
+    ) or _house_calendar_binding()
 
     async def search_email(ctx: RequestContext, args: dict[str, Any]) -> str:
         query = (args.get("query") or "").strip()
@@ -117,3 +122,18 @@ def make_google_tools(
             announce=True,
         ),
     ]
+
+
+def _configured_house_binding(
+    accounts: AccountConfig | None,
+    *,
+    name: str,
+    kind: str,
+) -> AccountBinding | None:
+    if accounts is None or not name:
+        return None
+    try:
+        binding = load_account_binding(accounts.bindings_dir, HOUSE, name)
+    except AccountBindingError:
+        return None
+    return binding if binding.kind == kind else None
