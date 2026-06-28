@@ -281,6 +281,15 @@ def test_voice_conversation_reset_clears_temporary_identity_and_mode() -> None:
     assert conn["voice_mode"] == DEFAULT_MODE
 
 
+def test_voice_conversation_reset_preserves_paired_identity() -> None:
+    conn = {"asserted": "jules", "base_asserted": "alice", "voice_mode": STAY_MODE}
+
+    BrainServer._reset_voice_conversation("voice", conn)
+
+    assert conn["asserted"] == "alice"
+    assert conn["voice_mode"] == DEFAULT_MODE
+
+
 def test_local_turnloop_reset_clears_temporary_identity_and_mode() -> None:
     loop = TurnLoop.__new__(TurnLoop)
     loop._asserted = "neil"
