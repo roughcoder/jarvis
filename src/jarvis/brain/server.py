@@ -446,7 +446,7 @@ class BrainServer:
         hardware = {h.strip().lower() for h in first.hardware if h.strip()}
         conn = {
             "asserted": first.identity,
-            "base_asserted": first.identity if channel != "voice" else "",
+            "base_asserted": first.identity,
             "device_default": device_default or HOUSE,
             "hardware": hardware,
             "voice_mode": "default",
