@@ -324,6 +324,8 @@ class BrainConfig(_Base):
     # Intercoms send captured utterances as JSON/base64 PCM. Long utterances can exceed
     # websockets' 1 MiB default frame cap, so keep the server receive limit explicit.
     websocket_max_size: int = 8 * 1024 * 1024
+    websocket_ping_interval_s: float = 20.0
+    websocket_ping_timeout_s: float = 60.0
 
 
 class IntercomConfig(_Base):
@@ -336,6 +338,9 @@ class IntercomConfig(_Base):
     brain_host: str = "localhost"
     brain_port: int = 8700
     token: SecretStr = SecretStr("")
+    websocket_max_size: int = 8 * 1024 * 1024
+    websocket_ping_interval_s: float = 20.0
+    websocket_ping_timeout_s: float = 60.0
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -743,12 +748,17 @@ class Config:
             "brain.port": self.brain.port,
             "brain.pairing_token": mask(self.brain.pairing_token),
             "brain.websocket_max_size": self.brain.websocket_max_size,
+            "brain.websocket_ping_interval_s": self.brain.websocket_ping_interval_s,
+            "brain.websocket_ping_timeout_s": self.brain.websocket_ping_timeout_s,
             "brain.devices": (
                 ", ".join(f"{d.device_id}->{d.identity or 'house'}" for d in self.brain.devices)
                 or "<none — shared token>"
             ),
             "intercom.brain_url": self.intercom.brain_url,
             "intercom.token": mask(self.intercom.token),
+            "intercom.websocket_max_size": self.intercom.websocket_max_size,
+            "intercom.websocket_ping_interval_s": self.intercom.websocket_ping_interval_s,
+            "intercom.websocket_ping_timeout_s": self.intercom.websocket_ping_timeout_s,
             "intercom_device.camera": self.intercom_device.camera,
             "intercom_device.camera_bin": self.intercom_device.camera_bin or "<auto>",
             "intercom_device.eyes": self.intercom_device.eyes,

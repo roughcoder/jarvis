@@ -213,7 +213,12 @@ class BrainServer:
         alarms: asyncio.Task | None = None
         try:
             async with websockets.serve(
-                self._handle, host, port, max_size=self._cfg.brain.websocket_max_size
+                self._handle,
+                host,
+                port,
+                max_size=self._cfg.brain.websocket_max_size,
+                ping_interval=self._cfg.brain.websocket_ping_interval_s,
+                ping_timeout=self._cfg.brain.websocket_ping_timeout_s,
             ):
                 print(f"Brain listening on ws://{host}:{port}")
                 if self._cfg.heartbeat.enabled:

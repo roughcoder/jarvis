@@ -86,7 +86,12 @@ class IntercomClient:
                 phrase = self._cfg.wake.keyword.replace("_", " ").title()
                 while True:  # reconnect loop — survive brain restarts/outages
                     try:
-                        async with websockets.connect(url) as ws:
+                        async with websockets.connect(
+                            url,
+                            max_size=self._cfg.intercom.websocket_max_size,
+                            ping_interval=self._cfg.intercom.websocket_ping_interval_s,
+                            ping_timeout=self._cfg.intercom.websocket_ping_timeout_s,
+                        ) as ws:
                             await ws.send(
                                 encode(
                                     Hello(
@@ -121,6 +126,8 @@ class IntercomClient:
                                         exc, (OSError, websockets.exceptions.WebSocketException)
                                     ):
                                         raise exc
+                                    if exc:
+                                        print(f"  [intercom] brain link ended: {exc!r}")
                             finally:
                                 for t in (router, turns):
                                     t.cancel()
@@ -150,8 +157,9 @@ class IntercomClient:
                         asyncio.create_task(self._handle_device_request(ws, msg))
                     else:
                         inbound.put_nowait(msg)
-        except Exception:  # noqa: BLE001 - socket closed
-            pass
+        except Exception as exc:  # noqa: BLE001 - socket closed
+            print(f"  [intercom] router stopped: {exc!r}")
+            raise
 
     async def _handle_device_request(self, ws, msg: DeviceRequest) -> None:  # noqa: ANN001
         try:
