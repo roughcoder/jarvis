@@ -551,6 +551,12 @@ class BrainServer:
             close_reason="alarm_ack",
         )
 
+    @staticmethod
+    def _apply_turn_result(channel: str, conn: dict, result: TurnResult) -> None:
+        conn["voice_mode"] = result.voice_mode
+        if result.ended:
+            BrainServer._reset_voice_conversation(channel, conn)
+
     async def _do_turn(self, ws, device_id: str, channel: str, conn: dict, msg) -> None:  # noqa: ANN001
         if isinstance(msg, Utterance):
             text = await asyncio.to_thread(
@@ -615,6 +621,7 @@ class BrainServer:
                     await ws.send(encode(ReplyAudio.of(turn_id, pcm)))
         except asyncio.CancelledError:
             session.finalize(text, result)  # remember what was actually said
+            self._apply_turn_result(channel, conn, result)
             self._tracer.emit(trace)
             raise
         session.finalize(text, result)
@@ -632,9 +639,7 @@ class BrainServer:
                     )
                 )
             )
-        conn["voice_mode"] = result.voice_mode
-        if result.ended:
-            self._reset_voice_conversation(channel, conn)
+        self._apply_turn_result(channel, conn, result)
 
     async def _request_device_action(
         self, ctx: RequestContext, action: str, args: dict, timeout_s: float

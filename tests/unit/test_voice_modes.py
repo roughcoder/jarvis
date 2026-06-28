@@ -258,3 +258,23 @@ def test_alarm_ack_preserves_stay_mode() -> None:
     assert end.continue_listening is True
     assert end.voice_mode == STAY_MODE
     assert end.close_reason == "alarm_ack"
+
+
+def test_turn_result_state_updates_connection_after_barge_in() -> None:
+    conn = {"asserted": "neil", "base_asserted": "", "voice_mode": STAY_MODE}
+    result = TurnResult(ended=True, voice_mode=DEFAULT_MODE)
+
+    BrainServer._apply_turn_result("voice", conn, result)
+
+    assert conn["asserted"] == ""
+    assert conn["voice_mode"] == DEFAULT_MODE
+
+
+def test_turn_result_state_preserves_open_stay_connection() -> None:
+    conn = {"asserted": "neil", "base_asserted": "", "voice_mode": DEFAULT_MODE}
+    result = TurnResult(ended=False, voice_mode=STAY_MODE)
+
+    BrainServer._apply_turn_result("voice", conn, result)
+
+    assert conn["asserted"] == "neil"
+    assert conn["voice_mode"] == STAY_MODE
