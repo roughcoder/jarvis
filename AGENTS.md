@@ -142,6 +142,9 @@ keeps the original single-process behaviour. The think/speak core is shared
   `Release-note: <user-facing change>`, `Env: <new/changed/removed env var and
   action needed>`, and `Breaking Change: <migration impact>`. Use
   `Release-note: skip` only for mechanical commits such as version metadata.
+- **Runtime releases are GitHub Actions only.** Never run
+  `scripts/release_runtime.sh` locally; use local scripts only for preflight
+  version/notes checks, then trigger the `Release` workflow.
 - **Lint with `uv run ruff check src/`** before committing. Keep comments at the
   density of the surrounding code; explain *why*, not *what*.
 - **Latency is the product.** Felt speed = STT + time-to-first-token + TTS-start.

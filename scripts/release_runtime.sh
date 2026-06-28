@@ -5,17 +5,16 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/release_runtime.sh <version> [--draft] [--skip-homebrew]
 
-Builds a source tarball from the current Jarvis runtime commit, pushes the tag,
-creates or updates a GitHub Release, and optionally updates the Homebrew formula.
+Internal release publisher for .github/workflows/release.yml.
+
+Builds a source tarball from the checked-out GitHub Actions commit, pushes the
+tag, creates or updates a GitHub Release, and optionally updates the Homebrew
+formula. Do not run this script locally; trigger the Release workflow instead.
 
 Environment:
   GITHUB_REPOSITORY=owner/repo      Override repository detection.
   SKIP_HOMEBREW=1                  Do not update the Homebrew formula.
   HOMEBREW_TAP_DIR=/path/to/tap    Override the local Homebrew tap checkout.
-
-Example:
-  scripts/release_runtime.sh 0.1.0 --draft
-  scripts/release_runtime.sh 0.1.0
 USAGE
 }
 
@@ -30,6 +29,15 @@ if [[ -z "$VERSION" ]]; then
   exit 2
 fi
 shift || true
+
+if [[ "${GITHUB_ACTIONS:-}" != "true" || "${GITHUB_WORKFLOW:-}" != "Release" ]]; then
+  cat >&2 <<'MSG'
+Runtime releases must be published by the GitHub Actions "Release" workflow.
+Do not run scripts/release_runtime.sh locally; local releases can create version,
+tag, asset, and Homebrew formula mismatches.
+MSG
+  exit 2
+fi
 
 DRAFT_FLAG=""
 SKIP_HOMEBREW="${SKIP_HOMEBREW:-0}"

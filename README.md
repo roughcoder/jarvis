@@ -149,7 +149,12 @@ jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence \
 
 ## Runtime Release
 
-Preferred release path: run the `Release` workflow in GitHub Actions with:
+Runtime releases are published **only** by the `Release` workflow in GitHub
+Actions. Do not run `scripts/release_runtime.sh` locally; the script refuses to
+publish outside that workflow because local runs can create version, tag,
+release asset, and Homebrew formula mismatches.
+
+Run the workflow with:
 
 - `draft`: whether the GitHub release should remain draft
 - `skip_homebrew`: whether to skip the tap update
@@ -202,11 +207,17 @@ configuration and the action required, and `Breaking Change:` for migration
 impact. Use `Release-note: skip` only for mechanical commits that should not
 appear in user-facing notes.
 
-Local fallback:
+Local preflight only:
 
 ```bash
 scripts/compute_next_release_version.sh   # dry-run candidate version from commit history
-scripts/release_runtime.sh <version>      # explicit release when needed
+tmpfile="$(mktemp)"
+uv run python scripts/generate_release_notes.py \
+  --version "$(scripts/compute_next_release_version.sh)" \
+  --ai never \
+  --output "$tmpfile"
+sed -n '1,160p' "$tmpfile"
+rm -f "$tmpfile"
 ```
 
 ## Conventional Commits (local)
@@ -231,11 +242,11 @@ Quick local check to verify your branch before release:
 scripts/check_conventional_commits.sh $(git describe --tags --abbrev=0) HEAD
 ```
 
-Manual release smoke test (recommended for this repo):
+Release smoke test (recommended for this repo):
 
-1. Make sure the repo version is what you expect in both `pyproject.toml` and
-   `src/jarvis/__init__.py`.
-2. Run `scripts/compute_next_release_version.sh` and confirm the number matches
+1. Run `scripts/compute_next_release_version.sh` and confirm the number matches
    your intended bump (`feat` => minor, patch set only when no `feat`).
+2. Preview deterministic release notes locally with
+   `scripts/generate_release_notes.py`; do not publish from your machine.
 3. Trigger `Release` with `skip_homebrew: true` and `draft: true` to validate the
    computed release output and artifact packaging without touching your tap.
