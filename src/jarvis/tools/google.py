@@ -135,5 +135,15 @@ def _configured_house_binding(
     try:
         binding = load_account_binding(accounts.bindings_dir, HOUSE, name)
     except AccountBindingError:
-        return None
-    return binding if binding.kind == kind else None
+        return _closed_house_binding(name=name, kind=kind)
+    return binding if binding.kind == kind else _closed_house_binding(name=name, kind=kind)
+
+
+def _closed_house_binding(*, name: str, kind: str) -> AccountBinding:
+    return AccountBinding(
+        name=name,
+        principal=HOUSE,
+        kind=kind,
+        provider="unconfigured",
+        grants=frozenset(),
+    )
