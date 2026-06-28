@@ -20,8 +20,6 @@ import threading
 import uuid
 
 import websockets
-
-from jarvis.brain.voice_modes import should_emit_idle_after_empty_capture
 from jarvis.config import Config
 from jarvis.intercom.audio import AudioIO, MicStream
 from jarvis.intercom.hardware import IntercomHardware
@@ -218,7 +216,7 @@ class IntercomClient:
         while True:
             if not pcm:
                 print("  (nothing said)")
-                if should_emit_idle_after_empty_capture(conversation_started):
+                if conversation_started:
                     with contextlib.suppress(Exception):
                         await ws.send(encode(ConversationIdle(reason="timeout")))
                 return None
