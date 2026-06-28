@@ -7,6 +7,7 @@ import asyncio
 from jarvis.brain.context import RequestContext
 from jarvis.brain.server import BrainServer
 from jarvis.brain.session import BrainSession, TurnResult
+from jarvis.brain.turnloop import TurnLoop
 from jarvis.brain.voice_modes import (
     DEFAULT_MODE,
     STAY_MODE,
@@ -278,6 +279,18 @@ def test_voice_conversation_reset_clears_temporary_identity_and_mode() -> None:
 
     assert conn["asserted"] == ""
     assert conn["voice_mode"] == DEFAULT_MODE
+
+
+def test_local_turnloop_reset_clears_temporary_identity_and_mode() -> None:
+    loop = TurnLoop.__new__(TurnLoop)
+    loop._asserted = "neil"
+    loop._base_asserted = ""
+    loop._voice_mode = STAY_MODE
+
+    loop._reset_voice_conversation()
+
+    assert loop._asserted == ""
+    assert loop._voice_mode == DEFAULT_MODE
 
 
 def test_alarm_ack_preserves_stay_mode() -> None:

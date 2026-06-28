@@ -216,6 +216,7 @@ class TurnLoop:
             trace.end("stt", audio_s=round(secs, 1), chars=len(text))
             print(f"  you: {text!r}")
             if not text:
+                self._reset_voice_conversation()
                 return
 
             # Resolve WHO is speaking from this utterance (§5) and route to that
