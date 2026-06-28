@@ -274,6 +274,17 @@ class BrainSession:
         if self._ctx.channel == "voice":
             action = local_voice_action(user_text, self._voice_mode)
             if action is not None:
+                if action.mode == STAY_MODE and not self._cfg.vad.conversation_mode:
+                    reply = "I can't stay with you while follow-up listening is off."
+                    result.raw = reply
+                    result.reply = reply
+                    result.voice_mode = DEFAULT_MODE
+                    result.ended = True
+                    result.continue_listening = False
+                    result.close_reason = "conversation_disabled"
+                    async for pcm in self._tts_source(reply, trace):
+                        yield pcm
+                    return
                 self._voice_mode = action.mode
                 result.raw = action.reply
                 result.reply = action.reply

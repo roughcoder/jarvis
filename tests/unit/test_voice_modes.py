@@ -76,6 +76,23 @@ def test_stay_mode_activation_is_pre_llm() -> None:
     assert sess._gateway.calls == 0
 
 
+def test_stay_mode_activation_is_unavailable_when_conversation_mode_disabled() -> None:
+    sess = _session(conversation_mode=False)
+    result = TurnResult()
+
+    async def go() -> list[bytes]:
+        return [chunk async for chunk in sess.respond("stay with me", None, result)]
+
+    chunks = asyncio.run(go())
+
+    assert chunks == [b"I can't stay with you while follow-up listening is off."]
+    assert result.voice_mode == DEFAULT_MODE
+    assert result.continue_listening is False
+    assert result.ended is True
+    assert result.close_reason == "conversation_disabled"
+    assert sess._gateway.calls == 0
+
+
 def test_hard_exit_is_pre_llm_and_returns_default_mode() -> None:
     sess = _session(STAY_MODE)
     result = TurnResult()
