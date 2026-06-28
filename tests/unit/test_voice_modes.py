@@ -151,6 +151,32 @@ def test_alarm_tools_force_voice_turn_closed() -> None:
     assert result.close_reason == "task_complete"
 
 
+def test_alarm_tools_do_not_exit_stay_mode() -> None:
+    sess = _session(STAY_MODE)
+    result = TurnResult(
+        raw="Alarm set for seven.",
+        tool_messages=[
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "set_alarm", "arguments": "{}"},
+                    }
+                ],
+            }
+        ],
+    )
+
+    sess.finalize("set an alarm for seven", result)
+
+    assert result.ended is False
+    assert result.continue_listening is True
+    assert result.voice_mode == STAY_MODE
+    assert result.close_reason == "stay_mode"
+
+
 def test_local_voice_action_ignores_requests() -> None:
     assert local_voice_action("bye, can you set a timer") is None
 

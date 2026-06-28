@@ -231,6 +231,8 @@ class IntercomClient:
                 return
             mic.drain()
             while True:
+                if state["voice_mode"] == "stay" and await self._play_queued_proactive(ws, mic, inbound):
+                    continue
                 if state["voice_mode"] == "stay":
                     print("  …(stay mode — listening)")
                 else:
@@ -249,6 +251,14 @@ class IntercomClient:
                 with contextlib.suppress(Exception):
                     await ws.send(encode(ConversationIdle(reason="timeout")))
                 return
+
+    async def _play_queued_proactive(self, ws, mic: MicStream, inbound: asyncio.Queue) -> bool:  # noqa: ANN001
+        pro = self._take_proactive(inbound)
+        if pro is None:
+            return False
+        await self._play_proactive(ws, mic, inbound, pro)
+        mic.drain()
+        return True
 
     def _take_proactive(self, inbound: asyncio.Queue):  # noqa: ANN202
         """Non-blocking: a Proactive at the head of the queue, else None. Stray

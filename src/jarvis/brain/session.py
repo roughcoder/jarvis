@@ -346,17 +346,17 @@ class BrainSession:
                 or _is_clear_signoff(user_text)
                 or _is_reply_farewell(raw)
             )
-            if tool_completes_voice_turn(result.tool_messages):
-                result.ended = True
-                result.continue_listening = False
-                result.close_reason = "task_complete"
-                mode = DEFAULT_MODE
-            elif mode == STAY_MODE:
+            if mode == STAY_MODE:
                 result.ended = control.conversation == "closed" or explicit_close
                 result.continue_listening = not result.ended
                 result.close_reason = control.reason or ("user_closed" if result.ended else "stay_mode")
                 if result.ended:
                     mode = DEFAULT_MODE
+            elif tool_completes_voice_turn(result.tool_messages):
+                result.ended = True
+                result.continue_listening = False
+                result.close_reason = "task_complete"
+                mode = DEFAULT_MODE
             elif control.conversation == "open":
                 result.ended = False
                 result.continue_listening = True
