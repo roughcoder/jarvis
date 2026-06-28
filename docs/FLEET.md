@@ -258,8 +258,8 @@ INTERCOM_DEVICE_CAMERA_WIDTH=1280
 INTERCOM_DEVICE_CAMERA_HEIGHT=720
 INTERCOM_DEVICE_CAMERA_TIMEOUT_S=8
 INTERCOM_DEVICE_CAMERA_WARMUP_MS=300
-INTERCOM_DEVICE_EYES=auto
-INTERCOM_DEVICE_EYES_SLEEP_AFTER_S=25
+INTERCOM_DEVICE_PI_PANEL=auto
+INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S=25
 ```
 
 Brain Mac:
@@ -322,10 +322,12 @@ Ask for a physical power/network check, then retry SSH when Tailscale reports th
 host online.
 
 Pi screens are optional hardware. The SunFounder Pironman 5 Pro Max screen is a
-4.3-inch 800x480 MIPI DSI display. Keep `INTERCOM_DEVICE_EYES=auto` until the
-systemd service has a real display session (`DISPLAY` or `WAYLAND_DISPLAY`);
-forcing eyes on a headless unit can make the UI probe fail. Grant
-`intercom.display` only on profiles for Pis that actually have a working screen.
+4.3-inch 800x480 MIPI DSI touch display. Keep `INTERCOM_DEVICE_PI_PANEL=auto`
+until the systemd service has a real display session (`DISPLAY` or
+`WAYLAND_DISPLAY`); forcing PiPanel on a headless unit can make the UI probe
+fail. Grant `intercom.display` only on profiles for Pis that actually have a
+working screen. Existing `INTERCOM_DEVICE_EYES` values remain supported as
+legacy aliases.
 
 Post-update smoke:
 

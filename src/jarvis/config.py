@@ -365,9 +365,20 @@ class IntercomDeviceConfig(_Base):
     camera_height: int = 720
     camera_timeout_s: float = 8.0
     camera_warmup_ms: int = 300
-    # "auto" starts the eyes UI only when a display session is available.
+    # Preferred Pi touchscreen shell. "auto" starts only when a display session is
+    # available. `eyes` is the legacy env name kept for existing Pi installs.
+    pi_panel: str = ""
+    pi_panel_sleep_after_s: float = 0.0
     eyes: str = "auto"
     eyes_sleep_after_s: float = 25.0
+
+    @property
+    def pi_panel_setting(self) -> str:
+        return self.pi_panel or self.eyes
+
+    @property
+    def pi_panel_sleep_s(self) -> float:
+        return self.pi_panel_sleep_after_s or self.eyes_sleep_after_s
 
 
 class WorkerConfig(_Base):
@@ -761,7 +772,8 @@ class Config:
             "intercom.websocket_ping_timeout_s": self.intercom.websocket_ping_timeout_s,
             "intercom_device.camera": self.intercom_device.camera,
             "intercom_device.camera_bin": self.intercom_device.camera_bin or "<auto>",
-            "intercom_device.eyes": self.intercom_device.eyes,
+            "intercom_device.pi_panel": self.intercom_device.pi_panel_setting,
+            "intercom_device.pi_panel_sleep_after_s": self.intercom_device.pi_panel_sleep_s,
             "worker.base_url": self.worker.base_url,
             "worker.token": mask(self.worker.token),
             "worker.agent": self.worker.agent,
