@@ -180,6 +180,58 @@ def test_gog_invocation_is_noninteractive_and_allowlisted(monkeypatch) -> None: 
     ]
 
 
+def test_gog_invocation_uses_bound_calendar_id(monkeypatch) -> None:  # noqa: ANN001
+    calls: list[tuple[str, ...]] = []
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"ok", b""
+
+    async def fake_exec(*argv, stdout=None, stderr=None):  # noqa: ANN001
+        calls.append(tuple(argv))
+        return FakeProc()
+
+    monkeypatch.setattr("jarvis.brain.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
+    monkeypatch.setattr("jarvis.brain.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    binding = AccountBinding(
+        name="school-calendar",
+        principal=HOUSE,
+        kind="calendar",
+        provider="gogcli",
+        account="house",
+        calendar_id="family@example.invalid",
+        grants=frozenset({"calendar.read"}),
+    )
+    tools = {
+        t.name: t
+        for t in make_google_tools(
+            GoogleConfig(_env_file=None, gogcli_bin="gog"),
+            calendar_binding=binding,
+        )
+    }
+
+    out = asyncio.run(tools["upcoming_events"].handler(_ctx("calendar.read"), {"days": 2}))
+
+    assert out == "ok"
+    assert calls == [
+        (
+            "gog",
+            "--plain",
+            "--no-input",
+            "--account",
+            "house",
+            "--enable-commands-exact=calendar.events",
+            "calendar",
+            "events",
+            "family@example.invalid",
+            "--days",
+            "2",
+        )
+    ]
+
+
 def test_gog_invocation_selects_account_from_credential_ref(monkeypatch) -> None:  # noqa: ANN001
     calls: list[tuple[str, ...]] = []
 
