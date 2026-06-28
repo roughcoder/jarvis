@@ -13,6 +13,7 @@ import queue
 import random
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
 
@@ -79,9 +80,7 @@ class PiPanel:
         except Exception as exc:  # noqa: BLE001
             print(f"  [pi-panel] couldn't open display: {exc}")
             return
-        root.title("Jarvis")
-        root.configure(bg="#05070a")
-        root.attributes("-fullscreen", True)
+        _configure_fullscreen_root(root)
         canvas = tk.Canvas(root, bg="#05070a", highlightthickness=0)
         canvas.pack(fill="both", expand=True)
 
@@ -263,6 +262,21 @@ class PiPanel:
             root.mainloop()
         finally:
             self._stop.set()
+
+
+def _configure_fullscreen_root(root) -> None:  # noqa: ANN001
+    root.title("Jarvis")
+    root.configure(bg="#05070a")
+    # labwc/Xwayland can leave Tk's fullscreen hint decorated with a title bar.
+    # Make the panel borderless but let the compositor choose the output bounds.
+    with suppress(Exception):
+        root.overrideredirect(True)
+    with suppress(Exception):
+        root.attributes("-fullscreen", True)
+    with suppress(Exception):
+        root.lift()
+    with suppress(Exception):
+        root.focus_force()
 
 
 def _draw_listening_beacons(canvas, width: int, height: int, now: float) -> None:  # noqa: ANN001
