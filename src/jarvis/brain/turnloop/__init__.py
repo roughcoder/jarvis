@@ -119,6 +119,13 @@ class TurnLoop:
         self._asserted = self._base_asserted
         self._voice_mode = DEFAULT_MODE
 
+    def _apply_cancelled_turn_result(self, result: TurnResult) -> None:
+        if result.close_reason not in {"mode_enter", "mode_exit"}:
+            return
+        self._voice_mode = result.voice_mode
+        if result.close_reason == "mode_exit":
+            self._reset_voice_conversation()
+
     # --- blocking frame loops (run via to_thread) --------------------------
     def _wait_for_wake(self, mic: MicStream) -> None:
         # If the wake loop falls behind (e.g. a CPU/thread spike from the
@@ -245,7 +252,10 @@ class TurnLoop:
             )
             # finalize() runs even after a barge-in: result.raw is what was said.
             session.finalize(text, result)
-            self._voice_mode = result.voice_mode
+            if interrupted:
+                self._apply_cancelled_turn_result(result)
+            else:
+                self._voice_mode = result.voice_mode
             reply, ended = result.reply, result.ended
             print(f"  jarvis: {reply}{'  ⏹' if ended else ''}")
             if interrupted:

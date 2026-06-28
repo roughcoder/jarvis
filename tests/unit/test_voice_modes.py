@@ -302,6 +302,32 @@ def test_local_turnloop_reset_clears_temporary_identity_and_mode() -> None:
     assert loop._voice_mode == DEFAULT_MODE
 
 
+def test_local_cancelled_mode_exit_resets_identity_and_mode() -> None:
+    loop = TurnLoop.__new__(TurnLoop)
+    loop._asserted = "neil"
+    loop._base_asserted = ""
+    loop._voice_mode = STAY_MODE
+    result = TurnResult(ended=True, voice_mode=DEFAULT_MODE, close_reason="mode_exit")
+
+    loop._apply_cancelled_turn_result(result)
+
+    assert loop._asserted == ""
+    assert loop._voice_mode == DEFAULT_MODE
+
+
+def test_local_cancelled_user_closed_preserves_identity_and_mode() -> None:
+    loop = TurnLoop.__new__(TurnLoop)
+    loop._asserted = "neil"
+    loop._base_asserted = ""
+    loop._voice_mode = STAY_MODE
+    result = TurnResult(ended=True, voice_mode=DEFAULT_MODE, close_reason="user_closed")
+
+    loop._apply_cancelled_turn_result(result)
+
+    assert loop._asserted == "neil"
+    assert loop._voice_mode == STAY_MODE
+
+
 def test_alarm_ack_preserves_stay_mode() -> None:
     conn = {"voice_mode": STAY_MODE}
 
