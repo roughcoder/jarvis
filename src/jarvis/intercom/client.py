@@ -231,7 +231,11 @@ class IntercomClient:
                 return
             mic.drain()
             while True:
-                if state["voice_mode"] == "stay" and await self._play_queued_proactive(ws, mic, inbound):
+                proactive_state = await self._play_queued_proactive(ws, mic, inbound)
+                if proactive_state is not None:
+                    state.update(proactive_state)
+                    if state["ended"] or not state["continue_listening"]:
+                        return
                     continue
                 if state["voice_mode"] == "stay":
                     print("  …(stay mode — listening)")
@@ -252,13 +256,13 @@ class IntercomClient:
                     await ws.send(encode(ConversationIdle(reason="timeout")))
                 return
 
-    async def _play_queued_proactive(self, ws, mic: MicStream, inbound: asyncio.Queue) -> bool:  # noqa: ANN001
+    async def _play_queued_proactive(self, ws, mic: MicStream, inbound: asyncio.Queue) -> dict | None:  # noqa: ANN001
         pro = self._take_proactive(inbound)
         if pro is None:
-            return False
-        await self._play_proactive(ws, mic, inbound, pro)
+            return None
+        state = await self._play_proactive(ws, mic, inbound, pro)
         mic.drain()
-        return True
+        return state
 
     def _take_proactive(self, inbound: asyncio.Queue):  # noqa: ANN202
         """Non-blocking: a Proactive at the head of the queue, else None. Stray
@@ -289,7 +293,7 @@ class IntercomClient:
                 return True
         return False
 
-    async def _play_proactive(self, ws, mic: MicStream, inbound: asyncio.Queue, pro: Proactive) -> None:  # noqa: ANN001
+    async def _play_proactive(self, ws, mic: MicStream, inbound: asyncio.Queue, pro: Proactive) -> dict:  # noqa: ANN001
         """Play a proactive's audio (tone + spoken text under its 'pa-' turn id); if it
         asked to open the mic, listen for a reply and carry it into a chat."""
         print(f"  🔔 {pro.text}")
@@ -316,6 +320,7 @@ class IntercomClient:
             if pcm:
                 self._panel.set("thinking")
                 await self._converse(ws, mic, inbound, pcm)
+        return state
 
     # --- reply playback + barge-in -----------------------------------------
     async def _reply_audio(self, inbound, turn_id, state):  # noqa: ANN001
