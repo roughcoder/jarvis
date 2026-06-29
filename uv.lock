@@ -461,7 +461,7 @@ wheels = [
 
 [[package]]
 name = "jarvis"
-version = "0.6.1"
+version = "0.7.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or sys_platform == 'darwin'" },
