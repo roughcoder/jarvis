@@ -13,6 +13,8 @@ from jarvis.config import load_config
 from jarvis.intercom.client import IntercomClient
 from jarvis.intercom.metrics import SCHEMA_VERSION, IntercomReplyMetrics, summary
 from jarvis.protocol.messages import (
+    AUDIO_BINARY_V1,
+    BinaryAudio,
     ConversationIdle,
     DeviceRequest,
     DeviceResponse,
@@ -197,10 +199,31 @@ def test_reply_audio_yields_pcm_and_records_state() -> None:
         audio = metrics.data["stages"]["reply_audio"]
         assert audio["chunks"] == 2
         assert audio["bytes"] == 4
+        assert audio["protocol"] == "json_base64_v1"
         assert audio["decode_ms"] >= 0
         return chunks
 
     assert asyncio.run(go()) == [b"\x01\x02", b"\x03\x04"]  # only this turn's audio
+
+
+def test_binary_reply_audio_yields_pcm_without_base64_decode() -> None:
+    c = _client()
+    q: asyncio.Queue = asyncio.Queue()
+    q.put_nowait(BinaryAudio(kind="reply_audio", turn_id="t1", pcm=b"\x01\x02"))
+    q.put_nowait(ReplyEnd(turn_id="t1"))
+
+    async def go() -> tuple[list[bytes], dict]:
+        state = {"ended": False, "text": ""}
+        metrics = IntercomReplyMetrics(turn_id="t1", device_id="pi")
+        chunks = [pcm async for pcm in c._reply_audio(q, "t1", state, metrics)]
+        return chunks, metrics.data["stages"]["reply_audio"]
+
+    chunks, audio = asyncio.run(go())
+    assert chunks == [b"\x01\x02"]
+    assert audio["protocol"] == AUDIO_BINARY_V1
+    assert audio["chunks"] == 1
+    assert audio["encoded_bytes"] == 2
+    assert audio["decode_ms"] == 0
 
 
 def test_intercom_metric_summary_reports_playback_baseline() -> None:

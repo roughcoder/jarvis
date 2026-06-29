@@ -14,7 +14,7 @@ import websockets
 
 from jarvis.brain.server import BrainServer
 from jarvis.config import BrainConfig, CapabilityConfig, MCPConfig, load_config
-from jarvis.protocol.messages import Hello, Welcome, decode, encode
+from jarvis.protocol.messages import AUDIO_BINARY_V1, Hello, Welcome, decode, encode
 
 
 @pytest.fixture
@@ -37,11 +37,13 @@ def cfg(tmp_path):  # noqa: ANN001, ANN201
     return c
 
 
-async def _welcome(server: BrainServer, device_id: str) -> Welcome:
+async def _welcome(
+    server: BrainServer, device_id: str, *, protocols: list[str] | None = None
+) -> Welcome:
     async with websockets.serve(server._handle, "localhost", 0) as srv:
         port = srv.sockets[0].getsockname()[1]
         async with websockets.connect(f"ws://localhost:{port}") as ws:
-            await ws.send(encode(Hello(device_id=device_id)))
+            await ws.send(encode(Hello(device_id=device_id, protocols=protocols or [])))
             return decode(await asyncio.wait_for(ws.recv(), 5))
 
 
@@ -61,3 +63,11 @@ def test_shared_device_resolves_to_house(cfg) -> None:  # noqa: ANN001
     assert w.scope == "house"
     assert "mcp.notion" not in w.capabilities  # no personal grants for an unknown speaker
     assert w.capabilities == ["web.search"]
+
+
+def test_pairing_negotiates_binary_audio_protocol(cfg) -> None:  # noqa: ANN001
+    w = asyncio.run(
+        _welcome(BrainServer(cfg), "room-pi", protocols=[AUDIO_BINARY_V1, "unknown_v9"])
+    )
+    assert isinstance(w, Welcome)
+    assert w.protocols == [AUDIO_BINARY_V1]

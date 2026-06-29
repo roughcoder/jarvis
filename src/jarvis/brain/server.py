@@ -39,6 +39,7 @@ from jarvis.brain.voice_modes import (
 from jarvis.config import Config, insecure_bind
 from jarvis.mcp import MCPBridge
 from jarvis.protocol.messages import (
+    AUDIO_BINARY_V1,
     BargeIn,
     Cancel,
     ConversationIdle,
@@ -56,6 +57,7 @@ from jarvis.protocol.messages import (
     Utterance,
     Welcome,
     decode,
+    encode_reply_audio_binary,
     encode,
 )
 from jarvis.services.stt import Transcriber
@@ -451,11 +453,13 @@ class BrainServer:
         # `device_default` is the device's pinned principal (a personal device) — used
         # only when nobody is otherwise identified.
         hardware = {h.strip().lower() for h in first.hardware if h.strip()}
+        negotiated = sorted(set(first.protocols).intersection({AUDIO_BINARY_V1}))
         conn = {
             "asserted": first.identity,
             "base_asserted": first.identity,
             "device_default": device_default or HOUSE,
             "hardware": hardware,
+            "protocols": set(negotiated),
             "voice_mode": "default",
             "waiters": {},
         }
@@ -465,14 +469,18 @@ class BrainServer:
         await ws.send(
             encode(
                 Welcome(
-                    identity=base.identity, scope=base.scope, capabilities=sorted(base.capabilities)
+                    identity=base.identity,
+                    scope=base.scope,
+                    capabilities=sorted(base.capabilities),
+                    protocols=negotiated,
                 )
             )
         )
         hw = ",".join(sorted(hardware)) or "none"
+        proto = ",".join(negotiated) or "json_base64_v1"
         print(
             f"intercom paired: device={device_id} channel={channel} "
-            f"identity={base.identity} hardware={hw}"
+            f"identity={base.identity} hardware={hw} protocols={proto}"
         )
 
         self._connections.add(ws)  # eligible for proactive heartbeat push
@@ -586,18 +594,42 @@ class BrainServer:
             BrainServer._reset_voice_conversation(channel, conn)
 
     async def _do_turn(self, ws, device_id: str, channel: str, conn: dict, msg) -> None:  # noqa: ANN001
+        turn_id = msg.turn_id
+        trace = self._tracer.turn(
+            room=self._cfg.gateway.room,
+            speaker=conn.get("asserted") or conn.get("device_default", HOUSE),
+            channel=channel,
+            device_id=device_id,
+        )
+        trace.set(
+            audio_downlink=AUDIO_BINARY_V1
+            if AUDIO_BINARY_V1 in conn.get("protocols", set())
+            else "json_base64_v1"
+        )
         if isinstance(msg, Utterance):
-            text = await asyncio.to_thread(
-                self._stt.transcribe, msg.pcm(), sample_rate=msg.sample_rate
+            pcm = msg.pcm()
+            secs = len(pcm) / 2 / msg.sample_rate
+            trace.stage(
+                "uplink",
+                0.0,
+                protocol="json_base64_v1",
+                pcm_bytes=len(pcm),
+                frame_bytes=len(msg.pcm_b64),
+                audio_s=round(secs, 1),
             )
+            trace.start("stt")
+            text = await asyncio.to_thread(
+                self._stt.transcribe, pcm, sample_rate=msg.sample_rate
+            )
+            trace.end("stt", audio_s=round(secs, 1), chars=len(text))
         else:  # TextIn
             text = msg.text
-        turn_id = msg.turn_id
         if not text:
             end = self._empty_transcript_reply_end(turn_id, channel)
             await ws.send(encode(end))
             if end.ended:
                 self._reset_voice_conversation(channel, conn)
+            self._tracer.emit(trace)
             return
         print(f"  you: {text!r}")
         with contextlib.suppress(Exception):  # let the intercom print what was heard
@@ -612,7 +644,7 @@ class BrainServer:
             if not text_only:
                 with contextlib.suppress(Exception):
                     async for pcm in self._tts.synthesize_stream(reply):
-                        await ws.send(encode(ReplyAudio.of(turn_id, pcm)))
+                        await self._send_reply_audio(ws, conn, turn_id, pcm)
             end = self._alarm_ack_reply_end(turn_id, channel, conn)
             with contextlib.suppress(Exception):
                 await ws.send(encode(ReplyText(turn_id=turn_id, text=reply)))
@@ -620,6 +652,7 @@ class BrainServer:
             conn["voice_mode"] = end.voice_mode
             if end.ended:
                 self._reset_voice_conversation(channel, conn)
+            self._tracer.emit(trace)
             return
         # Resolve WHO this utterance is from (claim detection needs the transcript),
         # then route to that principal's session. A spoken claim sticks for the rest
@@ -636,20 +669,20 @@ class BrainServer:
             conn["asserted"] = ctx.identity
         session = self._contexts.get(ctx)
         session.set_voice_mode(conn.get("voice_mode", "default"))
-        trace = self._tracer.turn(
-            room=self._cfg.gateway.room,
+        trace.set(
             speaker=ctx.identity,
             channel=ctx.channel,
             device_id=ctx.device_id,
+            scope=ctx.scope,
+            confidence=ctx.confidence,
         )
-        trace.set(scope=ctx.scope, confidence=ctx.confidence)
         result = TurnResult()
         try:
             if text_only:  # text console / scripted test — reply text only, no TTS
                 await session.respond_text(text, trace, result)
             else:
                 async for pcm in session.respond(text, trace, result):
-                    await ws.send(encode(ReplyAudio.of(turn_id, pcm)))
+                    await self._send_reply_audio(ws, conn, turn_id, pcm)
         except asyncio.CancelledError:
             session.finalize(text, result, trace)  # remember what was actually said
             self._apply_cancelled_turn_result(channel, conn, result)
@@ -671,6 +704,13 @@ class BrainServer:
                 )
             )
         self._apply_turn_result(channel, conn, result)
+
+    @staticmethod
+    async def _send_reply_audio(ws, conn: dict, turn_id: str, pcm: bytes) -> None:  # noqa: ANN001
+        if AUDIO_BINARY_V1 in conn.get("protocols", set()):
+            await ws.send(encode_reply_audio_binary(turn_id, pcm))
+        else:
+            await ws.send(encode(ReplyAudio.of(turn_id, pcm)))
 
     async def _request_device_action(
         self, ctx: RequestContext, action: str, args: dict, timeout_s: float

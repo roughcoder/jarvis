@@ -157,11 +157,25 @@ sudo JARVIS_ENV_FILE=/opt/jarvis/.env jarvis traces -n 20
 
 Intercom playback entries have `kind: "intercom"` and
 `schema_version: "jarvis.intercom.playback.v1"`. They record the Pi-side view:
-time to first reply-audio frame, base64 decode cost, chunks/bytes, playback
-prebuffer/preroll, first speech, underruns, block size, and cut latency. Brain
-turn entries in the same file still record STT/LLM/TTS timings. Compare the two
-by wall-clock time; do not subtract Pi monotonic timings from brain monotonic
-timings across machines.
+capture duration, captured audio duration, time to first reply-audio frame,
+reply-audio protocol (`json_base64_v1` or `audio_binary_v1`), decode cost,
+chunks/bytes, playback prebuffer/preroll, first speech, underruns, block size,
+and cut latency. Brain turn entries now record the corresponding uplink protocol
+and STT timing for WebSocket voice turns, so a few real questions are enough to
+separate capture, upload, STT, LLM, TTS, network, decode, and local playback.
+Compare intercom and brain traces by wall-clock time; do not subtract Pi
+monotonic timings from brain monotonic timings across machines.
+
+After deploying a protocol change, restart the intercom service so the running
+process advertises its current capabilities:
+
+```bash
+sudo systemctl restart jarvis-intercom.service
+sudo journalctl -u jarvis-intercom.service -n 80 --no-pager
+```
+
+The pairing log should mention `audio_binary_v1` when the brain and intercom both
+support binary reply audio.
 
 See `docs/DEPLOYMENT.md` for the product install flow.
 
