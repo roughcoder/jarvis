@@ -20,8 +20,82 @@ import queue
 import threading
 import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 
 from jarvis.config import AudioConfig
+
+
+@dataclass
+class PlaybackMetrics:
+    """Timing captured by the local output path for one streamed playback."""
+
+    sample_rate: int
+    blocksize: int
+    prebuffer_ms: float
+    preroll_ms: float
+    started_at: float = field(default_factory=time.perf_counter)
+    chunks: int = 0
+    bytes: int = 0
+    underruns: int = 0
+    first_feed_ms: float | None = None
+    producer_done_ms: float | None = None
+    ready_ms: float | None = None
+    first_output_ms: float | None = None
+    first_speech_ms: float | None = None
+    finished_ms: float | None = None
+    cut_latency_ms: float | None = None
+    aborted: bool = False
+
+    def _elapsed_ms(self) -> float:
+        return (time.perf_counter() - self.started_at) * 1000
+
+    def mark_feed(self, n_bytes: int) -> None:
+        if self.first_feed_ms is None:
+            self.first_feed_ms = self._elapsed_ms()
+        self.chunks += 1
+        self.bytes += n_bytes
+
+    def mark_producer_done(self) -> None:
+        if self.producer_done_ms is None:
+            self.producer_done_ms = self._elapsed_ms()
+
+    def mark_ready(self) -> None:
+        if self.ready_ms is None:
+            self.ready_ms = self._elapsed_ms()
+
+    def mark_output(self, *, speech: bool) -> None:
+        if self.first_output_ms is None:
+            self.first_output_ms = self._elapsed_ms()
+        if speech and self.first_speech_ms is None:
+            self.first_speech_ms = self._elapsed_ms()
+
+    def mark_finished(self) -> None:
+        if self.finished_ms is None:
+            self.finished_ms = self._elapsed_ms()
+
+    def as_dict(self) -> dict:
+        return {
+            "ms": round(self.finished_ms or self._elapsed_ms(), 1),
+            "sample_rate": self.sample_rate,
+            "blocksize": self.blocksize,
+            "block_ms": round(self.blocksize / self.sample_rate * 1000, 1),
+            "prebuffer_ms": round(self.prebuffer_ms, 1),
+            "preroll_ms": round(self.preroll_ms, 1),
+            "chunks": self.chunks,
+            "bytes": self.bytes,
+            "underruns": self.underruns,
+            "first_feed_ms": _round_ms(self.first_feed_ms),
+            "producer_done_ms": _round_ms(self.producer_done_ms),
+            "ready_ms": _round_ms(self.ready_ms),
+            "first_output_ms": _round_ms(self.first_output_ms),
+            "first_speech_ms": _round_ms(self.first_speech_ms),
+            "cut_latency_ms": _round_ms(self.cut_latency_ms),
+            "aborted": self.aborted,
+        }
+
+
+def _round_ms(value: float | None) -> float | None:
+    return round(value, 1) if value is not None else None
 
 
 class _StreamingPlayer:
@@ -48,6 +122,7 @@ class _StreamingPlayer:
         # would need an O(n) copy under the realtime lock and starve playback.
         self._chunks: deque = deque()
         self._leftover = np.empty(0, dtype=np.int16)
+        self._leftover_silence = False
         self._buffered = 0  # total queued samples
         # Prebuffer audio before consuming, to absorb network jitter and avoid
         # startup underruns (interference at the start that "cleans up" once the
@@ -66,6 +141,13 @@ class _StreamingPlayer:
         self._finished = threading.Event()
         self._stop_at: float | None = None
         self.cut_latency_ms: float | None = None  # audible barge-in cut latency
+        blocksize = 2048
+        self.metrics = PlaybackMetrics(
+            sample_rate=sample_rate,
+            blocksize=blocksize,
+            prebuffer_ms=self._prebuffer / sample_rate * 1000,
+            preroll_ms=self._preroll / sample_rate * 1000,
+        )
         # Large block so each callback has ~85ms to run (the device only offers
         # ~20ms of hardware buffer, which starves a cold low-latency callback).
         # abort() still discards pending audio, so barge-in stays under 100ms.
@@ -74,7 +156,7 @@ class _StreamingPlayer:
             channels=1,
             dtype="int16",
             device=output_device,
-            blocksize=2048,
+            blocksize=blocksize,
             callback=self._callback,
             finished_callback=self._on_finished,
         )
@@ -82,10 +164,13 @@ class _StreamingPlayer:
     def _on_finished(self) -> None:
         if self._stop_at is not None:
             self.cut_latency_ms = (time.perf_counter() - self._stop_at) * 1000
+            self.metrics.cut_latency_ms = self.cut_latency_ms
+        self.metrics.mark_finished()
         self._finished.set()
 
     def _callback(self, outdata, frames, time_info, status) -> None:  # noqa: ANN001
         if self._stop.is_set():
+            self.metrics.aborted = True
             raise self._sd.CallbackAbort
         idx = 0
         with self._lock:
@@ -93,14 +178,16 @@ class _StreamingPlayer:
                 # Hold output silent until enough is buffered (or input ended).
                 if self._buffered >= self._prebuffer or self._producer_done.is_set():
                     self._ready = True
+                    self.metrics.mark_ready()
                 else:
                     outdata[:, 0] = 0
                     return
             while idx < frames and (len(self._leftover) or self._chunks):
                 if len(self._leftover) == 0:
-                    self._leftover = self._chunks.popleft()
+                    self._leftover, self._leftover_silence = self._chunks.popleft()
                 take = min(frames - idx, len(self._leftover))
                 outdata[idx : idx + take, 0] = self._leftover[:take]
+                self.metrics.mark_output(speech=not self._leftover_silence)
                 self._leftover = self._leftover[take:]
                 self._buffered -= take
                 idx += take
@@ -111,13 +198,15 @@ class _StreamingPlayer:
             outdata[idx:, 0] = 0  # pad underflow with silence
             if done:
                 raise self._sd.CallbackStop  # drained -> clean finish
+            if self._ready:
+                self.metrics.underruns += 1
 
     def start(self) -> None:
         # Seed silence so cold-start callbacks consume silence, not speech.
         if self._preroll > 0:
             silence = self._np.zeros(self._preroll, dtype=self._np.int16)
             with self._lock:
-                self._chunks.append(silence)
+                self._chunks.append((silence, True))
                 self._buffered += self._preroll
         self._stream.start()
 
@@ -125,11 +214,13 @@ class _StreamingPlayer:
         if self._stop.is_set():
             return
         arr = self._np.frombuffer(pcm, dtype=self._np.int16)
+        self.metrics.mark_feed(len(pcm))
         with self._lock:
-            self._chunks.append(arr)
+            self._chunks.append((arr, False))
             self._buffered += len(arr)
 
     def mark_producer_done(self) -> None:
+        self.metrics.mark_producer_done()
         self._producer_done.set()
 
     def wait(self) -> None:
@@ -281,7 +372,7 @@ class AudioIO:
 
     async def play_stream(
         self, pcm_chunks: AsyncIterator[bytes], *, sample_rate: int
-    ) -> None:
+    ) -> PlaybackMetrics:
         """Stream PCM to the speaker as chunks arrive (start before complete).
 
         The producer runs as a cancellable task so a barge-in (stop_playback)
@@ -309,6 +400,7 @@ class AudioIO:
                 pass  # barge-in cancelled the producer; audio already aborting
             await asyncio.to_thread(player.wait)
             self.last_cut_latency_ms = player.cut_latency_ms
+            return player.metrics
         finally:
             player.close()
             self._feed_task = None

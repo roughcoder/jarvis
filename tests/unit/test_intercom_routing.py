@@ -11,6 +11,7 @@ import asyncio
 
 from jarvis.config import load_config
 from jarvis.intercom.client import IntercomClient
+from jarvis.intercom.metrics import SCHEMA_VERSION, IntercomReplyMetrics, summary
 from jarvis.protocol.messages import (
     ConversationIdle,
     DeviceRequest,
@@ -186,14 +187,40 @@ def test_reply_audio_yields_pcm_and_records_state() -> None:
 
     async def go() -> list[bytes]:
         state = {"ended": False, "text": ""}
-        chunks = [pcm async for pcm in c._reply_audio(q, "t1", state)]
+        metrics = IntercomReplyMetrics(turn_id="t1", device_id="pi")
+        chunks = [pcm async for pcm in c._reply_audio(q, "t1", state, metrics)]
+        assert metrics.data["schema_version"] == SCHEMA_VERSION
         assert state["text"] == "hi there"
         assert state["ended"] is False
         assert state["continue_listening"] is True
         assert state["voice_mode"] == "stay"
+        audio = metrics.data["stages"]["reply_audio"]
+        assert audio["chunks"] == 2
+        assert audio["bytes"] == 4
+        assert audio["decode_ms"] >= 0
         return chunks
 
     assert asyncio.run(go()) == [b"\x01\x02", b"\x03\x04"]  # only this turn's audio
+
+
+def test_intercom_metric_summary_reports_playback_baseline() -> None:
+    metrics = IntercomReplyMetrics(turn_id="t1", device_id="kitchen-pi")
+    metrics.mark_utterance_sent(pcm_bytes=32000, frame_bytes=43000)
+    metrics.record_audio_decode(encoded_bytes=8, pcm_bytes=4, decode_ms=1.25)
+    metrics.data["stages"]["playback"] = {
+        "ms": 500.0,
+        "first_speech_ms": 420.0,
+        "underruns": 2,
+        "block_ms": 85.3,
+    }
+    metrics.data["total_ms"] = 900.0
+
+    text = summary(metrics.data)
+    assert "intercom/turn" in text
+    assert "device=kitchen-pi" in text
+    assert "first_frame=" in text
+    assert "speech=420ms" in text
+    assert "underruns=2" in text
 
 
 def test_reply_audio_works_for_proactive_turn_id() -> None:
