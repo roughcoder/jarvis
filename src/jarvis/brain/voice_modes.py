@@ -77,6 +77,7 @@ _SOFT_CLOSE = re.compile(
     r"lovely|all good|no thanks|nothing else)[.! ]*$",
     re.IGNORECASE,
 )
+_LEADING_TTS_TAG = re.compile(r"^\s*\[[^\[\]]+\]\s*")
 _FOLLOWUP_QUESTION_REPLY = re.compile(
     r"(?:^|[.!?,;]\s+)\b(?:could you|can you|would you|what time|which one|"
     r"who should|where should|"
@@ -236,6 +237,11 @@ def tool_completes_voice_turn(tool_messages: list) -> bool:
 
 def assistant_requests_followup(reply: str) -> bool:
     text = strip_voice_controls(reply or "").strip()
+    while True:
+        stripped = _LEADING_TTS_TAG.sub("", text, count=1).strip()
+        if stripped == text:
+            break
+        text = stripped
     return bool(
         text
         and (_FOLLOWUP_QUESTION_REPLY.search(text) or _FOLLOWUP_REQUEST_REPLY.search(text))
