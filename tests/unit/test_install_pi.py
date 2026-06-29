@@ -50,14 +50,21 @@ def test_pi_installer_dry_run_models_intercom_install() -> None:
     assert "+ mkdir -p /opt/jarvis-test" in result.stdout
     assert "+ tar -xzf /tmp/jarvis-pi-test/jarvis.tar.gz --strip-components=1 -C /opt/jarvis-test" in result.stdout
     assert "+ cd /opt/jarvis-test" in result.stdout
-    assert "+ env UV_PYTHON=python3 UV_LINK_MODE=copy uv sync --no-dev --extra stt --extra vad-lite --extra wake" in result.stdout
+    assert "+ env UV_PYTHON=python3 UV_LINK_MODE=copy uv sync --no-dev --extra stt --extra vad-lite" in result.stdout
+    assert "+ uv pip install --python /opt/jarvis-test/.venv/bin/python onnxruntime pvporcupine requests scikit-learn scipy setuptools sounddevice tqdm webrtcvad-wheels" in result.stdout
+    assert "+ uv pip install --python /opt/jarvis-test/.venv/bin/python --no-deps openwakeword==0.6.0" in result.stdout
+    assert "+ verify Pi wake/VAD imports" in result.stdout
     assert "+ write /opt/jarvis-test/.env" in result.stdout
     assert "+ set VAD_ENGINE=webrtc" in result.stdout
+    assert "+ set INTERCOM_DEVICE_PI_PANEL=false" in result.stdout
     assert "+ chmod 0600 /opt/jarvis-test/.env" in result.stdout
     assert "+ write /usr/local/bin/jarvis" in result.stdout
     assert "+ chmod 0755 /usr/local/bin/jarvis" in result.stdout
     assert "+ write /usr/local/bin/jarvis-network-recover" in result.stdout
     assert "+ chmod 0755 /usr/local/bin/jarvis-network-recover" in result.stdout
+    assert "+ write /usr/local/bin/jarvis-panel-preview" in result.stdout
+    assert "+ chmod 0755 /usr/local/bin/jarvis-panel-preview" in result.stdout
+    assert "+ write /etc/systemd/system/jarvis-panel-preview.service" in result.stdout
     assert "+ mkdir -p /var/log/journal" in result.stdout
     assert "+ systemd-tmpfiles --create --prefix /var/log/journal" in result.stdout
     assert "+ systemctl restart systemd-journald" in result.stdout
@@ -66,6 +73,8 @@ def test_pi_installer_dry_run_models_intercom_install() -> None:
     assert "+ jarvis service install intercom --platform systemd --jarvis-bin /usr/local/bin/jarvis --workdir /opt/jarvis-test" in result.stdout
     assert "+ systemctl daemon-reload" in result.stdout
     assert "+ systemctl enable --now jarvis-intercom.service" in result.stdout
+    assert "+ systemctl enable --now jarvis-panel-preview.service" in result.stdout
+    assert "Check panel with: systemctl status jarvis-panel-preview.service" in result.stdout
     assert "Check hardware with: jarvis-pi doctor" in result.stdout
     assert "Update later with: sudo jarvis-pi update" in result.stdout
     assert "Physical bring-up evidence:" in result.stdout
@@ -80,7 +89,7 @@ def test_pi_installer_dry_run_skips_uv_install_when_present() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "astral.sh/uv/install.sh" not in result.stdout
-    assert "+ env UV_PYTHON=python3 UV_LINK_MODE=copy uv sync --no-dev --extra stt --extra vad-lite --extra wake" in result.stdout
+    assert "+ env UV_PYTHON=python3 UV_LINK_MODE=copy uv sync --no-dev --extra stt --extra vad-lite" in result.stdout
 
 
 def test_pi_helper_doctor_checks_bookworm_camera_and_display() -> None:
@@ -93,3 +102,5 @@ def test_pi_helper_doctor_checks_bookworm_camera_and_display() -> None:
     assert "/dev/dri/card*" in source
     assert "recover-network)" in source
     assert "/usr/local/bin/jarvis-network-recover" in source
+    assert "panel-status)" in source
+    assert "jarvis-panel-preview.service" in source

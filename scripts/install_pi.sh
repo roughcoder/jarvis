@@ -14,7 +14,9 @@ Environment:
   JARVIS_BRAIN_HOST=imac.example         Brain hostname on the private network.
   JARVIS_BRAIN_PORT=8700                 Brain WebSocket port.
   JARVIS_INTERCOM_TOKEN=...              Token issued by the brain.
-  JARVIS_PI_PANEL_GEOMETRY=800x480+0+0   Optional Tk geometry for the touch panel.
+  JARVIS_PI_PANEL_GEOMETRY=800x480+0+0   Optional geometry for the Pi display panel.
+  JARVIS_PI_PANEL_USER=pi                Desktop user that owns the Pi display.
+  JARVIS_PI_PANEL_PORT=8787              Local HTTP port for the Pi display panel.
   JARVIS_UV_BIN=/usr/local/bin/uv         uv binary used by installed helpers.
   JARVIS_PYTHON_BIN=python3               Python used by uv on Raspberry Pi OS.
   JARVIS_DRY_RUN=0                       Print commands instead of running.
@@ -60,11 +62,53 @@ INTERCOM_TOKEN="${JARVIS_INTERCOM_TOKEN:-}"
 UV_BIN="${JARVIS_UV_BIN:-/usr/local/bin/uv}"
 PYTHON_BIN="${JARVIS_PYTHON_BIN:-python3}"
 PI_PANEL_GEOMETRY="${JARVIS_PI_PANEL_GEOMETRY:-}"
+PI_PANEL_PORT="${JARVIS_PI_PANEL_PORT:-8787}"
+PI_PANEL_USER="${JARVIS_PI_PANEL_USER:-}"
 
 if [[ -z "$BRAIN_HOST" || -z "$INTERCOM_TOKEN" ]]; then
   echo "Set JARVIS_BRAIN_HOST and JARVIS_INTERCOM_TOKEN before installing." >&2
   exit 2
 fi
+
+resolve_panel_user() {
+  if [[ -n "$PI_PANEL_USER" ]]; then
+    printf '%s\n' "$PI_PANEL_USER"
+    return
+  fi
+  awk -F: '$3 >= 1000 && $3 < 60000 { print $1; exit }' /etc/passwd
+}
+
+install_pi_runtime_deps() {
+  cd "$INSTALL_DIR"
+  env UV_PYTHON="$PYTHON_BIN" UV_LINK_MODE=copy "$UV_BIN" sync --no-dev --extra stt --extra vad-lite
+  "$UV_BIN" pip install --python "$INSTALL_DIR/.venv/bin/python" \
+    onnxruntime \
+    pvporcupine \
+    requests \
+    scikit-learn \
+    scipy \
+    setuptools \
+    sounddevice \
+    tqdm \
+    webrtcvad-wheels
+  "$UV_BIN" pip install --python "$INSTALL_DIR/.venv/bin/python" --no-deps openwakeword==0.6.0
+  "$INSTALL_DIR/.venv/bin/python" - <<'PY'
+import importlib
+from importlib.metadata import version
+
+for module in ("openwakeword", "onnxruntime", "pvporcupine", "sounddevice", "webrtcvad"):
+    importlib.import_module(module)
+assert version("openwakeword") == "0.6.0"
+PY
+}
+
+dry_run_pi_runtime_deps() {
+  echo "+ cd $INSTALL_DIR"
+  run env UV_PYTHON="$PYTHON_BIN" UV_LINK_MODE=copy uv sync --no-dev --extra stt --extra vad-lite
+  run uv pip install --python "$INSTALL_DIR/.venv/bin/python" onnxruntime pvporcupine requests scikit-learn scipy setuptools sounddevice tqdm webrtcvad-wheels
+  run uv pip install --python "$INSTALL_DIR/.venv/bin/python" --no-deps openwakeword==0.6.0
+  echo "+ verify Pi wake/VAD imports"
+}
 
 export DEBIAN_FRONTEND=noninteractive
 run apt-get update
@@ -78,7 +122,8 @@ run apt-get install -y --no-install-recommends \
   build-essential \
   portaudio19-dev \
   libasound2-dev \
-  alsa-utils
+  alsa-utils \
+  chromium
 
 if [[ "$DRY_RUN" == "1" ]]; then
   if [[ "$DRY_RUN_UV_INSTALLED" != "1" ]]; then
@@ -104,16 +149,15 @@ run mkdir -p "$INSTALL_DIR"
 run tar -xzf "$archive" --strip-components=1 -C "$INSTALL_DIR"
 
 if [[ "$DRY_RUN" == "1" ]]; then
-  echo "+ cd $INSTALL_DIR"
-  run env UV_PYTHON="$PYTHON_BIN" UV_LINK_MODE=copy uv sync --no-dev --extra stt --extra vad-lite --extra wake
+  dry_run_pi_runtime_deps
 else
-  cd "$INSTALL_DIR"
-  env UV_PYTHON="$PYTHON_BIN" UV_LINK_MODE=copy uv sync --no-dev --extra stt --extra vad-lite --extra wake
+  install_pi_runtime_deps
 fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "+ write $INSTALL_DIR/.env"
   echo "+ set VAD_ENGINE=webrtc"
+  echo "+ set INTERCOM_DEVICE_PI_PANEL=false"
 else
   cat > "$INSTALL_DIR/.env" <<ENV
 INTERCOM_BRAIN_HOST=$BRAIN_HOST
@@ -123,7 +167,7 @@ CAPS_DEVICE_ID=$DEVICE_ID
 CAPS_IDENTITY=house
 CAPS_SCOPE=house
 VAD_ENGINE=webrtc
-INTERCOM_DEVICE_PI_PANEL=auto
+INTERCOM_DEVICE_PI_PANEL=false
 INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S=25
 INTERCOM_DEVICE_PI_PANEL_GEOMETRY=$PI_PANEL_GEOMETRY
 ENV
@@ -174,6 +218,117 @@ EOF
 fi
 run chmod 0755 /usr/local/bin/jarvis-network-recover
 
+if [[ "$DRY_RUN" == "1" ]]; then
+  echo "+ write /usr/local/bin/jarvis-panel-preview"
+else
+  cat > /usr/local/bin/jarvis-panel-preview <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+INSTALL_DIR="$INSTALL_DIR"
+ENV_FILE="\${JARVIS_ENV_FILE:-\$INSTALL_DIR/.env}"
+HOST="\${JARVIS_PI_PANEL_HOST:-127.0.0.1}"
+PORT="\${JARVIS_PI_PANEL_PORT:-$PI_PANEL_PORT}"
+GEOMETRY="\${JARVIS_PI_PANEL_GEOMETRY:-800x480+0+0}"
+
+if [[ -r "\$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "\$ENV_FILE"
+  set +a
+  GEOMETRY="\${INTERCOM_DEVICE_PI_PANEL_GEOMETRY:-\$GEOMETRY}"
+fi
+
+width=800
+height=480
+x=0
+y=0
+if [[ "\$GEOMETRY" =~ ^([0-9]+)x([0-9]+)\\+([0-9]+)\\+([0-9]+)\$ ]]; then
+  width="\${BASH_REMATCH[1]}"
+  height="\${BASH_REMATCH[2]}"
+  x="\${BASH_REMATCH[3]}"
+  y="\${BASH_REMATCH[4]}"
+elif [[ "\$GEOMETRY" =~ ^([0-9]+)x([0-9]+)\$ ]]; then
+  width="\${BASH_REMATCH[1]}"
+  height="\${BASH_REMATCH[2]}"
+fi
+
+browser=""
+if command -v chromium >/dev/null 2>&1; then
+  browser="chromium"
+elif command -v chromium-browser >/dev/null 2>&1; then
+  browser="chromium-browser"
+fi
+
+url="http://\$HOST:\$PORT/"
+export PYTHONPATH="\$INSTALL_DIR/src\${PYTHONPATH:+:\$PYTHONPATH}"
+/usr/bin/python3 -m jarvis.intercom.panel_dev --host "\$HOST" --port "\$PORT" --state idle &
+server_pid="\$!"
+
+cleanup() {
+  kill "\$server_pid" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+for _ in \$(seq 1 80); do
+  if curl -fsS "\$url" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+
+if [[ -z "\$browser" ]]; then
+  echo "chromium/chromium-browser is not installed; serving panel at \$url" >&2
+  wait "\$server_pid"
+  exit \$?
+fi
+
+exec "\$browser" \\
+  --noerrdialogs \\
+  --disable-infobars \\
+  --disable-session-crashed-bubble \\
+  --app="\$url" \\
+  --window-position="\$x,\$y" \\
+  --window-size="\$width,\$height" \\
+  --user-data-dir="\$HOME/.cache/jarvis-panel-chromium"
+EOF
+fi
+run chmod 0755 /usr/local/bin/jarvis-panel-preview
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  echo "+ write /etc/systemd/system/jarvis-panel-preview.service"
+else
+  resolved_panel_user="$(resolve_panel_user)"
+  if [[ -z "$resolved_panel_user" ]] || ! id -u "$resolved_panel_user" >/dev/null 2>&1; then
+    echo "Could not resolve JARVIS_PI_PANEL_USER; set it to the desktop user that owns the display." >&2
+    exit 2
+  fi
+  panel_uid="$(id -u "$resolved_panel_user")"
+  panel_home="$(getent passwd "$resolved_panel_user" | cut -d: -f6)"
+  cat > /etc/systemd/system/jarvis-panel-preview.service <<EOF
+[Unit]
+Description=Jarvis Pi display panel
+After=graphical.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$resolved_panel_user
+Environment=HOME=$panel_home
+Environment=JARVIS_ENV_FILE=$INSTALL_DIR/.env
+Environment=JARVIS_PI_PANEL_PORT=$PI_PANEL_PORT
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=$panel_home/.Xauthority
+Environment=XDG_RUNTIME_DIR=/run/user/$panel_uid
+ExecStart=/usr/local/bin/jarvis-panel-preview
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=graphical.target
+EOF
+fi
+
 run mkdir -p /var/log/journal
 run systemd-tmpfiles --create --prefix /var/log/journal
 run systemctl restart systemd-journald
@@ -189,6 +344,7 @@ INSTALL_DIR="$INSTALL_DIR"
 REPO="$REPO"
 REF="$REF"
 SERVICE="jarvis-intercom.service"
+PANEL_SERVICE="jarvis-panel-preview.service"
 UV_BIN="\${JARVIS_UV_BIN:-$UV_BIN}"
 PYTHON_BIN="\${JARVIS_PYTHON_BIN:-$PYTHON_BIN}"
 
@@ -201,6 +357,12 @@ Commands:
   restart   Restart the intercom service
   status    Show systemd service status
   logs      Follow intercom service logs
+  panel-restart
+            Restart the Pi display panel service
+  panel-status
+            Show Pi display panel service status
+  panel-logs
+            Follow Pi display panel service logs
   doctor    Print basic Pi audio/camera/service readiness
   recover-network
             Ask NetworkManager to reconnect the first autoconnect WiFi profile
@@ -287,9 +449,22 @@ case "\$cmd" in
     tar -xzf "\$archive" --strip-components=1 -C "\$source_dir"
     rsync -a --delete --exclude .env --exclude .venv --exclude jarvis-workspace "\$source_dir/" "\$INSTALL_DIR/"
     cd "\$INSTALL_DIR"
-    env UV_PYTHON="\$PYTHON_BIN" UV_LINK_MODE=copy "\$UV_BIN" sync --no-dev --extra stt --extra vad-lite --extra wake
+    env UV_PYTHON="\$PYTHON_BIN" UV_LINK_MODE=copy "\$UV_BIN" sync --no-dev --extra stt --extra vad-lite
+    "\$UV_BIN" pip install --python "\$INSTALL_DIR/.venv/bin/python" onnxruntime pvporcupine requests scikit-learn scipy setuptools sounddevice tqdm webrtcvad-wheels
+    "\$UV_BIN" pip install --python "\$INSTALL_DIR/.venv/bin/python" --no-deps openwakeword==0.6.0
+    "\$INSTALL_DIR/.venv/bin/python" - <<'PY'
+import importlib
+from importlib.metadata import version
+
+for module in ("openwakeword", "onnxruntime", "pvporcupine", "sounddevice", "webrtcvad"):
+    importlib.import_module(module)
+assert version("openwakeword") == "0.6.0"
+PY
     systemctl daemon-reload
     systemctl restart "\$SERVICE"
+    if systemctl list-unit-files "\$PANEL_SERVICE" >/dev/null 2>&1; then
+      systemctl restart "\$PANEL_SERVICE"
+    fi
     echo "Jarvis Pi runtime updated and \$SERVICE restarted."
     ;;
   restart)
@@ -301,6 +476,16 @@ case "\$cmd" in
     ;;
   logs)
     journalctl -u "\$SERVICE" -f --no-pager
+    ;;
+  panel-restart)
+    require_root "\$cmd"
+    systemctl restart "\$PANEL_SERVICE"
+    ;;
+  panel-status)
+    systemctl status "\$PANEL_SERVICE"
+    ;;
+  panel-logs)
+    journalctl -u "\$PANEL_SERVICE" -f --no-pager
     ;;
   doctor)
     doctor
@@ -328,9 +513,11 @@ run jarvis service install intercom \
 
 run systemctl daemon-reload
 run systemctl enable --now jarvis-intercom.service
+run systemctl enable --now jarvis-panel-preview.service
 
 echo "Jarvis Pi intercom installed as $DEVICE_ID."
 echo "Check status with: systemctl status jarvis-intercom.service"
+echo "Check panel with: systemctl status jarvis-panel-preview.service"
 echo "Check hardware with: jarvis-pi doctor"
 echo "Update later with: sudo jarvis-pi update"
 cat <<NEXT
