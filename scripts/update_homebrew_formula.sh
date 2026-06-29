@@ -124,12 +124,12 @@ text.sub!(
   ""
 )
 
-wrapper = <<~'FORMULA'
-      #!/usr/bin/env bash
-      set -euo pipefail
-      export PYTHONPATH="#{libexec}/src${PYTHONPATH:+:$PYTHONPATH}"
-      exec "#{libexec}/.venv/bin/python" -m jarvis.cli "$@"
-FORMULA
+wrapper = [
+  '      #!/usr/bin/env bash',
+  '      set -euo pipefail',
+  '      export PYTHONPATH="#{libexec}/src${PYTHONPATH:+:$PYTHONPATH}"',
+  '      exec "#{libexec}/.venv/bin/python" -m jarvis.cli "$@"',
+].join("\n") + "\n"
 
 unless text.sub!(
   /      #!\/usr\/bin\/env bash\n      set -euo pipefail\n(?:      .+\n)*?      exec .+\n/,
