@@ -52,6 +52,7 @@ STRICT_TRAILER_TYPES = {"feat", "fix", "perf"}
 QUALITY_SECTION_LIMIT = 8
 RAW_SCOPE_BULLET_RE = re.compile(r"^- [a-z][a-z0-9_-]+: ")
 SECTION_RE = re.compile(r"^## (?P<title>.+)$")
+RELEASE_NOTE_OVERRIDES_PATH = Path(".release-note-overrides.json")
 
 
 @dataclass
@@ -158,6 +159,44 @@ def load_commits(base_tag: str, head_ref: str) -> list[CommitInfo]:
             continue
         commits.append(commit)
     return commits
+
+
+def load_release_note_overrides(path: Path = RELEASE_NOTE_OVERRIDES_PATH) -> dict[str, dict[str, list[str]]]:
+    if not path.exists():
+        return {}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise SystemExit(f"{path} must contain a JSON object keyed by commit SHA")
+    overrides: dict[str, dict[str, list[str]]] = {}
+    for sha, trailers in raw.items():
+        if not isinstance(sha, str) or not sha:
+            raise SystemExit(f"{path} contains an invalid commit key: {sha!r}")
+        if not isinstance(trailers, dict):
+            raise SystemExit(f"{path} entry {sha!r} must be an object of trailer keys")
+        normalized: dict[str, list[str]] = {}
+        for key, value in trailers.items():
+            normalized_key = str(key).strip().lower()
+            if isinstance(value, str):
+                normalized[normalized_key] = [value]
+            elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+                normalized[normalized_key] = value
+            else:
+                raise SystemExit(f"{path} entry {sha!r}.{key!s} must be a string or string list")
+        overrides[sha] = normalized
+    return overrides
+
+
+def apply_release_note_overrides(
+    commits: list[CommitInfo], overrides: dict[str, dict[str, list[str]]]
+) -> None:
+    for prefix, trailers in overrides.items():
+        matches = [commit for commit in commits if commit.sha.startswith(prefix)]
+        if not matches:
+            continue
+        if len(matches) > 1:
+            raise SystemExit(f"Release-note override prefix {prefix!r} matches multiple commits")
+        for key, values in trailers.items():
+            matches[0].trailers[key] = values
 
 
 def env_keys_at(ref: str) -> set[str]:
@@ -454,6 +493,7 @@ def ai_notes(payload: dict[str, object]) -> str:
 def build_notes(version: str, base_tag: str, head_ref: str, ai_mode: str, *, strict: bool = False) -> str:
     tag = f"v{version.lstrip('v')}"
     commits = load_commits(base_tag, head_ref)
+    apply_release_note_overrides(commits, load_release_note_overrides())
     if strict:
         trailer_errors = validate_release_trailers(commits)
         if trailer_errors:
