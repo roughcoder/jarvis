@@ -90,20 +90,11 @@ body {{
   min-width: 320px;
   min-height: 240px;
   overflow: hidden;
-  background:
-    linear-gradient(90deg, rgba(244, 239, 228, .025) 1px, transparent 1px) 0 0 / 32px 32px,
-    linear-gradient(0deg, rgba(244, 239, 228, .018) 1px, transparent 1px) 0 0 / 32px 32px,
-    radial-gradient(circle at 50% 24%, rgba(220, 233, 211, .12), transparent 42%),
-    var(--bg);
+  background: var(--bg);
 }}
 
 .screen::after {{
-  content: "";
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  border: 1px solid rgba(244, 239, 228, .08);
-  box-shadow: inset 0 0 0 8px rgba(7, 10, 8, .38);
+  content: none;
 }}
 
 .topline {{
@@ -153,7 +144,6 @@ body {{
   height: 10px;
   border-radius: 999px;
   background: var(--accent);
-  box-shadow: 0 0 20px var(--accent);
 }}
 
 .stage {{
@@ -180,13 +170,7 @@ body {{
   position: relative;
   height: var(--eye-height, min(24vw, 150px));
   border-radius: 999px;
-  background:
-    linear-gradient(180deg, rgba(255,255,255,.52), rgba(255,255,255,0) 42%),
-    var(--accent);
-  box-shadow:
-    0 0 0 1px rgba(244,239,228,.18),
-    0 20px 70px rgba(0,0,0,.38),
-    0 0 var(--glow, 32px) color-mix(in srgb, var(--accent), transparent 26%);
+  background: var(--accent);
   overflow: visible;
   transform:
     translate(var(--eye-x, 0px), var(--eye-y, 0px))
@@ -195,34 +179,22 @@ body {{
   transition:
     height 360ms cubic-bezier(.16, 1, .3, 1),
     transform 520ms cubic-bezier(.16, 1, .3, 1),
-    background 240ms ease,
-    box-shadow 240ms ease;
+    background 240ms ease;
 }}
 
 .eye::before {{
-  content: "";
-  position: absolute;
-  inset: -16% 8% 50%;
-  border-radius: 999px;
-  background: rgba(255,255,255,.34);
-  filter: blur(10px);
+  content: none;
 }}
 
 .brow {{
   position: absolute;
   left: 50%;
-  top: var(--brow-y, -20%);
+  top: var(--brow-y, -34%);
   z-index: 3;
   width: var(--brow-width, 62%);
   height: var(--brow-height, min(2.7vw, 16px));
   border-radius: 999px;
-  background:
-    linear-gradient(180deg, rgba(255,255,255,.28), rgba(255,255,255,0) 44%),
-    color-mix(in srgb, var(--accent), #050806 28%);
-  box-shadow:
-    0 0 0 1px rgba(244,239,228,.14),
-    0 10px 28px rgba(0,0,0,.26),
-    0 0 18px color-mix(in srgb, var(--accent), transparent 58%);
+  background: var(--accent);
   transform:
     translate(calc(-50% + var(--brow-x, 0px)), var(--brow-lift, 0px))
     rotate(var(--brow-rot, 0deg))
@@ -235,7 +207,6 @@ body {{
     width 260ms ease,
     height 260ms ease,
     background 240ms ease,
-    box-shadow 240ms ease,
     opacity 240ms ease;
 }}
 
@@ -263,8 +234,7 @@ body {{
     width 260ms ease,
     height 260ms ease,
     transform 460ms cubic-bezier(.16, 1, .3, 1),
-    background 220ms ease,
-    box-shadow 220ms ease;
+    background 220ms ease;
 }}
 
 .stage::before,
@@ -433,13 +403,12 @@ button[aria-pressed="true"] {{
   --accent-soft: #3b4b40;
   --eye-height: min(5vw, 28px);
   --pupil: 0px;
-  --brow-y: -32%;
+  --brow-y: -58%;
   --brow-height: min(2vw, 12px);
   --brow-width: 70%;
   --brow-left-rot: -2deg;
   --brow-right-rot: 2deg;
   --brow-lift: min(1vw, 6px);
-  --glow: 16px;
 }}
 
 .peek-left[data-state="sleep"] .eye:first-child,
@@ -450,7 +419,7 @@ button[aria-pressed="true"] {{
 
 .peek-left[data-state="sleep"] .eye:first-child .brow,
 .peek-right[data-state="sleep"] .eye:last-child .brow {{
-  --brow-y: -24%;
+  --brow-y: -42%;
   --brow-lift: min(-.8vw, -5px);
   --brow-scale-y: .86;
 }}
@@ -467,10 +436,9 @@ button[aria-pressed="true"] {{
   --accent: #dce9d3;
   --eye-height: min(22vw, 138px);
   --pupil: min(8.6vw, 58px);
-  --brow-y: -18%;
+  --brow-y: -36%;
   --brow-left-rot: -3deg;
   --brow-right-rot: 3deg;
-  --glow: 28px;
 }}
 
 [data-state="idle"] .eye:first-child .pupil {{
@@ -483,7 +451,6 @@ button[aria-pressed="true"] {{
 
 [data-state="connecting"] {{
   --accent: #f4d46a;
-  --glow: 36px;
 }}
 
 [data-state="connecting"] .eyes {{
@@ -496,10 +463,9 @@ button[aria-pressed="true"] {{
   width: min(22vw, 110px);
   aspect-ratio: 1;
   border-radius: 999px;
-  border: 3px solid color-mix(in srgb, var(--accent), transparent 76%);
+  border: 3px solid #5a4d23;
   border-top-color: var(--accent);
-  border-right-color: color-mix(in srgb, var(--accent), #f4efe4 18%);
-  box-shadow: 0 0 42px color-mix(in srgb, var(--accent), transparent 52%);
+  border-right-color: #fff0a3;
   animation: connectSpin 980ms linear infinite;
 }}
 
@@ -509,7 +475,6 @@ button[aria-pressed="true"] {{
   aspect-ratio: 1;
   border-radius: 999px;
   background: var(--accent);
-  box-shadow: 0 0 26px color-mix(in srgb, var(--accent), transparent 20%);
 }}
 
 [data-state="connecting"] .meter {{
@@ -521,13 +486,12 @@ button[aria-pressed="true"] {{
   --eye-height: min(11vw, 68px);
   --eye-width: .96;
   --pupil: min(6.4vw, 44px);
-  --brow-y: -30%;
+  --brow-y: -64%;
   --brow-height: min(3vw, 18px);
   --brow-width: 76%;
   --brow-left-rot: 18deg;
   --brow-right-rot: -18deg;
   --brow-lift: min(1vw, 6px);
-  --glow: 30px;
 }}
 
 [data-state="disconnected"] .eye:first-child {{
@@ -567,11 +531,10 @@ button[aria-pressed="true"] {{
   --accent: var(--ok);
   --eye-height: min(27vw, 164px);
   --pupil: min(8.8vw, 62px);
-  --brow-y: -24%;
+  --brow-y: -42%;
   --brow-left-rot: -7deg;
   --brow-right-rot: 7deg;
   --brow-lift: min(-.5vw, -4px);
-  --glow: 42px;
 }}
 
 [data-state="listening"] {{
@@ -579,31 +542,29 @@ button[aria-pressed="true"] {{
   --eye-height: min(25vw, 154px);
   --pupil: min(7.6vw, 54px);
   --look-y: -10px;
-  --brow-y: -27%;
+  --brow-y: -45%;
   --brow-left-rot: -9deg;
   --brow-right-rot: 9deg;
   --brow-lift: min(-.8vw, -6px);
-  --glow: 48px;
 }}
 
 [data-state="thinking"] {{
   --accent: #8ddcff;
   --eye-height: min(18vw, 114px);
   --pupil: min(6.2vw, 42px);
-  --brow-y: -25%;
+  --brow-y: -48%;
   --brow-left-rot: 13deg;
   --brow-right-rot: -13deg;
   --brow-width: 68%;
-  --glow: 36px;
 }}
 
 [data-state="thinking"] .pupil {{
   background: transparent;
   border-radius: 999px;
-  border: 3px solid rgba(8, 13, 10, .18);
+  border: 3px solid #080d0a;
   border-top-color: #080d0a;
   border-right-color: #080d0a;
-  box-shadow: 0 0 12px rgba(8, 13, 10, .12);
+  border-bottom-color: var(--accent);
   animation: pupilSpin 760ms linear infinite;
   will-change: transform;
 }}
@@ -620,11 +581,10 @@ button[aria-pressed="true"] {{
   --accent: #ff7abb;
   --eye-height: min(22vw, 136px);
   --pupil: min(8.2vw, 58px);
-  --brow-y: -22%;
+  --brow-y: -40%;
   --brow-left-rot: var(--speak-brow-left, -6deg);
   --brow-right-rot: var(--speak-brow-right, 6deg);
   --brow-lift: var(--speak-brow-lift, 0px);
-  --glow: 52px;
 }}
 
 @keyframes connectSpin {{

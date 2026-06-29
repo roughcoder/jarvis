@@ -27,6 +27,21 @@ def test_panel_preview_renders_every_voice_state() -> None:
     assert "--brow-right-rot" in html
 
 
+def test_panel_preview_uses_flat_pi_screen_artwork() -> None:
+    html = render_panel_preview_html()
+
+    assert "radial-gradient" not in html
+    assert "linear-gradient" not in html
+    assert "--glow" not in html
+    assert "0 0 var(--glow" not in html
+    assert ".screen::after {\n  content: none;" in html
+    assert ".eye {\n  position: relative;" in html
+    assert "background: var(--accent);" in html
+    assert ".eye::before {\n  content: none;" in html
+    assert ".brow {" in html
+    assert "top: var(--brow-y, -34%);" in html
+
+
 def test_panel_preview_sanitizes_title_and_falls_back_to_idle_state() -> None:
     html = render_panel_preview_html(PreviewConfig(initial_state="unknown", title='<Jarvis "panel">'))
 
@@ -180,6 +195,7 @@ def test_panel_preview_disconnected_looks_angry_and_offline() -> None:
     assert '[data-state="disconnected"] .eye:last-child' in html
     assert "rotate(7deg)" in html
     assert "rotate(-7deg)" in html
+    assert "--brow-y: -64%;" in html
     assert "--brow-left-rot: 18deg;" in html
     assert "--brow-right-rot: -18deg;" in html
     assert '[data-state="disconnected"] .pupil::before' in html
@@ -227,6 +243,7 @@ def test_panel_preview_sleep_feels_resting_but_ready() -> None:
 
     assert '<main class="screen" data-state="sleep">' in html
     assert "--accent: #c8d8ca;" in html
+    assert "--brow-y: -58%;" in html
     assert "height: min(20vw, 118px);" in html
     assert "peek-left" in html
     assert "peek-right" in html
