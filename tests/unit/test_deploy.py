@@ -69,8 +69,8 @@ def test_sync_role_dependencies_prefers_homebrew_python(monkeypatch) -> None:
     monkeypatch.delenv("UV_PYTHON", raising=False)
     monkeypatch.setattr("jarvis.deploy._find_uv", lambda: "/opt/homebrew/bin/uv")
     monkeypatch.setattr(
-        "jarvis.deploy.Path.is_file",
-        lambda self: str(self) == "/opt/homebrew/opt/python@3.12/bin/python3.12",
+        "jarvis.deploy._usable_homebrew_python",
+        lambda: "/opt/homebrew/opt/python@3.12/bin/python3.12",
     )
 
     def fake_run(argv, *, cwd, env, check, text):
@@ -85,6 +85,27 @@ def test_sync_role_dependencies_prefers_homebrew_python(monkeypatch) -> None:
     env = calls[0]["env"]
     assert isinstance(env, dict)
     assert env["UV_PYTHON"] == "/opt/homebrew/opt/python@3.12/bin/python3.12"
+
+
+def test_sync_role_dependencies_skips_unusable_homebrew_python(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    monkeypatch.delenv("UV_PYTHON", raising=False)
+    monkeypatch.setattr("jarvis.deploy._find_uv", lambda: "/opt/homebrew/bin/uv")
+    monkeypatch.setattr("jarvis.deploy._usable_homebrew_python", lambda: None)
+
+    def fake_run(argv, *, cwd, env, check, text):
+        calls.append({"argv": argv, "cwd": cwd, "env": env, "check": check, "text": text})
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr("jarvis.deploy.subprocess.run", fake_run)
+
+    sync_role_dependencies(["worker"])
+
+    assert calls
+    env = calls[0]["env"]
+    assert isinstance(env, dict)
+    assert "UV_PYTHON" not in env
 
 
 def test_render_launchd_service_uses_jarvis_command_not_uv() -> None:
