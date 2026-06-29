@@ -178,6 +178,19 @@ def test_default_mode_ignores_generic_anything_else_question_on_closed_turn() ->
     assert result.close_reason == "task_complete"
 
 
+def test_default_mode_does_not_treat_need_answer_as_followup() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(
+        raw="You need a Phillips screwdriver. [[CONVERSATION:closed:task_complete]]"
+    )
+
+    sess.finalize("what tool do I need", result)
+
+    assert result.ended is True
+    assert result.continue_listening is False
+    assert result.close_reason == "task_complete"
+
+
 def test_default_mode_opens_for_exploratory_turn_without_marker() -> None:
     sess = _session(DEFAULT_MODE)
     result = TurnResult(raw="We should split it into packing, timing, and budget.")
@@ -187,6 +200,20 @@ def test_default_mode_opens_for_exploratory_turn_without_marker() -> None:
     assert result.ended is False
     assert result.continue_listening is True
     assert result.close_reason == "brief_followup_expected"
+
+
+def test_default_mode_respects_closed_marker_for_completed_explanation() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(
+        raw="The sky looks blue because shorter blue wavelengths scatter more. "
+        "[[CONVERSATION:closed:task_complete]]"
+    )
+
+    sess.finalize("why is the sky blue", result)
+
+    assert result.ended is True
+    assert result.continue_listening is False
+    assert result.close_reason == "task_complete"
 
 
 def test_default_mode_soft_close_overrides_open_marker() -> None:

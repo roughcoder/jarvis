@@ -82,7 +82,7 @@ _FOLLOWUP_REPLY = re.compile(
     r"try again|one more time|what time|which one|who should|where should|"
     r"when should|when do|where are|where is|do you mean|did you mean|"
     r"tell me (which|what|who|where|when|how)|send (me )?(another|a clearer)|"
-    r"better lighting|more detail|need (a|the|more)|i need)",
+    r"better lighting)",
     re.IGNORECASE,
 )
 _EXPLORATORY_USER = re.compile(
@@ -325,6 +325,18 @@ def classify_voice_turn(
             policy_decision="marker_open",
             marker_seen=marker_seen,
             assistant_asked_followup=assistant_followup,
+        )
+
+    if control.conversation == "closed" and not assistant_followup:
+        return VoiceStateTransition(
+            mode=DEFAULT_MODE,
+            ended=True,
+            continue_listening=False,
+            reason=control.reason or "default_complete",
+            reset_conversation=True,
+            policy_decision="marker_closed",
+            marker_seen=marker_seen,
+            assistant_asked_followup=False,
         )
 
     if assistant_followup:
