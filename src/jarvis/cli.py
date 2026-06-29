@@ -803,7 +803,19 @@ def _parse_weekdays(text: str) -> list[int]:
         return [0, 1, 2, 3, 4]
     if text == "weekends":
         return [5, 6]
-    return [names[x.strip().lower()[:3]] for x in text.split(",") if x.strip().lower()[:3] in names]
+    weekdays = []
+    invalid = []
+    for part in text.split(","):
+        token = part.strip().lower()[:3]
+        if not token:
+            continue
+        if token not in names:
+            invalid.append(part.strip())
+            continue
+        weekdays.append(names[token])
+    if invalid or not weekdays:
+        raise ValueError(f"invalid weekdays: {', '.join(invalid or [text])}")
+    return weekdays
 
 
 def _cmd_schedules(args: argparse.Namespace) -> int:

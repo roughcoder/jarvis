@@ -185,6 +185,33 @@ def test_github_source_fetches_inline_pr_review_comments() -> None:
     assert ["gh", "api", "repos/roughcoder/jarvis/pulls/14/comments", "--paginate", "--slurp"] in seen
 
 
+def test_github_source_resolves_current_repo_for_inline_pr_review_comments() -> None:
+    class Result:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+
+    seen = []
+
+    def runner(args):
+        seen.append(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return Result(json.dumps({"comments": [], "reviews": []}))
+        if args[:3] == ["gh", "repo", "view"]:
+            return Result(json.dumps({"nameWithOwner": "roughcoder/jarvis"}))
+        if args[:2] == ["gh", "api"]:
+            return Result(json.dumps([[{"body": "inline"}]]))
+        raise AssertionError(args)
+
+    comments = GitHubWorkSource(runner).pr_comments("", 14)
+
+    assert [x["body"] for x in comments] == ["inline"]
+    assert ["gh", "repo", "view", "--json", "nameWithOwner"] in seen
+    assert ["gh", "api", "repos/roughcoder/jarvis/pulls/14/comments", "--paginate", "--slurp"] in seen
+
+
 def test_linear_source_normalizes_items() -> None:
     class Response:
         def raise_for_status(self) -> None:
@@ -394,6 +421,16 @@ def test_schedules_validate_new_and_stored_records(tmp_path) -> None:
         )
     )
     assert store.list() == []
+
+
+def test_cli_schedule_add_rejects_invalid_weekdays(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / ".env"))
+
+    assert main(["schedules", "add", "check", "issues", "--at", "09:00", "--weekdays", "mon,funday"]) == 1
+    assert "Invalid schedule: invalid weekdays: funday" in capsys.readouterr().out
 
 
 def test_campaign_creates_bounded_child_runs(tmp_path) -> None:
