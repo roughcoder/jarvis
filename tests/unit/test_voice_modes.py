@@ -165,6 +165,17 @@ def test_default_mode_reply_followup_overrides_stale_closed_marker() -> None:
     assert result.close_reason == "reply_followup_expected"
 
 
+def test_default_mode_opens_when_followup_reply_starts_with_tts_steering_tag() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(raw="[say gently] Could you try again with better lighting?")
+
+    sess.finalize("what am I holding", result)
+
+    assert result.ended is False
+    assert result.continue_listening is True
+    assert result.close_reason == "reply_followup_expected"
+
+
 def test_default_mode_ignores_generic_anything_else_question_on_closed_turn() -> None:
     sess = _session(DEFAULT_MODE)
     result = TurnResult(
