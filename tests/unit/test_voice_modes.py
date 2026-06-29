@@ -148,7 +148,7 @@ def test_default_mode_opens_when_reply_requests_followup_without_marker() -> Non
     assert result.voice_mode == DEFAULT_MODE
 
 
-def test_default_mode_reply_followup_overrides_stale_closed_marker() -> None:
+def test_default_mode_respects_closed_marker_when_reply_contains_followup_question() -> None:
     sess = _session(DEFAULT_MODE)
     result = TurnResult(
         raw=(
@@ -160,9 +160,9 @@ def test_default_mode_reply_followup_overrides_stale_closed_marker() -> None:
     sess.finalize("what am I holding", result)
 
     assert result.reply == "I can't tell from that image. Could you try again with better lighting?"
-    assert result.ended is False
-    assert result.continue_listening is True
-    assert result.close_reason == "reply_followup_expected"
+    assert result.ended is True
+    assert result.continue_listening is False
+    assert result.close_reason == "task_complete"
 
 
 def test_default_mode_opens_when_followup_reply_starts_with_tts_steering_tag() -> None:
@@ -248,6 +248,22 @@ def test_default_mode_respects_closed_marker_when_followup_phrases_are_quoted() 
     )
 
     sess.finalize("what is the difference between could you and can you", result)
+
+    assert result.ended is True
+    assert result.continue_listening is False
+    assert result.close_reason == "task_complete"
+
+
+def test_default_mode_respects_closed_marker_when_answer_lists_question_text() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(
+        raw=(
+            "Useful planning questions include: What should success look like? "
+            "[[CONVERSATION:closed:task_complete]]"
+        )
+    )
+
+    sess.finalize("give me some questions for planning", result)
 
     assert result.ended is True
     assert result.continue_listening is False
