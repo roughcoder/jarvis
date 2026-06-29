@@ -61,14 +61,14 @@ def test_clean_output_strips_codex_noise() -> None:
     assert "pong" in out
 
 
-def test_shell_tool_against_live_daemon() -> None:
+def test_shell_tool_against_live_daemon(tmp_path) -> None:
     pytest.importorskip("aiohttp")
     from aiohttp import web
 
     from jarvis.worker.server import make_app
 
     async def go() -> str:
-        daemon = WorkerConfig(_env_file=None, token="", workspace="jarvis-workspace/worker")
+        daemon = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"))
         runner = web.AppRunner(make_app(daemon))
         await runner.setup()
         site = web.TCPSite(runner, "localhost", 8804)
@@ -83,7 +83,7 @@ def test_shell_tool_against_live_daemon() -> None:
     assert asyncio.run(go()) == "brain-to-worker"
 
 
-def test_check_latest_and_list_against_live_daemon() -> None:
+def test_check_latest_and_list_against_live_daemon(tmp_path) -> None:
     pytest.importorskip("aiohttp")
     from aiohttp import web
 
@@ -91,7 +91,7 @@ def test_check_latest_and_list_against_live_daemon() -> None:
 
     async def go():  # noqa: ANN202
         # `echo` stands in for the coding agent so the job finishes instantly.
-        daemon = WorkerConfig(_env_file=None, token="", workspace="jarvis-workspace/worker", codex_bin="echo")
+        daemon = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"), codex_bin="echo")
         runner = web.AppRunner(make_app(daemon))
         await runner.setup()
         site = web.TCPSite(runner, "localhost", 8805)

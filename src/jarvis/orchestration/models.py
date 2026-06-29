@@ -16,6 +16,7 @@ Phase = Literal[
     "landing",
     "handoff",
     "done",
+    "completed",
     "blocked",
     "stalled",
     "failed",

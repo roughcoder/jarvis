@@ -415,7 +415,7 @@ class WorkerConfig(_Base):
     bind_host: str = ""              # daemon bind addr; empty => host
     token: SecretStr = SecretStr("")  # shared pairing token
     allow_insecure: bool = False     # permit a no-token, non-loopback bind (else refuse to start)
-    workspace: str = "jarvis-workspace/worker"  # default cwd for actions/jobs
+    workspace: str = "~/.jarvis/worker"  # default cwd for actions/jobs
     # Where the user's git repos live, so a job can name a repo ("polymarket")
     # instead of an absolute path. Empty = names must be absolute paths.
     repo_root: str = ""

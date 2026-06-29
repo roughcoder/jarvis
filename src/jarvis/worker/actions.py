@@ -187,22 +187,24 @@ async def prepare_worktree(
     the user's checkout. For a non-git directory, copy it into worker-owned scratch
     and run there. On failure to isolate a real repo, return (None, None, error) so
     the caller refuses rather than touching HEAD."""
-    inside = await run_exec(["git", "-C", repo, "rev-parse", "--is-inside-work-tree"], None, timeout_s)
+    repo_path = pathlib.Path(repo).expanduser().resolve()
+    worktrees_root = pathlib.Path(worktrees_dir).expanduser().resolve()
+    inside = await run_exec(["git", "-C", str(repo_path), "rev-parse", "--is-inside-work-tree"], None, timeout_s)
     suffix = uuid.uuid4().hex[:6]
-    pathlib.Path(worktrees_dir).mkdir(parents=True, exist_ok=True)
+    worktrees_root.mkdir(parents=True, exist_ok=True)
     if inside.strip() != "true":
-        scratch = pathlib.Path(worktrees_dir) / f"{slug}-{suffix}-scratch"
+        scratch = worktrees_root / f"{slug}-{suffix}-scratch"
         try:
-            shutil.copytree(repo, scratch, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+            shutil.copytree(repo_path, scratch, ignore=shutil.ignore_patterns(".git", "__pycache__"))
         except OSError as exc:
             return None, None, f"error: could not copy non-git input into scratch ({exc})"
         return str(scratch), None, None
     branch = f"{branch_prefix}/{slug}-{suffix}"
-    worktree = str(pathlib.Path(worktrees_dir) / f"{slug}-{suffix}")
-    out = await run_exec(["git", "-C", repo, "worktree", "add", "-b", branch, worktree], None, timeout_s)
-    if not pathlib.Path(worktree).exists():
+    worktree = worktrees_root / f"{slug}-{suffix}"
+    out = await run_exec(["git", "-C", str(repo_path), "worktree", "add", "-b", branch, str(worktree)], None, timeout_s)
+    if not worktree.exists():
         return None, None, f"error: could not create worktree ({out})"
-    return worktree, branch, None
+    return str(worktree), branch, None
 
 
 def _is_under(path: pathlib.Path, roots: list[pathlib.Path]) -> bool:

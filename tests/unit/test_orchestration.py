@@ -11,10 +11,11 @@ from jarvis.orchestration.campaign import CampaignPolicy, create_campaign
 from jarvis.orchestration.envelope import build_execution_envelope
 from jarvis.orchestration.executor import start_worker_job
 from jarvis.orchestration.intent import parse_work_command
-from jarvis.orchestration.models import WorkCommand, WorkItem
+from jarvis.orchestration.models import WorkCommand, WorkItem, WorkerJobLink
 from jarvis.orchestration.schedules import ScheduleStore
 from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource
 from jarvis.orchestration.store import ActiveWorkItemError, OrchestrationStore
+from jarvis.orchestration.supervisor import sync_run_jobs
 from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry
 
 
@@ -48,6 +49,18 @@ def test_active_primary_owner_prevents_duplicate_work(tmp_path) -> None:
     run = store.create_run("first", work_items=[item])
     assert store.active_primary_owner(item).run_id == run.run_id
     store.set_phase(run.run_id, "done", "complete")
+    assert store.active_primary_owner(item) is None
+
+
+def test_completed_phase_is_terminal(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    item = _item(id="#23")
+    run = store.create_run("Smoke", work_items=[item])
+
+    completed = store.set_phase(run.run_id, "completed", "Smoke dispatch verified")
+
+    assert completed.status == "terminal"
+    assert completed.terminal_reason == "Smoke dispatch verified"
     assert store.active_primary_owner(item) is None
 
 
@@ -375,6 +388,75 @@ def test_start_worker_job_links_run_graph(tmp_path) -> None:
     assert store.get(run.run_id).jobs[0].job_id == "job123"  # type: ignore[union-attr]
 
 
+def test_store_updates_worker_job_link(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Start work")
+    store.link_job(run.run_id, WorkerJobLink(worker_id="local-worker", job_id="job123"))
+
+    updated = store.update_job(
+        run.run_id,
+        "job123",
+        status="done",
+        session_id="session-1",
+        branch="jarvis/fix-worker",
+        cwd="/tmp/worktree",
+    )
+
+    job = updated.jobs[0]
+    assert job.status == "done"
+    assert job.session_id == "session-1"
+    assert job.branch == "jarvis/fix-worker"
+    assert job.cwd == "/tmp/worktree"
+    assert store.events(run.run_id)[-1].type == "job_updated"
+
+
+def test_sync_run_jobs_marks_completed_run(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Start work")
+    store.link_job(run.run_id, WorkerJobLink(worker_id="local-worker", job_id="job123"))
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "id": "job123",
+                "status": "done",
+                "session_id": "session-1",
+                "branch": "jarvis/fix-worker",
+                "cwd": "/tmp/worktree",
+            }
+
+    seen = {}
+
+    def fake_get(url, **kwargs):  # noqa: ANN001
+        seen["url"] = url
+        seen["headers"] = kwargs["headers"]
+        return Response()
+
+    summary = sync_run_jobs(
+        store,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1, token="secret"),
+        get=fake_get,
+    )
+
+    reloaded = store.get(run.run_id)
+    assert summary.to_dict() == {
+        "runs_seen": 1,
+        "jobs_seen": 1,
+        "jobs_updated": 1,
+        "runs_completed": 1,
+        "runs_failed": 0,
+        "errors": [],
+    }
+    assert reloaded is not None
+    assert reloaded.phase == "completed"
+    assert reloaded.status == "terminal"
+    assert reloaded.jobs[0].session_id == "session-1"
+    assert seen["url"] == "http://localhost:1/jobs/job123"
+    assert seen["headers"] == {"Authorization": "Bearer secret"}
+
+
 def test_start_worker_job_uses_selected_worker_endpoint_and_token_env(monkeypatch) -> None:  # noqa: ANN001
     envelope = build_execution_envelope(
         run_id="run_1",
@@ -414,8 +496,35 @@ def test_start_worker_job_uses_selected_worker_endpoint_and_token_env(monkeypatc
     assert job.worker_id == "hive-worker"
     assert seen["url"] == "http://hive-worker:8780/run"
     assert seen["headers"] == {"Authorization": "Bearer hive-token"}
+    assert seen["json"]["args"]["name"] == "jarvis-1-fix-the-worker"
     assert seen["json"]["args"]["execution_envelope"]["run_id"] == "run_1"
     assert seen["json"]["args"]["execution_envelope"]["landing"]["mode"] == "draft_pr"
+
+
+def test_start_worker_job_reports_worker_error_body() -> None:
+    envelope = build_execution_envelope(
+        run_id="run_1",
+        command=WorkCommand("start_next_work", source="github", start=True),
+        items=[_item()],
+        worker_id="local-worker",
+    )
+
+    class Response:
+        status_code = 400
+        text = '{"ok": false, "error": "could not create worktree"}'
+
+        def json(self):
+            return {"ok": False, "error": "could not create worktree"}
+
+        def raise_for_status(self) -> None:
+            raise AssertionError("error body should be handled before generic HTTP raise")
+
+    with pytest.raises(RuntimeError, match="could not create worktree"):
+        start_worker_job(
+            envelope,
+            worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1, token=""),
+            post=lambda *_a, **_kw: Response(),
+        )
 
 
 def test_start_worker_job_refuses_named_worker_without_endpoint() -> None:

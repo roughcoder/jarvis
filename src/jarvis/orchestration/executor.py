@@ -39,7 +39,7 @@ def start_worker_job(
     args = {
         "agent": envelope.engine,
         "prompt": envelope.prompt,
-        "name": envelope.branch_name.rsplit("/", 1)[-1] or envelope.run_id,
+        "name": _job_name(envelope),
         "execution_envelope": envelope.to_dict(),
     }
     if envelope.repo:
@@ -50,8 +50,17 @@ def start_worker_job(
         headers=headers,
         timeout=worker_cfg.request_timeout_s,
     )
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+    status_code = getattr(response, "status_code", 200)
+    if status_code >= 400:
+        error = body.get("error") if isinstance(body, dict) else ""
+        if not error:
+            error = getattr(response, "text", "") or f"worker request failed with HTTP {status_code}"
+        raise RuntimeError(error)
     response.raise_for_status()
-    body = response.json()
     if not body.get("ok"):
         raise RuntimeError(body.get("error") or "worker rejected job")
     link = WorkerJobLink(
@@ -64,6 +73,13 @@ def start_worker_job(
     if store is not None:
         store.link_job(envelope.run_id, link)
     return link
+
+
+def _job_name(envelope: ExecutionEnvelope) -> str:
+    name = envelope.branch_name.rsplit("/", 1)[-1] if envelope.branch_name else envelope.run_id
+    if name.startswith("jarvis-"):
+        return name
+    return f"jarvis-{name}"
 
 
 def create_run_and_envelope(

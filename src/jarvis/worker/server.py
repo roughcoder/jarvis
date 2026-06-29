@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import os
 import pathlib
+import subprocess
 import uuid
 
 from aiohttp import web
@@ -87,9 +88,28 @@ def _shell_env(cfg: WorkerConfig) -> dict:
     return env
 
 
-def make_app(cfg: WorkerConfig) -> web.Application:
-    workspace = pathlib.Path(cfg.workspace)
+def _workspace_error(path: pathlib.Path) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode == 0 and result.stdout.strip() == "true":
+        return f"worker workspace {path} is inside a git checkout; set WORKER_WORKSPACE to an external absolute path"
+    return ""
+
+
+def _worker_workspace(cfg: WorkerConfig) -> pathlib.Path:
+    workspace = pathlib.Path(cfg.workspace).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
+    if err := _workspace_error(workspace):
+        raise ValueError(err)
+    return workspace
+
+
+def make_app(cfg: WorkerConfig) -> web.Application:
+    workspace = _worker_workspace(cfg)
     # Persist jobs to disk under the workspace so they survive a daemon restart.
     jobs = JobManager(store_dir=str(workspace / "jobs"))
 

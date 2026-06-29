@@ -150,7 +150,7 @@ class OrchestrationStore:
         if run is None:
             raise KeyError(run_id)
         run.phase = phase  # type: ignore[assignment]
-        if phase in {"done", "failed", "blocked", "cancelled", "needs_human"}:
+        if phase in {"done", "completed", "failed", "blocked", "cancelled", "needs_human"}:
             run.status = "terminal"
             run.terminal_reason = message
         self.save(run)
@@ -176,6 +176,32 @@ class OrchestrationStore:
         self.save(run)
         self.append_event(run_id, "job_started", f"Worker job {job.job_id} started", job.to_dict())
         return run
+
+    def update_job(self, run_id: str, job_id: str, **updates: str) -> OrchestrationRun:
+        with self._locked():
+            run = self.get(run_id)
+            if run is None:
+                raise KeyError(run_id)
+            job = next((x for x in run.jobs if x.job_id == job_id), None)
+            if job is None:
+                raise KeyError(job_id)
+            changed: dict[str, str] = {}
+            for field in ("status", "session_id", "branch", "cwd"):
+                value = updates.get(field)
+                if value is None:
+                    continue
+                if getattr(job, field) != value:
+                    setattr(job, field, value)
+                    changed[field] = value
+            if changed:
+                self.save(run)
+                self.append_event(
+                    run_id,
+                    "job_updated",
+                    f"Worker job {job_id} updated",
+                    {"job_id": job_id, **changed},
+                )
+            return run
 
     def link_artifact(self, run_id: str, artifact: Artifact) -> OrchestrationRun:
         run = self.get(run_id)
