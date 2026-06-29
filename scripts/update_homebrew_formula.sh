@@ -136,7 +136,8 @@ wrapper = [
   '      #!/usr/bin/env bash',
   '      set -euo pipefail',
   '      export PYTHONPATH="#{libexec}/src${PYTHONPATH:+:$PYTHONPATH}"',
-  '      exec "#{libexec}/.venv/bin/python" -m jarvis.cli "$@"',
+  '      export UV_PROJECT="#{libexec}"',
+  '      exec "#{formula_opt_bin("uv")}/uv" run python -m jarvis.cli "$@"',
 ].join("\n") + "\n"
 
 unless text.sub!(
