@@ -173,6 +173,12 @@ def test_panel_preview_uses_spinner_pupils_for_thinking_state() -> None:
     assert "apertureThink" not in html
     assert "pupilLoader" not in html
     assert '<span class="pupil"></span>' in html
+    assert "--brow-left-rot: -8deg;" in html
+    assert "--brow-right-rot: 6deg;" in html
+    assert '[data-state="thinking"] .eye:first-child .brow' in html
+    assert '[data-state="thinking"] .eye:last-child .brow' in html
+    assert "--brow-lift: min(-1.4vw, -10px);" in html
+    assert "--brow-lift: min(.8vw, 6px);" in html
 
 
 def test_panel_preview_connecting_is_spinner_only() -> None:
@@ -191,13 +197,12 @@ def test_panel_preview_disconnected_looks_angry_and_offline() -> None:
 
     assert '<main class="screen" data-state="disconnected">' in html
     assert "--accent: #ff4b42;" in html
-    assert '[data-state="disconnected"] .eye:first-child' in html
-    assert '[data-state="disconnected"] .eye:last-child' in html
-    assert "rotate(7deg)" in html
-    assert "rotate(-7deg)" in html
-    assert "--brow-y: -64%;" in html
-    assert "--brow-left-rot: 18deg;" in html
-    assert "--brow-right-rot: -18deg;" in html
+    assert "--eye-scale-y: .74;" in html
+    assert "rotate(7deg)" not in html
+    assert "rotate(-7deg)" not in html
+    assert "--brow-y: -88%;" in html
+    assert "--brow-left-rot: 14deg;" in html
+    assert "--brow-right-rot: -14deg;" in html
     assert '[data-state="disconnected"] .pupil::before' in html
     assert '[data-state="disconnected"] .pupil::after' in html
     assert "rotate(45deg)" in html
@@ -244,9 +249,12 @@ def test_panel_preview_sleep_feels_resting_but_ready() -> None:
     assert '<main class="screen" data-state="sleep">' in html
     assert "--accent: #c8d8ca;" in html
     assert "--brow-y: -58%;" in html
+    assert '[data-state="sleep"] .brow' in html
+    assert "opacity: 0;" in html
     assert "height: min(20vw, 118px);" in html
     assert "peek-left" in html
     assert "peek-right" in html
+    assert "opacity: 1;" in html
     assert "scheduleSleepPeek" in html
     assert "sleepPeekPupil" in html
     assert "--sleep-look-1-x" in html

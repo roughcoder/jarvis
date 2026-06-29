@@ -411,6 +411,10 @@ button[aria-pressed="true"] {{
   --brow-lift: min(1vw, 6px);
 }}
 
+[data-state="sleep"] .brow {{
+  opacity: 0;
+}}
+
 .peek-left[data-state="sleep"] .eye:first-child,
 .peek-right[data-state="sleep"] .eye:last-child {{
   height: min(20vw, 118px);
@@ -422,6 +426,7 @@ button[aria-pressed="true"] {{
   --brow-y: -42%;
   --brow-lift: min(-.8vw, -5px);
   --brow-scale-y: .86;
+  opacity: 1;
 }}
 
 .peek-left[data-state="sleep"] .eye:first-child .pupil,
@@ -485,21 +490,15 @@ button[aria-pressed="true"] {{
   --accent: #ff4b42;
   --eye-height: min(11vw, 68px);
   --eye-width: .96;
+  --eye-scale-y: .74;
+  --eye-y: min(.9vw, 6px);
   --pupil: min(6.4vw, 44px);
-  --brow-y: -64%;
+  --brow-y: -88%;
   --brow-height: min(3vw, 18px);
   --brow-width: 76%;
-  --brow-left-rot: 18deg;
-  --brow-right-rot: -18deg;
-  --brow-lift: min(1vw, 6px);
-}}
-
-[data-state="disconnected"] .eye:first-child {{
-  transform: translateY(min(.9vw, 6px)) rotate(7deg) scaleX(.96) scaleY(.74);
-}}
-
-[data-state="disconnected"] .eye:last-child {{
-  transform: translateY(min(.9vw, 6px)) rotate(-7deg) scaleX(.96) scaleY(.74);
+  --brow-left-rot: 14deg;
+  --brow-right-rot: -14deg;
+  --brow-lift: min(-.3vw, -2px);
 }}
 
 [data-state="disconnected"] .pupil {{
@@ -553,9 +552,19 @@ button[aria-pressed="true"] {{
   --eye-height: min(18vw, 114px);
   --pupil: min(6.2vw, 42px);
   --brow-y: -48%;
-  --brow-left-rot: 13deg;
-  --brow-right-rot: -13deg;
+  --brow-left-rot: -8deg;
+  --brow-right-rot: 6deg;
   --brow-width: 68%;
+}}
+
+[data-state="thinking"] .eye:first-child .brow {{
+  --brow-lift: min(-1.4vw, -10px);
+  --brow-scale-x: .95;
+}}
+
+[data-state="thinking"] .eye:last-child .brow {{
+  --brow-lift: min(.8vw, 6px);
+  --brow-scale-x: 1.05;
 }}
 
 [data-state="thinking"] .pupil {{
