@@ -193,6 +193,7 @@ def test_linear_source_normalizes_items() -> None:
         def json(self):
             return {
                 "data": {
+                    "viewer": {"id": "user-1", "name": "Neil"},
                     "issues": {
                         "nodes": [
                             {
@@ -204,7 +205,7 @@ def test_linear_source_normalizes_items() -> None:
                                 "priorityLabel": "High",
                                 "updatedAt": "now",
                                 "state": {"name": "Ready"},
-                                "assignee": {"name": "Neil"},
+                                "assignee": {"id": "user-1", "name": "Neil"},
                                 "labels": {"nodes": [{"name": "bug"}]},
                             }
                         ]
@@ -217,6 +218,50 @@ def test_linear_source_normalizes_items() -> None:
     assert items[0].id == "ENG-1"
     assert items[0].source_internal_id == "uuid-1"
     assert items[0].labels == ["bug"]
+
+
+def test_linear_source_filters_assignee_me_before_next_selection() -> None:
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {
+                "data": {
+                    "viewer": {"id": "user-1", "name": "Neil", "email": "neil@example.test"},
+                    "issues": {
+                        "nodes": [
+                            {
+                                "id": "uuid-1",
+                                "identifier": "ENG-1",
+                                "title": "Someone else's ticket",
+                                "description": "",
+                                "url": "https://linear/ENG-1",
+                                "updatedAt": "now",
+                                "state": {"name": "Ready"},
+                                "assignee": {"id": "user-2", "name": "Alex", "email": "alex@example.test"},
+                                "labels": {"nodes": []},
+                            },
+                            {
+                                "id": "uuid-2",
+                                "identifier": "ENG-2",
+                                "title": "My ticket",
+                                "description": "",
+                                "url": "https://linear/ENG-2",
+                                "updatedAt": "now",
+                                "state": {"name": "Ready"},
+                                "assignee": {"id": "user-1", "name": "Neil", "email": "neil@example.test"},
+                                "labels": {"nodes": []},
+                            },
+                        ]
+                    },
+                }
+            }
+
+    item = LinearWorkSource("token", post=lambda *_a, **_kw: Response()).next(filters={"assignee": "me"})
+
+    assert item is not None
+    assert item.id == "ENG-2"
 
 
 def test_execution_envelope_uses_natural_language_verification() -> None:

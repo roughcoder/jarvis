@@ -122,6 +122,7 @@ class LinearWorkSource:
     def list(self, *, repo: str = "", filters: dict | None = None, limit: int = 10) -> list[WorkItem]:
         query = """
         query JarvisIssues($first: Int!) {
+          viewer { id name email }
           issues(first: $first, orderBy: updatedAt) {
             nodes {
               identifier
@@ -132,7 +133,7 @@ class LinearWorkSource:
               priorityLabel
               updatedAt
               state { name }
-              assignee { name }
+              assignee { id name email }
               labels { nodes { name } }
             }
           }
@@ -140,13 +141,24 @@ class LinearWorkSource:
         """
         data = self._graphql(query, {"first": limit})
         nodes = data.get("issues", {}).get("nodes", [])
-        items = [_linear_to_item(x, repo) for x in nodes]
+        pairs = [(raw, _linear_to_item(raw, repo)) for raw in nodes]
         filters = filters or {}
         if label := filters.get("label"):
-            items = [x for x in items if label in x.labels]
+            pairs = [(raw, item) for raw, item in pairs if label in item.labels]
         if filters.get("status") == "ready":
-            items = [x for x in items if x.status.lower() not in {"blocked", "done", "canceled", "cancelled"}]
-        return items
+            pairs = [
+                (raw, item)
+                for raw, item in pairs
+                if item.status.lower() not in {"blocked", "done", "canceled", "cancelled"}
+            ]
+        if assignee := filters.get("assignee"):
+            viewer = data.get("viewer", {})
+            pairs = [
+                (raw, item)
+                for raw, item in pairs
+                if _matches_linear_assignee(raw, item, str(assignee), viewer)
+            ]
+        return [item for _raw, item in pairs]
 
     def next(self, *, repo: str = "", filters: dict | None = None) -> WorkItem | None:
         items = self.list(repo=repo, filters=filters, limit=10)
@@ -203,3 +215,27 @@ def _linear_to_item(raw: dict[str, Any], repo: str) -> WorkItem:
         assignee=raw.get("assignee", {}).get("name", "") if raw.get("assignee") else "",
         updated_at=raw.get("updatedAt", ""),
     )
+
+
+def _matches_linear_assignee(
+    raw: dict[str, Any],
+    item: WorkItem,
+    assignee_filter: str,
+    viewer: dict[str, Any],
+) -> bool:
+    assignee = raw.get("assignee") or {}
+    wanted = assignee_filter.strip().lower()
+    if not wanted:
+        return True
+    if wanted == "me":
+        return any(
+            assignee.get(key) and viewer.get(key) and str(assignee[key]).lower() == str(viewer[key]).lower()
+            for key in ("id", "email", "name")
+        )
+    candidates = {
+        item.assignee.lower(),
+        str(assignee.get("id", "")).lower(),
+        str(assignee.get("email", "")).lower(),
+        str(assignee.get("name", "")).lower(),
+    }
+    return wanted in candidates
