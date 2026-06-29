@@ -58,6 +58,7 @@ class GitHubWorkSource:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "gh pr view failed")
         data = json.loads(result.stdout or "{}")
         comments = list(data.get("comments", [])) + list(data.get("reviews", [])) + list(data.get("reviewThreads", []))
+        repo = repo or self._current_repo()
         if repo:
             inline = self._run(["gh", "api", f"repos/{repo}/pulls/{number}/comments", "--paginate", "--slurp"])
             if inline.returncode != 0:
@@ -71,6 +72,12 @@ class GitHubWorkSource:
             elif isinstance(inline_data, dict):
                 comments.append(inline_data)
         return comments
+
+    def _current_repo(self) -> str:
+        result = self._run(["gh", "repo", "view", "--json", "nameWithOwner"])
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "gh repo view failed")
+        return str(json.loads(result.stdout or "{}").get("nameWithOwner", ""))
 
     def claim(self, item: WorkItem) -> bool:
         return False
