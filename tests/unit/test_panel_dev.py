@@ -6,6 +6,7 @@ from pathlib import Path
 import threading
 import time
 
+from jarvis import __version__
 from jarvis.config import IntercomDeviceConfig
 from jarvis.intercom.panel_dev import (
     PANEL_STATES,
@@ -80,6 +81,17 @@ def test_panel_preview_omits_brand_and_expression_copy() -> None:
     assert "waiting for hey jarvis" not in html
     assert "working" not in html
     assert "tap for controls" not in html
+
+
+def test_panel_preview_shows_runtime_version_top_left() -> None:
+    html = render_panel_preview_html()
+
+    assert '<div class="version-label" aria-label="Jarvis version">' in html
+    assert f">v{__version__}</div>" in html
+    assert "position: absolute;" in html
+    assert "left: clamp(8px, 2vw, 16px);" in html
+    assert "top: clamp(6px, 1.6vh, 12px);" in html
+    assert "letter-spacing: 0;" in html
 
 
 def test_panel_preview_sanitizes_title_and_falls_back_to_idle_state() -> None:
