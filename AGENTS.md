@@ -143,6 +143,11 @@ keeps the original single-process behaviour. The think/speak core is shared
   action needed>`, `Upgrade-note: <operator action>`, `Docs: <doc pointer>`, and
   `Breaking Change: <migration impact>`. Use `Release-note: skip` only for
   mechanical or internal commits that should not appear in user-facing notes.
+  Trailer lines must be real commit-message lines. Do not embed literal `\n`
+  sequences inside a `git commit -m` argument; CI rejects those because release
+  tooling cannot parse them as trailers. Prefer either repeated `-m` arguments
+  for each paragraph/trailer or a message file:
+  `git commit -F /tmp/commit-message.txt`.
 - **Runtime releases are GitHub Actions only.** Never run
   `scripts/release_runtime.sh` locally; use local scripts only for preflight
   version/notes checks, then trigger the `Release` workflow.
