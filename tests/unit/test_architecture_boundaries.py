@@ -7,17 +7,39 @@ from pathlib import Path
 
 
 SRC = Path(__file__).parents[2] / "src" / "jarvis"
+MOVED_ACCOUNT_MODULES = frozenset(
+    {
+        "jarvis.brain.accounts",
+        "jarvis.brain.account_router",
+        "jarvis.brain.account_adapters",
+    }
+)
+
+
+def _absolute_from_import(file: Path, node: ast.ImportFrom) -> str:
+    if node.level == 0:
+        return node.module or ""
+
+    package = ("jarvis", *file.relative_to(SRC).with_suffix("").parts[:-1])
+    keep = len(package) - node.level + 1
+    base = package[:keep] if keep > 0 else ("jarvis",)
+    if node.module:
+        base = (*base, *node.module.split("."))
+    return ".".join(base)
 
 
 def _imports_under(path: Path) -> list[tuple[str, str]]:
     imports: list[tuple[str, str]] = []
-    for file in path.rglob("*.py"):
+    files = [path] if path.is_file() else path.rglob("*.py")
+    for file in files:
         tree = ast.parse(file.read_text(encoding="utf-8"))
         rel = str(file.relative_to(SRC))
         for node in ast.walk(tree):
             modules: list[str] = []
             if isinstance(node, ast.ImportFrom) and node.module:
-                modules.append(node.module)
+                modules.append(_absolute_from_import(file, node))
+            elif isinstance(node, ast.ImportFrom) and node.level:
+                modules.append(_absolute_from_import(file, node))
             elif isinstance(node, ast.Import):
                 modules.extend(alias.name for alias in node.names)
             for module in modules:
@@ -50,5 +72,25 @@ def test_skills_do_not_import_user_profile_store() -> None:
         module
         for _rel, module in _imports_under(skills.parent)
         if module == "jarvis.users" and _rel == "brain/skills.py"
+    ]
+    assert offenders == []
+
+
+def test_moved_account_modules_are_updated_everywhere() -> None:
+    stale_files = [
+        path
+        for path in (
+            SRC / "brain" / "accounts.py",
+            SRC / "brain" / "account_router.py",
+            SRC / "brain" / "account_adapters.py",
+        )
+        if path.exists()
+    ]
+    assert stale_files == []
+
+    offenders = [
+        f"{rel}: {module}"
+        for rel, module in _imports_under(SRC)
+        if module in MOVED_ACCOUNT_MODULES
     ]
     assert offenders == []
