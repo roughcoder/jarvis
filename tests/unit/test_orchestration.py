@@ -447,7 +447,7 @@ def test_cli_work_next_preserves_parsed_linear_source(tmp_path, monkeypatch, cap
     monkeypatch.setenv("CAPS_DEFAULT_CAPABILITIES", "work.linear.read")
     seen = {}
 
-    def work_source(name):  # noqa: ANN001, ANN202
+    def work_source(name, _cfg=None):  # noqa: ANN001, ANN202
         seen["source"] = name
         return Source()
 
@@ -468,7 +468,7 @@ def test_cli_work_start_requires_worker_start_capability(tmp_path, monkeypatch, 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / ".env"))
     monkeypatch.setenv("CAPS_DEFAULT_CAPABILITIES", "work.github.issues.read")
-    monkeypatch.setattr(cli, "_work_source", lambda _name: Source())
+    monkeypatch.setattr(cli, "_work_source", lambda _name, _cfg=None: Source())
 
     assert cli.main(["work", "next", "--start"]) == 1
     assert "Missing orchestration capability: worker.job.start" in capsys.readouterr().out
@@ -504,9 +504,61 @@ def test_cli_work_start_rejects_saturated_explicit_worker(tmp_path, monkeypatch,
         )
     )
     (tmp_path / ".env").write_text(f"ORCHESTRATION_WORKERS_PATH={workers_path}\n")
-    monkeypatch.setattr(cli, "_work_source", lambda _name: Source())
+    monkeypatch.setattr(cli, "_work_source", lambda _name, _cfg=None: Source())
     monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
     monkeypatch.setattr("jarvis.orchestration.executor.start_worker_job", fail_start)
 
     assert cli.main(["work", "next", "--start", "--worker", "hive-worker"]) == 1
     assert "No eligible worker found." in capsys.readouterr().out
+
+
+def test_cli_work_dispatch_failure_marks_run_failed(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis import cli
+
+    class Source:
+        def next(self, *, repo="", filters=None):  # noqa: ANN001, ANN201
+            return _item(id="#24")
+
+    def fail_start(*_args, **_kwargs):  # noqa: ANN001, ANN202
+        raise RuntimeError("worker unavailable")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / ".env"))
+    monkeypatch.setenv("CAPS_DEFAULT_CAPABILITIES", "work.github.issues.read,worker.job.start")
+    monkeypatch.setattr(cli, "_work_source", lambda _name, _cfg=None: Source())
+    monkeypatch.setattr(
+        "jarvis.orchestration.workers.WorkerRegistry.choose",
+        lambda _self, _required=None: WorkerProfile(
+            worker_id="local-worker",
+            display_name="Local",
+            capabilities=["git"],
+            base_url="http://localhost:1",
+            status="online",
+            max_concurrent_jobs=1,
+            current_jobs=0,
+        ),
+    )
+    monkeypatch.setattr("jarvis.orchestration.executor.start_worker_job", fail_start)
+
+    assert cli.main(["work", "next", "--start"]) == 1
+    assert "Worker dispatch failed" in capsys.readouterr().out
+
+    runs = OrchestrationStore(str(tmp_path / "jarvis-workspace/orchestration")).list_runs()
+    assert len(runs) == 1
+    assert runs[0].phase == "failed"
+    assert runs[0].status == "terminal"
+    assert OrchestrationStore(str(tmp_path / "jarvis-workspace/orchestration")).active_primary_owner(_item(id="#24")) is None
+
+
+def test_cli_linear_source_uses_configured_api_key(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis import cli
+    from jarvis.config import load_config
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("LINEAR_API_KEY=lin-secret\n")
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+
+    source = cli._work_source("linear", load_config())
+
+    assert source.api_key == "lin-secret"
