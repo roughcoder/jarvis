@@ -166,6 +166,37 @@ body {{
   content: none;
 }}
 
+.eye::after {{
+  content: "";
+  position: absolute;
+  inset: -1px;
+  z-index: 2;
+  border-radius: inherit;
+  background: var(--bg);
+  opacity: 0;
+  pointer-events: none;
+  transform: scaleY(0);
+  transform-origin: center;
+}}
+
+[data-state="idle"] .eye::after,
+[data-state="awake"] .eye::after,
+[data-state="listening"] .eye::after,
+[data-state="thinking"] .eye::after,
+[data-state="speaking"] .eye::after,
+[data-state="disconnected"] .eye::after {{
+  animation: eyeBlink 7.8s cubic-bezier(.16, 1, .3, 1) infinite;
+}}
+
+[data-state="idle"] .eye:last-child::after,
+[data-state="awake"] .eye:last-child::after,
+[data-state="listening"] .eye:last-child::after,
+[data-state="thinking"] .eye:last-child::after,
+[data-state="speaking"] .eye:last-child::after,
+[data-state="disconnected"] .eye:last-child::after {{
+  animation-delay: 90ms;
+}}
+
 .brow {{
   position: absolute;
   left: 50%;
@@ -406,6 +437,11 @@ button[aria-pressed="true"] {{
   animation: sleepPeekPupil 2.45s cubic-bezier(.16, 1, .3, 1) both;
 }}
 
+.peek-left[data-state="sleep"] .eye:first-child::after,
+.peek-right[data-state="sleep"] .eye:last-child::after {{
+  animation: sleepPeekBlink 2.45s cubic-bezier(.16, 1, .3, 1) both;
+}}
+
 [data-state="idle"] {{
   --accent: #dce9d3;
   --eye-height: min(22vw, 138px);
@@ -605,6 +641,16 @@ button[aria-pressed="true"] {{
   }}
 }}
 
+@keyframes eyeBlink {{
+  0%, 87%, 91%, 100% {{ opacity: 0; transform: scaleY(0); }}
+  88.4%, 89.6% {{ opacity: 1; transform: scaleY(1.08); }}
+}}
+
+@keyframes sleepPeekBlink {{
+  0%, 48%, 54%, 100% {{ opacity: 0; transform: scaleY(0); }}
+  50.5%, 51.5% {{ opacity: 1; transform: scaleY(1.08); }}
+}}
+
 @keyframes sleepFloat {{
   0%, 100% {{ opacity: 0; transform: translate(0, 18px) rotate(0deg) scale(.82); }}
   8% {{ opacity: .28; transform: translate(calc(var(--zz-sway-a, -4vw) * .24), -5vh) rotate(calc(var(--zz-rot-a, -12deg) * .22)) scale(.9); }}
@@ -635,6 +681,12 @@ button[aria-pressed="true"] {{
 @media (max-width: 520px), (max-height: 420px) {{
   .debug {{ grid-template-columns: repeat(2, 1fr); }}
   .meter {{ height: 22px; gap: 3px; }}
+}}
+
+@media (prefers-reduced-motion: reduce) {{
+  .eye::after {{
+    animation: none !important;
+  }}
 }}
 </style>
 </head>

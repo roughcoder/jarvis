@@ -259,6 +259,22 @@ def test_panel_preview_ready_state_has_subtle_idle_motion_only() -> None:
     assert "trick-spin" not in html
 
 
+def test_panel_preview_open_eyes_blink_occasionally() -> None:
+    html = render_panel_preview_html()
+
+    for state in ("idle", "awake", "listening", "thinking", "speaking", "disconnected"):
+        assert f'[data-state="{state}"] .eye::after' in html
+    assert '[data-state="connecting"] .eye::after' not in html
+    assert ".peek-left[data-state=\"sleep\"] .eye:first-child::after" in html
+    assert ".peek-right[data-state=\"sleep\"] .eye:last-child::after" in html
+    assert "@keyframes eyeBlink" in html
+    assert "@keyframes sleepPeekBlink" in html
+    assert "animation: eyeBlink 7.8s cubic-bezier(.16, 1, .3, 1) infinite;" in html
+    assert "animation-delay: 90ms;" in html
+    assert "@media (prefers-reduced-motion: reduce)" in html
+    assert "animation: none !important;" in html
+
+
 def test_panel_preview_speaking_uses_soft_bright_pink() -> None:
     html = render_panel_preview_html()
 
