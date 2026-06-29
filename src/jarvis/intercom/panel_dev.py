@@ -882,7 +882,8 @@ for (const z of sleepZs) {{
   z.addEventListener("animationiteration", () => seedSleepZ(z));
 }}
 
-setState(new URLSearchParams(location.search).get("state") || screen.dataset.state);
+const initialQueryState = new URLSearchParams(location.search).get("state");
+setState(initialQueryState || screen.dataset.state, {{ publish: Boolean(initialQueryState) }});
 async function pollState() {{
   try {{
     const response = await fetch("/state", {{ cache: "no-store" }});
