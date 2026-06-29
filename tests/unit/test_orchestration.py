@@ -493,6 +493,44 @@ def test_cli_schedule_add_rejects_invalid_weekdays(tmp_path, monkeypatch, capsys
     assert "Invalid schedule: invalid weekdays: funday" in capsys.readouterr().out
 
 
+def test_cli_schedule_add_requires_write_capability(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis.cli import main
+
+    schedules_path = tmp_path / "state" / "schedules.json"
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"ORCHESTRATION_SCHEDULES_PATH={schedules_path}\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    monkeypatch.setenv("CAPS_DEFAULT_CAPABILITIES", "")
+
+    assert main(["schedules", "add", "check", "issues", "--at", "09:00"]) == 1
+    assert "Missing orchestration capability: orchestration.schedules.write" in capsys.readouterr().out
+    assert not schedules_path.exists()
+
+
+def test_cli_schedule_tick_ack_requires_write_capability(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis.cli import main
+
+    schedules_path = tmp_path / "state" / "schedules.json"
+    ScheduleStore(str(schedules_path)).add(
+        "Daily",
+        WorkCommand("inspect_work"),
+        hour=9,
+        minute=0,
+        weekdays=[0],
+        timezone="Europe/London",
+    )
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"ORCHESTRATION_SCHEDULES_PATH={schedules_path}\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    monkeypatch.setenv("CAPS_DEFAULT_CAPABILITIES", "")
+
+    assert main(["schedules", "tick", "--now", "2026-06-29T09:00:00+01:00", "--ack"]) == 1
+    assert "Missing orchestration capability: orchestration.schedules.write" in capsys.readouterr().out
+    assert ScheduleStore(str(schedules_path)).list()[0].last_fired_date == ""
+
+
 def test_campaign_creates_bounded_child_runs(tmp_path) -> None:
     store = OrchestrationStore(str(tmp_path))
     parent = create_campaign(
@@ -571,6 +609,28 @@ def test_cli_work_start_requires_worker_start_capability(tmp_path, monkeypatch, 
     assert "Missing orchestration capability: worker.job.start" in capsys.readouterr().out
 
 
+def test_cli_work_start_requires_landing_capabilities(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis import cli
+
+    class Source:
+        def next(self, *, repo="", filters=None):  # noqa: ANN001, ANN201
+            return _item(id="#25")
+
+    def fail_choose(*_args, **_kwargs):  # noqa: ANN001, ANN202
+        raise AssertionError("worker should not be selected without landing authority")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / ".env"))
+    monkeypatch.setenv("CAPS_DEFAULT_CAPABILITIES", "work.github.issues.read,worker.job.start")
+    monkeypatch.setattr(cli, "_work_source", lambda _name, _cfg=None: Source())
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry.choose", fail_choose)
+
+    assert cli.main(["work", "next", "--start"]) == 1
+    out = capsys.readouterr().out
+    assert "forge.github.branch.push" in out
+    assert "forge.github.pr.create" in out
+
+
 def test_cli_work_start_rejects_saturated_explicit_worker(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
     from jarvis import cli
 
@@ -583,7 +643,10 @@ def test_cli_work_start_rejects_saturated_explicit_worker(tmp_path, monkeypatch,
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / ".env"))
-    monkeypatch.setenv("CAPS_DEFAULT_CAPABILITIES", "work.github.issues.read,worker.job.start")
+    monkeypatch.setenv(
+        "CAPS_DEFAULT_CAPABILITIES",
+        "work.github.issues.read,worker.job.start,forge.github.branch.push,forge.github.pr.create",
+    )
     workers_path = tmp_path / "workers.json"
     workers_path.write_text(
         json.dumps(
@@ -621,7 +684,10 @@ def test_cli_work_dispatch_failure_marks_run_failed(tmp_path, monkeypatch, capsy
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / ".env"))
-    monkeypatch.setenv("CAPS_DEFAULT_CAPABILITIES", "work.github.issues.read,worker.job.start")
+    monkeypatch.setenv(
+        "CAPS_DEFAULT_CAPABILITIES",
+        "work.github.issues.read,worker.job.start,forge.github.branch.push,forge.github.pr.create",
+    )
     monkeypatch.setattr(cli, "_work_source", lambda _name, _cfg=None: Source())
     monkeypatch.setattr(
         "jarvis.orchestration.workers.WorkerRegistry.choose",
