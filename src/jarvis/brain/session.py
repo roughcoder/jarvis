@@ -341,14 +341,16 @@ class BrainSession:
             async for pcm in self._tts_source(self._clean_reply(raw), trace):
                 yield pcm
 
-    def finalize(self, user_text: str, result: TurnResult) -> None:
+    def finalize(self, user_text: str, result: TurnResult, trace=None) -> None:  # noqa: ANN001
         """End-detection + remember + cold-path. Safe to call after a barge-in —
         `result.raw` is what was actually said."""
         raw = result.raw or ""
         result.reply = self._clean_reply(raw)  # never store control markers
+        voice_mode_before = self._voice_mode
         result.voice_mode = normalize_mode(result.voice_mode or self._voice_mode)
         is_voice_channel = self._ctx.channel == "voice"
         is_open_mic_voice = is_voice_channel and self._cfg.vad.conversation_mode
+        transition = None
         if is_open_mic_voice and not result.close_reason:
             explicit_close = (
                 bool(_END_RE.search(raw))
@@ -379,6 +381,20 @@ class BrainSession:
             result.continue_listening = False
             result.voice_mode = DEFAULT_MODE
         self._voice_mode = result.voice_mode
+        if trace is not None and is_voice_channel:
+            trace.set(
+                voice_mode_before=voice_mode_before,
+                voice_mode_after=result.voice_mode,
+                close_reason=result.close_reason,
+                continue_listening=result.continue_listening,
+                ended=result.ended,
+            )
+            if transition is not None:
+                trace.set(
+                    policy_decision=transition.policy_decision,
+                    marker_seen=transition.marker_seen,
+                    assistant_asked_followup=transition.assistant_asked_followup,
+                )
         self._remember(user_text, result)
         if result.reply:
             self._fire_cold_path(user_text, result.reply)

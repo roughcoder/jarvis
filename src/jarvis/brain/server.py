@@ -651,11 +651,11 @@ class BrainServer:
                 async for pcm in session.respond(text, trace, result):
                     await ws.send(encode(ReplyAudio.of(turn_id, pcm)))
         except asyncio.CancelledError:
-            session.finalize(text, result)  # remember what was actually said
+            session.finalize(text, result, trace)  # remember what was actually said
             self._apply_cancelled_turn_result(channel, conn, result)
             self._tracer.emit(trace)
             raise
-        session.finalize(text, result)
+        session.finalize(text, result, trace)
         self._tracer.emit(trace)
         with contextlib.suppress(Exception):
             await ws.send(encode(ReplyText(turn_id=turn_id, text=result.reply)))

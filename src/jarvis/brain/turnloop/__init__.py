@@ -255,7 +255,7 @@ class TurnLoop:
                 mic, session.respond(text, trace, result)
             )
             # finalize() runs even after a barge-in: result.raw is what was said.
-            session.finalize(text, result)
+            session.finalize(text, result, trace)
             if interrupted:
                 self._apply_cancelled_turn_result(result)
             else:
