@@ -68,6 +68,7 @@ class CommitInfo:
     title: str = ""
     breaking: bool = False
     trailers: dict[str, list[str]] = field(default_factory=dict)
+    release_note_override_applied: bool = False
 
     @property
     def release_notes(self) -> list[str]:
@@ -198,6 +199,7 @@ def apply_release_note_overrides(
             continue
         if len(matches) > 1:
             raise SystemExit(f"Release-note override prefix {prefix!r} matches multiple commits")
+        matches[0].release_note_override_applied = True
         for key, values in trailers.items():
             matches[0].trailers[key] = values
 
@@ -366,7 +368,7 @@ def validate_release_trailers(commits: list[CommitInfo]) -> list[str]:
     errors: list[str] = []
     for commit in commits:
         escaped_trailers = sorted({match.group("key") for match in ESCAPED_TRAILER_RE.finditer(commit.body)})
-        if escaped_trailers and not commit.has_release_note_decision:
+        if escaped_trailers and not commit.release_note_override_applied:
             keys = ", ".join(escaped_trailers)
             errors.append(
                 f"{commit.sha[:12]} {commit.subject!r} contains escaped newline trailer text "
