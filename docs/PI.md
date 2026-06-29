@@ -136,6 +136,33 @@ intercom dependencies, reloads systemd, and restarts the intercom service.
 enumeration, display interface hints, and camera listing when `rpicam-hello`
 or legacy `libcamera-hello` is available.
 
+## Playback performance traces
+
+The intercom writes persistent playback metrics to the normal Jarvis trace JSONL
+file. On the default Pi install this is:
+
+```bash
+/opt/jarvis/.cache/traces.jsonl
+```
+
+That file lives under the Pi install directory, so it survives service restarts
+and reboots. It is not rotated automatically. Keep or copy it before wiping
+`/opt/jarvis` during a fresh reinstall.
+
+Use the CLI summary after a few real voice turns:
+
+```bash
+sudo JARVIS_ENV_FILE=/opt/jarvis/.env jarvis traces -n 20
+```
+
+Intercom playback entries have `kind: "intercom"` and
+`schema_version: "jarvis.intercom.playback.v1"`. They record the Pi-side view:
+time to first reply-audio frame, base64 decode cost, chunks/bytes, playback
+prebuffer/preroll, first speech, underruns, block size, and cut latency. Brain
+turn entries in the same file still record STT/LLM/TTS timings. Compare the two
+by wall-clock time; do not subtract Pi monotonic timings from brain monotonic
+timings across machines.
+
 See `docs/DEPLOYMENT.md` for the product install flow.
 
 ## Notes

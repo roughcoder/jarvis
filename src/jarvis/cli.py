@@ -1601,9 +1601,11 @@ def _write_bringup_summary(data: dict[str, object], output_path: str) -> str:
 
 
 def _cmd_traces(args: argparse.Namespace) -> int:
-    """View recent per-turn pipeline traces (STT/LLM/TTS/memory timings)."""
+    """View recent per-turn pipeline traces."""
     import json
     import pathlib
+
+    from jarvis.intercom.metrics import summary as intercom_summary
 
     cfg = load_config()
     path = pathlib.Path(cfg.trace.path)
@@ -1635,6 +1637,9 @@ def _cmd_traces(args: argparse.Namespace) -> int:
             print(
                 f"  {clock(d)}  memory      mem={s.get('memory', {}).get('ms', 0):.0f}ms (cold path)"
             )
+            continue
+        if kind == "intercom":
+            print(f"  {clock(d)}  {intercom_summary(d)}")
             continue
         stt = s.get("stt", {})
         llm = s.get("llm", {})

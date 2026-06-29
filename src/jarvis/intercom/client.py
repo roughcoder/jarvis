@@ -19,12 +19,14 @@ import queue
 import shlex
 import socket
 import threading
+import time
 import uuid
 
 import websockets
 from jarvis.config import Config
 from jarvis.intercom.audio import AudioIO, MicStream
 from jarvis.intercom.hardware import IntercomHardware
+from jarvis.intercom.metrics import IntercomReplyMetrics
 from jarvis.intercom.pi_panel import CompositePanel, PiPanel, WebPiPanel
 from jarvis.intercom.vad import Endpointer, SileroVAD
 from jarvis.intercom.wake import WakeWord
@@ -272,7 +274,12 @@ class IntercomClient:
                         await ws.send(encode(ConversationIdle(reason="timeout")))
                 return None
             turn_id = uuid.uuid4().hex
-            await ws.send(encode(Utterance.of(turn_id, self._sr, pcm)))
+            metrics = IntercomReplyMetrics(
+                turn_id=turn_id, device_id=self._device_id, kind="turn"
+            )
+            frame = encode(Utterance.of(turn_id, self._sr, pcm))
+            metrics.mark_utterance_sent(pcm_bytes=len(pcm), frame_bytes=len(frame))
+            await ws.send(frame)
             conversation_started = True
             state = {
                 "ended": False,
@@ -281,7 +288,9 @@ class IntercomClient:
                 "voice_mode": active_voice_mode,
                 "close_reason": "",
             }
-            interrupted = await self._play_reply(ws, mic, inbound, turn_id, state)
+            interrupted = await self._play_reply(
+                ws, mic, inbound, turn_id, state, metrics
+            )
             active_voice_mode = state["voice_mode"]
             print(f"  jarvis: {state['text']}{'  ⏹' if state['ended'] else ''}")
 
@@ -380,11 +389,18 @@ class IntercomClient:
             "voice_mode": "default",
             "close_reason": "",
         }
+        metrics = IntercomReplyMetrics(
+            turn_id=pro.turn_id, device_id=self._device_id, kind="proactive"
+        )
+        metrics.mark_proactive_received(text_chars=len(pro.text))
         with contextlib.suppress(Exception):
             self._panel.set("speaking")
-            await self._audio.play_stream(
-                self._reply_audio(inbound, pro.turn_id, state), sample_rate=self._cfg.tts.sample_rate
+            playback = await self._audio.play_stream(
+                self._reply_audio(inbound, pro.turn_id, state, metrics),
+                sample_rate=self._cfg.tts.sample_rate,
             )
+            metrics.attach_playback(playback)
+            metrics.emit(self._cfg.trace)
         if pro.open_mic:
             mic.drain()
             print("  …(listening for your reply)")
@@ -400,15 +416,28 @@ class IntercomClient:
         return state
 
     # --- reply playback + barge-in -----------------------------------------
-    async def _reply_audio(self, inbound, turn_id, state):  # noqa: ANN001
+    async def _reply_audio(self, inbound, turn_id, state, metrics=None):  # noqa: ANN001
         """Yield reply PCM (from the router queue) until ReplyEnd; record text/ended.
         Used for both a normal turn and a proactive's audio (its 'pa-' turn id)."""
         while True:
             msg = await inbound.get()
             if isinstance(msg, Transcript) and msg.turn_id == turn_id:
                 print(f"  you: {msg.text!r}")
+                if metrics is not None:
+                    metrics.mark_transcript()
             elif isinstance(msg, ReplyAudio) and msg.turn_id == turn_id:
-                yield msg.pcm()
+                if metrics is not None:
+                    metrics.mark_audio_frame_seen()
+                t0 = time.perf_counter()
+                pcm = msg.pcm()
+                decode_ms = (time.perf_counter() - t0) * 1000
+                if metrics is not None:
+                    metrics.record_audio_decode(
+                        encoded_bytes=len(msg.pcm_b64),
+                        pcm_bytes=len(pcm),
+                        decode_ms=decode_ms,
+                    )
+                yield pcm
             elif isinstance(msg, ReplyText) and msg.turn_id == turn_id:
                 state["text"] = msg.text
             elif isinstance(msg, ReplyEnd) and msg.turn_id == turn_id:
@@ -422,12 +451,24 @@ class IntercomClient:
             # Frames for another turn id (e.g. a proactive arriving mid-turn) are
             # dropped for now; idle-aware queuing is the next layer (#3).
 
-    async def _play_reply(self, ws, mic: MicStream, inbound, turn_id: str, state: dict) -> bool:  # noqa: ANN001
+    async def _play_reply(
+        self,
+        ws,
+        mic: MicStream,
+        inbound,
+        turn_id: str,
+        state: dict,
+        metrics: IntercomReplyMetrics | None = None,
+    ) -> bool:  # noqa: ANN001
         if not self._cfg.vad.bargein_enabled:
             self._panel.set("speaking")
-            await self._audio.play_stream(
-                self._reply_audio(inbound, turn_id, state), sample_rate=self._cfg.tts.sample_rate
+            playback = await self._audio.play_stream(
+                self._reply_audio(inbound, turn_id, state, metrics),
+                sample_rate=self._cfg.tts.sample_rate,
             )
+            if metrics is not None:
+                metrics.attach_playback(playback)
+                metrics.emit(self._cfg.trace)
             return False
         mic.drain()
         self._wake.reset()
@@ -475,7 +516,8 @@ class IntercomClient:
         self._panel.set("speaking")
         play_task = asyncio.create_task(
             self._audio.play_stream(
-                self._reply_audio(inbound, turn_id, state), sample_rate=self._cfg.tts.sample_rate
+                self._reply_audio(inbound, turn_id, state, metrics),
+                sample_rate=self._cfg.tts.sample_rate,
             )
         )
         mon_task = asyncio.create_task(asyncio.to_thread(monitor))
@@ -490,8 +532,14 @@ class IntercomClient:
             stop_monitor.set()
             results = await asyncio.gather(play_task, mon_task, return_exceptions=True)
             for r in results:
-                if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
+                if not isinstance(r, BaseException):
+                    if metrics is not None and hasattr(r, "as_dict"):
+                        metrics.attach_playback(r)
+                    continue
+                if not isinstance(r, asyncio.CancelledError):
                     print(f"  [reply error] {r!r}")
+            if metrics is not None:
+                metrics.emit(self._cfg.trace)
         return interrupted.is_set()
 
     # --- local capture (parallel to TurnLoop) ------------------------------

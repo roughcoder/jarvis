@@ -340,6 +340,13 @@ JARVIS_ENV_FILE=~/.jarvis/.env jarvis text --once "Smoke test after upgrade: rep
 JARVIS_ENV_FILE=~/.jarvis/.env jarvis traces -n 10
 ```
 
+Room intercom performance traces are persisted in the service workdir's
+`TRACE_PATH`. For the default Pi installer that is
+`/opt/jarvis/.cache/traces.jsonl`; for packaged Mac services it is usually
+`~/.jarvis/.cache/traces.jsonl`. Intercom playback records are marked
+`kind: "intercom"` and `schema_version: "jarvis.intercom.playback.v1"`, so later
+runtime versions can still identify the baseline schema.
+
 In LiteLLM spend logs, Jarvis turns should be filterable by request tags:
 `kind:turn`, `channel:text` or `channel:whatsapp`, `speaker:<person>`, and
 `device:<device_id>`. Heartbeats should show `end_user=heartbeat` and tags
