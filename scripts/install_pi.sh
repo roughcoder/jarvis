@@ -158,6 +158,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
   echo "+ write $INSTALL_DIR/.env"
   echo "+ set VAD_ENGINE=webrtc"
   echo "+ set INTERCOM_DEVICE_PI_PANEL=false"
+  echo "+ set INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S=90"
   echo "+ set INTERCOM_DEVICE_PI_PANEL_URL=http://127.0.0.1:$PI_PANEL_PORT"
 else
   cat > "$INSTALL_DIR/.env" <<ENV
@@ -169,7 +170,7 @@ CAPS_IDENTITY=house
 CAPS_SCOPE=house
 VAD_ENGINE=webrtc
 INTERCOM_DEVICE_PI_PANEL=false
-INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S=25
+INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S=90
 INTERCOM_DEVICE_PI_PANEL_GEOMETRY=$PI_PANEL_GEOMETRY
 INTERCOM_DEVICE_PI_PANEL_URL=http://127.0.0.1:$PI_PANEL_PORT
 ENV
@@ -232,6 +233,7 @@ ENV_FILE="\${JARVIS_ENV_FILE:-\$INSTALL_DIR/.env}"
 HOST="\${JARVIS_PI_PANEL_HOST:-127.0.0.1}"
 PORT="\${JARVIS_PI_PANEL_PORT:-$PI_PANEL_PORT}"
 GEOMETRY="\${JARVIS_PI_PANEL_GEOMETRY:-800x480+0+0}"
+SLEEP_AFTER="\${JARVIS_PI_PANEL_SLEEP_AFTER_S:-90}"
 
 if [[ -r "\$ENV_FILE" ]]; then
   set -a
@@ -239,6 +241,7 @@ if [[ -r "\$ENV_FILE" ]]; then
   . "\$ENV_FILE"
   set +a
   GEOMETRY="\${INTERCOM_DEVICE_PI_PANEL_GEOMETRY:-\$GEOMETRY}"
+  SLEEP_AFTER="\${INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S:-\${INTERCOM_DEVICE_EYES_SLEEP_AFTER_S:-\$SLEEP_AFTER}}"
 fi
 
 width=800
@@ -264,7 +267,7 @@ fi
 
 url="http://\$HOST:\$PORT/"
 export PYTHONPATH="\$INSTALL_DIR/src\${PYTHONPATH:+:\$PYTHONPATH}"
-/usr/bin/python3 -m jarvis.intercom.panel_dev --host "\$HOST" --port "\$PORT" --state idle &
+/usr/bin/python3 -m jarvis.intercom.panel_dev --host "\$HOST" --port "\$PORT" --state idle --sleep-after "\$SLEEP_AFTER" &
 server_pid="\$!"
 
 cleanup() {

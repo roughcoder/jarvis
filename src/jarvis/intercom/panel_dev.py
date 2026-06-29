@@ -12,6 +12,7 @@ import contextlib
 import functools
 import http.server
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,7 @@ from urllib.parse import parse_qs, urlparse
 from jarvis import __version__ as JARVIS_VERSION
 
 
+DEFAULT_SLEEP_AFTER_S = 90.0
 PANEL_STATES = (
     "idle",
     "connecting",
@@ -39,12 +41,14 @@ PANEL_STATES = (
 class PreviewConfig:
     initial_state: str = "idle"
     title: str = "Jarvis PiPanel"
+    sleep_after_s: float = DEFAULT_SLEEP_AFTER_S
 
 
 def render_panel_preview_html(cfg: PreviewConfig | None = None) -> str:
     cfg = cfg or PreviewConfig()
     state = cfg.initial_state if cfg.initial_state in PANEL_STATES else "idle"
     states = ",".join(f'"{item}"' for item in PANEL_STATES)
+    sleep_after_ms = int(max(5.0, cfg.sleep_after_s) * 1000)
     version = _escape_html(JARVIS_VERSION)
     return f"""<!doctype html>
 <html lang="en">
@@ -739,6 +743,7 @@ const labels = {{
   disconnected: "offline",
   sleep: "resting"
 }};
+const sleepAfterMs = {sleep_after_ms};
 const screen = document.querySelector(".screen");
 const controls = document.getElementById("controls");
 const meter = document.getElementById("meter");
@@ -752,6 +757,8 @@ let controlsTimer = 0;
 let demoTimer = 0;
 let speakingTimer = 0;
 let sleepPeekTimer = 0;
+let sleepTimer = 0;
+let autoSleepActive = false;
 
 for (const state of states) {{
   const button = document.createElement("button");
@@ -783,6 +790,7 @@ async function publishState(next) {{
 
 function setState(next, options = {{}}) {{
   if (!states.includes(next)) return;
+  autoSleepActive = Boolean(options.autoSleep);
   stateIndex = states.indexOf(next);
   screen.dataset.state = next;
   clearSpeakingMotion();
@@ -795,12 +803,20 @@ function setState(next, options = {{}}) {{
   }}
   const params = new URLSearchParams(location.search);
   params.set("state", next);
-  if (!options.remote) history.replaceState(null, "", `${{location.pathname}}?${{params}}`);
+  if (!options.remote && !options.autoSleep) history.replaceState(null, "", `${{location.pathname}}?${{params}}`);
   if (options.publish) publishState(next);
   if (next === "speaking") scheduleSpeakingMotion();
   if (next === "sleep") {{
     seedSleepZs();
     scheduleSleepPeek();
+  }}
+  scheduleAutoSleep(next);
+}}
+
+function scheduleAutoSleep(activeState = screen.dataset.state) {{
+  clearTimeout(sleepTimer);
+  if (activeState === "idle") {{
+    sleepTimer = setTimeout(() => setState("sleep", {{ autoSleep: true }}), sleepAfterMs);
   }}
 }}
 
@@ -957,6 +973,7 @@ async function pollState() {{
     const response = await fetch("/state", {{ cache: "no-store" }});
     if (response.ok) {{
       const payload = await response.json();
+      if (autoSleepActive && payload.state === "idle") return;
       if (payload.state && payload.state !== screen.dataset.state) {{
         setState(payload.state, {{ remote: true }});
       }}
@@ -1086,10 +1103,11 @@ def serve_preview(
     host: str = "127.0.0.1",
     port: int = 8787,
     initial_state: str = "idle",
+    sleep_after_s: float = DEFAULT_SLEEP_AFTER_S,
     open_browser: bool = False,
     kiosk: bool = False,
 ) -> None:
-    html = render_panel_preview_html(PreviewConfig(initial_state=initial_state))
+    html = render_panel_preview_html(PreviewConfig(initial_state=initial_state, sleep_after_s=sleep_after_s))
     state_store = PanelStateStore(initial_state)
     handler = functools.partial(_PreviewHandler, html=html, state_store=state_store)
     server = http.server.ThreadingHTTPServer((host, port), handler)
@@ -1120,6 +1138,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="127.0.0.1", help="Bind host. Use 0.0.0.0 for LAN/device testing.")
     parser.add_argument("--port", type=int, default=8787, help="HTTP port.")
     parser.add_argument("--state", choices=PANEL_STATES, default="idle", help="Initial panel state.")
+    parser.add_argument(
+        "--sleep-after",
+        type=float,
+        default=_default_sleep_after_s(),
+        help="Seconds an idle panel waits before switching to sleep.",
+    )
     parser.add_argument("--open", action="store_true", help="Open the preview in the default browser.")
     parser.add_argument("--kiosk", action="store_true", help="Launch Chromium/Chrome fullscreen kiosk.")
     args = parser.parse_args(argv)
@@ -1127,10 +1151,20 @@ def main(argv: list[str] | None = None) -> int:
         host=args.host,
         port=args.port,
         initial_state=args.state,
+        sleep_after_s=args.sleep_after,
         open_browser=args.open,
         kiosk=args.kiosk,
     )
     return 0
+
+
+def _default_sleep_after_s() -> float:
+    for name in ("INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S", "INTERCOM_DEVICE_EYES_SLEEP_AFTER_S"):
+        value = os.environ.get(name)
+        if value:
+            with contextlib.suppress(ValueError):
+                return float(value)
+    return DEFAULT_SLEEP_AFTER_S
 
 
 if __name__ == "__main__":

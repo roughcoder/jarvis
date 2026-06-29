@@ -98,7 +98,7 @@ For mini screens, set:
 
 ```bash
 INTERCOM_DEVICE_PI_PANEL=auto
-INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S=25
+INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S=90
 # Optional on multi-output desktop sessions, for example Pironman DSI + HDMI:
 INTERCOM_DEVICE_PI_PANEL_GEOMETRY=800x480+0+0
 ```

@@ -59,6 +59,14 @@ def test_websocket_keepalive_tolerates_slow_pi_event_loop() -> None:
     assert intercom.websocket_ping_timeout_s == brain.websocket_ping_timeout_s
 
 
+def test_pi_panel_sleep_defaults_to_ninety_seconds(monkeypatch) -> None:
+    _clean(monkeypatch, "INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S", "INTERCOM_DEVICE_EYES_SLEEP_AFTER_S")
+
+    c = IntercomDeviceConfig(_env_file=None)
+
+    assert c.pi_panel_sleep_s == 90.0
+
+
 def test_pi_panel_env_names_configure_panel(monkeypatch) -> None:
     _clean(
         monkeypatch,

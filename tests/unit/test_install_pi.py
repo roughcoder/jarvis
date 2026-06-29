@@ -57,6 +57,7 @@ def test_pi_installer_dry_run_models_intercom_install() -> None:
     assert "+ write /opt/jarvis-test/.env" in result.stdout
     assert "+ set VAD_ENGINE=webrtc" in result.stdout
     assert "+ set INTERCOM_DEVICE_PI_PANEL=false" in result.stdout
+    assert "+ set INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S=90" in result.stdout
     assert "+ set INTERCOM_DEVICE_PI_PANEL_URL=http://127.0.0.1:8787" in result.stdout
     assert "+ chmod 0600 /opt/jarvis-test/.env" in result.stdout
     assert "+ write /usr/local/bin/jarvis" in result.stdout
@@ -97,6 +98,10 @@ def test_pi_installer_dry_run_skips_uv_install_when_present() -> None:
 def test_pi_helper_doctor_checks_bookworm_camera_and_display() -> None:
     source = INSTALLER.read_text(encoding="utf-8")
 
+    assert "INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S=90" in source
+    assert 'SLEEP_AFTER="\\${JARVIS_PI_PANEL_SLEEP_AFTER_S:-90}"' in source
+    assert "INTERCOM_DEVICE_EYES_SLEEP_AFTER_S" in source
+    assert '--sleep-after "\\$SLEEP_AFTER"' in source
     assert "rpicam-hello --list-cameras" in source
     assert "libcamera-hello --list-cameras" in source
     assert "vcgencmd display_power" in source
