@@ -75,6 +75,7 @@ def test_pi_installer_dry_run_models_intercom_install() -> None:
     assert "+ systemctl daemon-reload" in result.stdout
     assert "+ systemctl enable --now jarvis-intercom.service" in result.stdout
     assert "+ systemctl enable --now jarvis-panel-preview.service" in result.stdout
+    assert "+ systemctl restart jarvis-panel-preview.service" in result.stdout
     assert "Check panel with: systemctl status jarvis-panel-preview.service" in result.stdout
     assert "Check hardware with: jarvis-pi doctor" in result.stdout
     assert "Update later with: sudo jarvis-pi update" in result.stdout

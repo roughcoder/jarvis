@@ -516,6 +516,7 @@ run jarvis service install intercom \
 run systemctl daemon-reload
 run systemctl enable --now jarvis-intercom.service
 run systemctl enable --now jarvis-panel-preview.service
+run systemctl restart jarvis-panel-preview.service
 
 echo "Jarvis Pi intercom installed as $DEVICE_ID."
 echo "Check status with: systemctl status jarvis-intercom.service"
