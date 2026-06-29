@@ -187,7 +187,7 @@ body {{
     0 0 0 1px rgba(244,239,228,.18),
     0 20px 70px rgba(0,0,0,.38),
     0 0 var(--glow, 32px) color-mix(in srgb, var(--accent), transparent 26%);
-  overflow: hidden;
+  overflow: visible;
   transform:
     translate(var(--eye-x, 0px), var(--eye-y, 0px))
     scaleX(var(--eye-width, 1))
@@ -208,12 +208,52 @@ body {{
   filter: blur(10px);
 }}
 
+.brow {{
+  position: absolute;
+  left: 50%;
+  top: var(--brow-y, -20%);
+  z-index: 3;
+  width: var(--brow-width, 62%);
+  height: var(--brow-height, min(2.7vw, 16px));
+  border-radius: 999px;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,.28), rgba(255,255,255,0) 44%),
+    color-mix(in srgb, var(--accent), #050806 28%);
+  box-shadow:
+    0 0 0 1px rgba(244,239,228,.14),
+    0 10px 28px rgba(0,0,0,.26),
+    0 0 18px color-mix(in srgb, var(--accent), transparent 58%);
+  transform:
+    translate(calc(-50% + var(--brow-x, 0px)), var(--brow-lift, 0px))
+    rotate(var(--brow-rot, 0deg))
+    scaleX(var(--brow-scale-x, 1))
+    scaleY(var(--brow-scale-y, 1));
+  transform-origin: center;
+  transition:
+    transform 520ms cubic-bezier(.16, 1, .3, 1),
+    top 360ms cubic-bezier(.16, 1, .3, 1),
+    width 260ms ease,
+    height 260ms ease,
+    background 240ms ease,
+    box-shadow 240ms ease,
+    opacity 240ms ease;
+}}
+
+.eye:first-child .brow {{
+  --brow-rot: var(--brow-left-rot, -4deg);
+}}
+
+.eye:last-child .brow {{
+  --brow-rot: var(--brow-right-rot, 4deg);
+}}
+
 .pupil {{
   position: absolute;
   left: 50%;
   top: 50%;
-  width: var(--pupil, min(8vw, 54px));
-  height: var(--pupil, min(8vw, 54px));
+  z-index: 2;
+  width: var(--pupil, min(9vw, 64px));
+  height: var(--pupil, min(9vw, 64px));
   border-radius: 999px;
   background: #080d0a;
   transform:
@@ -393,6 +433,12 @@ button[aria-pressed="true"] {{
   --accent-soft: #3b4b40;
   --eye-height: min(5vw, 28px);
   --pupil: 0px;
+  --brow-y: -32%;
+  --brow-height: min(2vw, 12px);
+  --brow-width: 70%;
+  --brow-left-rot: -2deg;
+  --brow-right-rot: 2deg;
+  --brow-lift: min(1vw, 6px);
   --glow: 16px;
 }}
 
@@ -402,10 +448,17 @@ button[aria-pressed="true"] {{
   transform: translateY(min(-1.2vw, -6px)) scaleX(.98) scaleY(.72);
 }}
 
+.peek-left[data-state="sleep"] .eye:first-child .brow,
+.peek-right[data-state="sleep"] .eye:last-child .brow {{
+  --brow-y: -24%;
+  --brow-lift: min(-.8vw, -5px);
+  --brow-scale-y: .86;
+}}
+
 .peek-left[data-state="sleep"] .eye:first-child .pupil,
 .peek-right[data-state="sleep"] .eye:last-child .pupil {{
-  width: min(4.4vw, 26px);
-  height: min(4.4vw, 26px);
+  width: min(5.4vw, 34px);
+  height: min(5.4vw, 34px);
   opacity: .82;
   animation: sleepPeekPupil 2.45s cubic-bezier(.16, 1, .3, 1) both;
 }}
@@ -413,7 +466,10 @@ button[aria-pressed="true"] {{
 [data-state="idle"] {{
   --accent: #dce9d3;
   --eye-height: min(22vw, 138px);
-  --pupil: min(7vw, 46px);
+  --pupil: min(8.6vw, 58px);
+  --brow-y: -18%;
+  --brow-left-rot: -3deg;
+  --brow-right-rot: 3deg;
   --glow: 28px;
 }}
 
@@ -464,7 +520,13 @@ button[aria-pressed="true"] {{
   --accent: #ff4b42;
   --eye-height: min(11vw, 68px);
   --eye-width: .96;
-  --pupil: min(5.4vw, 36px);
+  --pupil: min(6.4vw, 44px);
+  --brow-y: -30%;
+  --brow-height: min(3vw, 18px);
+  --brow-width: 76%;
+  --brow-left-rot: 18deg;
+  --brow-right-rot: -18deg;
+  --brow-lift: min(1vw, 6px);
   --glow: 30px;
 }}
 
@@ -504,22 +566,34 @@ button[aria-pressed="true"] {{
 [data-state="awake"] {{
   --accent: var(--ok);
   --eye-height: min(27vw, 164px);
-  --pupil: min(7vw, 48px);
+  --pupil: min(8.8vw, 62px);
+  --brow-y: -24%;
+  --brow-left-rot: -7deg;
+  --brow-right-rot: 7deg;
+  --brow-lift: min(-.5vw, -4px);
   --glow: 42px;
 }}
 
 [data-state="listening"] {{
   --accent: #8ddcff;
   --eye-height: min(25vw, 154px);
-  --pupil: min(6vw, 42px);
+  --pupil: min(7.6vw, 54px);
   --look-y: -10px;
+  --brow-y: -27%;
+  --brow-left-rot: -9deg;
+  --brow-right-rot: 9deg;
+  --brow-lift: min(-.8vw, -6px);
   --glow: 48px;
 }}
 
 [data-state="thinking"] {{
   --accent: #8ddcff;
   --eye-height: min(18vw, 114px);
-  --pupil: min(5vw, 32px);
+  --pupil: min(6.2vw, 42px);
+  --brow-y: -25%;
+  --brow-left-rot: 13deg;
+  --brow-right-rot: -13deg;
+  --brow-width: 68%;
   --glow: 36px;
 }}
 
@@ -545,7 +619,11 @@ button[aria-pressed="true"] {{
 [data-state="speaking"] {{
   --accent: #ff7abb;
   --eye-height: min(22vw, 136px);
-  --pupil: min(6.5vw, 44px);
+  --pupil: min(8.2vw, 58px);
+  --brow-y: -22%;
+  --brow-left-rot: var(--speak-brow-left, -6deg);
+  --brow-right-rot: var(--speak-brow-right, 6deg);
+  --brow-lift: var(--speak-brow-lift, 0px);
   --glow: 52px;
 }}
 
@@ -628,8 +706,8 @@ button[aria-pressed="true"] {{
   </section>
   <section class="stage" aria-label="eyes">
     <div class="eyes">
-      <div class="eye"><span class="pupil"></span></div>
-      <div class="eye"><span class="pupil"></span></div>
+      <div class="eye"><span class="brow"></span><span class="pupil"></span></div>
+      <div class="eye"><span class="brow"></span><span class="pupil"></span></div>
     </div>
     <div class="sleep-zz" aria-hidden="true"><span>z</span><span>z</span><span>z</span></div>
   </section>
@@ -763,6 +841,9 @@ function randomBetween(min, max) {{
 
 function clearSpeakingMotion() {{
   clearTimeout(speakingTimer);
+  screen.style.removeProperty("--speak-brow-left");
+  screen.style.removeProperty("--speak-brow-right");
+  screen.style.removeProperty("--speak-brow-lift");
   for (const eye of eyes) {{
     eye.style.removeProperty("--eye-x");
     eye.style.removeProperty("--eye-y");
@@ -809,17 +890,21 @@ function seedSleepZs() {{
 }}
 
 function applySpeakingPose() {{
+  const browLift = randomBetween(-5, 3).toFixed(1);
+  screen.style.setProperty("--speak-brow-left", `${{randomBetween(-10, -3).toFixed(1)}}deg`);
+  screen.style.setProperty("--speak-brow-right", `${{randomBetween(3, 10).toFixed(1)}}deg`);
+  screen.style.setProperty("--speak-brow-lift", `${{browLift}}px`);
   for (const [index, eye] of eyes.entries()) {{
     const side = index === 0 ? -1 : 1;
-    eye.style.setProperty("--eye-x", `${{randomBetween(-3, 3) + side * randomBetween(0, 1.5)}}px`);
-    eye.style.setProperty("--eye-y", `${{randomBetween(-2, 2)}}px`);
-    eye.style.setProperty("--eye-scale-y", randomBetween(.96, 1.04).toFixed(2));
+    eye.style.setProperty("--eye-x", `${{randomBetween(-2, 2) + side * randomBetween(0, 1)}}px`);
+    eye.style.setProperty("--eye-y", `${{randomBetween(-1.3, 1.3)}}px`);
+    eye.style.setProperty("--eye-scale-y", randomBetween(.98, 1.03).toFixed(2));
   }}
   for (const [index, pupil] of pupils.entries()) {{
     const side = index === 0 ? -1 : 1;
-    pupil.style.setProperty("--look-x", `${{randomBetween(-4, 4) + side * randomBetween(0, 1.5)}}px`);
-    pupil.style.setProperty("--look-y", `${{randomBetween(-2, 2)}}px`);
-    pupil.style.setProperty("--pupil-scale", randomBetween(.96, 1.04).toFixed(2));
+    pupil.style.setProperty("--look-x", `${{randomBetween(-1.8, 1.8) + side * randomBetween(0, .8)}}px`);
+    pupil.style.setProperty("--look-y", `${{randomBetween(-1.2, 1.2)}}px`);
+    pupil.style.setProperty("--pupil-scale", randomBetween(.98, 1.03).toFixed(2));
   }}
 }}
 
