@@ -700,6 +700,14 @@ class OrchestrationConfig(_Base):
     landing_mode: str = "draft_pr"
 
 
+class LinearConfig(_Base):
+    """Linear work-source credentials."""
+
+    model_config = SettingsConfigDict(env_prefix="LINEAR_", env_file=".env", extra="ignore")
+
+    api_key: SecretStr = SecretStr("")
+
+
 class Config:
     """Aggregate config. Construct once and pass modules their slice."""
 
@@ -734,6 +742,7 @@ class Config:
         self.whatsapp = WhatsAppConfig(**source)
         self.google = GoogleConfig(**source)
         self.orchestration = OrchestrationConfig(**source)
+        self.linear = LinearConfig(**source)
 
     def resolved(self) -> dict:
         """Flat, secret-masked view for the dry-run printout (Step 0 gate)."""
@@ -855,6 +864,7 @@ class Config:
             "orchestration.schedules_path": self.orchestration.schedules_path,
             "orchestration.default_repo": self.orchestration.default_repo or "<unset>",
             "orchestration.landing_mode": self.orchestration.landing_mode,
+            "linear.api_key": mask(self.linear.api_key),
         }
 
 

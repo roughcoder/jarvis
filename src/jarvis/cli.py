@@ -617,10 +617,13 @@ def _cmd_workers(args: argparse.Namespace) -> int:
     return 0
 
 
-def _work_source(name: str):  # noqa: ANN202
+def _work_source(name: str, cfg=None):  # noqa: ANN001, ANN202
     from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource
 
-    return LinearWorkSource() if name == "linear" else GitHubWorkSource()
+    if name == "linear":
+        api_key = cfg.linear.api_key.get_secret_value() if cfg is not None else None
+        return LinearWorkSource(api_key)
+    return GitHubWorkSource()
 
 
 def _cmd_work(args: argparse.Namespace) -> int:
@@ -654,7 +657,7 @@ def _cmd_work(args: argparse.Namespace) -> int:
         command.target_worker_id = args.worker
     if getattr(args, "repo", ""):
         command.filters["repo"] = args.repo
-    source = _work_source(command.source)
+    source = _work_source(command.source, cfg)
     capabilities = resolve_capabilities(cfg.capabilities)
     public_write_mode = cfg.orchestration.landing_mode
 
@@ -727,7 +730,12 @@ def _cmd_work(args: argparse.Namespace) -> int:
         except ActiveWorkItemError as exc:
             print(f"{item.source}:{item.id} is already owned by {exc.owner.run_id} ({exc.owner.phase}).")
             return 0
-        job = start_worker_job(envelope, worker_cfg=cfg.worker, worker=worker, store=store)
+        try:
+            job = start_worker_job(envelope, worker_cfg=cfg.worker, worker=worker, store=store)
+        except Exception as exc:  # noqa: BLE001 - dispatch failure must release the local claim
+            store.set_phase(envelope.run_id, "failed", f"Worker dispatch failed: {exc}")
+            print(f"Worker dispatch failed for {envelope.run_id}: {exc}")
+            return 1
         print(f"Started {envelope.run_id} on {worker.worker_id}: worker job {job.job_id}")
         if job.branch:
             print(f"Branch: {job.branch}")

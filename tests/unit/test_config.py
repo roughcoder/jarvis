@@ -13,6 +13,7 @@ from jarvis.config import (
     GatewayConfig,
     IntercomConfig,
     IntercomDeviceConfig,
+    LinearConfig,
     MemoryConfig,
 )
 
@@ -114,6 +115,18 @@ def test_config_uses_jarvis_env_file(monkeypatch, tmp_path) -> None:
     assert c.capabilities.device_id == "laptop-worker"
     assert c.intercom.brain_host == "imac.private"
     assert c.intercom.token.get_secret_value() == "paired-token"
+
+
+def test_linear_config_uses_jarvis_env_file(monkeypatch, tmp_path) -> None:
+    env_file = tmp_path / "service.env"
+    env_file.write_text("LINEAR_API_KEY=lin-secret\n", encoding="utf-8")
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    _clean(monkeypatch, "LINEAR_API_KEY")
+
+    c = Config()
+
+    assert c.linear.api_key.get_secret_value() == "lin-secret"
+    assert LinearConfig(_env_file=str(env_file)).api_key.get_secret_value() == "lin-secret"
 
 
 def test_database_url_masks_password(monkeypatch) -> None:
