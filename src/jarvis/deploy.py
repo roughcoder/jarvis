@@ -86,6 +86,34 @@ def _find_uv() -> str:
     raise FileNotFoundError("uv not found; install Homebrew uv or set UV_BIN")
 
 
+def _usable_homebrew_python() -> str | None:
+    for candidate in (
+        "/opt/homebrew/opt/python@3.12/bin/python3.12",
+        "/usr/local/opt/python@3.12/bin/python3.12",
+    ):
+        path = Path(candidate)
+        if not path.is_file():
+            continue
+        try:
+            probe = subprocess.run(
+                [
+                    candidate,
+                    "-c",
+                    "import platform; raise SystemExit(0 if platform.mac_ver()[0] else 1)",
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0:
+            return candidate
+    return None
+
+
 def sync_role_dependencies(
     roles: list[str] | tuple[str, ...] | set[str],
     *,
@@ -94,14 +122,8 @@ def sync_role_dependencies(
     """Sync optional runtime dependencies needed by the selected roles."""
     args = uv_sync_args_for_roles(roles)
     env = os.environ.copy()
-    if "UV_PYTHON" not in env:
-        for candidate in (
-            "/opt/homebrew/opt/python@3.12/bin/python3.12",
-            "/usr/local/opt/python@3.12/bin/python3.12",
-        ):
-            if Path(candidate).is_file():
-                env["UV_PYTHON"] = candidate
-                break
+    if "UV_PYTHON" not in env and (python_bin := _usable_homebrew_python()):
+        env["UV_PYTHON"] = python_bin
     return subprocess.run(
         [_find_uv(), *args],
         cwd=cwd,
