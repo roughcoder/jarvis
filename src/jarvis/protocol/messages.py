@@ -1,9 +1,9 @@
 """Brain <-> intercom WebSocket protocol (Phase 3 W4).
 
 Language-neutral message schemas so a Python intercom (now) and a native client
-(later) are interchangeable on the brain side. All messages are JSON text frames
-with a `type` discriminator; audio PCM travels base64-encoded inside them (simple
-and uniform for 3a — a binary-frame fast path is a later optimisation).
+(later) are interchangeable on the brain side. Control messages are JSON text
+frames with a `type` discriminator. Audio PCM defaults to base64 in JSON for
+compatibility, with negotiated binary frames for latency-sensitive clients.
 
   up   (intercom -> brain): Hello, Utterance, BargeIn, TextIn, ConversationIdle,
                             DeviceResponse
@@ -14,9 +14,27 @@ and uniform for 3a — a binary-frame fast path is a later optimisation).
 from __future__ import annotations
 
 import base64
+import dataclasses
+import struct
 from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, Field, TypeAdapter
+
+AUDIO_BINARY_V1 = "audio_binary_v1"
+
+_BINARY_MAGIC = b"JARVIS1"
+_BINARY_HEADER = struct.Struct("!7sBBHI")
+_BINARY_TYPE_REPLY_AUDIO = 1
+
+
+@dataclasses.dataclass(frozen=True)
+class BinaryAudio:
+    """Decoded negotiated binary audio frame."""
+
+    kind: Literal["reply_audio"]
+    turn_id: str
+    pcm: bytes
+    sample_rate: int = 0
 
 # --- up: intercom -> brain -------------------------------------------------
 
@@ -36,6 +54,8 @@ class Hello(BaseModel):
     # grant authority by themselves; the brain intersects them with the device
     # profile before exposing tools.
     hardware: list[str] = Field(default_factory=list)
+    # Optional protocol capabilities. Absence means JSON/base64 v1 only.
+    protocols: list[str] = Field(default_factory=list)
 
 
 class Identify(BaseModel):
@@ -108,6 +128,7 @@ class Welcome(BaseModel):
     identity: str
     scope: str
     capabilities: list[str]
+    protocols: list[str] = Field(default_factory=list)
 
 
 class Reject(BaseModel):
@@ -210,3 +231,41 @@ def encode(msg: BaseModel) -> str:
 def decode(data: str | bytes) -> Message:
     """Parse a JSON frame into the matching message type (by `type`)."""
     return _ADAPTER.validate_json(data)
+
+
+def encode_reply_audio_binary(turn_id: str, pcm: bytes) -> bytes:
+    """Serialise reply PCM as a negotiated binary WebSocket frame."""
+    turn = turn_id.encode("utf-8")
+    if len(turn) > 65535:
+        raise ValueError("turn_id is too long for a binary audio frame")
+    return (
+        _BINARY_HEADER.pack(
+            _BINARY_MAGIC,
+            _BINARY_TYPE_REPLY_AUDIO,
+            0,  # flags reserved
+            len(turn),
+            0,  # reply audio sample rate is implicit from config
+        )
+        + turn
+        + pcm
+    )
+
+
+def decode_binary_audio(data: bytes) -> BinaryAudio | None:
+    """Return a binary audio frame, or None when `data` is not this protocol."""
+    if len(data) < _BINARY_HEADER.size:
+        return None
+    magic, frame_type, _flags, turn_len, sample_rate = _BINARY_HEADER.unpack_from(data)
+    if magic != _BINARY_MAGIC:
+        return None
+    start = _BINARY_HEADER.size
+    end = start + turn_len
+    if len(data) < end:
+        raise ValueError("truncated binary audio frame")
+    turn_id = data[start:end].decode("utf-8")
+    pcm = data[end:]
+    if frame_type == _BINARY_TYPE_REPLY_AUDIO:
+        return BinaryAudio(
+            kind="reply_audio", turn_id=turn_id, pcm=pcm, sample_rate=sample_rate
+        )
+    raise ValueError(f"unknown binary audio frame type: {frame_type}")

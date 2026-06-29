@@ -107,6 +107,11 @@ def _summary(d: dict) -> str:
     speaker = d.get("speaker")
     if channel or speaker:
         parts.append(f"{channel or '?'}:{speaker or '?'}")
+    if "uplink" in s:
+        uplink = s["uplink"]
+        parts.append(
+            f"uplink[{uplink.get('protocol', '?')}]={uplink.get('audio_s', 0):.1f}s"
+        )
     if "stt" in s:
         parts.append(f"stt={s['stt']['ms']:.0f}ms")
     if "llm" in s:

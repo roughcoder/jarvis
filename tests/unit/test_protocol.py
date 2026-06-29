@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 from jarvis.protocol.messages import (
+    AUDIO_BINARY_V1,
     BargeIn,
     DeviceRequest,
     DeviceResponse,
@@ -18,7 +19,9 @@ from jarvis.protocol.messages import (
     TextIn,
     Utterance,
     Welcome,
+    decode_binary_audio,
     decode,
+    encode_reply_audio_binary,
     encode,
 )
 
@@ -40,10 +43,25 @@ def test_reply_audio_pcm_round_trip() -> None:
     assert back.pcm() == pcm
 
 
+def test_binary_reply_audio_round_trip() -> None:
+    pcm = b"\x00\x01\x02\x03" * 10
+    frame = encode_reply_audio_binary("t9", pcm)
+    back = decode_binary_audio(frame)
+    assert back is not None
+    assert back.kind == "reply_audio"
+    assert back.turn_id == "t9"
+    assert back.pcm == pcm
+
+
+def test_binary_audio_decoder_ignores_json_bytes() -> None:
+    assert decode_binary_audio(encode(ReplyAudio.of("t1", b"x")).encode("utf-8")) is None
+
+
 @pytest.mark.parametrize(
     "msg",
     [
         Hello(device_id="kitchen-pi", token="x"),
+        Hello(device_id="room-pi", token="x", protocols=[AUDIO_BINARY_V1]),
         BargeIn(turn_id="t2"),
         TextIn(turn_id="t3", text="hello"),
         DeviceRequest(request_id="r1", action="capture_photo", args={"width": 640}),
