@@ -202,6 +202,17 @@ def test_default_mode_does_not_treat_need_answer_as_followup() -> None:
     assert result.close_reason == "task_complete"
 
 
+def test_default_mode_does_not_treat_better_lighting_statement_as_followup() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(raw="Better lighting makes photos clearer.")
+
+    sess.finalize("photo is hard to read", result)
+
+    assert result.ended is True
+    assert result.continue_listening is False
+    assert result.close_reason == "default_complete"
+
+
 def test_default_mode_opens_for_exploratory_turn_without_marker() -> None:
     sess = _session(DEFAULT_MODE)
     result = TurnResult(raw="We should split it into packing, timing, and budget.")
