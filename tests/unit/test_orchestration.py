@@ -728,7 +728,7 @@ def test_cli_work_check_prints_compact_summary(tmp_path, monkeypatch, capsys) ->
     assert "Found 1 github issue for roughcoder/jarvis." in out
     assert "github:#7" in out
     assert "labels=bug,orchestration" in out
-    assert "jarvis work next" in out
+    assert "jarvis work next --source github --repo roughcoder/jarvis" in out
 
 
 def test_cli_pr_comments_prints_compact_summary(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
@@ -739,7 +739,7 @@ def test_cli_pr_comments_prints_compact_summary(tmp_path, monkeypatch, capsys) -
             return [
                 {
                     "author": {"login": "alice"},
-                    "body": "Please expand the default workspace before shell dispatch.",
+                    "body": "\x1b]0;bad\x07Please expand the default workspace before shell dispatch.",
                     "path": "src/jarvis/worker/server.py",
                     "line": 170,
                     "url": "https://example.test/thread",
@@ -761,6 +761,8 @@ def test_cli_pr_comments_prints_compact_summary(tmp_path, monkeypatch, capsys) -
     assert "PR roughcoder/jarvis#26: 2 comment/review object(s)" in out
     assert "inline=1 review=1 top-level=0" in out
     assert "alice at src/jarvis/worker/server.py:170" in out
+    assert "\x1b" not in out
+    assert "\x07" not in out
     assert "Use --json for raw GitHub objects." in out
 
 
