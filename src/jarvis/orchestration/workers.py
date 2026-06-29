@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 from collections.abc import Callable
 from typing import Any
@@ -75,7 +76,10 @@ class WorkerRegistry:
         profiles: list[WorkerProfile] = []
         for item in items:
             try:
-                profiles.append(WorkerProfile.from_dict(item))
+                profile = WorkerProfile.from_dict(item)
+                if profile.token_env and os.environ.get(profile.token_env):
+                    profile.token_set = True
+                profiles.append(profile)
             except (TypeError, KeyError):
                 continue
         return profiles
@@ -85,7 +89,10 @@ class WorkerRegistry:
             profile.status = "unknown"
             return profile
         headers = {}
-        token = self.worker_cfg.token.get_secret_value() if profile.worker_id == "local-worker" else ""
+        token = os.environ.get(profile.token_env, "") if profile.token_env else ""
+        if not token and profile.worker_id == "local-worker":
+            token = self.worker_cfg.token.get_secret_value()
+        profile.token_set = bool(token)
         if token:
             headers["Authorization"] = f"Bearer {token}"
         try:

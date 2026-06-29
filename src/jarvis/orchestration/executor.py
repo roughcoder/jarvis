@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -16,12 +17,16 @@ def start_worker_job(
     envelope: ExecutionEnvelope,
     *,
     worker_cfg: WorkerConfig,
+    worker: WorkerProfile | None = None,
     store: OrchestrationStore | None = None,
     post: Callable[..., Any] | None = None,
 ) -> WorkerJobLink:
     post = post or httpx.post
+    base_url = worker.base_url if worker and worker.base_url else worker_cfg.base_url
     headers = {}
-    token = worker_cfg.token.get_secret_value()
+    token = os.environ.get(worker.token_env, "") if worker and worker.token_env else ""
+    if not token and (worker is None or worker.worker_id == "local-worker"):
+        token = worker_cfg.token.get_secret_value()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     args = {
@@ -32,7 +37,7 @@ def start_worker_job(
     if envelope.repo:
         args["repo"] = envelope.repo
     response = post(
-        f"{worker_cfg.base_url}/run",
+        f"{base_url}/run",
         json={"action": "code", "args": args},
         headers=headers,
         timeout=worker_cfg.request_timeout_s,

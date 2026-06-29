@@ -687,7 +687,7 @@ def _cmd_work(args: argparse.Namespace) -> int:
             worker=worker,
             landing_mode=cfg.orchestration.landing_mode,
         )
-        job = start_worker_job(envelope, worker_cfg=cfg.worker, store=store)
+        job = start_worker_job(envelope, worker_cfg=cfg.worker, worker=worker, store=store)
         print(f"Started {envelope.run_id} on {worker.worker_id}: worker job {job.job_id}")
         if job.branch:
             print(f"Branch: {job.branch}")

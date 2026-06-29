@@ -271,6 +271,7 @@ class WorkerProfile:
     display_name: str
     capabilities: list[str] = field(default_factory=list)
     base_url: str = ""
+    token_env: str = ""
     token_set: bool = False
     max_concurrent_jobs: int = 1
     current_jobs: int = 0

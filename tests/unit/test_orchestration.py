@@ -15,7 +15,7 @@ from jarvis.orchestration.models import WorkCommand, WorkItem
 from jarvis.orchestration.schedules import ScheduleStore
 from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource
 from jarvis.orchestration.store import OrchestrationStore
-from jarvis.orchestration.workers import WorkerRegistry
+from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry
 
 
 def _item(**kw) -> WorkItem:  # noqa: ANN003
@@ -51,6 +51,14 @@ def test_active_primary_owner_prevents_duplicate_work(tmp_path) -> None:
     assert store.active_primary_owner(item) is None
 
 
+def test_active_primary_owner_scopes_github_numbers_by_repo(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("first", work_items=[_item(id="#1", repo="owner/a")])
+
+    assert store.active_primary_owner(_item(id="#1", repo="owner/a")).run_id == run.run_id
+    assert store.active_primary_owner(_item(id="#1", repo="owner/b")) is None
+
+
 def test_worker_registry_redacts_private_connection_details(monkeypatch) -> None:  # noqa: ANN001
     class Response:
         def __init__(self, data):
@@ -80,10 +88,11 @@ def test_worker_registry_redacts_private_connection_details(monkeypatch) -> None
 
 def test_worker_registry_accepts_list_profile_file(tmp_path) -> None:
     path = tmp_path / "workers.json"
-    path.write_text(json.dumps([{"worker_id": "hive-worker", "display_name": "Hive"}]))
+    path.write_text(json.dumps([{"worker_id": "hive-worker", "display_name": "Hive", "token_env": "HIVE_TOKEN"}]))
     reg = WorkerRegistry(WorkerConfig(_env_file=None), profiles_path=str(path))
 
     assert reg.profiles()[0].worker_id == "hive-worker"
+    assert "token_env" not in reg.profiles()[0].public()
 
 
 @pytest.mark.parametrize(
@@ -133,6 +142,30 @@ def test_github_source_normalizes_issues() -> None:
     assert items[0].labels == ["bug"]
     assert "--repo" in seen and "roughcoder/jarvis" in seen
     assert "--assignee" in seen and "@me" in seen
+
+
+def test_github_source_fetches_inline_pr_review_comments() -> None:
+    class Result:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+
+    seen = []
+
+    def runner(args):
+        seen.append(args)
+        if args[:3] == ["gh", "pr", "view"]:
+            return Result(json.dumps({"comments": [{"body": "top-level"}], "reviews": [{"body": "review"}]}))
+        if args[:2] == ["gh", "api"]:
+            return Result(json.dumps([[{"body": "inline"}]]))
+        raise AssertionError(args)
+
+    comments = GitHubWorkSource(runner).pr_comments("roughcoder/jarvis", 14)
+
+    assert [x["body"] for x in comments] == ["top-level", "review", "inline"]
+    assert ["gh", "api", "repos/roughcoder/jarvis/pulls/14/comments", "--paginate", "--slurp"] in seen
 
 
 def test_linear_source_normalizes_items() -> None:
@@ -209,6 +242,46 @@ def test_start_worker_job_links_run_graph(tmp_path) -> None:
 
     assert job.job_id == "job123"
     assert store.get(run.run_id).jobs[0].job_id == "job123"  # type: ignore[union-attr]
+
+
+def test_start_worker_job_uses_selected_worker_endpoint_and_token_env(monkeypatch) -> None:  # noqa: ANN001
+    envelope = build_execution_envelope(
+        run_id="run_1",
+        command=WorkCommand("start_next_work", source="github", start=True),
+        items=[_item()],
+        worker_id="hive-worker",
+    )
+    profile = WorkerProfile(
+        worker_id="hive-worker",
+        display_name="Hive",
+        base_url="http://hive-worker:8780",
+        token_env="HIVE_WORKER_TOKEN",
+    )
+    monkeypatch.setenv("HIVE_WORKER_TOKEN", "hive-token")
+    seen = {}
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {"ok": True, "job_id": "job456", "status": "running"}
+
+    def fake_post(url, **kwargs):  # noqa: ANN001
+        seen["url"] = url
+        seen["headers"] = kwargs["headers"]
+        return Response()
+
+    job = start_worker_job(
+        envelope,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1, token="local-token"),
+        worker=profile,
+        post=fake_post,
+    )
+
+    assert job.worker_id == "hive-worker"
+    assert seen["url"] == "http://hive-worker:8780/run"
+    assert seen["headers"] == {"Authorization": "Bearer hive-token"}
 
 
 def test_schedules_fire_once_per_local_day(tmp_path) -> None:

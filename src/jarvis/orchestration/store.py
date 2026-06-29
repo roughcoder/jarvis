@@ -160,10 +160,16 @@ class OrchestrationStore:
             if run.status == "terminal":
                 continue
             for link in run.work_items:
-                if (
-                    link.role == "primary"
-                    and link.item.source == item.source
-                    and link.item.id == item.id
-                ):
+                if link.role == "primary" and _same_work_item(link.item, item):
                     return run
         return None
+
+
+def _same_work_item(left: WorkItem, right: WorkItem) -> bool:
+    if left.source != right.source:
+        return False
+    if left.repo and right.repo and left.repo != right.repo:
+        return False
+    left_id = left.source_internal_id or left.id
+    right_id = right.source_internal_id or right.id
+    return left_id == right_id
