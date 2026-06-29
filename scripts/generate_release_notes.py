@@ -323,6 +323,11 @@ def deterministic_notes(payload: dict[str, object]) -> str:
 def validate_release_trailers(commits: list[CommitInfo]) -> list[str]:
     errors: list[str] = []
     for commit in commits:
+        if commit.breaking and not (commit.release_notes or commit.breaking_notes):
+            errors.append(
+                f"{commit.sha[:12]} {commit.subject!r} is breaking and needs "
+                "Release-note: <text> or Breaking Change: <migration impact>"
+            )
         if commit.type not in STRICT_TRAILER_TYPES:
             continue
         if commit.has_release_note_decision:
