@@ -25,7 +25,7 @@ import websockets
 from jarvis.config import Config
 from jarvis.intercom.audio import AudioIO, MicStream
 from jarvis.intercom.hardware import IntercomHardware
-from jarvis.intercom.pi_panel import PiPanel
+from jarvis.intercom.pi_panel import CompositePanel, PiPanel, WebPiPanel
 from jarvis.intercom.vad import Endpointer, SileroVAD
 from jarvis.intercom.wake import WakeWord
 from jarvis.protocol.messages import (
@@ -76,7 +76,10 @@ class IntercomClient:
         self._vad = vad
         self._wake = wake
         self._hardware = hardware or IntercomHardware(cfg.intercom_device)
-        self._panel = panel or PiPanel(cfg.intercom_device, hardware=self._hardware)
+        self._panel = panel or CompositePanel(
+            PiPanel(cfg.intercom_device, hardware=self._hardware),
+            WebPiPanel(cfg.intercom_device),
+        )
         self._sr = cfg.audio.sample_rate
         self._device_id = cfg.capabilities.device_id
 

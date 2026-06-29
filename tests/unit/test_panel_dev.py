@@ -2,8 +2,17 @@ import functools
 import http.client
 import http.server
 import threading
+import time
 
-from jarvis.intercom.panel_dev import PANEL_STATES, PreviewConfig, _PreviewHandler, render_panel_preview_html
+from jarvis.config import IntercomDeviceConfig
+from jarvis.intercom.panel_dev import (
+    PANEL_STATES,
+    PanelStateStore,
+    PreviewConfig,
+    _PreviewHandler,
+    render_panel_preview_html,
+)
+from jarvis.intercom.pi_panel import WebPiPanel
 
 
 def test_panel_preview_renders_every_voice_state() -> None:
@@ -50,6 +59,85 @@ def test_panel_preview_head_does_not_expose_host_filesystem() -> None:
     assert host_file.status == 404
 
 
+def test_panel_state_endpoint_accepts_valid_states() -> None:
+    html = render_panel_preview_html()
+    store = PanelStateStore("idle")
+    handler = functools.partial(_PreviewHandler, html=html, state_store=store)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        conn.request("POST", "/state", '{"state":"listening"}', {"Content-Type": "application/json"})
+        posted = conn.getresponse()
+        posted_body = posted.read().decode()
+        conn.close()
+
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        conn.request("GET", "/state")
+        fetched = conn.getresponse()
+        fetched_body = fetched.read().decode()
+        conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert posted.status == 200
+    assert posted_body == '{"state": "listening"}'
+    assert fetched.status == 200
+    assert fetched.getheader("Content-Type") == "application/json"
+    assert fetched_body == '{"state": "listening"}'
+
+
+def test_panel_state_endpoint_rejects_invalid_states() -> None:
+    html = render_panel_preview_html()
+    handler = functools.partial(_PreviewHandler, html=html, state_store=PanelStateStore("idle"))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        conn.request("POST", "/state", '{"state":"unknown"}', {"Content-Type": "application/json"})
+        response = conn.getresponse()
+        response.read()
+        conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert response.status == 400
+
+
+def test_web_pi_panel_publishes_state_to_local_panel_endpoint() -> None:
+    html = render_panel_preview_html()
+    store = PanelStateStore("idle")
+    handler = functools.partial(_PreviewHandler, html=html, state_store=store)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    panel = WebPiPanel(
+        IntercomDeviceConfig(
+            pi_panel_url=f"http://127.0.0.1:{server.server_port}",
+            _env_file=None,
+        )
+    )
+    try:
+        panel.start()
+        panel.set("speaking")
+        deadline = time.monotonic() + 2
+        while store.get() != "speaking" and time.monotonic() < deadline:
+            time.sleep(0.02)
+    finally:
+        panel.stop()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert store.get() == "speaking"
+
+
 def test_panel_preview_uses_spinner_pupils_for_thinking_state() -> None:
     html = render_panel_preview_html(PreviewConfig(initial_state="thinking"))
 
@@ -76,6 +164,7 @@ def test_panel_preview_connecting_is_spinner_only() -> None:
     assert '[data-state="connecting"] .eyes' in html
     assert "@keyframes connectSpin" in html
     assert 'screen.classList.toggle("info", next === "disconnected")' in html
+    assert 'fetch("/state"' in html
 
 
 def test_panel_preview_disconnected_looks_angry_and_offline() -> None:

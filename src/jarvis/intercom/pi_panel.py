@@ -15,6 +15,8 @@ import re
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
@@ -433,3 +435,81 @@ def _draw_text_view(canvas, width: int, height: int, *, title: str, rows: tuple[
             font=("TkDefaultFont", max(14, int(height * 0.042))),
         )
         y += max(34, int(height * 0.105))
+
+
+class WebPiPanel:
+    """Publish intercom state to the local web panel service without blocking turns."""
+
+    def __init__(self, cfg: IntercomDeviceConfig) -> None:
+        self._url = cfg.pi_panel_url.rstrip("/")
+        self._events: queue.Queue[str | None] = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._warned = False
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._url)
+
+    def start(self) -> None:
+        if self._thread is not None or not self.enabled:
+            return
+        self._thread = threading.Thread(target=self._run, name="jarvis-web-pi-panel", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread is not None:
+            self._events.put(None)
+
+    def set(self, state: str) -> None:
+        if self._thread is not None and state in _STATES:
+            self._events.put(state)
+
+    def _run(self) -> None:
+        last_state = ""
+        while True:
+            state = self._events.get()
+            while state is not None:
+                with suppress(queue.Empty):
+                    state = self._events.get_nowait()
+                    continue
+                break
+            if state is None:
+                return
+            if state == last_state:
+                continue
+            if self._post_state(state):
+                last_state = state
+
+    def _post_state(self, state: str) -> bool:
+        data = f'{{"state":"{state}"}}'.encode("utf-8")
+        req = urllib.request.Request(
+            f"{self._url}/state",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=0.25) as resp:  # noqa: S310 - local operator URL
+                return 200 <= resp.status < 300
+        except (OSError, urllib.error.URLError) as exc:
+            if not self._warned:
+                print(f"  [web-pi-panel] couldn't publish state: {exc}")
+                self._warned = True
+            return False
+
+
+class CompositePanel:
+    def __init__(self, *panels) -> None:  # noqa: ANN002
+        self._panels = panels
+
+    def start(self) -> None:
+        for panel in self._panels:
+            panel.start()
+
+    def stop(self) -> None:
+        for panel in self._panels:
+            panel.stop()
+
+    def set(self, state: str) -> None:
+        for panel in self._panels:
+            panel.set(state)

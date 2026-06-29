@@ -57,6 +57,7 @@ def test_pi_installer_dry_run_models_intercom_install() -> None:
     assert "+ write /opt/jarvis-test/.env" in result.stdout
     assert "+ set VAD_ENGINE=webrtc" in result.stdout
     assert "+ set INTERCOM_DEVICE_PI_PANEL=false" in result.stdout
+    assert "+ set INTERCOM_DEVICE_PI_PANEL_URL=http://127.0.0.1:8787" in result.stdout
     assert "+ chmod 0600 /opt/jarvis-test/.env" in result.stdout
     assert "+ write /usr/local/bin/jarvis" in result.stdout
     assert "+ chmod 0755 /usr/local/bin/jarvis" in result.stdout

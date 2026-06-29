@@ -11,12 +11,14 @@ import argparse
 import contextlib
 import functools
 import http.server
+import json
 import shutil
 import subprocess
 import sys
 import threading
 import webbrowser
 from dataclasses import dataclass
+from urllib.parse import parse_qs, urlparse
 
 
 PANEL_STATES = (
@@ -677,7 +679,7 @@ for (const state of states) {{
   button.type = "button";
   button.textContent = labels[state];
   button.dataset.state = state;
-  button.addEventListener("click", () => setState(state));
+  button.addEventListener("click", () => setState(state, {{ publish: true }}));
   controls.append(button);
 }}
 
@@ -687,7 +689,20 @@ for (let i = 0; i < 24; i += 1) {{
   meter.append(bar);
 }}
 
-function setState(next) {{
+async function publishState(next) {{
+  try {{
+    await fetch("/state", {{
+      method: "POST",
+      headers: {{ "Content-Type": "application/json" }},
+      body: JSON.stringify({{ state: next }}),
+      cache: "no-store"
+    }});
+  }} catch (_error) {{
+    // Local preview still works if the state endpoint is unavailable.
+  }}
+}}
+
+function setState(next, options = {{}}) {{
   if (!states.includes(next)) return;
   stateIndex = states.indexOf(next);
   screen.dataset.state = next;
@@ -702,7 +717,8 @@ function setState(next) {{
   }}
   const params = new URLSearchParams(location.search);
   params.set("state", next);
-  history.replaceState(null, "", `${{location.pathname}}?${{params}}`);
+  if (!options.remote) history.replaceState(null, "", `${{location.pathname}}?${{params}}`);
+  if (options.publish) publishState(next);
   if (next === "speaking") scheduleSpeakingMotion();
   if (next === "sleep") {{
     seedSleepZs();
@@ -717,7 +733,7 @@ function showControls() {{
 }}
 
 function cycle(delta) {{
-  setState(states[(stateIndex + delta + states.length) % states.length]);
+  setState(states[(stateIndex + delta + states.length) % states.length], {{ publish: true }});
   showControls();
 }}
 
@@ -736,7 +752,7 @@ function startDemo() {{
   const demo = ["idle", "awake", "listening", "thinking", "speaking", "idle", "sleep"];
   let i = 0;
   demoTimer = setInterval(() => {{
-    setState(demo[i % demo.length]);
+    setState(demo[i % demo.length], {{ publish: true }});
     i += 1;
   }}, 1800);
 }}
@@ -850,6 +866,22 @@ for (const z of sleepZs) {{
 }}
 
 setState(new URLSearchParams(location.search).get("state") || screen.dataset.state);
+async function pollState() {{
+  try {{
+    const response = await fetch("/state", {{ cache: "no-store" }});
+    if (response.ok) {{
+      const payload = await response.json();
+      if (payload.state && payload.state !== screen.dataset.state) {{
+        setState(payload.state, {{ remote: true }});
+      }}
+    }}
+  }} catch (_error) {{
+    // Keep the panel responsive; the service manager will restart hard failures.
+  }} finally {{
+    setTimeout(pollState, 250);
+  }}
+}}
+pollState();
 tickMeter();
 </script>
 </body>
@@ -857,9 +889,27 @@ tickMeter();
 """
 
 
+class PanelStateStore:
+    def __init__(self, initial_state: str = "idle") -> None:
+        self._state = initial_state if initial_state in PANEL_STATES else "idle"
+        self._lock = threading.Lock()
+
+    def get(self) -> str:
+        with self._lock:
+            return self._state
+
+    def set(self, state: str) -> bool:
+        if state not in PANEL_STATES:
+            return False
+        with self._lock:
+            self._state = state
+        return True
+
+
 class _PreviewHandler(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *args, html: str, **kwargs) -> None:  # noqa: ANN002, ANN003
+    def __init__(self, *args, html: str, state_store: PanelStateStore | None = None, **kwargs) -> None:  # noqa: ANN002, ANN003
         self._html = html
+        self._state_store = state_store or PanelStateStore()
         super().__init__(*args, directory="/", **kwargs)
 
     def do_GET(self) -> None:  # noqa: N802
@@ -868,8 +918,31 @@ class _PreviewHandler(http.server.SimpleHTTPRequestHandler):
     def do_HEAD(self) -> None:  # noqa: N802
         self._send_panel_response(include_body=False)
 
+    def do_POST(self) -> None:  # noqa: N802
+        if urlparse(self.path).path != "/state":
+            self.send_error(404)
+            return
+        length = min(int(self.headers.get("Content-Length") or "0"), 4096)
+        raw = self.rfile.read(length).decode("utf-8", errors="replace")
+        state = ""
+        if self.headers.get("Content-Type", "").split(";")[0] == "application/json":
+            with contextlib.suppress(json.JSONDecodeError):
+                payload = json.loads(raw or "{}")
+                if isinstance(payload, dict):
+                    state = str(payload.get("state") or "")
+        else:
+            state = parse_qs(raw).get("state", [""])[0]
+        if not self._state_store.set(state):
+            self.send_error(400, "invalid panel state")
+            return
+        self._send_state_response(include_body=True)
+
     def _send_panel_response(self, *, include_body: bool) -> None:
-        if self.path == "/" or self.path.startswith("/?"):
+        parsed = urlparse(self.path)
+        if parsed.path == "/state":
+            self._send_state_response(include_body=include_body)
+            return
+        if parsed.path == "/":
             data = self._html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -880,6 +953,16 @@ class _PreviewHandler(http.server.SimpleHTTPRequestHandler):
                 self.wfile.write(data)
             return
         self.send_error(404)
+
+    def _send_state_response(self, *, include_body: bool) -> None:
+        data = json.dumps({"state": self._state_store.get()}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if include_body:
+            self.wfile.write(data)
 
     def log_message(self, fmt: str, *args) -> None:  # noqa: ANN002
         print(f"  [panel-preview] {fmt % args}", file=sys.stderr)
@@ -921,7 +1004,8 @@ def serve_preview(
     kiosk: bool = False,
 ) -> None:
     html = render_panel_preview_html(PreviewConfig(initial_state=initial_state))
-    handler = functools.partial(_PreviewHandler, html=html)
+    state_store = PanelStateStore(initial_state)
+    handler = functools.partial(_PreviewHandler, html=html, state_store=state_store)
     server = http.server.ThreadingHTTPServer((host, port), handler)
     url_host = "127.0.0.1" if host in {"", "0.0.0.0"} else host
     url = f"http://{url_host}:{server.server_port}/"
