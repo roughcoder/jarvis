@@ -520,6 +520,257 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _orch_store(cfg=None):  # noqa: ANN001, ANN202
+    from jarvis.orchestration.store import OrchestrationStore
+
+    cfg = cfg or load_config()
+    return OrchestrationStore(cfg.orchestration.workspace)
+
+
+def _cmd_runs(args: argparse.Namespace) -> int:
+    import json
+
+    cfg = load_config()
+    store = _orch_store(cfg)
+    if args.create:
+        run = store.create_run(args.create)
+        print(f"Created {run.run_id}: {run.objective}")
+        return 0
+    if args.events:
+        events = store.events(args.events)
+        if args.json:
+            print(json.dumps([e.to_dict() for e in events], indent=2))
+        else:
+            for e in events:
+                print(f"{e.time} {e.type:<28} {e.message}")
+        return 0
+    if args.run_id:
+        run = store.get(args.run_id)
+        if run is None:
+            print(f"No run found for {args.run_id!r}.")
+            return 1
+        print(json.dumps(run.to_dict(), indent=2) if args.json else _format_run(run))
+        return 0
+    runs = store.list_runs()
+    if args.json:
+        print(json.dumps([r.to_dict() for r in runs], indent=2))
+        return 0
+    if not runs:
+        print("No orchestration runs yet.")
+        return 0
+    for run in runs[-args.n :]:
+        print(f"{run.run_id:<26} {run.phase:<13} {run.objective}")
+    return 0
+
+
+def _format_run(run) -> str:  # noqa: ANN001
+    parts = [
+        f"Run: {run.run_id}",
+        f"Objective: {run.objective}",
+        f"Phase: {run.phase} ({run.status})",
+    ]
+    if run.parent_run_id:
+        parts.append(f"Parent: {run.parent_run_id}")
+    if run.child_run_ids:
+        parts.append(f"Children: {', '.join(run.child_run_ids)}")
+    if run.work_items:
+        parts.append("Work items:")
+        parts.extend(
+            f"  - {x.role}: {x.item.source}:{x.item.id} {x.item.title}" for x in run.work_items
+        )
+    if run.jobs:
+        parts.append("Jobs:")
+        parts.extend(
+            f"  - {x.worker_id}:{x.job_id} {x.status} {x.branch}".rstrip() for x in run.jobs
+        )
+    if run.artifacts:
+        parts.append("Artifacts:")
+        parts.extend(f"  - {x.type}: {x.url or x.name or x.id}" for x in run.artifacts)
+    if run.terminal_reason:
+        parts.append(f"Terminal reason: {run.terminal_reason}")
+    return "\n".join(parts)
+
+
+def _cmd_workers(args: argparse.Namespace) -> int:
+    import json
+
+    from jarvis.orchestration.workers import WorkerRegistry
+
+    cfg = load_config()
+    registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path)
+    profiles = registry.profiles(probe=args.probe)
+    if args.json:
+        print(json.dumps([p.public() for p in profiles], indent=2))
+        return 0
+    if not profiles:
+        print("No workers configured.")
+        return 0
+    for p in profiles:
+        pub = p.public()
+        cap = ", ".join(pub["capabilities"]) or "<none>"
+        capacity = pub["capacity"]
+        print(
+            f"{pub['worker_id']:<20} {pub['status']:<8} "
+            f"{capacity['current_jobs']}/{capacity['max_concurrent_jobs']} jobs  "
+            f"{pub['agent']}  {cap}"
+        )
+    return 0
+
+
+def _work_source(name: str):  # noqa: ANN202
+    from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource
+
+    return LinearWorkSource() if name == "linear" else GitHubWorkSource()
+
+
+def _cmd_work(args: argparse.Namespace) -> int:
+    import json
+
+    from jarvis.orchestration.executor import create_run_and_envelope, start_worker_job
+    from jarvis.orchestration.intent import parse_work_command
+    from jarvis.orchestration.workers import WorkerRegistry
+
+    cfg = load_config()
+    if args.work_action == "intent":
+        command = parse_work_command(" ".join(args.phrase))
+        print(json.dumps(command.to_dict(), indent=2))
+        return 0
+
+    source_name = args.source or "github"
+    command = parse_work_command(" ".join(getattr(args, "phrase", []) or [args.work_action]))
+    if source_name:
+        command.source = source_name
+    if getattr(args, "worker", ""):
+        command.target_worker_id = args.worker
+    if getattr(args, "repo", ""):
+        command.filters["repo"] = args.repo
+    source = _work_source(command.source)
+
+    if args.work_action == "check":
+        items = source.list(repo=args.repo or cfg.orchestration.default_repo, filters=command.filters, limit=args.limit)
+        if args.json:
+            print(json.dumps([x.to_dict() for x in items], indent=2))
+        else:
+            _print_items(items)
+        return 0
+
+    if args.work_action == "pr-comments":
+        if command.source != "github":
+            print("PR comments are currently a GitHub work source operation.")
+            return 1
+        comments = source.pr_comments(args.repo or cfg.orchestration.default_repo, args.number)
+        print(json.dumps(comments, indent=2) if args.json else f"{len(comments)} comment/review object(s)")
+        return 0
+
+    if args.work_action == "next":
+        item = source.next(repo=args.repo or cfg.orchestration.default_repo, filters=command.filters)
+        if item is None:
+            print("No eligible work item found.")
+            return 0
+        store = _orch_store(cfg)
+        existing = store.active_primary_owner(item)
+        if existing:
+            print(f"{item.source}:{item.id} is already owned by {existing.run_id} ({existing.phase}).")
+            return 0
+        if not args.start:
+            print(json.dumps(item.to_dict(), indent=2) if args.json else _format_item(item))
+            return 0
+        registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path)
+        worker = registry.get(command.target_worker_id, probe=True) if command.target_worker_id else registry.choose(item.capability_requirements)
+        if worker is None:
+            print("No eligible worker found.")
+            return 1
+        envelope = create_run_and_envelope(
+            store=store,
+            command=command,
+            items=[item],
+            worker=worker,
+            landing_mode=cfg.orchestration.landing_mode,
+        )
+        job = start_worker_job(envelope, worker_cfg=cfg.worker, store=store)
+        print(f"Started {envelope.run_id} on {worker.worker_id}: worker job {job.job_id}")
+        if job.branch:
+            print(f"Branch: {job.branch}")
+        return 0
+
+    if args.work_action == "resume":
+        store = _orch_store(cfg)
+        run = store.get(args.run_id)
+        if run is None:
+            print(f"No run found for {args.run_id!r}.")
+            return 1
+        print(_format_run(run))
+        return 0
+
+    print(f"Unknown work action {args.work_action!r}.")
+    return 1
+
+
+def _format_item(item) -> str:  # noqa: ANN001
+    return f"{item.source}:{item.id} {item.title}\n  {item.url or '<no url>'}\n  status={item.status or '<unknown>'} repo={item.repo or '<unset>'}"
+
+
+def _print_items(items) -> None:  # noqa: ANN001
+    if not items:
+        print("No work items found.")
+        return
+    for item in items:
+        print(f"{item.source}:{item.id:<8} {item.status or '-':<12} {item.title}")
+        if item.url:
+            print(f"            {item.url}")
+
+
+def _parse_weekdays(text: str) -> list[int]:
+    if not text:
+        return [0, 1, 2, 3, 4, 5, 6]
+    names = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    if text == "weekdays":
+        return [0, 1, 2, 3, 4]
+    if text == "weekends":
+        return [5, 6]
+    return [names[x.strip().lower()[:3]] for x in text.split(",") if x.strip().lower()[:3] in names]
+
+
+def _cmd_schedules(args: argparse.Namespace) -> int:
+    import json
+    from datetime import datetime
+
+    from jarvis.orchestration.intent import parse_work_command
+    from jarvis.orchestration.schedules import ScheduleStore
+
+    cfg = load_config()
+    store = ScheduleStore(cfg.orchestration.schedules_path)
+    if args.schedule_action == "add":
+        hh, mm = [int(x) for x in args.at.split(":", 1)]
+        command = parse_work_command(" ".join(args.phrase))
+        schedule = store.add(
+            args.name or " ".join(args.phrase),
+            command,
+            hour=hh,
+            minute=mm,
+            weekdays=_parse_weekdays(args.weekdays),
+            timezone=args.timezone or cfg.orchestration.default_timezone,
+            mode=args.mode,
+        )
+        print(f"Added {schedule.schedule_id}: {schedule.name}")
+        return 0
+    if args.schedule_action == "tick":
+        now = datetime.fromisoformat(args.now) if args.now else datetime.now().astimezone()
+        due = store.due(now)
+        print(json.dumps([x.to_dict() for x in due], indent=2) if args.json else f"{len(due)} schedule(s) due")
+        return 0
+    schedules = store.list()
+    if args.json:
+        print(json.dumps([x.to_dict() for x in schedules], indent=2))
+    elif not schedules:
+        print("No schedules.")
+    else:
+        for s in schedules:
+            days = ",".join(str(x) for x in s.weekdays)
+            print(f"{s.schedule_id:<26} {s.hour:02d}:{s.minute:02d} {days:<13} {s.name}")
+    return 0
+
+
 def _upsert_env(key: str, value: str, path: str = ".env") -> None:
     """Set key=value in .env, replacing any existing line."""
     import pathlib
@@ -1513,6 +1764,69 @@ def build_parser() -> argparse.ArgumentParser:
         help="Clean up all finished jobs (worktrees + branches)",
     )
     p_jobs.set_defaults(func=_cmd_jobs)
+
+    p_runs = sub.add_parser("runs", help="List/show Jarvis orchestration runs")
+    p_runs.add_argument("run_id", nargs="?", help="Run id or unique prefix to show")
+    p_runs.add_argument("--create", metavar="OBJECTIVE", help="Create a local fake run for inspection")
+    p_runs.add_argument("--events", metavar="RUN_ID", help="Show append-only events for a run")
+    p_runs.add_argument("-n", type=int, default=20, help="How many recent runs to list")
+    p_runs.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    p_runs.set_defaults(func=_cmd_runs)
+
+    p_workers = sub.add_parser("workers", help="List named orchestration workers")
+    p_workers.add_argument("--probe", action="store_true", help="Probe worker health and current job capacity")
+    p_workers.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    p_workers.set_defaults(func=_cmd_workers)
+
+    p_work = sub.add_parser("work", help="Work-source orchestration commands")
+    work_sub = p_work.add_subparsers(dest="work_action", required=True)
+    p_work_intent = work_sub.add_parser("intent", help="Parse text into a structured WorkCommand")
+    p_work_intent.add_argument("phrase", nargs="+")
+    p_work_intent.set_defaults(func=_cmd_work)
+    p_work_check = work_sub.add_parser("check", help="List work items from a source")
+    p_work_check.add_argument("phrase", nargs="*", help="Optional natural-language filter phrase")
+    p_work_check.add_argument("--source", choices=["github", "linear"], default="github")
+    p_work_check.add_argument("--repo", default="", help="Repository, e.g. roughcoder/jarvis")
+    p_work_check.add_argument("--limit", type=int, default=10)
+    p_work_check.add_argument("--json", action="store_true")
+    p_work_check.set_defaults(func=_cmd_work)
+    p_work_next = work_sub.add_parser("next", help="Select the next eligible work item")
+    p_work_next.add_argument("phrase", nargs="*", help="Optional natural-language filter phrase")
+    p_work_next.add_argument("--source", choices=["github", "linear"], default="github")
+    p_work_next.add_argument("--repo", default="", help="Repository, e.g. roughcoder/jarvis")
+    p_work_next.add_argument("--worker", default="", help="Explicit worker_id target")
+    p_work_next.add_argument("--start", action="store_true", help="Start a worker job for the selected item")
+    p_work_next.add_argument("--json", action="store_true")
+    p_work_next.set_defaults(func=_cmd_work)
+    p_pr_comments = work_sub.add_parser("pr-comments", help="Inspect GitHub PR review/comment objects")
+    p_pr_comments.add_argument("number", type=int)
+    p_pr_comments.add_argument("--repo", default="", help="Repository, e.g. roughcoder/jarvis")
+    p_pr_comments.add_argument("--source", choices=["github"], default="github")
+    p_pr_comments.add_argument("--json", action="store_true")
+    p_pr_comments.set_defaults(func=_cmd_work)
+    p_work_resume = work_sub.add_parser("resume", help="Show a run to resume or inspect")
+    p_work_resume.add_argument("run_id")
+    p_work_resume.add_argument("--source", default="jarvis")
+    p_work_resume.set_defaults(func=_cmd_work)
+
+    p_schedules = sub.add_parser("schedules", help="List/add/tick scheduled WorkCommands")
+    sched_sub = p_schedules.add_subparsers(dest="schedule_action", required=False)
+    p_sched_list = sched_sub.add_parser("list", help="List schedules")
+    p_sched_list.add_argument("--json", action="store_true")
+    p_sched_list.set_defaults(func=_cmd_schedules)
+    p_sched_add = sched_sub.add_parser("add", help="Add a daily/weekly scheduled WorkCommand")
+    p_sched_add.add_argument("phrase", nargs="+", help="Natural-language command to store structurally")
+    p_sched_add.add_argument("--at", required=True, help="HH:MM local time")
+    p_sched_add.add_argument("--weekdays", default="", help="weekdays, weekends, or comma list like mon,wed,sat")
+    p_sched_add.add_argument("--timezone", default="")
+    p_sched_add.add_argument("--mode", choices=["one_shot", "campaign"], default="one_shot")
+    p_sched_add.add_argument("--name", default="")
+    p_sched_add.set_defaults(func=_cmd_schedules)
+    p_sched_tick = sched_sub.add_parser("tick", help="Return schedules due at the current/simulated minute")
+    p_sched_tick.add_argument("--now", default="", help="ISO datetime for deterministic checks")
+    p_sched_tick.add_argument("--json", action="store_true")
+    p_sched_tick.set_defaults(func=_cmd_schedules)
+    p_schedules.set_defaults(func=_cmd_schedules, schedule_action="list", json=False)
 
     p_status = sub.add_parser(
         "status", help="Is the brain reachable + what is this device allowed to do?"

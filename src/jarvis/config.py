@@ -682,6 +682,24 @@ class WhatsAppConfig(_Base):
     trigger: str = "jarvis"  # the name that "calls out" the bot in a group (case-insensitive)
 
 
+class OrchestrationConfig(_Base):
+    """Agentic work orchestration state.
+
+    This is private local operational state: run graphs, schedule definitions,
+    and optional worker profile metadata. Public trackers reflect state, but do
+    not own it.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="ORCHESTRATION_", env_file=".env", extra="ignore")
+
+    workspace: str = "jarvis-workspace/orchestration"
+    workers_path: str = "jarvis-workspace/orchestration/workers.json"
+    schedules_path: str = "jarvis-workspace/orchestration/schedules.json"
+    default_repo: str = ""
+    default_timezone: str = "Europe/London"
+    landing_mode: str = "draft_pr"
+
+
 class Config:
     """Aggregate config. Construct once and pass modules their slice."""
 
@@ -715,6 +733,7 @@ class Config:
         self.browser = BrowserConfig(**source)
         self.whatsapp = WhatsAppConfig(**source)
         self.google = GoogleConfig(**source)
+        self.orchestration = OrchestrationConfig(**source)
 
     def resolved(self) -> dict:
         """Flat, secret-masked view for the dry-run printout (Step 0 gate)."""
@@ -831,6 +850,11 @@ class Config:
             "whatsapp.enabled": self.whatsapp.enabled,
             "whatsapp.wacli_bin": self.whatsapp.wacli_bin,
             "google.gogcli_bin": self.google.gogcli_bin,
+            "orchestration.workspace": self.orchestration.workspace,
+            "orchestration.workers_path": self.orchestration.workers_path,
+            "orchestration.schedules_path": self.orchestration.schedules_path,
+            "orchestration.default_repo": self.orchestration.default_repo or "<unset>",
+            "orchestration.landing_mode": self.orchestration.landing_mode,
         }
 
 

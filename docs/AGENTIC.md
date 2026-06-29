@@ -1,12 +1,12 @@
 # AGENTIC.md — the agentic engineering cycle
 
-**Status: design / decomposition. Nothing here is built yet.** This is the shared
-map we argue over and fill in. It describes the *whole* capability — commanding
-real engineering work by voice/text and having it done across machines and
-agents — as a **single closed cycle**, then pulls that cycle apart into the
-primitives that power it. The five currently-missing primitives are called out,
-but always *in their place in the loop*, never as a standalone backlog: the point
-is the complete cycle, including them.
+**Status: design / decomposition, with the first CLI-checkable orchestration
+foundation under construction.** This is the shared map we argue over and fill
+in. It describes the *whole* capability — commanding real engineering work by
+voice/text and having it done across machines and agents — as a **single closed
+cycle**, then pulls that cycle apart into the primitives that power it. The
+missing primitives are called out, but always *in their place in the loop*, never
+as a standalone backlog: the point is the complete cycle, including them.
 
 > The north-star use: *"review PR 27 on `<repo>` with Opus and GPT-5.5, combine,
 > and write the replies in the PR"* — or *"take the Linear ticket, build the
@@ -28,6 +28,158 @@ Everything below lives under AGENTS.md's two constraints:
    returns immediately ("on it"); all execution, review, and landing happen on
    the cold/background path and report back proactively. No primitive here may be
    awaited on the hot path.
+
+## Work sources, commands, and orchestration truth
+
+The Symphony-shaped addition to Jarvis is **work-source orchestration**: Linear,
+GitHub, and direct voice/text requests are intake sources for the same loop, not
+separate product features.
+
+```
+WorkSource -> WorkCommand -> OrchestrationRun -> ExecutionEnvelope
+  -> WorkerJob(s) -> Branch/PR/comment artifacts -> WorkSource update -> Report
+```
+
+**Jarvis, not the tracker, owns orchestration state.** Linear/GitHub are public
+or human-facing reflections: they can rank, describe, claim, link, and comment on
+work, but the local Jarvis run graph is the operational truth because one unit of
+work may span many tickets, many jobs, many PRs, or no tracker item at all.
+
+### Work sources
+
+Work sources expose common verbs over different systems:
+
+- `list` / `next` — inspect or select candidate work.
+- `claim` — best-effort public reflection that Jarvis has picked something up.
+- `comment` / `link_pr` — public-safe status and handoff updates.
+- `inspect_pr_comments` — read review threads/comments as work inputs.
+
+GitHub may be both a **work source** (issues, PR comments, failing checks) and a
+**forge** (branch push, PR creation, review comment, merge). These are different
+authority levels: reading an issue is not the same thing as pushing to GitHub.
+
+### WorkCommand
+
+Natural language is first converted into a structured `WorkCommand`. The LLM may
+produce this structure directly; deterministic code validates and executes it.
+Adapters never parse casual English themselves.
+
+Examples:
+
+```json
+{"operation":"inspect_work","source":"github","kind":"issue","autonomy":"read_only"}
+{"operation":"start_next_work","source":"linear","kind":"ticket","autonomy":"start_if_unambiguous"}
+{"operation":"inspect_pr_comments","source":"github","kind":"pull_request","autonomy":"read_only"}
+{"operation":"resume_run","source":"jarvis","autonomy":"start_if_unambiguous"}
+```
+
+Default command semantics:
+
+- `check`, `show`, `list`, `summarize` -> read-only inspection.
+- `get`, `take`, `pick up`, `start`, `work on` -> select, claim, and start when
+  unambiguous and authorised.
+- `fix`, `address`, `handle` -> execute against a selected issue/PR/comment.
+- `resume`, `continue` -> find the existing run/session before starting new work.
+- `blocked`, `stalled`, `what's running` -> inspect Jarvis run graph state.
+
+### Run graph
+
+The durable unit is an `OrchestrationRun`, not a one-ticket-one-PR record:
+
+```
+OrchestrationRun
+  -> WorkItems[]     # primary, related, blocks, blocked_by, follow_up
+  -> WorkerJobs[]    # worker_id + job_id + engine session/resume handle
+  -> Artifacts[]     # branches, PRs, comments, evidence
+  -> Events[]        # append-only audit trail
+  -> ChildRuns[]     # campaigns or split delivery
+```
+
+Rules:
+
+- One active **primary owner** run per work item.
+- A run may own many work items, jobs, and artifacts.
+- A work item may appear as related context in other runs.
+- Large objectives become parent campaign runs with bounded child runs.
+- `events.jsonl` is the audit trail; `run.json` is the current view.
+
+### Scheduler and schedules
+
+There are two schedulers:
+
+- **Work scheduler:** selects, filters, ranks, claims, starts, or resumes work.
+- **Time scheduler:** fires stored structured `WorkCommand`s at configured times.
+
+Scheduled work stores structure, not raw prose. A phrase like "every weekday at
+9am, get the next Linear ticket" is translated once into:
+
+```json
+{
+  "trigger": "09:00 weekdays Europe/London",
+  "command": {"operation":"start_next_work","source":"linear","kind":"ticket"},
+  "policy": {"skip_if_active":true,"max_concurrent_runs":1,"report_on_no_work":true}
+}
+```
+
+Two modes are first-class:
+
+- **Recurring one-shot:** each trigger starts at most one item.
+- **Campaign:** a parent run drains a queue under limits: max items, duration,
+  concurrency, and stop conditions (`queue_empty`, `budget_exhausted`, `blocked`,
+  `human_needed`).
+
+### Authority policy
+
+Authority is separate from work discovery and machine capability:
+
+```
+Work source says: what work exists
+Worker profile says: what can run
+Principal/device says: who is asking and what they may authorize
+Repo policy says: what public writes are allowed
+```
+
+Settings may make defaults stricter or choose behaviour (`branch_only`,
+`draft_pr`, `ready_pr`, `confirm_before_pr`), but settings do not grant authority
+by themselves. Scheduled work re-checks authority when it fires. Merge and release
+remain explicit high-trust actions, never default automation.
+
+### ExecutionEnvelope
+
+The handoff from scheduler to worker is an `ExecutionEnvelope`:
+
+- selected work items and objective
+- named `worker_id` target, not raw machine/host details
+- repo/workspace policy
+- engine
+- allowed actions
+- verification plan
+- landing policy
+
+Workers receive the envelope and stay inside it. They do not rediscover or widen
+authority; if they need more, the run becomes `needs_human`.
+
+Verification has two layers:
+
+- **Repo-native gates:** `AGENTS.md`, README, `docs/TESTING.md`, package scripts,
+  Makefile, CI conventions.
+- **Task-specific proof:** natural-language requirements such as "boot the app
+  and verify the changed flow in a browser; report the URL, path, and result."
+
+### Observability and reporting
+
+Jarvis should be quiet while work is healthy, clear when work finishes, and loud
+only when it needs a human. Default reporting is terminal-only, with pull status
+available any time:
+
+- `what's running?`
+- `what's blocked?`
+- `resume that ticket`
+- `show the last run`
+
+Public tracker updates are sanitized summaries only: status, PR link, high-level
+verification, and public-safe blockers. Private local paths, hostnames, raw logs,
+tokens, and engine session IDs stay local.
 
 ## Proportionality — the loop chooses the lightest sufficient depth
 
@@ -645,19 +797,34 @@ P0), P7 cross-target recovery, and the not-yet-enforceable forge gate (I4).
 ## Settled as invariants (no longer open)
 
 - **I1** Isolation absolute; non-git inputs copied to worker-owned scratch or
-  refused; cleanup deletes only worker-owned paths. → **P0 fix outstanding** in
-  `src/jarvis/worker/actions.py` (see P4).
+  refused; cleanup deletes only worker-owned paths. → First implementation lives
+  in `src/jarvis/worker/actions.py` and is protected by worker tests.
 - **I2** Panels read-only on a shared workspace; writing engines isolated
   per-worktree with explicit converge. (P3)
 - **I3** Machine resources (probed) ≠ principal-bound authority (trust gate). (P2/P9)
 - **I4** Public forge writes gated (`forge.write.public`) + draft-by-default;
   autonomy pre-granted per principal×repo. (P5/P9)
 
-## Action items (code, not just doc)
+## Checkable implementation stages
 
-- [ ] **P0:** make non-git worker jobs copy-into-scratch (or refuse) and scope
-      cleanup to worker-owned paths — `src/jarvis/worker/actions.py`
-      `prepare_worktree`/`cleanup_job`, `src/jarvis/worker/server.py` code action.
+- [x] **P0 safety prerequisite:** non-git worker jobs copy into worker-owned
+      scratch; cleanup refuses non-worker-owned paths.
+- [x] **Run graph foundation:** local `run.json` + append-only `events.jsonl`
+      under private orchestration workspace; CLI can create/list/show runs.
+- [x] **Worker registry:** named `worker_id` profiles with public-safe status
+      output and optional probing.
+- [x] **GitHub work source first:** read-only issue list and PR comment/review
+      inspection via the `gh` boundary.
+- [x] **WorkCommand intent:** initial deterministic mapper for check/get/fix/
+      resume/blocked phrases; LLMs can emit the same structure later.
+- [x] **ExecutionEnvelope:** selected work item -> envelope -> existing worker
+      `code` job; run graph links the worker job.
+- [x] **Linear adapter:** read/list/next plus claim/comment/link methods through
+      Linear GraphQL, guarded by `LINEAR_API_KEY`.
+- [x] **Time scheduler:** durable scheduled structured WorkCommands with
+      daily/weekly-style weekday selection and deterministic tick checks.
+- [x] **Campaign primitive:** parent run creates bounded child runs and stops
+      cleanly on empty queues.
 
 ## Open questions log (fill as we go)
 
