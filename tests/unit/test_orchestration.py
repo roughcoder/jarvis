@@ -781,7 +781,10 @@ def test_cli_work_start_requires_worker_start_capability(tmp_path, monkeypatch, 
     assert "Missing orchestration capability: worker.job.start" in out
     assert "Authority source:" in out
     assert "jarvis-workspace/profiles/local-mac.md" in out
-    assert "CAPS_DEFAULT_CAPABILITIES=worker.job.start" in out
+    assert (
+        "CAPS_DEFAULT_CAPABILITIES=forge.github.branch.push,forge.github.pr.create,"
+        "work.github.issues.read,worker.job.start"
+    ) in out
 
 
 def test_cli_capability_hint_notes_existing_profile_takes_precedence(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
