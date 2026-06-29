@@ -373,8 +373,8 @@ button[aria-pressed="true"] {{
   --eye-height: min(5vw, 28px);
   --pupil: 0px;
   --brow-y: -58%;
-  --brow-height: min(2vw, 12px);
-  --brow-width: 70%;
+  --brow-height: min(3vw, 18px);
+  --brow-width: 76%;
   --brow-left-rot: -2deg;
   --brow-right-rot: 2deg;
   --brow-lift: min(1vw, 6px);
@@ -394,14 +394,14 @@ button[aria-pressed="true"] {{
 .peek-right[data-state="sleep"] .eye:last-child .brow {{
   --brow-y: -42%;
   --brow-lift: min(-.8vw, -5px);
-  --brow-scale-y: .86;
+  --brow-scale-y: 1.12;
   opacity: 1;
 }}
 
 .peek-left[data-state="sleep"] .eye:first-child .pupil,
 .peek-right[data-state="sleep"] .eye:last-child .pupil {{
-  width: min(5.4vw, 34px);
-  height: min(5.4vw, 34px);
+  width: min(6.4vw, 42px);
+  height: min(6.4vw, 42px);
   opacity: .82;
   animation: sleepPeekPupil 2.45s cubic-bezier(.16, 1, .3, 1) both;
 }}
@@ -510,10 +510,19 @@ button[aria-pressed="true"] {{
   --eye-height: min(25vw, 154px);
   --pupil: min(7.6vw, 54px);
   --look-y: -10px;
-  --brow-y: -45%;
-  --brow-left-rot: -9deg;
-  --brow-right-rot: 9deg;
+  --brow-y: -34%;
+  --brow-width: 82%;
+  --brow-left-rot: -2deg;
+  --brow-right-rot: 12deg;
+  --brow-lift: min(-.3vw, -2px);
+}}
+
+[data-state="listening"] .eye:first-child .brow {{
   --brow-lift: min(-.8vw, -6px);
+}}
+
+[data-state="listening"] .eye:last-child .brow {{
+  --brow-lift: min(.4vw, 3px);
 }}
 
 [data-state="thinking"] {{

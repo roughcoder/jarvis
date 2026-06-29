@@ -260,9 +260,14 @@ def test_panel_preview_sleep_feels_resting_but_ready() -> None:
     assert '<main class="screen" data-state="sleep">' in html
     assert "--accent: #c8d8ca;" in html
     assert "--brow-y: -58%;" in html
+    assert "--brow-height: min(3vw, 18px);" in html
+    assert "--brow-width: 76%;" in html
     assert '[data-state="sleep"] .brow' in html
     assert "opacity: 0;" in html
     assert "height: min(20vw, 118px);" in html
+    assert "--brow-scale-y: 1.12;" in html
+    assert "width: min(6.4vw, 42px);" in html
+    assert "height: min(6.4vw, 42px);" in html
     assert "peek-left" in html
     assert "peek-right" in html
     assert "opacity: 1;" in html
@@ -289,3 +294,10 @@ def test_panel_preview_listening_uses_bright_blue() -> None:
     assert '<main class="screen" data-state="listening">' in html
     assert '[data-state="listening"]' in html
     assert "--accent: #8ddcff;" in html
+    assert "--brow-y: -34%;" in html
+    assert "--brow-width: 82%;" in html
+    assert "--brow-left-rot: -2deg;" in html
+    assert "--brow-right-rot: 12deg;" in html
+    assert '[data-state="listening"] .eye:first-child .brow' in html
+    assert '[data-state="listening"] .eye:last-child .brow' in html
+    assert "--brow-lift: min(.4vw, 3px);" in html
