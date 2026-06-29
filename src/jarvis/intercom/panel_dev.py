@@ -104,28 +104,8 @@ body {{
   top: clamp(16px, 4vh, 26px);
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
+  justify-content: flex-end;
   z-index: 3;
-}}
-
-.brand {{
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  min-width: 0;
-}}
-
-.brand strong {{
-  font-size: clamp(16px, 4.4vw, 26px);
-  letter-spacing: 0;
-  font-weight: 720;
-}}
-
-.brand span {{
-  color: var(--muted);
-  font-size: clamp(11px, 2.8vw, 15px);
-  white-space: nowrap;
 }}
 
 .state-pill {{
@@ -287,17 +267,6 @@ body {{
 [data-state="sleep"] .sleep-zz span:nth-child(3) {{
   animation-delay: 4.05s;
   opacity: .56;
-}}
-
-.expression {{
-  position: absolute;
-  left: 50%;
-  bottom: clamp(42px, 10vh, 64px);
-  transform: translateX(-50%);
-  color: var(--muted);
-  font-size: clamp(12px, 3vw, 16px);
-  text-align: center;
-  white-space: nowrap;
 }}
 
 .meter {{
@@ -655,7 +624,6 @@ button[aria-pressed="true"] {{
 }}
 
 @media (max-width: 520px), (max-height: 420px) {{
-  .brand span {{ display: none; }}
   .debug {{ grid-template-columns: repeat(2, 1fr); }}
   .meter {{ height: 22px; gap: 3px; }}
 }}
@@ -664,7 +632,6 @@ button[aria-pressed="true"] {{
 <body>
 <main class="screen" data-state="{state}">
   <div class="topline">
-    <div class="brand"><strong>Jarvis</strong><span>room intercom</span></div>
     <div class="state-pill"><i></i><span id="stateLabel">{state}</span></div>
   </div>
   <section class="debug" aria-label="status">
@@ -680,7 +647,6 @@ button[aria-pressed="true"] {{
     </div>
     <div class="sleep-zz" aria-hidden="true"><span>z</span><span>z</span><span>z</span></div>
   </section>
-  <div class="expression" id="expression">tap for controls</div>
   <div class="controls" id="controls" aria-label="preview states"></div>
   <div class="meter" id="meter" aria-hidden="true"></div>
 </main>
@@ -696,22 +662,11 @@ const labels = {{
   disconnected: "offline",
   sleep: "resting"
 }};
-const expressions = {{
-  idle: "waiting for hey jarvis",
-  connecting: "finding the brain",
-  awake: "wake word heard",
-  listening: "listening",
-  thinking: "working",
-  speaking: "speaking",
-  disconnected: "brain link offline",
-  sleep: "screen resting"
-}};
 const screen = document.querySelector(".screen");
 const controls = document.getElementById("controls");
 const meter = document.getElementById("meter");
 const stateLabel = document.getElementById("stateLabel");
 const tileVoice = document.getElementById("tileVoice");
-const expression = document.getElementById("expression");
 const eyes = [...document.querySelectorAll(".eye")];
 const pupils = [...document.querySelectorAll(".pupil")];
 const sleepZs = [...document.querySelectorAll(".sleep-zz span")];
@@ -758,7 +713,6 @@ function setState(next, options = {{}}) {{
   screen.classList.toggle("info", next === "disconnected");
   stateLabel.textContent = labels[next];
   tileVoice.textContent = labels[next];
-  expression.textContent = expressions[next];
   for (const button of controls.children) {{
     button.setAttribute("aria-pressed", String(button.dataset.state === next));
   }}

@@ -42,6 +42,17 @@ def test_panel_preview_uses_flat_pi_screen_artwork() -> None:
     assert "top: var(--brow-y, -34%);" in html
 
 
+def test_panel_preview_omits_brand_and_expression_copy() -> None:
+    html = render_panel_preview_html()
+
+    assert '<div class="brand">' not in html
+    assert "room intercom" not in html
+    assert '<div class="expression"' not in html
+    assert "waiting for hey jarvis" not in html
+    assert "working" not in html
+    assert "tap for controls" not in html
+
+
 def test_panel_preview_sanitizes_title_and_falls_back_to_idle_state() -> None:
     html = render_panel_preview_html(PreviewConfig(initial_state="unknown", title='<Jarvis "panel">'))
 
