@@ -427,6 +427,19 @@ def test_failed_alarm_tool_opens_when_reply_asks_clarifying_question_without_mar
     assert result.close_reason == "reply_followup_expected"
 
 
+def test_failed_timer_tool_opens_for_common_duration_clarification_without_marker() -> None:
+    sess = _session(DEFAULT_MODE)
+
+    for raw in ("What should I set it for?", "For how long?"):
+        result = TurnResult(raw=raw)
+
+        sess.finalize("set a timer", result)
+
+        assert result.ended is False
+        assert result.continue_listening is True
+        assert result.close_reason == "reply_followup_expected"
+
+
 def test_voice_lifecycle_writes_trace_metadata() -> None:
     sess = _session(DEFAULT_MODE)
     result = TurnResult(raw="Could you try again?")
