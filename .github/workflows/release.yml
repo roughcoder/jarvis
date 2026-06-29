@@ -52,6 +52,16 @@ jobs:
       - name: Sync runtime version metadata
         run: scripts/sync_runtime_version.sh "${{ steps.compute-version.outputs.release_version }}" --commit
 
+      - name: Check release note quality
+        run: |
+          set -euo pipefail
+          tmpfile="$(mktemp)"
+          uv run python scripts/generate_release_notes.py \
+            --version "${{ steps.compute-version.outputs.release_version }}" \
+            --strict \
+            --output "$tmpfile"
+          rm -f "$tmpfile"
+
       - name: Build and publish runtime release
         run: |
           set -euo pipefail

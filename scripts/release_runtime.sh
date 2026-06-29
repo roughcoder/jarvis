@@ -128,6 +128,7 @@ shasum -a 256 "$ASSET_PATH" > "$ASSET_PATH.sha256"
 
 uv run python scripts/generate_release_notes.py \
   --version "$VERSION" \
+  --strict \
   --output "$DIST_DIR/runtime-release-notes.md"
 
 if ! git rev-parse "$TAG" >/dev/null 2>&1; then

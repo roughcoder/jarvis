@@ -180,6 +180,12 @@ publishes the deterministic summary from the same facts. Set
 `JARVIS_RELEASE_NOTES_AI=always` when you want release creation to fail instead
 of falling back.
 
+Release-note quality is checked before publication. `feat(...)`, `fix(...)`,
+and `perf(...)` commits in the release range must include either
+`Release-note: <user-facing text>` or `Release-note: skip`; missing trailers fail
+the release. Generated notes also fail if raw commit-scope bullets such as
+`voice: ...` leak into the output or if a change section is too noisy to scan.
+
 Workflow inputs are now limited to:
 
 - `draft`: whether the GitHub release should remain draft
@@ -206,11 +212,14 @@ feat(intercom): route room devices independently
 
 Release-note: Added per-room intercom routing for multi-device homes.
 Env: JARVIS_ROOM_ID added; set this on each room device before enabling routing.
+Upgrade-note: Restart room intercom services after setting JARVIS_ROOM_ID.
+Docs: docs/DEPLOYMENT.md covers room device pairing.
 ```
 
 Use `Release-note:` for changes worth mentioning, `Env:` for new/changed/removed
-configuration and the action required, and `Breaking Change:` for migration
-impact. Use `Release-note: skip` only for mechanical commits that should not
+configuration, `Upgrade-note:` for explicit operator action, `Docs:` for a
+release-note documentation pointer, and `Breaking Change:` for migration impact.
+Use `Release-note: skip` only for mechanical or internal commits that should not
 appear in user-facing notes.
 
 Local preflight only:
@@ -221,6 +230,7 @@ tmpfile="$(mktemp)"
 uv run python scripts/generate_release_notes.py \
   --version "$(scripts/compute_next_release_version.sh)" \
   --ai never \
+  --strict \
   --output "$tmpfile"
 sed -n '1,160p' "$tmpfile"
 rm -f "$tmpfile"

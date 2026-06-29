@@ -140,8 +140,9 @@ keeps the original single-process behaviour. The think/speak core is shared
 - **Release notes come from commit messages.** Use Conventional Commits for the
   subject, then add trailers when the change matters to users or operators:
   `Release-note: <user-facing change>`, `Env: <new/changed/removed env var and
-  action needed>`, and `Breaking Change: <migration impact>`. Use
-  `Release-note: skip` only for mechanical commits such as version metadata.
+  action needed>`, `Upgrade-note: <operator action>`, `Docs: <doc pointer>`, and
+  `Breaking Change: <migration impact>`. Use `Release-note: skip` only for
+  mechanical or internal commits that should not appear in user-facing notes.
 - **Runtime releases are GitHub Actions only.** Never run
   `scripts/release_runtime.sh` locally; use local scripts only for preflight
   version/notes checks, then trigger the `Release` workflow.

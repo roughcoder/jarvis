@@ -51,6 +51,8 @@ Release-note: Added queued background jobs for long-running work.
 
 Release-note: Fixed duplicate TTS starts during streaming playback.
 Env: TTS_STREAM_TIMEOUT changed; increase it for slow networks.
+Upgrade-note: Restart Jarvis after changing TTS_STREAM_TIMEOUT.
+Docs: docs/TESTING.md covers streaming playback checks.
 """,
         ),
     ]
@@ -69,9 +71,13 @@ Env: TTS_STREAM_TIMEOUT changed; increase it for slow networks.
     assert "- Added queued background jobs for long-running work." in notes
     assert "## Fixed" in notes
     assert "- Fixed duplicate TTS starts during streaming playback." in notes
+    assert "## Operator Action" in notes
+    assert "- Restart Jarvis after changing TTS_STREAM_TIMEOUT." in notes
     assert "## Environment" in notes
-    assert "New env vars: `JARVIS_BACKGROUND_ENABLED`." in notes
+    assert "Env vars added to `.env.example`: `JARVIS_BACKGROUND_ENABLED`." in notes
     assert "TTS_STREAM_TIMEOUT changed; increase it for slow networks." in notes
+    assert "## Documentation" in notes
+    assert "- docs/TESTING.md covers streaming playback checks." in notes
     assert "brew upgrade jarvis" in notes
 
 
@@ -109,6 +115,110 @@ Release-note: skip
     )
 
     assert release_notes.grouped_notes([commit])["other"] == []
+
+
+def test_missing_release_note_does_not_fall_back_to_commit_subject() -> None:
+    commit = release_notes.parse_commit(
+        "abc123",
+        """fix(voice): preserve paired identity baseline
+
+Keep pairing identity stable after a voice reset.
+""",
+    )
+
+    groups = release_notes.grouped_notes([commit])
+
+    assert groups["fixes"] == []
+
+
+def test_strict_release_trailers_require_note_or_skip() -> None:
+    missing = release_notes.parse_commit(
+        "abc123",
+        """fix(voice): preserve paired identity baseline
+
+Keep pairing identity stable after a voice reset.
+""",
+    )
+    skipped = release_notes.parse_commit(
+        "def456",
+        """fix(tts): adjust internal buffering
+
+Release-note: skip
+""",
+    )
+
+    errors = release_notes.validate_release_trailers([missing, skipped])
+
+    assert len(errors) == 1
+    assert "abc123" in errors[0]
+    assert "Release-note: <text> or Release-note: skip" in errors[0]
+
+
+def test_release_markdown_quality_rejects_raw_scope_bullets() -> None:
+    notes = """# Jarvis Runtime v1.2.3
+
+## Changed
+
+- ops: make fleet runtime controls easier
+
+## Operator Action
+
+- No operator action required.
+
+## Environment
+
+- No env changes detected.
+
+## Install
+
+```bash
+brew install jarvis
+```
+
+## Update
+
+```bash
+brew upgrade jarvis
+```
+"""
+
+    errors = release_notes.validate_release_markdown(notes)
+
+    assert errors == ["raw commit-style bullet leaked into release notes: - ops: make fleet runtime controls easier"]
+
+
+def test_release_markdown_quality_caps_noisy_sections() -> None:
+    bullets = "\n".join(f"- Fix {index}" for index in range(9))
+    notes = f"""# Jarvis Runtime v1.2.3
+
+## Fixed
+
+{bullets}
+
+## Operator Action
+
+- No operator action required.
+
+## Environment
+
+- No env changes detected.
+
+## Install
+
+```bash
+brew install jarvis
+```
+
+## Update
+
+```bash
+brew upgrade jarvis
+```
+"""
+
+    errors = release_notes.validate_release_markdown(notes)
+
+    assert errors == ["Fixed has 9 bullets; group related changes down to 8 or fewer"]
 
 
 def test_release_runtime_refuses_local_publish(monkeypatch) -> None:

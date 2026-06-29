@@ -6,6 +6,8 @@ the broad category, while trailers carry user-facing detail:
 
   Release-note: Added wake-word barge-in tuning to the room intercom.
   Env: JARVIS_FOO_TIMEOUT added; set to seconds before enabling foo.
+  Upgrade-note: No operator action required for existing installs.
+  Docs: docs/PI.md explains the new room display controls.
 
 If OPENAI_API_KEY and JARVIS_RELEASE_NOTES_MODEL are present, the script asks an
 AI model to rewrite the gathered facts into polished notes. Otherwise it emits a
@@ -46,6 +48,10 @@ RELEASABLE_TYPES = {
     "revert",
 }
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
+STRICT_TRAILER_TYPES = {"feat", "fix", "perf"}
+QUALITY_SECTION_LIMIT = 8
+RAW_SCOPE_BULLET_RE = re.compile(r"^- [a-z][a-z0-9_-]+: ")
+SECTION_RE = re.compile(r"^## (?P<title>.+)$")
 
 
 @dataclass
@@ -68,6 +74,10 @@ class CommitInfo:
         ]
 
     @property
+    def has_release_note_decision(self) -> bool:
+        return "release-note" in self.trailers
+
+    @property
     def env_notes(self) -> list[str]:
         notes: list[str] = []
         for key in ("env", "env-change", "env-note"):
@@ -78,6 +88,20 @@ class CommitInfo:
     def breaking_notes(self) -> list[str]:
         notes: list[str] = []
         for key in ("breaking change", "breaking-change"):
+            notes.extend(self.trailers.get(key, []))
+        return notes
+
+    @property
+    def upgrade_notes(self) -> list[str]:
+        notes: list[str] = []
+        for key in ("upgrade-note", "operator-action"):
+            notes.extend(self.trailers.get(key, []))
+        return notes
+
+    @property
+    def docs_notes(self) -> list[str]:
+        notes: list[str] = []
+        for key in ("docs", "documentation"):
             notes.extend(self.trailers.get(key, []))
         return notes
 
@@ -153,10 +177,7 @@ def env_diff(base_tag: str, head_ref: str) -> dict[str, list[str]]:
 def note_for(commit: CommitInfo) -> str:
     if commit.release_notes:
         return "; ".join(commit.release_notes)
-    if commit.title:
-        scope = f"{commit.scope}: " if commit.scope else ""
-        return f"{scope}{commit.title}"
-    return commit.subject
+    return ""
 
 
 def grouped_notes(commits: list[CommitInfo]) -> dict[str, list[str]]:
@@ -167,6 +188,8 @@ def grouped_notes(commits: list[CommitInfo]) -> dict[str, list[str]]:
         "other": [],
         "breaking": [],
         "env": [],
+        "operator_action": [],
+        "docs": [],
     }
     for commit in commits:
         if commit.type not in RELEASABLE_TYPES and not commit.release_notes:
@@ -177,7 +200,11 @@ def grouped_notes(commits: list[CommitInfo]) -> dict[str, list[str]]:
             groups["breaking"].append(detail)
         if commit.env_notes:
             groups["env"].extend(commit.env_notes)
-        if commit.release_notes or commit.type in {"feat", "fix", "perf"}:
+        if commit.upgrade_notes:
+            groups["operator_action"].extend(commit.upgrade_notes)
+        if commit.docs_notes:
+            groups["docs"].extend(commit.docs_notes)
+        if note:
             if commit.type == "feat":
                 groups["features"].append(note)
             elif commit.type == "fix":
@@ -204,6 +231,8 @@ def facts_payload(version: str, tag: str, base_tag: str, commits: list[CommitInf
                 "scope": commit.scope,
                 "release_notes": commit.release_notes,
                 "env_notes": commit.env_notes,
+                "upgrade_notes": commit.upgrade_notes,
+                "docs_notes": commit.docs_notes,
                 "breaking": commit.breaking,
                 "breaking_notes": commit.breaking_notes,
             }
@@ -242,17 +271,33 @@ def deterministic_notes(payload: dict[str, object]) -> str:
         if bullets:
             lines.extend([f"## {title}", "", *bullets, ""])
 
+    action_lines = list(summary.get("operator_action", []))
+    if not action_lines:
+        if summary.get("breaking", []):
+            action_lines.append("Review the breaking changes before upgrading.")
+        elif summary.get("env", []) or env_changes.get("added", []) or env_changes.get("removed", []):
+            action_lines.append("Review the environment notes before upgrading.")
+        else:
+            action_lines.append("No operator action required.")
+    lines.extend(["## Operator Action", ""])
+    lines.extend(bullet_lines(action_lines))
+    lines.append("")
+
     env_lines: list[str] = []
     added = list(env_changes.get("added", []))
     removed = list(env_changes.get("removed", []))
     if added:
-        env_lines.append("New env vars: " + ", ".join(f"`{key}`" for key in added) + ".")
+        env_lines.append("Env vars added to `.env.example`: " + ", ".join(f"`{key}`" for key in added) + ".")
     if removed:
-        env_lines.append("Removed env vars: " + ", ".join(f"`{key}`" for key in removed) + ".")
+        env_lines.append("Env vars removed from `.env.example`: " + ", ".join(f"`{key}`" for key in removed) + ".")
     env_lines.extend(list(summary.get("env", [])))
     lines.extend(["## Environment", ""])
     lines.extend(bullet_lines(env_lines) or ["- No env changes detected."])
     lines.append("")
+
+    docs_lines = bullet_lines(list(summary.get("docs", [])))
+    if docs_lines:
+        lines.extend(["## Documentation", "", *docs_lines, ""])
 
     lines.extend(
         [
@@ -273,6 +318,48 @@ def deterministic_notes(payload: dict[str, object]) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def validate_release_trailers(commits: list[CommitInfo]) -> list[str]:
+    errors: list[str] = []
+    for commit in commits:
+        if commit.type not in STRICT_TRAILER_TYPES:
+            continue
+        if commit.has_release_note_decision:
+            continue
+        errors.append(
+            f"{commit.sha[:12]} {commit.subject!r} needs Release-note: <text> or Release-note: skip"
+        )
+    return errors
+
+
+def validate_release_markdown(notes: str, *, section_limit: int = QUALITY_SECTION_LIMIT) -> list[str]:
+    errors: list[str] = []
+    current_section = ""
+    bullet_counts: dict[str, int] = {}
+    limited_sections = {"Changed", "Fixed", "Performance", "Other Changes"}
+    required_sections = {"Operator Action", "Environment", "Install", "Update"}
+    seen_sections: set[str] = set()
+
+    for line in notes.splitlines():
+        if match := SECTION_RE.match(line):
+            current_section = match.group("title").strip()
+            seen_sections.add(current_section)
+            continue
+        if not line.startswith("- "):
+            continue
+        if RAW_SCOPE_BULLET_RE.match(line):
+            errors.append(f"raw commit-style bullet leaked into release notes: {line}")
+        if current_section in limited_sections:
+            bullet_counts[current_section] = bullet_counts.get(current_section, 0) + 1
+
+    for section, count in sorted(bullet_counts.items()):
+        if count > section_limit:
+            errors.append(f"{section} has {count} bullets; group related changes down to {section_limit} or fewer")
+    missing = sorted(required_sections - seen_sections)
+    if missing:
+        errors.append("missing required sections: " + ", ".join(missing))
+    return errors
 
 
 def ai_enabled(mode: str) -> bool:
@@ -298,12 +385,20 @@ def ai_notes(payload: dict[str, object]) -> str:
         - H1 title: Jarvis Runtime <tag>
         - Changed
         - Fixed
+        - Operator Action
         - Environment
+        - Documentation when documentation links are present
         - Install
         - Update
         Include Breaking Changes before Changed only when present.
+        Group related commits by user-visible outcome. Prefer 3-6 bullets per
+        section and never exceed 8 bullets in Changed, Fixed, Performance, or
+        Other Changes.
+        Never emit raw commit-subject bullets or scope prefixes such as
+        "voice:", "comms:", "ops:", or "intercom:".
         Environment must explicitly say whether env vars are new, removed, need changing,
         or that no env changes were detected.
+        Operator Action must say whether existing installs need action.
         Keep Homebrew install/update commands exactly as provided by the fallback notes.
         """
     ).strip()
@@ -340,6 +435,9 @@ def ai_notes(payload: dict[str, object]) -> str:
         content = data["choices"][0]["message"]["content"].strip()
         if not content:
             raise ValueError("empty AI release notes response")
+        quality_errors = validate_release_markdown(content)
+        if quality_errors:
+            raise ValueError("; ".join(quality_errors))
         return content + "\n"
     except (urllib.error.URLError, KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
         if os.environ.get("JARVIS_RELEASE_NOTES_AI", "auto").lower() == "always":
@@ -348,13 +446,23 @@ def ai_notes(payload: dict[str, object]) -> str:
         return fallback
 
 
-def build_notes(version: str, base_tag: str, head_ref: str, ai_mode: str) -> str:
+def build_notes(version: str, base_tag: str, head_ref: str, ai_mode: str, *, strict: bool = False) -> str:
     tag = f"v{version.lstrip('v')}"
     commits = load_commits(base_tag, head_ref)
+    if strict:
+        trailer_errors = validate_release_trailers(commits)
+        if trailer_errors:
+            raise SystemExit("Release note trailer check failed:\n- " + "\n- ".join(trailer_errors))
     payload = facts_payload(version.lstrip("v"), tag, base_tag, commits, env_diff(base_tag, head_ref))
     if ai_enabled(ai_mode):
-        return ai_notes(payload)
-    return deterministic_notes(payload)
+        notes = ai_notes(payload)
+    else:
+        notes = deterministic_notes(payload)
+    if strict:
+        quality_errors = validate_release_markdown(notes)
+        if quality_errors:
+            raise SystemExit("Release note quality check failed:\n- " + "\n- ".join(quality_errors))
+    return notes
 
 
 def main() -> int:
@@ -369,9 +477,15 @@ def main() -> int:
         default=os.environ.get("JARVIS_RELEASE_NOTES_AI", "auto").lower(),
         help="Use AI when configured, require AI, or never use AI.",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        default=os.environ.get("JARVIS_RELEASE_NOTES_STRICT", "").lower() in {"1", "true", "yes"},
+        help="Fail when release-visible commits lack release-note trailers or generated notes are noisy.",
+    )
     args = parser.parse_args()
     base_tag = args.base_tag or latest_semver_tag()
-    notes = build_notes(args.version, base_tag, args.head, args.ai)
+    notes = build_notes(args.version, base_tag, args.head, args.ai, strict=args.strict)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(notes, encoding="utf-8")
     print(f"Wrote release notes to {args.output} from {base_tag}..{args.head}")
