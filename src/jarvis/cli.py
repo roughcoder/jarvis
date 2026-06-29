@@ -544,6 +544,25 @@ def _cmd_runs(args: argparse.Namespace) -> int:
             for e in events:
                 print(f"{e.time} {e.type:<28} {e.message}")
         return 0
+    if args.sync:
+        from jarvis.orchestration.supervisor import sync_run_jobs
+
+        summary = sync_run_jobs(
+            store,
+            worker_cfg=cfg.worker,
+            workers_path=cfg.orchestration.workers_path,
+            run_id=args.run_id or "",
+        )
+        if args.json and not args.run_id:
+            print(json.dumps(summary.to_dict(), indent=2))
+            return 0
+        if not args.json:
+            print(
+                f"Synced {summary.runs_seen} run(s), {summary.jobs_seen} job(s); "
+                f"{summary.jobs_updated} updated, {summary.runs_completed} completed, {summary.runs_failed} failed."
+            )
+        if not args.run_id:
+            return 0
     if args.run_id:
         run = store.get(args.run_id)
         if run is None:
@@ -1908,6 +1927,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_runs.add_argument("run_id", nargs="?", help="Run id or unique prefix to show")
     p_runs.add_argument("--create", metavar="OBJECTIVE", help="Create a local fake run for inspection")
     p_runs.add_argument("--events", metavar="RUN_ID", help="Show append-only events for a run")
+    p_runs.add_argument("--sync", action="store_true", help="Refresh linked worker job status before listing/showing")
     p_runs.add_argument("-n", type=int, default=20, help="How many recent runs to list")
     p_runs.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     p_runs.set_defaults(func=_cmd_runs)

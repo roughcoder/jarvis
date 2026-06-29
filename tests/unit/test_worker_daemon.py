@@ -32,8 +32,8 @@ async def _with_server(cfg: WorkerConfig, port: int, fn):  # noqa: ANN001
         await runner.cleanup()
 
 
-def test_daemon_health_shell_and_auth() -> None:
-    cfg = WorkerConfig(_env_file=None, token="tkn", workspace="jarvis-workspace/worker")
+def test_daemon_health_shell_and_auth(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
     h = {"Authorization": "Bearer tkn"}
 
     async def calls(base, c):  # noqa: ANN001
@@ -54,9 +54,9 @@ def test_daemon_health_shell_and_auth() -> None:
     assert unknown == 400  # unknown action
 
 
-def test_daemon_code_dispatch_runs_a_job() -> None:
+def test_daemon_code_dispatch_runs_a_job(tmp_path) -> None:
     # `echo` stands in for the coding agent so the job finishes instantly.
-    cfg = WorkerConfig(_env_file=None, token="", workspace="jarvis-workspace/worker", codex_bin="echo")
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"), codex_bin="echo")
 
     async def calls(base, c):  # noqa: ANN001
         disp = (await c.post(base + "/run", json={"action": "code", "args": {"prompt": "hello-job"}})).json()
@@ -74,6 +74,19 @@ def test_daemon_code_dispatch_runs_a_job() -> None:
     assert disp["ok"] and disp["job_id"]
     assert status == "done"
     assert len(listed["jobs"]) >= 1
+
+
+def test_daemon_refuses_worker_workspace_inside_git_checkout(tmp_path) -> None:
+    import subprocess
+
+    repo = tmp_path / "repo"
+    workspace = repo / "jarvis-workspace" / "worker"
+    workspace.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(workspace))
+
+    with pytest.raises(ValueError, match="inside a git checkout"):
+        make_app(cfg)
 
 
 def test_daemon_rejects_orchestration_code_job_without_start_action(tmp_path) -> None:

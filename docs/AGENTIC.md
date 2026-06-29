@@ -1103,7 +1103,8 @@ P0), P7 cross-target recovery, and the not-yet-enforceable forge gate (I4).
 - [x] **P0 safety prerequisite:** non-git worker jobs copy into worker-owned
       scratch; cleanup refuses non-worker-owned paths.
 - [x] **Run graph foundation:** local `run.json` + append-only `events.jsonl`
-      under private orchestration workspace; CLI can create/list/show runs.
+      under private orchestration workspace; CLI can create/list/show runs and
+      sync linked worker job status back into the graph.
 - [x] **Worker registry:** named `worker_id` profiles with public-safe status
       output and optional probing.
 - [x] **GitHub work source first:** read-only issue list and PR comment/review
@@ -1118,6 +1119,24 @@ P0), P7 cross-target recovery, and the not-yet-enforceable forge gate (I4).
       daily/weekly-style weekday selection and deterministic tick checks.
 - [x] **Campaign primitive:** parent run creates bounded child runs and stops
       cleanly on empty queues.
+
+## Dogfood follow-up notes
+
+These came out of the first local orchestration smoke pass. They should be
+handled at the stage where they belong rather than widening the current slice:
+
+- [x] **Foundation hardening:** default worker workspaces outside the Jarvis repo;
+      reject worker workspaces inside any git checkout; use `jarvis-` names for
+      orchestration worktrees/branches; surface worker dispatch error bodies.
+- [x] **Run graph observability:** `runs --sync` refreshes linked worker job
+      status, branch, cwd, and `codex resume` session id from the worker daemon.
+- [ ] **Work-source UX:** `work check` and `work pr-comments` should summarize
+      useful next actions by default, with raw JSON kept behind `--json`.
+- [ ] **Capability guidance:** when authority is missing, CLI output should show
+      the exact local profile/config location to edit and whether it applies to
+      the brain profile or named worker profile.
+- [ ] **Smoke dispatch command:** add a disposable, explicit orchestration smoke
+      command that creates or selects safe test work and cleans up after itself.
 
 ## Open questions log (fill as we go)
 

@@ -7,6 +7,8 @@ background-job lifecycle. Uses `echo`/missing binaries so it's fast and safe.
 from __future__ import annotations
 
 import asyncio
+import os
+import pathlib
 
 from jarvis.worker.actions import cleanup_job, code_argv, prepare_worktree, run_exec, run_shell
 from jarvis.worker.jobs import JobManager
@@ -127,10 +129,30 @@ def test_prepare_worktree_copies_non_git_inputs_to_scratch(tmp_path) -> None:
     assert branch is None
     assert cwd is not None and cwd != str(src)
     assert "/worktrees/" in cwd and cwd.endswith("-scratch")
-    copied = tmp_path / cwd
+    copied = pathlib.Path(cwd)
     assert (copied / "note.txt").read_text() == "original"
     (copied / "note.txt").write_text("changed")
     assert (src / "note.txt").read_text() == "original"
+
+
+def test_prepare_worktree_returns_absolute_paths_from_relative_workspace(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run([*git, "init", "-q"], cwd=repo, check=True)
+    subprocess.run([*git, "commit", "--allow-empty", "-qm", "init"], cwd=repo, check=True)
+    monkeypatch.chdir(tmp_path)
+
+    cwd, branch, err = asyncio.run(
+        prepare_worktree(str(repo), "relative-worker/worktrees", "jarvis-smoke", "jarvis", 5)
+    )
+
+    assert err is None
+    assert branch is not None
+    assert cwd is not None and os.path.isabs(cwd)
+    assert pathlib.Path(cwd).exists()
 
 
 def test_cleanup_refuses_non_worker_owned_paths(tmp_path) -> None:

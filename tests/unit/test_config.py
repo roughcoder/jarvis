@@ -16,6 +16,7 @@ from jarvis.config import (
     IntercomDeviceConfig,
     LinearConfig,
     MemoryConfig,
+    WorkerConfig,
 )
 
 
@@ -37,6 +38,10 @@ def test_base_url_is_computed_from_host_port(monkeypatch) -> None:
     _clean(monkeypatch, "MEMORY_HOST", "MEMORY_PORT")
     c = MemoryConfig(_env_file=None, host="frankfurt", port=8123)
     assert c.base_url == "http://frankfurt:8123"
+
+
+def test_worker_workspace_defaults_outside_repo() -> None:
+    assert WorkerConfig(_env_file=None).workspace == "~/.jarvis/worker"
 
 
 def test_brain_websocket_limit_allows_long_utterances() -> None:
