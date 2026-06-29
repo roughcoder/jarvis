@@ -709,7 +709,7 @@ def _cmd_work(args: argparse.Namespace) -> int:
             print(json.dumps(item.to_dict(), indent=2) if args.json else _format_item(item))
             return 0
         if not _has_orchestration_authority(
-            ["worker.job.start"],
+            ["worker.job.start", *_required_for_landing_mode(cfg.orchestration.landing_mode)],
             capabilities,
             public_write_mode=public_write_mode,
         ):
@@ -773,6 +773,14 @@ def _has_orchestration_authority(
     return True
 
 
+def _required_for_landing_mode(mode: str) -> list[str]:
+    if mode in {"draft_pr", "ready_pr"}:
+        return ["forge.github.branch.push", "forge.github.pr.create"]
+    if mode == "branch_only":
+        return ["forge.github.branch.push"]
+    return []
+
+
 def _worker_is_eligible(worker, required: list[str] | None = None) -> bool:  # noqa: ANN001
     if worker.status == "offline":
         return False
@@ -822,11 +830,12 @@ def _cmd_schedules(args: argparse.Namespace) -> int:
     import json
     from datetime import datetime
 
+    from jarvis.brain.capabilities import resolve_capabilities
     from jarvis.orchestration.intent import parse_work_command
-    from jarvis.orchestration.schedules import ScheduleStore
+    from jarvis.orchestration.schedules import Schedule, ScheduleStore
 
     cfg = load_config()
-    store = ScheduleStore(cfg.orchestration.schedules_path)
+    capabilities = resolve_capabilities(cfg.capabilities)
     if args.schedule_action == "add":
         try:
             hh, mm = [int(x) for x in args.at.split(":", 1)]
@@ -835,13 +844,36 @@ def _cmd_schedules(args: argparse.Namespace) -> int:
             return 1
         command = parse_work_command(" ".join(args.phrase))
         try:
+            weekdays = _parse_weekdays(args.weekdays)
+            timezone = args.timezone or cfg.orchestration.default_timezone
+            Schedule(
+                schedule_id="validate",
+                name=args.name or " ".join(args.phrase),
+                command=command,
+                hour=hh,
+                minute=mm,
+                weekdays=weekdays,
+                timezone=timezone,
+                mode=args.mode,
+            )
+        except ValueError as exc:
+            print(f"Invalid schedule: {exc}")
+            return 1
+        if not _has_orchestration_authority(
+            ["orchestration.schedules.write"],
+            capabilities,
+            public_write_mode=cfg.orchestration.landing_mode,
+        ):
+            return 1
+        store = ScheduleStore(cfg.orchestration.schedules_path)
+        try:
             schedule = store.add(
                 args.name or " ".join(args.phrase),
                 command,
                 hour=hh,
                 minute=mm,
-                weekdays=_parse_weekdays(args.weekdays),
-                timezone=args.timezone or cfg.orchestration.default_timezone,
+                weekdays=weekdays,
+                timezone=timezone,
                 mode=args.mode,
             )
         except ValueError as exc:
@@ -851,12 +883,21 @@ def _cmd_schedules(args: argparse.Namespace) -> int:
         return 0
     if args.schedule_action == "tick":
         now = datetime.fromisoformat(args.now) if args.now else datetime.now().astimezone()
+        if args.ack:
+            if not _has_orchestration_authority(
+                ["orchestration.schedules.write"],
+                capabilities,
+                public_write_mode=cfg.orchestration.landing_mode,
+            ):
+                return 1
+        store = ScheduleStore(cfg.orchestration.schedules_path)
         due = store.due(now)
         if args.ack:
             for schedule in due:
                 store.ack(schedule.schedule_id, now)
         print(json.dumps([x.to_dict() for x in due], indent=2) if args.json else f"{len(due)} schedule(s) due")
         return 0
+    store = ScheduleStore(cfg.orchestration.schedules_path)
     schedules = store.list()
     if args.json:
         print(json.dumps([x.to_dict() for x in schedules], indent=2))
