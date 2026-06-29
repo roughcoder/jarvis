@@ -11,7 +11,8 @@ def test_homebrew_formula_helper_writes_non_recursive_wrapper() -> None:
 
     assert 'ENV[\\"UV_PYTHON\\"]' not in text
     assert "'      #!/usr/bin/env bash'" in text
-    assert 'exec "#{libexec}/.venv/bin/python" -m jarvis.cli "$@"' in text
+    assert 'export UV_PROJECT="#{libexec}"' in text
+    assert 'exec "#{formula_opt_bin("uv")}/uv" run python -m jarvis.cli "$@"' in text
     assert 'uv" run --no-sync jarvis "$@"' not in text
 
 
