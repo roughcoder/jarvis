@@ -93,9 +93,19 @@ def sync_role_dependencies(
 ) -> subprocess.CompletedProcess[str]:
     """Sync optional runtime dependencies needed by the selected roles."""
     args = uv_sync_args_for_roles(roles)
+    env = os.environ.copy()
+    if "UV_PYTHON" not in env:
+        for candidate in (
+            "/opt/homebrew/opt/python@3.12/bin/python3.12",
+            "/usr/local/opt/python@3.12/bin/python3.12",
+        ):
+            if Path(candidate).is_file():
+                env["UV_PYTHON"] = candidate
+                break
     return subprocess.run(
         [_find_uv(), *args],
         cwd=cwd,
+        env=env,
         check=False,
         text=True,
     )

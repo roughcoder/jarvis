@@ -15,6 +15,7 @@ from jarvis.deploy import (
     render_service,
     role_extras,
     service_control_argv,
+    sync_role_dependencies,
     summarize_bringup_evidence,
     upsert_brain_device_entry,
     uv_sync_args_for_roles,
@@ -60,6 +61,30 @@ def test_uv_sync_args_for_roles_are_packaged_install_safe() -> None:
         "worker",
         "browser",
     ]
+
+
+def test_sync_role_dependencies_prefers_homebrew_python(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    monkeypatch.delenv("UV_PYTHON", raising=False)
+    monkeypatch.setattr("jarvis.deploy._find_uv", lambda: "/opt/homebrew/bin/uv")
+    monkeypatch.setattr(
+        "jarvis.deploy.Path.is_file",
+        lambda self: str(self) == "/opt/homebrew/opt/python@3.12/bin/python3.12",
+    )
+
+    def fake_run(argv, *, cwd, env, check, text):
+        calls.append({"argv": argv, "cwd": cwd, "env": env, "check": check, "text": text})
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr("jarvis.deploy.subprocess.run", fake_run)
+
+    sync_role_dependencies(["worker"])
+
+    assert calls
+    env = calls[0]["env"]
+    assert isinstance(env, dict)
+    assert env["UV_PYTHON"] == "/opt/homebrew/opt/python@3.12/bin/python3.12"
 
 
 def test_render_launchd_service_uses_jarvis_command_not_uv() -> None:
