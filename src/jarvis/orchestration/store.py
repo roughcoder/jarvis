@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import pathlib
+import re
 
 from jarvis.orchestration.models import (
     Artifact,
@@ -15,6 +18,15 @@ from jarvis.orchestration.models import (
 )
 
 
+_RUN_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+class ActiveWorkItemError(RuntimeError):
+    def __init__(self, owner: OrchestrationRun) -> None:
+        super().__init__(f"work item is already owned by {owner.run_id}")
+        self.owner = owner
+
+
 class OrchestrationStore:
     """File-backed run graph store.
 
@@ -26,9 +38,16 @@ class OrchestrationStore:
         self.root = pathlib.Path(root).expanduser()
         self.runs_dir = self.root / "runs"
         self.runs_dir.mkdir(parents=True, exist_ok=True)
+        self._lock_path = self.root / ".lock"
 
     def run_dir(self, run_id: str) -> pathlib.Path:
-        return self.runs_dir / run_id
+        if not _RUN_ID.fullmatch(run_id):
+            raise ValueError(f"invalid run id {run_id!r}")
+        root = self.runs_dir.resolve()
+        path = (self.runs_dir / run_id).resolve(strict=False)
+        if not path.is_relative_to(root):
+            raise ValueError(f"run id escapes orchestration store: {run_id!r}")
+        return path
 
     def run_path(self, run_id: str) -> pathlib.Path:
         return self.run_dir(run_id) / "run.json"
@@ -43,23 +62,29 @@ class OrchestrationStore:
         work_items: list[WorkItem] | None = None,
         parent_run_id: str | None = None,
     ) -> OrchestrationRun:
-        run = OrchestrationRun(
-            run_id=new_id("run"),
-            objective=objective,
-            parent_run_id=parent_run_id,
-            work_items=[
-                WorkItemLink(item=item, role="primary" if i == 0 else "related")
-                for i, item in enumerate(work_items or [])
-            ],
-        )
-        self.save(run)
-        self.append_event(run.run_id, "run_created", f"Created run: {objective}")
-        if parent_run_id:
-            parent = self.get(parent_run_id)
-            if parent and run.run_id not in parent.child_run_ids:
-                parent.child_run_ids.append(run.run_id)
-                parent.updated_at = utc_now()
-                self.save(parent)
+        items = work_items or []
+        with self._locked():
+            if items:
+                owner = self._active_primary_owner_unlocked(items[0])
+                if owner is not None:
+                    raise ActiveWorkItemError(owner)
+            run = OrchestrationRun(
+                run_id=new_id("run"),
+                objective=objective,
+                parent_run_id=parent_run_id,
+                work_items=[
+                    WorkItemLink(item=item, role="primary" if i == 0 else "related")
+                    for i, item in enumerate(items)
+                ],
+            )
+            self.save(run)
+            self.append_event(run.run_id, "run_created", f"Created run: {objective}")
+            if parent_run_id:
+                parent = self.get(parent_run_id)
+                if parent and run.run_id not in parent.child_run_ids:
+                    parent.child_run_ids.append(run.run_id)
+                    parent.updated_at = utc_now()
+                    self.save(parent)
         return run
 
     def save(self, run: OrchestrationRun) -> None:
@@ -69,7 +94,10 @@ class OrchestrationStore:
         self.run_path(run.run_id).write_text(json.dumps(run.to_dict(), indent=2, sort_keys=True))
 
     def get(self, run_id: str) -> OrchestrationRun | None:
-        p = self.run_path(run_id)
+        try:
+            p = self.run_path(run_id)
+        except ValueError:
+            return None
         if not p.exists():
             matches = [x for x in self.runs_dir.glob(f"{run_id}*") if (x / "run.json").exists()]
             if len(matches) == 1:
@@ -101,7 +129,10 @@ class OrchestrationStore:
         return event
 
     def events(self, run_id: str) -> list[RunEvent]:
-        p = self.events_path(run_id)
+        try:
+            p = self.events_path(run_id)
+        except ValueError:
+            return []
         if not p.exists():
             return []
         events: list[RunEvent] = []
@@ -156,6 +187,10 @@ class OrchestrationStore:
         return run
 
     def active_primary_owner(self, item: WorkItem) -> OrchestrationRun | None:
+        with self._locked():
+            return self._active_primary_owner_unlocked(item)
+
+    def _active_primary_owner_unlocked(self, item: WorkItem) -> OrchestrationRun | None:
         for run in self.list_runs():
             if run.status == "terminal":
                 continue
@@ -163,6 +198,16 @@ class OrchestrationStore:
                 if link.role == "primary" and _same_work_item(link.item, item):
                     return run
         return None
+
+    @contextlib.contextmanager
+    def _locked(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        with self._lock_path.open("a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def _same_work_item(left: WorkItem, right: WorkItem) -> bool:
