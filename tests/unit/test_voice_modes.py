@@ -505,6 +505,22 @@ def test_failed_timer_tool_opens_for_common_duration_clarification_without_marke
         assert result.close_reason == "reply_followup_expected"
 
 
+def test_default_mode_opens_for_followup_question_after_colon_or_dash() -> None:
+    sess = _session(DEFAULT_MODE)
+
+    for raw in (
+        "I need one more detail: what time should I set it for?",
+        "I need one more detail - what time should I set it for?",
+    ):
+        result = TurnResult(raw=raw)
+
+        sess.finalize("set an alarm", result)
+
+        assert result.ended is False
+        assert result.continue_listening is True
+        assert result.close_reason == "reply_followup_expected"
+
+
 def test_voice_lifecycle_writes_trace_metadata() -> None:
     sess = _session(DEFAULT_MODE)
     result = TurnResult(raw="Could you try again?")
