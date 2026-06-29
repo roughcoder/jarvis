@@ -870,7 +870,18 @@ def _print_items(items) -> None:  # noqa: ANN001
         print(f"{item.source}:{item.id:<8} {meta:<36} {item.title}")
         if item.url:
             print(f"            {item.url}")
-    print("Next: use `jarvis work next` to select one, or add `--start --worker <worker_id>` to dispatch.")
+    print(f"Next: use `{_work_next_hint(source, repo)}` to select one, or add `--start --worker <worker_id>` to dispatch.")
+
+
+def _work_next_hint(source: str, repo: str) -> str:
+    import shlex
+
+    parts = ["jarvis", "work", "next"]
+    if source in {"github", "linear"}:
+        parts.extend(["--source", source])
+    if repo and repo != "<unset>":
+        parts.extend(["--repo", repo])
+    return " ".join(shlex.quote(part) for part in parts)
 
 
 def _format_pr_comments_summary(comments: list[dict], *, repo: str, number: int) -> str:
@@ -907,7 +918,7 @@ def _comment_author(comment: dict) -> str:
 
 def _format_pr_comment_line(comment: dict) -> str:
     body = str(comment.get("body") or "").strip().splitlines()
-    preview = body[0].strip() if body else "<empty>"
+    preview = _terminal_safe(body[0].strip()) if body else "<empty>"
     if len(preview) > 120:
         preview = preview[:117] + "..."
     location = "top-level"
@@ -919,6 +930,13 @@ def _format_pr_comment_line(comment: dict) -> str:
     url = comment.get("url") or comment.get("html_url") or ""
     suffix = f" ({url})" if url else ""
     return f"{_comment_author(comment)} at {location}: {preview}{suffix}"
+
+
+def _terminal_safe(text: str) -> str:
+    return "".join(
+        ch if (ch == "\t" or (ord(ch) >= 32 and ord(ch) != 127 and not 0x80 <= ord(ch) <= 0x9F)) else "?"
+        for ch in text
+    )
 
 
 def _parse_weekdays(text: str) -> list[int]:
