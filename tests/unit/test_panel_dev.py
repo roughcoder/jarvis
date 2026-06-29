@@ -9,6 +9,7 @@ import time
 from jarvis import __version__
 from jarvis.config import IntercomDeviceConfig
 from jarvis.intercom.panel_dev import (
+    DEFAULT_SLEEP_AFTER_S,
     PANEL_STATES,
     PanelStateStore,
     PreviewConfig,
@@ -31,6 +32,27 @@ def test_panel_preview_renders_every_voice_state() -> None:
     assert ".brow {" in html
     assert "--brow-left-rot" in html
     assert "--brow-right-rot" in html
+
+
+def test_panel_preview_auto_sleeps_from_idle_after_timeout() -> None:
+    html = render_panel_preview_html()
+
+    assert DEFAULT_SLEEP_AFTER_S == 90.0
+    assert "const sleepAfterMs = 90000;" in html
+    assert "let autoSleepActive = false;" in html
+    assert "scheduleAutoSleep(next);" in html
+    assert 'if (activeState === "idle")' in html
+    assert 'setTimeout(() => setState("sleep", { autoSleep: true }), sleepAfterMs)' in html
+    assert 'if (autoSleepActive && payload.state === "idle") return;' in html
+    assert "if (!options.remote && !options.autoSleep)" in html
+
+
+def test_panel_preview_sleep_timeout_can_be_overridden_and_is_clamped() -> None:
+    html = render_panel_preview_html(PreviewConfig(sleep_after_s=12))
+    clamped = render_panel_preview_html(PreviewConfig(sleep_after_s=1))
+
+    assert "const sleepAfterMs = 12000;" in html
+    assert "const sleepAfterMs = 5000;" in clamped
 
 
 def test_panel_preview_state_contract_matches_runtime_panel() -> None:

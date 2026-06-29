@@ -392,7 +392,7 @@ class IntercomDeviceConfig(_Base):
     pi_panel_geometry: str = ""
     pi_panel_url: str = ""
     eyes: str = "auto"
-    eyes_sleep_after_s: float = 25.0
+    eyes_sleep_after_s: float = 90.0
 
     @property
     def pi_panel_setting(self) -> str:
