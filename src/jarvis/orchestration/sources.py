@@ -43,7 +43,8 @@ class GitHubWorkSource:
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "gh issue list failed")
         data = json.loads(result.stdout or "[]")
-        return [_issue_to_item(x, repo) for x in data]
+        item_repo = repo or (self._current_repo() if data else "")
+        return [_issue_to_item(x, item_repo) for x in data]
 
     def next(self, *, repo: str = "", filters: dict | None = None) -> WorkItem | None:
         items = self.list(repo=repo, filters=filters, limit=10)
