@@ -164,6 +164,9 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             out = await take_screenshot(shots, args.get("name"), cfg.shell_timeout_s)
             return web.json_response({"ok": True, "output": out})
         if action == "code":
+            policy_error = _code_policy_error(args)
+            if policy_error:
+                return web.json_response({"ok": False, "error": policy_error}, status=403)
             agent = args.get("agent") or cfg.agent
             argv = code_argv(agent, cfg.codex_bin, cfg.claude_bin, args.get("prompt", ""))
             label = args.get("prompt", "")[:80] or agent
@@ -257,6 +260,24 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 cleaned.append(j.name)
             return web.json_response({"ok": True, "cleaned": cleaned})
         return web.json_response({"error": f"unknown action {action!r}"}, status=400)
+
+    def _code_policy_error(args: dict) -> str:
+        envelope = args.get("execution_envelope")
+        if envelope is None:
+            return ""
+        if not isinstance(envelope, dict):
+            return "execution_envelope must be an object"
+        allowed_actions = set(envelope.get("allowed_actions") or [])
+        if "worker.job.start" not in allowed_actions:
+            return "execution envelope does not allow worker.job.start"
+        landing = envelope.get("landing") or {}
+        if not isinstance(landing, dict):
+            return "execution envelope landing policy must be an object"
+        if landing.get("allow_merge") is True:
+            return "execution envelope cannot allow merge at worker dispatch"
+        if landing.get("mode") in {"merge", "release"}:
+            return "execution envelope landing mode is not allowed at worker dispatch"
+        return ""
 
     async def get_job(request: web.Request) -> web.Response:
         if not authorised(request):

@@ -626,8 +626,11 @@ def _work_source(name: str):  # noqa: ANN202
 def _cmd_work(args: argparse.Namespace) -> int:
     import json
 
+    from jarvis.brain.capabilities import resolve_capabilities
+    from jarvis.orchestration.authority import required_for_command
     from jarvis.orchestration.executor import create_run_and_envelope, start_worker_job
     from jarvis.orchestration.intent import parse_work_command
+    from jarvis.orchestration.store import ActiveWorkItemError
     from jarvis.orchestration.workers import WorkerRegistry
 
     cfg = load_config()
@@ -636,17 +639,32 @@ def _cmd_work(args: argparse.Namespace) -> int:
         print(json.dumps(command.to_dict(), indent=2))
         return 0
 
-    source_name = args.source or "github"
+    source_name = args.source or ""
     command = parse_work_command(" ".join(getattr(args, "phrase", []) or [args.work_action]))
     if source_name:
         command.source = source_name
+    elif command.source == "direct" and args.work_action in {"check", "next"}:
+        command.source = "github"
+        command.kind = "issue"
+    elif args.work_action == "pr-comments":
+        command.source = "github"
+        command.operation = "inspect_pr_comments"
+        command.kind = "pull_request"
     if getattr(args, "worker", ""):
         command.target_worker_id = args.worker
     if getattr(args, "repo", ""):
         command.filters["repo"] = args.repo
     source = _work_source(command.source)
+    capabilities = resolve_capabilities(cfg.capabilities)
+    public_write_mode = cfg.orchestration.landing_mode
 
     if args.work_action == "check":
+        if not _has_orchestration_authority(
+            required_for_command(command.operation, command.source),
+            capabilities,
+            public_write_mode=public_write_mode,
+        ):
+            return 1
         items = source.list(repo=args.repo or cfg.orchestration.default_repo, filters=command.filters, limit=args.limit)
         if args.json:
             print(json.dumps([x.to_dict() for x in items], indent=2))
@@ -658,11 +676,23 @@ def _cmd_work(args: argparse.Namespace) -> int:
         if command.source != "github":
             print("PR comments are currently a GitHub work source operation.")
             return 1
+        if not _has_orchestration_authority(
+            required_for_command(command.operation, command.source),
+            capabilities,
+            public_write_mode=public_write_mode,
+        ):
+            return 1
         comments = source.pr_comments(args.repo or cfg.orchestration.default_repo, args.number)
         print(json.dumps(comments, indent=2) if args.json else f"{len(comments)} comment/review object(s)")
         return 0
 
     if args.work_action == "next":
+        if not _has_orchestration_authority(
+            required_for_command(command.operation, command.source),
+            capabilities,
+            public_write_mode=public_write_mode,
+        ):
+            return 1
         item = source.next(repo=args.repo or cfg.orchestration.default_repo, filters=command.filters)
         if item is None:
             print("No eligible work item found.")
@@ -675,18 +705,28 @@ def _cmd_work(args: argparse.Namespace) -> int:
         if not args.start:
             print(json.dumps(item.to_dict(), indent=2) if args.json else _format_item(item))
             return 0
+        if not _has_orchestration_authority(
+            ["worker.job.start"],
+            capabilities,
+            public_write_mode=public_write_mode,
+        ):
+            return 1
         registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path)
         worker = registry.get(command.target_worker_id, probe=True) if command.target_worker_id else registry.choose(item.capability_requirements)
         if worker is None:
             print("No eligible worker found.")
             return 1
-        envelope = create_run_and_envelope(
-            store=store,
-            command=command,
-            items=[item],
-            worker=worker,
-            landing_mode=cfg.orchestration.landing_mode,
-        )
+        try:
+            envelope = create_run_and_envelope(
+                store=store,
+                command=command,
+                items=[item],
+                worker=worker,
+                landing_mode=cfg.orchestration.landing_mode,
+            )
+        except ActiveWorkItemError as exc:
+            print(f"{item.source}:{item.id} is already owned by {exc.owner.run_id} ({exc.owner.phase}).")
+            return 0
         job = start_worker_job(envelope, worker_cfg=cfg.worker, worker=worker, store=store)
         print(f"Started {envelope.run_id} on {worker.worker_id}: worker job {job.job_id}")
         if job.branch:
@@ -704,6 +744,25 @@ def _cmd_work(args: argparse.Namespace) -> int:
 
     print(f"Unknown work action {args.work_action!r}.")
     return 1
+
+
+def _has_orchestration_authority(
+    actions: list[str],
+    capabilities: set[str],
+    *,
+    public_write_mode: str,
+) -> bool:
+    from jarvis.orchestration.authority import allowed
+
+    denied = [
+        action
+        for action in actions
+        if not allowed(action, capabilities, public_write_mode=public_write_mode)
+    ]
+    if denied:
+        print(f"Missing orchestration capability: {', '.join(denied)}")
+        return False
+    return True
 
 
 def _format_item(item) -> str:  # noqa: ANN001
@@ -741,22 +800,33 @@ def _cmd_schedules(args: argparse.Namespace) -> int:
     cfg = load_config()
     store = ScheduleStore(cfg.orchestration.schedules_path)
     if args.schedule_action == "add":
-        hh, mm = [int(x) for x in args.at.split(":", 1)]
+        try:
+            hh, mm = [int(x) for x in args.at.split(":", 1)]
+        except ValueError:
+            print("Schedule time must be HH:MM.")
+            return 1
         command = parse_work_command(" ".join(args.phrase))
-        schedule = store.add(
-            args.name or " ".join(args.phrase),
-            command,
-            hour=hh,
-            minute=mm,
-            weekdays=_parse_weekdays(args.weekdays),
-            timezone=args.timezone or cfg.orchestration.default_timezone,
-            mode=args.mode,
-        )
+        try:
+            schedule = store.add(
+                args.name or " ".join(args.phrase),
+                command,
+                hour=hh,
+                minute=mm,
+                weekdays=_parse_weekdays(args.weekdays),
+                timezone=args.timezone or cfg.orchestration.default_timezone,
+                mode=args.mode,
+            )
+        except ValueError as exc:
+            print(f"Invalid schedule: {exc}")
+            return 1
         print(f"Added {schedule.schedule_id}: {schedule.name}")
         return 0
     if args.schedule_action == "tick":
         now = datetime.fromisoformat(args.now) if args.now else datetime.now().astimezone()
         due = store.due(now)
+        if args.ack:
+            for schedule in due:
+                store.ack(schedule.schedule_id, now)
         print(json.dumps([x.to_dict() for x in due], indent=2) if args.json else f"{len(due)} schedule(s) due")
         return 0
     schedules = store.list()
@@ -1785,14 +1855,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_work_intent.set_defaults(func=_cmd_work)
     p_work_check = work_sub.add_parser("check", help="List work items from a source")
     p_work_check.add_argument("phrase", nargs="*", help="Optional natural-language filter phrase")
-    p_work_check.add_argument("--source", choices=["github", "linear"], default="github")
+    p_work_check.add_argument("--source", choices=["github", "linear"], default="")
     p_work_check.add_argument("--repo", default="", help="Repository, e.g. roughcoder/jarvis")
     p_work_check.add_argument("--limit", type=int, default=10)
     p_work_check.add_argument("--json", action="store_true")
     p_work_check.set_defaults(func=_cmd_work)
     p_work_next = work_sub.add_parser("next", help="Select the next eligible work item")
     p_work_next.add_argument("phrase", nargs="*", help="Optional natural-language filter phrase")
-    p_work_next.add_argument("--source", choices=["github", "linear"], default="github")
+    p_work_next.add_argument("--source", choices=["github", "linear"], default="")
     p_work_next.add_argument("--repo", default="", help="Repository, e.g. roughcoder/jarvis")
     p_work_next.add_argument("--worker", default="", help="Explicit worker_id target")
     p_work_next.add_argument("--start", action="store_true", help="Start a worker job for the selected item")
@@ -1801,12 +1871,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_pr_comments = work_sub.add_parser("pr-comments", help="Inspect GitHub PR review/comment objects")
     p_pr_comments.add_argument("number", type=int)
     p_pr_comments.add_argument("--repo", default="", help="Repository, e.g. roughcoder/jarvis")
-    p_pr_comments.add_argument("--source", choices=["github"], default="github")
+    p_pr_comments.add_argument("--source", choices=["github"], default="")
     p_pr_comments.add_argument("--json", action="store_true")
     p_pr_comments.set_defaults(func=_cmd_work)
     p_work_resume = work_sub.add_parser("resume", help="Show a run to resume or inspect")
     p_work_resume.add_argument("run_id")
-    p_work_resume.add_argument("--source", default="jarvis")
+    p_work_resume.add_argument("--source", default="")
     p_work_resume.set_defaults(func=_cmd_work)
 
     p_schedules = sub.add_parser("schedules", help="List/add/tick scheduled WorkCommands")
@@ -1824,6 +1894,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sched_add.set_defaults(func=_cmd_schedules)
     p_sched_tick = sched_sub.add_parser("tick", help="Return schedules due at the current/simulated minute")
     p_sched_tick.add_argument("--now", default="", help="ISO datetime for deterministic checks")
+    p_sched_tick.add_argument("--ack", action="store_true", help="Mark returned schedules fired after the caller handled them")
     p_sched_tick.add_argument("--json", action="store_true")
     p_sched_tick.set_defaults(func=_cmd_schedules)
     p_schedules.set_defaults(func=_cmd_schedules, schedule_action="list", json=False)

@@ -76,6 +76,30 @@ def test_daemon_code_dispatch_runs_a_job() -> None:
     assert len(listed["jobs"]) >= 1
 
 
+def test_daemon_rejects_orchestration_code_job_without_start_action(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path), codex_bin="echo")
+
+    async def calls(base, c):  # noqa: ANN001
+        return await c.post(
+            base + "/run",
+            json={
+                "action": "code",
+                "args": {
+                    "prompt": "hello-job",
+                    "execution_envelope": {
+                        "run_id": "run_1",
+                        "allowed_actions": [],
+                        "landing": {"mode": "draft_pr", "allow_merge": False},
+                    },
+                },
+            },
+        )
+
+    response = asyncio.run(_with_server(cfg, 8814, calls))
+    assert response.status_code == 403
+    assert "worker.job.start" in response.json()["error"]
+
+
 def test_no_repo_jobs_get_isolated_run_dirs(tmp_path) -> None:
     cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path), codex_bin="echo")
 

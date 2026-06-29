@@ -33,6 +33,7 @@ def start_worker_job(
         "agent": envelope.engine,
         "prompt": envelope.prompt,
         "name": envelope.branch_name.rsplit("/", 1)[-1] or envelope.run_id,
+        "execution_envelope": envelope.to_dict(),
     }
     if envelope.repo:
         args["repo"] = envelope.repo

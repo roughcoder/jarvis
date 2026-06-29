@@ -4,7 +4,7 @@ import json
 import pathlib
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from jarvis.orchestration.models import WorkCommand, new_id
 
@@ -32,6 +32,14 @@ class Schedule:
     policy: SchedulePolicy = field(default_factory=SchedulePolicy)
     last_fired_date: str = ""
 
+    def __post_init__(self) -> None:
+        _validate_time(self.hour, self.minute)
+        _validate_weekdays(self.weekdays)
+        try:
+            ZoneInfo(self.timezone)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError(f"unknown timezone {self.timezone!r}") from exc
+
     @classmethod
     def from_dict(cls, data: dict) -> Schedule:
         return cls(
@@ -57,7 +65,10 @@ class Schedule:
     def due(self, now: datetime) -> bool:
         if not self.enabled:
             return False
-        local = now.astimezone(ZoneInfo(self.timezone))
+        try:
+            local = now.astimezone(ZoneInfo(self.timezone))
+        except Exception:
+            return False
         if local.weekday() not in self.weekdays:
             return False
         if local.hour != self.hour or local.minute != self.minute:
@@ -81,7 +92,13 @@ class ScheduleStore:
             raw = json.loads(self.path.read_text())
         except (OSError, json.JSONDecodeError):
             return []
-        return [Schedule.from_dict(x) for x in raw.get("schedules", [])]
+        schedules: list[Schedule] = []
+        for item in raw.get("schedules", []):
+            try:
+                schedules.append(Schedule.from_dict(item))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return schedules
 
     def save_all(self, schedules: list[Schedule]) -> None:
         self.path.write_text(
@@ -115,11 +132,30 @@ class ScheduleStore:
         return schedule
 
     def due(self, now: datetime) -> list[Schedule]:
+        return [x for x in self.list() if x.due(now)]
+
+    def ack(self, schedule_id: str, now: datetime) -> Schedule | None:
         schedules = self.list()
-        due = [x for x in schedules if x.due(now)]
-        if due:
-            for schedule in schedules:
-                if any(schedule.schedule_id == x.schedule_id for x in due):
-                    schedule.mark_fired(now)
+        acked: Schedule | None = None
+        for schedule in schedules:
+            if schedule.schedule_id == schedule_id:
+                schedule.mark_fired(now)
+                acked = schedule
+                break
+        if acked is not None:
             self.save_all(schedules)
-        return due
+        return acked
+
+
+def _validate_time(hour: int, minute: int) -> None:
+    if hour < 0 or hour > 23:
+        raise ValueError("hour must be between 0 and 23")
+    if minute < 0 or minute > 59:
+        raise ValueError("minute must be between 0 and 59")
+
+
+def _validate_weekdays(weekdays: list[int]) -> None:
+    if not weekdays:
+        raise ValueError("weekdays must not be empty")
+    if any(day < 0 or day > 6 for day in weekdays):
+        raise ValueError("weekdays must be between 0 and 6")
