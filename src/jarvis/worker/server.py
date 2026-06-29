@@ -246,7 +246,13 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 targets = [j]
             cleaned = []
             for j in targets:
-                await cleanup_job(j.repo, j.cwd, j.branch, cfg.shell_timeout_s)
+                await cleanup_job(
+                    j.repo,
+                    j.cwd,
+                    j.branch,
+                    cfg.shell_timeout_s,
+                    owned_roots=[str(workspace / "runs"), str(workspace / "worktrees")],
+                )
                 jobs.remove(j.id)
                 cleaned.append(j.name)
             return web.json_response({"ok": True, "cleaned": cleaned})

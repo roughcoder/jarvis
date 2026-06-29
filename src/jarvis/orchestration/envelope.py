@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+from jarvis.orchestration.models import (
+    ExecutionEnvelope,
+    LandingPolicy,
+    VerificationPlan,
+    WorkCommand,
+    WorkItem,
+)
+from jarvis.worker.jobs import slugify
+
+
+def build_execution_envelope(
+    *,
+    run_id: str,
+    command: WorkCommand,
+    items: list[WorkItem],
+    worker_id: str,
+    landing_mode: str = "draft_pr",
+    engine: str = "codex",
+) -> ExecutionEnvelope:
+    primary = items[0] if items else WorkItem(source="direct", id=run_id, title=command.filters.get("text", "Direct request"))
+    repo = primary.repo or str(command.filters.get("repo", ""))
+    title = primary.title or command.filters.get("text", "Jarvis work")
+    proof = _task_proof(primary, command)
+    prompt = _prompt(command, items, landing_mode, proof)
+    branch = f"jarvis/{slugify(primary.id + '-' + title)}" if primary.id else f"jarvis/{slugify(title)}"
+    return ExecutionEnvelope(
+        run_id=run_id,
+        repo=repo,
+        prompt=prompt,
+        worker_id=worker_id or command.target_worker_id or "local-worker",
+        engine=engine,
+        branch_name=branch,
+        allowed_actions=["worker.job.start", "forge.write.local"],
+        verification=VerificationPlan(
+            minimum_rung=_minimum_rung(primary),
+            repo_native=True,
+            task_proof=proof,
+        ),
+        landing=LandingPolicy(mode=landing_mode),
+    )
+
+
+def _minimum_rung(item: WorkItem) -> str:
+    labels = {x.lower() for x in item.labels}
+    text = f"{item.title} {item.body}".lower()
+    if "ui" in labels or "browser" in labels or "frontend" in labels or "browser" in text:
+        return "real_app_exercise"
+    if "api" in labels or "service" in labels:
+        return "integration"
+    if "docs" in labels or item.kind == "documentation":
+        return "static"
+    return "repo_native"
+
+
+def _task_proof(item: WorkItem, command: WorkCommand) -> str:
+    if command.kind == "pull_request" or "comment" in command.operation:
+        return "Inspect the PR review comments, address only actionable feedback, and report which comments were fixed or left for human review."
+    if _minimum_rung(item) == "real_app_exercise":
+        return "Boot the app and verify the changed flow in a real browser. Report the URL, interaction path, observed result, and known gaps."
+    return "Use the repository's own tests, lint, and documentation guidance before claiming completion. Report commands run, observed behavior, and known gaps."
+
+
+def _prompt(command: WorkCommand, items: list[WorkItem], landing_mode: str, task_proof: str) -> str:
+    lines = [
+        "You are working inside Jarvis's isolated worker job.",
+        "Follow the target repository's AGENTS.md, README, and nearby docs before editing.",
+        f"Operation: {command.operation}",
+        f"Landing policy: {landing_mode}. Do not merge or release.",
+        "",
+        "Work items:",
+    ]
+    for item in items:
+        lines.extend(
+            [
+                f"- {item.source}:{item.id} {item.title}",
+                f"  URL: {item.url or '<none>'}",
+                f"  Status: {item.status or '<unknown>'}",
+                f"  Body: {item.body[:1200] if item.body else '<none>'}",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "Verification:",
+            task_proof,
+            "",
+            "Final report:",
+            "Summarize changed files, verification evidence, branch/PR status, and known gaps.",
+        ]
+    )
+    return "\n".join(lines)

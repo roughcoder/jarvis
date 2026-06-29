@@ -1,0 +1,266 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime
+
+import pytest
+
+from jarvis.config import WorkerConfig
+from jarvis.orchestration.authority import allowed
+from jarvis.orchestration.campaign import CampaignPolicy, create_campaign
+from jarvis.orchestration.envelope import build_execution_envelope
+from jarvis.orchestration.executor import start_worker_job
+from jarvis.orchestration.intent import parse_work_command
+from jarvis.orchestration.models import WorkCommand, WorkItem
+from jarvis.orchestration.schedules import ScheduleStore
+from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource
+from jarvis.orchestration.store import OrchestrationStore
+from jarvis.orchestration.workers import WorkerRegistry
+
+
+def _item(**kw) -> WorkItem:  # noqa: ANN003
+    data = {
+        "source": "github",
+        "id": "#1",
+        "title": "Fix the worker",
+        "repo": "roughcoder/jarvis",
+        "url": "https://github.com/roughcoder/jarvis/issues/1",
+    }
+    data.update(kw)
+    return WorkItem(**data)
+
+
+def test_run_graph_persists_run_and_events(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Fix worker status", work_items=[_item()])
+    store.set_phase(run.run_id, "running", "Started")
+
+    reloaded = store.get(run.run_id)
+    assert reloaded is not None
+    assert reloaded.phase == "running"
+    assert reloaded.work_items[0].item.id == "#1"
+    assert [e.type for e in store.events(run.run_id)] == ["run_created", "phase_changed"]
+
+
+def test_active_primary_owner_prevents_duplicate_work(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    item = _item(id="#2")
+    run = store.create_run("first", work_items=[item])
+    assert store.active_primary_owner(item).run_id == run.run_id
+    store.set_phase(run.run_id, "done", "complete")
+    assert store.active_primary_owner(item) is None
+
+
+def test_worker_registry_redacts_private_connection_details(monkeypatch) -> None:  # noqa: ANN001
+    class Response:
+        def __init__(self, data):
+            self._data = data
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self._data
+
+    def fake_get(url, **_kw):  # noqa: ANN001
+        if url.endswith("/health"):
+            return Response({"ok": True, "agent": "codex"})
+        return Response({"jobs": [{"status": "running"}, {"status": "done"}]})
+
+    cfg = WorkerConfig(_env_file=None, token="secret", host="private-host", port=9999)
+    reg = WorkerRegistry(cfg, http_get=fake_get)
+    public = reg.profiles(probe=True)[0].public()
+
+    assert public["worker_id"] == "local-worker"
+    assert public["status"] == "online"
+    assert public["capacity"]["current_jobs"] == 1
+    assert "private-host" not in json.dumps(public)
+    assert "secret" not in json.dumps(public)
+
+
+def test_worker_registry_accepts_list_profile_file(tmp_path) -> None:
+    path = tmp_path / "workers.json"
+    path.write_text(json.dumps([{"worker_id": "hive-worker", "display_name": "Hive"}]))
+    reg = WorkerRegistry(WorkerConfig(_env_file=None), profiles_path=str(path))
+
+    assert reg.profiles()[0].worker_id == "hive-worker"
+
+
+@pytest.mark.parametrize(
+    ("phrase", "operation", "source", "start"),
+    [
+        ("check the github issues", "inspect_work", "github", False),
+        ("get the next linear ticket", "start_next_work", "linear", True),
+        ("fix PR comments", "start_selected_work", "github", True),
+        ("what's running", "inspect_runs", "jarvis", False),
+        ("resume that ticket", "resume_run", "jarvis", False),
+    ],
+)
+def test_parse_work_command_initial_phrases(phrase: str, operation: str, source: str, start: bool) -> None:
+    cmd = parse_work_command(phrase)
+    assert cmd.operation == operation
+    assert cmd.source == source
+    assert cmd.start is start
+
+
+def test_github_source_normalizes_issues() -> None:
+    class Result:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps(
+            [
+                {
+                    "number": 7,
+                    "title": "Bug",
+                    "url": "https://example/7",
+                    "body": "body",
+                    "labels": [{"name": "bug"}],
+                    "assignees": [{"login": "neil"}],
+                    "state": "OPEN",
+                    "updatedAt": "now",
+                }
+            ]
+        )
+
+    seen = []
+
+    def runner(args):
+        seen.extend(args)
+        return Result()
+
+    items = GitHubWorkSource(runner).list(repo="roughcoder/jarvis", filters={"label": "bug", "assignee": "me"})
+    assert items[0].id == "#7"
+    assert items[0].labels == ["bug"]
+    assert "--repo" in seen and "roughcoder/jarvis" in seen
+    assert "--assignee" in seen and "@me" in seen
+
+
+def test_linear_source_normalizes_items() -> None:
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {
+                "data": {
+                    "issues": {
+                        "nodes": [
+                            {
+                                "id": "uuid-1",
+                                "identifier": "ENG-1",
+                                "title": "Build it",
+                                "description": "Do work",
+                                "url": "https://linear/ENG-1",
+                                "priorityLabel": "High",
+                                "updatedAt": "now",
+                                "state": {"name": "Ready"},
+                                "assignee": {"name": "Neil"},
+                                "labels": {"nodes": [{"name": "bug"}]},
+                            }
+                        ]
+                    }
+                }
+            }
+
+    items = LinearWorkSource("token", post=lambda *_a, **_kw: Response()).list(repo="roughcoder/jarvis")
+    assert items[0].source == "linear"
+    assert items[0].id == "ENG-1"
+    assert items[0].source_internal_id == "uuid-1"
+    assert items[0].labels == ["bug"]
+
+
+def test_execution_envelope_uses_natural_language_verification() -> None:
+    item = _item(title="Fix browser flow", labels=["browser"])
+    envelope = build_execution_envelope(
+        run_id="run_1",
+        command=WorkCommand("start_next_work", source="github", start=True),
+        items=[item],
+        worker_id="macbook-worker",
+    )
+    assert envelope.worker_id == "macbook-worker"
+    assert envelope.verification.minimum_rung == "real_app_exercise"
+    assert "real browser" in envelope.verification.task_proof
+    assert "Do not merge or release" in envelope.prompt
+
+
+def test_start_worker_job_links_run_graph(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Start work")
+    envelope = build_execution_envelope(
+        run_id=run.run_id,
+        command=WorkCommand("start_next_work", source="github", start=True),
+        items=[_item()],
+        worker_id="local-worker",
+    )
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {"ok": True, "job_id": "job123", "status": "running", "branch": "jarvis/x"}
+
+    job = start_worker_job(
+        envelope,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1, token=""),
+        store=store,
+        post=lambda *_a, **_kw: Response(),
+    )
+
+    assert job.job_id == "job123"
+    assert store.get(run.run_id).jobs[0].job_id == "job123"  # type: ignore[union-attr]
+
+
+def test_schedules_fire_once_per_local_day(tmp_path) -> None:
+    store = ScheduleStore(str(tmp_path / "schedules.json"))
+    schedule = store.add(
+        "Daily issue",
+        WorkCommand("start_next_work", source="github", start=True),
+        hour=9,
+        minute=0,
+        weekdays=[0],
+        timezone="Europe/London",
+    )
+    assert schedule.schedule_id
+    due = store.due(datetime.fromisoformat("2026-06-29T09:00:00+01:00"))
+    assert len(due) == 1
+    assert store.due(datetime.fromisoformat("2026-06-29T09:00:30+01:00")) == []
+
+
+def test_campaign_creates_bounded_child_runs(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    parent = create_campaign(
+        store,
+        objective="Clear bugs",
+        candidates=[_item(id="#1"), _item(id="#2"), _item(id="#3")],
+        policy=CampaignPolicy(max_items=2),
+    )
+
+    assert len(parent.child_run_ids) == 2
+    assert all(store.get(child_id) is not None for child_id in parent.child_run_ids)
+
+
+def test_authority_does_not_grant_public_writes_by_config() -> None:
+    assert allowed("work.github.issues.read", set()) is False
+    assert allowed("work.github.issues.read", {"owner.full"}) is True
+    assert allowed("forge.github.pr.create", {"owner.full"}) is False
+    assert allowed("forge.github.pr.create", {"forge.github.pr.create"}) is True
+
+
+def test_cli_runs_and_work_intent_smoke(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / ".env"))
+
+    assert main(["runs", "--create", "Smoke run"]) == 0
+    out = capsys.readouterr().out
+    assert "Created run_" in out
+
+    assert main(["runs"]) == 0
+    assert "Smoke run" in capsys.readouterr().out
+
+    assert main(["work", "intent", "get", "the", "next", "linear", "ticket"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["operation"] == "start_next_work"
+    assert data["source"] == "linear"

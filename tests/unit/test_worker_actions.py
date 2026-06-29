@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 
-from jarvis.worker.actions import code_argv, run_exec, run_shell
+from jarvis.worker.actions import cleanup_job, code_argv, prepare_worktree, run_exec, run_shell
 from jarvis.worker.jobs import JobManager
 
 
@@ -111,6 +111,38 @@ def test_slugify_makes_readable_handles() -> None:
 
     assert slugify("Polymarket Refactor!") == "polymarket-refactor"
     assert slugify("") == "job"
+
+
+def test_prepare_worktree_copies_non_git_inputs_to_scratch(tmp_path) -> None:
+    src = tmp_path / "input"
+    src.mkdir()
+    (src / "note.txt").write_text("original")
+    worktrees = tmp_path / "worker" / "worktrees"
+
+    cwd, branch, err = asyncio.run(
+        prepare_worktree(str(src), str(worktrees), "plain-dir", "jarvis", 5)
+    )
+
+    assert err is None
+    assert branch is None
+    assert cwd is not None and cwd != str(src)
+    assert "/worktrees/" in cwd and cwd.endswith("-scratch")
+    copied = tmp_path / cwd
+    assert (copied / "note.txt").read_text() == "original"
+    (copied / "note.txt").write_text("changed")
+    assert (src / "note.txt").read_text() == "original"
+
+
+def test_cleanup_refuses_non_worker_owned_paths(tmp_path) -> None:
+    user_dir = tmp_path / "user-owned"
+    user_dir.mkdir()
+    (user_dir / "keep.txt").write_text("keep")
+    owned = tmp_path / "worker" / "runs"
+
+    out = asyncio.run(cleanup_job("", str(user_dir), None, 5, owned_roots=[str(owned)]))
+
+    assert out.startswith("refused")
+    assert (user_dir / "keep.txt").exists()
 
 
 def test_jobs_named_and_findable() -> None:

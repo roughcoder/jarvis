@@ -184,30 +184,59 @@ async def prepare_worktree(
 ) -> tuple[str | None, str | None, str | None]:
     """Isolate a repo job. For a git repo, create a fresh worktree on a new branch
     off HEAD and return (worktree_path, branch, None) — the job edits there, never
-    the user's checkout. For a non-git directory, return (repo, None, None) (run in
-    place; there's no working tree to protect). On failure to isolate a real repo,
-    return (None, None, error) so the caller refuses rather than touching HEAD."""
+    the user's checkout. For a non-git directory, copy it into worker-owned scratch
+    and run there. On failure to isolate a real repo, return (None, None, error) so
+    the caller refuses rather than touching HEAD."""
     inside = await run_exec(["git", "-C", repo, "rev-parse", "--is-inside-work-tree"], None, timeout_s)
-    if inside.strip() != "true":
-        return repo, None, None  # not a git repo — run in the dir as given
     suffix = uuid.uuid4().hex[:6]
+    pathlib.Path(worktrees_dir).mkdir(parents=True, exist_ok=True)
+    if inside.strip() != "true":
+        scratch = pathlib.Path(worktrees_dir) / f"{slug}-{suffix}-scratch"
+        try:
+            shutil.copytree(repo, scratch, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+        except OSError as exc:
+            return None, None, f"error: could not copy non-git input into scratch ({exc})"
+        return str(scratch), None, None
     branch = f"{branch_prefix}/{slug}-{suffix}"
     worktree = str(pathlib.Path(worktrees_dir) / f"{slug}-{suffix}")
-    pathlib.Path(worktrees_dir).mkdir(parents=True, exist_ok=True)
     out = await run_exec(["git", "-C", repo, "worktree", "add", "-b", branch, worktree], None, timeout_s)
     if not pathlib.Path(worktree).exists():
         return None, None, f"error: could not create worktree ({out})"
     return worktree, branch, None
 
 
-async def cleanup_job(repo: str, cwd: str, branch: str | None, timeout_s: float) -> str:
+def _is_under(path: pathlib.Path, roots: list[pathlib.Path]) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path.absolute()
+    for root in roots:
+        try:
+            resolved.relative_to(root.resolve())
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+async def cleanup_job(
+    repo: str,
+    cwd: str,
+    branch: str | None,
+    timeout_s: float,
+    owned_roots: list[str] | None = None,
+) -> str:
     """Tidy a finished job's working area: remove the worktree + delete the branch
-    for a repo job, or delete the scratch dir for a no-repo job."""
+    for a repo job, or delete worker-owned scratch. Never delete arbitrary
+    user-supplied paths."""
     if repo and branch and cwd:
         await run_exec(["git", "-C", repo, "worktree", "remove", "--force", cwd], None, timeout_s)
         await run_exec(["git", "-C", repo, "branch", "-D", branch], None, timeout_s)
         return f"removed worktree + branch {branch}"
     if cwd:
+        roots = [pathlib.Path(p) for p in (owned_roots or []) if p]
+        if roots and not _is_under(pathlib.Path(cwd), roots):
+            return f"refused to remove non-worker-owned path {cwd}"
         shutil.rmtree(cwd, ignore_errors=True)
         return f"removed {cwd}"
     return "nothing to remove"

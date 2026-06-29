@@ -121,6 +121,38 @@ def test_repo_job_isolates_on_a_worktree_branch(tmp_path) -> None:
     assert r["branch"] in branches
 
 
+def test_non_git_repo_input_is_copied_to_worker_scratch(tmp_path) -> None:
+    import pathlib
+
+    user_dir = tmp_path / "plain-input"
+    user_dir.mkdir()
+    (user_dir / "note.txt").write_text("original")
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "ws"), codex_bin="echo")
+
+    async def calls(base, c):  # noqa: ANN001
+        r = (
+            await c.post(
+                base + "/run",
+                json={"action": "code", "args": {"prompt": "x", "name": "plain", "repo": str(user_dir)}},
+            )
+        ).json()
+        await asyncio.sleep(0.3)
+        j = (await c.get(f"{base}/jobs/{r['job_id']}")).json()
+        existed_before_cleanup = pathlib.Path(j["cwd"]).exists()
+        clean = (await c.post(base + "/run", json={"action": "cleanup", "args": {"job": "plain"}})).json()
+        return r, j, existed_before_cleanup, clean
+
+    r, j, existed_before_cleanup, clean = asyncio.run(_with_server(cfg, 8813, calls))
+    assert r["branch"] is None
+    assert j["cwd"] != str(user_dir)
+    assert "/worktrees/" in j["cwd"] and j["cwd"].endswith("-scratch")
+    assert existed_before_cleanup
+    assert (user_dir / "note.txt").read_text() == "original"
+    assert "plain" in clean["cleaned"]
+    assert not pathlib.Path(j["cwd"]).exists()
+    assert user_dir.exists()
+
+
 def test_cleanup_removes_worktree_and_branch(tmp_path) -> None:
     import pathlib
     import subprocess
