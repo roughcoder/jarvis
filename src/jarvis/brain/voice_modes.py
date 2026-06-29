@@ -80,7 +80,8 @@ _SOFT_CLOSE = re.compile(
 _FOLLOWUP_REPLY = re.compile(
     r"(could you|can you|would you|please (tell|say|try|send|show)|"
     r"try again|one more time|what time|which one|who should|where should|"
-    r"when should|when do|where are|where is|do you mean|did you mean|"
+    r"what should|when should|when do|where are|where is|for how long|"
+    r"how long should|do you mean|did you mean|"
     r"tell me (which|what|who|where|when|how)|send (me )?(another|a clearer)|"
     r"better lighting)",
     re.IGNORECASE,
