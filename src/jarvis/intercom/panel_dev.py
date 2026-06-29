@@ -20,6 +20,8 @@ import webbrowser
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
 
+from jarvis import __version__ as JARVIS_VERSION
+
 
 PANEL_STATES = (
     "idle",
@@ -43,6 +45,7 @@ def render_panel_preview_html(cfg: PreviewConfig | None = None) -> str:
     cfg = cfg or PreviewConfig()
     state = cfg.initial_state if cfg.initial_state in PANEL_STATES else "idle"
     states = ",".join(f'"{item}"' for item in PANEL_STATES)
+    version = _escape_html(JARVIS_VERSION)
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -106,6 +109,18 @@ body {{
   align-items: center;
   justify-content: flex-end;
   z-index: 3;
+}}
+
+.version-label {{
+  position: absolute;
+  left: clamp(8px, 2vw, 16px);
+  top: clamp(6px, 1.6vh, 12px);
+  z-index: 4;
+  color: #909b91;
+  font-size: clamp(10px, 2vw, 13px);
+  font-weight: 760;
+  line-height: 1;
+  letter-spacing: 0;
 }}
 
 .state-pill {{
@@ -692,6 +707,7 @@ button[aria-pressed="true"] {{
 </head>
 <body>
 <main class="screen" data-state="{state}">
+  <div class="version-label" aria-label="Jarvis version">v{version}</div>
   <div class="topline">
     <div class="state-pill"><i></i><span id="stateLabel">{state}</span></div>
   </div>
