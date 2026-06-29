@@ -472,3 +472,41 @@ def test_cli_work_start_requires_worker_start_capability(tmp_path, monkeypatch, 
 
     assert cli.main(["work", "next", "--start"]) == 1
     assert "Missing orchestration capability: worker.job.start" in capsys.readouterr().out
+
+
+def test_cli_work_start_rejects_saturated_explicit_worker(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis import cli
+
+    class Source:
+        def next(self, *, repo="", filters=None):  # noqa: ANN001, ANN201
+            return _item(id="#23")
+
+    def fail_start(*_args, **_kwargs):  # noqa: ANN001, ANN202
+        raise AssertionError("worker job should not be started")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / ".env"))
+    monkeypatch.setenv("CAPS_DEFAULT_CAPABILITIES", "work.github.issues.read,worker.job.start")
+    workers_path = tmp_path / "workers.json"
+    workers_path.write_text(
+        json.dumps(
+            [
+                {
+                    "worker_id": "hive-worker",
+                    "display_name": "Hive",
+                    "capabilities": ["git"],
+                    "base_url": "http://worker.invalid",
+                    "max_concurrent_jobs": 1,
+                    "current_jobs": 1,
+                    "status": "online",
+                }
+            ]
+        )
+    )
+    (tmp_path / ".env").write_text(f"ORCHESTRATION_WORKERS_PATH={workers_path}\n")
+    monkeypatch.setattr(cli, "_work_source", lambda _name: Source())
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+    monkeypatch.setattr("jarvis.orchestration.executor.start_worker_job", fail_start)
+
+    assert cli.main(["work", "next", "--start", "--worker", "hive-worker"]) == 1
+    assert "No eligible worker found." in capsys.readouterr().out
