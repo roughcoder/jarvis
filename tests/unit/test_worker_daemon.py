@@ -54,6 +54,24 @@ def test_daemon_health_shell_and_auth(tmp_path) -> None:
     assert unknown == 400  # unknown action
 
 
+def test_daemon_shell_uses_expanded_default_workspace(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    cfg = WorkerConfig(_env_file=None, token="", workspace="~/jarvis-worker")
+
+    async def calls(base, c):  # noqa: ANN001
+        health = (await c.get(base + "/health")).json()
+        shell = (
+            await c.post(base + "/run", json={"action": "shell", "args": {"command": "pwd"}})
+        ).json()
+        return health, shell
+
+    health, shell = asyncio.run(_with_server(cfg, 8817, calls))
+
+    assert health["workspace"] == str(home / "jarvis-worker")
+    assert shell["output"] == str(home / "jarvis-worker")
+
+
 def test_daemon_code_dispatch_runs_a_job(tmp_path) -> None:
     # `echo` stands in for the coding agent so the job finishes instantly.
     cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"), codex_bin="echo")

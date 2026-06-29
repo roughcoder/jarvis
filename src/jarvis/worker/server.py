@@ -167,7 +167,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             return web.json_response({"error": "bad json"}, status=400)
         action = body.get("action")
         args = body.get("args") or {}
-        cwd = args.get("cwd") or cfg.workspace
+        cwd = args.get("cwd") or str(workspace)
         if cfg.verbose:
             print(f"[worker] → {action}  {_summarize(args)}")
 
@@ -321,7 +321,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             {
                 "ok": True,
                 "agent": cfg.agent,
-                "workspace": cfg.workspace,
+                "workspace": str(workspace),
                 "repo_root_configured": bool(cfg.repo_root),
                 "browser_enabled": browser_cfg.enabled,
                 "gui_provider_configured": bool(cfg.peekaboo_ai_providers),
