@@ -11,10 +11,10 @@ else from a configured CSV default, else **empty** (everything denied).
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 from jarvis.config import CapabilityConfig
+from jarvis.frontmatter import parse_front_matter
 from jarvis.runtime import CapabilityError, RequestContext, require
 
 __all__ = [
@@ -28,42 +28,19 @@ __all__ = [
 ]
 
 
-# --- profile parsing -------------------------------------------------------
-
-_FRONT_MATTER = re.compile(r"^\s*---\s*\n(.*?)\n---\s*(?:\n|$)", re.DOTALL)
-_INLINE_LIST = re.compile(r"^capabilities:\s*\[(.*?)\]", re.MULTILINE)
-_BLOCK_KEY = re.compile(r"^capabilities:\s*$")
-_BLOCK_ITEM = re.compile(r"^\s*-\s*(.+?)\s*$")
-
-
 def parse_profile_capabilities(text: str) -> set[str]:
     """Extract the capability set from a profile markdown's YAML front-matter.
 
     Supports inline (`capabilities: [a, b]`) and block (`capabilities:\n  - a`)
     forms. No front-matter / no capabilities key → empty set (deny-by-default).
     """
-    m = _FRONT_MATTER.match(text)
-    if not m:
-        return set()
-    fm = m.group(1)
-
-    inline = _INLINE_LIST.search(fm)
-    if inline:
-        return {c.strip().strip("'\"") for c in inline.group(1).split(",") if c.strip()}
-
-    caps: set[str] = set()
-    collecting = False
-    for line in fm.splitlines():
-        if _BLOCK_KEY.match(line):
-            collecting = True
-            continue
-        if collecting:
-            item = _BLOCK_ITEM.match(line)
-            if item:
-                caps.add(item.group(1).strip().strip("'\""))
-            elif line.strip() and not line[0].isspace():
-                break  # reached the next top-level key
-    return caps
+    value = parse_front_matter(text).get("capabilities")
+    if isinstance(value, list):
+        return {str(cap).strip() for cap in value if str(cap).strip()}
+    if value:
+        cap = str(value).strip()
+        return {cap} if cap else set()
+    return set()
 
 
 # --- resolution ------------------------------------------------------------
