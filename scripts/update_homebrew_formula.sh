@@ -125,7 +125,7 @@ text.sub!(
 )
 
 unless text.sub!(
-  /      system formula_opt_bin\("uv"\)\/"uv", "sync", "--no-dev", "--no-editable"\n/,
+  /(?:      ENV\["UV_PYTHON"\] = \(formula_opt_bin\("python@3\.12"\)\/"python3\.12"\)\.to_s\n)*      system formula_opt_bin\("uv"\)\/"uv", "sync", "--no-dev", "--no-editable"\n/,
   "      ENV[\"UV_PYTHON\"] = (formula_opt_bin(\"python@3.12\")/\"python3.12\").to_s\n" \
   "      system formula_opt_bin(\"uv\")/\"uv\", \"sync\", \"--no-dev\", \"--no-editable\"\n"
 )
