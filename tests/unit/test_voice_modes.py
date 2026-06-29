@@ -216,6 +216,17 @@ def test_default_mode_respects_closed_marker_for_completed_explanation() -> None
     assert result.close_reason == "task_complete"
 
 
+def test_default_mode_followup_phrases_do_not_match_inside_completed_answer_words() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(raw="That's when Docker starts. [[CONVERSATION:closed:task_complete]]")
+
+    sess.finalize("when does Docker start", result)
+
+    assert result.ended is True
+    assert result.continue_listening is False
+    assert result.close_reason == "task_complete"
+
+
 def test_default_mode_soft_close_overrides_open_marker() -> None:
     sess = _session(DEFAULT_MODE)
     result = TurnResult(raw="No problem. [[CONVERSATION:open:followup_expected]]")
