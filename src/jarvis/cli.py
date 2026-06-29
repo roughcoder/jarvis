@@ -900,13 +900,20 @@ def _format_pr_comments_summary(comments: list[dict], *, repo: str, number: int)
         f"  authors: {author_summary or '<unknown>'}",
         "Highlights:",
     ]
-    for comment in comments[:8]:
+    highlights = _highlight_pr_comments(comments, limit=8)
+    for comment in highlights:
         lines.append(f"  - {_format_pr_comment_line(comment)}")
-    if len(comments) > 8:
-        lines.append(f"  ... {len(comments) - 8} more; use --json for raw GitHub objects.")
+    if len(comments) > len(highlights):
+        lines.append(f"  ... {len(comments) - len(highlights)} more; use --json for raw GitHub objects.")
     else:
         lines.append("Use --json for raw GitHub objects.")
     return "\n".join(lines)
+
+
+def _highlight_pr_comments(comments: list[dict], *, limit: int) -> list[dict]:
+    inline = [comment for comment in comments if comment.get("path")]
+    other = [comment for comment in comments if not comment.get("path")]
+    return [*inline, *other][:limit]
 
 
 def _comment_author(comment: dict) -> str:
@@ -923,13 +930,14 @@ def _format_pr_comment_line(comment: dict) -> str:
         preview = preview[:117] + "..."
     location = "top-level"
     if comment.get("path"):
-        line = comment.get("line") or comment.get("original_line") or "?"
-        location = f"{comment['path']}:{line}"
+        path = _terminal_safe(str(comment["path"]))
+        line = _terminal_safe(str(comment.get("line") or comment.get("original_line") or "?"))
+        location = f"{path}:{line}"
     elif comment.get("state"):
-        location = f"review:{comment['state']}"
+        location = f"review:{_terminal_safe(str(comment['state']))}"
     url = comment.get("url") or comment.get("html_url") or ""
-    suffix = f" ({url})" if url else ""
-    return f"{_comment_author(comment)} at {location}: {preview}{suffix}"
+    suffix = f" ({_terminal_safe(str(url))})" if url else ""
+    return f"{_terminal_safe(_comment_author(comment))} at {location}: {preview}{suffix}"
 
 
 def _terminal_safe(text: str) -> str:
