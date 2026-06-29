@@ -25,5 +25,32 @@
   },
   "909c9f7b9de9": {
     "Release-note": "skip"
+  },
+  "56167e5649f5": {
+    "Release-note": "Default voice conversations now stay open briefly when Jarvis asks a concrete follow-up or the user is exploring, while completed turns still close."
+  },
+  "e0c025862134": {
+    "Release-note": "skip"
+  },
+  "3e3325272ab2": {
+    "Release-note": "skip"
+  },
+  "3194845059ae": {
+    "Release-note": "skip"
+  },
+  "3468ce4c58b3": {
+    "Release-note": "skip"
+  },
+  "308696a444fd": {
+    "Release-note": "skip"
+  },
+  "ed1519b66c78": {
+    "Release-note": "skip"
+  },
+  "c8556e91bc3f": {
+    "Release-note": "skip"
+  },
+  "b78cfa9c4736": {
+    "Release-note": "skip"
   }
 }
