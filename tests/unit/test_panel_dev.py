@@ -1,4 +1,9 @@
-from jarvis.intercom.panel_dev import PANEL_STATES, PreviewConfig, render_panel_preview_html
+import functools
+import http.client
+import http.server
+import threading
+
+from jarvis.intercom.panel_dev import PANEL_STATES, PreviewConfig, _PreviewHandler, render_panel_preview_html
 
 
 def test_panel_preview_renders_every_voice_state() -> None:
@@ -14,6 +19,35 @@ def test_panel_preview_sanitizes_title_and_falls_back_to_idle_state() -> None:
 
     assert "<title>&lt;Jarvis &quot;panel&quot;&gt;</title>" in html
     assert '<main class="screen" data-state="idle">' in html
+
+
+def test_panel_preview_head_does_not_expose_host_filesystem() -> None:
+    html = render_panel_preview_html()
+    handler = functools.partial(_PreviewHandler, html=html)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        conn.request("HEAD", "/")
+        root = conn.getresponse()
+        root.read()
+        conn.close()
+
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        conn.request("HEAD", "/etc/passwd")
+        host_file = conn.getresponse()
+        host_file.read()
+        conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert root.status == 200
+    assert root.getheader("Content-Type") == "text/html; charset=utf-8"
+    assert root.getheader("Content-Length") == str(len(html.encode("utf-8")))
+    assert host_file.status == 404
 
 
 def test_panel_preview_uses_spinner_pupils_for_thinking_state() -> None:
