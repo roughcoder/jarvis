@@ -88,7 +88,7 @@ _FOLLOWUP_QUESTION_REPLY = re.compile(
 _FOLLOWUP_REQUEST_REPLY = re.compile(
     r"(?:^|[.!?,;]\s+)\b(?:please (?:tell|say|try|send|show)|try again|"
     r"one more time|tell me (?:which|what|who|where|when|how)|"
-    r"send (?:me )?(?:another|a clearer)|better lighting)\b",
+    r"send (?:me )?(?:another|a clearer))\b",
     re.IGNORECASE,
 )
 _EXPLORATORY_USER = re.compile(
