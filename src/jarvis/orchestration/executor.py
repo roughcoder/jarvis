@@ -22,7 +22,14 @@ def start_worker_job(
     post: Callable[..., Any] | None = None,
 ) -> WorkerJobLink:
     post = post or httpx.post
-    base_url = worker.base_url if worker and worker.base_url else worker_cfg.base_url
+    if worker is None:
+        base_url = worker_cfg.base_url
+    elif worker.base_url:
+        base_url = worker.base_url
+    elif worker.worker_id == "local-worker":
+        base_url = worker_cfg.base_url
+    else:
+        raise RuntimeError(f"worker {worker.worker_id} has no base_url; refusing to route to local worker")
     headers = {}
     token = os.environ.get(worker.token_env, "") if worker and worker.token_env else ""
     if not token and (worker is None or worker.worker_id == "local-worker"):

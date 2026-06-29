@@ -418,6 +418,27 @@ def test_start_worker_job_uses_selected_worker_endpoint_and_token_env(monkeypatc
     assert seen["json"]["args"]["execution_envelope"]["landing"]["mode"] == "draft_pr"
 
 
+def test_start_worker_job_refuses_named_worker_without_endpoint() -> None:
+    envelope = build_execution_envelope(
+        run_id="run_1",
+        command=WorkCommand("start_next_work", source="github", start=True),
+        items=[_item()],
+        worker_id="hive-worker",
+    )
+    profile = WorkerProfile(worker_id="hive-worker", display_name="Hive")
+
+    def fail_post(*_args, **_kwargs):  # noqa: ANN001, ANN202
+        raise AssertionError("must not dispatch to a fallback worker endpoint")
+
+    with pytest.raises(RuntimeError, match="worker hive-worker has no base_url"):
+        start_worker_job(
+            envelope,
+            worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1, token="local-token"),
+            worker=profile,
+            post=fail_post,
+        )
+
+
 def test_schedules_fire_once_per_local_day(tmp_path) -> None:
     store = ScheduleStore(str(tmp_path / "schedules.json"))
     schedule = store.add(
