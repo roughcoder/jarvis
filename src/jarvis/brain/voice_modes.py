@@ -79,14 +79,14 @@ _SOFT_CLOSE = re.compile(
 )
 _LEADING_TTS_TAG = re.compile(r"^\s*\[[^\[\]]+\]\s*")
 _FOLLOWUP_QUESTION_REPLY = re.compile(
-    r"(?:^|[.!?,;]\s+)\b(?:could you|can you|would you|what time|which one|"
+    r"(?:^|[.!?,;:-]\s+)\b(?:could you|can you|would you|what time|which one|"
     r"who should|where should|"
     r"what should|when should|when do|where are|where is|for how long|"
     r"how long should|do you mean|did you mean)\b[^.?!]*\?",
     re.IGNORECASE,
 )
 _FOLLOWUP_REQUEST_REPLY = re.compile(
-    r"(?:^|[.!?,;]\s+)\b(?:please (?:tell|say|try|send|show)|try again|"
+    r"(?:^|[.!?,;:-]\s+)\b(?:please (?:tell|say|try|send|show)|try again|"
     r"one more time|tell me (?:which|what|who|where|when|how)|"
     r"send (?:me )?(?:another|a clearer))\b",
     re.IGNORECASE,
