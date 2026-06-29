@@ -341,7 +341,7 @@ def classify_voice_turn(
             assistant_asked_followup=assistant_followup,
         )
 
-    if control.conversation == "closed" and not assistant_followup:
+    if control.conversation == "closed":
         return VoiceStateTransition(
             mode=DEFAULT_MODE,
             ended=True,
@@ -350,7 +350,7 @@ def classify_voice_turn(
             reset_conversation=True,
             policy_decision="marker_closed",
             marker_seen=marker_seen,
-            assistant_asked_followup=False,
+            assistant_asked_followup=assistant_followup,
         )
 
     if assistant_followup:
