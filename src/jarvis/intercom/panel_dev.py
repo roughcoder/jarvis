@@ -863,6 +863,12 @@ class _PreviewHandler(http.server.SimpleHTTPRequestHandler):
         super().__init__(*args, directory="/", **kwargs)
 
     def do_GET(self) -> None:  # noqa: N802
+        self._send_panel_response(include_body=True)
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._send_panel_response(include_body=False)
+
+    def _send_panel_response(self, *, include_body: bool) -> None:
         if self.path == "/" or self.path.startswith("/?"):
             data = self._html.encode("utf-8")
             self.send_response(200)
@@ -870,7 +876,8 @@ class _PreviewHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            self.wfile.write(data)
+            if include_body:
+                self.wfile.write(data)
             return
         self.send_error(404)
 
