@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 def test_homebrew_formula_helper_writes_non_recursive_wrapper() -> None:
     text = (ROOT / "scripts" / "update_homebrew_formula.sh").read_text()
 
+    assert 'ENV[\\"UV_PYTHON\\"] = (formula_opt_bin(\\"python@3.12\\")/\\"python3.12\\").to_s' in text
     assert "'      #!/usr/bin/env bash'" in text
     assert 'exec "#{libexec}/.venv/bin/python" -m jarvis.cli "$@"' in text
     assert 'uv" run --no-sync jarvis "$@"' not in text
