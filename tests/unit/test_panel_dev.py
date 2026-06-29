@@ -12,6 +12,10 @@ def test_panel_preview_renders_every_voice_state() -> None:
     for state in PANEL_STATES:
         assert f'"{state}"' in html
         assert f'[data-state="{state}"]' in html
+    assert html.count('<span class="brow"></span>') == 2
+    assert ".brow {" in html
+    assert "--brow-left-rot" in html
+    assert "--brow-right-rot" in html
 
 
 def test_panel_preview_sanitizes_title_and_falls_back_to_idle_state() -> None:
@@ -87,6 +91,8 @@ def test_panel_preview_disconnected_looks_angry_and_offline() -> None:
     assert '[data-state="disconnected"] .eye:last-child' in html
     assert "rotate(7deg)" in html
     assert "rotate(-7deg)" in html
+    assert "--brow-left-rot: 18deg;" in html
+    assert "--brow-right-rot: -18deg;" in html
     assert '[data-state="disconnected"] .pupil::before' in html
     assert '[data-state="disconnected"] .pupil::after' in html
     assert "rotate(45deg)" in html
@@ -116,10 +122,14 @@ def test_panel_preview_speaking_randomizes_eye_motion() -> None:
     assert '<main class="screen" data-state="speaking">' in html
     assert "scheduleSpeakingMotion" in html
     assert "applySpeakingPose" in html
+    assert "--speak-brow-left" in html
+    assert "--speak-brow-right" in html
+    assert "--speak-brow-lift" in html
     assert "--eye-scale-y" in html
     assert "--pupil-scale" in html
-    assert "randomBetween(-3, 3)" in html
-    assert "randomBetween(.96, 1.04)" in html
+    assert "randomBetween(-2, 2)" in html
+    assert "randomBetween(-1.8, 1.8)" in html
+    assert "randomBetween(.98, 1.03)" in html
     assert "720 + Math.random() * 640" in html
 
 
