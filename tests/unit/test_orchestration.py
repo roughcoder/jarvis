@@ -702,6 +702,68 @@ def test_cli_work_next_preserves_parsed_linear_source(tmp_path, monkeypatch, cap
     assert json.loads(capsys.readouterr().out)["source"] == "linear"
 
 
+def test_cli_work_check_prints_compact_summary(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis import cli
+
+    class Source:
+        def list(self, *, repo="", filters=None, limit=10):  # noqa: ANN001, ANN201
+            return [
+                _item(
+                    id="#7",
+                    title="Fix orchestration copy",
+                    status="OPEN",
+                    labels=["bug", "orchestration"],
+                    assignee="neil",
+                    repo=repo,
+                )
+            ]
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / ".env"))
+    monkeypatch.setenv("CAPS_DEFAULT_CAPABILITIES", "work.github.issues.read")
+    monkeypatch.setattr(cli, "_work_source", lambda _name, _cfg=None: Source())
+
+    assert cli.main(["work", "check", "issues", "--repo", "roughcoder/jarvis"]) == 0
+    out = capsys.readouterr().out
+    assert "Found 1 github issue for roughcoder/jarvis." in out
+    assert "github:#7" in out
+    assert "labels=bug,orchestration" in out
+    assert "jarvis work next" in out
+
+
+def test_cli_pr_comments_prints_compact_summary(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis import cli
+
+    class Source:
+        def pr_comments(self, repo, number):  # noqa: ANN001, ANN201
+            return [
+                {
+                    "author": {"login": "alice"},
+                    "body": "Please expand the default workspace before shell dispatch.",
+                    "path": "src/jarvis/worker/server.py",
+                    "line": 170,
+                    "url": "https://example.test/thread",
+                },
+                {
+                    "author": {"login": "bob"},
+                    "body": "Review summary",
+                    "state": "COMMENTED",
+                },
+            ]
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / ".env"))
+    monkeypatch.setenv("CAPS_DEFAULT_CAPABILITIES", "work.github.pr.read")
+    monkeypatch.setattr(cli, "_work_source", lambda _name, _cfg=None: Source())
+
+    assert cli.main(["work", "pr-comments", "26", "--repo", "roughcoder/jarvis"]) == 0
+    out = capsys.readouterr().out
+    assert "PR roughcoder/jarvis#26: 2 comment/review object(s)" in out
+    assert "inline=1 review=1 top-level=0" in out
+    assert "alice at src/jarvis/worker/server.py:170" in out
+    assert "Use --json for raw GitHub objects." in out
+
+
 def test_cli_work_start_requires_worker_start_capability(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
     from jarvis import cli
 
@@ -715,7 +777,29 @@ def test_cli_work_start_requires_worker_start_capability(tmp_path, monkeypatch, 
     monkeypatch.setattr(cli, "_work_source", lambda _name, _cfg=None: Source())
 
     assert cli.main(["work", "next", "--start"]) == 1
-    assert "Missing orchestration capability: worker.job.start" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Missing orchestration capability: worker.job.start" in out
+    assert "Authority source:" in out
+    assert "jarvis-workspace/profiles/local-mac.md" in out
+    assert "CAPS_DEFAULT_CAPABILITIES=worker.job.start" in out
+
+
+def test_cli_capability_hint_notes_existing_profile_takes_precedence(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis import cli
+
+    profile = tmp_path / "jarvis-workspace" / "profiles" / "local-mac.md"
+    profile.parent.mkdir(parents=True)
+    profile.write_text("---\ncapabilities: [web.search]\n---\n")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / ".env"))
+    monkeypatch.setenv("CAPS_DEFAULT_CAPABILITIES", "work.github.issues.read")
+
+    assert cli.main(["work", "check", "issues", "--repo", "roughcoder/jarvis"]) == 1
+    out = capsys.readouterr().out
+    assert "Missing orchestration capability: work.github.issues.read" in out
+    assert f"add work.github.issues.read to {profile}" in out
+    assert "That profile exists, so CAPS_DEFAULT_CAPABILITIES is ignored" in out
 
 
 def test_cli_work_start_requires_landing_capabilities(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
