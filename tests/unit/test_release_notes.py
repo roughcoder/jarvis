@@ -154,6 +154,30 @@ Release-note: skip
     assert "Release-note: <text> or Release-note: skip" in errors[0]
 
 
+def test_strict_release_trailers_require_breaking_detail_for_any_type() -> None:
+    missing = release_notes.parse_commit(
+        "abc123",
+        """refactor(architecture)!: move account contracts
+
+Release-note: skip
+""",
+    )
+    documented = release_notes.parse_commit(
+        "def456",
+        """chore(config)!: remove legacy env alias
+
+Breaking Change: OLD_SETTING is no longer read; use NEW_SETTING instead.
+""",
+    )
+
+    errors = release_notes.validate_release_trailers([missing, documented])
+
+    assert len(errors) == 1
+    assert "abc123" in errors[0]
+    assert "is breaking" in errors[0]
+    assert "Breaking Change: <migration impact>" in errors[0]
+
+
 def test_release_markdown_quality_rejects_raw_scope_bullets() -> None:
     notes = """# Jarvis Runtime v1.2.3
 
