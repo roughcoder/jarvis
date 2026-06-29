@@ -171,6 +171,41 @@ Constraint: voice release metadata matters.\\nRelease-note: Voice follow-up life
     assert "use real commit-message lines" in errors[0]
 
 
+def test_strict_release_trailers_reject_escaped_text_after_release_note() -> None:
+    malformed = release_notes.parse_commit(
+        "abc123",
+        """fix(config): add runtime setting
+
+Release-note: skip\\nEnv: NEW_VAR added for runtime tuning.
+""",
+    )
+
+    errors = release_notes.validate_release_trailers([malformed])
+
+    assert len(errors) == 1
+    assert "abc123" in errors[0]
+    assert "contains escaped newline trailer text" in errors[0]
+    assert "Env" in errors[0]
+
+
+def test_release_note_override_allows_historical_escaped_trailer_text(tmp_path) -> None:
+    malformed = release_notes.parse_commit(
+        "abc123def456",
+        """fix(config): add runtime setting
+
+Release-note: skip\\nEnv: NEW_VAR added for runtime tuning.
+""",
+    )
+    path = tmp_path / "overrides.json"
+    path.write_text('{"abc123": {"Release-note": "skip"}}', encoding="utf-8")
+
+    overrides = release_notes.load_release_note_overrides(path)
+    release_notes.apply_release_note_overrides([malformed], overrides)
+
+    assert malformed.release_note_override_applied is True
+    assert release_notes.validate_release_trailers([malformed]) == []
+
+
 def test_release_note_overrides_satisfy_strict_trailers(tmp_path) -> None:
     missing = release_notes.parse_commit(
         "abc123def456",
