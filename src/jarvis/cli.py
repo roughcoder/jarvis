@@ -684,6 +684,7 @@ def _cmd_work(args: argparse.Namespace) -> int:
         if not _has_orchestration_authority(
             required_for_command(command.operation, command.source),
             capabilities,
+            cfg=cfg,
             public_write_mode=public_write_mode,
         ):
             return 1
@@ -701,17 +702,23 @@ def _cmd_work(args: argparse.Namespace) -> int:
         if not _has_orchestration_authority(
             required_for_command(command.operation, command.source),
             capabilities,
+            cfg=cfg,
             public_write_mode=public_write_mode,
         ):
             return 1
         comments = source.pr_comments(args.repo or cfg.orchestration.default_repo, args.number)
-        print(json.dumps(comments, indent=2) if args.json else f"{len(comments)} comment/review object(s)")
+        print(
+            json.dumps(comments, indent=2)
+            if args.json
+            else _format_pr_comments_summary(comments, repo=args.repo or cfg.orchestration.default_repo, number=args.number)
+        )
         return 0
 
     if args.work_action == "next":
         if not _has_orchestration_authority(
             required_for_command(command.operation, command.source),
             capabilities,
+            cfg=cfg,
             public_write_mode=public_write_mode,
         ):
             return 1
@@ -730,6 +737,7 @@ def _cmd_work(args: argparse.Namespace) -> int:
         if not _has_orchestration_authority(
             ["worker.job.start", *_required_for_landing_mode(cfg.orchestration.landing_mode)],
             capabilities,
+            cfg=cfg,
             public_write_mode=public_write_mode,
         ):
             return 1
@@ -777,6 +785,7 @@ def _has_orchestration_authority(
     actions: list[str],
     capabilities: set[str],
     *,
+    cfg=None,  # noqa: ANN001
     public_write_mode: str,
 ) -> bool:
     from jarvis.orchestration.authority import allowed
@@ -788,8 +797,31 @@ def _has_orchestration_authority(
     ]
     if denied:
         print(f"Missing orchestration capability: {', '.join(denied)}")
+        if cfg is not None:
+            print(_capability_hint(denied, cfg))
         return False
     return True
+
+
+def _capability_hint(actions: list[str], cfg) -> str:  # noqa: ANN001
+    profile = Path(cfg.capabilities.profiles_dir).expanduser() / f"{cfg.capabilities.device_id}.md"
+    worker_profiles = Path(cfg.orchestration.workers_path).expanduser()
+    profile_display = profile.resolve(strict=False)
+    worker_profiles_display = worker_profiles.resolve(strict=False)
+    action_list = ", ".join(actions)
+    if profile.exists():
+        authority = (
+            f"Authority source: add {action_list} to {profile_display} front matter. "
+            "That profile exists, so CAPS_DEFAULT_CAPABILITIES is ignored for this device."
+        )
+    else:
+        authority = (
+            f"Authority source: create {profile_display} with {action_list} in front matter, "
+            f"or set CAPS_DEFAULT_CAPABILITIES={action_list} for local smoke testing."
+        )
+    return (
+        f"{authority} Named worker capacity lives separately at {worker_profiles_display}."
+    )
 
 
 def _required_for_landing_mode(mode: str) -> list[str]:
@@ -816,10 +848,75 @@ def _print_items(items) -> None:  # noqa: ANN001
     if not items:
         print("No work items found.")
         return
+    first = items[0]
+    kind = first.kind or "item"
+    plural = kind if len(items) == 1 else f"{kind}s"
+    source = first.source or "work"
+    repo = first.repo or "<unset>"
+    print(f"Found {len(items)} {source} {plural} for {repo}.")
     for item in items:
-        print(f"{item.source}:{item.id:<8} {item.status or '-':<12} {item.title}")
+        meta = " ".join(
+            x
+            for x in [
+                item.status or "-",
+                f"priority={item.priority}" if item.priority else "",
+                f"assignee={item.assignee}" if item.assignee else "",
+                f"labels={','.join(item.labels[:3])}" if item.labels else "",
+            ]
+            if x
+        )
+        print(f"{item.source}:{item.id:<8} {meta:<36} {item.title}")
         if item.url:
             print(f"            {item.url}")
+    print("Next: use `jarvis work next` to select one, or add `--start --worker <worker_id>` to dispatch.")
+
+
+def _format_pr_comments_summary(comments: list[dict], *, repo: str, number: int) -> str:
+    if not comments:
+        return f"No PR comment/review objects found for {repo or '<current repo>'}#{number}."
+    inline = [c for c in comments if c.get("path")]
+    reviewish = [c for c in comments if not c.get("path") and (c.get("state") or c.get("submittedAt"))]
+    authors: dict[str, int] = {}
+    for comment in comments:
+        author = _comment_author(comment)
+        authors[author] = authors.get(author, 0) + 1
+    author_summary = ", ".join(f"{name}={count}" for name, count in sorted(authors.items()))
+    lines = [
+        f"PR {repo or '<current repo>'}#{number}: {len(comments)} comment/review object(s)",
+        f"  inline={len(inline)} review={len(reviewish)} top-level={len(comments) - len(inline) - len(reviewish)}",
+        f"  authors: {author_summary or '<unknown>'}",
+        "Highlights:",
+    ]
+    for comment in comments[:8]:
+        lines.append(f"  - {_format_pr_comment_line(comment)}")
+    if len(comments) > 8:
+        lines.append(f"  ... {len(comments) - 8} more; use --json for raw GitHub objects.")
+    else:
+        lines.append("Use --json for raw GitHub objects.")
+    return "\n".join(lines)
+
+
+def _comment_author(comment: dict) -> str:
+    author = comment.get("author") or comment.get("user") or {}
+    if isinstance(author, dict):
+        return str(author.get("login") or author.get("name") or "<unknown>")
+    return str(author or "<unknown>")
+
+
+def _format_pr_comment_line(comment: dict) -> str:
+    body = str(comment.get("body") or "").strip().splitlines()
+    preview = body[0].strip() if body else "<empty>"
+    if len(preview) > 120:
+        preview = preview[:117] + "..."
+    location = "top-level"
+    if comment.get("path"):
+        line = comment.get("line") or comment.get("original_line") or "?"
+        location = f"{comment['path']}:{line}"
+    elif comment.get("state"):
+        location = f"review:{comment['state']}"
+    url = comment.get("url") or comment.get("html_url") or ""
+    suffix = f" ({url})" if url else ""
+    return f"{_comment_author(comment)} at {location}: {preview}{suffix}"
 
 
 def _parse_weekdays(text: str) -> list[int]:
@@ -881,6 +978,7 @@ def _cmd_schedules(args: argparse.Namespace) -> int:
         if not _has_orchestration_authority(
             ["orchestration.schedules.write"],
             capabilities,
+            cfg=cfg,
             public_write_mode=cfg.orchestration.landing_mode,
         ):
             return 1
@@ -906,6 +1004,7 @@ def _cmd_schedules(args: argparse.Namespace) -> int:
             if not _has_orchestration_authority(
                 ["orchestration.schedules.write"],
                 capabilities,
+                cfg=cfg,
                 public_write_mode=cfg.orchestration.landing_mode,
             ):
                 return 1

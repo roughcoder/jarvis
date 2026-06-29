@@ -1130,9 +1130,9 @@ handled at the stage where they belong rather than widening the current slice:
       orchestration worktrees/branches; surface worker dispatch error bodies.
 - [x] **Run graph observability:** `runs --sync` refreshes linked worker job
       status, branch, cwd, and `codex resume` session id from the worker daemon.
-- [ ] **Work-source UX:** `work check` and `work pr-comments` should summarize
+- [x] **Work-source UX:** `work check` and `work pr-comments` should summarize
       useful next actions by default, with raw JSON kept behind `--json`.
-- [ ] **Capability guidance:** when authority is missing, CLI output should show
+- [x] **Capability guidance:** when authority is missing, CLI output should show
       the exact local profile/config location to edit and whether it applies to
       the brain profile or named worker profile.
 - [ ] **Smoke dispatch command:** add a disposable, explicit orchestration smoke
