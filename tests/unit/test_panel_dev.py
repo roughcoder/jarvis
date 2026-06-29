@@ -1,6 +1,8 @@
+import ast
 import functools
 import http.client
 import http.server
+from pathlib import Path
 import threading
 import time
 
@@ -12,7 +14,10 @@ from jarvis.intercom.panel_dev import (
     _PreviewHandler,
     render_panel_preview_html,
 )
-from jarvis.intercom.pi_panel import WebPiPanel
+from jarvis.intercom.pi_panel import _STATES, WebPiPanel
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_panel_preview_renders_every_voice_state() -> None:
@@ -25,6 +30,30 @@ def test_panel_preview_renders_every_voice_state() -> None:
     assert ".brow {" in html
     assert "--brow-left-rot" in html
     assert "--brow-right-rot" in html
+
+
+def test_panel_preview_state_contract_matches_runtime_panel() -> None:
+    assert set(PANEL_STATES) == set(_STATES)
+
+
+def test_intercom_client_only_publishes_runtime_panel_states() -> None:
+    tree = ast.parse((REPO_ROOT / "src/jarvis/intercom/client.py").read_text())
+    states = {
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "set"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "_panel"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    }
+
+    assert {"connecting", "disconnected", "idle", "awake", "listening", "thinking", "speaking"} <= states
+    assert "sleep" not in states
+    assert states <= set(PANEL_STATES)
 
 
 def test_panel_preview_uses_flat_pi_screen_artwork() -> None:
