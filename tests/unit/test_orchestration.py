@@ -766,6 +766,70 @@ def test_cli_pr_comments_prints_compact_summary(tmp_path, monkeypatch, capsys) -
     assert "Use --json for raw GitHub objects." in out
 
 
+def test_cli_pr_comments_prioritizes_inline_highlights(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis import cli
+
+    class Source:
+        def pr_comments(self, repo, number):  # noqa: ANN001, ANN201
+            top_level = [
+                {
+                    "author": {"login": f"reviewer-{idx}"},
+                    "body": f"Top-level note {idx}",
+                    "state": "COMMENTED",
+                }
+                for idx in range(8)
+            ]
+            return [
+                *top_level,
+                {
+                    "author": {"login": "codex"},
+                    "body": "Inline fix needed",
+                    "path": "src/jarvis/cli.py",
+                    "line": 903,
+                },
+            ]
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / ".env"))
+    monkeypatch.setenv("CAPS_DEFAULT_CAPABILITIES", "work.github.pr.read")
+    monkeypatch.setattr(cli, "_work_source", lambda _name, _cfg=None: Source())
+
+    assert cli.main(["work", "pr-comments", "29", "--repo", "roughcoder/jarvis"]) == 0
+    out = capsys.readouterr().out
+
+    assert "codex at src/jarvis/cli.py:903: Inline fix needed" in out
+    assert "... 1 more; use --json for raw GitHub objects." in out
+
+
+def test_cli_pr_comments_sanitizes_location_components(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis import cli
+
+    class Source:
+        def pr_comments(self, repo, number):  # noqa: ANN001, ANN201
+            return [
+                {
+                    "author": {"login": "alice"},
+                    "body": "Please fix",
+                    "path": "src/jarvis/cli.py\nfake: injected\x1b]0;bad\x07",
+                    "line": "927\nfake-line\x1b[31m",
+                    "url": "https://example.test/thread\x1b[0m",
+                },
+            ]
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / ".env"))
+    monkeypatch.setenv("CAPS_DEFAULT_CAPABILITIES", "work.github.pr.read")
+    monkeypatch.setattr(cli, "_work_source", lambda _name, _cfg=None: Source())
+
+    assert cli.main(["work", "pr-comments", "29", "--repo", "roughcoder/jarvis"]) == 0
+    out = capsys.readouterr().out
+
+    assert "fake: injected" in out
+    assert "fake-line" in out
+    assert "\x1b" not in out
+    assert "\x07" not in out
+
+
 def test_cli_work_start_requires_worker_start_capability(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
     from jarvis import cli
 
