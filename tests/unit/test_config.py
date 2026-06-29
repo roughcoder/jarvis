@@ -7,6 +7,7 @@ are deterministic regardless of the developer's local secrets.
 from __future__ import annotations
 
 from jarvis.config import (
+    AccountConfig,
     BrainConfig,
     Config,
     DatabaseConfig,
@@ -71,6 +72,15 @@ def test_pi_panel_env_names_configure_panel(monkeypatch) -> None:
     assert c.pi_panel_setting == "true"
     assert c.pi_panel_sleep_s == 12.0
     assert c.pi_panel_geometry == "800x480+0+0"
+
+
+def test_account_binding_env_defaults() -> None:
+    c = AccountConfig(_env_file=None)
+
+    assert c.bindings_dir == "jarvis-workspace/.accounts"
+    assert c.audit_path == "jarvis-workspace/.accounts/audit.jsonl"
+    assert c.house_email_binding == "house-email"
+    assert c.house_calendar_binding == "house-calendar"
 
 
 def test_legacy_eyes_env_still_configures_pi_panel(monkeypatch) -> None:

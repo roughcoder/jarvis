@@ -11,6 +11,8 @@ import math
 import os
 import queue
 import random
+import re
+import subprocess
 import threading
 import time
 from contextlib import suppress
@@ -21,6 +23,7 @@ from jarvis.config import IntercomDeviceConfig
 from jarvis.intercom.hardware import IntercomHardware, _enabled
 
 PanelMode = Literal["eyes", "status", "camera", "debug"]
+_GEOMETRY_RE = re.compile(r"^(?P<name>\S+) connected(?: primary)? (?P<w>\d+)x(?P<h>\d+)\+(?P<x>\d+)\+(?P<y>\d+)")
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,8 @@ class EyeState:
 _STATES = {
     "idle": EyeState("idle", 0.82, 0.0),
     "sleep": EyeState("sleep", 0.05, 0.0),
+    "connecting": EyeState("connecting", 0.5, 0.0),
+    "disconnected": EyeState("disconnected", 0.28, 0.0),
     "awake": EyeState("awake", 1.0, -0.04),
     "listening": EyeState("listening", 0.95, -0.08),
     "thinking": EyeState("thinking", 0.72, 0.03),
@@ -80,7 +85,8 @@ class PiPanel:
         except Exception as exc:  # noqa: BLE001
             print(f"  [pi-panel] couldn't open display: {exc}")
             return
-        _configure_fullscreen_root(root, geometry=self._cfg.pi_panel_geometry)
+        geometry = self._cfg.pi_panel_geometry.strip() or _preferred_geometry()
+        _configure_fullscreen_root(root, geometry=geometry or "")
         canvas = tk.Canvas(root, bg="#05070a", highlightthickness=0)
         canvas.pack(fill="both", expand=True)
 
@@ -165,7 +171,7 @@ class PiPanel:
                 set_mode("eyes")
             if now - last_active > max(5.0, self._cfg.pi_panel_sleep_s):
                 target = _STATES["sleep"]
-            if now >= next_blink and target.name != "sleep":
+            if now >= next_blink and target.name not in {"sleep", "disconnected"}:
                 blink_until = now + 0.12
                 next_blink = now + random.uniform(3.0, 7.0)
 
@@ -232,6 +238,12 @@ class PiPanel:
             accent = "#74d2ff" if target.name in {"awake", "listening"} else "#d9f3ff"
             if target.name == "thinking":
                 accent = "#f6cf5c"
+            if target.name == "connecting":
+                accent = "#9fb6c5"
+                _draw_status_banner(canvas, w, h, "connecting", "#9fb6c5")
+            if target.name == "disconnected":
+                accent = "#ff6b57"
+                _draw_status_banner(canvas, w, h, "offline", "#ff6b57")
             if target.name == "listening":
                 _draw_listening_beacons(canvas, w, h, now)
             for x in xs:
@@ -264,6 +276,43 @@ class PiPanel:
             self._stop.set()
 
 
+def _preferred_geometry() -> str | None:
+    """Return a Tk geometry for the built-in Pi touchscreen, if xrandr exposes it.
+
+    On a Pi with both DSI and HDMI active, Tk fullscreen can span the full virtual
+    desktop. Pinning the panel to the DSI connector keeps the UI inside the small
+    touch display while leaving any HDMI desktop alone.
+    """
+    display = os.environ.get("DISPLAY")
+    if not display:
+        return None
+    try:
+        proc = subprocess.run(
+            ["xrandr", "--query"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    matches: list[tuple[str, str]] = []
+    for line in proc.stdout.splitlines():
+        match = _GEOMETRY_RE.match(line)
+        if not match:
+            continue
+        name = match.group("name").lower()
+        geometry = f"{match.group('w')}x{match.group('h')}+{match.group('x')}+{match.group('y')}"
+        matches.append((name, geometry))
+    for prefix in ("dsi", "lcd", "edp", "lvds"):
+        for name, geometry in matches:
+            if name.startswith(prefix):
+                return geometry
+    return matches[0][1] if matches else None
+
+
 def _configure_fullscreen_root(root, *, geometry: str = "") -> None:  # noqa: ANN001
     root.title("Jarvis")
     root.configure(bg="#05070a")
@@ -290,6 +339,19 @@ def _configure_fullscreen_root(root, *, geometry: str = "") -> None:  # noqa: AN
         root.lift()
     with suppress(Exception):
         root.focus_force()
+
+
+def _draw_status_banner(canvas, width: int, height: int, text: str, color: str) -> None:  # noqa: ANN001
+    y = max(28.0, height * 0.09)
+    font_size = max(16, min(34, int(height * 0.075)))
+    canvas.create_text(
+        width * 0.5,
+        y,
+        anchor="center",
+        text=text,
+        fill=color,
+        font=("TkDefaultFont", font_size, "bold"),
+    )
 
 
 def _draw_listening_beacons(canvas, width: int, height: int, now: float) -> None:  # noqa: ANN001
