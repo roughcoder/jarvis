@@ -73,6 +73,37 @@ Examples:
 {"operation":"resume_run","source":"jarvis","autonomy":"start_if_unambiguous"}
 ```
 
+Richer examples, preserving the intent of the user's words:
+
+```json
+{
+  "operation": "start_next_work",
+  "source": "linear",
+  "kind": "ticket",
+  "filters": {
+    "assignee": "me",
+    "status": "ready"
+  },
+  "autonomy": "start_if_unambiguous",
+  "target_worker_id": "macbook-worker",
+  "start": true
+}
+```
+
+```json
+{
+  "operation": "inspect_work",
+  "source": "github",
+  "kind": "issue",
+  "filters": {
+    "repo": "roughcoder/jarvis",
+    "state": "open"
+  },
+  "autonomy": "read_only",
+  "start": false
+}
+```
+
 Default command semantics:
 
 - `check`, `show`, `list`, `summarize` -> read-only inspection.
@@ -103,6 +134,84 @@ Rules:
 - Large objectives become parent campaign runs with bounded child runs.
 - `events.jsonl` is the audit trail; `run.json` is the current view.
 
+Example run graph for one ticket producing one PR:
+
+```json
+{
+  "run_id": "run_20260629_abcd1234",
+  "parent_run_id": null,
+  "objective": "Add worker heartbeat status",
+  "phase": "running",
+  "status": "active",
+  "work_items": [
+    {
+      "role": "primary",
+      "item": {
+        "source": "linear",
+        "id": "ENG-42",
+        "title": "Add worker heartbeat status",
+        "url": "https://linear.app/example/issue/ENG-42",
+        "repo": "roughcoder/jarvis",
+        "kind": "ticket",
+        "status": "In Progress",
+        "labels": ["worker"]
+      }
+    }
+  ],
+  "jobs": [
+    {
+      "worker_id": "macbook-worker",
+      "job_id": "job_abc123",
+      "status": "running",
+      "engine": "codex",
+      "session_id": "codex-session-id",
+      "branch": "jarvis/eng-42-worker-heartbeat"
+    }
+  ],
+  "artifacts": [
+    {
+      "type": "pull_request",
+      "url": "https://github.com/roughcoder/jarvis/pull/123",
+      "status": "draft",
+      "public": true
+    }
+  ],
+  "child_run_ids": []
+}
+```
+
+Example run graph for many tickets batched into one run:
+
+```json
+{
+  "run_id": "run_batch_cleanup",
+  "objective": "Batch the next three cleanup tickets",
+  "work_items": [
+    {"role": "primary", "item": {"source": "linear", "id": "ENG-42", "title": "Clean worker status"}},
+    {"role": "primary", "item": {"source": "linear", "id": "ENG-43", "title": "Clean job output"}},
+    {"role": "primary", "item": {"source": "linear", "id": "ENG-44", "title": "Clean CLI copy"}}
+  ],
+  "artifacts": [
+    {"type": "pull_request", "url": "https://github.com/roughcoder/jarvis/pull/124"}
+  ]
+}
+```
+
+Example parent campaign that creates multiple child PR runs:
+
+```json
+{
+  "run_id": "run_campaign_bugs",
+  "objective": "Spend two hours clearing GitHub bugs",
+  "phase": "running",
+  "child_run_ids": ["run_bug_1", "run_bug_2", "run_bug_3"],
+  "events": [
+    {"type": "campaign_started", "message": "Budget: 120 minutes, max 5 items"},
+    {"type": "campaign_children_created", "message": "Created 3 child run(s)"}
+  ]
+}
+```
+
 ### Scheduler and schedules
 
 There are two schedulers:
@@ -118,6 +227,59 @@ Scheduled work stores structure, not raw prose. A phrase like "every weekday at
   "trigger": "09:00 weekdays Europe/London",
   "command": {"operation":"start_next_work","source":"linear","kind":"ticket"},
   "policy": {"skip_if_active":true,"max_concurrent_runs":1,"report_on_no_work":true}
+}
+```
+
+Concrete schedule record:
+
+```json
+{
+  "schedule_id": "sched_weekday_linear",
+  "name": "Weekday Linear pickup",
+  "enabled": true,
+  "timezone": "Europe/London",
+  "hour": 9,
+  "minute": 0,
+  "weekdays": [0, 1, 2, 3, 4],
+  "mode": "one_shot",
+  "command": {
+    "operation": "start_next_work",
+    "source": "linear",
+    "kind": "ticket",
+    "filters": {
+      "assignee": "me",
+      "status": "ready"
+    },
+    "autonomy": "start_if_unambiguous",
+    "target_worker_id": "macbook-worker",
+    "start": true
+  },
+  "policy": {
+    "max_concurrent_runs": 1,
+    "skip_if_active": true,
+    "catch_up": "skip",
+    "report_on_no_work": true,
+    "public_write_mode": "draft_then_confirm"
+  }
+}
+```
+
+Concrete campaign policy:
+
+```json
+{
+  "mode": "campaign",
+  "source": "github",
+  "filters": {
+    "repo": "roughcoder/jarvis",
+    "label": "bug"
+  },
+  "budget": {
+    "max_items": 5,
+    "max_duration_minutes": 120,
+    "max_concurrent_runs": 1
+  },
+  "stop_when": ["queue_empty", "budget_exhausted", "blocked", "human_needed"]
 }
 ```
 
@@ -144,6 +306,47 @@ Settings may make defaults stricter or choose behaviour (`branch_only`,
 by themselves. Scheduled work re-checks authority when it fires. Merge and release
 remain explicit high-trust actions, never default automation.
 
+Example repo/forge policy:
+
+```json
+{
+  "repo": "roughcoder/jarvis",
+  "public_write_mode": "draft_then_confirm",
+  "pull_request_mode": "draft_pr",
+  "allow_branch_push": true,
+  "allow_pr_comments": "confirm",
+  "allow_automerge": false,
+  "blocked_actions": ["forge.github.merge", "release.trigger"]
+}
+```
+
+Example capability vocabulary:
+
+```json
+{
+  "read": [
+    "work.linear.read",
+    "work.github.issues.read",
+    "work.github.pr.read",
+    "orchestration.runs.read"
+  ],
+  "write": [
+    "worker.job.start",
+    "work.linear.write",
+    "forge.github.branch.push",
+    "forge.github.pr.create",
+    "forge.github.pr.comment",
+    "orchestration.schedules.write"
+  ],
+  "high_risk": [
+    "forge.github.merge",
+    "release.trigger",
+    "secrets.read",
+    "public.write.autonomous"
+  ]
+}
+```
+
 ### ExecutionEnvelope
 
 The handoff from scheduler to worker is an `ExecutionEnvelope`:
@@ -158,6 +361,59 @@ The handoff from scheduler to worker is an `ExecutionEnvelope`:
 
 Workers receive the envelope and stay inside it. They do not rediscover or widen
 authority; if they need more, the run becomes `needs_human`.
+
+Example worker profile:
+
+```json
+{
+  "worker_id": "macbook-worker",
+  "display_name": "MacBook worker",
+  "status": "online",
+  "capabilities": ["git", "python", "uv", "browser", "codex"],
+  "capacity": {
+    "max_concurrent_jobs": 1,
+    "current_jobs": 0
+  },
+  "authority_tags": ["owner-private"],
+  "agent": "codex"
+}
+```
+
+Private connection details such as hostnames, paths, and tokens live in local
+config only; they are not copied into public tracker comments or AGENTIC records.
+
+Example execution envelope:
+
+```json
+{
+  "run_id": "run_20260629_abcd1234",
+  "repo": "roughcoder/jarvis",
+  "base_ref": "main",
+  "branch_name": "jarvis/eng-42-worker-heartbeat",
+  "worker_id": "macbook-worker",
+  "engine": "codex",
+  "allowed_actions": ["worker.job.start", "forge.write.local"],
+  "prompt": "Follow AGENTS.md, read the ticket, implement the change, verify it, and report evidence.",
+  "verification": {
+    "minimum_rung": "repo_native_plus_task_proof",
+    "repo_native": true,
+    "task_proof": "Boot the app and verify the changed flow in a browser. Record the URL, interaction path, and observed result.",
+    "suggested_commands": [],
+    "evidence_required": [
+      "repo checks followed",
+      "commands run",
+      "observed behavior",
+      "known gaps"
+    ]
+  },
+  "landing": {
+    "mode": "draft_pr",
+    "public_write_mode": "draft_then_confirm",
+    "allow_comments": "confirm",
+    "allow_merge": false
+  }
+}
+```
 
 Verification has two layers:
 
@@ -180,6 +436,43 @@ available any time:
 Public tracker updates are sanitized summaries only: status, PR link, high-level
 verification, and public-safe blockers. Private local paths, hostnames, raw logs,
 tokens, and engine session IDs stay local.
+
+Example append-only event:
+
+```json
+{
+  "time": "2026-06-29T09:15:00Z",
+  "type": "verification_evidence_added",
+  "run_id": "run_20260629_abcd1234",
+  "message": "Ruff and focused worker tests passed",
+  "data": {
+    "commands": [
+      "uv run ruff check src/ tests/ scripts/generate_release_notes.py",
+      "uv run pytest tests/unit/test_worker_actions.py -q"
+    ]
+  }
+}
+```
+
+Example terminal report payload:
+
+```json
+{
+  "run_id": "run_20260629_abcd1234",
+  "state": "handoff",
+  "summary": "ENG-42 is ready for review.",
+  "worker_id": "macbook-worker",
+  "branch": "jarvis/eng-42-worker-heartbeat",
+  "pr_url": "https://github.com/roughcoder/jarvis/pull/123",
+  "verification": "ruff passed; focused unit tests passed; browser check not applicable",
+  "known_gaps": [],
+  "resume": {
+    "job_id": "job_abc123",
+    "engine": "codex",
+    "session_id": "codex-session-id"
+  }
+}
+```
 
 ## Proportionality — the loop chooses the lightest sufficient depth
 
