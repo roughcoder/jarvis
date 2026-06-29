@@ -5,7 +5,8 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/check_conventional_commits.sh <base-ref> [head-ref]
 
-Checks commit messages in <base-ref>..<head-ref> for Conventional Commits format.
+Checks commit messages in <base-ref>..<head-ref> for Conventional Commits
+format and release-note trailer hygiene.
 
 Examples:
   scripts/check_conventional_commits.sh v0.1.21 HEAD
@@ -54,6 +55,25 @@ for commit in "${commits[@]}"; do
       echo "Allowed types: feat, fix, chore, docs, style, refactor, test, perf, build, ci, revert" >&2
       echo "Release trailers: Release-note:, Env:, Upgrade-note:, Docs:, Breaking Change:" >&2
       exit 3
+      ;;
+  esac
+
+  if printf '%s\n' "$body" | grep -Eq '\\n[A-Za-z][A-Za-z0-9-]*( [A-Za-z0-9-]+)?:[[:space:]]*'; then
+    echo "Malformed commit trailers: $commit" >&2
+    echo "  $subject" >&2
+    echo "Found literal escaped newline text before a trailer-like key." >&2
+    echo "Use real commit-message lines, for example multiple 'git commit -m' arguments or 'git commit -F <file>'." >&2
+    exit 4
+  fi
+
+  case "$type" in
+    feat|fix|perf)
+      if ! printf '%s\n' "$body" | grep -Eiq '^Release-note:[[:space:]]*(skip|[^[:space:]].*)$'; then
+        echo "Missing release-note trailer: $commit" >&2
+        echo "  $subject" >&2
+        echo "Add a real trailer line: Release-note: <text> or Release-note: skip" >&2
+        exit 5
+      fi
       ;;
   esac
 done

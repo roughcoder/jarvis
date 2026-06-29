@@ -154,6 +154,23 @@ Release-note: skip
     assert "Release-note: <text> or Release-note: skip" in errors[0]
 
 
+def test_strict_release_trailers_reject_escaped_newline_trailer_text() -> None:
+    malformed = release_notes.parse_commit(
+        "abc123",
+        """fix(voice): keep follow-up open
+
+Constraint: voice release metadata matters.\\nRelease-note: Voice follow-up lifecycle improved.
+""",
+    )
+
+    errors = release_notes.validate_release_trailers([malformed])
+
+    assert len(errors) == 1
+    assert "abc123" in errors[0]
+    assert "contains escaped newline trailer text" in errors[0]
+    assert "use real commit-message lines" in errors[0]
+
+
 def test_release_note_overrides_satisfy_strict_trailers(tmp_path) -> None:
     missing = release_notes.parse_commit(
         "abc123def456",

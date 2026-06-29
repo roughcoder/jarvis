@@ -33,6 +33,9 @@ CONVENTIONAL_RE = re.compile(
     r"^(?P<type>[a-z]+)(?:\((?P<scope>[^)]+)\))?(?P<breaking>!)?:\s+(?P<title>.+)$"
 )
 TRAILER_RE = re.compile(r"^(?P<key>[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z0-9-]+)?):\s*(?P<value>.*)$")
+ESCAPED_TRAILER_RE = re.compile(
+    r"\\n(?P<key>[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z0-9-]+)?):\s*"
+)
 ENV_KEY_RE = re.compile(r"^\s*(?:export\s+)?([A-Z][A-Z0-9_]+)\s*=")
 RELEASABLE_TYPES = {
     "feat",
@@ -362,6 +365,14 @@ def deterministic_notes(payload: dict[str, object]) -> str:
 def validate_release_trailers(commits: list[CommitInfo]) -> list[str]:
     errors: list[str] = []
     for commit in commits:
+        escaped_trailers = sorted({match.group("key") for match in ESCAPED_TRAILER_RE.finditer(commit.body)})
+        if escaped_trailers and not commit.has_release_note_decision:
+            keys = ", ".join(escaped_trailers)
+            errors.append(
+                f"{commit.sha[:12]} {commit.subject!r} contains escaped newline trailer text "
+                f"for {keys}; use real commit-message lines instead of literal \\n sequences"
+            )
+            continue
         if commit.breaking and not (commit.release_notes or commit.breaking_notes):
             errors.append(
                 f"{commit.sha[:12]} {commit.subject!r} is breaking and needs "
