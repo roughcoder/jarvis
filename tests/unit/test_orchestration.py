@@ -161,6 +161,45 @@ def test_github_source_normalizes_issues() -> None:
     assert "--assignee" in seen and "@me" in seen
 
 
+def test_github_source_resolves_current_repo_for_issues() -> None:
+    class Result:
+        returncode = 0
+        stderr = ""
+
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+
+    seen = []
+
+    def runner(args):
+        seen.append(args)
+        if args[:3] == ["gh", "issue", "list"]:
+            return Result(
+                json.dumps(
+                    [
+                        {
+                            "number": 7,
+                            "title": "Bug",
+                            "url": "https://example/7",
+                            "body": "body",
+                            "labels": [{"name": "bug"}],
+                            "assignees": [{"login": "neil"}],
+                            "state": "OPEN",
+                            "updatedAt": "now",
+                        }
+                    ]
+                )
+            )
+        if args[:3] == ["gh", "repo", "view"]:
+            return Result(json.dumps({"nameWithOwner": "roughcoder/jarvis"}))
+        raise AssertionError(args)
+
+    items = GitHubWorkSource(runner).list()
+
+    assert items[0].repo == "roughcoder/jarvis"
+    assert ["gh", "repo", "view", "--json", "nameWithOwner"] in seen
+
+
 def test_github_source_fetches_inline_pr_review_comments() -> None:
     class Result:
         returncode = 0
