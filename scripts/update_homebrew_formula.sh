@@ -124,6 +124,21 @@ text.sub!(
   ""
 )
 
+wrapper = <<~'FORMULA'
+      #!/usr/bin/env bash
+      set -euo pipefail
+      export PYTHONPATH="#{libexec}/src${PYTHONPATH:+:$PYTHONPATH}"
+      exec "#{libexec}/.venv/bin/python" -m jarvis.cli "$@"
+FORMULA
+
+unless text.sub!(
+  /      #!\/usr\/bin\/env bash\n      set -euo pipefail\n(?:      .+\n)*?      exec .+\n/,
+  wrapper
+)
+  warn "Could not update Jarvis Homebrew wrapper in #{path}"
+  exit 1
+end
+
 File.write(path, text)
 RUBY
 
@@ -146,13 +161,27 @@ fi
 
 BREW_TAP_REMOTE_URL="file://$TAP_DIR"
 BREW_TAP_REPO="$(brew --repo "$TAP_NAME" 2>/dev/null || true)"
+BREW_TAP_CREATED=0
+BREW_TAP_ORIGINAL_REMOTE=""
+
+restore_brew_tap_remote() {
+  if [[ "$BREW_TAP_CREATED" -eq 1 ]]; then
+    brew untap "$TAP_NAME" >/dev/null 2>&1 || true
+  elif [[ -n "$BREW_TAP_ORIGINAL_REMOTE" && -d "$BREW_TAP_REPO/.git" ]]; then
+    git -C "$BREW_TAP_REPO" remote set-url origin "$BREW_TAP_ORIGINAL_REMOTE" >/dev/null 2>&1 || true
+  fi
+}
+trap restore_brew_tap_remote EXIT
+
 if [[ -z "$BREW_TAP_REPO" || ! -d "$BREW_TAP_REPO/.git" ]]; then
   brew tap "$TAP_NAME" "$BREW_TAP_REMOTE_URL" --custom-remote
+  BREW_TAP_CREATED=1
   BREW_TAP_REPO="$(brew --repo "$TAP_NAME")"
 fi
 
 BREW_TAP_REMOTE="$(git -C "$BREW_TAP_REPO" remote get-url origin 2>/dev/null || true)"
 if [[ "$BREW_TAP_REMOTE" != "$BREW_TAP_REMOTE_URL" ]]; then
+  BREW_TAP_ORIGINAL_REMOTE="$BREW_TAP_REMOTE"
   git -C "$BREW_TAP_REPO" remote set-url origin "$BREW_TAP_REMOTE_URL"
 fi
 git -C "$BREW_TAP_REPO" pull --ff-only
