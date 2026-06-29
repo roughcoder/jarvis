@@ -227,6 +227,22 @@ def test_default_mode_followup_phrases_do_not_match_inside_completed_answer_word
     assert result.close_reason == "task_complete"
 
 
+def test_default_mode_respects_closed_marker_when_followup_phrases_are_quoted() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(
+        raw=(
+            "'Could you' is a little more formal than 'can you'. "
+            "[[CONVERSATION:closed:task_complete]]"
+        )
+    )
+
+    sess.finalize("what is the difference between could you and can you", result)
+
+    assert result.ended is True
+    assert result.continue_listening is False
+    assert result.close_reason == "task_complete"
+
+
 def test_default_mode_soft_close_overrides_open_marker() -> None:
     sess = _session(DEFAULT_MODE)
     result = TurnResult(raw="No problem. [[CONVERSATION:open:followup_expected]]")
