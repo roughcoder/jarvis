@@ -713,7 +713,7 @@ def _cmd_work(args: argparse.Namespace) -> int:
             return 1
         registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path)
         worker = registry.get(command.target_worker_id, probe=True) if command.target_worker_id else registry.choose(item.capability_requirements)
-        if worker is None:
+        if worker is None or not _worker_is_eligible(worker, item.capability_requirements):
             print("No eligible worker found.")
             return 1
         try:
@@ -763,6 +763,14 @@ def _has_orchestration_authority(
         print(f"Missing orchestration capability: {', '.join(denied)}")
         return False
     return True
+
+
+def _worker_is_eligible(worker, required: list[str] | None = None) -> bool:  # noqa: ANN001
+    if worker.status == "offline":
+        return False
+    if worker.current_jobs >= worker.max_concurrent_jobs:
+        return False
+    return set(required or []).issubset(set(worker.capabilities))
 
 
 def _format_item(item) -> str:  # noqa: ANN001

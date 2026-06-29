@@ -1,6 +1,7 @@
 .env
 jarvis-workspace/.mcp-auth/
 jarvis-workspace/.accounts/
+jarvis-workspace/orchestration/
 jarvis-workspace/worker/jobs/
 jarvis-workspace/worker/runs/
 jarvis-workspace/worker/worktrees/
