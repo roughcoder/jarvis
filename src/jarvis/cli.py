@@ -798,17 +798,18 @@ def _has_orchestration_authority(
     if denied:
         print(f"Missing orchestration capability: {', '.join(denied)}")
         if cfg is not None:
-            print(_capability_hint(denied, cfg))
+            print(_capability_hint(denied, cfg, capabilities))
         return False
     return True
 
 
-def _capability_hint(actions: list[str], cfg) -> str:  # noqa: ANN001
+def _capability_hint(actions: list[str], cfg, capabilities: set[str]) -> str:  # noqa: ANN001
     profile = Path(cfg.capabilities.profiles_dir).expanduser() / f"{cfg.capabilities.device_id}.md"
     worker_profiles = Path(cfg.orchestration.workers_path).expanduser()
     profile_display = profile.resolve(strict=False)
     worker_profiles_display = worker_profiles.resolve(strict=False)
     action_list = ", ".join(actions)
+    fallback_caps = ",".join(sorted(capabilities | set(actions)))
     if profile.exists():
         authority = (
             f"Authority source: add {action_list} to {profile_display} front matter. "
@@ -817,7 +818,8 @@ def _capability_hint(actions: list[str], cfg) -> str:  # noqa: ANN001
     else:
         authority = (
             f"Authority source: create {profile_display} with {action_list} in front matter, "
-            f"or set CAPS_DEFAULT_CAPABILITIES={action_list} for local smoke testing."
+            f"or append the missing capability and set CAPS_DEFAULT_CAPABILITIES={fallback_caps} "
+            "for local smoke testing."
         )
     return (
         f"{authority} Named worker capacity lives separately at {worker_profiles_display}."
