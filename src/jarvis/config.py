@@ -357,6 +357,10 @@ class IntercomConfig(_Base):
     websocket_max_size: int = 8 * 1024 * 1024
     websocket_ping_interval_s: float = 20.0
     websocket_ping_timeout_s: float = 60.0
+    websocket_open_timeout_s: float = 10.0
+    websocket_close_timeout_s: float = 5.0
+    network_recover_cmd: str = "/usr/local/bin/jarvis-network-recover"
+    network_recover_timeout_s: float = 20.0
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -822,11 +826,15 @@ class Config:
             "intercom.websocket_max_size": self.intercom.websocket_max_size,
             "intercom.websocket_ping_interval_s": self.intercom.websocket_ping_interval_s,
             "intercom.websocket_ping_timeout_s": self.intercom.websocket_ping_timeout_s,
+            "intercom.websocket_open_timeout_s": self.intercom.websocket_open_timeout_s,
+            "intercom.websocket_close_timeout_s": self.intercom.websocket_close_timeout_s,
+            "intercom.network_recover_cmd": self.intercom.network_recover_cmd,
+            "intercom.network_recover_timeout_s": self.intercom.network_recover_timeout_s,
             "intercom_device.camera": self.intercom_device.camera,
             "intercom_device.camera_bin": self.intercom_device.camera_bin or "<auto>",
             "intercom_device.pi_panel": self.intercom_device.pi_panel_setting,
             "intercom_device.pi_panel_sleep_after_s": self.intercom_device.pi_panel_sleep_s,
-            "intercom_device.pi_panel_geometry": self.intercom_device.pi_panel_geometry or "<fullscreen>",
+            "intercom_device.pi_panel_geometry": self.intercom_device.pi_panel_geometry or "<auto>",
             "worker.base_url": self.worker.base_url,
             "worker.token": mask(self.worker.token),
             "worker.agent": self.worker.agent,

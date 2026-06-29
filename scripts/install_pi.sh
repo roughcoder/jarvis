@@ -14,6 +14,7 @@ Environment:
   JARVIS_BRAIN_HOST=imac.example         Brain hostname on the private network.
   JARVIS_BRAIN_PORT=8700                 Brain WebSocket port.
   JARVIS_INTERCOM_TOKEN=...              Token issued by the brain.
+  JARVIS_PI_PANEL_GEOMETRY=800x480+0+0   Optional Tk geometry for the touch panel.
   JARVIS_UV_BIN=/usr/local/bin/uv         uv binary used by installed helpers.
   JARVIS_PYTHON_BIN=python3               Python used by uv on Raspberry Pi OS.
   JARVIS_DRY_RUN=0                       Print commands instead of running.
@@ -58,6 +59,7 @@ BRAIN_PORT="${JARVIS_BRAIN_PORT:-8700}"
 INTERCOM_TOKEN="${JARVIS_INTERCOM_TOKEN:-}"
 UV_BIN="${JARVIS_UV_BIN:-/usr/local/bin/uv}"
 PYTHON_BIN="${JARVIS_PYTHON_BIN:-python3}"
+PI_PANEL_GEOMETRY="${JARVIS_PI_PANEL_GEOMETRY:-}"
 
 if [[ -z "$BRAIN_HOST" || -z "$INTERCOM_TOKEN" ]]; then
   echo "Set JARVIS_BRAIN_HOST and JARVIS_INTERCOM_TOKEN before installing." >&2
@@ -121,6 +123,9 @@ CAPS_DEVICE_ID=$DEVICE_ID
 CAPS_IDENTITY=house
 CAPS_SCOPE=house
 VAD_ENGINE=webrtc
+INTERCOM_DEVICE_PI_PANEL=auto
+INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S=25
+INTERCOM_DEVICE_PI_PANEL_GEOMETRY=$PI_PANEL_GEOMETRY
 ENV
 fi
 run chmod 0600 "$INSTALL_DIR/.env"
@@ -137,6 +142,41 @@ exec "$UV_BIN" run jarvis "\$@"
 EOF
 fi
 run chmod 0755 /usr/local/bin/jarvis
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  echo "+ write /usr/local/bin/jarvis-network-recover"
+else
+  cat > /usr/local/bin/jarvis-network-recover <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! command -v nmcli >/dev/null 2>&1; then
+  exit 0
+fi
+
+if command -v nm-online >/dev/null 2>&1 && nm-online -q -s -t 5; then
+  exit 0
+fi
+
+profile="${JARVIS_WIFI_PROFILE:-}"
+if [[ -z "$profile" ]]; then
+  profile="$(
+    nmcli -t -f NAME,TYPE,AUTOCONNECT connection show \
+      | awk -F: '$2 == "wifi" && $3 == "yes" { print $1; exit }'
+  )"
+fi
+
+nmcli radio wifi on >/dev/null 2>&1 || true
+if [[ -n "$profile" ]]; then
+  nmcli connection up "$profile" >/dev/null 2>&1 || true
+fi
+EOF
+fi
+run chmod 0755 /usr/local/bin/jarvis-network-recover
+
+run mkdir -p /var/log/journal
+run systemd-tmpfiles --create --prefix /var/log/journal
+run systemctl restart systemd-journald
 
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "+ write /usr/local/bin/jarvis-pi"
@@ -162,6 +202,8 @@ Commands:
   status    Show systemd service status
   logs      Follow intercom service logs
   doctor    Print basic Pi audio/camera/service readiness
+  recover-network
+            Ask NetworkManager to reconnect the first autoconnect WiFi profile
 PISCRIPT_USAGE
 }
 
@@ -262,6 +304,9 @@ case "\$cmd" in
     ;;
   doctor)
     doctor
+    ;;
+  recover-network)
+    /usr/local/bin/jarvis-network-recover
     ;;
   -h|--help|help|"")
     usage

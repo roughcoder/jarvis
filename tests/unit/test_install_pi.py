@@ -56,6 +56,11 @@ def test_pi_installer_dry_run_models_intercom_install() -> None:
     assert "+ chmod 0600 /opt/jarvis-test/.env" in result.stdout
     assert "+ write /usr/local/bin/jarvis" in result.stdout
     assert "+ chmod 0755 /usr/local/bin/jarvis" in result.stdout
+    assert "+ write /usr/local/bin/jarvis-network-recover" in result.stdout
+    assert "+ chmod 0755 /usr/local/bin/jarvis-network-recover" in result.stdout
+    assert "+ mkdir -p /var/log/journal" in result.stdout
+    assert "+ systemd-tmpfiles --create --prefix /var/log/journal" in result.stdout
+    assert "+ systemctl restart systemd-journald" in result.stdout
     assert "+ write /usr/local/bin/jarvis-pi" in result.stdout
     assert "+ chmod 0755 /usr/local/bin/jarvis-pi" in result.stdout
     assert "+ jarvis service install intercom --platform systemd --jarvis-bin /usr/local/bin/jarvis --workdir /opt/jarvis-test" in result.stdout
@@ -86,3 +91,5 @@ def test_pi_helper_doctor_checks_bookworm_camera_and_display() -> None:
     assert "vcgencmd display_power" in source
     assert "/dev/fb0" in source
     assert "/dev/dri/card*" in source
+    assert "recover-network)" in source
+    assert "/usr/local/bin/jarvis-network-recover" in source

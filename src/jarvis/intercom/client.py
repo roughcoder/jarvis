@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import queue
+import shlex
+import socket
 import threading
 import uuid
 
@@ -88,6 +90,7 @@ class IntercomClient:
         if hardware:
             print(f"Local intercom hardware: {', '.join(hardware)}")
         print(f"Connecting to brain at {url}…")
+        self._panel.set("connecting")
         # Models + mic are loaded once and kept open across brain reconnects: a brain
         # restart must not drop the voice device or re-load Whisper/wake every time.
         try:
@@ -97,11 +100,14 @@ class IntercomClient:
                 phrase = self._cfg.wake.keyword.replace("_", " ").title()
                 while True:  # reconnect loop — survive brain restarts/outages
                     try:
+                        self._panel.set("connecting")
                         async with websockets.connect(
                             url,
                             max_size=self._cfg.intercom.websocket_max_size,
                             ping_interval=self._cfg.intercom.websocket_ping_interval_s,
                             ping_timeout=self._cfg.intercom.websocket_ping_timeout_s,
+                            open_timeout=self._cfg.intercom.websocket_open_timeout_s,
+                            close_timeout=self._cfg.intercom.websocket_close_timeout_s,
                         ) as ws:
                             await ws.send(
                                 encode(
@@ -115,6 +121,7 @@ class IntercomClient:
                             welcome = decode(await ws.recv())
                             if not isinstance(welcome, Welcome):
                                 print(f"pairing rejected: {welcome}; retrying in 5s…")
+                                self._panel.set("disconnected")
                                 await asyncio.sleep(5)
                                 continue
                             print(f"Paired with brain. Capabilities: {welcome.capabilities}")
@@ -144,14 +151,49 @@ class IntercomClient:
                                     t.cancel()
                                     with contextlib.suppress(asyncio.CancelledError, Exception):
                                         await t
+                        self._panel.set("disconnected")
                         print("  [intercom] brain link closed; reconnecting in 3s…")
+                        await self._recover_network_if_needed()
                         await asyncio.sleep(3)
-                    except (OSError, websockets.exceptions.WebSocketException) as exc:
+                    except (OSError, TimeoutError, websockets.exceptions.WebSocketException) as exc:
+                        self._panel.set("disconnected")
                         print(f"  [intercom] brain link lost ({type(exc).__name__}); reconnecting in 3s…")
+                        await self._recover_network_if_needed()
                         await asyncio.sleep(3)
         finally:
             self._panel.stop()
             self._wake.delete()
+
+    async def _recover_network_if_needed(self) -> None:
+        """Best-effort local nudge for Pi installs whose WiFi stack stopped retrying.
+
+        The installer adds /usr/local/bin/jarvis-network-recover when NetworkManager
+        is present. Calling it here is harmless on non-Pi hosts and keeps recovery
+        close to the symptom: the intercom just lost the brain.
+        """
+        if self._cfg.intercom.network_recover_cmd.lower() in {"", "none", "false", "0"}:
+            return
+        if await asyncio.to_thread(self._brain_port_open):
+            return
+        argv = shlex.split(self._cfg.intercom.network_recover_cmd)
+        if not argv:
+            return
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(proc.wait(), timeout=self._cfg.intercom.network_recover_timeout_s)
+
+    def _brain_port_open(self) -> bool:
+        try:
+            with socket.create_connection(
+                (self._cfg.intercom.brain_host, self._cfg.intercom.brain_port), timeout=2.0
+            ):
+                return True
+        except OSError:
+            return False
 
     async def _turn_forever(self, ws, mic, inbound: asyncio.Queue) -> None:  # noqa: ANN001
         """Run turns for the life of one brain connection (idle → wake → turn, repeat)."""
