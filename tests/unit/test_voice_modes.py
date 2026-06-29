@@ -7,6 +7,7 @@ import asyncio
 from jarvis.brain.context import RequestContext
 from jarvis.brain.server import BrainServer
 from jarvis.brain.session import BrainSession, TurnResult
+from jarvis.brain.tracing import TurnTrace
 from jarvis.brain.turnloop import TurnLoop
 from jarvis.brain.voice_modes import (
     DEFAULT_MODE,
@@ -133,6 +134,59 @@ def test_default_mode_stays_open_on_explicit_open_marker() -> None:
     assert result.ended is False
     assert result.continue_listening is True
     assert result.voice_mode == DEFAULT_MODE
+
+
+def test_default_mode_opens_when_reply_requests_followup_without_marker() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(raw="I can't tell from that image. Could you try again with better lighting?")
+
+    sess.finalize("what am I holding", result)
+
+    assert result.ended is False
+    assert result.continue_listening is True
+    assert result.close_reason == "reply_followup_expected"
+    assert result.voice_mode == DEFAULT_MODE
+
+
+def test_default_mode_reply_followup_overrides_stale_closed_marker() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(
+        raw=(
+            "I can't tell from that image. Could you try again with better lighting? "
+            "[[CONVERSATION:closed:task_complete]]"
+        )
+    )
+
+    sess.finalize("what am I holding", result)
+
+    assert result.reply == "I can't tell from that image. Could you try again with better lighting?"
+    assert result.ended is False
+    assert result.continue_listening is True
+    assert result.close_reason == "reply_followup_expected"
+
+
+def test_default_mode_ignores_generic_anything_else_question_on_closed_turn() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(
+        raw="It's one fifteen. Anything else? [[CONVERSATION:closed:task_complete]]"
+    )
+
+    sess.finalize("what time is it", result)
+
+    assert result.ended is True
+    assert result.continue_listening is False
+    assert result.close_reason == "task_complete"
+
+
+def test_default_mode_opens_for_exploratory_turn_without_marker() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(raw="We should split it into packing, timing, and budget.")
+
+    sess.finalize("help me think through the move", result)
+
+    assert result.ended is False
+    assert result.continue_listening is True
+    assert result.close_reason == "brief_followup_expected"
 
 
 def test_default_mode_soft_close_overrides_open_marker() -> None:
@@ -318,6 +372,48 @@ def test_failed_alarm_tool_keeps_voice_turn_open_for_clarification() -> None:
     assert result.ended is False
     assert result.continue_listening is True
     assert result.close_reason == "clarification_needed"
+
+
+def test_failed_alarm_tool_opens_when_reply_asks_clarifying_question_without_marker() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(
+        raw="What time should I set it for?",
+        tool_messages=[
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "set_alarm", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "error: tell me when"},
+        ],
+    )
+
+    sess.finalize("set an alarm", result)
+
+    assert result.ended is False
+    assert result.continue_listening is True
+    assert result.close_reason == "reply_followup_expected"
+
+
+def test_voice_lifecycle_writes_trace_metadata() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(raw="Could you try again?")
+    trace = TurnTrace(room="default", speaker="alice", channel="voice", device_id="pi")
+
+    sess.finalize("what am I holding", result, trace)
+
+    assert trace.data["voice_mode_before"] == DEFAULT_MODE
+    assert trace.data["voice_mode_after"] == DEFAULT_MODE
+    assert trace.data["close_reason"] == "reply_followup_expected"
+    assert trace.data["continue_listening"] is True
+    assert trace.data["policy_decision"] == "reply_followup"
+    assert trace.data["marker_seen"] is False
+    assert trace.data["assistant_asked_followup"] is True
 
 
 def test_local_voice_action_ignores_requests() -> None:

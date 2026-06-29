@@ -77,6 +77,21 @@ _SOFT_CLOSE = re.compile(
     r"lovely|all good|no thanks|nothing else)[.! ]*$",
     re.IGNORECASE,
 )
+_FOLLOWUP_REPLY = re.compile(
+    r"(could you|can you|would you|please (tell|say|try|send|show)|"
+    r"try again|one more time|what time|which one|who should|where should|"
+    r"when should|when do|where are|where is|do you mean|did you mean|"
+    r"tell me (which|what|who|where|when|how)|send (me )?(another|a clearer)|"
+    r"better lighting|more detail|need (a|the|more)|i need)",
+    re.IGNORECASE,
+)
+_EXPLORATORY_USER = re.compile(
+    r"\b(help me|think through|walk me through|talk me through|plan|planning|"
+    r"troubleshoot|debug|figure out|work out|explain|why|how should|how do i|"
+    r"what should|what do you think|compare|decide|design|review|diagnose|"
+    r"investigate|research|brainstorm|step by step)\b",
+    re.IGNORECASE,
+)
 _TASK_COMPLETE_TOOLS = frozenset({"set_alarm", "cancel_alarm", "list_alarms"})
 
 
@@ -103,6 +118,9 @@ class VoiceStateTransition:
     continue_listening: bool
     reason: str
     reset_conversation: bool = False
+    policy_decision: str = ""
+    marker_seen: bool = False
+    assistant_asked_followup: bool = False
 
 
 def normalize_mode(mode: str | None) -> str:
@@ -211,6 +229,16 @@ def tool_completes_voice_turn(tool_messages: list) -> bool:
     return tool_completes_successfully(tool_messages, _TASK_COMPLETE_TOOLS)
 
 
+def assistant_requests_followup(reply: str) -> bool:
+    text = strip_voice_controls(reply or "").strip()
+    return bool(text and _FOLLOWUP_REPLY.search(text))
+
+
+def user_expects_followup(user_text: str) -> bool:
+    text = _norm(user_text)
+    return bool(text and _EXPLORATORY_USER.search(text))
+
+
 def classify_voice_turn(
     *,
     active_mode: str,
@@ -223,6 +251,8 @@ def classify_voice_turn(
     active_mode = normalize_mode(active_mode)
     control = parse_voice_control(raw_reply)
     requested_mode = normalize_mode(control.mode or active_mode)
+    marker_seen = control.conversation is not None or control.mode is not None
+    assistant_followup = assistant_requests_followup(raw_reply)
     soft_close = should_soft_close_default(user_text)
     default_user_closed = explicit_close or soft_close
 
@@ -237,12 +267,18 @@ def classify_voice_turn(
                 continue_listening=False,
                 reason="user_closed" if explicit_close else control.reason,
                 reset_conversation=True,
+                policy_decision="stay_explicit_exit",
+                marker_seen=marker_seen,
+                assistant_asked_followup=assistant_followup,
             )
         return VoiceStateTransition(
             mode=STAY_MODE,
             ended=False,
             continue_listening=True,
             reason="stay_mode",
+            policy_decision="stay_persistent",
+            marker_seen=marker_seen,
+            assistant_asked_followup=assistant_followup,
         )
 
     if requested_mode == STAY_MODE and control.conversation == "open" and not default_user_closed:
@@ -251,6 +287,9 @@ def classify_voice_turn(
             ended=False,
             continue_listening=True,
             reason=control.reason or "mode_enter",
+            policy_decision="mode_enter",
+            marker_seen=marker_seen,
+            assistant_asked_followup=assistant_followup,
         )
 
     if tool_completes_voice_turn(tool_messages):
@@ -260,22 +299,65 @@ def classify_voice_turn(
             continue_listening=False,
             reason="task_complete",
             reset_conversation=True,
+            policy_decision="tool_complete",
+            marker_seen=marker_seen,
+            assistant_asked_followup=assistant_followup,
         )
 
-    if control.conversation == "open" and not default_user_closed:
+    if default_user_closed:
+        return VoiceStateTransition(
+            mode=DEFAULT_MODE,
+            ended=True,
+            continue_listening=False,
+            reason="user_closed",
+            reset_conversation=True,
+            policy_decision="user_closed",
+            marker_seen=marker_seen,
+            assistant_asked_followup=assistant_followup,
+        )
+
+    if control.conversation == "open":
         return VoiceStateTransition(
             mode=requested_mode,
             ended=False,
             continue_listening=True,
             reason=control.reason or "followup_expected",
+            policy_decision="marker_open",
+            marker_seen=marker_seen,
+            assistant_asked_followup=assistant_followup,
+        )
+
+    if assistant_followup:
+        return VoiceStateTransition(
+            mode=DEFAULT_MODE,
+            ended=False,
+            continue_listening=True,
+            reason="reply_followup_expected",
+            policy_decision="reply_followup",
+            marker_seen=marker_seen,
+            assistant_asked_followup=True,
+        )
+
+    if user_expects_followup(user_text):
+        return VoiceStateTransition(
+            mode=DEFAULT_MODE,
+            ended=False,
+            continue_listening=True,
+            reason="brief_followup_expected",
+            policy_decision="user_exploratory",
+            marker_seen=marker_seen,
+            assistant_asked_followup=assistant_followup,
         )
 
     return VoiceStateTransition(
         mode=DEFAULT_MODE,
         ended=True,
         continue_listening=False,
-        reason="user_closed" if default_user_closed else control.reason or "default_complete",
+        reason=control.reason or "default_complete",
         reset_conversation=True,
+        policy_decision="default_complete",
+        marker_seen=marker_seen,
+        assistant_asked_followup=assistant_followup,
     )
 
 
@@ -286,6 +368,7 @@ def voice_disabled_transition() -> VoiceStateTransition:
         continue_listening=False,
         reason="conversation_disabled",
         reset_conversation=True,
+        policy_decision="conversation_disabled",
     )
 
 
@@ -302,6 +385,7 @@ def voice_result_transition(
         continue_listening=continue_listening,
         reason=close_reason,
         reset_conversation=ended,
+        policy_decision="result_reset" if ended else "result_open",
     )
 
 
@@ -318,6 +402,7 @@ def cancelled_voice_transition(
         continue_listening=close_reason == "mode_enter",
         reason=close_reason,
         reset_conversation=close_reason == "mode_exit",
+        policy_decision="cancelled_mode_transition",
     )
 
 
@@ -329,6 +414,7 @@ def alarm_ack_transition(active_mode: str) -> VoiceStateTransition:
             ended=False,
             continue_listening=True,
             reason="alarm_ack",
+            policy_decision="alarm_ack_stay",
         )
     return VoiceStateTransition(
         mode=DEFAULT_MODE,
@@ -336,6 +422,7 @@ def alarm_ack_transition(active_mode: str) -> VoiceStateTransition:
         continue_listening=False,
         reason="alarm_ack",
         reset_conversation=True,
+        policy_decision="alarm_ack_close",
     )
 
 
@@ -347,8 +434,15 @@ def empty_transcript_transition(channel: str) -> VoiceStateTransition:
             continue_listening=False,
             reason="empty_transcript",
             reset_conversation=True,
+            policy_decision="empty_transcript",
         )
-    return VoiceStateTransition(mode=DEFAULT_MODE, ended=False, continue_listening=False, reason="")
+    return VoiceStateTransition(
+        mode=DEFAULT_MODE,
+        ended=False,
+        continue_listening=False,
+        reason="",
+        policy_decision="empty_message",
+    )
 
 
 def voice_mode_instruction(mode: str) -> str:
@@ -367,9 +461,11 @@ def voice_mode_instruction(mode: str) -> str:
         "Voice mode: default. This is spoken household use, not chat. Prefer a "
         "short complete answer, then close the mic after completed commands "
         "(alarms, timers, reminders), time/weather/simple factual answers, and "
-        "polite endings such as thanks, bye, or that's all. Keep listening only "
+        "polite endings such as thanks, bye, or that's all. Keep listening briefly "
+        "when the reply asks the user for clarification, asks them to try again, or "
         "when the user is clearly exploring, planning, troubleshooting, or asking "
-        "a multi-step question. Append exactly one conversation marker at the end: "
+        "a multi-step question. If unsure, prefer a brief follow-up listen rather "
+        "than going straight to sleep. Append exactly one conversation marker at the end: "
         "[[CONVERSATION:closed:task_complete]] when the turn is complete, or "
         "[[CONVERSATION:open:followup_expected]] when a real follow-up is expected. "
         "If the user asks for stay mode, append [[VOICE_MODE:stay:mode_enter]] "
