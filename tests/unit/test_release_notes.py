@@ -154,6 +154,25 @@ Release-note: skip
     assert "Release-note: <text> or Release-note: skip" in errors[0]
 
 
+def test_release_note_overrides_satisfy_strict_trailers(tmp_path) -> None:
+    missing = release_notes.parse_commit(
+        "abc123def456",
+        """fix(voice): preserve paired identity baseline
+
+Keep pairing identity stable after a voice reset.
+""",
+    )
+    path = tmp_path / "overrides.json"
+    path.write_text('{"abc123": {"Release-note": "skip"}}', encoding="utf-8")
+
+    overrides = release_notes.load_release_note_overrides(path)
+    release_notes.apply_release_note_overrides([missing], overrides)
+
+    assert missing.has_release_note_decision is True
+    assert missing.release_notes == []
+    assert release_notes.validate_release_trailers([missing]) == []
+
+
 def test_strict_release_trailers_require_breaking_detail_for_any_type() -> None:
     missing = release_notes.parse_commit(
         "abc123",
