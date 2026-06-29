@@ -77,13 +77,17 @@ _SOFT_CLOSE = re.compile(
     r"lovely|all good|no thanks|nothing else)[.! ]*$",
     re.IGNORECASE,
 )
-_FOLLOWUP_REPLY = re.compile(
-    r"\b(?:could you|can you|would you|please (?:tell|say|try|send|show)|"
-    r"try again|one more time|what time|which one|who should|where should|"
+_FOLLOWUP_QUESTION_REPLY = re.compile(
+    r"(?:^|[.!?,;]\s+)\b(?:could you|can you|would you|what time|which one|"
+    r"who should|where should|"
     r"what should|when should|when do|where are|where is|for how long|"
-    r"how long should|do you mean|did you mean|"
-    r"tell me (?:which|what|who|where|when|how)|send (?:me )?(?:another|a clearer)|"
-    r"better lighting)\b",
+    r"how long should|do you mean|did you mean)\b[^.?!]*\?",
+    re.IGNORECASE,
+)
+_FOLLOWUP_REQUEST_REPLY = re.compile(
+    r"(?:^|[.!?,;]\s+)\b(?:please (?:tell|say|try|send|show)|try again|"
+    r"one more time|tell me (?:which|what|who|where|when|how)|"
+    r"send (?:me )?(?:another|a clearer)|better lighting)\b",
     re.IGNORECASE,
 )
 _EXPLORATORY_USER = re.compile(
@@ -232,7 +236,10 @@ def tool_completes_voice_turn(tool_messages: list) -> bool:
 
 def assistant_requests_followup(reply: str) -> bool:
     text = strip_voice_controls(reply or "").strip()
-    return bool(text and _FOLLOWUP_REPLY.search(text))
+    return bool(
+        text
+        and (_FOLLOWUP_QUESTION_REPLY.search(text) or _FOLLOWUP_REQUEST_REPLY.search(text))
+    )
 
 
 def user_expects_followup(user_text: str) -> bool:
