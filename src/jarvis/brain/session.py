@@ -628,7 +628,15 @@ class BrainSession:
             # which tends to fumble multi-step browsing and answer from stale
             # snippets. Plain no-tool chat stays on fast (this code only runs when
             # the model chose to call a tool).
-            if model != self._cfg.gateway.strong_model:
+            fast_tool_routes = {
+                self._cfg.gateway.fast_model,
+                self._cfg.gateway.voice_model or self._cfg.gateway.fast_model,
+            }
+            if (
+                model in fast_tool_routes
+                and model != self._cfg.gateway.strong_model
+                and model != self._cfg.gateway.vision_model
+            ):
                 model = self._cfg.gateway.strong_model
             for tc in msg.tool_calls:
                 n_tools += 1
