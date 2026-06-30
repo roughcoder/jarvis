@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import json
-import os
 import queue
-import signal
 import subprocess
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -123,7 +121,7 @@ class CodexProviderAdapter:
             session.session_id,
             request_id,
             kind=REQUEST_KIND_APPROVAL,
-            result=_approval_result(request),
+            request=request,
         )
         if not delivered:
             raise RuntimeError(f"no pending codex approval request {request_id!r}")
@@ -146,7 +144,7 @@ class CodexProviderAdapter:
             session.session_id,
             request_id,
             kind=REQUEST_KIND_INPUT,
-            result=_input_result(request),
+            request=request,
         )
         if not delivered:
             raise RuntimeError(f"no pending codex input request {request_id!r}")
@@ -160,10 +158,13 @@ class _PendingCodexRequest:
     kind: str
     process: subprocess.Popen[str]
     rpc_id: Any
+    params: dict[str, Any] = field(default_factory=dict)
 
 
 _PENDING_LOCK = threading.Lock()
 _PENDING_REQUESTS: dict[tuple[str, str], _PendingCodexRequest] = {}
+_PROCESS_LOCK = threading.Lock()
+_PROVIDER_PROCESSES: dict[str, subprocess.Popen[str]] = {}
 
 
 def _run_codex_turn(
@@ -190,6 +191,7 @@ def _run_codex_turn(
             text=True,
             bufsize=1,
         )
+        _track_provider_process(session_id, process)
         line_queue = _start_line_readers(process)
         sessions.update_metadata(
             session_id,
@@ -332,6 +334,8 @@ def _run_codex_turn(
             },
         )
     finally:
+        if process is not None:
+            _untrack_provider_process(session_id, process)
         if process is not None:
             _clear_pending_requests(session_id, process)
         if process is not None and process.poll() is None:
@@ -517,17 +521,38 @@ def _project_jsonrpc_message(
             sessions.append_event(session_id, EVENT_TOOL_CALL, {**common, "item": item})
     elif method == "item/commandExecution/requestApproval":
         request_id = _message_request_id(message, params)
-        _track_pending_request(session_id, request_id, kind=REQUEST_KIND_APPROVAL, process=process, rpc_id=message.get("id"))
+        _track_pending_request(
+            session_id,
+            request_id,
+            kind=REQUEST_KIND_APPROVAL,
+            process=process,
+            rpc_id=message.get("id"),
+            params=params,
+        )
         sessions.append_event(session_id, EVENT_APPROVAL_REQUESTED, {**common, **params, "request_id": request_id})
         sessions.update_status(session_id, SESSION_WAITING_APPROVAL)
     elif method == "item/fileChange/requestApproval":
         request_id = _message_request_id(message, params)
-        _track_pending_request(session_id, request_id, kind=REQUEST_KIND_APPROVAL, process=process, rpc_id=message.get("id"))
+        _track_pending_request(
+            session_id,
+            request_id,
+            kind=REQUEST_KIND_APPROVAL,
+            process=process,
+            rpc_id=message.get("id"),
+            params=params,
+        )
         sessions.append_event(session_id, EVENT_APPROVAL_REQUESTED, {**common, **params, "request_id": request_id})
         sessions.update_status(session_id, SESSION_WAITING_APPROVAL)
     elif method == "item/tool/requestUserInput":
         request_id = _message_request_id(message, params)
-        _track_pending_request(session_id, request_id, kind=REQUEST_KIND_INPUT, process=process, rpc_id=message.get("id"))
+        _track_pending_request(
+            session_id,
+            request_id,
+            kind=REQUEST_KIND_INPUT,
+            process=process,
+            rpc_id=message.get("id"),
+            params=params,
+        )
         sessions.append_event(session_id, EVENT_INPUT_REQUESTED, {**common, **params, "request_id": request_id})
         sessions.update_status(session_id, SESSION_WAITING_INPUT)
     elif method == "turn/completed":
@@ -563,14 +588,20 @@ def _track_pending_request(
     kind: str,
     process: subprocess.Popen[str],
     rpc_id: Any,
+    params: dict[str, Any] | None = None,
 ) -> None:
     if not request_id or rpc_id is None:
         return
     with _PENDING_LOCK:
-        _PENDING_REQUESTS[(session_id, request_id)] = _PendingCodexRequest(kind=kind, process=process, rpc_id=rpc_id)
+        _PENDING_REQUESTS[(session_id, request_id)] = _PendingCodexRequest(
+            kind=kind,
+            process=process,
+            rpc_id=rpc_id,
+            params=dict(params or {}),
+        )
 
 
-def _deliver_pending_request(session_id: str, request_id: str, *, kind: str, result: dict[str, Any]) -> bool:
+def _deliver_pending_request(session_id: str, request_id: str, *, kind: str, request: dict[str, Any]) -> bool:
     with _PENDING_LOCK:
         key = (session_id, request_id)
         pending = _PENDING_REQUESTS.get(key)
@@ -578,6 +609,7 @@ def _deliver_pending_request(session_id: str, request_id: str, *, kind: str, res
             _PENDING_REQUESTS.pop(key, None)
     if pending is None or pending.kind != kind:
         return False
+    result = _approval_result(request) if kind == REQUEST_KIND_APPROVAL else _input_result(request, pending.params)
     _send_json(pending.process, {"jsonrpc": "2.0", "id": pending.rpc_id, "result": result})
     return True
 
@@ -591,19 +623,54 @@ def _clear_pending_requests(session_id: str, process: subprocess.Popen[str]) -> 
 
 def _approval_result(request: dict[str, Any]) -> dict[str, Any]:
     decision = str(request.get("decision") or "").strip().lower()
-    if decision in {"approved", "approve", "allow", "allowed", "yes"}:
-        mapped = "approve"
+    if decision in {"approved", "approve", "allow", "allowed", "yes", "accept"}:
+        mapped = "accept"
+    elif decision in {"acceptforsession", "accept_for_session", "always"}:
+        mapped = "acceptForSession"
+    elif decision == "cancel":
+        mapped = "cancel"
     else:
-        mapped = "deny"
+        mapped = "decline"
     return {"decision": mapped}
 
 
-def _input_result(request: dict[str, Any]) -> dict[str, Any]:
+def _input_result(request: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
     answers = request.get("answers")
-    if isinstance(answers, dict):
-        return {"answers": answers}
+    question_ids = _input_question_ids(params or {})
     text = str(request.get("text") or request.get("answer") or "")
-    return {"answers": {"text": text}}
+    if isinstance(answers, dict):
+        return {
+            "answers": {
+                question_id: _input_answer_payload(answers.get(question_id, text))
+                for question_id in question_ids
+            }
+        }
+    return {"answers": {question_id: {"answers": [text]} for question_id in question_ids}}
+
+
+def _input_question_ids(params: dict[str, Any]) -> list[str]:
+    result: list[str] = []
+    for key in ("questions", "items", "inputs"):
+        values = params.get(key)
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            if isinstance(item, dict):
+                question_id = str(item.get("id") or item.get("name") or item.get("key") or "").strip()
+                if question_id and question_id not in result:
+                    result.append(question_id)
+    question_id = str(params.get("question_id") or params.get("id") or "").strip()
+    if question_id and question_id not in result:
+        result.append(question_id)
+    return result or ["text"]
+
+
+def _input_answer_payload(value: Any) -> dict[str, list[str]]:
+    if isinstance(value, dict) and isinstance(value.get("answers"), list):
+        return {"answers": [str(item) for item in value["answers"]]}
+    if isinstance(value, list):
+        return {"answers": [str(item) for item in value]}
+    return {"answers": [str(value or "")]}
 
 
 def _record_provider_log(session_id: str, turn: ProviderTurn, sessions: SessionManager, text: str) -> None:
@@ -662,10 +729,22 @@ def _session_cancelled(sessions: SessionManager, session_id: str) -> bool:
 
 
 def _terminate_provider_process(session: WorkerSession) -> None:
-    pid = str(session.metadata.get("provider_pid") or "").strip()
-    if not pid:
+    with _PROCESS_LOCK:
+        process = _PROVIDER_PROCESSES.get(session.session_id)
+    if process is None or process.poll() is not None:
         return
     try:
-        os.kill(int(pid), signal.SIGTERM)
-    except (OSError, ValueError):
+        process.terminate()
+    except OSError:
         return
+
+
+def _track_provider_process(session_id: str, process: subprocess.Popen[str]) -> None:
+    with _PROCESS_LOCK:
+        _PROVIDER_PROCESSES[session_id] = process
+
+
+def _untrack_provider_process(session_id: str, process: subprocess.Popen[str]) -> None:
+    with _PROCESS_LOCK:
+        if _PROVIDER_PROCESSES.get(session_id) is process:
+            _PROVIDER_PROCESSES.pop(session_id, None)

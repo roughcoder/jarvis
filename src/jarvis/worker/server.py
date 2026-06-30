@@ -22,6 +22,7 @@ import os
 import pathlib
 import subprocess
 import uuid
+from typing import Any
 
 from aiohttp import web
 
@@ -463,13 +464,13 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         session = sessions.get(session_id)
         if session is None:
             return web.json_response({"error": "no such session"}, status=404)
-        authority_error = _require_session_authority(session, WORKER_SESSION_RESTORE)
-        if authority_error is not None:
-            return authority_error
         try:
             body = await request.json()
         except Exception:
             return web.json_response({"error": "bad json"}, status=400)
+        authority_error = _require_session_control_authority(session, WORKER_SESSION_RESTORE, body)
+        if authority_error is not None:
+            return authority_error
         checkpoint_id = str(body.get(CHECKPOINT_ID_KEY) or "").strip()
         if not checkpoint_id:
             return web.json_response({"error": "checkpoint_id is required"}, status=400)
@@ -669,13 +670,13 @@ async def _provider_control_event(
     if session is None:
         return web.json_response({"error": "no such session"}, status=404)
     required_action = WORKER_SESSION_APPROVE if action == "approval" else WORKER_SESSION_INPUT
-    authority_error = _require_session_authority(session, required_action)
-    if authority_error is not None:
-        return authority_error
     try:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "bad json"}, status=400)
+    authority_error = _require_session_control_authority(session, required_action, body)
+    if authority_error is not None:
+        return authority_error
     try:
         adapter = provider_for(session.provider)
     except ValueError as exc:
@@ -705,7 +706,11 @@ async def _provider_terminal_event(
     if session is None:
         return web.json_response({"error": "no such session"}, status=404)
     required_action = WORKER_SESSION_STOP if action == "stop" else WORKER_SESSION_INTERRUPT
-    authority_error = _require_session_authority(session, required_action)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "bad json"}, status=400)
+    authority_error = _require_session_control_authority(session, required_action, body)
     if authority_error is not None:
         return authority_error
     try:
@@ -730,6 +735,36 @@ def _require_session_authority(session, action: str) -> web.Response | None:  # 
     except RuntimeError as exc:
         return web.json_response({"ok": False, "error": str(exc)}, status=400)
     return None
+
+
+def _require_session_control_authority(
+    session: WorkerSession,
+    action: str,
+    body: dict[str, Any],
+) -> web.Response | None:
+    ceiling_error = _require_session_authority(session, action)
+    if ceiling_error is not None:
+        return ceiling_error
+    try:
+        caller = WorkerSessionAuthority.from_metadata(_control_authority_metadata(body))
+        caller.require(action)
+    except RuntimeError as exc:
+        return web.json_response({"ok": False, "error": f"caller control authority denied: {exc}"}, status=400)
+    return None
+
+
+def _control_authority_metadata(body: dict[str, Any]) -> dict[str, Any]:
+    metadata = dict(body.get("metadata") or {}) if isinstance(body.get("metadata"), dict) else {}
+    control_envelope = metadata.get("control_envelope")
+    if isinstance(control_envelope, dict):
+        metadata["execution_envelope"] = control_envelope
+    envelope = body.get("execution_envelope")
+    if isinstance(envelope, dict):
+        metadata["execution_envelope"] = envelope
+    allowed_actions = body.get("allowed_actions")
+    if isinstance(allowed_actions, list):
+        metadata["allowed_actions"] = allowed_actions
+    return metadata
 
 
 async def _terminal_session_event(

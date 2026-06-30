@@ -25,7 +25,7 @@ from jarvis.orchestration.models import (
 from jarvis.orchestration.policy import required_for_worker_dispatch
 from jarvis.orchestration.reports import build_run_report, public_status_comment
 from jarvis.orchestration.schedules import ScheduleStore, dispatch_due_schedules
-from jarvis.orchestration.service import MissingWorkRepoError, OrchestrationService, StartedWork
+from jarvis.orchestration.service import MissingWorkRepoError, NoEligibleWorkerError, OrchestrationService, StartedWork
 from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource
 from jarvis.orchestration.store import ActiveWorkItemError, OrchestrationStore
 from jarvis.orchestration.supervisor import sync_run_jobs, sync_run_sessions
@@ -700,9 +700,10 @@ def test_orchestration_service_starts_ensemble_sessions(tmp_path, monkeypatch) -
         def next(self, *, repo="", filters=None):  # noqa: ANN001, ANN201
             return _item(id="#33")
 
-    def fake_choose(_self, _required=None, *, engine="", engines=None):  # noqa: ANN001, ANN202
+    def fake_choose(_self, _required=None, *, engine="", engines=None, slots=1):  # noqa: ANN001, ANN202
         assert engine == ""
         assert engines == ["codex", "claude"]
+        assert slots == 2
         return WorkerProfile(
             worker_id="local-worker",
             display_name="Local",
@@ -710,6 +711,7 @@ def test_orchestration_service_starts_ensemble_sessions(tmp_path, monkeypatch) -
             base_url="http://localhost:1",
             status="online",
             supported_engines=["codex", "claude"],
+            max_concurrent_jobs=2,
         )
 
     def fake_start_ensemble(envelope, *, engines, worker_cfg, worker=None, store=None, post=None):  # noqa: ANN001, ANN202
@@ -778,6 +780,7 @@ def test_orchestration_service_selects_worker_supporting_all_ensemble_engines(tm
                         "status": "online",
                         "agent": "codex",
                         "supported_engines": ["codex", "claude"],
+                        "max_concurrent_jobs": 2,
                     },
                 ]
             }
@@ -835,6 +838,68 @@ def test_orchestration_service_selects_worker_supporting_all_ensemble_engines(tm
 
     assert isinstance(result, StartedWork)
     assert seen["worker_id"] == "multi-engine"
+
+
+def test_orchestration_service_rejects_ensemble_when_worker_lacks_slots(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    workers_path = tmp_path / "workers.json"
+    workers_path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "multi-engine",
+                        "display_name": "Multi",
+                        "base_url": "http://multi.invalid",
+                        "status": "online",
+                        "agent": "codex",
+                        "supported_engines": ["codex", "claude"],
+                        "max_concurrent_jobs": 1,
+                    }
+                ]
+            }
+        )
+    )
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                f"ORCHESTRATION_WORKERS_PATH={workers_path}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    cfg = load_config()
+
+    class Source:
+        def next(self, *, repo="", filters=None):  # noqa: ANN001, ANN201
+            return _item(id="#35")
+
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={
+            "work.github.issues.read",
+            "worker.session.create",
+            "worker.session.turn",
+            "worker.session.stop",
+            "forge.github.branch.push",
+        },
+        source_factory=lambda _name, _cfg=None: Source(),
+    )
+
+    with pytest.raises(NoEligibleWorkerError):
+        service.next_work(
+            WorkCommand(
+                "start_next_work",
+                source="github",
+                start=True,
+                engine_strategy="ensemble",
+                target_engine_id="codex,claude",
+            ),
+            start=True,
+        )
 
 
 def test_orchestration_service_needs_human_for_start_without_repo(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -1298,6 +1363,8 @@ def test_start_worker_ensemble_stops_started_sessions_on_later_failure(tmp_path)
         )
 
     assert any(url.endswith("/sessions/sess_codex/stop") for url, _payload in calls)
+    stop_payload = next(payload for url, payload in calls if url.endswith("/sessions/sess_codex/stop"))
+    assert WORKER_SESSION_STOP in stop_payload["metadata"]["execution_envelope"]["allowed_actions"]
     assert store.get(run.run_id).sessions[0].status == "stopped"  # type: ignore[union-attr]
 
 
@@ -1960,6 +2027,70 @@ def test_orchestration_service_resume_preserves_original_landing_policy(tmp_path
     assert envelope.landing.mode == "draft_pr"
     assert envelope.allowed_actions == required_for_worker_dispatch("draft_pr")
     assert "Landing policy: draft_pr" in envelope.prompt
+
+
+def test_orchestration_service_resume_dispatch_failure_rolls_back_reservation(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    cfg = load_config()
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    run = store.create_run("Fix worker", work_items=[_item(id="#61")])
+    store.link_session(
+        run.run_id,
+        WorkerSessionLink(
+            worker_id="local-worker",
+            session_id="550e8400-e29b-41d4-a716-446655440000",
+            status="completed",
+            provider="codex",
+            engine="codex",
+            branch="jarvis/61-fix-worker",
+            cwd="/worker/worktrees/61",
+            last_event_id="ev_done",
+        ),
+    )
+    store.set_phase(run.run_id, "completed", "done")
+
+    def fail_start(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("worker rejected session turn")
+
+    monkeypatch.setattr("jarvis.orchestration.service.sync_run_sessions", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        "jarvis.orchestration.workers.WorkerRegistry._probe",
+        lambda _self, profile: WorkerProfile(
+            worker_id=profile.worker_id,
+            display_name=profile.display_name,
+            capabilities=profile.capabilities,
+            base_url=profile.base_url,
+            status="online",
+            agent="codex",
+            supported_engines=["codex"],
+        ),
+    )
+    monkeypatch.setattr("jarvis.orchestration.executor.start_worker_session", fail_start)
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"orchestration.runs.read", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: None,
+    )
+
+    with pytest.raises(Exception, match="worker rejected session turn"):
+        service.resume_run(run.run_id)
+
+    reloaded = store.get(run.run_id)
+    assert reloaded is not None
+    assert reloaded.phase == "completed"
+    assert reloaded.status == "terminal"
+    assert reloaded.sessions[0].status == "completed"
+    assert reloaded.sessions[0].last_event_id == "ev_done"
+    assert store.events(run.run_id)[-1].type == "resume_dispatch_failed"
 
 
 def test_orchestration_service_resume_rechecks_work_item_capabilities(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -3018,7 +3149,10 @@ def test_cli_sessions_restore_checkpoint_preserves_worker_response(monkeypatch, 
     assert calls == [
         (
             "http://worker/sessions/sess_1/checkpoints/restore",
-            {"checkpoint_id": "ckpt_1", "metadata": {"surface": "cli"}},
+            {
+                "checkpoint_id": "ckpt_1",
+                "metadata": {"surface": "cli", "allowed_actions": ["worker.session.restore"]},
+            },
         )
     ]
     assert "checkpoint.restored" in capsys.readouterr().out

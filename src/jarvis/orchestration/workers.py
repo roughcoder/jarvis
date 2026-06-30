@@ -47,6 +47,7 @@ class WorkerRegistry:
         *,
         engine: str = "",
         engines: list[str] | None = None,
+        slots: int = 1,
     ) -> WorkerProfile | None:
         required_set = set(required or [])
         required_engines = _required_engines(engines or [])
@@ -64,7 +65,7 @@ class WorkerRegistry:
             if any(not worker_supports_engine(profile.supported_engines, target) for target in required_engines):
                 continue
             if required_set.issubset(set(profile.capabilities)):
-                if profile.current_jobs < profile.max_concurrent_jobs:
+                if profile.current_jobs + max(1, slots) <= profile.max_concurrent_jobs:
                     return profile
         return None
 

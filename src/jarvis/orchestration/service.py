@@ -13,7 +13,7 @@ from jarvis.orchestration.sources import WorkSource
 from jarvis.orchestration.store import ActiveWorkerSessionError, ActiveWorkItemError, OrchestrationStore
 from jarvis.orchestration.supervisor import sync_run_sessions
 from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry
-from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, SESSION_FAILED, SESSION_RUNNING
+from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, SESSION_RUNNING
 
 
 class SourceFactory(Protocol):
@@ -119,16 +119,24 @@ class OrchestrationService:
         if command.target_worker_id:
             worker = registry.get(command.target_worker_id, probe=True)
         elif command.engine_strategy == "ensemble" and requested_engines:
-            worker = registry.choose(item.capability_requirements, engines=requested_engines)
+            worker = registry.choose(item.capability_requirements, engines=requested_engines, slots=len(requested_engines))
         elif target_engine:
             worker = registry.choose(item.capability_requirements, engine=target_engine)
         else:
             worker = registry.choose(item.capability_requirements)
-        if worker is None or not _worker_is_eligible(worker, item.capability_requirements, engine=target_engine):
+        required_slots = len(requested_engines) if command.engine_strategy == "ensemble" and requested_engines else 1
+        if worker is None or not _worker_is_eligible(
+            worker,
+            item.capability_requirements,
+            engine=target_engine,
+            required_slots=required_slots,
+        ):
             raise NoEligibleWorkerError("No eligible worker found.")
         engine = target_engine or worker.default_engine or worker.agent
         engines = _target_engines(command, worker, fallback_engine=engine)
         if any(not worker_supports_engine(worker.supported_engines, target) for target in engines):
+            raise NoEligibleWorkerError("No eligible worker found.")
+        if command.engine_strategy == "ensemble" and worker.current_jobs + len(engines) > worker.max_concurrent_jobs:
             raise NoEligibleWorkerError("No eligible worker found.")
 
         try:
@@ -187,6 +195,9 @@ class OrchestrationService:
         previous = _resume_session(run.sessions)
         if previous is None:
             raise ResumeRunError(f"Run {run.run_id} has no resumable worker session.")
+        previous_state = previous.to_dict()
+        previous_phase = run.phase
+        previous_terminal_reason = run.terminal_reason
 
         item = run.work_items[0].item if run.work_items else WorkItem(source="jarvis", id=run.run_id, title=run.objective)
         registry = WorkerRegistry(self.cfg.worker, profiles_path=self.cfg.orchestration.workers_path)
@@ -231,7 +242,9 @@ class OrchestrationService:
         try:
             session = executor.start_worker_session(envelope, worker_cfg=self.cfg.worker, worker=worker, store=store)
         except Exception as exc:  # noqa: BLE001 - dispatch failure must leave an inspectable run
-            store.update_session(run.run_id, previous.session_id, status=SESSION_FAILED)
+            previous_updates = {key: value for key, value in previous_state.items() if key not in {"worker_id", "session_id"}}
+            store.update_session(run.run_id, previous.session_id, **previous_updates)
+            store.set_phase(run.run_id, previous_phase, previous_terminal_reason)
             _record_failed_resume(store, run.run_id, str(exc))
             raise WorkerDispatchError(envelope.run_id, exc) from exc
         return StartedWork(item=item, worker=worker, envelope=envelope, session=session)
@@ -253,10 +266,16 @@ class OrchestrationService:
         return str(command.filters.get("repo") or self.cfg.orchestration.default_repo)
 
 
-def _worker_is_eligible(worker: WorkerProfile, required: list[str] | None = None, *, engine: str = "") -> bool:
+def _worker_is_eligible(
+    worker: WorkerProfile,
+    required: list[str] | None = None,
+    *,
+    engine: str = "",
+    required_slots: int = 1,
+) -> bool:
     if worker.status == "offline":
         return False
-    if worker.current_jobs >= worker.max_concurrent_jobs:
+    if worker.current_jobs + max(1, required_slots) > worker.max_concurrent_jobs:
         return False
     if engine and not worker_supports_engine(worker.supported_engines, engine):
         return False

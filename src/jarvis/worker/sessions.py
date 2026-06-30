@@ -23,6 +23,16 @@ from jarvis.worker_session_contract import (
     resolved_request_type as contract_resolved_request_type,
 )
 
+PROVIDER_OWNED_METADATA_KEYS = {
+    "provider_pid",
+    "provider_runtime",
+    "provider_cwd",
+    "provider_session_id",
+    "codex_thread_id",
+    "claude_session_id",
+    "claude_session_started",
+}
+
 
 @dataclass
 class SessionEvent:
@@ -118,7 +128,7 @@ class SessionManager:
                 branch=str(data.get("branch") or ""),
                 cwd=str(data.get("cwd") or ""),
                 title=str(data.get("title") or data.get("name") or ""),
-                metadata=dict(data.get("metadata") or {}),
+                metadata=_caller_metadata(data.get("metadata") or {}),
             )
             self.save(session)
             event = self.append_event(
@@ -355,3 +365,8 @@ def _valid_event_type(value: str) -> bool:
 def _clean_id(value: Any) -> str:
     text = str(value or "").strip().lower()
     return text if _valid_id(text) else "unknown"
+
+
+def _caller_metadata(value: Any) -> dict[str, Any]:
+    metadata = dict(value or {}) if isinstance(value, dict) else {}
+    return {key: item for key, item in metadata.items() if key not in PROVIDER_OWNED_METADATA_KEYS}
