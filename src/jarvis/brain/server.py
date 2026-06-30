@@ -600,7 +600,9 @@ class BrainServer:
         trace.set(audio_downlink=REPLY_AUDIO_BINARY_V1)
         if isinstance(msg, Utterance):
             if channel == "voice":
-                conn["voice_mode"] = normalize_mode(msg.voice_mode)
+                conn["voice_mode"] = BrainServer._voice_mode_for_utterance(
+                    msg, current=conn.get("voice_mode", DEFAULT_MODE)
+                )
             pcm = msg.pcm()
             secs = len(pcm) / 2 / msg.sample_rate
             trace.stage(
@@ -698,6 +700,12 @@ class BrainServer:
                 )
             )
         self._apply_turn_result(channel, conn, result)
+
+    @staticmethod
+    def _voice_mode_for_utterance(msg: Utterance, *, current: str = DEFAULT_MODE) -> str:
+        if "voice_mode" not in msg.model_fields_set:
+            return normalize_mode(current)
+        return normalize_mode(msg.voice_mode)
 
     @staticmethod
     async def _send_reply_audio(ws, turn_id: str, pcm: bytes) -> None:  # noqa: ANN001

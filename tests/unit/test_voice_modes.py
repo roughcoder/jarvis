@@ -17,7 +17,7 @@ from jarvis.brain.voice_modes import (
     strip_voice_controls,
 )
 from jarvis.config import load_config
-from jarvis.protocol.messages import ReplyEnd, decode, encode
+from jarvis.protocol.messages import ReplyEnd, Utterance, decode, encode
 
 
 class _Gateway:
@@ -557,6 +557,19 @@ def test_reply_end_carries_voice_mode_metadata() -> None:
 
     assert isinstance(back, ReplyEnd)
     assert back.model_dump() == msg.model_dump()
+
+
+def test_brain_preserves_connection_mode_when_utterance_omits_voice_mode() -> None:
+    msg = decode('{"type":"utterance","turn_id":"t1","sample_rate":16000,"pcm_b64":""}')
+
+    assert isinstance(msg, Utterance)
+    assert BrainServer._voice_mode_for_utterance(msg, current=STAY_MODE) == STAY_MODE
+
+
+def test_brain_applies_explicit_utterance_voice_mode() -> None:
+    msg = Utterance.of("t1", 16000, b"", voice_mode=DEFAULT_MODE)
+
+    assert BrainServer._voice_mode_for_utterance(msg, current=STAY_MODE) == DEFAULT_MODE
 
 
 def test_voice_conversation_reset_clears_temporary_identity_and_mode() -> None:

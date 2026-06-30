@@ -411,13 +411,46 @@ def test_network_probe_failure_does_not_block_brain_reconnect() -> None:
 
     c._recover_network_if_needed = fake_recover  # type: ignore[method-assign]
 
+    async def go() -> bool:
+        return await c._ensure_network_ready()
+
+    assert asyncio.run(go()) is False
+
+    assert panel.states == ["network"]
+    assert recovered is True
+
+
+def test_failed_network_probe_keeps_network_state_during_brain_connect_attempt() -> None:
+    panel = _Panel()
+    c = _client(panel)
+
+    c._network_online = lambda: False  # type: ignore[method-assign]
+
+    async def fake_recover() -> None:
+        return None
+
+    c._recover_network_if_needed = fake_recover  # type: ignore[method-assign]
+
     async def go() -> None:
-        await c._ensure_network_ready()
+        await c._prepare_brain_connect_attempt()
 
     asyncio.run(go())
 
     assert panel.states == ["network"]
-    assert recovered is True
+
+
+def test_network_probe_success_shows_connecting_before_brain_attempt() -> None:
+    panel = _Panel()
+    c = _client(panel)
+
+    c._network_online = lambda: True  # type: ignore[method-assign]
+
+    async def go() -> None:
+        await c._prepare_brain_connect_attempt()
+
+    asyncio.run(go())
+
+    assert panel.states == ["connecting"]
 
 
 def test_interrupted_stay_mode_silence_keeps_listening_without_idle() -> None:
