@@ -633,15 +633,27 @@ def _session_cwd(session: WorkerSession, worker_cfg: WorkerConfig) -> str:
         session.cwd,
         str(session.metadata.get("provider_cwd") or ""),
         str(session.metadata.get("cwd") or ""),
-        str(Path(worker_cfg.workspace).expanduser()),
     ]
+    rejected: list[str] = []
     for candidate in candidates:
         if not candidate:
             continue
         path = Path(candidate).expanduser().resolve(strict=False)
-        if path.exists() and path.is_dir():
+        if not _worker_owned_path(path, worker_cfg):
+            rejected.append(str(path))
+            continue
+        if path.is_dir():
             return str(path)
-    return str(Path(worker_cfg.workspace).expanduser().resolve(strict=False))
+        rejected.append(str(path))
+    if rejected:
+        raise RuntimeError(f"worker session cwd is not a valid worker-owned directory: {', '.join(rejected)}")
+    raise RuntimeError("worker session cwd is required for codex provider turns")
+
+
+def _worker_owned_path(path: Path, worker_cfg: WorkerConfig) -> bool:
+    workspace = Path(worker_cfg.workspace).expanduser().resolve(strict=False)
+    roots = [(workspace / "runs").resolve(strict=False), (workspace / "worktrees").resolve(strict=False)]
+    return any(path.is_relative_to(root) for root in roots)
 
 
 def _session_cancelled(sessions: SessionManager, session_id: str) -> bool:

@@ -8,7 +8,6 @@ from typing import Any
 import httpx
 
 from jarvis.config import WorkerConfig
-from jarvis.ids import new_id
 from jarvis.orchestration.envelope import build_execution_envelope
 from jarvis.orchestration.models import ExecutionEnvelope, WorkCommand, WorkItem, WorkerJobLink, WorkerSessionLink
 from jarvis.orchestration.store import OrchestrationStore
@@ -135,7 +134,8 @@ def start_worker_session(
         if not create_body.get("ok"):
             raise RuntimeError(create_body.get("error") or "worker rejected session")
         session = create_body["session"]
-    turn_id = new_id("turn")
+    turn_id = _turn_id(envelope)
+    idempotency_key = _turn_idempotency_key(envelope)
     turn_response = post(
         f"{base_url}/sessions/{session['session_id']}/turns",
         json={
@@ -146,7 +146,7 @@ def start_worker_session(
                 "resume_session": envelope.resume_session,
                 "execution_envelope": envelope.to_dict(),
             },
-            "idempotency_key": f"{envelope.run_id}:{turn_id}",
+            "idempotency_key": idempotency_key,
         },
         headers=headers,
         timeout=worker_cfg.request_timeout_s,
@@ -188,6 +188,7 @@ def start_worker_ensemble(
                 envelope,
                 engine=engine,
                 engine_strategy="ensemble",
+                dispatch_id=f"{_dispatch_id(envelope)}-{engine}",
                 session_id="" if engine != envelope.engine else envelope.session_id,
                 session_name=f"{envelope.session_name}-{engine}" if envelope.session_name else "",
                 branch_name=f"{envelope.branch_name}-{engine}" if envelope.branch_name else "",
@@ -248,6 +249,20 @@ def _job_name(envelope: ExecutionEnvelope) -> str:
     if name.startswith("jarvis-"):
         return name
     return f"jarvis-{name}"
+
+
+def _dispatch_id(envelope: ExecutionEnvelope) -> str:
+    return envelope.dispatch_id or f"dispatch_{envelope.run_id}_{envelope.engine}"
+
+
+def _turn_id(envelope: ExecutionEnvelope) -> str:
+    dispatch_id = _dispatch_id(envelope)
+    clean = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in dispatch_id)
+    return f"turn_{clean}"
+
+
+def _turn_idempotency_key(envelope: ExecutionEnvelope) -> str:
+    return f"{envelope.run_id}:{_dispatch_id(envelope)}:turn"
 
 
 def _worker_endpoint(worker_cfg: WorkerConfig, worker: WorkerProfile | None) -> tuple[str, dict[str, str]]:

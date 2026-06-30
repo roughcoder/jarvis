@@ -23,6 +23,7 @@ from jarvis.capabilities import (  # noqa: E402
     FORGE_BRANCH_PUSH,
     FORGE_PR_CREATE,
     WORKER_SESSION_APPROVE,
+    WORKER_SESSION_CREATE,
     WORKER_SESSION_INPUT,
     WORKER_SESSION_INTERRUPT,
     WORKER_SESSION_STOP,
@@ -31,6 +32,7 @@ from jarvis.capabilities import (  # noqa: E402
 from jarvis.config import WorkerConfig  # noqa: E402
 from jarvis.worker.server import make_app  # noqa: E402
 from jarvis.worker.authority import WorkerSessionAuthority  # noqa: E402
+from jarvis.worker.providers.codex import _session_cwd as codex_session_cwd  # noqa: E402
 from jarvis.worker.sessions import WorkerSession  # noqa: E402
 from jarvis.worker.sessions import SessionManager  # noqa: E402
 
@@ -61,6 +63,12 @@ def _authority_metadata(engine: str = "codex", extra_actions: list[str] | None =
         "allowed_actions": allowed_actions,
         "landing": landing,
     }
+
+
+def _owned_worker_cwd(tmp_path, name: str = "session") -> str:  # noqa: ANN001
+    cwd = tmp_path / "worker" / "worktrees" / name
+    cwd.mkdir(parents=True, exist_ok=True)
+    return str(cwd)
 
 
 def _session_with_authority(
@@ -165,6 +173,59 @@ def test_session_manager_serializes_concurrent_session_writes(tmp_path) -> None:
     assert fetched.status == "running"
     assert fetched.metadata["k39"] == "39"
     assert len([event for event in sessions.events(session.session_id) if event.type == "provider.log"]) == 40
+
+
+def test_session_manager_lists_past_corrupt_or_legacy_session_json(tmp_path) -> None:
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    good, _ = sessions.create({"provider": "fake", "engine": "fake"})
+    bad = sessions.root / "bad" / "session.json"
+    bad.parent.mkdir(parents=True)
+    bad.write_text('{"session_id": "../bad"}')
+
+    listed = sessions.list()
+
+    assert [session.session_id for session in listed] == [good.session_id]
+
+
+def test_session_manager_reserves_idempotent_turn_once_under_concurrency(tmp_path) -> None:
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create({"provider": "fake", "engine": "fake"})
+    results = []
+
+    def reserve() -> None:
+        results.append(
+            sessions.reserve_turn(
+                session.session_id,
+                {
+                    "turn_id": "turn_shared",
+                    "prompt": "same",
+                    "idempotency_key": "idem_shared",
+                },
+            )
+        )
+
+    threads = [threading.Thread(target=reserve), threading.Thread(target=reserve)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(created for _session, _event, created in results) == [False, True]
+    assert [event.type for event in sessions.events(session.session_id)].count("turn.started") == 1
+
+
+def test_codex_provider_revalidates_worker_owned_cwd(tmp_path) -> None:
+    session = WorkerSession(
+        session_id="sess_bad_cwd",
+        provider="codex",
+        engine="codex",
+        cwd=str(tmp_path),
+        metadata=_authority_metadata("codex"),
+    )
+    cfg = WorkerConfig(_env_file=None, workspace=str(tmp_path / "worker"))
+
+    with pytest.raises(RuntimeError, match="worker-owned"):
+        codex_session_cwd(session, cfg)
 
 
 def test_daemon_health_shell_and_auth(tmp_path) -> None:
@@ -331,6 +392,121 @@ def test_daemon_session_api_records_structured_events(tmp_path) -> None:
     ]
     assert listed[0]["session_id"] == created["session"]["session_id"]
     assert fetched["status"] == "interrupted"
+
+
+def test_daemon_session_create_requires_authority_before_provisioning(tmp_path) -> None:
+    dev = tmp_path / "dev"
+    repo = dev / "jarvis"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    (repo / "README.md").write_text("hello\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="tkn",
+        workspace=str(tmp_path / "worker"),
+        repo_root=str(dev),
+        clone_missing=False,
+    )
+    headers = {"Authorization": "Bearer tkn"}
+    allowed_actions = [WORKER_SESSION_TURN, FORGE_BRANCH_PUSH]
+    metadata = {
+        "execution_envelope": {
+            "allowed_actions": allowed_actions,
+            "landing": {"mode": "branch_only", "allow_merge": False},
+        },
+        "allowed_actions": allowed_actions,
+        "landing": {"mode": "branch_only", "allow_merge": False},
+    }
+
+    async def calls(base, c):  # noqa: ANN001
+        created = await c.post(
+            base + "/sessions",
+            json={
+                "provider": "fake",
+                "engine": "fake",
+                "repo": "roughcoder/jarvis",
+                "metadata": {**metadata, "provision_workspace": True},
+            },
+            headers=headers,
+        )
+        listed = (await c.get(f"{base}/sessions", headers=headers)).json()
+        return created.status_code, created.json(), listed
+
+    status_code, body, listed = asyncio.run(_with_server(cfg, 8839, calls))
+
+    assert status_code == 400
+    assert WORKER_SESSION_CREATE in body["error"]
+    assert listed["sessions"] == []
+    assert not (tmp_path / "worker" / "worktrees").exists()
+
+
+def test_daemon_session_turn_requires_authority_before_event_append(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+    allowed_actions = [WORKER_SESSION_CREATE, FORGE_BRANCH_PUSH]
+    metadata = {
+        "execution_envelope": {
+            "allowed_actions": allowed_actions,
+            "landing": {"mode": "branch_only", "allow_merge": False},
+        },
+        "allowed_actions": allowed_actions,
+        "landing": {"mode": "branch_only", "allow_merge": False},
+    }
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={"provider": "fake", "engine": "fake", "metadata": metadata},
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        turn = await c.post(
+            f"{base}/sessions/{session_id}/turns",
+            json={"prompt": "should not append", "idempotency_key": "idem_missing_turn"},
+            headers=headers,
+        )
+        events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+        return turn.status_code, turn.json(), events
+
+    status_code, body, events = asyncio.run(_with_server(cfg, 8840, calls))
+
+    assert status_code == 400
+    assert WORKER_SESSION_TURN in body["error"]
+    assert [event["type"] for event in events] == ["session.created"]
+
+
+def test_daemon_session_create_rejects_caller_supplied_non_worker_cwd(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        created = await c.post(
+            base + "/sessions",
+            json={
+                "provider": "fake",
+                "engine": "fake",
+                "cwd": str(tmp_path),
+                "metadata": _authority_metadata("fake"),
+            },
+            headers=headers,
+        )
+        listed = (await c.get(f"{base}/sessions", headers=headers)).json()
+        return created.status_code, created.json(), listed
+
+    status_code, body, listed = asyncio.run(_with_server(cfg, 8841, calls))
+
+    assert status_code == 400
+    assert "worker-owned workspace" in body["error"]
+    assert listed["sessions"] == []
 
 
 def test_daemon_session_controls_require_envelope_authority(tmp_path) -> None:
@@ -625,6 +801,7 @@ for line in sys.stdin:
                     "engine": "codex",
                     "repo": "roughcoder/jarvis",
                     "branch": "jarvis/codex-session",
+                    "cwd": _owned_worker_cwd(tmp_path, "codex-projection"),
                     "title": "Codex app-server projection",
                     "metadata": _authority_metadata("codex"),
                 },
@@ -712,6 +889,7 @@ for line in sys.stdin:
                     "run_id": "run_codex",
                     "provider": "codex",
                     "engine": "codex",
+                    "cwd": _owned_worker_cwd(tmp_path, "codex-interrupt"),
                     "title": "Interrupt Codex",
                     "metadata": _authority_metadata("codex", extra_actions=[WORKER_SESSION_INTERRUPT]),
                 },
@@ -791,6 +969,7 @@ for line in sys.stdin:
                     "run_id": "run_codex",
                     "provider": "codex",
                     "engine": "codex",
+                    "cwd": _owned_worker_cwd(tmp_path, "codex-stop"),
                     "title": "Stop Codex",
                     "metadata": _authority_metadata("codex", extra_actions=[WORKER_SESSION_STOP]),
                 },
@@ -887,6 +1066,7 @@ for line in sys.stdin:
                     "run_id": "run_codex",
                     "provider": "codex",
                     "engine": "codex",
+                    "cwd": _owned_worker_cwd(tmp_path, "codex-approval"),
                     "title": "Approve Codex",
                     "metadata": metadata,
                 },
@@ -1001,6 +1181,7 @@ for line in sys.stdin:
                     "run_id": "run_codex",
                     "provider": "codex",
                     "engine": "codex",
+                    "cwd": _owned_worker_cwd(tmp_path, "codex-input"),
                     "title": "Input Codex",
                     "metadata": metadata,
                 },
@@ -1090,32 +1271,20 @@ def test_daemon_real_provider_requires_execution_envelope_authority(tmp_path) ->
     headers = {"Authorization": "Bearer tkn"}
 
     async def calls(base, c):  # noqa: ANN001
-        created = (
-            await c.post(
-                base + "/sessions",
-                json={"run_id": "run_no_auth", "provider": "codex", "engine": "codex"},
-                headers=headers,
-            )
-        ).json()
-        session_id = created["session"]["session_id"]
-        turn = (
-            await c.post(
-                f"{base}/sessions/{session_id}/turns",
-                json={"prompt": "should fail before spawn", "idempotency_key": "idem_no_auth"},
-                headers=headers,
-            )
+        created = await c.post(
+            base + "/sessions",
+            json={"run_id": "run_no_auth", "provider": "codex", "engine": "codex"},
+            headers=headers,
         )
-        session = (await c.get(f"{base}/sessions/{session_id}", headers=headers)).json()
-        events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
-        return turn.status_code, turn.json(), session, events
+        listed = (await c.get(f"{base}/sessions", headers=headers)).json()
+        return created.status_code, created.json(), listed
 
-    status_code, body, session, events = asyncio.run(_with_server(cfg, 8832, calls))
+    status_code, body, listed = asyncio.run(_with_server(cfg, 8832, calls))
 
     assert status_code == 400
     assert body["ok"] is False
-    assert "worker.session.turn" in body["error"]
-    assert session["status"] == "failed"
-    assert [event["type"] for event in events] == ["session.created", "turn.started", "turn.failed"]
+    assert "worker.session.create" in body["error"]
+    assert listed["sessions"] == []
 
 
 def test_daemon_claude_provider_projects_stream_json_events_and_resumes(tmp_path) -> None:
@@ -1169,6 +1338,7 @@ emit({"type": "result", "subtype": "success", "session_id": session_id, "total_c
                     "engine": "claude",
                     "repo": "roughcoder/jarvis",
                     "branch": "jarvis/claude-session",
+                    "cwd": _owned_worker_cwd(tmp_path, "claude-projection"),
                     "title": "Claude stream-json projection",
                     "metadata": _authority_metadata("claude"),
                 },

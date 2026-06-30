@@ -12,8 +12,10 @@ from jarvis.worker_session_contract import (
     EVENT_CHECKPOINT_CREATED,
     EVENT_CHECKPOINT_RESTORED,
     EVENT_SESSION_CREATED,
+    EVENT_TURN_STARTED,
     IDEMPOTENT_SESSION_EVENT_TYPES,
     SESSION_CREATED,
+    SESSION_RUNNING,
     request_type as contract_request_type,
     resolved_request_type as contract_resolved_request_type,
 )
@@ -149,7 +151,7 @@ class SessionManager:
         for path in sorted(self.root.glob("*/session.json")):
             try:
                 sessions.append(WorkerSession.from_dict(json.loads(path.read_text())))
-            except (OSError, json.JSONDecodeError, KeyError):
+            except (OSError, json.JSONDecodeError, ValueError, KeyError):
                 continue
         return sorted(sessions, key=lambda x: x.updated_at)
 
@@ -189,6 +191,22 @@ class SessionManager:
             session.updated_at = event.time
             self.save(session)
             return event
+
+    def reserve_turn(self, session_id: str, data: dict[str, Any]) -> tuple[WorkerSession, SessionEvent, bool]:
+        with self._lock:
+            session = self.get(session_id)
+            if session is None:
+                raise KeyError(session_id)
+            existing = self._idempotent_event(session.session_id, EVENT_TURN_STARTED, data)
+            if existing is not None:
+                return session, existing, False
+            event = SessionEvent.create(session.session_id, EVENT_TURN_STARTED, data)
+            with self.events_path(session.session_id).open("a") as f:
+                f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
+            session.status = SESSION_RUNNING
+            session.updated_at = event.time
+            self.save(session)
+            return session, event, True
 
     def events(self, session_id: str, *, after: str = "", limit: int | None = None) -> list[SessionEvent]:
         try:

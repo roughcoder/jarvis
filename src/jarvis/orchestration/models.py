@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from jarvis.capabilities import WORKER_SESSION_CREATE, WORKER_SESSION_TURN
 from jarvis.engines import default_engine, engine_ids
-from jarvis.ids import utc_now
+from jarvis.ids import new_id, utc_now
 
 
 Phase = Literal[
@@ -168,6 +168,7 @@ class ExecutionEnvelope:
     run_id: str
     repo: str
     prompt: str
+    dispatch_id: str = field(default_factory=lambda: new_id("dispatch"))
     worker_id: str = "local-worker"
     engine: str = "codex"
     engine_strategy: str = "single"

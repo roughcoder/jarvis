@@ -393,13 +393,15 @@ The handoff from scheduler to worker is an `ExecutionEnvelope`:
 Workers receive the envelope and stay inside it. They do not rediscover or widen
 authority; if they need more, the run becomes `needs_human`.
 
-Engine sessions are local resumability handles. `session_name` is the stable
-Jarvis-assigned human handle shown in run/session lists and engine pickers.
-`session_id` is the engine-native resume id when one is available. Jarvis may
-pre-allocate it only for engines that support first-run session ids, such as
-Claude Code's `--session-id`. Follow-up turns resume through the worker
-`/sessions/:id/turns` API; provider adapters map that to Codex app-server thread
-resume or Claude's `--resume` session id.
+Worker sessions are Jarvis-owned resumability handles. `session_name` is the
+stable Jarvis-assigned human handle shown in run/session lists and engine
+pickers. `WorkerSession.session_id` is the Jarvis worker-session id used in
+`/sessions/:id` URLs and run graph links. Provider-native resume ids are stored
+separately in session metadata such as `provider_session_id`, `codex_thread_id`,
+or `claude_session_id`; they are not the API path id. Follow-up turns resume
+through the worker `/sessions/:id/turns` API, and provider adapters map the
+Jarvis worker session to Codex app-server thread resume or Claude's `--resume`
+session id.
 
 Example worker profile:
 

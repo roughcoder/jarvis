@@ -30,6 +30,7 @@ from jarvis.capabilities import (
     WORKER_SESSION_INPUT,
     WORKER_SESSION_INTERRUPT,
     WORKER_SESSION_STOP,
+    WORKER_SESSION_TURN,
 )
 from jarvis.config import WorkerConfig
 from jarvis.engines import engine_ids, normalize_engine_id, worker_supports_engine
@@ -60,10 +61,8 @@ from jarvis.worker_session_contract import (
     EVENT_SESSION_INTERRUPTED,
     EVENT_SESSION_STOPPED,
     EVENT_TURN_FAILED,
-    EVENT_TURN_STARTED,
     SESSION_FAILED,
     SESSION_INTERRUPTED,
-    SESSION_RUNNING,
     SESSION_STOPPED,
 )
 
@@ -394,9 +393,10 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             body = await request.json()
+            WorkerSessionAuthority.for_session_create(body or {})
             body = await _prepare_session_body(body or {}, cfg, workspace)
             session, event = sessions.create(body or {})
-        except ValueError as exc:
+        except (RuntimeError, ValueError) as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
         except Exception:
             return web.json_response({"ok": False, "error": "bad json"}, status=400)
@@ -492,6 +492,9 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         session = sessions.get(session_id)
         if session is None:
             return web.json_response({"error": "no such session"}, status=404)
+        authority_error = _require_session_authority(session, WORKER_SESSION_TURN)
+        if authority_error is not None:
+            return authority_error
         try:
             body = await request.json()
         except Exception:
@@ -514,17 +517,23 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             adapter = provider_for(session.provider)
         except ValueError as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
-        sessions.update_status(session.session_id, SESSION_RUNNING)
-        started = sessions.append_event(
-            session.session_id,
-            EVENT_TURN_STARTED,
-            {
-                "turn_id": turn_id,
-                "prompt": str(body.get("prompt") or ""),
-                "metadata": dict(body.get("metadata") or {}),
-                "idempotency_key": idempotency_key,
-            },
-        )
+        turn_data = {
+            "turn_id": turn_id,
+            "prompt": str(body.get("prompt") or ""),
+            "metadata": dict(body.get("metadata") or {}),
+            "idempotency_key": idempotency_key,
+        }
+        session, started, reserved = sessions.reserve_turn(session.session_id, turn_data)
+        if not reserved:
+            return web.json_response(
+                {
+                    "ok": True,
+                    "session": session.to_dict(),
+                    "turn_id": str(started.data.get("turn_id") or turn_id),
+                    "events": [started.to_dict()],
+                    "idempotent": True,
+                }
+            )
         try:
             provider_events = adapter.start_turn(
                 session=session,
@@ -650,7 +659,7 @@ async def _provider_control_event(
         return web.json_response({"error": "no such session"}, status=404)
     required_action = WORKER_SESSION_APPROVE if action == "approval" else WORKER_SESSION_INPUT
     authority_error = _require_session_authority(session, required_action)
-    if authority_error:
+    if authority_error is not None:
         return authority_error
     try:
         body = await request.json()
@@ -686,7 +695,7 @@ async def _provider_terminal_event(
         return web.json_response({"error": "no such session"}, status=404)
     required_action = WORKER_SESSION_STOP if action == "stop" else WORKER_SESSION_INTERRUPT
     authority_error = _require_session_authority(session, required_action)
-    if authority_error:
+    if authority_error is not None:
         return authority_error
     try:
         adapter = provider_for(session.provider)
@@ -731,6 +740,11 @@ async def _prepare_session_body(body: dict, cfg: WorkerConfig, workspace: pathli
     data = dict(body)
     metadata = dict(data.get("metadata") or {})
     envelope = metadata.get("execution_envelope")
+    if data.get("cwd"):
+        cwd, err = _worker_owned_cwd(str(data.get("cwd") or ""), workspace)
+        if err:
+            raise ValueError(err)
+        data["cwd"] = cwd
     if data.get("cwd") or not data.get("repo") or not isinstance(envelope, dict):
         return data
     if metadata.get("provision_workspace") is not True:
@@ -763,12 +777,16 @@ async def _prepare_session_body(body: dict, cfg: WorkerConfig, workspace: pathli
 
 
 def _resume_cwd(cwd: str, workspace: pathlib.Path) -> tuple[str, str]:
+    return _worker_owned_cwd(cwd, workspace, action="resume")
+
+
+def _worker_owned_cwd(cwd: str, workspace: pathlib.Path, *, action: str = "session") -> tuple[str, str]:
     path = pathlib.Path(cwd).expanduser().resolve(strict=False)
     allowed_roots = [(workspace / "runs").resolve(), (workspace / "worktrees").resolve()]
     if not any(path.is_relative_to(root) for root in allowed_roots):
-        return "", f"refusing to resume outside worker-owned workspace: {cwd}"
+        return "", f"refusing to {action} outside worker-owned workspace: {cwd}"
     if not path.is_dir():
-        return "", f"resume cwd does not exist: {cwd}"
+        return "", f"{action} cwd does not exist: {cwd}"
     return str(path), ""
 
 
