@@ -236,6 +236,15 @@ def test_parse_work_command_handles_terse_linear_ticket_list() -> None:
     assert cmd.start is False
 
 
+@pytest.mark.parametrize("phrase", ["improve performance", "project cleanup"])
+def test_parse_work_command_keeps_direct_phrases_with_pr_substrings_direct(phrase: str) -> None:
+    cmd = parse_work_command(phrase)
+
+    assert cmd.operation == "direct_request"
+    assert cmd.source == "direct"
+    assert cmd.filters["text"] == phrase
+
+
 def test_parse_work_command_ignores_engine_prefix_inside_worker_id() -> None:
     cmd = parse_work_command("get next github issue using codex-worker with claude")
 
