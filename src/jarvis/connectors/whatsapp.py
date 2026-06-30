@@ -251,6 +251,8 @@ class WhatsAppConnector:
         reply frames for handle_message."""
         try:
             async for raw in ws:
+                if isinstance(raw, bytes):
+                    continue  # voice audio frames are irrelevant to WhatsApp.
                 with contextlib.suppress(Exception):
                     m = decode(raw)
                     if await forward_proactive(self._wacli, m):

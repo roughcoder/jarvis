@@ -1,7 +1,7 @@
 """Brain WebSocket server (Phase 3 W4).
 
 Intercoms connect and pair; each connection gets its own BrainSession. Per
-Utterance: STT -> think(+tools) -> TTS -> stream ReplyAudio frames -> ReplyEnd.
+Utterance: STT -> think(+tools) -> TTS -> stream binary reply-audio frames -> ReplyEnd.
 A BargeIn cancels the in-flight turn (mirrors the single-process stop_playback
 cancelling the feed task). STT/TTS run in-process here (services co-located in
 3a). Provider credentials live only on the brain — the intercom holds none.
@@ -39,7 +39,6 @@ from jarvis.brain.voice_modes import (
 from jarvis.config import Config, insecure_bind
 from jarvis.mcp import MCPBridge
 from jarvis.protocol.messages import (
-    AUDIO_BINARY_V1,
     BargeIn,
     Cancel,
     ConversationIdle,
@@ -49,7 +48,7 @@ from jarvis.protocol.messages import (
     Identify,
     Proactive,
     Reject,
-    ReplyAudio,
+    REPLY_AUDIO_BINARY_V1,
     ReplyEnd,
     ReplyText,
     TextIn,
@@ -453,13 +452,11 @@ class BrainServer:
         # `device_default` is the device's pinned principal (a personal device) — used
         # only when nobody is otherwise identified.
         hardware = {h.strip().lower() for h in first.hardware if h.strip()}
-        negotiated = sorted(set(first.protocols).intersection({AUDIO_BINARY_V1}))
         conn = {
             "asserted": first.identity,
             "base_asserted": first.identity,
             "device_default": device_default or HOUSE,
             "hardware": hardware,
-            "protocols": set(negotiated),
             "voice_mode": "default",
             "waiters": {},
         }
@@ -472,15 +469,13 @@ class BrainServer:
                     identity=base.identity,
                     scope=base.scope,
                     capabilities=sorted(base.capabilities),
-                    protocols=negotiated,
                 )
             )
         )
         hw = ",".join(sorted(hardware)) or "none"
-        proto = ",".join(negotiated) or "json_base64_v1"
         print(
             f"intercom paired: device={device_id} channel={channel} "
-            f"identity={base.identity} hardware={hw} protocols={proto}"
+            f"identity={base.identity} hardware={hw} audio={REPLY_AUDIO_BINARY_V1}"
         )
 
         self._connections.add(ws)  # eligible for proactive heartbeat push
@@ -601,11 +596,7 @@ class BrainServer:
             channel=channel,
             device_id=device_id,
         )
-        trace.set(
-            audio_downlink=AUDIO_BINARY_V1
-            if AUDIO_BINARY_V1 in conn.get("protocols", set())
-            else "json_base64_v1"
-        )
+        trace.set(audio_downlink=REPLY_AUDIO_BINARY_V1)
         if isinstance(msg, Utterance):
             pcm = msg.pcm()
             secs = len(pcm) / 2 / msg.sample_rate
@@ -644,7 +635,7 @@ class BrainServer:
             if not text_only:
                 with contextlib.suppress(Exception):
                     async for pcm in self._tts.synthesize_stream(reply):
-                        await self._send_reply_audio(ws, conn, turn_id, pcm)
+                        await self._send_reply_audio(ws, turn_id, pcm)
             end = self._alarm_ack_reply_end(turn_id, channel, conn)
             with contextlib.suppress(Exception):
                 await ws.send(encode(ReplyText(turn_id=turn_id, text=reply)))
@@ -682,7 +673,7 @@ class BrainServer:
                 await session.respond_text(text, trace, result)
             else:
                 async for pcm in session.respond(text, trace, result):
-                    await self._send_reply_audio(ws, conn, turn_id, pcm)
+                    await self._send_reply_audio(ws, turn_id, pcm)
         except asyncio.CancelledError:
             session.finalize(text, result, trace)  # remember what was actually said
             self._apply_cancelled_turn_result(channel, conn, result)
@@ -706,11 +697,8 @@ class BrainServer:
         self._apply_turn_result(channel, conn, result)
 
     @staticmethod
-    async def _send_reply_audio(ws, conn: dict, turn_id: str, pcm: bytes) -> None:  # noqa: ANN001
-        if AUDIO_BINARY_V1 in conn.get("protocols", set()):
-            await ws.send(encode_reply_audio_binary(turn_id, pcm))
-        else:
-            await ws.send(encode(ReplyAudio.of(turn_id, pcm)))
+    async def _send_reply_audio(ws, turn_id: str, pcm: bytes) -> None:  # noqa: ANN001
+        await ws.send(encode_reply_audio_binary(turn_id, pcm))
 
     async def _request_device_action(
         self, ctx: RequestContext, action: str, args: dict, timeout_s: float

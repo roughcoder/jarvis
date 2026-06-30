@@ -6,7 +6,7 @@ import asyncio
 
 from jarvis.brain.proactive import proactive_frames
 from jarvis.brain.tones import make_tone
-from jarvis.protocol.messages import Proactive, ReplyAudio, ReplyEnd, decode
+from jarvis.protocol.messages import BinaryAudio, Proactive, ReplyEnd, decode, decode_binary_audio
 
 
 class _FakeTTS:
@@ -35,13 +35,14 @@ def test_proactive_frames_header_audio_end() -> None:
             turn_id="pa-1", kind="notification", open_mic=True, speak=True, tone=True,
         )
     )
-    msgs = [decode(f) for f in frames]
-    assert isinstance(msgs[0], Proactive)
-    assert msgs[0].kind == "notification" and msgs[0].open_mic is True and msgs[0].turn_id == "pa-1"
-    audio = [m for m in msgs if isinstance(m, ReplyAudio)]
+    header = decode(frames[0])
+    end = decode(frames[-1])
+    audio = [decode_binary_audio(f) for f in frames[1:-1] if isinstance(f, bytes)]
+    assert isinstance(header, Proactive)
+    assert header.kind == "notification" and header.open_mic is True and header.turn_id == "pa-1"
     assert len(audio) == 3  # 1 tone + 2 speech chunks
-    assert all(m.turn_id == "pa-1" for m in audio)
-    assert isinstance(msgs[-1], ReplyEnd) and msgs[-1].turn_id == "pa-1"
+    assert all(isinstance(m, BinaryAudio) and m.turn_id == "pa-1" for m in audio)
+    assert isinstance(end, ReplyEnd) and end.turn_id == "pa-1"
 
 
 def test_proactive_frames_tone_only_no_speech() -> None:
@@ -49,9 +50,10 @@ def test_proactive_frames_tone_only_no_speech() -> None:
     frames = asyncio.run(
         proactive_frames(_FakeTTS([b"x"]), 16000, "Alarm.", turn_id="pa-2", kind="alarm", speak=False, tone=True)
     )
-    msgs = [decode(f) for f in frames]
-    assert [type(m).__name__ for m in msgs] == ["Proactive", "ReplyAudio", "ReplyEnd"]
-    assert msgs[0].kind == "alarm"
+    assert isinstance(decode(frames[0]), Proactive)
+    assert decode_binary_audio(frames[1]) is not None
+    assert isinstance(decode(frames[2]), ReplyEnd)
+    assert decode(frames[0]).kind == "alarm"
 
 
 def test_proactive_frames_text_only_no_audio() -> None:

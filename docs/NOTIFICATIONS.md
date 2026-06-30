@@ -29,7 +29,8 @@ delivery via `server._deliver_ring` → the proactive audio path.
 ## Proactive voice delivery
 A proactive event plays as **tone + spoken text** on the device, then (for notifications)
 **opens the mic for a reply**. TTS is brain-side, so the brain synthesises the audio and
-streams it (`Proactive` header + ReplyAudio frames under a `pa-` turn id, then ReplyEnd);
+streams it (`Proactive` header + binary reply-audio frames under a `pa-` turn id,
+then ReplyEnd);
 text clients (`jarvis text`, WhatsApp) use the header text. See `brain/proactive.py` +
 `brain/tones.py`; the intercom plays it via its socket router (`intercom/client.py`).
 

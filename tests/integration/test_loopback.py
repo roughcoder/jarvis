@@ -19,10 +19,10 @@ from jarvis.brain.server import BrainServer
 from jarvis.config import load_config
 from jarvis.protocol.messages import (
     Hello,
-    ReplyAudio,
     ReplyEnd,
     TextIn,
     Welcome,
+    decode_binary_audio,
     decode,
     encode,
 )
@@ -57,10 +57,13 @@ def test_text_turn_streams_reply_audio() -> None:
                 got_audio = False
                 ended = False
                 async for raw in ws:
+                    if isinstance(raw, bytes):
+                        audio = decode_binary_audio(raw)
+                        if audio is not None and audio.turn_id == "t1":
+                            got_audio = True
+                        continue
                     msg = decode(raw)
-                    if isinstance(msg, ReplyAudio) and msg.turn_id == "t1":
-                        got_audio = True
-                    elif isinstance(msg, ReplyEnd) and msg.turn_id == "t1":
+                    if isinstance(msg, ReplyEnd) and msg.turn_id == "t1":
                         ended = True
                         break
                 return got_audio, ended
