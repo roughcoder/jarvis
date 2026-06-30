@@ -151,6 +151,29 @@ def test_worker_registry_advertises_supported_engines(tmp_path) -> None:
     assert profile.public()["supported_engines"] == ["codex", "claude"]
 
 
+def test_worker_registry_keeps_configured_default_engine_first(tmp_path) -> None:
+    path = tmp_path / "workers.json"
+    path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "hive-worker",
+                        "display_name": "Hive",
+                        "agent": "claude",
+                        "supported_engines": ["codex", "claude"],
+                    }
+                ]
+            }
+        )
+    )
+    reg = WorkerRegistry(WorkerConfig(_env_file=None), profiles_path=str(path))
+    profile = reg.profiles()[0]
+
+    assert profile.default_engine == "claude"
+    assert profile.supported_engines == ["claude", "codex"]
+
+
 def test_worker_registry_filters_by_engine(tmp_path) -> None:
     path = tmp_path / "workers.json"
     path.write_text(
@@ -201,6 +224,13 @@ def test_parse_work_command_captures_engine_target() -> None:
 
     assert cmd.operation == "start_next_work"
     assert cmd.source == "linear"
+    assert cmd.target_engine_id == "claude"
+
+
+def test_parse_work_command_ignores_engine_prefix_inside_worker_id() -> None:
+    cmd = parse_work_command("get next github issue using codex-worker with claude")
+
+    assert cmd.target_worker_id == "codex-worker"
     assert cmd.target_engine_id == "claude"
 
 
