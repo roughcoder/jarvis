@@ -373,6 +373,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             body = await request.json()
+            body = await _prepare_session_body(body or {}, cfg, workspace)
             session, event = sessions.create(body or {})
         except ValueError as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
@@ -683,6 +684,41 @@ async def _terminal_session_event(
     session = sessions.update_status(session.session_id, status)
     event = sessions.append_event(session.session_id, event_type, {"status": status})
     return web.json_response({"ok": True, "session": session.to_dict(), "event": event.to_dict()})
+
+
+async def _prepare_session_body(body: dict, cfg: WorkerConfig, workspace: pathlib.Path) -> dict:
+    data = dict(body)
+    metadata = dict(data.get("metadata") or {})
+    envelope = metadata.get("execution_envelope")
+    if data.get("cwd") or not data.get("repo") or not isinstance(envelope, dict):
+        return data
+    if metadata.get("provision_workspace") is not True:
+        return data
+    repo_ref = str(data.get("repo") or "")
+    resolved = resolve_repo(repo_ref, cfg.repo_root)
+    if resolved is None and cfg.clone_missing and cfg.repo_root:
+        resolved, clone_err = await clone_repo(repo_ref, cfg.repo_root, cfg.clone_timeout_s)
+        if resolved is None:
+            raise ValueError(clone_err or f"couldn't clone {repo_ref!r}")
+    if resolved is None:
+        avail = list_repos(cfg.repo_root)
+        hint = f" I can see: {', '.join(avail)}." if avail else ""
+        raise ValueError(f"couldn't find a repo called {repo_ref!r}.{hint}")
+    slug = slugify(str(data.get("title") or data.get("branch") or data.get("run_id") or repo_ref or "session"))
+    cwd, branch, err = await prepare_worktree(
+        resolved,
+        str(workspace / "worktrees"),
+        slug,
+        cfg.worktree_branch_prefix,
+        cfg.shell_timeout_s,
+    )
+    if err:
+        raise ValueError(err)
+    data["cwd"] = cwd or ""
+    data["branch"] = branch or str(data.get("branch") or "")
+    metadata["source_repo"] = resolved
+    data["metadata"] = metadata
+    return data
 
 
 def _resume_cwd(cwd: str, workspace: pathlib.Path) -> tuple[str, str]:

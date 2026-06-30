@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 
@@ -125,6 +126,32 @@ def test_worker_registry_redacts_private_connection_details(monkeypatch) -> None
     assert public["capacity"]["current_jobs"] == 1
     assert "private-host" not in json.dumps(public)
     assert "secret" not in json.dumps(public)
+
+
+def test_worker_registry_counts_running_sessions_for_capacity() -> None:
+    class Response:
+        def __init__(self, data):
+            self._data = data
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self._data
+
+    def fake_get(url, **_kw):  # noqa: ANN001
+        if url.endswith("/health"):
+            return Response({"ok": True, "agent": "codex"})
+        if url.endswith("/jobs"):
+            return Response({"jobs": [{"status": "done"}]})
+        if url.endswith("/sessions"):
+            return Response({"sessions": [{"status": "running"}, {"status": "completed"}]})
+        raise AssertionError(url)
+
+    cfg = WorkerConfig(_env_file=None, token="secret", host="private-host", port=9999)
+    reg = WorkerRegistry(cfg, http_get=fake_get)
+
+    assert reg.profiles(probe=True)[0].current_jobs == 1
 
 
 def test_worker_registry_accepts_list_profile_file(tmp_path) -> None:
@@ -651,8 +678,9 @@ def test_orchestration_service_starts_ensemble_sessions(tmp_path, monkeypatch) -
         def next(self, *, repo="", filters=None):  # noqa: ANN001, ANN201
             return _item(id="#33")
 
-    def fake_choose(_self, _required=None, *, engine=""):  # noqa: ANN001, ANN202
-        assert engine == "codex"
+    def fake_choose(_self, _required=None, *, engine="", engines=None):  # noqa: ANN001, ANN202
+        assert engine == ""
+        assert engines == ["codex", "claude"]
         return WorkerProfile(
             worker_id="local-worker",
             display_name="Local",
@@ -697,6 +725,81 @@ def test_orchestration_service_starts_ensemble_sessions(tmp_path, monkeypatch) -
     runs = OrchestrationStore(cfg.orchestration.workspace).list_runs()
     assert len(runs) == 1
     assert [session.engine for session in runs[0].sessions] == ["codex", "claude"]
+
+
+def test_orchestration_service_selects_worker_supporting_all_ensemble_engines(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    workers_path = tmp_path / "workers.json"
+    workers_path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "codex-only",
+                        "display_name": "Codex only",
+                        "base_url": "http://codex.invalid",
+                        "status": "online",
+                        "agent": "codex",
+                        "supported_engines": ["codex"],
+                    },
+                    {
+                        "worker_id": "multi-engine",
+                        "display_name": "Multi",
+                        "base_url": "http://multi.invalid",
+                        "status": "online",
+                        "agent": "codex",
+                        "supported_engines": ["codex", "claude"],
+                    },
+                ]
+            }
+        )
+    )
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                f"ORCHESTRATION_WORKERS_PATH={workers_path}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    cfg = load_config()
+
+    class Source:
+        def next(self, *, repo="", filters=None):  # noqa: ANN001, ANN201
+            return _item(id="#34")
+
+    seen = {}
+
+    def fake_start_ensemble(envelope, *, engines, worker_cfg, worker=None, store=None, post=None):  # noqa: ANN001, ANN202
+        seen["worker_id"] = worker.worker_id
+        links = [WorkerSessionLink(worker_id=worker.worker_id, session_id=f"sess_{engine}", engine=engine) for engine in engines]
+        for link in links:
+            store.link_session(envelope.run_id, link)
+        return links
+
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+    monkeypatch.setattr("jarvis.orchestration.executor.start_worker_ensemble", fake_start_ensemble)
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"work.github.issues.read", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: Source(),
+    )
+
+    result = service.next_work(
+        WorkCommand(
+            "start_next_work",
+            source="github",
+            start=True,
+            engine_strategy="ensemble",
+            target_engine_id="codex,claude",
+        ),
+        start=True,
+    )
+
+    assert isinstance(result, StartedWork)
+    assert seen["worker_id"] == "multi-engine"
 
 
 def test_orchestration_service_needs_human_for_start_without_repo(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -953,6 +1056,83 @@ def test_start_worker_ensemble_uses_distinct_provider_branches(tmp_path) -> None
     assert any(event.type == "ensemble_sessions_started" for event in store.events(run.run_id))
 
 
+def test_start_worker_ensemble_stops_started_sessions_on_later_failure(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Start ensemble")
+    envelope = ExecutionEnvelope(
+        run_id=run.run_id,
+        repo="roughcoder/jarvis",
+        prompt="x",
+        worker_id="local-worker",
+        engine="codex",
+        engine_strategy="ensemble",
+        branch_name="jarvis/example",
+        session_name="jarvis-example",
+    )
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, body: dict) -> None:
+            self._body = body
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self._body
+
+    def fake_post(url, **kwargs):  # noqa: ANN001
+        calls.append((url, kwargs.get("json")))
+        if url.endswith("/sessions/sess_codex/stop"):
+            return Response({"ok": True})
+        if url.endswith("/sessions"):
+            engine = kwargs["json"]["engine"]
+            if engine == "claude":
+                raise RuntimeError("claude worker unavailable")
+            return Response(
+                {
+                    "ok": True,
+                    "session": {
+                        "session_id": "sess_codex",
+                        "status": "created",
+                        "provider": "codex",
+                        "engine": "codex",
+                        "branch": "jarvis/example-codex",
+                    },
+                }
+            )
+        if url.endswith("/sessions/sess_codex/turns"):
+            return Response(
+                {
+                    "ok": True,
+                    "turn_id": "turn_123",
+                    "session": {
+                        "session_id": "sess_codex",
+                        "status": "running",
+                        "provider": "codex",
+                        "engine": "codex",
+                        "branch": "jarvis/example-codex",
+                    },
+                    "events": [],
+                }
+            )
+        raise AssertionError(url)
+
+    with pytest.raises(RuntimeError, match="claude worker unavailable"):
+        start_worker_ensemble(
+            envelope,
+            engines=["codex", "claude"],
+            worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1, token=""),
+            store=store,
+            post=fake_post,
+        )
+
+    assert any(url.endswith("/sessions/sess_codex/stop") for url, _payload in calls)
+    assert store.get(run.run_id).sessions[0].status == "stopped"  # type: ignore[union-attr]
+
+
 def test_store_updates_worker_job_link(tmp_path) -> None:
     store = OrchestrationStore(str(tmp_path))
     run = store.create_run("Start work")
@@ -1063,6 +1243,44 @@ def test_sync_run_sessions_marks_completed_run_and_advances_event_cursor(tmp_pat
     assert reloaded.phase == "completed"
     assert reloaded.sessions[0].last_event_id == "event_2"
     assert seen["http://localhost:1/sessions/sess_123/events"]["params"] == {"after": "event_1"}
+
+
+def test_sync_run_sessions_marks_blocked_run_failed(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Start live session")
+    store.link_session(
+        run.run_id,
+        WorkerSessionLink(
+            worker_id="local-worker",
+            session_id="sess_blocked",
+            status="waiting_approval",
+            provider="fake",
+            engine="fake",
+        ),
+    )
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, body: dict) -> None:
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    def fake_get(url, **_kwargs):  # noqa: ANN001
+        if url.endswith("/events"):
+            return Response({"events": [{"event_id": "event_2", "type": "approval.resolved"}]})
+        return Response({"session_id": "sess_blocked", "status": "blocked", "provider": "fake", "engine": "fake"})
+
+    summary = sync_run_sessions(
+        store,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1),
+        get=fake_get,
+    )
+
+    assert summary.runs_failed == 1
+    assert store.get(run.run_id).phase == "failed"  # type: ignore[union-attr]
 
 
 def test_sync_run_jobs_marks_completed_run(tmp_path) -> None:
@@ -1556,7 +1774,46 @@ def test_orchestration_service_resume_run_refuses_when_session_running(tmp_path,
         source_factory=lambda _name, _cfg=None: None,
     )
 
-    with pytest.raises(ResumeRunError, match="already has running worker session 650e8400-e29b-41d4-a716-446655440000"):
+    with pytest.raises(ResumeRunError, match="already has active worker session 650e8400-e29b-41d4-a716-446655440000"):
+        service.resume_run(run.run_id)
+
+
+def test_orchestration_service_resume_run_refuses_when_session_waiting(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.service import ResumeRunError
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    cfg = load_config()
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    run = store.create_run("Fix worker", work_items=[_item(id="#58")])
+    store.link_session(
+        run.run_id,
+        WorkerSessionLink(
+            worker_id="local-worker",
+            session_id="750e8400-e29b-41d4-a716-446655440000",
+            status="waiting_input",
+            provider="claude",
+            engine="claude",
+            branch="jarvis/58",
+            cwd="/worker/worktrees/58",
+        ),
+    )
+    monkeypatch.setattr("jarvis.orchestration.service.sync_run_sessions", lambda *_a, **_kw: None)
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"orchestration.runs.read", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: None,
+    )
+
+    with pytest.raises(ResumeRunError, match=r"already has active worker session .*waiting_input"):
         service.resume_run(run.run_id)
 
 
@@ -2275,6 +2532,60 @@ def test_cli_capability_hint_notes_existing_profile_takes_precedence(tmp_path, m
     assert "Missing orchestration capability: work.github.issues.read" in out
     assert f"add work.github.issues.read to {profile}" in out
     assert "That profile exists, so CAPS_DEFAULT_CAPABILITIES is ignored" in out
+
+
+def test_cli_sessions_requests_preserves_worker_response(monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis import cli
+
+    calls = []
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {"requests": [{"session_id": "sess_1", "request_id": "input_1", "kind": "input"}]}
+
+    class Http:
+        @staticmethod
+        def get(url, **_kwargs):  # noqa: ANN001
+            calls.append(url)
+            return Response()
+
+        @staticmethod
+        def post(*_args, **_kwargs):  # noqa: ANN001
+            raise AssertionError("post should not be called")
+
+    monkeypatch.setattr(cli, "load_config", lambda: None)
+    monkeypatch.setattr(cli, "_worker_http", lambda _cfg: (Http, "http://worker", {}, 1))
+
+    result = cli._cmd_sessions(
+        SimpleNamespace(
+            requests="all",
+            checkpoints="",
+            restore_checkpoint="",
+            events="",
+            after="",
+            limit=0,
+            json=True,
+            turn="",
+            input="",
+            approval="",
+            interrupt="",
+            stop="",
+            session_id="",
+            prompt="",
+            idempotency_key="",
+            request_id="",
+            text="",
+            decision="",
+            checkpoint_id="",
+        )
+    )
+
+    assert result == 0
+    assert calls == ["http://worker/sessions/requests"]
+    assert "input_1" in capsys.readouterr().out
 
 
 def test_cli_work_start_requires_landing_capabilities(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001

@@ -228,6 +228,8 @@ def _run_codex_turn(
             timeout_s=max(1.0, float(worker_cfg.job_timeout_s)),
         )
     except Exception as exc:  # noqa: BLE001 - provider failures must become session events
+        if _session_cancelled(sessions, session_id):
+            return
         sessions.update_status(session_id, "failed")
         sessions.append_event(
             session_id,
@@ -495,6 +497,11 @@ def _session_cwd(session: WorkerSession, worker_cfg: WorkerConfig) -> str:
         if path.exists() and path.is_dir():
             return str(path)
     return str(Path(worker_cfg.workspace).expanduser().resolve(strict=False))
+
+
+def _session_cancelled(sessions: SessionManager, session_id: str) -> bool:
+    session = sessions.get(session_id)
+    return session is not None and session.status in {"interrupted", "stopped"}
 
 
 def _terminate_provider_process(session: WorkerSession) -> None:

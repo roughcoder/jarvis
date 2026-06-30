@@ -257,7 +257,7 @@ def _final_session_phase(run: OrchestrationRun) -> str:
         return ""
     if statuses <= {"completed", "done"}:
         return "completed"
-    if statuses & {"failed", "error", "interrupted", "stopped"}:
+    if statuses & {"failed", "error", "interrupted", "stopped", "blocked"}:
         return "failed"
     return ""
 

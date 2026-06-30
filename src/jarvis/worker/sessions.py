@@ -248,7 +248,10 @@ class SessionManager:
     def save(self, session: WorkerSession) -> None:
         directory = self.session_dir(session.session_id)
         directory.mkdir(parents=True, exist_ok=True)
-        self.session_path(session.session_id).write_text(json.dumps(session.to_dict(), indent=2, sort_keys=True))
+        path = self.session_path(session.session_id)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(session.to_dict(), indent=2, sort_keys=True))
+        tmp.replace(path)
 
     def session_dir(self, session_id: str) -> pathlib.Path:
         if not _valid_id(session_id):

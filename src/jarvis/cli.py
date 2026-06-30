@@ -576,7 +576,7 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
             response.raise_for_status()
             body = response.json()
             return _print_session_events(body.get("events", []), json_output=args.json)
-        if args.turn:
+        elif args.turn:
             response = httpx.post(
                 f"{base}/sessions/{args.turn}/turns",
                 headers=headers,

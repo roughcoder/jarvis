@@ -120,6 +120,7 @@ def start_worker_session(
                 "title": envelope.session_name or _job_name(envelope),
                 "metadata": {
                     "execution_envelope": envelope.to_dict(),
+                    "provision_workspace": bool(envelope.repo and not envelope.cwd and not envelope.resume_session),
                     "allowed_actions": envelope.allowed_actions,
                     "landing": envelope.landing.to_dict(),
                     "verification": envelope.verification.to_dict(),
@@ -180,23 +181,27 @@ def start_worker_ensemble(
     post: Callable[..., Any] | None = None,
 ) -> list[WorkerSessionLink]:
     links: list[WorkerSessionLink] = []
-    for engine in engines:
-        engine_envelope = replace(
-            envelope,
-            engine=engine,
-            engine_strategy="ensemble",
-            session_id="" if engine != envelope.engine else envelope.session_id,
-            session_name=f"{envelope.session_name}-{engine}" if envelope.session_name else "",
-            branch_name=f"{envelope.branch_name}-{engine}" if envelope.branch_name else "",
-        )
-        link = start_worker_session(
-            engine_envelope,
-            worker_cfg=worker_cfg,
-            worker=worker,
-            store=store,
-            post=post,
-        )
-        links.append(link)
+    try:
+        for engine in engines:
+            engine_envelope = replace(
+                envelope,
+                engine=engine,
+                engine_strategy="ensemble",
+                session_id="" if engine != envelope.engine else envelope.session_id,
+                session_name=f"{envelope.session_name}-{engine}" if envelope.session_name else "",
+                branch_name=f"{envelope.branch_name}-{engine}" if envelope.branch_name else "",
+            )
+            link = start_worker_session(
+                engine_envelope,
+                worker_cfg=worker_cfg,
+                worker=worker,
+                store=store,
+                post=post,
+            )
+            links.append(link)
+    except Exception:
+        _stop_started_sessions(links, run_id=envelope.run_id, worker_cfg=worker_cfg, worker=worker, post=post, store=store)
+        raise
     if store is not None:
         store.append_event(
             envelope.run_id,
@@ -205,6 +210,36 @@ def start_worker_ensemble(
             {"session_ids": [x.session_id for x in links], "engines": engines},
         )
     return links
+
+
+def _stop_started_sessions(
+    links: list[WorkerSessionLink],
+    *,
+    run_id: str,
+    worker_cfg: WorkerConfig,
+    worker: WorkerProfile | None,
+    post: Callable[..., Any] | None,
+    store: OrchestrationStore | None,
+) -> None:
+    if not links:
+        return
+    http_post = post or httpx.post
+    base_url, headers = _worker_endpoint(worker_cfg, worker)
+    for link in reversed(links):
+        try:
+            http_post(
+                f"{base_url}/sessions/{link.session_id}/stop",
+                json={},
+                headers=headers,
+                timeout=worker_cfg.request_timeout_s,
+            )
+        except Exception:  # noqa: BLE001 - preserve original ensemble dispatch failure
+            pass
+        if store is not None:
+            try:
+                store.update_session(run_id, link.session_id, status="stopped")
+            except Exception:  # noqa: BLE001 - best-effort rollback marker
+                pass
 
 
 def _job_name(envelope: ExecutionEnvelope) -> str:

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import pathlib
+import subprocess
 
 import httpx
 import pytest
@@ -208,6 +209,55 @@ def test_daemon_session_api_records_structured_events(tmp_path) -> None:
     ]
     assert listed[0]["session_id"] == created["session"]["session_id"]
     assert fetched["status"] == "interrupted"
+
+
+def test_daemon_session_creation_provisions_repo_worktree(tmp_path) -> None:
+    dev = tmp_path / "dev"
+    repo = dev / "jarvis"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    (repo / "README.md").write_text("hello\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="tkn",
+        workspace=str(tmp_path / "worker"),
+        repo_root=str(dev),
+        clone_missing=False,
+    )
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        return (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "run_id": "run_repo",
+                    "provider": "fake",
+                    "engine": "fake",
+                    "repo": "roughcoder/jarvis",
+                    "branch": "jarvis/session",
+                    "title": "Fix worker sessions",
+                    "metadata": {**_authority_metadata("fake"), "provision_workspace": True},
+                },
+                headers=headers,
+            )
+        ).json()
+
+    created = asyncio.run(_with_server(cfg, 8833, calls))
+
+    assert created["ok"] is True
+    cwd = pathlib.Path(created["session"]["cwd"])
+    assert cwd.exists()
+    assert cwd != repo
+    assert created["session"]["branch"].startswith("jarvis/")
+    assert created["session"]["metadata"]["source_repo"] == str(repo)
 
 
 def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path) -> None:
@@ -436,6 +486,85 @@ for line in sys.stdin:
     assert fetched["status"] == "completed"
     assert fetched["metadata"]["codex_thread_id"] == "thread_fake"
     assert fetched["metadata"]["provider_session_id"] == "session_fake"
+
+
+def test_daemon_codex_interrupt_preserves_cancelled_status(tmp_path) -> None:
+    agent = tmp_path / "fake-codex-slow"
+    agent.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+import time
+
+
+def emit(payload):
+    print(json.dumps(payload), flush=True)
+
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    payload = json.loads(line)
+    method = payload.get("method")
+    request_id = payload.get("id")
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method in {"thread/start", "thread/resume"}:
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {"thread": {"id": "thread_slow"}}})
+    elif method == "turn/start":
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {"turn": {"id": "turn_slow"}}})
+        emit({"jsonrpc": "2.0", "method": "turn/started", "params": {"turn": {"id": "turn_slow"}}})
+        while True:
+            time.sleep(1)
+"""
+    )
+    agent.chmod(0o755)
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="tkn",
+        workspace=str(tmp_path / "worker"),
+        codex_bin=str(agent),
+        job_timeout_s=5,
+    )
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "run_id": "run_codex",
+                    "provider": "codex",
+                    "engine": "codex",
+                    "title": "Interrupt Codex",
+                    "metadata": _authority_metadata("codex"),
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        await c.post(
+            f"{base}/sessions/{session_id}/turns",
+            json={"prompt": "wait", "idempotency_key": "idem_codex_interrupt"},
+            headers=headers,
+        )
+        events = []
+        for _ in range(100):
+            events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+            if any(event["type"] == "provider.process.started" for event in events):
+                break
+            await asyncio.sleep(0.05)
+        interrupted = (await c.post(f"{base}/sessions/{session_id}/interrupt", json={}, headers=headers)).json()
+        await asyncio.sleep(0.2)
+        fetched = (await c.get(f"{base}/sessions/{session_id}", headers=headers)).json()
+        events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+        return interrupted, fetched, events
+
+    interrupted, fetched, events = asyncio.run(_with_server(cfg, 8834, calls))
+
+    assert interrupted["session"]["status"] == "interrupted"
+    assert fetched["status"] == "interrupted"
+    assert "turn.failed" not in [event["type"] for event in events]
 
 
 def test_daemon_rejects_unknown_session_provider(tmp_path) -> None:
