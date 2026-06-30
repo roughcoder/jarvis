@@ -686,6 +686,13 @@ class CompositePanel:
                 return voice_mode
         return None
 
+    def control(self, action: str) -> dict[str, object]:
+        for panel in self._panels:
+            control = getattr(panel, "control", None)
+            if control is not None:
+                return dict(control(action))
+        raise RuntimeError("no controllable PiPanel is available")
+
 
 def _valid_voice_mode(value: str | None) -> str:
     mode = (value or "").strip().lower().replace("-", "_")

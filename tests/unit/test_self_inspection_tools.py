@@ -58,7 +58,7 @@ def test_diagnostics_are_fixed_read_only_checks() -> None:
         )
     }
 
-    out = tools["run_self_diagnostics"].handler(_ctx("self.diagnostics"), {})
+    out = asyncio.run(tools["run_self_diagnostics"].handler(_ctx("self.diagnostics"), {}))
 
     assert "basic_runtime:" in out
     assert "terminal_checks:" in out
