@@ -367,8 +367,10 @@ Engine sessions are local resumability handles. `session_name` is the stable
 Jarvis-assigned human handle shown in job lists and engine pickers. `session_id`
 is the engine-native resume id when one is available. Jarvis may pre-allocate it
 only for engines that support first-run session ids, such as Claude Code's
-`--session-id`; Codex `exec` currently captures the emitted session id after the
-first run and uses `codex exec resume <id>` for later turns.
+`--session-id`. Later follow-up turns must mark the envelope as
+`resume_session: true`, which maps Claude to `claude -p --resume <id> ...`.
+Codex `exec` currently captures the emitted session id after the first run and
+uses `codex exec resume <id>` for later turns.
 
 Example worker profile:
 
@@ -408,6 +410,7 @@ Example execution envelope:
   "engine_strategy": "single",
   "session_name": "jarvis-eng-42-worker-heartbeat",
   "session_id": "e7b5586f-8c20-40ac-bf4e-e41a4e6f9fb4",
+  "resume_session": false,
   "allowed_actions": ["worker.job.start", "forge.github.branch.push", "forge.github.pr.create"],
   "prompt": "Follow AGENTS.md, read the ticket, implement the change, verify it, and report evidence.",
   "verification": {

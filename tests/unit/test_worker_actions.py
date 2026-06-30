@@ -66,6 +66,20 @@ def test_code_argv_for_each_agent() -> None:
         "-p",
         "fix bug",
     ]
+    assert code_argv(
+        "claude",
+        "codex",
+        "claude",
+        "follow up",
+        session_id="550e8400-e29b-41d4-a716-446655440000",
+        resume_session=True,
+    ) == [
+        "claude",
+        "-p",
+        "--resume",
+        "550e8400-e29b-41d4-a716-446655440000",
+        "follow up",
+    ]
     try:
         code_argv("whatever", "codex", "claude", "x")
     except ValueError as exc:

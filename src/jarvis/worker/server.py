@@ -194,6 +194,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 return web.json_response({"ok": False, "error": f"worker does not support engine {agent!r}"}, status=400)
             session_id = str(args.get("session_id") or "").strip()
             session_name = str(args.get("session_name") or args.get("name") or "").strip()
+            resume_session = bool(args.get("resume_session"))
             try:
                 argv = code_argv(
                     agent,
@@ -202,6 +203,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                     args.get("prompt", ""),
                     session_id=session_id,
                     session_name=session_name,
+                    resume_session=resume_session,
                 )
             except ValueError as exc:
                 return web.json_response({"ok": False, "error": str(exc)}, status=400)

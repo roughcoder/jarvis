@@ -165,6 +165,7 @@ class ExecutionEnvelope:
     branch_name: str = ""
     session_id: str = ""
     session_name: str = ""
+    resume_session: bool = False
     allowed_actions: list[str] = field(default_factory=lambda: ["worker.job.start"])
     verification: VerificationPlan = field(default_factory=VerificationPlan)
     landing: LandingPolicy = field(default_factory=LandingPolicy)

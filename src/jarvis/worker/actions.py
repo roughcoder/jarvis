@@ -149,6 +149,7 @@ def code_argv(
     *,
     session_id: str = "",
     session_name: str = "",
+    resume_session: bool = False,
 ) -> list[str]:
     """The headless coding-agent command for `agent`. Both run non-interactively
     in the job's repo cwd; tune flags per your setup via the *_bin config."""
@@ -159,6 +160,7 @@ def code_argv(
         prompt,
         session_id=session_id,
         session_name=session_name,
+        resume_session=resume_session,
     )
 
 

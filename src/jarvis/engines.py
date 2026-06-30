@@ -41,10 +41,13 @@ def code_engine_argv(
     *,
     session_id: str = "",
     session_name: str = "",
+    resume_session: bool = False,
 ) -> list[str]:
     engine = normalize_engine_id(agent) or ENGINE_CODEX
     if engine == ENGINE_CLAUDE:
         argv = [claude_bin]
+        if resume_session and session_id:
+            return [claude_bin, "-p", "--resume", session_id, prompt]
         if session_id:
             argv.extend(["--session-id", session_id])
         if session_name:
