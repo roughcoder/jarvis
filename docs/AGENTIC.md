@@ -361,6 +361,7 @@ Example capability vocabulary:
     "worker.session.turn",
     "worker.session.input",
     "worker.session.approve",
+    "worker.session.restore",
     "worker.session.interrupt",
     "worker.session.stop",
     "work.linear.write",
@@ -544,10 +545,10 @@ provider stdout.
 
 Checkpoints are also event-derived. Providers emit `checkpoint.created` with a
 provider checkpoint id; `/sessions/:id/checkpoints` lists them, and
-`/sessions/:id/checkpoints/restore` records `checkpoint.restored` after the
-provider adapter accepts the restore. Provider adapters that cannot roll back
-must fail closed or record an explicit unsupported error instead of pretending
-that state changed.
+`/sessions/:id/checkpoints/restore` requires `worker.session.restore` authority.
+It records `checkpoint.restored` only after the provider adapter accepts the
+restore. Provider adapters that cannot roll back return unsupported instead of
+pretending that state changed.
 
 Schedules and campaigns dispatch sessions, not old coding jobs. `jarvis
 schedules tick --dispatch` rechecks authority, starts due `WorkCommand`s through

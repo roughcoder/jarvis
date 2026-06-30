@@ -73,7 +73,7 @@ class WorkerSessionAuthority:
 
     @property
     def codex_approval_policy(self) -> str:
-        if WORKER_SESSION_APPROVE in self.allowed or WORKER_SESSION_INPUT in self.allowed:
+        if WORKER_SESSION_APPROVE in self.allowed:
             return "on-request"
         return "never"
 

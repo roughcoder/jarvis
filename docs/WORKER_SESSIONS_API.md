@@ -256,7 +256,9 @@ Emits `approval.resolved`.
 ### `POST /sessions/:id/checkpoints/restore`
 
 Ask the provider adapter to restore a known checkpoint. The worker validates the
-checkpoint id against the session event stream before calling the provider.
+session envelope has `worker.session.restore`, validates the checkpoint id
+against the session event stream, then calls the provider. Providers without a
+restore handler return unsupported and do not emit `checkpoint.restored`.
 
 Request:
 
@@ -267,7 +269,7 @@ Request:
 }
 ```
 
-Emits `checkpoint.restored` when accepted.
+Emits `checkpoint.restored` only when the provider accepts the restore.
 
 ### `POST /sessions/:id/interrupt`
 
