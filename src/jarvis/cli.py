@@ -688,7 +688,15 @@ def _cmd_work(args: argparse.Namespace) -> int:
             public_write_mode=public_write_mode,
         ):
             return 1
-        items = source.list(repo=args.repo or cfg.orchestration.default_repo, filters=command.filters, limit=args.limit)
+        try:
+            items = source.list(
+                repo=args.repo or cfg.orchestration.default_repo,
+                filters=command.filters,
+                limit=args.limit,
+            )
+        except RuntimeError as exc:
+            print(_work_source_error(command.source, exc))
+            return 1
         if args.json:
             print(json.dumps([x.to_dict() for x in items], indent=2))
         else:
@@ -722,7 +730,11 @@ def _cmd_work(args: argparse.Namespace) -> int:
             public_write_mode=public_write_mode,
         ):
             return 1
-        item = source.next(repo=args.repo or cfg.orchestration.default_repo, filters=command.filters)
+        try:
+            item = source.next(repo=args.repo or cfg.orchestration.default_repo, filters=command.filters)
+        except RuntimeError as exc:
+            print(_work_source_error(command.source, exc))
+            return 1
         if item is None:
             print("No eligible work item found.")
             return 0
@@ -801,6 +813,16 @@ def _has_orchestration_authority(
             print(_capability_hint(denied, cfg, capabilities))
         return False
     return True
+
+
+def _work_source_error(source: str, exc: RuntimeError) -> str:
+    message = str(exc)
+    if source == "linear" and "LINEAR_API_KEY" in message:
+        return (
+            "Linear work source is not configured: set LINEAR_API_KEY in the Jarvis env file "
+            "used by this service."
+        )
+    return f"{source} work source failed: {message}"
 
 
 def _capability_hint(actions: list[str], cfg, capabilities: set[str]) -> str:  # noqa: ANN001

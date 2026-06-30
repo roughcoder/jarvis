@@ -155,6 +155,29 @@ def test_linear_config_uses_jarvis_env_file(monkeypatch, tmp_path) -> None:
     assert LinearConfig(_env_file=str(env_file)).api_key.get_secret_value() == "lin-secret"
 
 
+def test_private_state_paths_resolve_relative_to_jarvis_env_file(monkeypatch, tmp_path) -> None:
+    env_dir = tmp_path / "runtime-home"
+    env_dir.mkdir()
+    env_file = env_dir / ".env"
+    env_file.write_text("", encoding="utf-8")
+    other_cwd = tmp_path / "elsewhere"
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+
+    c = Config()
+
+    assert c.capabilities.profiles_dir == str(env_dir / "jarvis-workspace/profiles")
+    assert c.capabilities.users_dir == str(env_dir / "jarvis-workspace/users")
+    assert c.orchestration.workspace == str(env_dir / "jarvis-workspace/orchestration")
+    assert c.orchestration.workers_path == str(
+        env_dir / "jarvis-workspace/orchestration/workers.json"
+    )
+    assert c.orchestration.schedules_path == str(
+        env_dir / "jarvis-workspace/orchestration/schedules.json"
+    )
+
+
 def test_database_url_masks_password(monkeypatch) -> None:
     _clean(monkeypatch, "DB_PASSWORD", "DB_HOST")
     c = DatabaseConfig(_env_file=None, password="s3cret", host="localhost")
