@@ -26,6 +26,7 @@ from jarvis.capabilities import (  # noqa: E402
     WORKER_SESSION_CREATE,
     WORKER_SESSION_INPUT,
     WORKER_SESSION_INTERRUPT,
+    WORKER_SESSION_RESTORE,
     WORKER_SESSION_STOP,
     WORKER_SESSION_TURN,
 )
@@ -127,6 +128,19 @@ def test_worker_session_authority_maps_draft_pr_and_approval_modes() -> None:
     assert authority.codex_sandbox == "workspace-write"
     assert authority.codex_approval_policy == "on-request"
     assert authority.claude_permission_mode == "default"
+
+
+def test_worker_session_authority_keeps_input_separate_from_codex_approval() -> None:
+    authority = WorkerSessionAuthority.from_session(
+        _session_with_authority(
+            allowed_actions=[WORKER_SESSION_TURN, WORKER_SESSION_INPUT, FORGE_BRANCH_PUSH],
+            landing={"mode": "branch_only", "allow_merge": False},
+        )
+    )
+
+    assert authority.codex_approval_policy == "never"
+    assert authority.can_receive_input is True
+    assert authority.can_resolve_approval is False
 
 
 def test_worker_session_authority_fails_closed_for_unsupported_landing() -> None:
@@ -694,7 +708,7 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
                     "title": "Pending request",
                     "metadata": _authority_metadata(
                         "fake",
-                        extra_actions=[WORKER_SESSION_APPROVE, WORKER_SESSION_INPUT],
+                        extra_actions=[WORKER_SESSION_APPROVE, WORKER_SESSION_INPUT, WORKER_SESSION_RESTORE],
                     ),
                 },
                 headers=headers,
@@ -806,6 +820,69 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
     assert restored["event"]["type"] == "checkpoint.restored"
     assert checkpoints_after_restore["checkpoints"][0]["restored"] is True
     assert "turn.failed" in [event["type"] for event in events]
+
+
+def test_daemon_checkpoint_restore_requires_envelope_authority(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={"provider": "fake", "engine": "fake", "metadata": _authority_metadata("fake")},
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        restored = await c.post(
+            f"{base}/sessions/{session_id}/checkpoints/restore",
+            json={"checkpoint_id": "ckpt_any"},
+            headers=headers,
+        )
+        events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+        return restored.status_code, restored.json(), events
+
+    status_code, body, events = asyncio.run(_with_server(cfg, 8843, calls))
+
+    assert status_code == 400
+    assert WORKER_SESSION_RESTORE in body["error"]
+    assert [event["type"] for event in events] == ["session.created"]
+
+
+def test_daemon_checkpoint_restore_returns_unsupported_without_provider_handler(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "provider": "claude",
+                    "engine": "claude",
+                    "cwd": _owned_worker_cwd(tmp_path, "claude-no-restore"),
+                    "metadata": _authority_metadata("claude", extra_actions=[WORKER_SESSION_RESTORE]),
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        direct = SessionManager(str(tmp_path / "worker" / "sessions"))
+        direct.append_event(session_id, "checkpoint.created", {"checkpoint_id": "ckpt_manual"})
+        restored = await c.post(
+            f"{base}/sessions/{session_id}/checkpoints/restore",
+            json={"checkpoint_id": "ckpt_manual"},
+            headers=headers,
+        )
+        events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+        return restored.status_code, restored.json(), events
+
+    status_code, body, events = asyncio.run(_with_server(cfg, 8844, calls))
+
+    assert status_code == 501
+    assert "does not support checkpoint restore" in body["error"]
+    assert [event["type"] for event in events] == ["session.created", "checkpoint.created"]
 
 
 def test_daemon_codex_provider_projects_app_server_events(tmp_path) -> None:

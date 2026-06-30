@@ -12,6 +12,7 @@ from jarvis.worker_session_contract import (
     EVENT_ASSISTANT_DELTA,
     EVENT_ASSISTANT_MESSAGE,
     EVENT_CHECKPOINT_CREATED,
+    EVENT_CHECKPOINT_RESTORED,
     EVENT_INPUT_RECEIVED,
     EVENT_INPUT_REQUESTED,
     EVENT_TURN_COMPLETED,
@@ -136,3 +137,12 @@ class FakeProviderAdapter:
         event = sessions.append_event(session.session_id, EVENT_INPUT_RECEIVED, request)
         sessions.update_status(session.session_id, SESSION_COMPLETED)
         return event
+
+    def restore_checkpoint(
+        self,
+        *,
+        session: WorkerSession,
+        request: dict[str, Any],
+        sessions: SessionManager,
+    ) -> SessionEvent:
+        return sessions.append_event(session.session_id, EVENT_CHECKPOINT_RESTORED, request)

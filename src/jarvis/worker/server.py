@@ -29,6 +29,7 @@ from jarvis.capabilities import (
     WORKER_SESSION_APPROVE,
     WORKER_SESSION_INPUT,
     WORKER_SESSION_INTERRUPT,
+    WORKER_SESSION_RESTORE,
     WORKER_SESSION_STOP,
     WORKER_SESSION_TURN,
 )
@@ -56,7 +57,6 @@ from jarvis.worker.sessions import SessionManager, WorkerSession
 from jarvis.worker_session_contract import (
     CHECKPOINT_ID_KEY,
     EVENT_APPROVAL_RESOLVED,
-    EVENT_CHECKPOINT_RESTORED,
     EVENT_INPUT_RECEIVED,
     EVENT_SESSION_INTERRUPTED,
     EVENT_SESSION_STOPPED,
@@ -463,6 +463,9 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         session = sessions.get(session_id)
         if session is None:
             return web.json_response({"error": "no such session"}, status=404)
+        authority_error = _require_session_authority(session, WORKER_SESSION_RESTORE)
+        if authority_error is not None:
+            return authority_error
         try:
             body = await request.json()
         except Exception:
@@ -480,9 +483,11 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         handler = getattr(adapter, "restore_checkpoint", None)
         request_data = {CHECKPOINT_ID_KEY: checkpoint_id, "metadata": dict(body.get("metadata") or {})}
         if handler is None:
-            event = sessions.append_event(session.session_id, EVENT_CHECKPOINT_RESTORED, request_data)
-        else:
-            event = handler(session=session, request=request_data, sessions=sessions)
+            return web.json_response(
+                {"ok": False, "error": f"provider {session.provider!r} does not support checkpoint restore"},
+                status=501,
+            )
+        event = handler(session=session, request=request_data, sessions=sessions)
         return web.json_response({"ok": True, "event": event.to_dict()})
 
     async def start_session_turn(request: web.Request) -> web.Response:
