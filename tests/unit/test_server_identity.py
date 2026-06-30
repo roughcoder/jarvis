@@ -133,33 +133,60 @@ def test_audio_buffer_rejects_second_live_turn_on_same_connection() -> None:
 
 
 def test_audio_buffer_rejects_turn_that_exceeds_pcm_cap() -> None:
-    conn = {
-        "audio_buffers": {
-            "t1": {
-                "sample_rate": 16000,
-                "chunks": [],
-                "pcm_bytes": 0,
-                "frame_bytes": 0,
-                "max_pcm_bytes": 3,
-                "started_at": 1.0,
+    async def go() -> bool:
+        task = asyncio.create_task(asyncio.Event().wait())
+        conn = {
+            "audio_buffers": {
+                "t1": {
+                    "sample_rate": 16000,
+                    "chunks": [],
+                    "pcm_bytes": 0,
+                    "frame_bytes": 0,
+                    "max_pcm_bytes": 3,
+                    "started_at": 1.0,
+                    "streaming_stt_task": task,
+                }
             }
         }
-    }
 
-    first = BrainServer._buffer_audio_chunk(
-        conn,
-        BinaryAudio(kind="uplink_audio", turn_id="t1", pcm=b"aa", sample_rate=16000),
-        frame_bytes=10,
-    )
-    second = BrainServer._buffer_audio_chunk(
-        conn,
-        BinaryAudio(kind="uplink_audio", turn_id="t1", pcm=b"bb", sample_rate=16000),
-        frame_bytes=10,
-    )
+        first = BrainServer._buffer_audio_chunk(
+            conn,
+            BinaryAudio(kind="uplink_audio", turn_id="t1", pcm=b"aa", sample_rate=16000),
+            frame_bytes=10,
+        )
+        second = BrainServer._buffer_audio_chunk(
+            conn,
+            BinaryAudio(kind="uplink_audio", turn_id="t1", pcm=b"bb", sample_rate=16000),
+            frame_bytes=10,
+        )
+        await asyncio.sleep(0)
 
-    assert first is True
-    assert second is False
-    assert "t1" not in conn["audio_buffers"]
+        assert first is True
+        assert second is False
+        assert "t1" not in conn["audio_buffers"]
+        return task.cancelled()
+
+    assert asyncio.run(go()) is True
+
+
+def test_discard_audio_buffers_cancels_pending_streaming_stt() -> None:
+    async def go() -> tuple[bool, dict]:
+        task = asyncio.create_task(asyncio.Event().wait())
+        conn = {
+            "audio_buffers": {
+                "t1": {"streaming_stt_task": task},
+                "t2": {"streaming_stt_task": None},
+            }
+        }
+
+        BrainServer._discard_audio_buffers(conn)
+        await asyncio.sleep(0)
+        return task.cancelled(), conn
+
+    cancelled, conn = asyncio.run(go())
+
+    assert cancelled is True
+    assert conn["audio_buffers"] == {}
 
 
 def test_audio_buffer_accepts_final_frame_at_local_capture_limit() -> None:

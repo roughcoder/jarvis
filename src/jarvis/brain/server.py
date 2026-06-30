@@ -558,6 +558,7 @@ class BrainServer:
         finally:
             self._connections.discard(ws)
             self._conn_meta.pop(ws, None)
+            self._discard_audio_buffers(conn)
             for fut in list(conn.get("waiters", {}).values()):
                 if not fut.done():
                     fut.set_exception(ConnectionError("intercom disconnected"))
@@ -600,7 +601,7 @@ class BrainServer:
         pcm_bytes = int(buf.get("pcm_bytes") or 0) + len(binary.pcm)
         max_pcm_bytes = int(buf.get("max_pcm_bytes") or 0)
         if max_pcm_bytes and pcm_bytes > max_pcm_bytes:
-            buffers.pop(binary.turn_id, None)
+            BrainServer._discard_audio_buffer(buffers.pop(binary.turn_id, None))
             return False
         buf["chunks"].append(binary.pcm)
         buf["pcm_bytes"] = pcm_bytes
@@ -629,6 +630,22 @@ class BrainServer:
             streaming_stt_pcm_bytes=int(buf.get("streaming_stt_pcm_bytes") or 0),
             streaming_stt_partial_runs=int(buf.get("streaming_stt_partial_runs") or 0),
         )
+
+    @staticmethod
+    def _discard_audio_buffers(conn: dict) -> None:
+        buffers = conn.get("audio_buffers", {})
+        for buf in list(buffers.values()):
+            BrainServer._discard_audio_buffer(buf)
+        buffers.clear()
+
+    @staticmethod
+    def _discard_audio_buffer(buf: dict | None) -> None:
+        if not buf:
+            return
+        task = buf.get("streaming_stt_task")
+        if task is not None and not task.done():
+            task.cancel()
+            task.add_done_callback(BrainServer._observe_abandoned_stt_snapshot)
 
     def _maybe_schedule_streaming_stt(self, conn: dict, turn_id: str) -> None:
         if not self._cfg.brain.streaming_stt_enabled:
