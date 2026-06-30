@@ -59,6 +59,8 @@ def test_pi_installer_dry_run_models_intercom_install() -> None:
     assert "+ set INTERCOM_DEVICE_PI_PANEL=false" in result.stdout
     assert "+ set INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S=90" in result.stdout
     assert "+ set INTERCOM_DEVICE_PI_PANEL_URL=http://127.0.0.1:8787" in result.stdout
+    assert "+ set INTERCOM_NETWORK_PROBE_HOST=1.1.1.1" in result.stdout
+    assert "+ set INTERCOM_NETWORK_PROBE_PORT=53" in result.stdout
     assert "+ chmod 0600 /opt/jarvis-test/.env" in result.stdout
     assert "+ write /usr/local/bin/jarvis" in result.stdout
     assert "+ chmod 0755 /usr/local/bin/jarvis" in result.stdout
@@ -102,12 +104,17 @@ def test_pi_helper_doctor_checks_bookworm_camera_and_display() -> None:
     assert 'SLEEP_AFTER="\\${JARVIS_PI_PANEL_SLEEP_AFTER_S:-90}"' in source
     assert "INTERCOM_DEVICE_EYES_SLEEP_AFTER_S" in source
     assert '--sleep-after "\\$SLEEP_AFTER"' in source
+    assert "--no-debug-controls" in source
     assert "rpicam-hello --list-cameras" in source
     assert "libcamera-hello --list-cameras" in source
     assert "vcgencmd display_power" in source
     assert "/dev/fb0" in source
     assert "/dev/dri/card*" in source
     assert "recover-network)" in source
+    assert "panel-stop)" in source
+    assert "panel-start)" in source
+    assert "RestartPreventExitStatus=42" in source
+    assert 'kill "\\$browser_pid"' in source
     assert "/usr/local/bin/jarvis-network-recover" in source
     assert "panel-status)" in source
     assert "jarvis-panel-preview.service" in source

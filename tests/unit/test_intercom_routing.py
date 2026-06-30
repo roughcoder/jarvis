@@ -22,6 +22,7 @@ from jarvis.protocol.messages import (
     ReplyEnd,
     ReplyText,
     Transcript,
+    Utterance,
     decode,
 )
 
@@ -53,9 +54,31 @@ class _Mic:
         self.drained += 1
 
 
-def _client() -> IntercomClient:
+class _Panel:
+    def __init__(self, modes: list[str] | None = None) -> None:
+        self.modes = modes or []
+        self.published_modes: list[str] = []
+        self.states: list[str] = []
+
+    def start(self) -> None:
+        return
+
+    def stop(self) -> None:
+        return
+
+    def set(self, state: str) -> None:
+        self.states.append(state)
+
+    def set_voice_mode(self, voice_mode: str) -> None:
+        self.published_modes.append(voice_mode)
+
+    def take_voice_mode(self) -> str | None:
+        return self.modes.pop(0) if self.modes else None
+
+
+def _client(panel=None) -> IntercomClient:  # noqa: ANN001
     return IntercomClient(
-        load_config(), audio=_Stub(), vad=_Stub(), wake=_Stub(), hardware=_Hardware()
+        load_config(), audio=_Stub(), vad=_Stub(), wake=_Stub(), hardware=_Hardware(), panel=panel
     )
 
 
@@ -264,6 +287,69 @@ def test_interrupted_silence_sends_conversation_idle() -> None:
     assert asyncio.run(go()) is None
     sent = [decode(item) for item in ws.sent]
     assert any(isinstance(item, ConversationIdle) and item.reason == "timeout" for item in sent)
+
+
+def test_panel_selected_voice_mode_is_sent_with_next_utterance() -> None:
+    panel = _Panel(["stay"])
+    c = _client(panel)
+    q: asyncio.Queue = asyncio.Queue()
+    ws = _WS()
+    mic = _Mic()
+
+    async def fake_play(*args):  # noqa: ANN002
+        state = args[4]
+        state["ended"] = True
+        state["voice_mode"] = "stay"
+        state["continue_listening"] = False
+        return False
+
+    c._play_reply = fake_play  # type: ignore[method-assign]
+
+    async def go() -> dict | None:
+        return await c._converse(ws, mic, q, b"hello")
+
+    state = asyncio.run(go())
+    sent = [decode(item) for item in ws.sent]
+    utterances = [item for item in sent if isinstance(item, Utterance)]
+    assert state is not None
+    assert utterances and utterances[0].voice_mode == "stay"
+    assert c._active_voice_mode == "stay"
+    assert "stay" in panel.published_modes
+
+
+def test_link_loss_uses_network_state_when_probe_fails() -> None:
+    panel = _Panel()
+    c = _client(panel)
+
+    c._network_online = lambda: False  # type: ignore[method-assign]
+
+    async def go() -> None:
+        await c._set_link_lost_state()
+
+    asyncio.run(go())
+
+    assert panel.states == ["network"]
+
+
+def test_link_loss_uses_disconnected_when_network_probe_passes() -> None:
+    panel = _Panel()
+    c = _client(panel)
+
+    c._network_online = lambda: True  # type: ignore[method-assign]
+
+    async def go() -> None:
+        await c._set_link_lost_state()
+
+    asyncio.run(go())
+
+    assert panel.states == ["disconnected"]
+
+
+def test_network_probe_can_be_disabled_for_lan_only_installs() -> None:
+    c = _client()
+    c._cfg.intercom.network_probe_host = "none"
+
+    assert c._network_online() is True
 
 
 def test_interrupted_stay_mode_silence_keeps_listening_without_idle() -> None:

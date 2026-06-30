@@ -23,6 +23,7 @@ import time
 import uuid
 
 import websockets
+from jarvis.brain.voice_modes import DEFAULT_MODE, STAY_MODE, normalize_mode
 from jarvis.config import Config
 from jarvis.intercom.audio import AudioIO, MicStream
 from jarvis.intercom.hardware import IntercomHardware
@@ -86,18 +87,19 @@ class IntercomClient:
         )
         self._sr = cfg.audio.sample_rate
         self._device_id = cfg.capabilities.device_id
+        self._active_voice_mode = DEFAULT_MODE
 
     async def run(self) -> None:
         print("Loading models…")
         self._vad.load()
         self._wake.load()
         self._panel.start()
+        self._publish_voice_mode()
         url = self._cfg.intercom.brain_url
         hardware = self._hardware.capabilities()
         if hardware:
             print(f"Local intercom hardware: {', '.join(hardware)}")
         print(f"Connecting to brain at {url}…")
-        self._panel.set("connecting")
         # Models + mic are loaded once and kept open across brain reconnects: a brain
         # restart must not drop the voice device or re-load Whisper/wake every time.
         try:
@@ -107,6 +109,9 @@ class IntercomClient:
                 phrase = self._cfg.wake.keyword.replace("_", " ").title()
                 while True:  # reconnect loop — survive brain restarts/outages
                     try:
+                        if not await self._ensure_network_ready():
+                            await asyncio.sleep(3)
+                            continue
                         self._panel.set("connecting")
                         async with websockets.connect(
                             url,
@@ -159,12 +164,12 @@ class IntercomClient:
                                     t.cancel()
                                     with contextlib.suppress(asyncio.CancelledError, Exception):
                                         await t
-                        self._panel.set("disconnected")
+                        await self._set_link_lost_state()
                         print("  [intercom] brain link closed; reconnecting in 3s…")
                         await self._recover_network_if_needed()
                         await asyncio.sleep(3)
                     except (OSError, TimeoutError, websockets.exceptions.WebSocketException) as exc:
-                        self._panel.set("disconnected")
+                        await self._set_link_lost_state()
                         print(f"  [intercom] brain link lost ({type(exc).__name__}); reconnecting in 3s…")
                         await self._recover_network_if_needed()
                         await asyncio.sleep(3)
@@ -198,6 +203,36 @@ class IntercomClient:
         try:
             with socket.create_connection(
                 (self._cfg.intercom.brain_host, self._cfg.intercom.brain_port), timeout=2.0
+            ):
+                return True
+        except OSError:
+            return False
+
+    async def _ensure_network_ready(self) -> bool:
+        if await asyncio.to_thread(self._network_online):
+            return True
+        self._panel.set("network")
+        print("  [intercom] network appears offline; waiting before brain reconnect…")
+        await self._recover_network_if_needed()
+        return False
+
+    async def _set_link_lost_state(self) -> None:
+        if await asyncio.to_thread(self._network_online):
+            self._panel.set("disconnected")
+        else:
+            self._panel.set("network")
+
+    def _network_online(self) -> bool:
+        host = self._cfg.intercom.network_probe_host.strip()
+        if host.lower() in {"", "none", "false", "0"}:
+            return True
+        try:
+            with socket.create_connection(
+                (
+                    host,
+                    self._cfg.intercom.network_probe_port,
+                ),
+                timeout=max(0.1, self._cfg.intercom.network_probe_timeout_s),
             ):
                 return True
         except OSError:
@@ -247,6 +282,7 @@ class IntercomClient:
         print('● idle — say "Hey Jarvis"')
         self._panel.set("idle")
         while True:
+            self._sync_panel_voice_mode()
             pro = self._take_proactive(inbound)
             if pro is not None:
                 await self._play_proactive(ws, mic, inbound, pro)
@@ -280,11 +316,12 @@ class IntercomClient:
         """Run turns until the conversation closes — shared by a wake-started turn and a
         proactive that opened the mic."""
         conversation_started = False
-        active_voice_mode = "default"
+        active_voice_mode = self._sync_panel_voice_mode()
         while True:
+            active_voice_mode = self._sync_panel_voice_mode()
             if not pcm:
                 print("  (nothing said)")
-                if conversation_started and active_voice_mode == "stay":
+                if conversation_started and active_voice_mode == STAY_MODE:
                     self._panel.set("listening")
                     t0 = time.perf_counter()
                     pcm = await asyncio.to_thread(self._capture_utterance, mic)
@@ -306,7 +343,7 @@ class IntercomClient:
                     pcm_bytes=len(pcm),
                     streamed=False,
                 )
-            frame = encode(Utterance.of(turn_id, self._sr, pcm))
+            frame = encode(Utterance.of(turn_id, self._sr, pcm, voice_mode=active_voice_mode))
             metrics.mark_utterance_sent(
                 pcm_bytes=len(pcm),
                 frame_bytes=len(frame),
@@ -317,14 +354,14 @@ class IntercomClient:
             state = {
                 "ended": False,
                 "text": "",
-                "continue_listening": active_voice_mode == "stay",
+                "continue_listening": active_voice_mode == STAY_MODE,
                 "voice_mode": active_voice_mode,
                 "close_reason": "",
             }
             interrupted = await self._play_reply(
                 ws, mic, inbound, turn_id, state, metrics
             )
-            active_voice_mode = state["voice_mode"]
+            active_voice_mode = self._set_active_voice_mode(state["voice_mode"])
             print(f"  jarvis: {state['text']}{'  ⏹' if state['ended'] else ''}")
 
             if interrupted:
@@ -345,10 +382,14 @@ class IntercomClient:
                 proactive_state = await self._play_queued_proactive(ws, mic, inbound, state)
                 if proactive_state is not None:
                     state.update(proactive_state)
+                    active_voice_mode = self._set_active_voice_mode(state["voice_mode"])
                     if state["ended"] or not state["continue_listening"]:
                         return state
                     continue
-                if state["voice_mode"] == "stay":
+                active_voice_mode = self._sync_panel_voice_mode()
+                state["voice_mode"] = active_voice_mode
+                state["continue_listening"] = state["continue_listening"] or active_voice_mode == STAY_MODE
+                if state["voice_mode"] == STAY_MODE:
                     print("  …(stay mode — listening)")
                 else:
                     print("  …(listening — keep talking, or stay quiet to sleep)")
@@ -363,7 +404,7 @@ class IntercomClient:
                 self._panel.set("thinking")
                 if pcm:
                     break
-                if state["voice_mode"] == "stay":
+                if state["voice_mode"] == STAY_MODE:
                     continue
                 with contextlib.suppress(Exception):
                     await ws.send(encode(ConversationIdle(reason="timeout")))
@@ -422,8 +463,8 @@ class IntercomClient:
         state = {
             "ended": False,
             "text": "",
-            "continue_listening": False,
-            "voice_mode": "default",
+            "continue_listening": self._active_voice_mode == STAY_MODE,
+            "voice_mode": self._active_voice_mode,
             "close_reason": "",
         }
         metrics = IntercomReplyMetrics(
@@ -453,7 +494,9 @@ class IntercomClient:
                     ws, mic, inbound, pcm, capture_ms=capture_ms
                 )
                 if nested_state is not None:
+                    self._set_active_voice_mode(nested_state.get("voice_mode", self._active_voice_mode))
                     return nested_state
+        self._set_active_voice_mode(state.get("voice_mode", self._active_voice_mode))
         return state
 
     # --- reply playback + barge-in -----------------------------------------
@@ -481,6 +524,7 @@ class IntercomClient:
                 state["continue_listening"] = msg.continue_listening
                 state["voice_mode"] = msg.voice_mode
                 state["close_reason"] = msg.close_reason
+                self._set_active_voice_mode(msg.voice_mode)
                 return
             elif isinstance(msg, Cancel) and msg.turn_id == turn_id:
                 return
@@ -605,3 +649,18 @@ class IntercomClient:
         if self._cfg.audio.ack_mode == "none":
             return
         await asyncio.to_thread(self._audio.play_tone)
+
+    def _sync_panel_voice_mode(self) -> str:
+        while True:
+            voice_mode = self._panel.take_voice_mode()
+            if not voice_mode:
+                return self._active_voice_mode
+            self._set_active_voice_mode(voice_mode)
+
+    def _set_active_voice_mode(self, voice_mode: str) -> str:
+        self._active_voice_mode = normalize_mode(voice_mode)
+        self._publish_voice_mode()
+        return self._active_voice_mode
+
+    def _publish_voice_mode(self) -> None:
+        self._panel.set_voice_mode(self._active_voice_mode)

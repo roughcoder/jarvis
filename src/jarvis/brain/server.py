@@ -34,6 +34,7 @@ from jarvis.brain.voice_modes import (
     alarm_ack_transition,
     cancelled_voice_transition,
     empty_transcript_transition,
+    normalize_mode,
     voice_result_transition,
 )
 from jarvis.config import Config, insecure_bind
@@ -598,6 +599,8 @@ class BrainServer:
         )
         trace.set(audio_downlink=REPLY_AUDIO_BINARY_V1)
         if isinstance(msg, Utterance):
+            if channel == "voice":
+                conn["voice_mode"] = normalize_mode(msg.voice_mode)
             pcm = msg.pcm()
             secs = len(pcm) / 2 / msg.sample_rate
             trace.stage(

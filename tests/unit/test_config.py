@@ -59,6 +59,14 @@ def test_websocket_keepalive_tolerates_slow_pi_event_loop() -> None:
     assert intercom.websocket_ping_timeout_s == brain.websocket_ping_timeout_s
 
 
+def test_intercom_network_probe_defaults_are_configurable() -> None:
+    intercom = IntercomConfig(_env_file=None)
+
+    assert intercom.network_probe_host == "1.1.1.1"
+    assert intercom.network_probe_port == 53
+    assert intercom.network_probe_timeout_s == 0.75
+
+
 def test_pi_panel_sleep_defaults_to_ninety_seconds(monkeypatch) -> None:
     _clean(monkeypatch, "INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S", "INTERCOM_DEVICE_EYES_SLEEP_AFTER_S")
 

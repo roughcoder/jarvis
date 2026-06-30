@@ -160,6 +160,8 @@ if [[ "$DRY_RUN" == "1" ]]; then
   echo "+ set INTERCOM_DEVICE_PI_PANEL=false"
   echo "+ set INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S=90"
   echo "+ set INTERCOM_DEVICE_PI_PANEL_URL=http://127.0.0.1:$PI_PANEL_PORT"
+  echo "+ set INTERCOM_NETWORK_PROBE_HOST=1.1.1.1"
+  echo "+ set INTERCOM_NETWORK_PROBE_PORT=53"
 else
   cat > "$INSTALL_DIR/.env" <<ENV
 INTERCOM_BRAIN_HOST=$BRAIN_HOST
@@ -173,6 +175,8 @@ INTERCOM_DEVICE_PI_PANEL=false
 INTERCOM_DEVICE_PI_PANEL_SLEEP_AFTER_S=90
 INTERCOM_DEVICE_PI_PANEL_GEOMETRY=$PI_PANEL_GEOMETRY
 INTERCOM_DEVICE_PI_PANEL_URL=http://127.0.0.1:$PI_PANEL_PORT
+INTERCOM_NETWORK_PROBE_HOST=1.1.1.1
+INTERCOM_NETWORK_PROBE_PORT=53
 ENV
 fi
 run chmod 0600 "$INSTALL_DIR/.env"
@@ -267,7 +271,7 @@ fi
 
 url="http://\$HOST:\$PORT/"
 export PYTHONPATH="\$INSTALL_DIR/src\${PYTHONPATH:+:\$PYTHONPATH}"
-/usr/bin/python3 -m jarvis.intercom.panel_dev --host "\$HOST" --port "\$PORT" --state idle --sleep-after "\$SLEEP_AFTER" &
+/usr/bin/python3 -m jarvis.intercom.panel_dev --host "\$HOST" --port "\$PORT" --state idle --sleep-after "\$SLEEP_AFTER" --no-debug-controls &
 server_pid="\$!"
 
 cleanup() {
@@ -288,14 +292,35 @@ if [[ -z "\$browser" ]]; then
   exit \$?
 fi
 
-exec "\$browser" \\
+"\$browser" \\
   --noerrdialogs \\
   --disable-infobars \\
   --disable-session-crashed-bubble \\
   --app="\$url" \\
   --window-position="\$x,\$y" \\
   --window-size="\$width,\$height" \\
-  --user-data-dir="\$HOME/.cache/jarvis-panel-chromium"
+  --user-data-dir="\$HOME/.cache/jarvis-panel-chromium" &
+browser_pid="\$!"
+
+while true; do
+  if ! kill -0 "\$server_pid" >/dev/null 2>&1; then
+    set +e
+    wait "\$server_pid"
+    status="\$?"
+    set -e
+    kill "\$browser_pid" >/dev/null 2>&1 || true
+    exit "\$status"
+  fi
+  if ! kill -0 "\$browser_pid" >/dev/null 2>&1; then
+    kill "\$server_pid" >/dev/null 2>&1 || true
+    set +e
+    wait "\$browser_pid"
+    status="\$?"
+    set -e
+    exit "\$status"
+  fi
+  sleep 0.5
+done
 EOF
 fi
 run chmod 0755 /usr/local/bin/jarvis-panel-preview
@@ -327,6 +352,7 @@ Environment=XAUTHORITY=$panel_home/.Xauthority
 Environment=XDG_RUNTIME_DIR=/run/user/$panel_uid
 ExecStart=/usr/local/bin/jarvis-panel-preview
 Restart=always
+RestartPreventExitStatus=42
 RestartSec=3
 
 [Install]
@@ -364,6 +390,10 @@ Commands:
   logs      Follow intercom service logs
   panel-restart
             Restart the Pi display panel service
+  panel-stop
+            Close the Pi display panel service
+  panel-start
+            Reopen the Pi display panel service
   panel-status
             Show Pi display panel service status
   panel-logs
@@ -485,6 +515,14 @@ PY
   panel-restart)
     require_root "\$cmd"
     systemctl restart "\$PANEL_SERVICE"
+    ;;
+  panel-stop)
+    require_root "\$cmd"
+    systemctl stop "\$PANEL_SERVICE"
+    ;;
+  panel-start)
+    require_root "\$cmd"
+    systemctl start "\$PANEL_SERVICE"
     ;;
   panel-status)
     systemctl status "\$PANEL_SERVICE"
