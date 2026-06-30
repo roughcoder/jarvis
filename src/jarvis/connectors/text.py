@@ -160,12 +160,14 @@ class TextConsole:
         """The single socket reader: turn frames → queue; proactive pushes → print now."""
         try:
             async for raw in ws:
+                if isinstance(raw, bytes):
+                    continue  # voice audio frames are not meaningful in text mode
                 m = decode(raw)
                 if isinstance(m, Proactive):
                     print(f"\n🔔 {m.text}\n", flush=True)
                 elif isinstance(m, (ReplyText, ReplyEnd, Transcript)) and not m.turn_id.startswith("pa-"):
                     await turn_q.put(m)
-                # ReplyAudio (and proactive 'pa-' trailing frames) are ignored in text mode
+                # Proactive 'pa-' trailing frames are ignored in text mode.
         except Exception:  # noqa: BLE001 - socket closed / shutting down
             pass
 

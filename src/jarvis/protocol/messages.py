@@ -2,12 +2,12 @@
 
 Language-neutral message schemas so a Python intercom (now) and a native client
 (later) are interchangeable on the brain side. Control messages are JSON text
-frames with a `type` discriminator. Audio PCM defaults to base64 in JSON for
-compatibility, with negotiated binary frames for latency-sensitive clients.
+frames with a `type` discriminator. Downlink audio PCM travels in binary
+WebSocket frames; there is one audio transport in this home setup.
 
   up   (intercom -> brain): Hello, Utterance, BargeIn, TextIn, ConversationIdle,
                             DeviceResponse
-  down (brain -> intercom): Welcome / Reject, ReplyAudio, ReplyText, ReplyEnd,
+  down (brain -> intercom): Welcome / Reject, ReplyText, ReplyEnd,
                             Cancel, Proactive, DeviceRequest
 """
 
@@ -20,7 +20,7 @@ from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, Field, TypeAdapter
 
-AUDIO_BINARY_V1 = "audio_binary_v1"
+REPLY_AUDIO_BINARY_V1 = "reply_audio_binary_v1"
 
 _BINARY_MAGIC = b"JARVIS1"
 _BINARY_HEADER = struct.Struct("!7sBBHI")
@@ -29,7 +29,7 @@ _BINARY_TYPE_REPLY_AUDIO = 1
 
 @dataclasses.dataclass(frozen=True)
 class BinaryAudio:
-    """Decoded negotiated binary audio frame."""
+    """Decoded reply-audio binary WebSocket frame."""
 
     kind: Literal["reply_audio"]
     turn_id: str
@@ -54,8 +54,6 @@ class Hello(BaseModel):
     # grant authority by themselves; the brain intersects them with the device
     # profile before exposing tools.
     hardware: list[str] = Field(default_factory=list)
-    # Optional protocol capabilities. Absence means JSON/base64 v1 only.
-    protocols: list[str] = Field(default_factory=list)
 
 
 class Identify(BaseModel):
@@ -128,25 +126,11 @@ class Welcome(BaseModel):
     identity: str
     scope: str
     capabilities: list[str]
-    protocols: list[str] = Field(default_factory=list)
 
 
 class Reject(BaseModel):
     type: Literal["reject"] = "reject"
     reason: str
-
-
-class ReplyAudio(BaseModel):
-    type: Literal["reply_audio"] = "reply_audio"
-    turn_id: str
-    pcm_b64: str
-
-    def pcm(self) -> bytes:
-        return base64.b64decode(self.pcm_b64)
-
-    @classmethod
-    def of(cls, turn_id: str, pcm: bytes) -> "ReplyAudio":
-        return cls(turn_id=turn_id, pcm_b64=_b64(pcm))
 
 
 class Transcript(BaseModel):
@@ -180,9 +164,9 @@ class Cancel(BaseModel):
 
 class Proactive(BaseModel):
     """Down: a server-initiated message (alarm, background-job result, heartbeat). For a
-    voice device the brain follows this with ReplyAudio frames (tone + spoken text) under
-    the same `turn_id`, then ReplyEnd; text clients just show `text`. `open_mic` asks the
-    intercom to listen for a reply after speaking (turn the notification into a chat)."""
+    voice device the brain follows this with binary reply-audio frames (tone + spoken text)
+    under the same `turn_id`, then ReplyEnd; text clients just show `text`. `open_mic`
+    asks the intercom to listen for a reply after speaking."""
 
     type: Literal["proactive"] = "proactive"
     text: str
@@ -213,7 +197,7 @@ class DeviceRequest(BaseModel):
 
 Message = Union[
     Hello, Utterance, BargeIn, ConversationIdle, TextIn, Identify, DeviceResponse,
-    Welcome, Reject, ReplyAudio, ReplyText, ReplyEnd, Cancel, Proactive, WhoAreYou,
+    Welcome, Reject, ReplyText, ReplyEnd, Cancel, Proactive, WhoAreYou,
     Transcript, DeviceRequest,
 ]
 _ADAPTER: TypeAdapter = TypeAdapter(Annotated[Message, Field(discriminator="type")])
@@ -234,7 +218,7 @@ def decode(data: str | bytes) -> Message:
 
 
 def encode_reply_audio_binary(turn_id: str, pcm: bytes) -> bytes:
-    """Serialise reply PCM as a negotiated binary WebSocket frame."""
+    """Serialise reply PCM as a binary WebSocket frame."""
     turn = turn_id.encode("utf-8")
     if len(turn) > 65535:
         raise ValueError("turn_id is too long for a binary audio frame")

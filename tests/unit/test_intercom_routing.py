@@ -13,13 +13,12 @@ from jarvis.config import load_config
 from jarvis.intercom.client import IntercomClient
 from jarvis.intercom.metrics import SCHEMA_VERSION, IntercomReplyMetrics, summary
 from jarvis.protocol.messages import (
-    AUDIO_BINARY_V1,
     BinaryAudio,
     ConversationIdle,
     DeviceRequest,
     DeviceResponse,
     Proactive,
-    ReplyAudio,
+    REPLY_AUDIO_BINARY_V1,
     ReplyEnd,
     ReplyText,
     Transcript,
@@ -173,10 +172,10 @@ def test_reply_audio_yields_pcm_and_records_state() -> None:
     q: asyncio.Queue = asyncio.Queue()
     for m in [
         Transcript(turn_id="t1", text="hello"),
-        ReplyAudio.of("t1", b"\x01\x02"),
-        ReplyAudio.of("zz", b"\xff"),  # other turn id → ignored
+        BinaryAudio(kind="reply_audio", turn_id="t1", pcm=b"\x01\x02"),
+        BinaryAudio(kind="reply_audio", turn_id="zz", pcm=b"\xff"),  # other turn id
         ReplyText(turn_id="t1", text="hi there"),
-        ReplyAudio.of("t1", b"\x03\x04"),
+        BinaryAudio(kind="reply_audio", turn_id="t1", pcm=b"\x03\x04"),
         ReplyEnd(
             turn_id="t1",
             ended=False,
@@ -199,37 +198,21 @@ def test_reply_audio_yields_pcm_and_records_state() -> None:
         audio = metrics.data["stages"]["reply_audio"]
         assert audio["chunks"] == 2
         assert audio["bytes"] == 4
-        assert audio["protocol"] == "json_base64_v1"
-        assert audio["decode_ms"] >= 0
+        assert audio["protocol"] == REPLY_AUDIO_BINARY_V1
+        assert audio["decode_ms"] == 0
         return chunks
 
     assert asyncio.run(go()) == [b"\x01\x02", b"\x03\x04"]  # only this turn's audio
 
 
-def test_binary_reply_audio_yields_pcm_without_base64_decode() -> None:
-    c = _client()
-    q: asyncio.Queue = asyncio.Queue()
-    q.put_nowait(BinaryAudio(kind="reply_audio", turn_id="t1", pcm=b"\x01\x02"))
-    q.put_nowait(ReplyEnd(turn_id="t1"))
-
-    async def go() -> tuple[list[bytes], dict]:
-        state = {"ended": False, "text": ""}
-        metrics = IntercomReplyMetrics(turn_id="t1", device_id="pi")
-        chunks = [pcm async for pcm in c._reply_audio(q, "t1", state, metrics)]
-        return chunks, metrics.data["stages"]["reply_audio"]
-
-    chunks, audio = asyncio.run(go())
-    assert chunks == [b"\x01\x02"]
-    assert audio["protocol"] == AUDIO_BINARY_V1
-    assert audio["chunks"] == 1
-    assert audio["encoded_bytes"] == 2
-    assert audio["decode_ms"] == 0
-
-
 def test_intercom_metric_summary_reports_playback_baseline() -> None:
     metrics = IntercomReplyMetrics(turn_id="t1", device_id="kitchen-pi")
     metrics.mark_utterance_sent(pcm_bytes=32000, frame_bytes=43000)
-    metrics.record_audio_decode(encoded_bytes=8, pcm_bytes=4, decode_ms=1.25)
+    metrics.record_audio_frame(
+        protocol=REPLY_AUDIO_BINARY_V1,
+        encoded_bytes=4,
+        pcm_bytes=4,
+    )
     metrics.data["stages"]["playback"] = {
         "ms": 500.0,
         "first_speech_ms": 420.0,
@@ -250,7 +233,11 @@ def test_reply_audio_works_for_proactive_turn_id() -> None:
     # a proactive plays through the same path under its 'pa-' turn id
     c = _client()
     q: asyncio.Queue = asyncio.Queue()
-    for m in [ReplyAudio.of("pa-9", b"tone"), ReplyAudio.of("pa-9", b"talk"), ReplyEnd(turn_id="pa-9")]:
+    for m in [
+        BinaryAudio(kind="reply_audio", turn_id="pa-9", pcm=b"tone"),
+        BinaryAudio(kind="reply_audio", turn_id="pa-9", pcm=b"talk"),
+        ReplyEnd(turn_id="pa-9"),
+    ]:
         q.put_nowait(m)
 
     async def go() -> list[bytes]:

@@ -31,7 +31,6 @@ from jarvis.intercom.pi_panel import CompositePanel, PiPanel, WebPiPanel
 from jarvis.intercom.vad import Endpointer, SileroVAD
 from jarvis.intercom.wake import WakeWord
 from jarvis.protocol.messages import (
-    AUDIO_BINARY_V1,
     BargeIn,
     BinaryAudio,
     Cancel,
@@ -40,7 +39,7 @@ from jarvis.protocol.messages import (
     DeviceResponse,
     Hello,
     Proactive,
-    ReplyAudio,
+    REPLY_AUDIO_BINARY_V1,
     ReplyEnd,
     ReplyText,
     Transcript,
@@ -87,7 +86,6 @@ class IntercomClient:
         )
         self._sr = cfg.audio.sample_rate
         self._device_id = cfg.capabilities.device_id
-        self._protocols: set[str] = set()
 
     async def run(self) -> None:
         print("Loading models…")
@@ -124,7 +122,6 @@ class IntercomClient:
                                         device_id=self._device_id,
                                         token=self._cfg.intercom.token.get_secret_value(),
                                         hardware=hardware,
-                                        protocols=[AUDIO_BINARY_V1],
                                     )
                                 )
                             )
@@ -134,15 +131,8 @@ class IntercomClient:
                                 self._panel.set("disconnected")
                                 await asyncio.sleep(5)
                                 continue
-                            self._protocols = set(welcome.protocols)
-                            protocol_note = (
-                                f" Protocols: {', '.join(sorted(self._protocols))}."
-                                if self._protocols
-                                else ""
-                            )
                             print(f"Paired with brain. Capabilities: {welcome.capabilities}")
-                            if protocol_note:
-                                print(protocol_note.strip())
+                            print(f"Audio downlink: {REPLY_AUDIO_BINARY_V1}.")
                             print(f'\nJarvis is listening. Say "{phrase}".')
                             # One task reads the socket for the whole connection and queues
                             # every message; the turn flow and the idle wait both consume from
@@ -229,6 +219,7 @@ class IntercomClient:
                             if binary.kind == "reply_audio":
                                 inbound.put_nowait(binary)
                             continue
+                        continue
                     msg = decode(raw)
                     if isinstance(msg, DeviceRequest):
                         asyncio.create_task(self._handle_device_request(ws, msg))
@@ -478,24 +469,11 @@ class IntercomClient:
             elif isinstance(msg, BinaryAudio) and msg.turn_id == turn_id:
                 if metrics is not None:
                     metrics.record_audio_frame(
-                        protocol=AUDIO_BINARY_V1,
+                        protocol=REPLY_AUDIO_BINARY_V1,
                         encoded_bytes=len(msg.pcm),
                         pcm_bytes=len(msg.pcm),
                     )
                 yield msg.pcm
-            elif isinstance(msg, ReplyAudio) and msg.turn_id == turn_id:
-                if metrics is not None:
-                    metrics.mark_audio_frame_seen()
-                t0 = time.perf_counter()
-                pcm = msg.pcm()
-                decode_ms = (time.perf_counter() - t0) * 1000
-                if metrics is not None:
-                    metrics.record_audio_decode(
-                        encoded_bytes=len(msg.pcm_b64),
-                        pcm_bytes=len(pcm),
-                        decode_ms=decode_ms,
-                    )
-                yield pcm
             elif isinstance(msg, ReplyText) and msg.turn_id == turn_id:
                 state["text"] = msg.text
             elif isinstance(msg, ReplyEnd) and msg.turn_id == turn_id:
