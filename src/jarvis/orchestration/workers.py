@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 from jarvis.config import WorkerConfig
+from jarvis.engines import engine_ids, worker_supports_engine
 from jarvis.orchestration.models import WorkerProfile
 
 
@@ -38,7 +39,13 @@ class WorkerRegistry:
             return profiles[0] if profiles else None
         return next((p for p in profiles if p.worker_id == worker_id), None)
 
-    def choose(self, required: list[str] | None = None, preferred: list[str] | None = None) -> WorkerProfile | None:
+    def choose(
+        self,
+        required: list[str] | None = None,
+        preferred: list[str] | None = None,
+        *,
+        engine: str = "",
+    ) -> WorkerProfile | None:
         required_set = set(required or [])
         profiles = self.profiles(probe=True)
         if preferred:
@@ -48,6 +55,8 @@ class WorkerRegistry:
             ordered = profiles
         for profile in ordered:
             if profile.status == "offline":
+                continue
+            if engine and not worker_supports_engine(profile.supported_engines, engine):
                 continue
             if required_set.issubset(set(profile.capabilities)):
                 if profile.current_jobs < profile.max_concurrent_jobs:
@@ -63,6 +72,8 @@ class WorkerRegistry:
             token_set=bool(self.worker_cfg.token.get_secret_value()),
             max_concurrent_jobs=1,
             agent=self.worker_cfg.agent,
+            default_engine=self.worker_cfg.agent,
+            supported_engines=engine_ids(self.worker_cfg.supported_engines, default_engine=self.worker_cfg.agent),
         )
 
     def _load_profiles(self) -> list[WorkerProfile]:
@@ -110,4 +121,12 @@ class WorkerRegistry:
         data = health.json()
         if data.get("agent"):
             profile.agent = data["agent"]
+        if data.get("default_engine") or data.get("agent"):
+            profile.default_engine = data.get("default_engine") or data.get("agent")
+        if data.get("supported_engines"):
+            profile.supported_engines = engine_ids(
+                data["supported_engines"],
+                default_engine=profile.default_engine or profile.agent,
+            )
+        profile.__post_init__()
         return profile

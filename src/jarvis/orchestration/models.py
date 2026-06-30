@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, Literal
 
+from jarvis.engines import default_engine, engine_ids
+
 
 Phase = Literal[
     "created",
@@ -157,6 +159,7 @@ class ExecutionEnvelope:
     prompt: str
     worker_id: str = "local-worker"
     engine: str = "codex"
+    engine_strategy: str = "single"
     base_ref: str = "main"
     branch_name: str = ""
     allowed_actions: list[str] = field(default_factory=lambda: ["worker.job.start"])
@@ -256,6 +259,8 @@ class WorkCommand:
     filters: dict[str, Any] = field(default_factory=dict)
     autonomy: str = "read_only"
     target_worker_id: str = ""
+    target_engine_id: str = ""
+    engine_strategy: str = "single"
     start: bool = False
 
     @classmethod
@@ -278,9 +283,22 @@ class WorkerProfile:
     current_jobs: int = 0
     status: str = "unknown"
     agent: str = "codex"
+    default_engine: str = ""
+    supported_engines: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.default_engine = default_engine(self.default_engine or self.agent, self.supported_engines)
+        self.supported_engines = engine_ids(self.supported_engines, default_engine=self.default_engine)
+        self.agent = self.default_engine
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> WorkerProfile:
+        if "supported_engines" in data and isinstance(data["supported_engines"], str):
+            data = dict(data)
+            data["supported_engines"] = engine_ids(
+                data["supported_engines"],
+                default_engine=data.get("default_engine") or data.get("agent", "codex"),
+            )
         return _coerce(cls, data)
 
     def public(self) -> dict[str, Any]:
@@ -294,5 +312,7 @@ class WorkerProfile:
                 "current_jobs": self.current_jobs,
             },
             "agent": self.agent,
+            "default_engine": self.default_engine,
+            "supported_engines": self.supported_engines,
             "token_set": self.token_set,
         }

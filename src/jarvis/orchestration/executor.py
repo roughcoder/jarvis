@@ -89,6 +89,7 @@ def create_run_and_envelope(
     items: list[WorkItem],
     worker: WorkerProfile,
     landing_mode: str = "draft_pr",
+    engine: str = "",
 ) -> ExecutionEnvelope:
     objective = items[0].title if items else command.filters.get("text", command.operation)
     run = store.create_run(str(objective), work_items=items)
@@ -99,7 +100,8 @@ def create_run_and_envelope(
         items=items,
         worker_id=worker.worker_id,
         landing_mode=landing_mode,
-        engine=worker.agent,
+        engine=engine or worker.default_engine or worker.agent,
+        engine_strategy=command.engine_strategy,
     )
     store.append_event(run.run_id, "execution_envelope_created", "Execution envelope created", envelope.to_dict())
     return envelope

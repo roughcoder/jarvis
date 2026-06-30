@@ -354,7 +354,7 @@ The handoff from scheduler to worker is an `ExecutionEnvelope`:
 - selected work items and objective
 - named `worker_id` target, not raw machine/host details
 - repo/workspace policy
-- engine
+- `engine` / `engine_strategy`
 - allowed actions
 - verification plan
 - landing policy
@@ -369,18 +369,23 @@ Example worker profile:
   "worker_id": "macbook-worker",
   "display_name": "MacBook worker",
   "status": "online",
-  "capabilities": ["git", "python", "uv", "browser", "codex"],
+  "capabilities": ["git", "python", "uv", "browser", "codex", "claude"],
   "capacity": {
     "max_concurrent_jobs": 1,
     "current_jobs": 0
   },
   "authority_tags": ["owner-private"],
-  "agent": "codex"
+  "agent": "codex",
+  "default_engine": "codex",
+  "supported_engines": ["codex", "claude"]
 }
 ```
 
 Private connection details such as hostnames, paths, and tokens live in local
 config only; they are not copied into public tracker comments or AGENTIC records.
+`worker_id` answers where the job runs; `engine` answers which coding CLI or
+agent implementation runs inside that worker. Workers own their installed
+Codex/Claude credentials and advertise supported engine ids over `/health`.
 
 Example execution envelope:
 
@@ -391,8 +396,9 @@ Example execution envelope:
   "base_ref": "main",
   "branch_name": "jarvis/eng-42-worker-heartbeat",
   "worker_id": "macbook-worker",
-  "engine": "codex",
-  "allowed_actions": ["worker.job.start", "forge.write.local"],
+  "engine": "claude",
+  "engine_strategy": "single",
+  "allowed_actions": ["worker.job.start", "forge.github.branch.push", "forge.github.pr.create"],
   "prompt": "Follow AGENTS.md, read the ticket, implement the change, verify it, and report evidence.",
   "verification": {
     "minimum_rung": "repo_native_plus_task_proof",
@@ -412,6 +418,20 @@ Example execution envelope:
     "allow_comments": "confirm",
     "allow_merge": false
   }
+}
+```
+
+Later multi-engine compare/review mode should keep one parent run and create
+multiple worker jobs under it, rather than overloading one job:
+
+```json
+{
+  "run_id": "run_review_panel",
+  "engine_strategy": "compare",
+  "jobs": [
+    {"worker_id": "macbook-worker", "engine": "codex", "status": "running"},
+    {"worker_id": "macbook-worker", "engine": "claude", "status": "running"}
+  ]
 }
 ```
 
@@ -1107,6 +1127,9 @@ P0), P7 cross-target recovery, and the not-yet-enforceable forge gate (I4).
       sync linked worker job status back into the graph.
 - [x] **Worker registry:** named `worker_id` profiles with public-safe status
       output and optional probing.
+- [x] **Engine selection foundation:** workers advertise default/supported
+      coding engines; WorkCommands and ExecutionEnvelopes carry explicit engine
+      selection while preserving `codex` as the default.
 - [x] **GitHub work source first:** read-only issue list and PR comment/review
       inspection via the `gh` boundary.
 - [x] **WorkCommand intent:** initial deterministic mapper for check/get/fix/
