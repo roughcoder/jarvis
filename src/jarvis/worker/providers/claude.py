@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
 import queue
-import signal
 import subprocess
 import threading
 import time
@@ -35,6 +33,9 @@ from jarvis.worker_session_contract import (
     SESSION_RUNNING,
     SESSION_STOPPED,
 )
+
+_PROCESS_LOCK = threading.Lock()
+_PROVIDER_PROCESSES: dict[str, subprocess.Popen[str]] = {}
 
 
 class ClaudeProviderAdapter:
@@ -152,6 +153,7 @@ def _run_claude_turn(
             text=True,
             bufsize=1,
         )
+        _track_provider_process(session_id, process)
         line_queue = _start_line_readers(process)
         sessions.update_metadata(
             session_id,
@@ -188,6 +190,8 @@ def _run_claude_turn(
             },
         )
     finally:
+        if process is not None:
+            _untrack_provider_process(session_id, process)
         if process is not None and process.poll() is None:
             process.terminate()
             try:
@@ -411,10 +415,22 @@ def _claude_session_id(session: WorkerSession) -> str:
 
 
 def _terminate_provider_process(session: WorkerSession) -> None:
-    pid = str(session.metadata.get("provider_pid") or "").strip()
-    if not pid:
+    with _PROCESS_LOCK:
+        process = _PROVIDER_PROCESSES.get(session.session_id)
+    if process is None or process.poll() is not None:
         return
     try:
-        os.kill(int(pid), signal.SIGTERM)
-    except (OSError, ValueError):
+        process.terminate()
+    except OSError:
         return
+
+
+def _track_provider_process(session_id: str, process: subprocess.Popen[str]) -> None:
+    with _PROCESS_LOCK:
+        _PROVIDER_PROCESSES[session_id] = process
+
+
+def _untrack_provider_process(session_id: str, process: subprocess.Popen[str]) -> None:
+    with _PROCESS_LOCK:
+        if _PROVIDER_PROCESSES.get(session_id) is process:
+            _PROVIDER_PROCESSES.pop(session_id, None)

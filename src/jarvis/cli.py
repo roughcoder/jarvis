@@ -535,6 +535,10 @@ def _worker_http(cfg=None):  # noqa: ANN001, ANN202
     return httpx, cfg.worker.base_url, headers, cfg.worker.request_timeout_s
 
 
+def _session_control_metadata(action: str) -> dict:
+    return {"surface": "cli", "allowed_actions": [action]}
+
+
 def _cmd_sessions(args: argparse.Namespace) -> int:
     """Inspect and control live worker provider sessions."""
     import json
@@ -557,7 +561,7 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
                 headers=headers,
                 json={
                     "checkpoint_id": args.checkpoint_id,
-                    "metadata": {"surface": "cli"},
+                    "metadata": _session_control_metadata("worker.session.restore"),
                 },
                 timeout=timeout,
             )
@@ -591,7 +595,11 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
             response = httpx.post(
                 f"{base}/sessions/{args.input}/input",
                 headers=headers,
-                json={"request_id": args.request_id, "text": args.text, "metadata": {"surface": "cli"}},
+                json={
+                    "request_id": args.request_id,
+                    "text": args.text,
+                    "metadata": _session_control_metadata("worker.session.input"),
+                },
                 timeout=timeout,
             )
         elif args.approval:
@@ -601,7 +609,7 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
                 json={
                     "request_id": args.request_id,
                     "decision": args.decision,
-                    "metadata": {"surface": "cli"},
+                    "metadata": _session_control_metadata("worker.session.approve"),
                 },
                 timeout=timeout,
             )
@@ -609,14 +617,14 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
             response = httpx.post(
                 f"{base}/sessions/{args.interrupt}/interrupt",
                 headers=headers,
-                json={},
+                json={"metadata": _session_control_metadata("worker.session.interrupt")},
                 timeout=timeout,
             )
         elif args.stop:
             response = httpx.post(
                 f"{base}/sessions/{args.stop}/stop",
                 headers=headers,
-                json={},
+                json={"metadata": _session_control_metadata("worker.session.stop")},
                 timeout=timeout,
             )
         elif args.session_id:

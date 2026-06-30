@@ -206,7 +206,14 @@ def start_worker_ensemble(
             )
             links.append(link)
     except Exception:
-        _stop_started_sessions(links, run_id=envelope.run_id, worker_cfg=worker_cfg, worker=worker, post=post, store=store)
+        _stop_started_sessions(
+            links,
+            envelope=envelope,
+            worker_cfg=worker_cfg,
+            worker=worker,
+            post=post,
+            store=store,
+        )
         raise
     if store is not None:
         store.append_event(
@@ -221,7 +228,7 @@ def start_worker_ensemble(
 def _stop_started_sessions(
     links: list[WorkerSessionLink],
     *,
-    run_id: str,
+    envelope: ExecutionEnvelope,
     worker_cfg: WorkerConfig,
     worker: WorkerProfile | None,
     post: Callable[..., Any] | None,
@@ -231,11 +238,13 @@ def _stop_started_sessions(
         return
     http_post = post or httpx.post
     base_url, headers = _worker_endpoint(worker_cfg, worker)
+    control_envelope = envelope.to_dict()
+    control_envelope["allowed_actions"] = sorted({*control_envelope.get("allowed_actions", []), WORKER_SESSION_STOP})
     for link in reversed(links):
         try:
             response = http_post(
                 f"{base_url}/sessions/{link.session_id}/stop",
-                json={},
+                json={"metadata": {"execution_envelope": control_envelope}},
                 headers=headers,
                 timeout=worker_cfg.request_timeout_s,
             )
@@ -246,7 +255,7 @@ def _stop_started_sessions(
         except Exception:  # noqa: BLE001 - preserve original ensemble dispatch failure
             if store is not None:
                 store.append_event(
-                    run_id,
+                    envelope.run_id,
                     "session_rollback_stop_failed",
                     f"Could not stop worker session {link.session_id} after ensemble dispatch failure",
                     {"session_id": link.session_id},
@@ -255,7 +264,7 @@ def _stop_started_sessions(
         else:
             if store is not None:
                 try:
-                    store.update_session(run_id, link.session_id, status=SESSION_STOPPED)
+                    store.update_session(envelope.run_id, link.session_id, status=SESSION_STOPPED)
                 except Exception:  # noqa: BLE001 - best-effort rollback marker
                     pass
 

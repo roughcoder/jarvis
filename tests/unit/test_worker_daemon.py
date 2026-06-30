@@ -33,7 +33,12 @@ from jarvis.capabilities import (  # noqa: E402
 from jarvis.config import WorkerConfig  # noqa: E402
 from jarvis.worker.server import make_app  # noqa: E402
 from jarvis.worker.authority import WorkerSessionAuthority  # noqa: E402
-from jarvis.worker.providers.codex import _session_cwd as codex_session_cwd  # noqa: E402
+from jarvis.worker.providers.codex import (  # noqa: E402
+    _approval_result,
+    _input_result,
+    _session_cwd as codex_session_cwd,
+    _terminate_provider_process as codex_terminate_provider_process,
+)
 from jarvis.worker.sessions import WorkerSession  # noqa: E402
 from jarvis.worker.sessions import SessionManager  # noqa: E402
 
@@ -64,6 +69,10 @@ def _authority_metadata(engine: str = "codex", extra_actions: list[str] | None =
         "allowed_actions": allowed_actions,
         "landing": landing,
     }
+
+
+def _control_metadata(action: str) -> dict:
+    return {"allowed_actions": [action]}
 
 
 def _owned_worker_cwd(tmp_path, name: str = "session") -> str:  # noqa: ANN001
@@ -143,6 +152,36 @@ def test_worker_session_authority_keeps_input_separate_from_codex_approval() -> 
     assert authority.can_resolve_approval is False
 
 
+def test_codex_protocol_response_shapes_match_app_server_contract() -> None:
+    assert _approval_result({"decision": "approved"}) == {"decision": "accept"}
+    assert _approval_result({"decision": "denied"}) == {"decision": "decline"}
+    assert _approval_result({"decision": "acceptForSession"}) == {"decision": "acceptForSession"}
+
+    assert _input_result(
+        {"text": "continue"},
+        {"questions": [{"id": "details"}]},
+    ) == {"answers": {"details": {"answers": ["continue"]}}}
+    assert _input_result(
+        {"answers": {"details": "use pytest"}},
+        {"questions": [{"id": "details"}]},
+    ) == {"answers": {"details": {"answers": ["use pytest"]}}}
+
+
+def test_codex_stop_ignores_caller_supplied_provider_pid(monkeypatch) -> None:  # noqa: ANN001
+    def fail_if_called(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("provider stop must not trust metadata provider_pid")
+
+    monkeypatch.setattr("os.kill", fail_if_called)
+    codex_terminate_provider_process(
+        WorkerSession(
+            session_id="sess_untrusted_pid",
+            provider="codex",
+            engine="codex",
+            metadata={"provider_pid": "1"},
+        )
+    )
+
+
 def test_worker_session_authority_fails_closed_for_unsupported_landing() -> None:
     with pytest.raises(RuntimeError, match=FORGE_PR_CREATE):
         WorkerSessionAuthority.from_session(
@@ -187,6 +226,28 @@ def test_session_manager_serializes_concurrent_session_writes(tmp_path) -> None:
     assert fetched.status == "running"
     assert fetched.metadata["k39"] == "39"
     assert len([event for event in sessions.events(session.session_id) if event.type == "provider.log"]) == 40
+
+
+def test_session_manager_strips_provider_owned_metadata_on_create(tmp_path) -> None:
+    sessions = SessionManager(str(tmp_path / "sessions"))
+
+    session, _ = sessions.create(
+        {
+            "provider": "codex",
+            "engine": "codex",
+            "metadata": {
+                **_authority_metadata("codex"),
+                "provider_pid": "1",
+                "codex_thread_id": "thread_123",
+                "provider_session_id": "provider_123",
+            },
+        }
+    )
+
+    assert "provider_pid" not in session.metadata
+    assert "codex_thread_id" not in session.metadata
+    assert "provider_session_id" not in session.metadata
+    assert "execution_envelope" in session.metadata
 
 
 def test_session_manager_lists_past_corrupt_or_legacy_session_json(tmp_path) -> None:
@@ -394,11 +455,21 @@ def test_daemon_session_api_records_structured_events(tmp_path) -> None:
         approval = (
             await c.post(
                 f"{base}/sessions/{session_id}/approval",
-                json={"request_id": "approval_1", "decision": "approved"},
+                json={
+                    "request_id": "approval_1",
+                    "decision": "approved",
+                    "metadata": _control_metadata(WORKER_SESSION_APPROVE),
+                },
                 headers=headers,
             )
         ).json()
-        interrupted = (await c.post(f"{base}/sessions/{session_id}/interrupt", json={}, headers=headers)).json()
+        interrupted = (
+            await c.post(
+                f"{base}/sessions/{session_id}/interrupt",
+                json={"metadata": _control_metadata(WORKER_SESSION_INTERRUPT)},
+                headers=headers,
+            )
+        ).json()
         events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
         listed = (await c.get(base + "/sessions", headers=headers)).json()["sessions"]
         fetched = (await c.get(f"{base}/sessions/{session_id}", headers=headers)).json()
@@ -645,6 +716,35 @@ def test_daemon_session_controls_require_envelope_authority(tmp_path) -> None:
     assert [event["type"] for event in events] == ["session.created"]
 
 
+def test_daemon_session_controls_require_caller_authority(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "provider": "fake",
+                    "engine": "fake",
+                    "metadata": _authority_metadata("fake", extra_actions=[WORKER_SESSION_STOP]),
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        stopped = await c.post(f"{base}/sessions/{session_id}/stop", json={}, headers=headers)
+        events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+        return stopped.status_code, stopped.json(), events
+
+    status_code, body, events = asyncio.run(_with_server(cfg, 8845, calls))
+
+    assert status_code == 400
+    assert "caller control authority denied" in body["error"]
+    assert WORKER_SESSION_STOP in body["error"]
+    assert [event["type"] for event in events] == ["session.created"]
+
+
 def test_daemon_session_creation_provisions_repo_worktree(tmp_path) -> None:
     dev = tmp_path / "dev"
     repo = dev / "jarvis"
@@ -727,7 +827,11 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
         denied = (
             await c.post(
                 f"{base}/sessions/{session_id}/approval",
-                json={"request_id": "approval_turn_need_approval", "decision": "denied"},
+                json={
+                    "request_id": "approval_turn_need_approval",
+                    "decision": "denied",
+                    "metadata": _control_metadata(WORKER_SESSION_APPROVE),
+                },
                 headers=headers,
             )
         ).json()
@@ -743,7 +847,11 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
         input_reply = (
             await c.post(
                 f"{base}/sessions/{session_id}/input",
-                json={"request_id": "input_turn_need_input", "text": "continue"},
+                json={
+                    "request_id": "input_turn_need_input",
+                    "text": "continue",
+                    "metadata": _control_metadata(WORKER_SESSION_INPUT),
+                },
                 headers=headers,
             )
         ).json()
@@ -759,7 +867,10 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
         restored = (
             await c.post(
                 f"{base}/sessions/{session_id}/checkpoints/restore",
-                json={"checkpoint_id": "ckpt_turn_checkpoint"},
+                json={
+                    "checkpoint_id": "ckpt_turn_checkpoint",
+                    "metadata": _control_metadata(WORKER_SESSION_RESTORE),
+                },
                 headers=headers,
             )
         ).json()
@@ -872,7 +983,10 @@ def test_daemon_checkpoint_restore_returns_unsupported_without_provider_handler(
         direct.append_event(session_id, "checkpoint.created", {"checkpoint_id": "ckpt_manual"})
         restored = await c.post(
             f"{base}/sessions/{session_id}/checkpoints/restore",
-            json={"checkpoint_id": "ckpt_manual"},
+            json={
+                "checkpoint_id": "ckpt_manual",
+                "metadata": _control_metadata(WORKER_SESSION_RESTORE),
+            },
             headers=headers,
         )
         events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
@@ -1061,7 +1175,13 @@ for line in sys.stdin:
             if any(event["type"] == "provider.process.started" for event in events):
                 break
             await asyncio.sleep(0.05)
-        interrupted = (await c.post(f"{base}/sessions/{session_id}/interrupt", json={}, headers=headers)).json()
+        interrupted = (
+            await c.post(
+                f"{base}/sessions/{session_id}/interrupt",
+                json={"metadata": _control_metadata(WORKER_SESSION_INTERRUPT)},
+                headers=headers,
+            )
+        ).json()
         await asyncio.sleep(0.2)
         fetched = (await c.get(f"{base}/sessions/{session_id}", headers=headers)).json()
         events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
@@ -1141,7 +1261,13 @@ for line in sys.stdin:
             if any(event["type"] == "provider.process.started" for event in events):
                 break
             await asyncio.sleep(0.05)
-        stopped = (await c.post(f"{base}/sessions/{session_id}/stop", json={}, headers=headers)).json()
+        stopped = (
+            await c.post(
+                f"{base}/sessions/{session_id}/stop",
+                json={"metadata": _control_metadata(WORKER_SESSION_STOP)},
+                headers=headers,
+            )
+        ).json()
         await asyncio.sleep(0.2)
         fetched = (await c.get(f"{base}/sessions/{session_id}", headers=headers)).json()
         events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
@@ -1186,6 +1312,8 @@ for line in sys.stdin:
             "params": {"command": "pytest", "cwd": "/tmp"},
         })
     elif request_id == "approval_rpc":
+        if payload["result"]["decision"] != "accept":
+            raise SystemExit(f"unexpected approval decision {payload['result']!r}")
         emit({
             "jsonrpc": "2.0",
             "method": "item/completed",
@@ -1244,7 +1372,11 @@ for line in sys.stdin:
         approval = (
             await c.post(
                 f"{base}/sessions/{session_id}/approval",
-                json={"request_id": pending["requests"][0]["request_id"], "decision": "approved"},
+                json={
+                    "request_id": pending["requests"][0]["request_id"],
+                    "decision": "approved",
+                    "metadata": _control_metadata(WORKER_SESSION_APPROVE),
+                },
                 headers=headers,
             )
         ).json()
@@ -1298,13 +1430,14 @@ for line in sys.stdin:
             "jsonrpc": "2.0",
             "id": "input_rpc",
             "method": "item/tool/requestUserInput",
-            "params": {"prompt": "Need more context"},
+            "params": {"prompt": "Need more context", "questions": [{"id": "details"}]},
         })
     elif request_id == "input_rpc":
+        answer = payload["result"]["answers"]["details"]["answers"][0]
         emit({
             "jsonrpc": "2.0",
             "method": "item/completed",
-            "params": {"item": {"type": "agentMessage", "text": payload["result"]["answers"]["text"]}},
+            "params": {"item": {"type": "agentMessage", "text": answer}},
         })
         emit({
             "jsonrpc": "2.0",
@@ -1359,7 +1492,11 @@ for line in sys.stdin:
         response = (
             await c.post(
                 f"{base}/sessions/{session_id}/input",
-                json={"request_id": pending["requests"][0]["request_id"], "text": "continue with tests"},
+                json={
+                    "request_id": pending["requests"][0]["request_id"],
+                    "text": "continue with tests",
+                    "metadata": _control_metadata(WORKER_SESSION_INPUT),
+                },
                 headers=headers,
             )
         ).json()
