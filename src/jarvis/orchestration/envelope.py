@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import uuid
 
+from jarvis.engines import ENGINE_CLAUDE, normalize_engine_id
 from jarvis.orchestration.models import (
     ExecutionEnvelope,
     LandingPolicy,
@@ -29,6 +31,8 @@ def build_execution_envelope(
     proof = _task_proof(primary, command)
     prompt = _prompt(command, items, landing_mode, proof)
     branch = f"jarvis/{slugify(primary.id + '-' + title)}" if primary.id else f"jarvis/{slugify(title)}"
+    session_name = _session_name(primary, title)
+    session_id = str(uuid.uuid4()) if normalize_engine_id(engine) == ENGINE_CLAUDE else ""
     return ExecutionEnvelope(
         run_id=run_id,
         repo=repo,
@@ -37,6 +41,8 @@ def build_execution_envelope(
         engine=engine,
         engine_strategy=engine_strategy,
         branch_name=branch,
+        session_id=session_id,
+        session_name=session_name,
         allowed_actions=envelope_allowed_actions(landing_mode),
         verification=VerificationPlan(
             minimum_rung=_minimum_rung(primary),
@@ -45,6 +51,11 @@ def build_execution_envelope(
         ),
         landing=LandingPolicy(mode=landing_mode),
     )
+
+
+def _session_name(item: WorkItem, title: str) -> str:
+    text = f"{item.id}-{title}" if item.id else title
+    return f"jarvis-{slugify(text)}"
 
 
 def _minimum_rung(item: WorkItem) -> str:

@@ -40,8 +40,11 @@ def start_worker_job(
         "agent": envelope.engine,
         "prompt": envelope.prompt,
         "name": _job_name(envelope),
+        "session_name": envelope.session_name,
         "execution_envelope": envelope.to_dict(),
     }
+    if envelope.session_id:
+        args["session_id"] = envelope.session_id
     if envelope.repo:
         args["repo"] = envelope.repo
     response = post(
@@ -68,6 +71,8 @@ def start_worker_job(
         job_id=body["job_id"],
         status=body.get("status", "running"),
         engine=envelope.engine,
+        session_id=body.get("session_id") or envelope.session_id,
+        session_name=body.get("session_name") or envelope.session_name,
         branch=body.get("branch") or "",
     )
     if store is not None:

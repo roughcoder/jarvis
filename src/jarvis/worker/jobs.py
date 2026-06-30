@@ -34,12 +34,14 @@ class Job:
     action: str
     label: str  # the full task/prompt (the "description")
     name: str = ""  # short human handle (user-given or auto-slugged)
+    engine: str = ""
     cwd: str = ""  # the working directory the job ran in (where file changes land)
     branch: str | None = None  # git branch for an isolated repo-job worktree
     repo: str = ""  # the source repo (for worktree jobs) — needed to clean up
     status: str = "running"  # running | done | error | interrupted
     output: str = ""
     session_id: str | None = None  # the coding agent's session (for `codex resume`)
+    session_name: str = ""  # stable human handle for engine session pickers
     started: float = field(default_factory=time.time)
     ended: float | None = None
 
@@ -70,12 +72,14 @@ class JobManager:
                 action=d.get("action", "?"),
                 label=d.get("label", ""),
                 name=d.get("name", ""),
+                engine=d.get("engine", ""),
                 cwd=d.get("cwd", ""),
                 branch=d.get("branch"),
                 repo=d.get("repo", ""),
                 status=d.get("status", "done"),
                 output=d.get("output", ""),
                 session_id=d.get("session_id"),
+                session_name=d.get("session_name", ""),
                 started=d.get("started", 0.0),
                 ended=d.get("ended"),
             )
@@ -103,18 +107,24 @@ class JobManager:
         label: str,
         coro: Awaitable[str],
         name: str = "",
+        engine: str = "",
         cwd: str = "",
         branch: str | None = None,
         repo: str = "",
+        session_id: str | None = None,
+        session_name: str = "",
     ) -> Job:
         job = Job(
             id=uuid.uuid4().hex[:12],
             action=action,
             label=label,
             name=slugify(name or label),
+            engine=engine,
             cwd=cwd,
             branch=branch,
             repo=repo,
+            session_id=session_id,
+            session_name=session_name,
         )
         self._jobs[job.id] = job
         self._persist(job)
@@ -133,7 +143,7 @@ class JobManager:
         finally:
             job.ended = round(time.time(), 1)
             m = _SESSION_ID.search(job.output)
-            if m:
+            if m and not job.session_id:
                 job.session_id = m.group(1)
             self._persist(job)
 
