@@ -95,6 +95,69 @@ def test_daemon_code_dispatch_runs_a_job(tmp_path) -> None:
     assert len(listed["jobs"]) >= 1
 
 
+def test_daemon_session_api_records_structured_events(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        noauth = await c.get(base + "/sessions")
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "run_id": "run_123",
+                    "provider": "codex",
+                    "engine": "codex",
+                    "repo": "roughcoder/jarvis",
+                    "branch": "jarvis/live-session",
+                    "title": "Fix worker sessions",
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        turn = (
+            await c.post(
+                f"{base}/sessions/{session_id}/turns",
+                json={"prompt": "inspect the repo", "metadata": {"surface": "test"}},
+                headers=headers,
+            )
+        ).json()
+        approval = (
+            await c.post(
+                f"{base}/sessions/{session_id}/approval",
+                json={"request_id": "approval_1", "decision": "approved"},
+                headers=headers,
+            )
+        ).json()
+        interrupted = (await c.post(f"{base}/sessions/{session_id}/interrupt", json={}, headers=headers)).json()
+        events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+        listed = (await c.get(base + "/sessions", headers=headers)).json()["sessions"]
+        fetched = (await c.get(f"{base}/sessions/{session_id}", headers=headers)).json()
+        return noauth.status_code, created, turn, approval, interrupted, events, listed, fetched
+
+    noauth, created, turn, approval, interrupted, events, listed, fetched = asyncio.run(
+        _with_server(cfg, 8828, calls)
+    )
+
+    assert noauth == 401
+    assert created["ok"] is True
+    assert created["session"]["run_id"] == "run_123"
+    assert turn["turn_id"]
+    assert [event["type"] for event in turn["events"]] == ["turn.started", "turn.waiting_provider"]
+    assert approval["event"]["type"] == "approval.resolved"
+    assert interrupted["session"]["status"] == "interrupted"
+    assert [event["type"] for event in events] == [
+        "session.created",
+        "turn.started",
+        "turn.waiting_provider",
+        "approval.resolved",
+        "session.interrupted",
+    ]
+    assert listed[0]["session_id"] == created["session"]["session_id"]
+    assert fetched["status"] == "interrupted"
+
+
 def test_daemon_code_dispatch_marks_nonzero_agent_exit_as_error(tmp_path) -> None:
     agent = tmp_path / "bad-agent"
     agent.write_text("#!/usr/bin/env python3\nimport sys\nprint('bad auth')\nsys.exit(1)\n")

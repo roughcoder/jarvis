@@ -8,6 +8,9 @@ Endpoints:
   POST /run        {action, args}            -> result, or {job_id} for `code`
   GET  /jobs/{id}                            -> job status + output
   GET  /jobs                                 -> recent jobs
+  POST /sessions                             -> create a live provider session record
+  GET  /sessions[/id][/events]               -> inspect session state/events
+  POST /sessions/{id}/{turns,input,approval,interrupt,stop}
   GET  /health                               -> liveness
 """
 
@@ -40,6 +43,7 @@ from jarvis.worker.actions import (
     take_screenshot,
 )
 from jarvis.worker.jobs import JobManager, slugify
+from jarvis.worker.sessions import SessionManager
 
 
 def _peekaboo_env(cfg: WorkerConfig) -> dict:
@@ -113,6 +117,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
     workspace = _worker_workspace(cfg)
     # Persist jobs to disk under the workspace so they survive a daemon restart.
     jobs = JobManager(store_dir=str(workspace / "jobs"))
+    sessions = SessionManager(store_dir=str(workspace / "sessions"))
 
     # Browser lane: one lazily-created BrowserHost per process (own config slice, read
     # from env like the worker's). nodriver is imported only on first use.
@@ -362,6 +367,91 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             return web.json_response({"error": "unauthorized"}, status=401)
         return web.json_response({"jobs": [j.public() for j in jobs.recent()]})
 
+    async def create_session(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            body = await request.json()
+            session, event = sessions.create(body or {})
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        except Exception:
+            return web.json_response({"ok": False, "error": "bad json"}, status=400)
+        return web.json_response({"ok": True, "session": session.to_dict(), "event": event.to_dict()})
+
+    async def list_sessions(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return web.json_response({"sessions": [session.to_dict() for session in sessions.list()]})
+
+    async def get_session(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        session = sessions.get(request.match_info["id"])
+        if session is None:
+            return web.json_response({"error": "no such session"}, status=404)
+        return web.json_response(session.to_dict())
+
+    async def get_session_events(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        session_id = request.match_info["id"]
+        if sessions.get(session_id) is None:
+            return web.json_response({"error": "no such session"}, status=404)
+        return web.json_response({"events": [event.to_dict() for event in sessions.events(session_id)]})
+
+    async def start_session_turn(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        session_id = request.match_info["id"]
+        session = sessions.get(session_id)
+        if session is None:
+            return web.json_response({"error": "no such session"}, status=404)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "bad json"}, status=400)
+        turn_id = str(body.get("turn_id") or uuid.uuid4().hex)
+        sessions.update_status(session.session_id, "running")
+        started = sessions.append_event(
+            session.session_id,
+            "turn.started",
+            {"turn_id": turn_id, "prompt": str(body.get("prompt") or ""), "metadata": dict(body.get("metadata") or {})},
+        )
+        waiting = sessions.append_event(
+            session.session_id,
+            "turn.waiting_provider",
+            {"turn_id": turn_id, "message": "provider adapter not attached yet"},
+        )
+        return web.json_response(
+            {
+                "ok": True,
+                "session": sessions.get(session.session_id).to_dict(),  # type: ignore[union-attr]
+                "turn_id": turn_id,
+                "events": [started.to_dict(), waiting.to_dict()],
+            }
+        )
+
+    async def session_input(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return await _append_session_control_event(request, sessions, "input.received")
+
+    async def session_approval(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return await _append_session_control_event(request, sessions, "approval.resolved")
+
+    async def session_interrupt(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return await _terminal_session_event(request, sessions, "interrupted", "session.interrupted")
+
+    async def session_stop(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return await _terminal_session_event(request, sessions, "stopped", "session.stopped")
+
     async def health(_request: web.Request) -> web.Response:
         return web.json_response(
             {
@@ -383,9 +473,50 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         web.post("/run", run),
         web.get("/jobs/{id}", get_job),
         web.get("/jobs", list_jobs),
+        web.post("/sessions", create_session),
+        web.get("/sessions", list_sessions),
+        web.get("/sessions/{id}/events", get_session_events),
+        web.post("/sessions/{id}/turns", start_session_turn),
+        web.post("/sessions/{id}/input", session_input),
+        web.post("/sessions/{id}/approval", session_approval),
+        web.post("/sessions/{id}/interrupt", session_interrupt),
+        web.post("/sessions/{id}/stop", session_stop),
+        web.get("/sessions/{id}", get_session),
         web.get("/health", health),
     ])
     return app
+
+
+async def _append_session_control_event(
+    request: web.Request,
+    sessions: SessionManager,
+    event_type: str,
+) -> web.Response:
+    session_id = request.match_info["id"]
+    session = sessions.get(session_id)
+    if session is None:
+        return web.json_response({"error": "no such session"}, status=404)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "bad json"}, status=400)
+    event = sessions.append_event(session.session_id, event_type, dict(body or {}))
+    return web.json_response({"ok": True, "event": event.to_dict()})
+
+
+async def _terminal_session_event(
+    request: web.Request,
+    sessions: SessionManager,
+    status: str,
+    event_type: str,
+) -> web.Response:
+    session_id = request.match_info["id"]
+    session = sessions.get(session_id)
+    if session is None:
+        return web.json_response({"error": "no such session"}, status=404)
+    session = sessions.update_status(session.session_id, status)
+    event = sessions.append_event(session.session_id, event_type, {"status": status})
+    return web.json_response({"ok": True, "session": session.to_dict(), "event": event.to_dict()})
 
 
 def _resume_cwd(cwd: str, workspace: pathlib.Path) -> tuple[str, str]:

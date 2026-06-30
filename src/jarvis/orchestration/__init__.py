@@ -15,6 +15,7 @@ from jarvis.orchestration.models import (
     WorkItem,
     WorkItemLink,
     WorkerJobLink,
+    WorkerSessionLink,
     WorkerProfile,
 )
 from jarvis.orchestration.store import OrchestrationStore
@@ -31,5 +32,6 @@ __all__ = [
     "WorkItem",
     "WorkItemLink",
     "WorkerJobLink",
+    "WorkerSessionLink",
     "WorkerProfile",
 ]

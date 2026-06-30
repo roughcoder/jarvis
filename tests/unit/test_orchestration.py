@@ -11,7 +11,14 @@ from jarvis.orchestration.campaign import CampaignPolicy, create_campaign
 from jarvis.orchestration.envelope import build_execution_envelope
 from jarvis.orchestration.executor import start_worker_job
 from jarvis.orchestration.intent import parse_work_command
-from jarvis.orchestration.models import ExecutionEnvelope, LandingPolicy, WorkCommand, WorkItem, WorkerJobLink
+from jarvis.orchestration.models import (
+    ExecutionEnvelope,
+    LandingPolicy,
+    WorkCommand,
+    WorkItem,
+    WorkerJobLink,
+    WorkerSessionLink,
+)
 from jarvis.orchestration.policy import required_for_worker_dispatch
 from jarvis.orchestration.schedules import ScheduleStore
 from jarvis.orchestration.service import MissingWorkRepoError, OrchestrationService, StartedWork
@@ -749,6 +756,29 @@ def test_store_updates_worker_job_link(tmp_path) -> None:
     assert job.branch == "jarvis/fix-worker"
     assert job.cwd == "/tmp/worktree"
     assert store.events(run.run_id)[-1].type == "job_updated"
+
+
+def test_store_links_worker_session_to_run_graph(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Start live session")
+
+    linked = store.link_session(
+        run.run_id,
+        WorkerSessionLink(
+            worker_id="macbook-worker",
+            session_id="sess_123",
+            status="running",
+            provider="codex",
+            engine="codex",
+            branch="jarvis/live-session",
+        ),
+    )
+    updated = store.update_session(run.run_id, "sess_123", status="waiting_input", last_event_id="ev_1")
+
+    assert linked.sessions[0].session_id == "sess_123"
+    assert updated.sessions[0].status == "waiting_input"
+    assert updated.sessions[0].last_event_id == "ev_1"
+    assert [event.type for event in store.events(run.run_id)][-2:] == ["session_started", "session_updated"]
 
 
 def test_sync_run_jobs_marks_completed_run(tmp_path) -> None:
