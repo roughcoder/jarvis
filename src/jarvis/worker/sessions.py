@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import threading
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -82,38 +83,40 @@ class SessionManager:
     def __init__(self, store_dir: str) -> None:
         self.root = pathlib.Path(store_dir).expanduser()
         self.root.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
 
     def create(self, data: dict[str, Any]) -> tuple[WorkerSession, SessionEvent]:
-        provider = _clean_id(data.get("provider") or data.get("engine") or "codex")
-        engine = _clean_id(data.get("engine") or provider)
-        session_id = str(data.get("session_id") or new_id("sess"))
-        if not _valid_id(session_id):
-            raise ValueError(f"invalid session id {session_id!r}")
-        session = WorkerSession(
-            session_id=session_id,
-            provider=provider,
-            engine=engine,
-            status="created",
-            run_id=str(data.get("run_id") or ""),
-            repo=str(data.get("repo") or ""),
-            branch=str(data.get("branch") or ""),
-            cwd=str(data.get("cwd") or ""),
-            title=str(data.get("title") or data.get("name") or ""),
-            metadata=dict(data.get("metadata") or {}),
-        )
-        self.save(session)
-        event = self.append_event(
-            session.session_id,
-            "session.created",
-            {
-                "provider": session.provider,
-                "engine": session.engine,
-                "run_id": session.run_id,
-                "repo": session.repo,
-                "branch": session.branch,
-            },
-        )
-        return session, event
+        with self._lock:
+            provider = _clean_id(data.get("provider") or data.get("engine") or "codex")
+            engine = _clean_id(data.get("engine") or provider)
+            session_id = str(data.get("session_id") or new_id("sess"))
+            if not _valid_id(session_id):
+                raise ValueError(f"invalid session id {session_id!r}")
+            session = WorkerSession(
+                session_id=session_id,
+                provider=provider,
+                engine=engine,
+                status="created",
+                run_id=str(data.get("run_id") or ""),
+                repo=str(data.get("repo") or ""),
+                branch=str(data.get("branch") or ""),
+                cwd=str(data.get("cwd") or ""),
+                title=str(data.get("title") or data.get("name") or ""),
+                metadata=dict(data.get("metadata") or {}),
+            )
+            self.save(session)
+            event = self.append_event(
+                session.session_id,
+                "session.created",
+                {
+                    "provider": session.provider,
+                    "engine": session.engine,
+                    "run_id": session.run_id,
+                    "repo": session.repo,
+                    "branch": session.branch,
+                },
+            )
+            return session, event
 
     def get(self, session_id: str) -> WorkerSession | None:
         try:
@@ -141,38 +144,41 @@ class SessionManager:
         return sorted(sessions, key=lambda x: x.updated_at)
 
     def update_status(self, session_id: str, status: str) -> WorkerSession:
-        session = self.get(session_id)
-        if session is None:
-            raise KeyError(session_id)
-        session.status = status
-        session.updated_at = utc_now()
-        self.save(session)
-        return session
+        with self._lock:
+            session = self.get(session_id)
+            if session is None:
+                raise KeyError(session_id)
+            session.status = status
+            session.updated_at = utc_now()
+            self.save(session)
+            return session
 
     def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> WorkerSession:
-        session = self.get(session_id)
-        if session is None:
-            raise KeyError(session_id)
-        session.metadata.update(metadata)
-        session.updated_at = utc_now()
-        self.save(session)
-        return session
+        with self._lock:
+            session = self.get(session_id)
+            if session is None:
+                raise KeyError(session_id)
+            session.metadata.update(metadata)
+            session.updated_at = utc_now()
+            self.save(session)
+            return session
 
     def append_event(self, session_id: str, event_type: str, data: dict[str, Any] | None = None) -> SessionEvent:
-        session = self.get(session_id)
-        if session is None:
-            raise KeyError(session_id)
-        if not _valid_event_type(event_type):
-            raise ValueError(f"invalid event type {event_type!r}")
-        existing = self._idempotent_event(session.session_id, event_type, data or {})
-        if existing is not None:
-            return existing
-        event = SessionEvent.create(session.session_id, event_type, data)
-        with self.events_path(session.session_id).open("a") as f:
-            f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
-        session.updated_at = event.time
-        self.save(session)
-        return event
+        with self._lock:
+            session = self.get(session_id)
+            if session is None:
+                raise KeyError(session_id)
+            if not _valid_event_type(event_type):
+                raise ValueError(f"invalid event type {event_type!r}")
+            existing = self._idempotent_event(session.session_id, event_type, data or {})
+            if existing is not None:
+                return existing
+            event = SessionEvent.create(session.session_id, event_type, data)
+            with self.events_path(session.session_id).open("a") as f:
+                f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
+            session.updated_at = event.time
+            self.save(session)
+            return event
 
     def events(self, session_id: str, *, after: str = "", limit: int | None = None) -> list[SessionEvent]:
         try:
@@ -246,12 +252,13 @@ class SessionManager:
         return checkpoints
 
     def save(self, session: WorkerSession) -> None:
-        directory = self.session_dir(session.session_id)
-        directory.mkdir(parents=True, exist_ok=True)
-        path = self.session_path(session.session_id)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(session.to_dict(), indent=2, sort_keys=True))
-        tmp.replace(path)
+        with self._lock:
+            directory = self.session_dir(session.session_id)
+            directory.mkdir(parents=True, exist_ok=True)
+            path = self.session_path(session.session_id)
+            tmp = path.with_name(f"session.{threading.get_ident()}.{new_id('tmp')}.json.tmp")
+            tmp.write_text(json.dumps(session.to_dict(), indent=2, sort_keys=True))
+            tmp.replace(path)
 
     def session_dir(self, session_id: str) -> pathlib.Path:
         if not _valid_id(session_id):
