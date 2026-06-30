@@ -187,6 +187,46 @@ def test_daemon_code_dispatch_persists_engine_session_metadata(tmp_path) -> None
     assert "--session-id 550e8400-e29b-41d4-a716-446655440000 --name jarvis-hello -p hello" in job["output"]
 
 
+def test_daemon_code_dispatch_resumes_claude_session(tmp_path) -> None:
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="",
+        workspace=str(tmp_path / "worker"),
+        claude_bin="echo",
+        supported_engines="codex,claude",
+    )
+    session_id = "550e8400-e29b-41d4-a716-446655440000"
+
+    async def calls(base, c):  # noqa: ANN001
+        disp = (
+            await c.post(
+                base + "/run",
+                json={
+                    "action": "code",
+                    "args": {
+                        "prompt": "follow up",
+                        "agent": "claude",
+                        "session_id": session_id,
+                        "resume_session": True,
+                    },
+                },
+            )
+        ).json()
+        jid = disp["job_id"]
+        job = {}
+        for _ in range(100):
+            job = (await c.get(f"{base}/jobs/{jid}")).json()
+            if job["status"] != "running":
+                break
+            await asyncio.sleep(0.02)
+        return job
+
+    job = asyncio.run(_with_server(cfg, 8822, calls))
+
+    assert job["session_id"] == session_id
+    assert "-p --resume 550e8400-e29b-41d4-a716-446655440000 follow up" in job["output"]
+
+
 def test_daemon_rejects_unsupported_code_engine(tmp_path) -> None:
     cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"), codex_bin="echo")
 

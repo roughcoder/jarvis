@@ -41,6 +41,7 @@ def start_worker_job(
         "prompt": envelope.prompt,
         "name": _job_name(envelope),
         "session_name": envelope.session_name,
+        "resume_session": envelope.resume_session,
         "execution_envelope": envelope.to_dict(),
     }
     if envelope.session_id:

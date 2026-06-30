@@ -847,9 +847,11 @@ def test_start_worker_job_uses_selected_worker_endpoint_and_token_env(monkeypatc
     assert seen["headers"] == {"Authorization": "Bearer hive-token"}
     assert seen["json"]["args"]["name"] == "jarvis-1-fix-the-worker"
     assert seen["json"]["args"]["session_name"] == "jarvis-1-fix-the-worker"
+    assert seen["json"]["args"]["resume_session"] is False
     assert "session_id" not in seen["json"]["args"]
     assert seen["json"]["args"]["execution_envelope"]["run_id"] == "run_1"
     assert seen["json"]["args"]["execution_envelope"]["session_name"] == "jarvis-1-fix-the-worker"
+    assert seen["json"]["args"]["execution_envelope"]["resume_session"] is False
     assert seen["json"]["args"]["execution_envelope"]["landing"]["mode"] == "draft_pr"
 
 
