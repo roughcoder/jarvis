@@ -7,8 +7,9 @@ from typing import Any
 import httpx
 
 from jarvis.config import WorkerConfig
+from jarvis.ids import new_id
 from jarvis.orchestration.envelope import build_execution_envelope
-from jarvis.orchestration.models import ExecutionEnvelope, WorkCommand, WorkItem, WorkerJobLink
+from jarvis.orchestration.models import ExecutionEnvelope, WorkCommand, WorkItem, WorkerJobLink, WorkerSessionLink
 from jarvis.orchestration.store import OrchestrationStore
 from jarvis.orchestration.workers import WorkerProfile
 
@@ -86,11 +87,127 @@ def start_worker_job(
     return link
 
 
+def start_worker_session(
+    envelope: ExecutionEnvelope,
+    *,
+    worker_cfg: WorkerConfig,
+    worker: WorkerProfile | None = None,
+    store: OrchestrationStore | None = None,
+    post: Callable[..., Any] | None = None,
+) -> WorkerSessionLink:
+    post = post or httpx.post
+    base_url, headers = _worker_endpoint(worker_cfg, worker)
+    if envelope.resume_session and envelope.session_id:
+        session = {
+            "session_id": envelope.session_id,
+            "status": "running",
+            "provider": envelope.engine,
+            "engine": envelope.engine,
+            "branch": envelope.branch_name,
+            "cwd": envelope.cwd,
+        }
+    else:
+        create_response = post(
+            f"{base_url}/sessions",
+            json={
+                "run_id": envelope.run_id,
+                "provider": envelope.engine,
+                "engine": envelope.engine,
+                "repo": envelope.repo,
+                "branch": envelope.branch_name,
+                "cwd": envelope.cwd,
+                "title": envelope.session_name or _job_name(envelope),
+                "metadata": {
+                    "execution_envelope": envelope.to_dict(),
+                    "allowed_actions": envelope.allowed_actions,
+                    "landing": envelope.landing.to_dict(),
+                    "verification": envelope.verification.to_dict(),
+                },
+            },
+            headers=headers,
+            timeout=worker_cfg.request_timeout_s,
+        )
+        create_body = _json_body(create_response)
+        _raise_worker_error(create_response, create_body)
+        if not create_body.get("ok"):
+            raise RuntimeError(create_body.get("error") or "worker rejected session")
+        session = create_body["session"]
+    turn_id = new_id("turn")
+    turn_response = post(
+        f"{base_url}/sessions/{session['session_id']}/turns",
+        json={
+            "turn_id": turn_id,
+            "prompt": envelope.prompt,
+            "metadata": {
+                "session_name": envelope.session_name,
+                "resume_session": envelope.resume_session,
+                "execution_envelope": envelope.to_dict(),
+            },
+            "idempotency_key": f"{envelope.run_id}:{turn_id}",
+        },
+        headers=headers,
+        timeout=worker_cfg.request_timeout_s,
+    )
+    turn_body = _json_body(turn_response)
+    _raise_worker_error(turn_response, turn_body)
+    if not turn_body.get("ok"):
+        raise RuntimeError(turn_body.get("error") or "worker rejected session turn")
+    current = turn_body.get("session") or session
+    events = turn_body.get("events") or []
+    link = WorkerSessionLink(
+        worker_id=envelope.worker_id,
+        session_id=current["session_id"],
+        status=current.get("status", "running"),
+        provider=current.get("provider") or envelope.engine,
+        engine=current.get("engine") or envelope.engine,
+        branch=current.get("branch") or envelope.branch_name,
+        cwd=current.get("cwd") or envelope.cwd,
+        last_event_id=str(events[-1].get("event_id") or "") if events else "",
+    )
+    if store is not None:
+        store.link_session(envelope.run_id, link)
+    return link
+
+
 def _job_name(envelope: ExecutionEnvelope) -> str:
     name = envelope.branch_name.rsplit("/", 1)[-1] if envelope.branch_name else envelope.run_id
     if name.startswith("jarvis-"):
         return name
     return f"jarvis-{name}"
+
+
+def _worker_endpoint(worker_cfg: WorkerConfig, worker: WorkerProfile | None) -> tuple[str, dict[str, str]]:
+    if worker is None:
+        base_url = worker_cfg.base_url
+    elif worker.base_url:
+        base_url = worker.base_url
+    elif worker.worker_id == "local-worker":
+        base_url = worker_cfg.base_url
+    else:
+        raise RuntimeError(f"worker {worker.worker_id} has no base_url; refusing to route to local worker")
+    token = os.environ.get(worker.token_env, "") if worker and worker.token_env else ""
+    if not token and (worker is None or worker.worker_id == "local-worker"):
+        token = worker_cfg.token.get_secret_value()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    return base_url, headers
+
+
+def _json_body(response: Any) -> dict[str, Any]:
+    try:
+        body = response.json()
+    except ValueError:
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _raise_worker_error(response: Any, body: dict[str, Any]) -> None:
+    status_code = getattr(response, "status_code", 200)
+    if status_code >= 400:
+        error = body.get("error") if isinstance(body, dict) else ""
+        if not error:
+            error = getattr(response, "text", "") or f"worker request failed with HTTP {status_code}"
+        raise RuntimeError(error)
+    response.raise_for_status()
 
 
 def create_run_and_envelope(

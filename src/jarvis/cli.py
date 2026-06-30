@@ -524,6 +524,161 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _worker_http(cfg=None):  # noqa: ANN001, ANN202
+    import httpx
+
+    cfg = cfg or load_config()
+    headers = {}
+    token = cfg.worker.token.get_secret_value()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return httpx, cfg.worker.base_url, headers, cfg.worker.request_timeout_s
+
+
+def _cmd_sessions(args: argparse.Namespace) -> int:
+    """Inspect and control live worker provider sessions."""
+    import json
+
+    cfg = load_config()
+    httpx, base, headers, timeout = _worker_http(cfg)
+    try:
+        if args.events:
+            params = {}
+            if args.after:
+                params["after"] = args.after
+            if args.limit:
+                params["limit"] = str(args.limit)
+            response = httpx.get(
+                f"{base}/sessions/{args.events}/events",
+                headers=headers,
+                params=params,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            body = response.json()
+            return _print_session_events(body.get("events", []), json_output=args.json)
+        if args.turn:
+            response = httpx.post(
+                f"{base}/sessions/{args.turn}/turns",
+                headers=headers,
+                json={
+                    "prompt": args.prompt,
+                    "metadata": {"surface": "cli"},
+                    "idempotency_key": args.idempotency_key,
+                },
+                timeout=timeout,
+            )
+        elif args.input:
+            response = httpx.post(
+                f"{base}/sessions/{args.input}/input",
+                headers=headers,
+                json={"text": args.text, "metadata": {"surface": "cli"}},
+                timeout=timeout,
+            )
+        elif args.approval:
+            response = httpx.post(
+                f"{base}/sessions/{args.approval}/approval",
+                headers=headers,
+                json={
+                    "request_id": args.request_id,
+                    "decision": args.decision,
+                    "metadata": {"surface": "cli"},
+                },
+                timeout=timeout,
+            )
+        elif args.interrupt:
+            response = httpx.post(
+                f"{base}/sessions/{args.interrupt}/interrupt",
+                headers=headers,
+                json={},
+                timeout=timeout,
+            )
+        elif args.stop:
+            response = httpx.post(
+                f"{base}/sessions/{args.stop}/stop",
+                headers=headers,
+                json={},
+                timeout=timeout,
+            )
+        elif args.session_id:
+            response = httpx.get(f"{base}/sessions/{args.session_id}", headers=headers, timeout=timeout)
+        else:
+            response = httpx.get(f"{base}/sessions", headers=headers, timeout=timeout)
+        response.raise_for_status()
+        body = response.json()
+    except Exception as exc:  # noqa: BLE001
+        print(f"Worker not reachable at {base} ({exc}).")
+        print("Start it with: jarvis worker")
+        return 1
+
+    if args.json:
+        print(json.dumps(body, indent=2))
+        return 0
+    if "sessions" in body:
+        sessions = body.get("sessions", [])
+        if not sessions:
+            print("No worker sessions yet.")
+            return 0
+        print(f"Worker sessions at {base}:")
+        for session in sessions[-args.n :]:
+            print(_format_session_line(session))
+        return 0
+    if "session" in body:
+        print(_format_session_detail(body["session"]))
+        if body.get("events"):
+            _print_session_events(body["events"], json_output=False)
+        return 0
+    if body.get("session_id"):
+        print(_format_session_detail(body))
+        return 0
+    if body.get("event"):
+        event = body["event"]
+        print(f"{event.get('event_id', '')} {event.get('type', '')}")
+        return 0
+    print(json.dumps(body, indent=2))
+    return 0
+
+
+def _format_session_line(session: dict) -> str:
+    title = session.get("title") or session.get("session_id") or ""
+    provider = session.get("provider") or "-"
+    engine = session.get("engine") or provider
+    status = session.get("status") or "-"
+    branch = session.get("branch") or ""
+    suffix = f"  {branch}" if branch else ""
+    return f"  {session.get('session_id', ''):<28} {status:<16} {provider}/{engine:<12} {title}{suffix}"
+
+
+def _format_session_detail(session: dict) -> str:
+    lines = [
+        f"Session: {session.get('session_id', '')}",
+        f"Status: {session.get('status', '')}",
+        f"Provider: {session.get('provider', '')}",
+        f"Engine: {session.get('engine', '')}",
+    ]
+    for key in ("run_id", "repo", "branch", "cwd", "title"):
+        if session.get(key):
+            lines.append(f"{key.replace('_', ' ').title()}: {session[key]}")
+    return "\n".join(lines)
+
+
+def _print_session_events(events: list[dict], *, json_output: bool) -> int:
+    import json
+
+    if json_output:
+        print(json.dumps(events, indent=2))
+        return 0
+    if not events:
+        print("No session events.")
+        return 0
+    for event in events:
+        event_id = str(event.get("event_id") or "")
+        event_type = str(event.get("type") or "")
+        time = str(event.get("time") or "")
+        print(f"{time} {event_id:<28} {event_type}")
+    return 0
+
+
 def _orch_store(cfg=None):  # noqa: ANN001, ANN202
     from jarvis.orchestration.store import OrchestrationStore
 
@@ -549,9 +704,9 @@ def _cmd_runs(args: argparse.Namespace) -> int:
                 print(f"{e.time} {e.type:<28} {e.message}")
         return 0
     if args.sync:
-        from jarvis.orchestration.supervisor import sync_run_jobs
+        from jarvis.orchestration.supervisor import sync_run_sessions
 
-        summary = sync_run_jobs(
+        summary = sync_run_sessions(
             store,
             worker_cfg=cfg.worker,
             workers_path=cfg.orchestration.workers_path,
@@ -562,8 +717,8 @@ def _cmd_runs(args: argparse.Namespace) -> int:
             return 0
         if not args.json:
             print(
-                f"Synced {summary.runs_seen} run(s), {summary.jobs_seen} job(s); "
-                f"{summary.jobs_updated} updated, {summary.runs_completed} completed, {summary.runs_failed} failed."
+                f"Synced {summary.runs_seen} run(s), {summary.sessions_seen} session(s); "
+                f"{summary.sessions_updated} updated, {summary.runs_completed} completed, {summary.runs_failed} failed."
             )
         if not args.run_id:
             return 0
@@ -605,6 +760,12 @@ def _format_run(run) -> str:  # noqa: ANN001
         parts.append("Jobs:")
         parts.extend(
             f"  - {x.worker_id}:{x.job_id} {x.status} {x.branch}".rstrip() for x in run.jobs
+        )
+    if run.sessions:
+        parts.append("Sessions:")
+        parts.extend(
+            f"  - {x.worker_id}:{x.session_id} {x.status} {x.provider}/{x.engine} {x.branch}".rstrip()
+            for x in run.sessions
         )
     if run.artifacts:
         parts.append("Artifacts:")
@@ -754,10 +915,10 @@ def _cmd_work(args: argparse.Namespace) -> int:
             return 0
         print(
             f"Started {result.envelope.run_id} on {result.worker.worker_id} "
-            f"with {result.envelope.engine}: worker job {result.job.job_id}"
+            f"with {result.envelope.engine}: worker session {result.session.session_id}"
         )
-        if result.job.branch:
-            print(f"Branch: {result.job.branch}")
+        if result.session.branch:
+            print(f"Branch: {result.session.branch}")
         return 0
 
     if args.work_action == "resume":
@@ -766,7 +927,7 @@ def _cmd_work(args: argparse.Namespace) -> int:
         if args.inspect:
             if run_ref in {"latest", "last"}:
                 runs = store.list_runs()
-                run = next((r for r in reversed(runs) if r.jobs), runs[-1] if runs else None)
+                run = next((r for r in reversed(runs) if r.sessions), runs[-1] if runs else None)
             else:
                 run = store.get(run_ref)
             if run is None:
@@ -790,12 +951,10 @@ def _cmd_work(args: argparse.Namespace) -> int:
             return 1
         print(
             f"Resumed {result.envelope.run_id} on {result.worker.worker_id} "
-            f"with {result.envelope.engine}: worker job {result.job.job_id}"
+            f"with {result.envelope.engine}: worker session {result.session.session_id}"
         )
-        if result.job.session_name:
-            print(f"Session: {result.job.session_name}")
-        if result.job.branch:
-            print(f"Branch: {result.job.branch}")
+        if result.session.branch:
+            print(f"Branch: {result.session.branch}")
         return 0
 
     print(f"Unknown work action {args.work_action!r}.")
@@ -2086,11 +2245,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_jobs.set_defaults(func=_cmd_jobs)
 
+    p_sessions = sub.add_parser("sessions", help="List/show/control live worker sessions")
+    p_sessions.add_argument("session_id", nargs="?", help="Session id to show")
+    p_sessions.add_argument("--events", metavar="SESSION_ID", help="Show events for a session")
+    p_sessions.add_argument("--after", default="", help="Event cursor for --events")
+    p_sessions.add_argument("--limit", type=int, default=0, help="Maximum events for --events")
+    p_sessions.add_argument("--turn", metavar="SESSION_ID", help="Start a turn on a session")
+    p_sessions.add_argument("--prompt", default="", help="Prompt for --turn")
+    p_sessions.add_argument("--idempotency-key", default="", help="Idempotency key for --turn")
+    p_sessions.add_argument("--input", metavar="SESSION_ID", help="Send user input to a session")
+    p_sessions.add_argument("--text", default="", help="Text for --input")
+    p_sessions.add_argument("--approval", metavar="SESSION_ID", help="Resolve an approval request")
+    p_sessions.add_argument("--request-id", default="", help="Approval request id")
+    p_sessions.add_argument("--decision", choices=["approved", "denied"], default="approved")
+    p_sessions.add_argument("--interrupt", metavar="SESSION_ID", help="Interrupt a running session")
+    p_sessions.add_argument("--stop", metavar="SESSION_ID", help="Stop a session")
+    p_sessions.add_argument("-n", type=int, default=20, help="How many recent sessions to list")
+    p_sessions.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    p_sessions.set_defaults(func=_cmd_sessions)
+
     p_runs = sub.add_parser("runs", help="List/show Jarvis orchestration runs")
     p_runs.add_argument("run_id", nargs="?", help="Run id or unique prefix to show")
     p_runs.add_argument("--create", metavar="OBJECTIVE", help="Create a local fake run for inspection")
     p_runs.add_argument("--events", metavar="RUN_ID", help="Show append-only events for a run")
-    p_runs.add_argument("--sync", action="store_true", help="Refresh linked worker job status before listing/showing")
+    p_runs.add_argument("--sync", action="store_true", help="Refresh linked worker session status before listing/showing")
     p_runs.add_argument("-n", type=int, default=20, help="How many recent runs to list")
     p_runs.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     p_runs.set_defaults(func=_cmd_runs)
@@ -2118,7 +2296,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_work_next.add_argument("--repo", default="", help="Repository, e.g. roughcoder/jarvis")
     p_work_next.add_argument("--worker", default="", help="Explicit worker_id target")
     p_work_next.add_argument("--engine", default="", help="Explicit coding engine, e.g. codex or claude")
-    p_work_next.add_argument("--start", action="store_true", help="Start a worker job for the selected item")
+    p_work_next.add_argument("--start", action="store_true", help="Start a worker session for the selected item")
     p_work_next.add_argument("--json", action="store_true")
     p_work_next.set_defaults(func=_cmd_work)
     p_pr_comments = work_sub.add_parser("pr-comments", help="Inspect GitHub PR review/comment objects")

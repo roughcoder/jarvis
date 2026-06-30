@@ -12,7 +12,7 @@ from jarvis.orchestration.models import (
     WorkItem,
 )
 from jarvis.orchestration.policy import envelope_allowed_actions
-from jarvis.worker.jobs import slugify
+from jarvis.text import slugify
 
 
 def build_execution_envelope(

@@ -1,9 +1,17 @@
 from __future__ import annotations
 
-WORKER_JOB_START = "worker.job.start"
-FORGE_BRANCH_PUSH = "forge.github.branch.push"
-FORGE_PR_CREATE = "forge.github.pr.create"
-FORGE_PR_COMMENT = "forge.github.pr.comment"
+from jarvis.capabilities import (
+    FORGE_BRANCH_PUSH,
+    FORGE_PR_COMMENT,
+    FORGE_PR_CREATE,
+    WORKER_JOB_START,
+    WORKER_SESSION_APPROVE,
+    WORKER_SESSION_CREATE,
+    WORKER_SESSION_INPUT,
+    WORKER_SESSION_INTERRUPT,
+    WORKER_SESSION_STOP,
+    WORKER_SESSION_TURN,
+)
 
 READ_ACTIONS = {
     "work.github.issues.read",
@@ -15,6 +23,12 @@ READ_ACTIONS = {
 
 WRITE_ACTIONS = {
     WORKER_JOB_START,
+    WORKER_SESSION_CREATE,
+    WORKER_SESSION_TURN,
+    WORKER_SESSION_INPUT,
+    WORKER_SESSION_APPROVE,
+    WORKER_SESSION_INTERRUPT,
+    WORKER_SESSION_STOP,
     "work.linear.write",
     "work.github.issues.write",
     FORGE_BRANCH_PUSH,
@@ -64,7 +78,7 @@ def required_for_landing_mode(mode: str) -> list[str]:
 
 
 def required_for_worker_dispatch(landing_mode: str) -> list[str]:
-    return [WORKER_JOB_START, *required_for_landing_mode(landing_mode)]
+    return [WORKER_SESSION_CREATE, WORKER_SESSION_TURN, *required_for_landing_mode(landing_mode)]
 
 
 def envelope_allowed_actions(landing_mode: str) -> list[str]:

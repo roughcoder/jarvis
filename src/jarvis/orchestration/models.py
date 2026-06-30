@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import time
-import uuid
 from dataclasses import asdict, dataclass, field, fields
-from datetime import datetime, timezone
 from typing import Any, Literal
 
+from jarvis.capabilities import WORKER_SESSION_CREATE, WORKER_SESSION_TURN
 from jarvis.engines import default_engine, engine_ids
+from jarvis.ids import utc_now
 
 
 Phase = Literal[
@@ -25,14 +24,6 @@ Phase = Literal[
     "cancelled",
     "needs_human",
 ]
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def new_id(prefix: str) -> str:
-    return f"{prefix}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
 
 
 def _coerce(cls: type, data: dict[str, Any]):
@@ -186,7 +177,7 @@ class ExecutionEnvelope:
     session_id: str = ""
     session_name: str = ""
     resume_session: bool = False
-    allowed_actions: list[str] = field(default_factory=lambda: ["worker.job.start"])
+    allowed_actions: list[str] = field(default_factory=lambda: [WORKER_SESSION_CREATE, WORKER_SESSION_TURN])
     verification: VerificationPlan = field(default_factory=VerificationPlan)
     landing: LandingPolicy = field(default_factory=LandingPolicy)
 

@@ -1,10 +1,15 @@
 # Worker Sessions API
 
 Jarvis worker sessions are the live-agent execution contract for operator UIs,
-voice, WhatsApp, and future provider adapters. They sit beside the legacy
-`/run` worker jobs API. The compatibility rule is simple: `/run` starts
-one-shot worker jobs; `/sessions` owns long-lived provider sessions and
-structured events.
+voice, WhatsApp, and future provider adapters. They supersede one-shot coding
+jobs as the primary agentic execution model. The existing `/run` worker jobs API
+may remain as an internal transition/debug path, but new coding orchestration
+should target `/sessions`, which owns long-lived provider sessions and structured
+events.
+
+No new agentic coding path may dispatch through `/run` or `WorkerJob`. Any
+remaining `/run` use must be non-agentic shell, scratch, or explicit debug
+plumbing outside `WorkCommand` / `ExecutionEnvelope` coding flows.
 
 Jarvis remains the orchestration source of truth. A UI such as a T3 fork should
 read Jarvis runs and worker sessions; it should not create its own separate
@@ -61,6 +66,15 @@ All endpoints use the worker daemon bearer token when `WORKER_TOKEN` is set.
 
 Create a worker session record. The first implementation records durable state
 and emits `session.created`; provider adapters attach behind this contract.
+Codex sessions use `codex app-server` JSON-RPC. Claude sessions currently use
+`claude -p --output-format stream-json` with durable `--session-id` / `--resume`
+metadata, with a Claude Agent SDK sidecar planned as the richer live runtime.
+Real provider sessions must include an `ExecutionEnvelope` authority context in
+session metadata. Unknown provider ids are rejected when a turn is started rather
+than falling back to a default provider.
+Provider adapters consume this through the worker-side `WorkerSessionAuthority`
+boundary object; shared ids, slugging, and capability constants live in neutral
+`jarvis.*` modules so orchestration and worker packages remain boundary peers.
 
 Request:
 
@@ -74,7 +88,12 @@ Request:
   "cwd": "",
   "title": "Add worker heartbeat status",
   "metadata": {
-    "surface": "t3"
+    "surface": "t3",
+    "execution_envelope": {
+      "run_id": "run_1760000000_abcd1234",
+      "allowed_actions": ["worker.session.create", "worker.session.turn"],
+      "landing": {"mode": "branch_only", "allow_merge": false}
+    }
   }
 }
 ```
@@ -109,9 +128,10 @@ Read the append-only event stream for a session.
 
 ### `POST /sessions/:id/turns`
 
-Start or enqueue a provider turn. Until the Codex/Claude adapters land, Jarvis
-records the turn and emits `turn.waiting_provider` rather than pretending the
-provider ran.
+Start or enqueue a provider turn. Jarvis records `turn.started`, then the
+selected provider adapter appends canonical session events as the provider
+streams progress. Real providers fail closed if the session metadata does not
+grant `worker.session.turn` through the `ExecutionEnvelope` authority context.
 
 Request:
 
@@ -134,7 +154,7 @@ Response:
   "turn_id": "turn_1",
   "events": [
     {"type": "turn.started"},
-    {"type": "turn.waiting_provider"}
+    {"type": "provider.started"}
   ]
 }
 ```
@@ -187,7 +207,13 @@ Initial event vocabulary:
 
 - `session.created`
 - `turn.started`
-- `turn.waiting_provider`
+- `provider.started`
+- `provider.process.started`
+- `provider.session.ready`
+- `provider.thread.ready`
+- `provider.turn.started`
+- `provider.log`
+- `provider.error`
 - `assistant.delta`
 - `assistant.message`
 - `tool.call`
@@ -220,5 +246,6 @@ For a T3 fork:
 - Link PRs, branches, and evidence through Jarvis artifacts, not a UI-local
   project model.
 
-Provider adapters are expected to map Codex app-server JSON-RPC, Claude Agent
-SDK events, Cursor, and OpenCode into this canonical event stream.
+Provider adapters are expected to map Codex app-server JSON-RPC, Claude stream
+JSON / Claude Agent SDK events, Cursor, and OpenCode into this canonical event
+stream.

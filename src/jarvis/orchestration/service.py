@@ -6,11 +6,11 @@ from typing import Any, Protocol
 from jarvis.engines import normalize_engine_id, worker_supports_engine
 from jarvis.orchestration import executor
 from jarvis.orchestration.authority import allowed
-from jarvis.orchestration.models import ExecutionEnvelope, LandingPolicy, WorkCommand, WorkItem, WorkerJobLink, new_id
+from jarvis.orchestration.models import ExecutionEnvelope, LandingPolicy, WorkCommand, WorkItem, WorkerSessionLink
 from jarvis.orchestration.policy import required_for_command, required_for_worker_dispatch
 from jarvis.orchestration.sources import WorkSource
-from jarvis.orchestration.store import ActiveWorkerJobError, ActiveWorkItemError, OrchestrationStore
-from jarvis.orchestration.supervisor import sync_run_jobs
+from jarvis.orchestration.store import ActiveWorkItemError, OrchestrationStore
+from jarvis.orchestration.supervisor import sync_run_sessions
 from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry
 
 
@@ -58,7 +58,7 @@ class StartedWork:
     item: WorkItem
     worker: WorkerProfile
     envelope: ExecutionEnvelope
-    job: WorkerJobLink
+    session: WorkerSessionLink
 
 
 class OrchestrationService:
@@ -132,12 +132,12 @@ class OrchestrationService:
             raise WorkAlreadyOwnedError(item, exc.owner) from exc
 
         try:
-            job = executor.start_worker_job(envelope, worker_cfg=self.cfg.worker, worker=worker, store=store)
+            session = executor.start_worker_session(envelope, worker_cfg=self.cfg.worker, worker=worker, store=store)
         except Exception as exc:  # noqa: BLE001 - dispatch failure must release the local claim
             store.set_phase(envelope.run_id, "failed", f"Worker dispatch failed: {exc}")
             raise WorkerDispatchError(envelope.run_id, exc) from exc
 
-        return StartedWork(item=item, worker=worker, envelope=envelope, job=job)
+        return StartedWork(item=item, worker=worker, envelope=envelope, session=session)
 
     def resume_run(self, run_ref: str = "latest", *, prompt: str = "") -> StartedWork:
         self._require(required_for_command("resume_run", "jarvis"))
@@ -148,21 +148,19 @@ class OrchestrationService:
         landing, allowed_actions = _resume_policy(store, run.run_id, self.cfg.orchestration.landing_mode)
         self._require(allowed_actions)
 
-        sync_run_jobs(
+        sync_run_sessions(
             store,
             worker_cfg=self.cfg.worker,
             workers_path=self.cfg.orchestration.workers_path,
             run_id=run.run_id,
         )
         run = store.get(run.run_id) or run
-        running = next((job for job in reversed(run.jobs) if job.status == "running"), None)
+        running = next((session for session in reversed(run.sessions) if session.status == "running"), None)
         if running is not None:
-            raise ResumeRunError(f"Run {run.run_id} already has running worker job {running.job_id}.")
-        previous = _resume_job(run.jobs)
+            raise ResumeRunError(f"Run {run.run_id} already has running worker session {running.session_id}.")
+        previous = _resume_session(run.sessions)
         if previous is None:
             raise ResumeRunError(f"Run {run.run_id} has no resumable worker session.")
-        if not previous.cwd:
-            raise ResumeRunError(f"Run {run.run_id} has no worker cwd to resume.")
 
         item = run.work_items[0].item if run.work_items else WorkItem(source="jarvis", id=run.run_id, title=run.objective)
         registry = WorkerRegistry(self.cfg.worker, profiles_path=self.cfg.orchestration.workers_path)
@@ -182,35 +180,18 @@ class OrchestrationService:
             branch_name=previous.branch,
             cwd=previous.cwd,
             session_id=previous.session_id,
-            session_name=previous.session_name,
+            session_name=previous.session_id,
             resume_session=True,
             allowed_actions=allowed_actions,
             landing=landing,
         )
         store.append_event(run.run_id, "execution_envelope_created", "Resume execution envelope created", envelope.to_dict())
-        reservation = WorkerJobLink(
-            worker_id=envelope.worker_id,
-            job_id=new_id("resume"),
-            status="running",
-            engine=envelope.engine,
-            session_id=envelope.session_id,
-            session_name=envelope.session_name,
-            branch=envelope.branch_name,
-            cwd=envelope.cwd,
-        )
         try:
-            store.reserve_job_if_idle(run.run_id, reservation)
-        except ActiveWorkerJobError as exc:
-            raise ResumeRunError(f"Run {run.run_id} already has running worker job {exc.job.job_id}.") from exc
-        try:
-            job = executor.start_worker_job(envelope, worker_cfg=self.cfg.worker, worker=worker, store=None)
+            session = executor.start_worker_session(envelope, worker_cfg=self.cfg.worker, worker=worker, store=store)
         except Exception as exc:  # noqa: BLE001 - dispatch failure must leave an inspectable run
-            _restore_after_failed_resume(store, run, reservation.job_id, str(exc))
-            if "resume cwd does not exist" in str(exc):
-                raise ResumeRunError(f"Run {run.run_id} cannot be resumed: {exc}") from exc
+            _record_failed_resume(store, run.run_id, str(exc))
             raise WorkerDispatchError(envelope.run_id, exc) from exc
-        store.replace_job(run.run_id, reservation.job_id, job)
-        return StartedWork(item=item, worker=worker, envelope=envelope, job=job)
+        return StartedWork(item=item, worker=worker, envelope=envelope, session=session)
 
     def _require(self, actions: list[str]) -> None:
         denied = [
@@ -243,14 +224,14 @@ def _resolve_run(store: OrchestrationStore, run_ref: str):
     ref = (run_ref or "latest").strip()
     runs = store.list_runs()
     if ref in {"latest", "last"}:
-        return next((run for run in reversed(runs) if run.jobs), runs[-1] if runs else None)
+        return next((run for run in reversed(runs) if run.sessions), runs[-1] if runs else None)
     return store.get(ref)
 
 
-def _resume_job(jobs: list[WorkerJobLink]) -> WorkerJobLink | None:
-    for job in reversed(jobs):
-        if job.session_id and job.status != "running":
-            return job
+def _resume_session(sessions: list[WorkerSessionLink]) -> WorkerSessionLink | None:
+    for session in reversed(sessions):
+        if session.session_id and session.status != "running":
+            return session
     return None
 
 
@@ -269,27 +250,17 @@ def _resume_policy(store: OrchestrationStore, run_id: str, fallback_mode: str) -
     return LandingPolicy(mode=fallback_mode), required_for_worker_dispatch(fallback_mode)
 
 
-def _restore_after_failed_resume(
-    store: OrchestrationStore,
-    original_run,
-    reservation_id: str,
-    error: str,
-) -> None:
-    store.remove_job_link(original_run.run_id, reservation_id)
+def _record_failed_resume(store: OrchestrationStore, run_id: str, error: str) -> None:
     store.append_event(
-        original_run.run_id,
+        run_id,
         "resume_dispatch_failed",
         f"Worker resume dispatch failed: {error}",
         {"error": error},
     )
-    if original_run.status == "terminal":
-        store.set_phase(original_run.run_id, original_run.phase, original_run.terminal_reason)
-    else:
-        store.set_phase(original_run.run_id, original_run.phase, f"Resume dispatch failed: {error}")
 
 
 def _resume_prompt(objective: str, prompt: str, *, landing_mode: str) -> str:
-    follow_up = prompt.strip() or "Continue the previous Jarvis worker job. Inspect the current workspace, continue from the existing state, run the appropriate verification, and report evidence plus known gaps."
+    follow_up = prompt.strip() or "Continue the previous Jarvis worker session. Inspect the current workspace, continue from the existing state, run the appropriate verification, and report evidence plus known gaps."
     return "\n".join(
         [
             "Resume this Jarvis orchestration run.",

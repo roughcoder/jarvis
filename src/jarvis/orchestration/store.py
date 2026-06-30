@@ -6,6 +6,7 @@ import json
 import pathlib
 import re
 
+from jarvis.ids import new_id, utc_now
 from jarvis.orchestration.models import (
     Artifact,
     OrchestrationRun,
@@ -14,8 +15,6 @@ from jarvis.orchestration.models import (
     WorkItemLink,
     WorkerJobLink,
     WorkerSessionLink,
-    new_id,
-    utc_now,
 )
 
 
@@ -201,8 +200,10 @@ class OrchestrationStore:
             existing.branch = session.branch
             existing.cwd = session.cwd
             existing.last_event_id = session.last_event_id
-        if run.phase in {"created", "claimed", "provisioned"}:
+        if run.phase in {"created", "claimed", "provisioned", "completed", "done", "failed", "blocked"}:
             run.phase = "running"
+            run.status = "active"
+            run.terminal_reason = ""
         self.save(run)
         self.append_event(run_id, "session_started", f"Worker session {session.session_id} started", session.to_dict())
         return run
