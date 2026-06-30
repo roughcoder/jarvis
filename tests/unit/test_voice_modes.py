@@ -148,6 +148,26 @@ def test_default_mode_opens_when_reply_requests_followup_without_marker() -> Non
     assert result.voice_mode == DEFAULT_MODE
 
 
+def test_default_mode_opens_when_reply_asks_conversational_followup_without_marker() -> None:
+    sess = _session(DEFAULT_MODE)
+
+    for raw in (
+        "I'm running smoothly, thanks. How are you?",
+        "I'm running smoothly, thanks. How's your day going?",
+        "I'm good, thanks - what about you?",
+        "That sounds useful. What are you working on?",
+        "I can help with that. Would you like me to sketch a plan?",
+    ):
+        result = TurnResult(raw=raw)
+
+        sess.finalize("how are you doing", result)
+
+        assert result.ended is False
+        assert result.continue_listening is True
+        assert result.close_reason == "reply_followup_expected"
+        assert result.voice_mode == DEFAULT_MODE
+
+
 def test_default_mode_respects_closed_marker_when_reply_contains_followup_question() -> None:
     sess = _session(DEFAULT_MODE)
     result = TurnResult(
@@ -160,6 +180,20 @@ def test_default_mode_respects_closed_marker_when_reply_contains_followup_questi
     sess.finalize("what am I holding", result)
 
     assert result.reply == "I can't tell from that image. Could you try again with better lighting?"
+    assert result.ended is True
+    assert result.continue_listening is False
+    assert result.close_reason == "task_complete"
+
+
+def test_default_mode_respects_closed_marker_when_reply_contains_conversational_followup() -> None:
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(
+        raw="I'm running smoothly, thanks. How are you? [[CONVERSATION:closed:task_complete]]"
+    )
+
+    sess.finalize("how are you doing", result)
+
+    assert result.reply == "I'm running smoothly, thanks. How are you?"
     assert result.ended is True
     assert result.continue_listening is False
     assert result.close_reason == "task_complete"

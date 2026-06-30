@@ -34,6 +34,16 @@ def test_defaults_are_localhost(monkeypatch) -> None:
     assert DatabaseConfig(_env_file=None).host == "localhost"
 
 
+def test_gateway_voice_model_is_optional_and_env_driven(monkeypatch) -> None:
+    _clean(monkeypatch, "GATEWAY_FAST_MODEL", "GATEWAY_VOICE_MODEL")
+
+    assert GatewayConfig(_env_file=None).voice_model == ""
+
+    monkeypatch.setenv("GATEWAY_VOICE_MODEL", "strong")
+
+    assert GatewayConfig(_env_file=None).voice_model == "strong"
+
+
 def test_base_url_is_computed_from_host_port(monkeypatch) -> None:
     _clean(monkeypatch, "MEMORY_HOST", "MEMORY_PORT")
     c = MemoryConfig(_env_file=None, host="frankfurt", port=8123)

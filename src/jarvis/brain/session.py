@@ -580,13 +580,14 @@ class BrainSession:
 
     def _initial_model(self, user_text: str) -> str:
         """Pick the starting model for a turn. Voice is latency-bound by TTS, so short
-        voice turns use the fast model (and escalate on tool use in the loop). Messaging
-        channels (WhatsApp, the text console) aren't TTS-bound, so they use the strong
-        model from the start for better quality/accuracy. Long prompts always go strong."""
+        voice turns use the voice route (falling back to fast) and escalate on tool
+        use in the loop. Messaging channels (WhatsApp, the text console) aren't
+        TTS-bound, so they use the strong model from the start for better
+        quality/accuracy. Long prompts always go strong."""
         g = self._cfg.gateway
         if self._ctx.channel != "voice" or len(user_text) > 120:
             return g.strong_model
-        return g.fast_model
+        return g.voice_model or g.fast_model
 
     async def _run_tool_loop(self, messages, model, trace, tool_schemas, result):  # noqa: ANN001
         """Tool-aware completion: let the model call gated tools, feed results
@@ -627,7 +628,7 @@ class BrainSession:
             # which tends to fumble multi-step browsing and answer from stale
             # snippets. Plain no-tool chat stays on fast (this code only runs when
             # the model chose to call a tool).
-            if model == self._cfg.gateway.fast_model:
+            if model != self._cfg.gateway.strong_model:
                 model = self._cfg.gateway.strong_model
             for tc in msg.tool_calls:
                 n_tools += 1

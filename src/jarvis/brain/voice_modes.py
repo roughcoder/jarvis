@@ -85,6 +85,21 @@ _FOLLOWUP_QUESTION_REPLY = re.compile(
     r"how long should|do you mean|did you mean)\b[^.?!]*\?",
     re.IGNORECASE,
 )
+_FOLLOWUP_FINAL_QUESTION_REPLY = re.compile(
+    r"(?:^|[.!?,;:-]\s+)\b(?:"
+    r"and you|"
+    r"how (?:are|about|do|did|would|can|is|was|have) "
+    r"(?:you|we|it|that|this|things|your)\b|"
+    r"how's (?:your|the)\b|"
+    r"what (?:about|are|were|do|did|would|should|can) (?:you|we|i)\b|"
+    r"why do you\b|"
+    r"are you\b|do you\b|did you\b|would you\b|could you\b|can you\b|"
+    r"should we\b|shall we\b|is that\b|does that\b|will that\b|would that\b|"
+    r"want me to\b|need me to\b|anything else\b"
+    r")"
+    r"[^.?!]*\?\s*$",
+    re.IGNORECASE,
+)
 _FOLLOWUP_REQUEST_REPLY = re.compile(
     r"(?:^|[.!?,;:-]\s+)\b(?:please (?:tell|say|try|send|show)|try again|"
     r"one more time|tell me (?:which|what|who|where|when|how)|"
@@ -244,7 +259,11 @@ def assistant_requests_followup(reply: str) -> bool:
         text = stripped
     return bool(
         text
-        and (_FOLLOWUP_QUESTION_REPLY.search(text) or _FOLLOWUP_REQUEST_REPLY.search(text))
+        and (
+            _FOLLOWUP_QUESTION_REPLY.search(text)
+            or _FOLLOWUP_FINAL_QUESTION_REPLY.search(text)
+            or _FOLLOWUP_REQUEST_REPLY.search(text)
+        )
     )
 
 

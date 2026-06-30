@@ -60,9 +60,10 @@ def test_now_line_handles_named_and_bad_timezone() -> None:
     assert "Right now it's" in _now_line("Not/AZone")
 
 
-def _session(channel: str = "voice") -> BrainSession:
+def _session(channel: str = "voice", cfg=None) -> BrainSession:  # noqa: ANN001
+    cfg = cfg or load_config()
     return BrainSession(
-        load_config(),
+        cfg,
         RequestContext("dev", "house", "house", frozenset(), channel=channel),
         gateway=None,
         tts=None,
@@ -113,13 +114,28 @@ def test_system_prompt_tells_voice_to_ground_relative_dates() -> None:
 
 def test_initial_model_is_channel_aware() -> None:
     cfg = load_config()
-    fast, strong = cfg.gateway.fast_model, cfg.gateway.strong_model
-    # voice: short -> fast (latency), long -> strong
-    assert _session("voice")._initial_model("hi") == fast
-    assert _session("voice")._initial_model("x" * 200) == strong
+    fast, voice, strong = (
+        cfg.gateway.fast_model,
+        cfg.gateway.voice_model or cfg.gateway.fast_model,
+        cfg.gateway.strong_model,
+    )
+    # voice: short -> voice route (defaults to fast), long -> strong
+    assert _session("voice", cfg)._initial_model("hi") == voice
+    assert _session("voice", cfg)._initial_model("x" * 200) == strong
     # messaging channels aren't TTS-bound -> strong from the start
-    assert _session("whatsapp")._initial_model("hi") == strong
-    assert _session("text")._initial_model("hi") == strong
+    assert _session("whatsapp", cfg)._initial_model("hi") == strong
+    assert _session("text", cfg)._initial_model("hi") == strong
+    assert cfg.gateway.fast_model == fast
+
+
+def test_voice_model_can_be_tuned_without_changing_fast_model() -> None:
+    cfg = load_config()
+    cfg.gateway.fast_model = "fast-route"
+    cfg.gateway.voice_model = "voice-route"
+    cfg.gateway.strong_model = "strong-route"
+
+    assert _session("voice", cfg)._initial_model("hi") == "voice-route"
+    assert _session("whatsapp", cfg)._initial_model("hi") == "strong-route"
 
 
 def _drive(agen) -> None:  # noqa: ANN001

@@ -49,6 +49,9 @@ class GatewayConfig(_Base):
     # Per-turn model routing (spec §6 Step 1, §8): names are LiteLLM route names,
     # never provider SDK identifiers. Swapping model is a parameter, not code.
     fast_model: str = "fast"
+    # Optional voice-only route. Empty means "use fast_model" so heartbeat and
+    # other cheap fast-lane calls can stay fast while voice turns are tuned.
+    voice_model: str = ""
     strong_model: str = "strong"
     # Embeddings route (LiteLLM) for the optional embedding-based tool relevance
     # scorer (§9 / WS8). Only used when TOOLS_RELEVANCE_MODE=embedding.
@@ -782,6 +785,7 @@ class Config:
             "gateway.base_url": self.gateway.base_url,
             "gateway.api_key": mask(self.gateway.api_key),
             "gateway.fast_model": self.gateway.fast_model,
+            "gateway.voice_model": self.gateway.voice_model or self.gateway.fast_model,
             "gateway.strong_model": self.gateway.strong_model,
             "memory.base_url": self.memory.base_url,
             "memory.api_key": mask(self.memory.api_key),
