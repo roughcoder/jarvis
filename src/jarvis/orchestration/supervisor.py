@@ -10,6 +10,7 @@ import httpx
 from jarvis.config import WorkerConfig
 from jarvis.orchestration.models import OrchestrationRun
 from jarvis.orchestration.store import OrchestrationStore
+from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, FAILED_SESSION_STATUSES, SUCCESS_SESSION_STATUSES
 from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry
 
 TERMINAL_JOB_STATUSES = {"done", "error", "interrupted"}
@@ -253,11 +254,11 @@ def _final_session_phase(run: OrchestrationRun) -> str:
     if not run.sessions or run.status == "terminal":
         return ""
     statuses = {session.status for session in run.sessions}
-    if statuses & {"running", "created", "waiting_provider", "waiting_input", "waiting_approval"}:
+    if statuses & ACTIVE_SESSION_STATUSES:
         return ""
-    if statuses <= {"completed", "done"}:
+    if statuses <= SUCCESS_SESSION_STATUSES:
         return "completed"
-    if statuses & {"failed", "error", "interrupted", "stopped", "blocked"}:
+    if statuses & FAILED_SESSION_STATUSES:
         return "failed"
     return ""
 

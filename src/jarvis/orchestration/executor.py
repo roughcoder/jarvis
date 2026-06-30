@@ -13,6 +13,7 @@ from jarvis.orchestration.envelope import build_execution_envelope
 from jarvis.orchestration.models import ExecutionEnvelope, WorkCommand, WorkItem, WorkerJobLink, WorkerSessionLink
 from jarvis.orchestration.store import OrchestrationStore
 from jarvis.orchestration.workers import WorkerProfile
+from jarvis.worker_session_contract import SESSION_RUNNING, SESSION_STOPPED
 
 
 def start_worker_job(
@@ -101,7 +102,7 @@ def start_worker_session(
     if envelope.resume_session and envelope.session_id:
         session = {
             "session_id": envelope.session_id,
-            "status": "running",
+            "status": SESSION_RUNNING,
             "provider": envelope.engine,
             "engine": envelope.engine,
             "branch": envelope.branch_name,
@@ -159,7 +160,7 @@ def start_worker_session(
     link = WorkerSessionLink(
         worker_id=envelope.worker_id,
         session_id=current["session_id"],
-        status=current.get("status", "running"),
+        status=current.get("status", SESSION_RUNNING),
         provider=current.get("provider") or envelope.engine,
         engine=current.get("engine") or envelope.engine,
         branch=current.get("branch") or envelope.branch_name,
@@ -237,7 +238,7 @@ def _stop_started_sessions(
             pass
         if store is not None:
             try:
-                store.update_session(run_id, link.session_id, status="stopped")
+                store.update_session(run_id, link.session_id, status=SESSION_STOPPED)
             except Exception:  # noqa: BLE001 - best-effort rollback marker
                 pass
 

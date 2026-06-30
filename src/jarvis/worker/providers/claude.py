@@ -15,6 +15,26 @@ from jarvis.config import WorkerConfig
 from jarvis.worker.authority import WorkerSessionAuthority
 from jarvis.worker.providers.base import ProviderTurn
 from jarvis.worker.sessions import SessionEvent, SessionManager, WorkerSession
+from jarvis.worker_session_contract import (
+    CANCELLED_SESSION_STATUSES,
+    EVENT_ASSISTANT_MESSAGE,
+    EVENT_PROVIDER_EVENT,
+    EVENT_PROVIDER_LOG,
+    EVENT_PROVIDER_PROCESS_STARTED,
+    EVENT_PROVIDER_SESSION_READY,
+    EVENT_PROVIDER_STARTED,
+    EVENT_SESSION_INTERRUPTED,
+    EVENT_SESSION_STOPPED,
+    EVENT_TOOL_CALL,
+    EVENT_TOOL_RESULT,
+    EVENT_TURN_COMPLETED,
+    EVENT_TURN_FAILED,
+    SESSION_COMPLETED,
+    SESSION_FAILED,
+    SESSION_INTERRUPTED,
+    SESSION_RUNNING,
+    SESSION_STOPPED,
+)
 
 
 class ClaudeProviderAdapter:
@@ -48,7 +68,7 @@ class ClaudeProviderAdapter:
         worker_cfg: WorkerConfig,
     ) -> list[SessionEvent]:
         authority = WorkerSessionAuthority.from_session(session, provider=self.provider)
-        sessions.update_status(session.session_id, "running")
+        sessions.update_status(session.session_id, SESSION_RUNNING)
         claude_session_id = _claude_session_id(session)
         sessions.update_metadata(
             session.session_id,
@@ -60,7 +80,7 @@ class ClaudeProviderAdapter:
         )
         started = sessions.append_event(
             session.session_id,
-            "provider.started",
+            EVENT_PROVIDER_STARTED,
             {
                 "turn_id": turn.turn_id,
                 "idempotency_key": turn.idempotency_key,
@@ -80,14 +100,14 @@ class ClaudeProviderAdapter:
 
     def interrupt(self, *, session: WorkerSession, sessions: SessionManager) -> tuple[WorkerSession, SessionEvent]:
         _terminate_provider_process(session)
-        updated = sessions.update_status(session.session_id, "interrupted")
-        event = sessions.append_event(updated.session_id, "session.interrupted", {"status": "interrupted"})
+        updated = sessions.update_status(session.session_id, SESSION_INTERRUPTED)
+        event = sessions.append_event(updated.session_id, EVENT_SESSION_INTERRUPTED, {"status": SESSION_INTERRUPTED})
         return updated, event
 
     def stop(self, *, session: WorkerSession, sessions: SessionManager) -> tuple[WorkerSession, SessionEvent]:
         _terminate_provider_process(session)
-        updated = sessions.update_status(session.session_id, "stopped")
-        event = sessions.append_event(updated.session_id, "session.stopped", {"status": "stopped"})
+        updated = sessions.update_status(session.session_id, SESSION_STOPPED)
+        event = sessions.append_event(updated.session_id, EVENT_SESSION_STOPPED, {"status": SESSION_STOPPED})
         return updated, event
 
 
@@ -143,7 +163,7 @@ def _run_claude_turn(
         )
         sessions.append_event(
             session_id,
-            "provider.process.started",
+            EVENT_PROVIDER_PROCESS_STARTED,
             {"turn_id": turn.turn_id, "provider": "claude", "pid": process.pid, "cwd": cwd, "resume": resume},
         )
         _read_until_turn_done(
@@ -157,10 +177,10 @@ def _run_claude_turn(
     except Exception as exc:  # noqa: BLE001 - provider failures must become session events
         if _session_cancelled(sessions, session_id):
             return
-        sessions.update_status(session_id, "failed")
+        sessions.update_status(session_id, SESSION_FAILED)
         sessions.append_event(
             session_id,
-            "turn.failed",
+            EVENT_TURN_FAILED,
             {
                 "turn_id": turn.turn_id,
                 "provider": "claude",
@@ -202,10 +222,10 @@ def _read_until_turn_done(
         if message is None:
             if process.poll() is not None:
                 if process.returncode == 0:
-                    sessions.update_status(session_id, "completed")
+                    sessions.update_status(session_id, SESSION_COMPLETED)
                     sessions.append_event(
                         session_id,
-                        "turn.completed",
+                        EVENT_TURN_COMPLETED,
                         {"turn_id": turn.turn_id, "provider": "claude", "provider_status": "exited"},
                     )
                     return
@@ -266,7 +286,7 @@ def _project_claude_message(
     if message_type == "system" and subtype == "init":
         sessions.append_event(
             session_id,
-            "provider.session.ready",
+            EVENT_PROVIDER_SESSION_READY,
             {
                 **common,
                 "provider_session_id": provider_session_id,
@@ -280,19 +300,19 @@ def _project_claude_message(
             if item_type == "text":
                 text = str(item.get("text") or "")
                 if text:
-                    sessions.append_event(session_id, "assistant.message", {**common, "text": text})
+                    sessions.append_event(session_id, EVENT_ASSISTANT_MESSAGE, {**common, "text": text})
             elif item_type == "tool_use":
-                sessions.append_event(session_id, "tool.call", {**common, "item": item})
+                sessions.append_event(session_id, EVENT_TOOL_CALL, {**common, "item": item})
             elif item_type == "tool_result":
-                sessions.append_event(session_id, "tool.result", {**common, "item": item})
+                sessions.append_event(session_id, EVENT_TOOL_RESULT, {**common, "item": item})
     elif message_type == "result":
         is_error = subtype not in {"success", "done", "completed"}
-        event_type = "turn.failed" if is_error else "turn.completed"
-        sessions.update_status(session_id, "failed" if is_error else "completed")
+        event_type = EVENT_TURN_FAILED if is_error else EVENT_TURN_COMPLETED
+        sessions.update_status(session_id, SESSION_FAILED if is_error else SESSION_COMPLETED)
         sessions.append_event(session_id, event_type, {**common, "provider_status": subtype or message_type, "raw": message})
         return True
     elif message_type:
-        sessions.append_event(session_id, "provider.event", {**common, "raw": message})
+        sessions.append_event(session_id, EVENT_PROVIDER_EVENT, {**common, "raw": message})
     return False
 
 
@@ -330,13 +350,13 @@ def _record_provider_log(session_id: str, turn: ProviderTurn, sessions: SessionM
     recent = [
         event
         for event in sessions.events(session_id)
-        if event.type == "provider.log" and event.data.get("turn_id") == turn.turn_id
+        if event.type == EVENT_PROVIDER_LOG and event.data.get("turn_id") == turn.turn_id
     ]
     if len(recent) >= 20:
         return
     sessions.append_event(
         session_id,
-        "provider.log",
+        EVENT_PROVIDER_LOG,
         {
             "turn_id": turn.turn_id,
             "provider": "claude",
@@ -363,7 +383,7 @@ def _session_cwd(session: WorkerSession, worker_cfg: WorkerConfig) -> str:
 
 def _session_cancelled(sessions: SessionManager, session_id: str) -> bool:
     session = sessions.get(session_id)
-    return session is not None and session.status in {"interrupted", "stopped"}
+    return session is not None and session.status in CANCELLED_SESSION_STATUSES
 
 
 def _claude_session_id(session: WorkerSession) -> str:

@@ -275,6 +275,11 @@ Stop the session. Emits `session.stopped` and sets `status` to `stopped`.
 
 ## Canonical Event Types
 
+The implementation source of truth for session statuses, event type constants,
+request lifecycle mappings, checkpoint keys, and terminal-state groups is
+`src/jarvis/worker_session_contract.py`. Keep this list aligned with that
+contract when publishing API changes.
+
 Initial event vocabulary:
 
 - `session.created`
@@ -282,6 +287,7 @@ Initial event vocabulary:
 - `provider.started`
 - `provider.process.started`
 - `provider.session.ready`
+- `provider.event`
 - `provider.thread.ready`
 - `provider.turn.started`
 - `provider.log`

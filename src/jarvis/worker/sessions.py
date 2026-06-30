@@ -7,6 +7,16 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from jarvis.ids import new_id, utc_now
+from jarvis.worker_session_contract import (
+    CHECKPOINT_ID_KEY,
+    EVENT_CHECKPOINT_CREATED,
+    EVENT_CHECKPOINT_RESTORED,
+    EVENT_SESSION_CREATED,
+    IDEMPOTENT_SESSION_EVENT_TYPES,
+    SESSION_CREATED,
+    request_type as contract_request_type,
+    resolved_request_type as contract_resolved_request_type,
+)
 
 
 @dataclass
@@ -46,7 +56,7 @@ class WorkerSession:
     session_id: str
     provider: str
     engine: str
-    status: str = "created"
+    status: str = SESSION_CREATED
     run_id: str = ""
     repo: str = ""
     branch: str = ""
@@ -64,7 +74,7 @@ class WorkerSession:
             session_id=str(data["session_id"]),
             provider=str(data.get("provider") or "codex"),
             engine=str(data.get("engine") or data.get("provider") or "codex"),
-            status=str(data.get("status") or "created"),
+            status=str(data.get("status") or SESSION_CREATED),
             run_id=str(data.get("run_id") or ""),
             repo=str(data.get("repo") or ""),
             branch=str(data.get("branch") or ""),
@@ -96,7 +106,7 @@ class SessionManager:
                 session_id=session_id,
                 provider=provider,
                 engine=engine,
-                status="created",
+                status=SESSION_CREATED,
                 run_id=str(data.get("run_id") or ""),
                 repo=str(data.get("repo") or ""),
                 branch=str(data.get("branch") or ""),
@@ -107,7 +117,7 @@ class SessionManager:
             self.save(session)
             event = self.append_event(
                 session.session_id,
-                "session.created",
+                EVENT_SESSION_CREATED,
                 {
                     "provider": session.provider,
                     "engine": session.engine,
@@ -209,7 +219,7 @@ class SessionManager:
         pending: dict[tuple[str, str, str], dict[str, Any]] = {}
         for session in [x for x in sessions if x is not None]:
             for event in self.events(session.session_id):
-                request_type = _request_type(event.type)
+                request_type = contract_request_type(event.type)
                 if request_type:
                     request_id = str(event.data.get("request_id") or event.data.get("id") or event.event_id)
                     pending[(session.session_id, request_type, request_id)] = {
@@ -220,7 +230,7 @@ class SessionManager:
                         "event": event.to_dict(),
                     }
                     continue
-                resolved_type = _resolved_request_type(event.type)
+                resolved_type = contract_resolved_request_type(event.type)
                 if resolved_type:
                     request_id = str(event.data.get("request_id") or event.data.get("id") or "")
                     if request_id:
@@ -230,15 +240,15 @@ class SessionManager:
     def checkpoints(self, session_id: str) -> list[dict[str, Any]]:
         events = self.events(session_id)
         restored = {
-            str(event.data.get("checkpoint_id") or "")
+            str(event.data.get(CHECKPOINT_ID_KEY) or "")
             for event in events
-            if event.type == "checkpoint.restored" and event.data.get("checkpoint_id")
+            if event.type == EVENT_CHECKPOINT_RESTORED and event.data.get(CHECKPOINT_ID_KEY)
         }
         checkpoints: list[dict[str, Any]] = []
         for event in events:
-            if event.type != "checkpoint.created":
+            if event.type != EVENT_CHECKPOINT_CREATED:
                 continue
-            checkpoint_id = str(event.data.get("checkpoint_id") or event.event_id)
+            checkpoint_id = str(event.data.get(CHECKPOINT_ID_KEY) or event.event_id)
             checkpoints.append(
                 {
                     "session_id": session_id,
@@ -282,7 +292,7 @@ class SessionManager:
         data: dict[str, Any],
     ) -> SessionEvent | None:
         key = str(data.get("idempotency_key") or "").strip()
-        if not key or event_type not in _IDEMPOTENT_EVENT_TYPES:
+        if not key or event_type not in IDEMPOTENT_SESSION_EVENT_TYPES:
             return None
         for event in self.events(session_id):
             if event.type == event_type and str(event.data.get("idempotency_key") or "") == key:
@@ -301,27 +311,3 @@ def _valid_event_type(value: str) -> bool:
 def _clean_id(value: Any) -> str:
     text = str(value or "").strip().lower()
     return text if _valid_id(text) else "unknown"
-
-
-def _request_type(event_type: str) -> str:
-    if event_type == "approval.requested":
-        return "approval"
-    if event_type == "input.requested":
-        return "input"
-    return ""
-
-
-def _resolved_request_type(event_type: str) -> str:
-    if event_type == "approval.resolved":
-        return "approval"
-    if event_type == "input.received":
-        return "input"
-    return ""
-
-
-_IDEMPOTENT_EVENT_TYPES = {
-    "turn.started",
-    "provider.started",
-    "turn.completed",
-    "turn.failed",
-}

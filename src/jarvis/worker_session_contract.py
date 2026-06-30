@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+SESSION_CREATED = "created"
+SESSION_RUNNING = "running"
+SESSION_WAITING_PROVIDER = "waiting_provider"
+SESSION_WAITING_INPUT = "waiting_input"
+SESSION_WAITING_APPROVAL = "waiting_approval"
+SESSION_COMPLETED = "completed"
+SESSION_DONE = "done"
+SESSION_FAILED = "failed"
+SESSION_ERROR = "error"
+SESSION_INTERRUPTED = "interrupted"
+SESSION_STOPPED = "stopped"
+SESSION_BLOCKED = "blocked"
+
+ACTIVE_SESSION_STATUSES = {
+    SESSION_CREATED,
+    SESSION_RUNNING,
+    SESSION_WAITING_PROVIDER,
+    SESSION_WAITING_INPUT,
+    SESSION_WAITING_APPROVAL,
+}
+SUCCESS_SESSION_STATUSES = {SESSION_COMPLETED, SESSION_DONE}
+FAILED_SESSION_STATUSES = {
+    SESSION_FAILED,
+    SESSION_ERROR,
+    SESSION_INTERRUPTED,
+    SESSION_STOPPED,
+    SESSION_BLOCKED,
+}
+CANCELLED_SESSION_STATUSES = {SESSION_INTERRUPTED, SESSION_STOPPED}
+
+EVENT_SESSION_CREATED = "session.created"
+EVENT_SESSION_INTERRUPTED = "session.interrupted"
+EVENT_SESSION_STOPPED = "session.stopped"
+EVENT_TURN_STARTED = "turn.started"
+EVENT_TURN_COMPLETED = "turn.completed"
+EVENT_TURN_FAILED = "turn.failed"
+EVENT_PROVIDER_STARTED = "provider.started"
+EVENT_PROVIDER_PROCESS_STARTED = "provider.process.started"
+EVENT_PROVIDER_THREAD_READY = "provider.thread.ready"
+EVENT_PROVIDER_TURN_STARTED = "provider.turn.started"
+EVENT_PROVIDER_SESSION_READY = "provider.session.ready"
+EVENT_PROVIDER_EVENT = "provider.event"
+EVENT_PROVIDER_ERROR = "provider.error"
+EVENT_PROVIDER_LOG = "provider.log"
+EVENT_ASSISTANT_DELTA = "assistant.delta"
+EVENT_ASSISTANT_MESSAGE = "assistant.message"
+EVENT_TOOL_CALL = "tool.call"
+EVENT_TOOL_RESULT = "tool.result"
+EVENT_APPROVAL_REQUESTED = "approval.requested"
+EVENT_APPROVAL_RESOLVED = "approval.resolved"
+EVENT_INPUT_REQUESTED = "input.requested"
+EVENT_INPUT_RECEIVED = "input.received"
+EVENT_CHECKPOINT_CREATED = "checkpoint.created"
+EVENT_CHECKPOINT_RESTORED = "checkpoint.restored"
+EVENT_ARTIFACT_UPDATED = "artifact.updated"
+EVENT_PLAN_UPDATED = "plan.updated"
+
+REQUEST_KIND_APPROVAL = "approval"
+REQUEST_KIND_INPUT = "input"
+
+REQUEST_EVENT_TYPES = {
+    EVENT_APPROVAL_REQUESTED: REQUEST_KIND_APPROVAL,
+    EVENT_INPUT_REQUESTED: REQUEST_KIND_INPUT,
+}
+RESOLVED_REQUEST_EVENT_TYPES = {
+    EVENT_APPROVAL_RESOLVED: REQUEST_KIND_APPROVAL,
+    EVENT_INPUT_RECEIVED: REQUEST_KIND_INPUT,
+}
+
+CHECKPOINT_ID_KEY = "checkpoint_id"
+
+IDEMPOTENT_SESSION_EVENT_TYPES = {
+    EVENT_TURN_STARTED,
+    EVENT_PROVIDER_STARTED,
+    EVENT_TURN_COMPLETED,
+    EVENT_TURN_FAILED,
+}
+
+
+def request_type(event_type: str) -> str:
+    return REQUEST_EVENT_TYPES.get(event_type, "")
+
+
+def resolved_request_type(event_type: str) -> str:
+    return RESOLVED_REQUEST_EVENT_TYPES.get(event_type, "")

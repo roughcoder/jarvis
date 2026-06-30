@@ -12,6 +12,7 @@ from jarvis.orchestration.sources import WorkSource
 from jarvis.orchestration.store import ActiveWorkItemError, OrchestrationStore
 from jarvis.orchestration.supervisor import sync_run_sessions
 from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry
+from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES
 
 
 class SourceFactory(Protocol):
@@ -241,7 +242,7 @@ def _worker_is_eligible(worker: WorkerProfile, required: list[str] | None = None
 
 
 def _session_is_active(status: str) -> bool:
-    return status in {"created", "running", "waiting_provider", "waiting_input", "waiting_approval"}
+    return status in ACTIVE_SESSION_STATUSES
 
 
 def _first_engine(value: str) -> str:

@@ -10,6 +10,7 @@ import httpx
 
 from jarvis.config import WorkerConfig
 from jarvis.engines import engine_ids, normalize_engine_id, worker_supports_engine
+from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, SESSION_RUNNING
 from jarvis.orchestration.models import WorkerProfile
 
 
@@ -122,9 +123,8 @@ class WorkerRegistry:
             profile.current_jobs = 0
             return profile
         profile.status = "online"
-        active_sessions = {"created", "running", "waiting_provider", "waiting_input", "waiting_approval"}
-        profile.current_jobs = sum(1 for j in job_data if j.get("status") == "running") + sum(
-            1 for s in session_data if s.get("status") in active_sessions
+        profile.current_jobs = sum(1 for j in job_data if j.get("status") == SESSION_RUNNING) + sum(
+            1 for s in session_data if s.get("status") in ACTIVE_SESSION_STATUSES
         )
         data = health.json()
         if data.get("agent"):

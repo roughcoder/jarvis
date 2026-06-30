@@ -15,6 +15,38 @@ from jarvis.config import WorkerConfig
 from jarvis.worker.authority import WorkerSessionAuthority
 from jarvis.worker.providers.base import ProviderTurn
 from jarvis.worker.sessions import SessionEvent, SessionManager, WorkerSession
+from jarvis.worker_session_contract import (
+    CANCELLED_SESSION_STATUSES,
+    EVENT_APPROVAL_REQUESTED,
+    EVENT_APPROVAL_RESOLVED,
+    EVENT_ARTIFACT_UPDATED,
+    EVENT_ASSISTANT_DELTA,
+    EVENT_ASSISTANT_MESSAGE,
+    EVENT_INPUT_RECEIVED,
+    EVENT_INPUT_REQUESTED,
+    EVENT_PLAN_UPDATED,
+    EVENT_PROVIDER_ERROR,
+    EVENT_PROVIDER_LOG,
+    EVENT_PROVIDER_PROCESS_STARTED,
+    EVENT_PROVIDER_STARTED,
+    EVENT_PROVIDER_THREAD_READY,
+    EVENT_PROVIDER_TURN_STARTED,
+    EVENT_SESSION_INTERRUPTED,
+    EVENT_SESSION_STOPPED,
+    EVENT_TOOL_CALL,
+    EVENT_TOOL_RESULT,
+    EVENT_TURN_COMPLETED,
+    EVENT_TURN_FAILED,
+    REQUEST_KIND_APPROVAL,
+    REQUEST_KIND_INPUT,
+    SESSION_COMPLETED,
+    SESSION_FAILED,
+    SESSION_INTERRUPTED,
+    SESSION_RUNNING,
+    SESSION_STOPPED,
+    SESSION_WAITING_APPROVAL,
+    SESSION_WAITING_INPUT,
+)
 
 
 class CodexProviderAdapter:
@@ -44,10 +76,10 @@ class CodexProviderAdapter:
         worker_cfg: WorkerConfig,
     ) -> list[SessionEvent]:
         authority = WorkerSessionAuthority.from_session(session, provider=self.provider)
-        sessions.update_status(session.session_id, "running")
+        sessions.update_status(session.session_id, SESSION_RUNNING)
         started = sessions.append_event(
             session.session_id,
-            "provider.started",
+            EVENT_PROVIDER_STARTED,
             {
                 "turn_id": turn.turn_id,
                 "idempotency_key": turn.idempotency_key,
@@ -66,14 +98,14 @@ class CodexProviderAdapter:
 
     def interrupt(self, *, session: WorkerSession, sessions: SessionManager) -> tuple[WorkerSession, SessionEvent]:
         _terminate_provider_process(session)
-        updated = sessions.update_status(session.session_id, "interrupted")
-        event = sessions.append_event(updated.session_id, "session.interrupted", {"status": "interrupted"})
+        updated = sessions.update_status(session.session_id, SESSION_INTERRUPTED)
+        event = sessions.append_event(updated.session_id, EVENT_SESSION_INTERRUPTED, {"status": SESSION_INTERRUPTED})
         return updated, event
 
     def stop(self, *, session: WorkerSession, sessions: SessionManager) -> tuple[WorkerSession, SessionEvent]:
         _terminate_provider_process(session)
-        updated = sessions.update_status(session.session_id, "stopped")
-        event = sessions.append_event(updated.session_id, "session.stopped", {"status": "stopped"})
+        updated = sessions.update_status(session.session_id, SESSION_STOPPED)
+        event = sessions.append_event(updated.session_id, EVENT_SESSION_STOPPED, {"status": SESSION_STOPPED})
         return updated, event
 
     def resolve_approval(
@@ -90,13 +122,13 @@ class CodexProviderAdapter:
         delivered = _deliver_pending_request(
             session.session_id,
             request_id,
-            kind="approval",
+            kind=REQUEST_KIND_APPROVAL,
             result=_approval_result(request),
         )
         if not delivered:
             raise RuntimeError(f"no pending codex approval request {request_id!r}")
-        event = sessions.append_event(session.session_id, "approval.resolved", {**request, "request_id": request_id})
-        sessions.update_status(session.session_id, "running")
+        event = sessions.append_event(session.session_id, EVENT_APPROVAL_RESOLVED, {**request, "request_id": request_id})
+        sessions.update_status(session.session_id, SESSION_RUNNING)
         return event
 
     def receive_input(
@@ -113,13 +145,13 @@ class CodexProviderAdapter:
         delivered = _deliver_pending_request(
             session.session_id,
             request_id,
-            kind="input",
+            kind=REQUEST_KIND_INPUT,
             result=_input_result(request),
         )
         if not delivered:
             raise RuntimeError(f"no pending codex input request {request_id!r}")
-        event = sessions.append_event(session.session_id, "input.received", {**request, "request_id": request_id})
-        sessions.update_status(session.session_id, "running")
+        event = sessions.append_event(session.session_id, EVENT_INPUT_RECEIVED, {**request, "request_id": request_id})
+        sessions.update_status(session.session_id, SESSION_RUNNING)
         return event
 
 
@@ -169,7 +201,7 @@ def _run_codex_turn(
         )
         sessions.append_event(
             session_id,
-            "provider.process.started",
+            EVENT_PROVIDER_PROCESS_STARTED,
             {"turn_id": turn.turn_id, "provider": "codex", "pid": process.pid, "cwd": cwd},
         )
 
@@ -244,7 +276,7 @@ def _run_codex_turn(
             )
             sessions.append_event(
                 session_id,
-                "provider.thread.ready",
+                EVENT_PROVIDER_THREAD_READY,
                 {"turn_id": turn.turn_id, "provider": "codex", "thread_id": thread_id},
             )
 
@@ -288,10 +320,10 @@ def _run_codex_turn(
     except Exception as exc:  # noqa: BLE001 - provider failures must become session events
         if _session_cancelled(sessions, session_id):
             return
-        sessions.update_status(session_id, "failed")
+        sessions.update_status(session_id, SESSION_FAILED)
         sessions.append_event(
             session_id,
-            "turn.failed",
+            EVENT_TURN_FAILED,
             {
                 "turn_id": turn.turn_id,
                 "idempotency_key": turn.idempotency_key,
@@ -467,49 +499,49 @@ def _project_jsonrpc_message(
     params = dict(message.get("params") or {})
     common = {"turn_id": turn.turn_id, "idempotency_key": turn.idempotency_key, "provider": "codex"}
     if message.get("error"):
-        sessions.append_event(session_id, "provider.error", {**common, "error": message["error"]})
+        sessions.append_event(session_id, EVENT_PROVIDER_ERROR, {**common, "error": message["error"]})
         return False
     if method == "item/agentMessage/delta":
-        sessions.append_event(session_id, "assistant.delta", {**common, "text": str(params.get("delta") or "")})
+        sessions.append_event(session_id, EVENT_ASSISTANT_DELTA, {**common, "text": str(params.get("delta") or "")})
     elif method == "item/completed":
         item = dict(params.get("item") or {})
         item_type = str(item.get("type") or "")
         if item_type == "agentMessage":
-            sessions.append_event(session_id, "assistant.message", {**common, "text": str(item.get("text") or "")})
+            sessions.append_event(session_id, EVENT_ASSISTANT_MESSAGE, {**common, "text": str(item.get("text") or "")})
         elif item_type == "commandExecution":
-            sessions.append_event(session_id, "tool.result", {**common, "item": item})
+            sessions.append_event(session_id, EVENT_TOOL_RESULT, {**common, "item": item})
     elif method == "item/started":
         item = dict(params.get("item") or {})
         item_type = str(item.get("type") or "")
         if item_type and item_type not in {"userMessage", "reasoning"}:
-            sessions.append_event(session_id, "tool.call", {**common, "item": item})
+            sessions.append_event(session_id, EVENT_TOOL_CALL, {**common, "item": item})
     elif method == "item/commandExecution/requestApproval":
         request_id = _message_request_id(message, params)
-        _track_pending_request(session_id, request_id, kind="approval", process=process, rpc_id=message.get("id"))
-        sessions.append_event(session_id, "approval.requested", {**common, **params, "request_id": request_id})
-        sessions.update_status(session_id, "waiting_approval")
+        _track_pending_request(session_id, request_id, kind=REQUEST_KIND_APPROVAL, process=process, rpc_id=message.get("id"))
+        sessions.append_event(session_id, EVENT_APPROVAL_REQUESTED, {**common, **params, "request_id": request_id})
+        sessions.update_status(session_id, SESSION_WAITING_APPROVAL)
     elif method == "item/fileChange/requestApproval":
         request_id = _message_request_id(message, params)
-        _track_pending_request(session_id, request_id, kind="approval", process=process, rpc_id=message.get("id"))
-        sessions.append_event(session_id, "approval.requested", {**common, **params, "request_id": request_id})
-        sessions.update_status(session_id, "waiting_approval")
+        _track_pending_request(session_id, request_id, kind=REQUEST_KIND_APPROVAL, process=process, rpc_id=message.get("id"))
+        sessions.append_event(session_id, EVENT_APPROVAL_REQUESTED, {**common, **params, "request_id": request_id})
+        sessions.update_status(session_id, SESSION_WAITING_APPROVAL)
     elif method == "item/tool/requestUserInput":
         request_id = _message_request_id(message, params)
-        _track_pending_request(session_id, request_id, kind="input", process=process, rpc_id=message.get("id"))
-        sessions.append_event(session_id, "input.requested", {**common, **params, "request_id": request_id})
-        sessions.update_status(session_id, "waiting_input")
+        _track_pending_request(session_id, request_id, kind=REQUEST_KIND_INPUT, process=process, rpc_id=message.get("id"))
+        sessions.append_event(session_id, EVENT_INPUT_REQUESTED, {**common, **params, "request_id": request_id})
+        sessions.update_status(session_id, SESSION_WAITING_INPUT)
     elif method == "turn/completed":
         status = str(dict(params.get("turn") or {}).get("status") or "completed")
-        event_type = "turn.completed" if status in {"completed", "done", "succeeded"} else "turn.failed"
-        sessions.update_status(session_id, "completed" if event_type == "turn.completed" else "failed")
+        event_type = EVENT_TURN_COMPLETED if status in {"completed", "done", "succeeded"} else EVENT_TURN_FAILED
+        sessions.update_status(session_id, SESSION_COMPLETED if event_type == EVENT_TURN_COMPLETED else SESSION_FAILED)
         sessions.append_event(session_id, event_type, {**common, "provider_status": status, "raw": params})
         return True
     elif method == "turn/started":
-        sessions.append_event(session_id, "provider.turn.started", {**common, "raw": params})
+        sessions.append_event(session_id, EVENT_PROVIDER_TURN_STARTED, {**common, "raw": params})
     elif method == "turn/diff/updated":
-        sessions.append_event(session_id, "artifact.updated", {**common, "kind": "diff", "raw": params})
+        sessions.append_event(session_id, EVENT_ARTIFACT_UPDATED, {**common, "kind": "diff", "raw": params})
     elif method == "turn/plan/updated":
-        sessions.append_event(session_id, "plan.updated", {**common, "raw": params})
+        sessions.append_event(session_id, EVENT_PLAN_UPDATED, {**common, "raw": params})
     return False
 
 
@@ -580,13 +612,13 @@ def _record_provider_log(session_id: str, turn: ProviderTurn, sessions: SessionM
     recent = [
         event
         for event in sessions.events(session_id)
-        if event.type == "provider.log" and event.data.get("turn_id") == turn.turn_id
+        if event.type == EVENT_PROVIDER_LOG and event.data.get("turn_id") == turn.turn_id
     ]
     if len(recent) >= 20:
         return
     sessions.append_event(
         session_id,
-        "provider.log",
+        EVENT_PROVIDER_LOG,
         {
             "turn_id": turn.turn_id,
             "idempotency_key": turn.idempotency_key,
@@ -614,7 +646,7 @@ def _session_cwd(session: WorkerSession, worker_cfg: WorkerConfig) -> str:
 
 def _session_cancelled(sessions: SessionManager, session_id: str) -> bool:
     session = sessions.get(session_id)
-    return session is not None and session.status in {"interrupted", "stopped"}
+    return session is not None and session.status in CANCELLED_SESSION_STATUSES
 
 
 def _terminate_provider_process(session: WorkerSession) -> None:
