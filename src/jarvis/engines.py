@@ -33,10 +33,26 @@ def worker_supports_engine(supported: Iterable[str], engine: str) -> bool:
     return normalize_engine_id(engine) in {normalize_engine_id(x) for x in supported}
 
 
-def code_engine_argv(agent: str, codex_bin: str, claude_bin: str, prompt: str) -> list[str]:
+def code_engine_argv(
+    agent: str,
+    codex_bin: str,
+    claude_bin: str,
+    prompt: str,
+    *,
+    session_id: str = "",
+    session_name: str = "",
+) -> list[str]:
     engine = normalize_engine_id(agent) or ENGINE_CODEX
     if engine == ENGINE_CLAUDE:
-        return [claude_bin, "-p", prompt]
+        argv = [claude_bin]
+        if session_id:
+            argv.extend(["--session-id", session_id])
+        if session_name:
+            argv.extend(["--name", session_name])
+        argv.extend(["-p", prompt])
+        return argv
     if engine == ENGINE_CODEX:
+        if session_id:
+            return [codex_bin, "exec", "resume", session_id, prompt]
         return [codex_bin, "exec", prompt]
     raise ValueError(f"unsupported coding engine {agent!r}")

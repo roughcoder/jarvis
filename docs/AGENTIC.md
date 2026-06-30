@@ -164,6 +164,7 @@ Example run graph for one ticket producing one PR:
       "job_id": "job_abc123",
       "status": "running",
       "engine": "codex",
+      "session_name": "jarvis-eng-42-worker-heartbeat",
       "session_id": "codex-session-id",
       "branch": "jarvis/eng-42-worker-heartbeat"
     }
@@ -362,6 +363,13 @@ The handoff from scheduler to worker is an `ExecutionEnvelope`:
 Workers receive the envelope and stay inside it. They do not rediscover or widen
 authority; if they need more, the run becomes `needs_human`.
 
+Engine sessions are local resumability handles. `session_name` is the stable
+Jarvis-assigned human handle shown in job lists and engine pickers. `session_id`
+is the engine-native resume id when one is available. Jarvis may pre-allocate it
+only for engines that support first-run session ids, such as Claude Code's
+`--session-id`; Codex `exec` currently captures the emitted session id after the
+first run and uses `codex exec resume <id>` for later turns.
+
 Example worker profile:
 
 ```json
@@ -398,6 +406,8 @@ Example execution envelope:
   "worker_id": "macbook-worker",
   "engine": "claude",
   "engine_strategy": "single",
+  "session_name": "jarvis-eng-42-worker-heartbeat",
+  "session_id": "e7b5586f-8c20-40ac-bf4e-e41a4e6f9fb4",
   "allowed_actions": ["worker.job.start", "forge.github.branch.push", "forge.github.pr.create"],
   "prompt": "Follow AGENTS.md, read the ticket, implement the change, verify it, and report evidence.",
   "verification": {

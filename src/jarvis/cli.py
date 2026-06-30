@@ -515,8 +515,12 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
             )
         elif j.get("cwd"):
             print(f"            └─ ran in: {j['cwd']}  (git -C {j['cwd']} diff)")
+        if j.get("session_name"):
+            print(f"            └─ session: {j['session_name']}")
         if j.get("session_id"):
-            print(f"            └─ full transcript: codex resume {j['session_id']}")
+            engine = j.get("agent") or j.get("engine") or "codex"
+            resume = f"claude --resume {j['session_id']}" if engine == "claude" else f"codex resume {j['session_id']}"
+            print(f"            └─ full transcript: {resume}")
     return 0
 
 

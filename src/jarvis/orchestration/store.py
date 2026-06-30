@@ -186,7 +186,7 @@ class OrchestrationStore:
             if job is None:
                 raise KeyError(job_id)
             changed: dict[str, str] = {}
-            for field in ("status", "session_id", "branch", "cwd"):
+            for field in ("status", "session_id", "session_name", "branch", "cwd"):
                 value = updates.get(field)
                 if value is None:
                     continue

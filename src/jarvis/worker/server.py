@@ -192,8 +192,17 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             supported_engines = engine_ids(cfg.supported_engines, default_engine=cfg.agent)
             if not worker_supports_engine(supported_engines, agent):
                 return web.json_response({"ok": False, "error": f"worker does not support engine {agent!r}"}, status=400)
+            session_id = str(args.get("session_id") or "").strip()
+            session_name = str(args.get("session_name") or args.get("name") or "").strip()
             try:
-                argv = code_argv(agent, cfg.codex_bin, cfg.claude_bin, args.get("prompt", ""))
+                argv = code_argv(
+                    agent,
+                    cfg.codex_bin,
+                    cfg.claude_bin,
+                    args.get("prompt", ""),
+                    session_id=session_id,
+                    session_name=session_name,
+                )
             except ValueError as exc:
                 return web.json_response({"ok": False, "error": str(exc)}, status=400)
             label = args.get("prompt", "")[:80] or agent
@@ -232,12 +241,24 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 label,
                 run_exec(argv, job_cwd, cfg.job_timeout_s),
                 name=args.get("name", ""),
+                engine=agent,
                 cwd=job_cwd,
                 branch=branch,
                 repo=resolved or "",
+                session_id=session_id or None,
+                session_name=session_name,
             )
             return web.json_response(
-                {"ok": True, "job_id": job.id, "name": job.name, "branch": branch, "status": "running"}
+                {
+                    "ok": True,
+                    "job_id": job.id,
+                    "name": job.name,
+                    "branch": branch,
+                    "status": "running",
+                    "engine": job.engine,
+                    "session_id": job.session_id or "",
+                    "session_name": job.session_name,
+                }
             )
         if action == "peekaboo":
             argv = args.get("argv") or []

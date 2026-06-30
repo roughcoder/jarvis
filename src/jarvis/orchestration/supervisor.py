@@ -79,6 +79,7 @@ def sync_run_jobs(
                 link.job_id,
                 status=str(data.get("status") or link.status),
                 session_id=str(data.get("session_id") or link.session_id or ""),
+                session_name=str(data.get("session_name") or link.session_name or ""),
                 branch=str(data.get("branch") or link.branch or ""),
                 cwd=str(data.get("cwd") or link.cwd or ""),
             )

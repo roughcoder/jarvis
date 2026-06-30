@@ -614,6 +614,8 @@ def test_orchestration_service_selects_requested_engine(tmp_path, monkeypatch) -
     assert isinstance(result, StartedWork)
     assert seen == {"worker_id": "claude-worker", "engine": "claude"}
     assert result.envelope.engine_strategy == "single"
+    assert result.envelope.session_name.startswith("jarvis-")
+    assert result.envelope.session_id
 
 
 def test_orchestration_service_needs_human_for_start_without_repo(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -735,6 +737,7 @@ def test_store_updates_worker_job_link(tmp_path) -> None:
         "job123",
         status="done",
         session_id="session-1",
+        session_name="jarvis-start-work",
         branch="jarvis/fix-worker",
         cwd="/tmp/worktree",
     )
@@ -742,6 +745,7 @@ def test_store_updates_worker_job_link(tmp_path) -> None:
     job = updated.jobs[0]
     assert job.status == "done"
     assert job.session_id == "session-1"
+    assert job.session_name == "jarvis-start-work"
     assert job.branch == "jarvis/fix-worker"
     assert job.cwd == "/tmp/worktree"
     assert store.events(run.run_id)[-1].type == "job_updated"
@@ -760,6 +764,7 @@ def test_sync_run_jobs_marks_completed_run(tmp_path) -> None:
                 "id": "job123",
                 "status": "done",
                 "session_id": "session-1",
+                "session_name": "jarvis-start-work",
                 "branch": "jarvis/fix-worker",
                 "cwd": "/tmp/worktree",
             }
@@ -790,6 +795,7 @@ def test_sync_run_jobs_marks_completed_run(tmp_path) -> None:
     assert reloaded.phase == "completed"
     assert reloaded.status == "terminal"
     assert reloaded.jobs[0].session_id == "session-1"
+    assert reloaded.jobs[0].session_name == "jarvis-start-work"
     assert seen["url"] == "http://localhost:1/jobs/job123"
     assert seen["headers"] == {"Authorization": "Bearer secret"}
 
@@ -815,7 +821,12 @@ def test_start_worker_job_uses_selected_worker_endpoint_and_token_env(monkeypatc
             return None
 
         def json(self):
-            return {"ok": True, "job_id": "job456", "status": "running"}
+            return {
+                "ok": True,
+                "job_id": "job456",
+                "status": "running",
+                "session_name": "jarvis-1-fix-the-worker",
+            }
 
     def fake_post(url, **kwargs):  # noqa: ANN001
         seen["url"] = url
@@ -831,10 +842,14 @@ def test_start_worker_job_uses_selected_worker_endpoint_and_token_env(monkeypatc
     )
 
     assert job.worker_id == "hive-worker"
+    assert job.session_name == "jarvis-1-fix-the-worker"
     assert seen["url"] == "http://hive-worker:8780/run"
     assert seen["headers"] == {"Authorization": "Bearer hive-token"}
     assert seen["json"]["args"]["name"] == "jarvis-1-fix-the-worker"
+    assert seen["json"]["args"]["session_name"] == "jarvis-1-fix-the-worker"
+    assert "session_id" not in seen["json"]["args"]
     assert seen["json"]["args"]["execution_envelope"]["run_id"] == "run_1"
+    assert seen["json"]["args"]["execution_envelope"]["session_name"] == "jarvis-1-fix-the-worker"
     assert seen["json"]["args"]["execution_envelope"]["landing"]["mode"] == "draft_pr"
 
 

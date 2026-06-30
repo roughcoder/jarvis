@@ -43,6 +43,29 @@ def test_run_exec_nonzero_exit_returns_error() -> None:
 def test_code_argv_for_each_agent() -> None:
     assert code_argv("codex", "codex", "claude", "fix bug") == ["codex", "exec", "fix bug"]
     assert code_argv("claude", "codex", "claude", "fix bug") == ["claude", "-p", "fix bug"]
+    assert code_argv("codex", "codex", "claude", "fix bug", session_id="abc") == [
+        "codex",
+        "exec",
+        "resume",
+        "abc",
+        "fix bug",
+    ]
+    assert code_argv(
+        "claude",
+        "codex",
+        "claude",
+        "fix bug",
+        session_id="550e8400-e29b-41d4-a716-446655440000",
+        session_name="jarvis-fix-bug",
+    ) == [
+        "claude",
+        "--session-id",
+        "550e8400-e29b-41d4-a716-446655440000",
+        "--name",
+        "jarvis-fix-bug",
+        "-p",
+        "fix bug",
+    ]
     try:
         code_argv("whatever", "codex", "claude", "x")
     except ValueError as exc:

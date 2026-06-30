@@ -141,10 +141,25 @@ async def capture_screen_jpeg_b64(timeout_s: float) -> tuple[str, str]:
         tmp.unlink(missing_ok=True)
 
 
-def code_argv(agent: str, codex_bin: str, claude_bin: str, prompt: str) -> list[str]:
+def code_argv(
+    agent: str,
+    codex_bin: str,
+    claude_bin: str,
+    prompt: str,
+    *,
+    session_id: str = "",
+    session_name: str = "",
+) -> list[str]:
     """The headless coding-agent command for `agent`. Both run non-interactively
     in the job's repo cwd; tune flags per your setup via the *_bin config."""
-    return code_engine_argv(agent, codex_bin, claude_bin, prompt)
+    return code_engine_argv(
+        agent,
+        codex_bin,
+        claude_bin,
+        prompt,
+        session_id=session_id,
+        session_name=session_name,
+    )
 
 
 def list_repos(repo_root: str) -> list[str]:
