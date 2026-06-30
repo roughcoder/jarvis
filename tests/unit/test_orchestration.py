@@ -949,10 +949,12 @@ def test_orchestration_service_resume_run_dispatches_existing_session(tmp_path, 
             branch=envelope.branch_name,
             cwd=envelope.cwd,
         )
-        store.link_job(envelope.run_id, link)
         return link
 
-    monkeypatch.setattr("jarvis.orchestration.service.sync_run_jobs", lambda *_a, **_kw: None)
+    def fake_sync(*_args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        seen["workers_path"] = kwargs["workers_path"]
+
+    monkeypatch.setattr("jarvis.orchestration.service.sync_run_jobs", fake_sync)
     monkeypatch.setattr(
         "jarvis.orchestration.workers.WorkerRegistry._probe",
         lambda _self, profile: WorkerProfile(
@@ -982,7 +984,9 @@ def test_orchestration_service_resume_run_dispatches_existing_session(tmp_path, 
     assert envelope.session_name == "jarvis-55-fix-worker"
     assert envelope.cwd == "/worker/worktrees/55"
     assert envelope.branch_name == "jarvis/55-fix-worker"
+    assert envelope.landing.mode == "branch_only"
     assert "finish the tests" in envelope.prompt
+    assert seen["workers_path"] == cfg.orchestration.workers_path
     reloaded = store.get(run.run_id)
     assert reloaded is not None
     assert reloaded.status == "active"
@@ -1039,6 +1043,68 @@ def test_orchestration_service_resume_run_refuses_when_job_running(tmp_path, mon
 
     with pytest.raises(ResumeRunError, match="already has running worker job job-running"):
         service.resume_run(run.run_id)
+
+
+def test_orchestration_service_resume_missing_cwd_does_not_fail_completed_run(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.service import ResumeRunError
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    cfg = load_config()
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    run = store.create_run("Fix worker", work_items=[_item(id="#57")])
+    store.link_job(
+        run.run_id,
+        WorkerJobLink(
+            worker_id="local-worker",
+            job_id="job-old",
+            status="done",
+            engine="claude",
+            session_id="550e8400-e29b-41d4-a716-446655440000",
+            branch="jarvis/57",
+            cwd="/worker/worktrees/missing",
+        ),
+    )
+    store.set_phase(run.run_id, "completed", "done")
+    monkeypatch.setattr("jarvis.orchestration.service.sync_run_jobs", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        "jarvis.orchestration.workers.WorkerRegistry._probe",
+        lambda _self, profile: WorkerProfile(
+            worker_id=profile.worker_id,
+            display_name=profile.display_name,
+            capabilities=profile.capabilities,
+            base_url=profile.base_url,
+            status="online",
+            agent="claude",
+            supported_engines=["claude"],
+        ),
+    )
+    monkeypatch.setattr(
+        "jarvis.orchestration.executor.start_worker_job",
+        lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("resume cwd does not exist: /worker/worktrees/missing")),
+    )
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"orchestration.runs.read", "worker.job.start", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: None,
+    )
+
+    with pytest.raises(ResumeRunError, match="cannot be resumed"):
+        service.resume_run(run.run_id)
+
+    reloaded = store.get(run.run_id)
+    assert reloaded is not None
+    assert reloaded.status == "terminal"
+    assert reloaded.phase == "completed"
+    assert [job.job_id for job in reloaded.jobs] == ["job-old"]
 
 
 def test_start_worker_job_reports_worker_error_body() -> None:

@@ -27,6 +27,12 @@ class ActiveWorkItemError(RuntimeError):
         self.owner = owner
 
 
+class ActiveWorkerJobError(RuntimeError):
+    def __init__(self, job: WorkerJobLink) -> None:
+        super().__init__(f"worker job {job.job_id} is already running")
+        self.job = job
+
+
 class OrchestrationStore:
     """File-backed run graph store.
 
@@ -179,6 +185,47 @@ class OrchestrationStore:
         self.save(run)
         self.append_event(run_id, "job_started", f"Worker job {job.job_id} started", job.to_dict())
         return run
+
+    def reserve_job_if_idle(self, run_id: str, job: WorkerJobLink) -> OrchestrationRun:
+        with self._locked():
+            run = self.get(run_id)
+            if run is None:
+                raise KeyError(run_id)
+            running = next((x for x in run.jobs if x.status == "running"), None)
+            if running is not None:
+                raise ActiveWorkerJobError(running)
+            run.jobs.append(job)
+            run.phase = "running"
+            run.status = "active"
+            run.terminal_reason = ""
+            self.save(run)
+            self.append_event(run_id, "job_reserved", f"Reserved worker job {job.job_id}", job.to_dict())
+            return run
+
+    def replace_job(self, run_id: str, old_job_id: str, job: WorkerJobLink) -> OrchestrationRun:
+        with self._locked():
+            run = self.get(run_id)
+            if run is None:
+                raise KeyError(run_id)
+            for idx, existing in enumerate(run.jobs):
+                if existing.job_id == old_job_id:
+                    run.jobs[idx] = job
+                    break
+            else:
+                raise KeyError(old_job_id)
+            self.save(run)
+            self.append_event(run_id, "job_started", f"Worker job {job.job_id} started", job.to_dict())
+            return run
+
+    def remove_job_link(self, run_id: str, job_id: str) -> OrchestrationRun:
+        with self._locked():
+            run = self.get(run_id)
+            if run is None:
+                raise KeyError(run_id)
+            run.jobs = [job for job in run.jobs if job.job_id != job_id]
+            self.save(run)
+            self.append_event(run_id, "job_removed", f"Removed worker job link {job_id}", {"job_id": job_id})
+            return run
 
     def update_job(self, run_id: str, job_id: str, **updates: str) -> OrchestrationRun:
         with self._locked():

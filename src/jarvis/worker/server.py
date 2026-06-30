@@ -307,8 +307,11 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 if j.status not in finished:
                     return web.json_response({"ok": False, "error": f"job {j.name!r} is still running"})
                 targets = [j]
+            in_use = _running_workspace_refs(jobs.recent(1000))
             cleaned = []
             for j in targets:
+                if j.cleanup_owned and _workspace_in_use(j, in_use):
+                    continue
                 if j.cleanup_owned:
                     await cleanup_job(
                         j.repo,
@@ -391,6 +394,16 @@ def _resume_cwd(cwd: str, workspace: pathlib.Path) -> tuple[str, str]:
     if not path.is_dir():
         return "", f"resume cwd does not exist: {cwd}"
     return str(path), ""
+
+
+def _running_workspace_refs(items: list) -> set[tuple[str, str]]:
+    return {(job.cwd, job.branch or "") for job in items if job.status == "running" and job.cwd}
+
+
+def _workspace_in_use(job, running_refs: set[tuple[str, str]]) -> bool:  # noqa: ANN001
+    if not job.cwd:
+        return False
+    return (job.cwd, job.branch or "") in running_refs
 
 
 async def serve(cfg: WorkerConfig) -> None:

@@ -6,10 +6,10 @@ from typing import Any, Protocol
 from jarvis.engines import normalize_engine_id, worker_supports_engine
 from jarvis.orchestration import executor
 from jarvis.orchestration.authority import allowed
-from jarvis.orchestration.models import ExecutionEnvelope, WorkCommand, WorkItem, WorkerJobLink
+from jarvis.orchestration.models import ExecutionEnvelope, LandingPolicy, WorkCommand, WorkItem, WorkerJobLink, new_id
 from jarvis.orchestration.policy import required_for_command, required_for_worker_dispatch
 from jarvis.orchestration.sources import WorkSource
-from jarvis.orchestration.store import ActiveWorkItemError, OrchestrationStore
+from jarvis.orchestration.store import ActiveWorkerJobError, ActiveWorkItemError, OrchestrationStore
 from jarvis.orchestration.supervisor import sync_run_jobs
 from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry
 
@@ -147,7 +147,12 @@ class OrchestrationService:
         if run is None:
             raise ResumeRunError(f"No run found for {run_ref!r}.")
 
-        sync_run_jobs(store, worker_cfg=self.cfg.worker, run_id=run.run_id)
+        sync_run_jobs(
+            store,
+            worker_cfg=self.cfg.worker,
+            workers_path=self.cfg.orchestration.workers_path,
+            run_id=run.run_id,
+        )
         run = store.get(run.run_id) or run
         running = next((job for job in reversed(run.jobs) if job.status == "running"), None)
         if running is not None:
@@ -179,14 +184,31 @@ class OrchestrationService:
             session_name=previous.session_name,
             resume_session=True,
             allowed_actions=required_for_worker_dispatch(self.cfg.orchestration.landing_mode),
+            landing=LandingPolicy(mode=self.cfg.orchestration.landing_mode),
         )
         store.append_event(run.run_id, "execution_envelope_created", "Resume execution envelope created", envelope.to_dict())
-        store.set_phase(run.run_id, "running", f"Resuming worker session {previous.session_name or previous.session_id}")
+        reservation = WorkerJobLink(
+            worker_id=envelope.worker_id,
+            job_id=new_id("resume"),
+            status="running",
+            engine=envelope.engine,
+            session_id=envelope.session_id,
+            session_name=envelope.session_name,
+            branch=envelope.branch_name,
+            cwd=envelope.cwd,
+        )
         try:
-            job = executor.start_worker_job(envelope, worker_cfg=self.cfg.worker, worker=worker, store=store)
+            store.reserve_job_if_idle(run.run_id, reservation)
+        except ActiveWorkerJobError as exc:
+            raise ResumeRunError(f"Run {run.run_id} already has running worker job {exc.job.job_id}.") from exc
+        try:
+            job = executor.start_worker_job(envelope, worker_cfg=self.cfg.worker, worker=worker, store=None)
         except Exception as exc:  # noqa: BLE001 - dispatch failure must leave an inspectable run
-            store.set_phase(envelope.run_id, "failed", f"Worker resume dispatch failed: {exc}")
+            _restore_after_failed_resume(store, run, reservation.job_id, str(exc))
+            if "resume cwd does not exist" in str(exc):
+                raise ResumeRunError(f"Run {run.run_id} cannot be resumed: {exc}") from exc
             raise WorkerDispatchError(envelope.run_id, exc) from exc
+        store.replace_job(run.run_id, reservation.job_id, job)
         return StartedWork(item=item, worker=worker, envelope=envelope, job=job)
 
     def _require(self, actions: list[str]) -> None:
@@ -229,6 +251,25 @@ def _resume_job(jobs: list[WorkerJobLink]) -> WorkerJobLink | None:
         if job.session_id and job.status != "running":
             return job
     return None
+
+
+def _restore_after_failed_resume(
+    store: OrchestrationStore,
+    original_run,
+    reservation_id: str,
+    error: str,
+) -> None:
+    store.remove_job_link(original_run.run_id, reservation_id)
+    store.append_event(
+        original_run.run_id,
+        "resume_dispatch_failed",
+        f"Worker resume dispatch failed: {error}",
+        {"error": error},
+    )
+    if original_run.status == "terminal":
+        store.set_phase(original_run.run_id, original_run.phase, original_run.terminal_reason)
+    else:
+        store.set_phase(original_run.run_id, original_run.phase, f"Resume dispatch failed: {error}")
 
 
 def _resume_prompt(objective: str, prompt: str) -> str:
