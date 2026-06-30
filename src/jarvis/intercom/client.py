@@ -109,9 +109,7 @@ class IntercomClient:
                 phrase = self._cfg.wake.keyword.replace("_", " ").title()
                 while True:  # reconnect loop — survive brain restarts/outages
                     try:
-                        if not await self._ensure_network_ready():
-                            await asyncio.sleep(3)
-                            continue
+                        await self._ensure_network_ready()
                         self._panel.set("connecting")
                         async with websockets.connect(
                             url,
@@ -208,13 +206,12 @@ class IntercomClient:
         except OSError:
             return False
 
-    async def _ensure_network_ready(self) -> bool:
+    async def _ensure_network_ready(self) -> None:
         if await asyncio.to_thread(self._network_online):
-            return True
+            return
         self._panel.set("network")
-        print("  [intercom] network appears offline; waiting before brain reconnect…")
+        print("  [intercom] network probe failed; attempting brain reconnect anyway…")
         await self._recover_network_if_needed()
-        return False
 
     async def _set_link_lost_state(self) -> None:
         if await asyncio.to_thread(self._network_online):
