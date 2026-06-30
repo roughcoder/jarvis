@@ -33,6 +33,21 @@ async def _with_server(cfg: WorkerConfig, port: int, fn):  # noqa: ANN001
         await runner.cleanup()
 
 
+def _authority_metadata(engine: str = "codex") -> dict:
+    allowed_actions = ["worker.session.create", "worker.session.turn", "forge.github.branch.push"]
+    landing = {"mode": "branch_only", "allow_merge": False}
+    return {
+        "execution_envelope": {
+            "run_id": f"run_{engine}",
+            "engine": engine,
+            "allowed_actions": allowed_actions,
+            "landing": landing,
+        },
+        "allowed_actions": allowed_actions,
+        "landing": landing,
+    }
+
+
 def test_daemon_health_shell_and_auth(tmp_path) -> None:
     cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
     h = {"Authorization": "Bearer tkn"}
@@ -106,8 +121,8 @@ def test_daemon_session_api_records_structured_events(tmp_path) -> None:
                 base + "/sessions",
                 json={
                     "run_id": "run_123",
-                    "provider": "codex",
-                    "engine": "codex",
+                    "provider": "fake",
+                    "engine": "fake",
                     "repo": "roughcoder/jarvis",
                     "branch": "jarvis/live-session",
                     "title": "Fix worker sessions",
@@ -123,6 +138,20 @@ def test_daemon_session_api_records_structured_events(tmp_path) -> None:
                 headers=headers,
             )
         ).json()
+        retry = (
+            await c.post(
+                f"{base}/sessions/{session_id}/turns",
+                json={"prompt": "inspect the repo again", "idempotency_key": "idem_fake"},
+                headers=headers,
+            )
+        ).json()
+        retry_again = (
+            await c.post(
+                f"{base}/sessions/{session_id}/turns",
+                json={"prompt": "inspect the repo a third time", "idempotency_key": "idem_fake"},
+                headers=headers,
+            )
+        ).json()
         approval = (
             await c.post(
                 f"{base}/sessions/{session_id}/approval",
@@ -134,9 +163,9 @@ def test_daemon_session_api_records_structured_events(tmp_path) -> None:
         events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
         listed = (await c.get(base + "/sessions", headers=headers)).json()["sessions"]
         fetched = (await c.get(f"{base}/sessions/{session_id}", headers=headers)).json()
-        return noauth.status_code, created, turn, approval, interrupted, events, listed, fetched
+        return noauth.status_code, created, turn, retry, retry_again, approval, interrupted, events, listed, fetched
 
-    noauth, created, turn, approval, interrupted, events, listed, fetched = asyncio.run(
+    noauth, created, turn, retry, retry_again, approval, interrupted, events, listed, fetched = asyncio.run(
         _with_server(cfg, 8828, calls)
     )
 
@@ -144,18 +173,321 @@ def test_daemon_session_api_records_structured_events(tmp_path) -> None:
     assert created["ok"] is True
     assert created["session"]["run_id"] == "run_123"
     assert turn["turn_id"]
-    assert [event["type"] for event in turn["events"]] == ["turn.started", "turn.waiting_provider"]
+    assert [event["type"] for event in turn["events"]] == [
+        "turn.started",
+        "assistant.delta",
+        "assistant.message",
+        "checkpoint.created",
+        "turn.completed",
+    ]
+    assert retry.get("idempotent") is not True
+    assert retry_again["idempotent"] is True
+    assert [event["type"] for event in retry_again["events"]] == [
+        "turn.started",
+        "assistant.delta",
+        "assistant.message",
+        "checkpoint.created",
+        "turn.completed",
+    ]
     assert approval["event"]["type"] == "approval.resolved"
     assert interrupted["session"]["status"] == "interrupted"
     assert [event["type"] for event in events] == [
         "session.created",
         "turn.started",
-        "turn.waiting_provider",
+        "assistant.delta",
+        "assistant.message",
+        "checkpoint.created",
+        "turn.completed",
+        "turn.started",
+        "assistant.delta",
+        "assistant.message",
+        "checkpoint.created",
+        "turn.completed",
         "approval.resolved",
         "session.interrupted",
     ]
     assert listed[0]["session_id"] == created["session"]["session_id"]
     assert fetched["status"] == "interrupted"
+
+
+def test_daemon_codex_provider_projects_app_server_events(tmp_path) -> None:
+    agent = tmp_path / "fake-codex"
+    agent.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+
+
+def emit(payload):
+    print(json.dumps(payload), flush=True)
+
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    payload = json.loads(line)
+    method = payload.get("method")
+    request_id = payload.get("id")
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method in {"thread/start", "thread/resume"}:
+        emit({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "thread": {
+                    "id": "thread_fake",
+                    "sessionId": "session_fake",
+                    "path": "/tmp/thread_fake.json",
+                }
+            },
+        })
+    elif method == "turn/start":
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {"turn": {"id": "turn_fake"}}})
+        emit({"jsonrpc": "2.0", "method": "turn/started", "params": {"turn": {"id": "turn_fake"}}})
+        emit({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"delta": "he"}})
+        emit({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"delta": "llo"}})
+        emit({
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": {"item": {"type": "agentMessage", "text": "hello"}},
+        })
+        emit({
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {"turn": {"id": "turn_fake", "status": "completed"}},
+        })
+"""
+    )
+    agent.chmod(0o755)
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="tkn",
+        workspace=str(tmp_path / "worker"),
+        codex_bin=str(agent),
+        job_timeout_s=5,
+    )
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "run_id": "run_codex",
+                    "provider": "codex",
+                    "engine": "codex",
+                    "repo": "roughcoder/jarvis",
+                    "branch": "jarvis/codex-session",
+                    "title": "Codex app-server projection",
+                    "metadata": _authority_metadata("codex"),
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        turn = (
+            await c.post(
+                f"{base}/sessions/{session_id}/turns",
+                json={"prompt": "reply with hello", "idempotency_key": "idem_codex"},
+                headers=headers,
+            )
+        ).json()
+        events = []
+        for _ in range(100):
+            events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+            if any(event["type"] == "turn.completed" for event in events):
+                break
+            await asyncio.sleep(0.05)
+        fetched = (await c.get(f"{base}/sessions/{session_id}", headers=headers)).json()
+        return created, turn, events, fetched
+
+    created, turn, events, fetched = asyncio.run(_with_server(cfg, 8829, calls))
+
+    event_types = [event["type"] for event in events]
+    assert created["ok"] is True
+    assert [event["type"] for event in turn["events"]] == ["turn.started", "provider.started"]
+    assert "provider.process.started" in event_types
+    assert "provider.thread.ready" in event_types
+    assert "provider.turn.started" in event_types
+    assert event_types.count("assistant.delta") == 2
+    assert "assistant.message" in event_types
+    assert "turn.completed" in event_types
+    assert fetched["status"] == "completed"
+    assert fetched["metadata"]["codex_thread_id"] == "thread_fake"
+    assert fetched["metadata"]["provider_session_id"] == "session_fake"
+
+
+def test_daemon_rejects_unknown_session_provider(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "run_id": "run_unknown",
+                    "provider": "not-a-provider",
+                    "engine": "not-a-provider",
+                    "metadata": _authority_metadata("not-a-provider"),
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        turn = (
+            await c.post(
+                f"{base}/sessions/{session_id}/turns",
+                json={"prompt": "should not run"},
+                headers=headers,
+            )
+        )
+        return turn.status_code, turn.json(), (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()
+
+    status_code, body, events = asyncio.run(_with_server(cfg, 8831, calls))
+
+    assert status_code == 400
+    assert body["ok"] is False
+    assert "unsupported worker session provider" in body["error"]
+    assert [event["type"] for event in events["events"]] == ["session.created"]
+
+
+def test_daemon_real_provider_requires_execution_envelope_authority(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"), codex_bin="/missing/codex")
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={"run_id": "run_no_auth", "provider": "codex", "engine": "codex"},
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        turn = (
+            await c.post(
+                f"{base}/sessions/{session_id}/turns",
+                json={"prompt": "should fail before spawn", "idempotency_key": "idem_no_auth"},
+                headers=headers,
+            )
+        )
+        session = (await c.get(f"{base}/sessions/{session_id}", headers=headers)).json()
+        events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+        return turn.status_code, turn.json(), session, events
+
+    status_code, body, session, events = asyncio.run(_with_server(cfg, 8832, calls))
+
+    assert status_code == 400
+    assert body["ok"] is False
+    assert "worker.session.turn" in body["error"]
+    assert session["status"] == "failed"
+    assert [event["type"] for event in events] == ["session.created", "turn.started", "turn.failed"]
+
+
+def test_daemon_claude_provider_projects_stream_json_events_and_resumes(tmp_path) -> None:
+    agent = tmp_path / "fake-claude"
+    agent.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+
+
+def arg_value(flag):
+    if flag not in sys.argv:
+        return ""
+    index = sys.argv.index(flag)
+    return sys.argv[index + 1] if index + 1 < len(sys.argv) else ""
+
+
+def emit(payload):
+    print(json.dumps(payload), flush=True)
+
+
+session_id = arg_value("--session-id") or arg_value("--resume") or "11111111-1111-4111-8111-111111111111"
+emit({
+    "type": "system",
+    "subtype": "init",
+    "session_id": session_id,
+    "model": "claude-test",
+    "cwd": "/tmp",
+})
+emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "hello"}]}})
+emit({"type": "result", "subtype": "success", "session_id": session_id, "total_cost_usd": 0})
+"""
+    )
+    agent.chmod(0o755)
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="tkn",
+        workspace=str(tmp_path / "worker"),
+        claude_bin=str(agent),
+        job_timeout_s=5,
+    )
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "run_id": "run_claude",
+                    "provider": "claude",
+                    "engine": "claude",
+                    "repo": "roughcoder/jarvis",
+                    "branch": "jarvis/claude-session",
+                    "title": "Claude stream-json projection",
+                    "metadata": _authority_metadata("claude"),
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        first = (
+            await c.post(
+                f"{base}/sessions/{session_id}/turns",
+                json={"prompt": "reply with hello", "idempotency_key": "idem_claude_1"},
+                headers=headers,
+            )
+        ).json()
+        first_events = []
+        for _ in range(100):
+            first_events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+            if any(event["type"] == "turn.completed" for event in first_events):
+                break
+            await asyncio.sleep(0.05)
+        second = (
+            await c.post(
+                f"{base}/sessions/{session_id}/turns",
+                json={"prompt": "resume and reply again", "idempotency_key": "idem_claude_2"},
+                headers=headers,
+            )
+        ).json()
+        events = []
+        for _ in range(100):
+            events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+            completed = [event for event in events if event["type"] == "turn.completed"]
+            if len(completed) >= 2:
+                break
+            await asyncio.sleep(0.05)
+        fetched = (await c.get(f"{base}/sessions/{session_id}", headers=headers)).json()
+        return created, first, second, events, fetched
+
+    created, first, second, events, fetched = asyncio.run(_with_server(cfg, 8830, calls))
+
+    event_types = [event["type"] for event in events]
+    process_events = [event for event in events if event["type"] == "provider.process.started"]
+    assert created["ok"] is True
+    assert [event["type"] for event in first["events"]] == ["turn.started", "provider.started"]
+    assert [event["type"] for event in second["events"]] == ["turn.started", "provider.started"]
+    assert "provider.session.ready" in event_types
+    assert "assistant.message" in event_types
+    assert event_types.count("turn.completed") == 2
+    assert [event["data"]["resume"] for event in process_events] == [False, True]
+    assert fetched["status"] == "completed"
+    assert fetched["metadata"]["provider_session_id"]
+    assert fetched["metadata"]["claude_session_started"] == "true"
 
 
 def test_daemon_code_dispatch_marks_nonzero_agent_exit_as_error(tmp_path) -> None:

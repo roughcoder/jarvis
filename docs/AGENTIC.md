@@ -114,11 +114,11 @@ Default command semantics:
 - `blocked`, `stalled`, `what's running` -> inspect Jarvis run graph state.
 
 Resume execution uses the run graph, not tracker state: Jarvis finds the prior
-run, syncs linked worker jobs, selects the latest completed/interrupted job with
-an engine `session_id`, and dispatches a follow-up job to the same `worker_id`,
-`engine`, `session_name`, `session_id`, branch, and worker-owned cwd with
-`resume_session: true`. If the prior job is still running, has no session id, or
-its workspace has been cleaned up, the run is not resumed automatically.
+run, syncs linked worker sessions, selects the latest completed/interrupted
+session, and dispatches a follow-up turn to the same `worker_id`, `engine`,
+`session_id`, branch, and worker-owned cwd with `resume_session: true`. If the
+prior session is still running or has no session id, the run is not resumed
+automatically.
 
 ### Run graph
 
@@ -128,7 +128,7 @@ The durable unit is an `OrchestrationRun`, not a one-ticket-one-PR record:
 OrchestrationRun
   -> WorkItems[]     # primary, related, blocks, blocked_by, follow_up
   -> WorkerSessions[] # live provider sessions and event streams
-  -> WorkerJobs[]    # compatibility path for one-shot CLI jobs
+  -> WorkerJobs[]    # transitional/internal job records while migration completes
   -> Artifacts[]     # branches, PRs, comments, evidence
   -> Events[]        # append-only audit trail
   -> ChildRuns[]     # campaigns or split delivery
@@ -138,8 +138,8 @@ Rules:
 
 - One active **primary owner** run per work item.
 - A run may own many work items, sessions, jobs, and artifacts.
-- New agentic work should prefer `WorkerSession`; `WorkerJob` remains the
-  compatibility path for one-shot CLI work and existing tools.
+- New agentic coding work should target `WorkerSession`. `WorkerJob` is a
+  transitional/internal primitive while existing tool paths migrate.
 - A work item may appear as related context in other runs.
 - Large objectives become parent campaign runs with bounded child runs.
 - `events.jsonl` is the audit trail; `run.json` is the current view.
@@ -352,7 +352,12 @@ Example capability vocabulary:
     "orchestration.runs.read"
   ],
   "write": [
-    "worker.job.start",
+    "worker.session.create",
+    "worker.session.turn",
+    "worker.session.input",
+    "worker.session.approve",
+    "worker.session.interrupt",
+    "worker.session.stop",
     "work.linear.write",
     "forge.github.branch.push",
     "forge.github.pr.create",
@@ -384,13 +389,12 @@ Workers receive the envelope and stay inside it. They do not rediscover or widen
 authority; if they need more, the run becomes `needs_human`.
 
 Engine sessions are local resumability handles. `session_name` is the stable
-Jarvis-assigned human handle shown in job lists and engine pickers. `session_id`
-is the engine-native resume id when one is available. Jarvis may pre-allocate it
-only for engines that support first-run session ids, such as Claude Code's
-`--session-id`. Later follow-up turns must mark the envelope as
-`resume_session: true`, which maps Claude to `claude -p --resume <id> ...`.
-Codex `exec` currently captures the emitted session id after the first run and
-uses `codex exec resume <id>` for later turns.
+Jarvis-assigned human handle shown in run/session lists and engine pickers.
+`session_id` is the engine-native resume id when one is available. Jarvis may
+pre-allocate it only for engines that support first-run session ids, such as
+Claude Code's `--session-id`. Follow-up turns resume through the worker
+`/sessions/:id/turns` API; provider adapters map that to Codex app-server thread
+resume or Claude's `--resume` session id.
 
 Example worker profile:
 
@@ -420,8 +424,14 @@ Codex/Claude credentials and advertise supported engine ids over `/health`.
 ### WorkerSession
 
 The agentic work pivot is: **do not model coding agents as commands; model them
-as sessions.** `WorkerJob` remains for compatibility with one-shot CLI jobs, but
-new orchestration should target durable `WorkerSession`s with structured events.
+as sessions.** There are no external users to protect, so `WorkerJob` is not a
+long-term compatibility contract for coding work. New orchestration should target
+durable `WorkerSession`s with structured events, and old job-backed coding paths
+should be migrated or deleted once sessions cover them.
+
+Hard migration rule: no new agentic coding path may dispatch through `/run` or
+`WorkerJob`. Any remaining `/run` use must be non-agentic shell, scratch, or
+explicit debug plumbing outside `WorkCommand` / `ExecutionEnvelope` coding flows.
 
 T3 Code is the architectural reference, not the source of truth. Its useful
 lesson is the provider-session boundary: a UI talks to a server that owns live
@@ -494,14 +504,30 @@ Canonical event types include `session.created`, `turn.started`,
 
 Provider-specific events are projected into the canonical stream:
 
-- Codex adapter: wrap `codex app-server` and JSON-RPC over stdio.
-- Claude adapter: use a local boundary peer, likely a small TypeScript sidecar
-  around `@anthropic-ai/claude-agent-sdk`.
+- Codex adapter: wraps `codex app-server` and JSON-RPC over stdio, projects
+  assistant/tool/approval/turn notifications, and stores the Codex thread id in
+  session metadata.
+- Claude adapter: initial runtime uses `claude -p --output-format stream-json`
+  with `--session-id` / `--resume`, projects assistant/tool/result events, and
+  stores the Claude session id in session metadata.
+- Claude sidecar upgrade: replace the subprocess runtime with a small local
+  boundary peer around `@anthropic-ai/claude-agent-sdk` for prompt queues,
+  permission callbacks, structured questions, and richer interruption.
 - Cursor/OpenCode adapters: map their provider events into the same stream.
 
 Provider events are evidence, not authority. Jarvis still owns run ownership,
 allowed actions, landing policy, public writes, and human approval decisions.
-Provider adapters must enforce the `ExecutionEnvelope` outside prompt text.
+Provider adapters must enforce the `ExecutionEnvelope` outside prompt text. Real
+providers fail closed when session metadata does not include the required
+`worker.session.turn` authority, and unsupported provider ids are rejected rather
+than silently falling back to another engine.
+
+Shared primitives used on both sides of the orchestration/worker boundary live in
+neutral modules (`jarvis.ids`, `jarvis.text`, `jarvis.capabilities`). The worker
+does not import orchestration models for ids/time, and orchestration does not
+import worker job modules for slugging. Provider adapters consume the typed
+worker-side `WorkerSessionAuthority` boundary object rather than parsing raw
+envelope metadata inline.
 
 Example execution envelope:
 
@@ -517,7 +543,7 @@ Example execution envelope:
   "session_name": "jarvis-eng-42-worker-heartbeat",
   "session_id": "e7b5586f-8c20-40ac-bf4e-e41a4e6f9fb4",
   "resume_session": false,
-  "allowed_actions": ["worker.job.start", "forge.github.branch.push", "forge.github.pr.create"],
+  "allowed_actions": ["worker.session.create", "worker.session.turn", "forge.github.branch.push", "forge.github.pr.create"],
   "prompt": "Follow AGENTS.md, read the ticket, implement the change, verify it, and report evidence.",
   "verification": {
     "minimum_rung": "repo_native_plus_task_proof",
@@ -733,7 +759,8 @@ into stage 1 (iterate on a review, follow-up ticket, learned skill).
    HEAD: never the user's live checkout. A non-git input is **copied into
    worker-owned scratch**, never run in place (invariant I1; see P4).
 5. **Execute.** Run the engine(s) on the target in the workspace. One engine, or
-   **an ensemble in parallel** (panel). Long-running, async, tracked as a job.
+   **an ensemble in parallel** (panel). Long-running, async, tracked as live
+   worker sessions.
    Writing engines in a panel must each get their own isolated worktree
    (invariant I2) — only read-only review may share one workspace.
 6. **Converge.** If an ensemble ran, **synthesise** the outputs. Run the
@@ -748,9 +775,9 @@ into stage 1 (iterate on a review, follow-up ticket, learned skill).
 9. **Handoff.** The **unit of handoff is the branch / PR** — never proprietary
    state. Pick it up locally on any machine with `git fetch`, or iterate
    ("address the review comments") which re-enters the loop at stage 5.
-10. **Learn.** Persist the job record + the agent's `session_id` (for
-    `codex resume`), update memory, optionally save a reusable **skill**. Feeds
-    back into Intake for the next turn.
+10. **Learn.** Persist the run/session record + resume handle, update memory,
+    optionally save a reusable **skill**. Feeds back into Intake for the next
+    turn.
 
 Governing all ten, continuously: the **trust gate** (deny-by-default; "no
 limits" = the owner's full-caps profile on a trusted device) and
@@ -1060,10 +1087,10 @@ Today: strong — `src/jarvis/intercom/`, `src/jarvis/connectors/whatsapp/`,
 
 ### P11 · Observability — *trust & recovery* 🟡
 Role: stages 8, 10. "What's running", logs, traces, **resume** handles. Today:
-jobs persist with `session_id` captured for `codex resume` (`jobs.py:42,135`);
-`jarvis traces`/`jobs` exist. **Gap:** a unified cross-target job/run view;
-surfacing resume by voice. **Open:** how much detail reports back by voice vs
-stays queryable on demand.
+worker sessions persist with structured events and resume handles; `/jobs`
+remains internal transition/debug plumbing. **Gap:** a richer cross-target
+run/session view; surfacing resume by voice. **Open:** how much detail reports
+back by voice vs stays queryable on demand.
 
 ### P12 · Verification gate — *the inner loop's exit condition* ❌ — the part OpenClaw nails
 Role: stages 5→6→7 (the inner loop). The component that decides **done vs
@@ -1263,13 +1290,19 @@ P0), P7 cross-target recovery, and the not-yet-enforceable forge gate (I4).
       cleanly on empty queues.
 - [x] **Worker session API foundation:** worker daemon exposes durable
       `/sessions` records plus append-only session events for turns, input,
-      approvals, interrupts, and stops. This is the compatibility point for a
-      T3-style operator UI and the substrate for Codex/Claude provider adapters.
-- [ ] **Codex session adapter:** wrap `codex app-server` as a long-lived provider
-      session and project JSON-RPC events into canonical `SessionEvent`s.
-- [ ] **Claude session adapter:** add a local boundary peer, likely a small
-      TypeScript sidecar around `@anthropic-ai/claude-agent-sdk`, and project its
-      streaming/questions/permissions into the same session event stream.
+      approvals, interrupts, and stops. This is the substrate for a T3-style
+      operator UI and the Codex/Claude provider adapters; old job-backed coding
+      paths are migration targets, not product compatibility requirements.
+- [x] **Codex session adapter:** wrap `codex app-server` as a provider session
+      runtime and project JSON-RPC events into canonical `SessionEvent`s.
+- [x] **Claude session adapter:** attach Claude through `claude -p
+      --output-format stream-json` with durable `--session-id` / `--resume`
+      metadata and project its structured stream into the same session event
+      stream.
+- [ ] **Claude SDK sidecar upgrade:** replace the initial Claude subprocess
+      runtime with a local TypeScript sidecar around
+      `@anthropic-ai/claude-agent-sdk` for prompt queues, questions, permission
+      callbacks, and richer live control.
 - [ ] **T3-style cockpit:** fork/integrate a UI over Jarvis runs, worker
       sessions, event streams, approvals, interrupt/stop, artifacts, and reports
       without making the UI the orchestration source of truth.
@@ -1300,7 +1333,8 @@ handled at the stage where they belong rather than widening the current slice:
 - [ ] Ensemble synthesis: model / merge / vote, and blind vs debate? (P3)
 - [ ] Recipe representation: markdown, code, or a declarative schema? (P8)
 - [ ] Cross-target run identity + brain-restart recovery shape? (P7/P11)
-- [ ] Engine progress protocol: streaming CLI vs one-shot model? (P1)
+- [ ] Engine progress protocol: provider sessions and structured events first;
+      one-shot CLI only as an internal migration/debug fallback. (P1)
 - [ ] Verification gate: what defines "accepted actionable"; where do acceptance
       criteria come from; is the gate's reviewer the P3 ensemble or a cheaper
       checker; tests discovered vs declared? (P12)

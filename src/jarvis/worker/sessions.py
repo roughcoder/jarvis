@@ -5,7 +5,7 @@ import pathlib
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from jarvis.orchestration.models import new_id, utc_now
+from jarvis.ids import new_id, utc_now
 
 
 @dataclass
@@ -22,6 +22,12 @@ class SessionEvent:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SessionEvent:
+        if not _valid_id(str(data.get("event_id") or "")):
+            raise ValueError(f"invalid event id {data.get('event_id')!r}")
+        if not _valid_id(str(data.get("session_id") or "")):
+            raise ValueError(f"invalid session id {data.get('session_id')!r}")
+        if not _valid_event_type(str(data.get("type") or "")):
+            raise ValueError(f"invalid event type {data.get('type')!r}")
         return cls(
             event_id=str(data.get("event_id") or ""),
             session_id=str(data.get("session_id") or ""),
@@ -51,6 +57,8 @@ class WorkerSession:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> WorkerSession:
+        if not _valid_id(str(data.get("session_id") or "")):
+            raise ValueError(f"invalid session id {data.get('session_id')!r}")
         return cls(
             session_id=str(data["session_id"]),
             provider=str(data.get("provider") or "codex"),
@@ -78,8 +86,11 @@ class SessionManager:
     def create(self, data: dict[str, Any]) -> tuple[WorkerSession, SessionEvent]:
         provider = _clean_id(data.get("provider") or data.get("engine") or "codex")
         engine = _clean_id(data.get("engine") or provider)
+        session_id = str(data.get("session_id") or new_id("sess"))
+        if not _valid_id(session_id):
+            raise ValueError(f"invalid session id {session_id!r}")
         session = WorkerSession(
-            session_id=str(data.get("session_id") or new_id("sess")),
+            session_id=session_id,
             provider=provider,
             engine=engine,
             status="created",
@@ -115,7 +126,10 @@ class SessionManager:
                 path = matches[0] / "session.json"
             else:
                 return None
-        return WorkerSession.from_dict(json.loads(path.read_text()))
+        try:
+            return WorkerSession.from_dict(json.loads(path.read_text()))
+        except (json.JSONDecodeError, ValueError, KeyError):
+            return None
 
     def list(self) -> list[WorkerSession]:
         sessions: list[WorkerSession] = []
@@ -135,10 +149,24 @@ class SessionManager:
         self.save(session)
         return session
 
+    def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> WorkerSession:
+        session = self.get(session_id)
+        if session is None:
+            raise KeyError(session_id)
+        session.metadata.update(metadata)
+        session.updated_at = utc_now()
+        self.save(session)
+        return session
+
     def append_event(self, session_id: str, event_type: str, data: dict[str, Any] | None = None) -> SessionEvent:
         session = self.get(session_id)
         if session is None:
             raise KeyError(session_id)
+        if not _valid_event_type(event_type):
+            raise ValueError(f"invalid event type {event_type!r}")
+        existing = self._idempotent_event(session.session_id, event_type, data or {})
+        if existing is not None:
+            return existing
         event = SessionEvent.create(session.session_id, event_type, data)
         with self.events_path(session.session_id).open("a") as f:
             f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
@@ -146,7 +174,7 @@ class SessionManager:
         self.save(session)
         return event
 
-    def events(self, session_id: str) -> list[SessionEvent]:
+    def events(self, session_id: str, *, after: str = "", limit: int | None = None) -> list[SessionEvent]:
         try:
             path = self.events_path(session_id)
         except ValueError:
@@ -159,8 +187,15 @@ class SessionManager:
                 continue
             try:
                 events.append(SessionEvent.from_dict(json.loads(line)))
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, ValueError):
                 continue
+        if after:
+            for idx, event in enumerate(events):
+                if event.event_id == after:
+                    events = events[idx + 1 :]
+                    break
+        if limit is not None and limit >= 0:
+            events = events[:limit]
         return events
 
     def save(self, session: WorkerSession) -> None:
@@ -183,11 +218,37 @@ class SessionManager:
     def events_path(self, session_id: str) -> pathlib.Path:
         return self.session_dir(session_id) / "events.jsonl"
 
+    def _idempotent_event(
+        self,
+        session_id: str,
+        event_type: str,
+        data: dict[str, Any],
+    ) -> SessionEvent | None:
+        key = str(data.get("idempotency_key") or "").strip()
+        if not key or event_type not in _IDEMPOTENT_EVENT_TYPES:
+            return None
+        for event in self.events(session_id):
+            if event.type == event_type and str(event.data.get("idempotency_key") or "") == key:
+                return event
+        return None
+
 
 def _valid_id(value: str) -> bool:
     return bool(value) and all(ch.isalnum() or ch in {"_", "-"} for ch in value)
 
 
+def _valid_event_type(value: str) -> bool:
+    return bool(value) and all(ch.isalnum() or ch in {"_", ".", "-"} for ch in value)
+
+
 def _clean_id(value: Any) -> str:
     text = str(value or "").strip().lower()
     return text if _valid_id(text) else "unknown"
+
+
+_IDEMPOTENT_EVENT_TYPES = {
+    "turn.started",
+    "provider.started",
+    "turn.completed",
+    "turn.failed",
+}

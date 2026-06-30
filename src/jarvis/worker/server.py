@@ -43,6 +43,7 @@ from jarvis.worker.actions import (
     take_screenshot,
 )
 from jarvis.worker.jobs import JobManager, slugify
+from jarvis.worker.providers import ProviderTurn, provider_for
 from jarvis.worker.sessions import SessionManager
 
 
@@ -398,7 +399,19 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         session_id = request.match_info["id"]
         if sessions.get(session_id) is None:
             return web.json_response({"error": "no such session"}, status=404)
-        return web.json_response({"events": [event.to_dict() for event in sessions.events(session_id)]})
+        limit = _query_limit(request.query.get("limit"))
+        return web.json_response(
+            {
+                "events": [
+                    event.to_dict()
+                    for event in sessions.events(
+                        session_id,
+                        after=str(request.query.get("after") or ""),
+                        limit=limit,
+                    )
+                ]
+            }
+        )
 
     async def start_session_turn(request: web.Request) -> web.Response:
         if not authorised(request):
@@ -411,46 +424,92 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             body = await request.json()
         except Exception:
             return web.json_response({"error": "bad json"}, status=400)
-        turn_id = str(body.get("turn_id") or uuid.uuid4().hex)
+        turn_id = _clean_request_id(body.get("turn_id") or uuid.uuid4().hex, "turn")
+        idempotency_key = str(body.get("idempotency_key") or "").strip()
+        existing_events = _events_for_idempotency(sessions, session.session_id, idempotency_key)
+        if existing_events:
+            existing_turn_id = str(existing_events[0].data.get("turn_id") or turn_id)
+            return web.json_response(
+                {
+                    "ok": True,
+                    "session": session.to_dict(),
+                    "turn_id": existing_turn_id,
+                    "events": [event.to_dict() for event in existing_events],
+                    "idempotent": True,
+                }
+            )
+        try:
+            adapter = provider_for(session.provider)
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
         sessions.update_status(session.session_id, "running")
         started = sessions.append_event(
             session.session_id,
             "turn.started",
-            {"turn_id": turn_id, "prompt": str(body.get("prompt") or ""), "metadata": dict(body.get("metadata") or {})},
+            {
+                "turn_id": turn_id,
+                "prompt": str(body.get("prompt") or ""),
+                "metadata": dict(body.get("metadata") or {}),
+                "idempotency_key": idempotency_key,
+            },
         )
-        waiting = sessions.append_event(
-            session.session_id,
-            "turn.waiting_provider",
-            {"turn_id": turn_id, "message": "provider adapter not attached yet"},
-        )
+        try:
+            provider_events = adapter.start_turn(
+                session=session,
+                turn=ProviderTurn(
+                    turn_id=turn_id,
+                    prompt=str(body.get("prompt") or ""),
+                    metadata=dict(body.get("metadata") or {}),
+                    idempotency_key=idempotency_key,
+                ),
+                sessions=sessions,
+                worker_cfg=cfg,
+            )
+        except RuntimeError as exc:
+            sessions.update_status(session.session_id, "failed")
+            failed = sessions.append_event(
+                session.session_id,
+                "turn.failed",
+                {"turn_id": turn_id, "idempotency_key": idempotency_key, "error": str(exc)},
+            )
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": str(exc),
+                    "session": sessions.get(session.session_id).to_dict(),  # type: ignore[union-attr]
+                    "turn_id": turn_id,
+                    "events": [started.to_dict(), failed.to_dict()],
+                },
+                status=400,
+            )
         return web.json_response(
             {
                 "ok": True,
                 "session": sessions.get(session.session_id).to_dict(),  # type: ignore[union-attr]
                 "turn_id": turn_id,
-                "events": [started.to_dict(), waiting.to_dict()],
+                "events": [started.to_dict(), *[event.to_dict() for event in provider_events]],
             }
         )
 
     async def session_input(request: web.Request) -> web.Response:
         if not authorised(request):
             return web.json_response({"error": "unauthorized"}, status=401)
-        return await _append_session_control_event(request, sessions, "input.received")
+        return await _provider_control_event(request, sessions, "input")
 
     async def session_approval(request: web.Request) -> web.Response:
         if not authorised(request):
             return web.json_response({"error": "unauthorized"}, status=401)
-        return await _append_session_control_event(request, sessions, "approval.resolved")
+        return await _provider_control_event(request, sessions, "approval")
 
     async def session_interrupt(request: web.Request) -> web.Response:
         if not authorised(request):
             return web.json_response({"error": "unauthorized"}, status=401)
-        return await _terminal_session_event(request, sessions, "interrupted", "session.interrupted")
+        return await _provider_terminal_event(request, sessions, "interrupt")
 
     async def session_stop(request: web.Request) -> web.Response:
         if not authorised(request):
             return web.json_response({"error": "unauthorized"}, status=401)
-        return await _terminal_session_event(request, sessions, "stopped", "session.stopped")
+        return await _provider_terminal_event(request, sessions, "stop")
 
     async def health(_request: web.Request) -> web.Response:
         return web.json_response(
@@ -504,6 +563,59 @@ async def _append_session_control_event(
     return web.json_response({"ok": True, "event": event.to_dict()})
 
 
+async def _provider_control_event(
+    request: web.Request,
+    sessions: SessionManager,
+    action: str,
+) -> web.Response:
+    session_id = request.match_info["id"]
+    session = sessions.get(session_id)
+    if session is None:
+        return web.json_response({"error": "no such session"}, status=404)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "bad json"}, status=400)
+    try:
+        adapter = provider_for(session.provider)
+    except ValueError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    if action == "approval":
+        handler = getattr(adapter, "resolve_approval", None)
+    else:
+        handler = getattr(adapter, "receive_input", None)
+    if handler is None:
+        event_type = "approval.resolved" if action == "approval" else "input.received"
+        event = sessions.append_event(session.session_id, event_type, dict(body or {}))
+    else:
+        event = handler(session=session, request=dict(body or {}), sessions=sessions)
+    return web.json_response({"ok": True, "event": event.to_dict()})
+
+
+async def _provider_terminal_event(
+    request: web.Request,
+    sessions: SessionManager,
+    action: str,
+) -> web.Response:
+    session_id = request.match_info["id"]
+    session = sessions.get(session_id)
+    if session is None:
+        return web.json_response({"error": "no such session"}, status=404)
+    try:
+        adapter = provider_for(session.provider)
+    except ValueError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    handler = getattr(adapter, action, None)
+    if handler is None:
+        status = "stopped" if action == "stop" else "interrupted"
+        event_type = "session.stopped" if action == "stop" else "session.interrupted"
+        updated = sessions.update_status(session.session_id, status)
+        event = sessions.append_event(session.session_id, event_type, {"status": status})
+    else:
+        updated, event = handler(session=session, sessions=sessions)
+    return web.json_response({"ok": True, "session": updated.to_dict(), "event": event.to_dict()})
+
+
 async def _terminal_session_event(
     request: web.Request,
     sessions: SessionManager,
@@ -527,6 +639,34 @@ def _resume_cwd(cwd: str, workspace: pathlib.Path) -> tuple[str, str]:
     if not path.is_dir():
         return "", f"resume cwd does not exist: {cwd}"
     return str(path), ""
+
+
+def _query_limit(value: str | None) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        limit = int(value)
+    except ValueError:
+        return None
+    return max(0, min(limit, 1000))
+
+
+def _clean_request_id(value: object, prefix: str) -> str:
+    text = str(value or "").strip()
+    if text and all(ch.isalnum() or ch in {"_", "-"} for ch in text):
+        return text
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def _events_for_idempotency(
+    sessions: SessionManager,
+    session_id: str,
+    idempotency_key: str,
+) -> list:
+    key = idempotency_key.strip()
+    if not key:
+        return []
+    return [event for event in sessions.events(session_id) if str(event.data.get("idempotency_key") or "") == key]
 
 
 def _running_workspace_refs(items: list) -> set[str]:

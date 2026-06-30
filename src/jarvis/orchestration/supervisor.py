@@ -8,9 +8,9 @@ from typing import Any
 import httpx
 
 from jarvis.config import WorkerConfig
-from jarvis.orchestration.models import OrchestrationRun, WorkerProfile
+from jarvis.orchestration.models import OrchestrationRun
 from jarvis.orchestration.store import OrchestrationStore
-from jarvis.orchestration.workers import WorkerRegistry
+from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry
 
 TERMINAL_JOB_STATUSES = {"done", "error", "interrupted"}
 
@@ -20,6 +20,9 @@ class SyncSummary:
     runs_seen: int = 0
     jobs_seen: int = 0
     jobs_updated: int = 0
+    sessions_seen: int = 0
+    sessions_updated: int = 0
+    session_events_seen: int = 0
     runs_completed: int = 0
     runs_failed: int = 0
     errors: list[str] | None = None
@@ -29,6 +32,9 @@ class SyncSummary:
             "runs_seen": self.runs_seen,
             "jobs_seen": self.jobs_seen,
             "jobs_updated": self.jobs_updated,
+            "sessions_seen": self.sessions_seen,
+            "sessions_updated": self.sessions_updated,
+            "session_events_seen": self.session_events_seen,
             "runs_completed": self.runs_completed,
             "runs_failed": self.runs_failed,
             "errors": self.errors or [],
@@ -99,11 +105,96 @@ def sync_run_jobs(
     return summary
 
 
+def sync_run_sessions(
+    store: OrchestrationStore,
+    *,
+    worker_cfg: WorkerConfig,
+    workers_path: str = "",
+    run_id: str = "",
+    get: Callable[..., Any] | None = None,
+) -> SyncSummary:
+    """Refresh run graph session state from worker daemon session records."""
+
+    http_get = get or httpx.get
+    registry = WorkerRegistry(worker_cfg, profiles_path=workers_path)
+    runs = _session_runs_to_sync(store, run_id)
+    summary = SyncSummary(errors=[])
+    summary.runs_seen = len(runs)
+    for run in runs:
+        for link in run.sessions:
+            summary.sessions_seen += 1
+            profile = _profile_for_job(registry, worker_cfg, link.worker_id)
+            if profile is None:
+                _record_sync_error(store, run.run_id, link.session_id, f"worker {link.worker_id!r} is not configured")
+                summary.errors.append(f"{run.run_id}:{link.session_id}: worker not configured")
+                continue
+            headers = _headers_for_worker(worker_cfg, profile)
+            try:
+                response = http_get(
+                    f"{profile.base_url}/sessions/{link.session_id}",
+                    headers=headers,
+                    timeout=worker_cfg.request_timeout_s,
+                )
+                status_code = getattr(response, "status_code", 200)
+                if status_code >= 400:
+                    raise RuntimeError(_response_error(response, status_code))
+                data = response.json()
+                events_response = http_get(
+                    f"{profile.base_url}/sessions/{link.session_id}/events",
+                    headers=headers,
+                    params={"after": link.last_event_id} if link.last_event_id else {},
+                    timeout=worker_cfg.request_timeout_s,
+                )
+                event_status = getattr(events_response, "status_code", 200)
+                if event_status >= 400:
+                    raise RuntimeError(_response_error(events_response, event_status))
+                event_data = events_response.json()
+            except Exception as exc:  # noqa: BLE001 - sync must not make inspection unusable
+                _record_sync_error(store, run.run_id, link.session_id, str(exc))
+                summary.errors.append(f"{run.run_id}:{link.session_id}: {exc}")
+                continue
+            events = event_data.get("events") or []
+            last_event_id = str(events[-1].get("event_id") or link.last_event_id) if events else link.last_event_id
+            before = link.to_dict()
+            store.update_session(
+                run.run_id,
+                link.session_id,
+                status=str(data.get("status") or link.status),
+                provider=str(data.get("provider") or link.provider or ""),
+                engine=str(data.get("engine") or link.engine or ""),
+                branch=str(data.get("branch") or link.branch or ""),
+                cwd=str(data.get("cwd") or link.cwd or ""),
+                last_event_id=last_event_id,
+            )
+            summary.session_events_seen += len(events)
+            reloaded = store.get(run.run_id)
+            if reloaded is not None:
+                updated = next((x for x in reloaded.sessions if x.session_id == link.session_id), link)
+                if updated.to_dict() != before:
+                    summary.sessions_updated += 1
+                run = reloaded
+        final = _final_session_phase(run)
+        if final == "completed":
+            store.set_phase(run.run_id, "completed", "All worker sessions completed")
+            summary.runs_completed += 1
+        elif final == "failed":
+            store.set_phase(run.run_id, "failed", "At least one worker session failed, stopped, or was interrupted")
+            summary.runs_failed += 1
+    return summary
+
+
 def _runs_to_sync(store: OrchestrationStore, run_id: str) -> list[OrchestrationRun]:
     if run_id:
         run = store.get(run_id)
         return [] if run is None else [run]
     return [run for run in store.list_runs() if run.status != "terminal" and run.jobs]
+
+
+def _session_runs_to_sync(store: OrchestrationStore, run_id: str) -> list[OrchestrationRun]:
+    if run_id:
+        run = store.get(run_id)
+        return [] if run is None else [run]
+    return [run for run in store.list_runs() if run.status != "terminal" and run.sessions]
 
 
 def _profile_for_job(registry: WorkerRegistry, worker_cfg: WorkerConfig, worker_id: str) -> WorkerProfile | None:
@@ -156,6 +247,19 @@ def _final_phase(run: OrchestrationRun) -> str:
     if statuses == {"done"}:
         return "completed"
     return "failed"
+
+
+def _final_session_phase(run: OrchestrationRun) -> str:
+    if not run.sessions or run.status == "terminal":
+        return ""
+    statuses = {session.status for session in run.sessions}
+    if statuses & {"running", "created", "waiting_provider", "waiting_input", "waiting_approval"}:
+        return ""
+    if statuses <= {"completed", "done"}:
+        return "completed"
+    if statuses & {"failed", "error", "interrupted", "stopped"}:
+        return "failed"
+    return ""
 
 
 def _effective_terminal_statuses(run: OrchestrationRun) -> set[str]:

@@ -6,7 +6,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from jarvis.orchestration.models import WorkCommand, new_id
+from jarvis.ids import new_id
+from jarvis.orchestration.models import WorkCommand
 
 
 @dataclass

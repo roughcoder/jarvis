@@ -19,13 +19,9 @@ import uuid
 from collections.abc import Awaitable
 from dataclasses import asdict, dataclass, field
 
+from jarvis.text import slugify
+
 _SESSION_ID = re.compile(r"session id:\s*(\S+)", re.IGNORECASE)
-
-
-def slugify(text: str, max_words: int = 6) -> str:
-    """A short, file- and speech-friendly handle from free text."""
-    words = re.findall(r"[a-z0-9]+", text.lower())[:max_words]
-    return "-".join(words) or "job"
 
 
 @dataclass
