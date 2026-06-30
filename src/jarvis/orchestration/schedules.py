@@ -4,6 +4,7 @@ import json
 import pathlib
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from jarvis.ids import new_id
@@ -81,6 +82,20 @@ class Schedule:
         self.last_fired_date = now.astimezone(ZoneInfo(self.timezone)).date().isoformat()
 
 
+@dataclass
+class ScheduleDispatchResult:
+    schedule_id: str
+    name: str
+    status: str
+    message: str = ""
+    run_id: str = ""
+    session_id: str = ""
+    command: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class ScheduleStore:
     def __init__(self, path: str) -> None:
         self.path = pathlib.Path(path).expanduser()
@@ -148,6 +163,88 @@ class ScheduleStore:
         return acked
 
 
+def dispatch_due_schedules(
+    schedule_store: ScheduleStore,
+    *,
+    now: datetime,
+    service: Any,
+    run_store: Any,
+) -> list[ScheduleDispatchResult]:
+    results: list[ScheduleDispatchResult] = []
+    for schedule in schedule_store.due(now):
+        if schedule.policy.skip_if_active and _active_schedule_run(run_store, schedule.schedule_id):
+            schedule_store.ack(schedule.schedule_id, now)
+            results.append(
+                ScheduleDispatchResult(
+                    schedule_id=schedule.schedule_id,
+                    name=schedule.name,
+                    status="skipped_active",
+                    message="Skipped because an earlier scheduled run is still active.",
+                    command=schedule.command.to_dict(),
+                )
+            )
+            continue
+        try:
+            started = service.next_work(schedule.command, start=True)
+        except Exception as exc:  # noqa: BLE001 - a failed dispatch must not ack/drop the schedule
+            results.append(
+                ScheduleDispatchResult(
+                    schedule_id=schedule.schedule_id,
+                    name=schedule.name,
+                    status="failed",
+                    message=str(exc),
+                    command=schedule.command.to_dict(),
+                )
+            )
+            continue
+        if started is None:
+            run_id = ""
+            if schedule.policy.report_on_no_work:
+                run = run_store.create_run(f"Schedule {schedule.name}: no work")
+                run_store.append_event(
+                    run.run_id,
+                    "schedule_no_work",
+                    "Schedule fired and found no work.",
+                    {"schedule_id": schedule.schedule_id, "command": schedule.command.to_dict()},
+                )
+                run_store.set_phase(run.run_id, "done", "No work found for schedule.")
+                run_id = run.run_id
+            schedule_store.ack(schedule.schedule_id, now)
+            results.append(
+                ScheduleDispatchResult(
+                    schedule_id=schedule.schedule_id,
+                    name=schedule.name,
+                    status="no_work",
+                    message="No work found.",
+                    run_id=run_id,
+                    command=schedule.command.to_dict(),
+                )
+            )
+            continue
+        run_id = getattr(getattr(started, "envelope", None), "run_id", "")
+        session_id = getattr(getattr(started, "session", None), "session_id", "")
+        if run_id:
+            run_store.append_event(
+                run_id,
+                "schedule_fired",
+                f"Schedule {schedule.name} dispatched.",
+                {"schedule_id": schedule.schedule_id, "command": schedule.command.to_dict()},
+            )
+        schedule_store.ack(schedule.schedule_id, now)
+        results.append(
+            ScheduleDispatchResult(
+                schedule_id=schedule.schedule_id,
+                name=schedule.name,
+                status="started",
+                message="Scheduled work started.",
+                run_id=run_id,
+                session_id=session_id,
+                command=schedule.command.to_dict(),
+            )
+        )
+    return results
+
+
 def _validate_time(hour: int, minute: int) -> None:
     if hour < 0 or hour > 23:
         raise ValueError("hour must be between 0 and 23")
@@ -160,3 +257,13 @@ def _validate_weekdays(weekdays: list[int]) -> None:
         raise ValueError("weekdays must not be empty")
     if any(day < 0 or day > 6 for day in weekdays):
         raise ValueError("weekdays must be between 0 and 6")
+
+
+def _active_schedule_run(run_store: Any, schedule_id: str) -> bool:
+    for run in run_store.list_runs():
+        if getattr(run, "status", "") == "terminal":
+            continue
+        for event in run_store.events(run.run_id):
+            if event.type == "schedule_fired" and event.data.get("schedule_id") == schedule_id:
+                return True
+    return False

@@ -413,6 +413,56 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             }
         )
 
+    async def get_session_requests(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        session_id = request.match_info["id"]
+        if sessions.get(session_id) is None:
+            return web.json_response({"error": "no such session"}, status=404)
+        return web.json_response({"requests": sessions.pending_requests(session_id)})
+
+    async def list_session_requests(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return web.json_response({"requests": sessions.pending_requests()})
+
+    async def get_session_checkpoints(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        session_id = request.match_info["id"]
+        if sessions.get(session_id) is None:
+            return web.json_response({"error": "no such session"}, status=404)
+        return web.json_response({"checkpoints": sessions.checkpoints(session_id)})
+
+    async def restore_session_checkpoint(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        session_id = request.match_info["id"]
+        session = sessions.get(session_id)
+        if session is None:
+            return web.json_response({"error": "no such session"}, status=404)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "bad json"}, status=400)
+        checkpoint_id = str(body.get("checkpoint_id") or "").strip()
+        if not checkpoint_id:
+            return web.json_response({"error": "checkpoint_id is required"}, status=400)
+        known = {x["checkpoint_id"] for x in sessions.checkpoints(session.session_id)}
+        if checkpoint_id not in known:
+            return web.json_response({"error": "no such checkpoint"}, status=404)
+        try:
+            adapter = provider_for(session.provider)
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        handler = getattr(adapter, "restore_checkpoint", None)
+        request_data = {"checkpoint_id": checkpoint_id, "metadata": dict(body.get("metadata") or {})}
+        if handler is None:
+            event = sessions.append_event(session.session_id, "checkpoint.restored", request_data)
+        else:
+            event = handler(session=session, request=request_data, sessions=sessions)
+        return web.json_response({"ok": True, "event": event.to_dict()})
+
     async def start_session_turn(request: web.Request) -> web.Response:
         if not authorised(request):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -534,7 +584,11 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         web.get("/jobs", list_jobs),
         web.post("/sessions", create_session),
         web.get("/sessions", list_sessions),
+        web.get("/sessions/requests", list_session_requests),
         web.get("/sessions/{id}/events", get_session_events),
+        web.get("/sessions/{id}/requests", get_session_requests),
+        web.get("/sessions/{id}/checkpoints", get_session_checkpoints),
+        web.post("/sessions/{id}/checkpoints/restore", restore_session_checkpoint),
         web.post("/sessions/{id}/turns", start_session_turn),
         web.post("/sessions/{id}/input", session_input),
         web.post("/sessions/{id}/approval", session_approval),

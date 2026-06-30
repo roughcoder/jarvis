@@ -286,8 +286,8 @@ def _project_claude_message(
     elif message_type == "result":
         is_error = subtype not in {"success", "done", "completed"}
         event_type = "turn.failed" if is_error else "turn.completed"
-        sessions.append_event(session_id, event_type, {**common, "provider_status": subtype or message_type, "raw": message})
         sessions.update_status(session_id, "failed" if is_error else "completed")
+        sessions.append_event(session_id, event_type, {**common, "provider_status": subtype or message_type, "raw": message})
         return True
     elif message_type:
         sessions.append_event(session_id, "provider.event", {**common, "raw": message})

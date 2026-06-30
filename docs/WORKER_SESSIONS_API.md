@@ -7,6 +7,9 @@ may remain as an internal transition/debug path, but new coding orchestration
 should target `/sessions`, which owns long-lived provider sessions and structured
 events.
 
+The implementation plan and continuation context for this pivot live in
+`docs/AGENTIC_WORKER_SESSION_PLAN.md`.
+
 No new agentic coding path may dispatch through `/run` or `WorkerJob`. Any
 remaining `/run` use must be non-agentic shell, scratch, or explicit debug
 plumbing outside `WorkCommand` / `ExecutionEnvelope` coding flows.
@@ -126,6 +129,59 @@ Inspect a single session.
 
 Read the append-only event stream for a session.
 
+Query parameters:
+
+- `after`: event id cursor.
+- `limit`: maximum events, capped by the worker.
+
+### `GET /sessions/requests`
+
+List pending approval and input requests across all worker sessions. This is a
+derived view over append-only events, not a second state store.
+
+Response:
+
+```json
+{
+  "requests": [
+    {
+      "session_id": "sess_1760000000_abcd1234",
+      "request_id": "approval_turn_1",
+      "kind": "approval",
+      "status": "pending",
+      "event": {"type": "approval.requested"}
+    }
+  ]
+}
+```
+
+### `GET /sessions/:id/requests`
+
+List pending approval and input requests for one session. A request is pending
+when the stream has `approval.requested` or `input.requested` without a matching
+`approval.resolved` or `input.received` event for the same `request_id`.
+
+### `GET /sessions/:id/checkpoints`
+
+List provider checkpoints projected from `checkpoint.created` events.
+
+Response:
+
+```json
+{
+  "checkpoints": [
+    {
+      "session_id": "sess_1760000000_abcd1234",
+      "checkpoint_id": "ckpt_turn_1",
+      "label": "before review fixes",
+      "provider": "codex",
+      "restored": false,
+      "event": {"type": "checkpoint.created"}
+    }
+  ]
+}
+```
+
 ### `POST /sessions/:id/turns`
 
 Start or enqueue a provider turn. Jarvis records `turn.started`, then the
@@ -192,6 +248,22 @@ Request:
 
 Emits `approval.resolved`.
 
+### `POST /sessions/:id/checkpoints/restore`
+
+Ask the provider adapter to restore a known checkpoint. The worker validates the
+checkpoint id against the session event stream before calling the provider.
+
+Request:
+
+```json
+{
+  "checkpoint_id": "ckpt_turn_1",
+  "metadata": {"surface": "t3"}
+}
+```
+
+Emits `checkpoint.restored` when accepted.
+
 ### `POST /sessions/:id/interrupt`
 
 Interrupt the live provider turn without deleting session state. Emits
@@ -242,9 +314,26 @@ For a T3 fork:
 - Render `SessionEvent[]` as the timeline.
 - Send user replies to `/sessions/:id/input`.
 - Send approvals to `/sessions/:id/approval`.
+- Read pending questions/approvals from `/sessions/requests`.
+- Read checkpoint options from `/sessions/:id/checkpoints` and restore through
+  `/sessions/:id/checkpoints/restore`.
 - Use `/sessions/:id/interrupt` and `/sessions/:id/stop` for control buttons.
 - Link PRs, branches, and evidence through Jarvis artifacts, not a UI-local
   project model.
+
+Useful CLI equivalents:
+
+```bash
+jarvis sessions --requests all
+jarvis sessions --requests sess_1760000000_abcd1234
+jarvis sessions --input sess_1760000000_abcd1234 --text "Use the existing pattern."
+jarvis sessions --approval sess_1760000000_abcd1234 --request-id approval_turn_1 --decision denied
+jarvis sessions --checkpoints sess_1760000000_abcd1234
+jarvis sessions --restore-checkpoint sess_1760000000_abcd1234 --checkpoint-id ckpt_turn_1
+jarvis schedules tick --dispatch --json
+jarvis work next --start --engine-strategy ensemble --engine codex,claude
+jarvis runs --report run_1760000000_abcd1234 --public-comment
+```
 
 Provider adapters are expected to map Codex app-server JSON-RPC, Claude stream
 JSON / Claude Agent SDK events, Cursor, and OpenCode into this canonical event

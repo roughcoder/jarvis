@@ -210,6 +210,126 @@ def test_daemon_session_api_records_structured_events(tmp_path) -> None:
     assert fetched["status"] == "interrupted"
 
 
+def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={"provider": "fake", "engine": "fake", "title": "Pending request"},
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        approval_turn = (
+            await c.post(
+                f"{base}/sessions/{session_id}/turns",
+                json={"turn_id": "turn_need_approval", "prompt": "request approval"},
+                headers=headers,
+            )
+        ).json()
+        pending_before = (await c.get(f"{base}/sessions/{session_id}/requests", headers=headers)).json()
+        global_pending = (await c.get(f"{base}/sessions/requests", headers=headers)).json()
+        denied = (
+            await c.post(
+                f"{base}/sessions/{session_id}/approval",
+                json={"request_id": "approval_turn_need_approval", "decision": "denied"},
+                headers=headers,
+            )
+        ).json()
+        pending_after = (await c.get(f"{base}/sessions/{session_id}/requests", headers=headers)).json()
+        input_turn = (
+            await c.post(
+                f"{base}/sessions/{session_id}/turns",
+                json={"turn_id": "turn_need_input", "prompt": "request input"},
+                headers=headers,
+            )
+        ).json()
+        input_pending = (await c.get(f"{base}/sessions/{session_id}/requests", headers=headers)).json()
+        input_reply = (
+            await c.post(
+                f"{base}/sessions/{session_id}/input",
+                json={"request_id": "input_turn_need_input", "text": "continue"},
+                headers=headers,
+            )
+        ).json()
+        input_pending_after = (await c.get(f"{base}/sessions/{session_id}/requests", headers=headers)).json()
+        checkpoint_turn = (
+            await c.post(
+                f"{base}/sessions/{session_id}/turns",
+                json={"turn_id": "turn_checkpoint", "prompt": "complete normally"},
+                headers=headers,
+            )
+        ).json()
+        checkpoints = (await c.get(f"{base}/sessions/{session_id}/checkpoints", headers=headers)).json()
+        restored = (
+            await c.post(
+                f"{base}/sessions/{session_id}/checkpoints/restore",
+                json={"checkpoint_id": "ckpt_turn_checkpoint"},
+                headers=headers,
+            )
+        ).json()
+        checkpoints_after_restore = (await c.get(f"{base}/sessions/{session_id}/checkpoints", headers=headers)).json()
+        events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+        return (
+            approval_turn,
+            pending_before,
+            global_pending,
+            denied,
+            pending_after,
+            input_turn,
+            input_pending,
+            input_reply,
+            input_pending_after,
+            checkpoint_turn,
+            checkpoints,
+            restored,
+            checkpoints_after_restore,
+            events,
+        )
+
+    (
+        approval_turn,
+        pending_before,
+        global_pending,
+        denied,
+        pending_after,
+        input_turn,
+        input_pending,
+        input_reply,
+        input_pending_after,
+        checkpoint_turn,
+        checkpoints,
+        restored,
+        checkpoints_after_restore,
+        events,
+    ) = asyncio.run(_with_server(cfg, 8830, calls))
+
+    assert [event["type"] for event in approval_turn["events"]] == ["turn.started", "approval.requested"]
+    assert pending_before["requests"][0]["kind"] == "approval"
+    assert pending_before["requests"][0]["request_id"] == "approval_turn_need_approval"
+    assert global_pending["requests"][0]["session_id"] == pending_before["requests"][0]["session_id"]
+    assert denied["event"]["type"] == "approval.resolved"
+    assert pending_after["requests"] == []
+    assert [event["type"] for event in input_turn["events"]] == ["turn.started", "input.requested"]
+    assert input_pending["requests"][0]["request_id"] == "input_turn_need_input"
+    assert input_reply["event"]["type"] == "input.received"
+    assert input_pending_after["requests"] == []
+    assert [event["type"] for event in checkpoint_turn["events"]] == [
+        "turn.started",
+        "assistant.delta",
+        "assistant.message",
+        "checkpoint.created",
+        "turn.completed",
+    ]
+    assert checkpoints["checkpoints"][0]["checkpoint_id"] == "ckpt_turn_checkpoint"
+    assert restored["event"]["type"] == "checkpoint.restored"
+    assert checkpoints_after_restore["checkpoints"][0]["restored"] is True
+    assert "turn.failed" in [event["type"] for event in events]
+
+
 def test_daemon_codex_provider_projects_app_server_events(tmp_path) -> None:
     agent = tmp_path / "fake-codex"
     agent.write_text(
