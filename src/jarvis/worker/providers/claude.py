@@ -47,7 +47,7 @@ class ClaudeProviderAdapter:
         sessions: SessionManager,
         worker_cfg: WorkerConfig,
     ) -> list[SessionEvent]:
-        authority = WorkerSessionAuthority.from_session(session)
+        authority = WorkerSessionAuthority.from_session(session, provider=self.provider)
         sessions.update_status(session.session_id, "running")
         claude_session_id = _claude_session_id(session)
         sessions.update_metadata(

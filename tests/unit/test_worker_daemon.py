@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import pathlib
 import subprocess
+import threading
 
 import httpx
 import pytest
@@ -18,8 +19,18 @@ import pytest
 pytest.importorskip("aiohttp")
 from aiohttp import web  # noqa: E402
 
+from jarvis.capabilities import (  # noqa: E402
+    FORGE_BRANCH_PUSH,
+    FORGE_PR_CREATE,
+    WORKER_SESSION_APPROVE,
+    WORKER_SESSION_INPUT,
+    WORKER_SESSION_TURN,
+)
 from jarvis.config import WorkerConfig  # noqa: E402
 from jarvis.worker.server import make_app  # noqa: E402
+from jarvis.worker.authority import WorkerSessionAuthority  # noqa: E402
+from jarvis.worker.sessions import WorkerSession  # noqa: E402
+from jarvis.worker.sessions import SessionManager  # noqa: E402
 
 
 async def _with_server(cfg: WorkerConfig, port: int, fn):  # noqa: ANN001
@@ -47,6 +58,110 @@ def _authority_metadata(engine: str = "codex") -> dict:
         "allowed_actions": allowed_actions,
         "landing": landing,
     }
+
+
+def _session_with_authority(
+    *,
+    provider: str = "codex",
+    allowed_actions: list[str] | None = None,
+    landing: dict | None = None,
+) -> WorkerSession:
+    return WorkerSession(
+        session_id="sess_authority",
+        provider=provider,
+        engine=provider,
+        metadata={
+            "execution_envelope": {
+                "allowed_actions": allowed_actions or [WORKER_SESSION_TURN],
+                "landing": landing or {"mode": "read_only", "allow_merge": False},
+            }
+        },
+    )
+
+
+def test_worker_session_authority_maps_read_only_to_codex_read_only() -> None:
+    authority = WorkerSessionAuthority.from_session(_session_with_authority())
+
+    assert authority.codex_sandbox == "read-only"
+    assert authority.codex_approval_policy == "never"
+
+
+def test_worker_session_authority_maps_branch_only_to_workspace_write() -> None:
+    authority = WorkerSessionAuthority.from_session(
+        _session_with_authority(
+            allowed_actions=[WORKER_SESSION_TURN, FORGE_BRANCH_PUSH],
+            landing={"mode": "branch_only", "allow_merge": False},
+        )
+    )
+
+    assert authority.codex_sandbox == "workspace-write"
+    assert authority.codex_approval_policy == "never"
+    assert authority.claude_permission_mode == "dontAsk"
+
+
+def test_worker_session_authority_maps_draft_pr_and_approval_modes() -> None:
+    authority = WorkerSessionAuthority.from_session(
+        _session_with_authority(
+            allowed_actions=[
+                WORKER_SESSION_TURN,
+                WORKER_SESSION_INPUT,
+                WORKER_SESSION_APPROVE,
+                FORGE_BRANCH_PUSH,
+                FORGE_PR_CREATE,
+            ],
+            landing={"mode": "draft_pr", "allow_merge": False},
+        )
+    )
+
+    assert authority.codex_sandbox == "workspace-write"
+    assert authority.codex_approval_policy == "on-request"
+    assert authority.claude_permission_mode == "default"
+
+
+def test_worker_session_authority_fails_closed_for_unsupported_landing() -> None:
+    with pytest.raises(RuntimeError, match=FORGE_PR_CREATE):
+        WorkerSessionAuthority.from_session(
+            _session_with_authority(
+                allowed_actions=[WORKER_SESSION_TURN, FORGE_BRANCH_PUSH],
+                landing={"mode": "draft_pr", "allow_merge": False},
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="read-only"):
+        WorkerSessionAuthority.from_session(_session_with_authority(provider="claude"), provider="claude")
+
+
+def test_session_manager_serializes_concurrent_session_writes(tmp_path) -> None:
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create({"provider": "fake", "engine": "fake"})
+
+    def append_events() -> None:
+        for idx in range(40):
+            sessions.append_event(session.session_id, "provider.log", {"idx": idx})
+
+    def update_metadata() -> None:
+        for idx in range(40):
+            sessions.update_metadata(session.session_id, {f"k{idx}": str(idx)})
+
+    def update_status() -> None:
+        for _ in range(40):
+            sessions.update_status(session.session_id, "running")
+
+    threads = [
+        threading.Thread(target=append_events),
+        threading.Thread(target=update_metadata),
+        threading.Thread(target=update_status),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    fetched = sessions.get(session.session_id)
+    assert fetched is not None
+    assert fetched.status == "running"
+    assert fetched.metadata["k39"] == "39"
+    assert len([event for event in sessions.events(session.session_id) if event.type == "provider.log"]) == 40
 
 
 def test_daemon_health_shell_and_auth(tmp_path) -> None:
@@ -565,6 +680,313 @@ for line in sys.stdin:
     assert interrupted["session"]["status"] == "interrupted"
     assert fetched["status"] == "interrupted"
     assert "turn.failed" not in [event["type"] for event in events]
+
+
+def test_daemon_codex_stop_preserves_stopped_status(tmp_path) -> None:
+    agent = tmp_path / "fake-codex-stop"
+    agent.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+import time
+
+
+def emit(payload):
+    print(json.dumps(payload), flush=True)
+
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    payload = json.loads(line)
+    method = payload.get("method")
+    request_id = payload.get("id")
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method in {"thread/start", "thread/resume"}:
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {"thread": {"id": "thread_stop"}}})
+    elif method == "turn/start":
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {"turn": {"id": "turn_stop"}}})
+        emit({"jsonrpc": "2.0", "method": "turn/started", "params": {"turn": {"id": "turn_stop"}}})
+        while True:
+            time.sleep(1)
+"""
+    )
+    agent.chmod(0o755)
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="tkn",
+        workspace=str(tmp_path / "worker"),
+        codex_bin=str(agent),
+        job_timeout_s=5,
+    )
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "run_id": "run_codex",
+                    "provider": "codex",
+                    "engine": "codex",
+                    "title": "Stop Codex",
+                    "metadata": _authority_metadata("codex"),
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        await c.post(
+            f"{base}/sessions/{session_id}/turns",
+            json={"prompt": "wait", "idempotency_key": "idem_codex_stop"},
+            headers=headers,
+        )
+        events = []
+        for _ in range(100):
+            events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+            if any(event["type"] == "provider.process.started" for event in events):
+                break
+            await asyncio.sleep(0.05)
+        stopped = (await c.post(f"{base}/sessions/{session_id}/stop", json={}, headers=headers)).json()
+        await asyncio.sleep(0.2)
+        fetched = (await c.get(f"{base}/sessions/{session_id}", headers=headers)).json()
+        events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+        return stopped, fetched, events
+
+    stopped, fetched, events = asyncio.run(_with_server(cfg, 8835, calls))
+
+    assert stopped["session"]["status"] == "stopped"
+    assert fetched["status"] == "stopped"
+    assert "turn.failed" not in [event["type"] for event in events]
+
+
+def test_daemon_codex_approval_waits_for_endpoint_resolution(tmp_path) -> None:
+    agent = tmp_path / "fake-codex-approval"
+    agent.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+
+
+def emit(payload):
+    print(json.dumps(payload), flush=True)
+
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    payload = json.loads(line)
+    method = payload.get("method")
+    request_id = payload.get("id")
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method in {"thread/start", "thread/resume"}:
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {"thread": {"id": "thread_approval"}}})
+    elif method == "turn/start":
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {"turn": {"id": "turn_approval"}}})
+        emit({"jsonrpc": "2.0", "method": "turn/started", "params": {"turn": {"id": "turn_approval"}}})
+        emit({
+            "jsonrpc": "2.0",
+            "id": "approval_rpc",
+            "method": "item/commandExecution/requestApproval",
+            "params": {"command": "pytest", "cwd": "/tmp"},
+        })
+    elif request_id == "approval_rpc":
+        emit({
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": {"item": {"type": "agentMessage", "text": payload["result"]["decision"]}},
+        })
+        emit({
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {"turn": {"id": "turn_approval", "status": "completed"}},
+        })
+"""
+    )
+    agent.chmod(0o755)
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="tkn",
+        workspace=str(tmp_path / "worker"),
+        codex_bin=str(agent),
+        job_timeout_s=5,
+    )
+    headers = {"Authorization": "Bearer tkn"}
+    metadata = _authority_metadata("codex")
+    metadata["execution_envelope"]["allowed_actions"].append(WORKER_SESSION_APPROVE)
+    metadata["allowed_actions"].append(WORKER_SESSION_APPROVE)
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "run_id": "run_codex",
+                    "provider": "codex",
+                    "engine": "codex",
+                    "title": "Approve Codex",
+                    "metadata": metadata,
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        await c.post(
+            f"{base}/sessions/{session_id}/turns",
+            json={"prompt": "ask approval", "idempotency_key": "idem_codex_approval"},
+            headers=headers,
+        )
+        pending = {}
+        events = []
+        for _ in range(100):
+            pending = (await c.get(f"{base}/sessions/{session_id}/requests", headers=headers)).json()
+            events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+            if pending["requests"]:
+                break
+            await asyncio.sleep(0.05)
+        before_resolve_types = [event["type"] for event in events]
+        approval = (
+            await c.post(
+                f"{base}/sessions/{session_id}/approval",
+                json={"request_id": pending["requests"][0]["request_id"], "decision": "approved"},
+                headers=headers,
+            )
+        ).json()
+        for _ in range(100):
+            events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+            if any(event["type"] == "turn.completed" for event in events):
+                break
+            await asyncio.sleep(0.05)
+        fetched = (await c.get(f"{base}/sessions/{session_id}", headers=headers)).json()
+        return pending, before_resolve_types, approval, events, fetched
+
+    pending, before_resolve_types, approval, events, fetched = asyncio.run(_with_server(cfg, 8836, calls))
+
+    event_types = [event["type"] for event in events]
+    assert pending["requests"][0]["kind"] == "approval"
+    assert pending["requests"][0]["request_id"] == "approval_rpc"
+    assert "turn.completed" not in before_resolve_types
+    assert approval["event"]["type"] == "approval.resolved"
+    assert "approval.resolved" in event_types
+    assert "assistant.message" in event_types
+    assert "turn.completed" in event_types
+    assert fetched["status"] == "completed"
+
+
+def test_daemon_codex_input_waits_for_endpoint_response(tmp_path) -> None:
+    agent = tmp_path / "fake-codex-input"
+    agent.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+
+
+def emit(payload):
+    print(json.dumps(payload), flush=True)
+
+
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    payload = json.loads(line)
+    method = payload.get("method")
+    request_id = payload.get("id")
+    if method == "initialize":
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method in {"thread/start", "thread/resume"}:
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {"thread": {"id": "thread_input"}}})
+    elif method == "turn/start":
+        emit({"jsonrpc": "2.0", "id": request_id, "result": {"turn": {"id": "turn_input"}}})
+        emit({"jsonrpc": "2.0", "method": "turn/started", "params": {"turn": {"id": "turn_input"}}})
+        emit({
+            "jsonrpc": "2.0",
+            "id": "input_rpc",
+            "method": "item/tool/requestUserInput",
+            "params": {"prompt": "Need more context"},
+        })
+    elif request_id == "input_rpc":
+        emit({
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": {"item": {"type": "agentMessage", "text": payload["result"]["answers"]["text"]}},
+        })
+        emit({
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {"turn": {"id": "turn_input", "status": "completed"}},
+        })
+"""
+    )
+    agent.chmod(0o755)
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="tkn",
+        workspace=str(tmp_path / "worker"),
+        codex_bin=str(agent),
+        job_timeout_s=5,
+    )
+    headers = {"Authorization": "Bearer tkn"}
+    metadata = _authority_metadata("codex")
+    metadata["execution_envelope"]["allowed_actions"].append(WORKER_SESSION_INPUT)
+    metadata["allowed_actions"].append(WORKER_SESSION_INPUT)
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "run_id": "run_codex",
+                    "provider": "codex",
+                    "engine": "codex",
+                    "title": "Input Codex",
+                    "metadata": metadata,
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        await c.post(
+            f"{base}/sessions/{session_id}/turns",
+            json={"prompt": "ask input", "idempotency_key": "idem_codex_input"},
+            headers=headers,
+        )
+        pending = {}
+        events = []
+        for _ in range(100):
+            pending = (await c.get(f"{base}/sessions/{session_id}/requests", headers=headers)).json()
+            events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+            if pending["requests"]:
+                break
+            await asyncio.sleep(0.05)
+        before_resolve_types = [event["type"] for event in events]
+        response = (
+            await c.post(
+                f"{base}/sessions/{session_id}/input",
+                json={"request_id": pending["requests"][0]["request_id"], "text": "continue with tests"},
+                headers=headers,
+            )
+        ).json()
+        for _ in range(100):
+            events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+            if any(event["type"] == "turn.completed" for event in events):
+                break
+            await asyncio.sleep(0.05)
+        fetched = (await c.get(f"{base}/sessions/{session_id}", headers=headers)).json()
+        return pending, before_resolve_types, response, events, fetched
+
+    pending, before_resolve_types, response, events, fetched = asyncio.run(_with_server(cfg, 8837, calls))
+
+    event_types = [event["type"] for event in events]
+    assert pending["requests"][0]["kind"] == "input"
+    assert pending["requests"][0]["request_id"] == "input_rpc"
+    assert "turn.completed" not in before_resolve_types
+    assert response["event"]["type"] == "input.received"
+    assert "input.received" in event_types
+    assert "assistant.message" in event_types
+    assert "turn.completed" in event_types
+    assert fetched["status"] == "completed"
 
 
 def test_daemon_rejects_unknown_session_provider(tmp_path) -> None:

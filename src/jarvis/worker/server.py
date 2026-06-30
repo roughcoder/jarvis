@@ -643,7 +643,10 @@ async def _provider_control_event(
         event_type = "approval.resolved" if action == "approval" else "input.received"
         event = sessions.append_event(session.session_id, event_type, dict(body or {}))
     else:
-        event = handler(session=session, request=dict(body or {}), sessions=sessions)
+        try:
+            event = handler(session=session, request=dict(body or {}), sessions=sessions)
+        except RuntimeError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
     return web.json_response({"ok": True, "event": event.to_dict()})
 
 

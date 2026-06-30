@@ -7,6 +7,7 @@ import signal
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +43,7 @@ class CodexProviderAdapter:
         sessions: SessionManager,
         worker_cfg: WorkerConfig,
     ) -> list[SessionEvent]:
-        authority = WorkerSessionAuthority.from_session(session)
+        authority = WorkerSessionAuthority.from_session(session, provider=self.provider)
         sessions.update_status(session.session_id, "running")
         started = sessions.append_event(
             session.session_id,
@@ -74,6 +75,63 @@ class CodexProviderAdapter:
         updated = sessions.update_status(session.session_id, "stopped")
         event = sessions.append_event(updated.session_id, "session.stopped", {"status": "stopped"})
         return updated, event
+
+    def resolve_approval(
+        self,
+        *,
+        session: WorkerSession,
+        request: dict[str, Any],
+        sessions: SessionManager,
+    ) -> SessionEvent:
+        authority = WorkerSessionAuthority.from_session(session, provider=self.provider)
+        if not authority.can_resolve_approval:
+            raise RuntimeError("worker session missing required authority: worker.session.approve")
+        request_id = _control_request_id(request)
+        delivered = _deliver_pending_request(
+            session.session_id,
+            request_id,
+            kind="approval",
+            result=_approval_result(request),
+        )
+        if not delivered:
+            raise RuntimeError(f"no pending codex approval request {request_id!r}")
+        event = sessions.append_event(session.session_id, "approval.resolved", {**request, "request_id": request_id})
+        sessions.update_status(session.session_id, "running")
+        return event
+
+    def receive_input(
+        self,
+        *,
+        session: WorkerSession,
+        request: dict[str, Any],
+        sessions: SessionManager,
+    ) -> SessionEvent:
+        authority = WorkerSessionAuthority.from_session(session, provider=self.provider)
+        if not authority.can_receive_input:
+            raise RuntimeError("worker session missing required authority: worker.session.input")
+        request_id = _control_request_id(request)
+        delivered = _deliver_pending_request(
+            session.session_id,
+            request_id,
+            kind="input",
+            result=_input_result(request),
+        )
+        if not delivered:
+            raise RuntimeError(f"no pending codex input request {request_id!r}")
+        event = sessions.append_event(session.session_id, "input.received", {**request, "request_id": request_id})
+        sessions.update_status(session.session_id, "running")
+        return event
+
+
+@dataclass
+class _PendingCodexRequest:
+    kind: str
+    process: subprocess.Popen[str]
+    rpc_id: Any
+
+
+_PENDING_LOCK = threading.Lock()
+_PENDING_REQUESTS: dict[tuple[str, str], _PendingCodexRequest] = {}
 
 
 def _run_codex_turn(
@@ -242,6 +300,8 @@ def _run_codex_turn(
             },
         )
     finally:
+        if process is not None:
+            _clear_pending_requests(session_id, process)
         if process is not None and process.poll() is None:
             process.terminate()
             try:
@@ -424,14 +484,20 @@ def _project_jsonrpc_message(
         if item_type and item_type not in {"userMessage", "reasoning"}:
             sessions.append_event(session_id, "tool.call", {**common, "item": item})
     elif method == "item/commandExecution/requestApproval":
-        sessions.append_event(session_id, "approval.requested", {**common, **params})
-        _send_server_response(process, message, {"decision": "deny"})
+        request_id = _message_request_id(message, params)
+        _track_pending_request(session_id, request_id, kind="approval", process=process, rpc_id=message.get("id"))
+        sessions.append_event(session_id, "approval.requested", {**common, **params, "request_id": request_id})
+        sessions.update_status(session_id, "waiting_approval")
     elif method == "item/fileChange/requestApproval":
-        sessions.append_event(session_id, "approval.requested", {**common, **params})
-        _send_server_response(process, message, {"decision": "deny"})
+        request_id = _message_request_id(message, params)
+        _track_pending_request(session_id, request_id, kind="approval", process=process, rpc_id=message.get("id"))
+        sessions.append_event(session_id, "approval.requested", {**common, **params, "request_id": request_id})
+        sessions.update_status(session_id, "waiting_approval")
     elif method == "item/tool/requestUserInput":
-        sessions.append_event(session_id, "input.requested", {**common, **params})
-        _send_server_response(process, message, {"answers": {}})
+        request_id = _message_request_id(message, params)
+        _track_pending_request(session_id, request_id, kind="input", process=process, rpc_id=message.get("id"))
+        sessions.append_event(session_id, "input.requested", {**common, **params, "request_id": request_id})
+        sessions.update_status(session_id, "waiting_input")
     elif method == "turn/completed":
         status = str(dict(params.get("turn") or {}).get("status") or "completed")
         event_type = "turn.completed" if status in {"completed", "done", "succeeded"} else "turn.failed"
@@ -447,18 +513,65 @@ def _project_jsonrpc_message(
     return False
 
 
-def _send_server_response(
+def _message_request_id(message: dict[str, Any], params: dict[str, Any]) -> str:
+    return str(params.get("request_id") or params.get("id") or message.get("id") or "").strip()
+
+
+def _control_request_id(request: dict[str, Any]) -> str:
+    request_id = str(request.get("request_id") or request.get("id") or "").strip()
+    if not request_id:
+        raise RuntimeError("request_id is required")
+    return request_id
+
+
+def _track_pending_request(
+    session_id: str,
+    request_id: str,
+    *,
+    kind: str,
     process: subprocess.Popen[str],
-    message: dict[str, Any],
-    result: dict[str, Any],
+    rpc_id: Any,
 ) -> None:
-    # Server-initiated JSON-RPC requests are recorded for Jarvis surfaces. Until
-    # the approval/input bridge is implemented, deny or empty-answer them rather
-    # than letting Codex wait indefinitely.
-    request_id = message.get("id")
-    if request_id is None:
+    if not request_id or rpc_id is None:
         return
-    _send_json(process, {"jsonrpc": "2.0", "id": request_id, "result": result})
+    with _PENDING_LOCK:
+        _PENDING_REQUESTS[(session_id, request_id)] = _PendingCodexRequest(kind=kind, process=process, rpc_id=rpc_id)
+
+
+def _deliver_pending_request(session_id: str, request_id: str, *, kind: str, result: dict[str, Any]) -> bool:
+    with _PENDING_LOCK:
+        key = (session_id, request_id)
+        pending = _PENDING_REQUESTS.get(key)
+        if pending is not None and pending.kind == kind:
+            _PENDING_REQUESTS.pop(key, None)
+    if pending is None or pending.kind != kind:
+        return False
+    _send_json(pending.process, {"jsonrpc": "2.0", "id": pending.rpc_id, "result": result})
+    return True
+
+
+def _clear_pending_requests(session_id: str, process: subprocess.Popen[str]) -> None:
+    with _PENDING_LOCK:
+        for key, pending in list(_PENDING_REQUESTS.items()):
+            if key[0] == session_id and pending.process is process:
+                _PENDING_REQUESTS.pop(key, None)
+
+
+def _approval_result(request: dict[str, Any]) -> dict[str, Any]:
+    decision = str(request.get("decision") or "").strip().lower()
+    if decision in {"approved", "approve", "allow", "allowed", "yes"}:
+        mapped = "approve"
+    else:
+        mapped = "deny"
+    return {"decision": mapped}
+
+
+def _input_result(request: dict[str, Any]) -> dict[str, Any]:
+    answers = request.get("answers")
+    if isinstance(answers, dict):
+        return {"answers": answers}
+    text = str(request.get("text") or request.get("answer") or "")
+    return {"answers": {"text": text}}
 
 
 def _record_provider_log(session_id: str, turn: ProviderTurn, sessions: SessionManager, text: str) -> None:
