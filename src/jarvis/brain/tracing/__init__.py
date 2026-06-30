@@ -109,8 +109,11 @@ def _summary(d: dict) -> str:
         parts.append(f"{channel or '?'}:{speaker or '?'}")
     if "uplink" in s:
         uplink = s["uplink"]
+        chunks = uplink.get("chunks")
+        chunk_text = f"/{chunks}ch" if chunks is not None else ""
         parts.append(
             f"uplink[{uplink.get('protocol', '?')}]={uplink.get('audio_s', 0):.1f}s"
+            f"/{uplink.get('ms', 0):.0f}ms{chunk_text}"
         )
     if "stt" in s:
         parts.append(f"stt={s['stt']['ms']:.0f}ms")

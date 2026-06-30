@@ -49,13 +49,19 @@ class IntercomReplyMetrics:
         }
 
     def mark_utterance_sent(
-        self, *, pcm_bytes: int, frame_bytes: int, protocol: str = "json_base64_v1"
+        self,
+        *,
+        pcm_bytes: int,
+        frame_bytes: int,
+        protocol: str,
+        chunks: int = 1,
     ) -> None:
         self.data["stages"]["utterance_send"] = {
             "ms": 0.0,
             "pcm_bytes": pcm_bytes,
             "frame_bytes": frame_bytes,
             "protocol": protocol,
+            "chunks": chunks,
         }
 
     def mark_proactive_received(self, *, text_chars: int) -> None:
@@ -94,6 +100,19 @@ class IntercomReplyMetrics:
             "decode_ms_avg": round(self._decode_ms / self._audio_chunks, 3),
         }
 
+    @property
+    def reply_audio_chunks(self) -> int:
+        return self._audio_chunks
+
+    def mark_missing_reply_audio(self, *, text_chars: int) -> None:
+        self.data["events"].append(
+            {
+                "name": "reply_audio_missing",
+                "ms": round(self._elapsed_ms(), 1),
+                "text_chars": text_chars,
+            }
+        )
+
     def attach_playback(self, playback) -> None:  # noqa: ANN001 - PlaybackMetrics
         if playback is None:
             return
@@ -120,18 +139,27 @@ class IntercomReplyMetrics:
 
 def summary(d: dict) -> str:
     stages = d.get("stages", {})
+    utterance = stages.get("utterance_send", {})
     audio = stages.get("reply_audio", {})
     playback = stages.get("playback", {})
     parts = [
         f"⟐ intercom/{d.get('intercom_kind', '?')}",
         f"device={d.get('device_id', '?')}",
     ]
+    if utterance:
+        parts.append(
+            f"uplink={utterance.get('protocol', '?')}/"
+            f"{utterance.get('chunks', 0)}ch "
+            f"{utterance.get('frame_bytes', 0)}B"
+        )
     if audio:
         parts.append(
             f"first_frame={audio.get('ms', 0):.0f}ms "
             f"audio={audio.get('protocol', '?')} "
             f"decode={audio.get('decode_ms', 0):.1f}ms/{audio.get('chunks', 0)}ch"
         )
+    if any(e.get("name") == "reply_audio_missing" for e in d.get("events", [])):
+        parts.append("NO_REPLY_AUDIO")
     if playback:
         first_speech = playback.get("first_speech_ms")
         speech = f"{first_speech:.0f}ms" if first_speech is not None else "?"

@@ -63,6 +63,12 @@ def test_summary_renders_stage_breakdown() -> None:
         "channel": "whatsapp",
         "speaker": "neil",
         "stages": {
+            "uplink": {
+                "ms": 95,
+                "protocol": "uplink_audio_binary_v1",
+                "audio_s": 2.3,
+                "chunks": 11,
+            },
             "stt": {"ms": 800},
             "llm": {"ms": 1200, "model": "fast"},
             "tts": {"ms": 600, "ttfa_ms": 450, "voice": "Ashley"},
@@ -72,6 +78,7 @@ def test_summary_renders_stage_breakdown() -> None:
     }
     s = _summary(d)
     assert "whatsapp:neil" in s
+    assert "uplink[uplink_audio_binary_v1]=2.3s/95ms/11ch" in s
     assert "stt=800ms" in s
     assert "llm[fast]=1200ms" in s
     assert "tts[Ashley]=600ms" in s

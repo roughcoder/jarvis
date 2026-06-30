@@ -1,7 +1,8 @@
 """Brain WebSocket server (Phase 3 W4).
 
 Intercoms connect and pair; each connection gets its own BrainSession. Per
-Utterance: STT -> think(+tools) -> TTS -> stream binary reply-audio frames -> ReplyEnd.
+voice turn: stream binary uplink audio -> STT -> think(+tools) -> TTS ->
+stream binary reply-audio frames -> ReplyEnd.
 A BargeIn cancels the in-flight turn (mirrors the single-process stop_playback
 cancelling the feed task). STT/TTS run in-process here (services co-located in
 3a). Provider credentials live only on the brain — the intercom holds none.
@@ -12,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import time
 import uuid
 
 import websockets
@@ -40,7 +42,10 @@ from jarvis.brain.voice_modes import (
 from jarvis.config import Config, insecure_bind
 from jarvis.mcp import MCPBridge
 from jarvis.protocol.messages import (
+    AudioEnd,
+    AudioStart,
     BargeIn,
+    BinaryAudio,
     Cancel,
     ConversationIdle,
     DeviceRequest,
@@ -54,8 +59,9 @@ from jarvis.protocol.messages import (
     ReplyText,
     TextIn,
     Transcript,
-    Utterance,
+    UPLINK_AUDIO_BINARY_V1,
     Welcome,
+    decode_binary_audio,
     decode,
     encode_reply_audio_binary,
     encode,
@@ -84,6 +90,17 @@ _HARDWARE_CAPS = {
     "intercom.camera": "camera",
     "intercom.display": "display",
 }
+
+
+@dataclasses.dataclass
+class BufferedAudioTurn:
+    turn_id: str
+    sample_rate: int
+    pcm: bytes
+    chunks: int
+    frame_bytes: int
+    stream_ms: float
+    voice_mode: str = DEFAULT_MODE
 
 
 def _is_alarm_ack(text: str) -> bool:
@@ -460,6 +477,7 @@ class BrainServer:
             "hardware": hardware,
             "voice_mode": "default",
             "waiters": {},
+            "audio_buffers": {},
         }
         base = self._resolve(
             device_id, channel, conn["asserted"], "", conn["device_default"], hardware
@@ -485,11 +503,34 @@ class BrainServer:
         turn: asyncio.Task | None = None
         try:
             async for raw in ws:
+                if isinstance(raw, bytes):
+                    try:
+                        binary = decode_binary_audio(raw)
+                    except ValueError:
+                        continue
+                    if binary is not None and binary.kind == "uplink_audio":
+                        self._buffer_audio_chunk(conn, binary, frame_bytes=len(raw))
+                    continue
                 try:
                     msg = decode(raw)
                 except Exception:
                     continue
-                if isinstance(msg, (Utterance, TextIn)):
+                if isinstance(msg, AudioStart):
+                    conn["audio_buffers"][msg.turn_id] = {
+                        "sample_rate": msg.sample_rate,
+                        "voice_mode": normalize_mode(msg.voice_mode),
+                        "chunks": [],
+                        "frame_bytes": 0,
+                        "started_at": time.perf_counter(),
+                    }
+                elif isinstance(msg, AudioEnd):
+                    buffered = self._finish_audio_buffer(conn, msg.turn_id)
+                    if buffered is not None:
+                        turn = await self._cancel(turn)
+                        turn = asyncio.create_task(
+                            self._run_turn(ws, device_id, channel, conn, buffered)
+                        )
+                elif isinstance(msg, TextIn):
                     turn = await self._cancel(turn)
                     turn = asyncio.create_task(self._run_turn(ws, device_id, channel, conn, msg))
                 elif isinstance(msg, ConversationIdle):
@@ -517,6 +558,35 @@ class BrainServer:
                 if not conns:
                     self._device_conns.pop(device_id, None)
             await self._cancel(turn)
+
+    @staticmethod
+    def _buffer_audio_chunk(conn: dict, binary: BinaryAudio, *, frame_bytes: int) -> None:
+        buffers = conn.get("audio_buffers", {})
+        buf = buffers.get(binary.turn_id)
+        if buf is None:
+            return
+        buf["chunks"].append(binary.pcm)
+        buf["frame_bytes"] += frame_bytes
+        if binary.sample_rate:
+            buf["sample_rate"] = binary.sample_rate
+
+    @staticmethod
+    def _finish_audio_buffer(conn: dict, turn_id: str) -> BufferedAudioTurn | None:
+        buf = conn.get("audio_buffers", {}).pop(turn_id, None)
+        if buf is None:
+            return None
+        chunks = list(buf.get("chunks", []))
+        pcm = b"".join(chunks)
+        return BufferedAudioTurn(
+            turn_id=turn_id,
+            sample_rate=int(buf.get("sample_rate") or 16000),
+            pcm=pcm,
+            chunks=len(chunks),
+            frame_bytes=int(buf.get("frame_bytes") or len(pcm)),
+            stream_ms=(time.perf_counter() - float(buf.get("started_at", time.perf_counter())))
+            * 1000,
+            voice_mode=normalize_mode(buf.get("voice_mode") or DEFAULT_MODE),
+        )
 
     @staticmethod
     async def _cancel(turn: asyncio.Task | None) -> None:
@@ -598,19 +668,18 @@ class BrainServer:
             device_id=device_id,
         )
         trace.set(audio_downlink=REPLY_AUDIO_BINARY_V1)
-        if isinstance(msg, Utterance):
+        if isinstance(msg, BufferedAudioTurn):
             if channel == "voice":
-                conn["voice_mode"] = BrainServer._voice_mode_for_utterance(
-                    msg, current=conn.get("voice_mode", DEFAULT_MODE)
-                )
-            pcm = msg.pcm()
+                conn["voice_mode"] = msg.voice_mode
+            pcm = msg.pcm
             secs = len(pcm) / 2 / msg.sample_rate
             trace.stage(
                 "uplink",
-                0.0,
-                protocol="json_base64_v1",
+                msg.stream_ms,
+                protocol=UPLINK_AUDIO_BINARY_V1,
                 pcm_bytes=len(pcm),
-                frame_bytes=len(msg.pcm_b64),
+                frame_bytes=msg.frame_bytes,
+                chunks=msg.chunks,
                 audio_s=round(secs, 1),
             )
             trace.start("stt")
@@ -637,10 +706,17 @@ class BrainServer:
             stopped = self._scheduler.acknowledge(device_id)
             reply = "Alarm off." if stopped else "Okay."
             print(f"  [alarm] acknowledged on device={device_id}")
+            sent_audio_chunks = 0
             if not text_only:
-                with contextlib.suppress(Exception):
+                try:
                     async for pcm in self._tts.synthesize_stream(reply):
+                        sent_audio_chunks += 1
                         await self._send_reply_audio(ws, turn_id, pcm)
+                except Exception as exc:  # noqa: BLE001 - still close the turn cleanly
+                    trace.event("reply_audio_error", error=type(exc).__name__)
+                    print(f"  [tts] alarm reply audio failed: {exc!r}")
+                if sent_audio_chunks == 0:
+                    trace.event("reply_audio_missing", reply_chars=len(reply))
             end = self._alarm_ack_reply_end(turn_id, channel, conn)
             with contextlib.suppress(Exception):
                 await ws.send(encode(ReplyText(turn_id=turn_id, text=reply)))
@@ -673,18 +749,35 @@ class BrainServer:
             confidence=ctx.confidence,
         )
         result = TurnResult()
+        sent_audio_chunks = 0
+        sent_audio_bytes = 0
         try:
             if text_only:  # text console / scripted test — reply text only, no TTS
                 await session.respond_text(text, trace, result)
             else:
                 async for pcm in session.respond(text, trace, result):
+                    sent_audio_chunks += 1
+                    sent_audio_bytes += len(pcm)
                     await self._send_reply_audio(ws, turn_id, pcm)
         except asyncio.CancelledError:
             session.finalize(text, result, trace)  # remember what was actually said
             self._apply_cancelled_turn_result(channel, conn, result)
             self._tracer.emit(trace)
             raise
+        except Exception as exc:  # noqa: BLE001 - keep the intercom from hanging
+            trace.event("turn_error", error=type(exc).__name__)
+            print(f"  [turn error] {exc!r}")
+            if not result.raw:
+                result.raw = "I hit an error before I could say that out loud."
         session.finalize(text, result, trace)
+        if not text_only and result.reply and sent_audio_chunks == 0:
+            trace.event("reply_audio_missing", reply_chars=len(result.reply))
+            print(
+                "  [tts] reply completed without audio frames "
+                f"(turn={turn_id}, chars={len(result.reply)})"
+            )
+        if not text_only:
+            trace.set(reply_audio_chunks=sent_audio_chunks, reply_audio_bytes=sent_audio_bytes)
         self._tracer.emit(trace)
         with contextlib.suppress(Exception):
             await ws.send(encode(ReplyText(turn_id=turn_id, text=result.reply)))
@@ -700,12 +793,6 @@ class BrainServer:
                 )
             )
         self._apply_turn_result(channel, conn, result)
-
-    @staticmethod
-    def _voice_mode_for_utterance(msg: Utterance, *, current: str = DEFAULT_MODE) -> str:
-        if "voice_mode" not in msg.model_fields_set:
-            return normalize_mode(current)
-        return normalize_mode(msg.voice_mode)
 
     @staticmethod
     async def _send_reply_audio(ws, turn_id: str, pcm: bytes) -> None:  # noqa: ANN001

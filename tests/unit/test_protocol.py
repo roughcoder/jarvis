@@ -9,6 +9,8 @@ from __future__ import annotations
 import pytest
 
 from jarvis.protocol.messages import (
+    AudioEnd,
+    AudioStart,
     BargeIn,
     DeviceRequest,
     DeviceResponse,
@@ -16,24 +18,38 @@ from jarvis.protocol.messages import (
     REPLY_AUDIO_BINARY_V1,
     ReplyEnd,
     TextIn,
-    Utterance,
+    UPLINK_AUDIO_BINARY_V1,
     Welcome,
     decode_binary_audio,
     decode,
     encode_reply_audio_binary,
+    encode_uplink_audio_binary,
     encode,
 )
 
 
-def test_utterance_pcm_round_trip() -> None:
-    pcm = bytes(range(256))
-    u = Utterance.of("t1", 16000, pcm, voice_mode="stay")
-    back = decode(encode(u))
-    assert isinstance(back, Utterance)
+def test_audio_control_round_trips() -> None:
+    start = decode(encode(AudioStart(turn_id="t1", sample_rate=16000, voice_mode="stay")))
+    assert isinstance(start, AudioStart)
+    assert start.turn_id == "t1"
+    assert start.sample_rate == 16000
+    assert start.voice_mode == "stay"
+
+    end = decode(encode(AudioEnd(turn_id="t1")))
+    assert isinstance(end, AudioEnd)
+    assert end.turn_id == "t1"
+
+
+def test_binary_uplink_audio_round_trip() -> None:
+    pcm = b"\x00\x01\x02\x03" * 10
+    frame = encode_uplink_audio_binary("t1", 16000, pcm)
+    back = decode_binary_audio(frame)
+    assert back is not None
+    assert back.kind == "uplink_audio"
     assert back.turn_id == "t1"
     assert back.sample_rate == 16000
-    assert back.voice_mode == "stay"
-    assert back.pcm() == pcm
+    assert back.pcm == pcm
+    assert UPLINK_AUDIO_BINARY_V1 == "uplink_audio_binary_v1"
 
 
 def test_binary_reply_audio_round_trip() -> None:
@@ -55,6 +71,8 @@ def test_binary_audio_decoder_ignores_json_bytes() -> None:
     "msg",
     [
         Hello(device_id="kitchen-pi", token="x"),
+        AudioStart(turn_id="t1", sample_rate=16000),
+        AudioEnd(turn_id="t1"),
         BargeIn(turn_id="t2"),
         TextIn(turn_id="t3", text="hello"),
         DeviceRequest(request_id="r1", action="capture_photo", args={"width": 640}),

@@ -3,9 +3,10 @@
 Language-neutral message schemas so a Python intercom (now) and a native client
 (later) are interchangeable on the brain side. Control messages are JSON text
 frames with a `type` discriminator. Downlink audio PCM travels in binary
-WebSocket frames; there is one audio transport in this home setup.
+WebSocket frames. Uplink voice PCM streams as binary WebSocket frames bracketed
+by JSON control frames; there is one voice-audio transport in this home setup.
 
-  up   (intercom -> brain): Hello, Utterance, BargeIn, TextIn, ConversationIdle,
+  up   (intercom -> brain): Hello, AudioStart, AudioEnd, BargeIn, TextIn, ConversationIdle,
                             DeviceResponse
   down (brain -> intercom): Welcome / Reject, ReplyText, ReplyEnd,
                             Cancel, Proactive, DeviceRequest
@@ -13,7 +14,6 @@ WebSocket frames; there is one audio transport in this home setup.
 
 from __future__ import annotations
 
-import base64
 import dataclasses
 import struct
 from typing import Annotated, Any, Literal, Union
@@ -21,17 +21,19 @@ from typing import Annotated, Any, Literal, Union
 from pydantic import BaseModel, Field, TypeAdapter
 
 REPLY_AUDIO_BINARY_V1 = "reply_audio_binary_v1"
+UPLINK_AUDIO_BINARY_V1 = "uplink_audio_binary_v1"
 
 _BINARY_MAGIC = b"JARVIS1"
 _BINARY_HEADER = struct.Struct("!7sBBHI")
 _BINARY_TYPE_REPLY_AUDIO = 1
+_BINARY_TYPE_UPLINK_AUDIO = 2
 
 
 @dataclasses.dataclass(frozen=True)
 class BinaryAudio:
-    """Decoded reply-audio binary WebSocket frame."""
+    """Decoded binary audio WebSocket frame."""
 
-    kind: Literal["reply_audio"]
+    kind: Literal["reply_audio", "uplink_audio"]
     turn_id: str
     pcm: bytes
     sample_rate: int = 0
@@ -65,31 +67,16 @@ class Identify(BaseModel):
     identity: str
 
 
-class Utterance(BaseModel):
-    type: Literal["utterance"] = "utterance"
+class AudioStart(BaseModel):
+    type: Literal["audio_start"] = "audio_start"
     turn_id: str
     sample_rate: int
-    pcm_b64: str
     voice_mode: str = "default"
 
-    def pcm(self) -> bytes:
-        return base64.b64decode(self.pcm_b64)
 
-    @classmethod
-    def of(
-        cls,
-        turn_id: str,
-        sample_rate: int,
-        pcm: bytes,
-        *,
-        voice_mode: str = "default",
-    ) -> "Utterance":
-        return cls(
-            turn_id=turn_id,
-            sample_rate=sample_rate,
-            pcm_b64=_b64(pcm),
-            voice_mode=voice_mode,
-        )
+class AudioEnd(BaseModel):
+    type: Literal["audio_end"] = "audio_end"
+    turn_id: str
 
 
 class BargeIn(BaseModel):
@@ -209,15 +196,11 @@ class DeviceRequest(BaseModel):
 
 
 Message = Union[
-    Hello, Utterance, BargeIn, ConversationIdle, TextIn, Identify, DeviceResponse,
+    Hello, AudioStart, AudioEnd, BargeIn, ConversationIdle, TextIn, Identify, DeviceResponse,
     Welcome, Reject, ReplyText, ReplyEnd, Cancel, Proactive, WhoAreYou,
     Transcript, DeviceRequest,
 ]
 _ADAPTER: TypeAdapter = TypeAdapter(Annotated[Message, Field(discriminator="type")])
-
-
-def _b64(pcm: bytes) -> str:
-    return base64.b64encode(pcm).decode("ascii")
 
 
 def encode(msg: BaseModel) -> str:
@@ -248,6 +231,24 @@ def encode_reply_audio_binary(turn_id: str, pcm: bytes) -> bytes:
     )
 
 
+def encode_uplink_audio_binary(turn_id: str, sample_rate: int, pcm: bytes) -> bytes:
+    """Serialise captured mic PCM as a binary WebSocket frame."""
+    turn = turn_id.encode("utf-8")
+    if len(turn) > 65535:
+        raise ValueError("turn_id is too long for a binary audio frame")
+    return (
+        _BINARY_HEADER.pack(
+            _BINARY_MAGIC,
+            _BINARY_TYPE_UPLINK_AUDIO,
+            0,  # flags reserved
+            len(turn),
+            sample_rate,
+        )
+        + turn
+        + pcm
+    )
+
+
 def decode_binary_audio(data: bytes) -> BinaryAudio | None:
     """Return a binary audio frame, or None when `data` is not this protocol."""
     if len(data) < _BINARY_HEADER.size:
@@ -264,5 +265,9 @@ def decode_binary_audio(data: bytes) -> BinaryAudio | None:
     if frame_type == _BINARY_TYPE_REPLY_AUDIO:
         return BinaryAudio(
             kind="reply_audio", turn_id=turn_id, pcm=pcm, sample_rate=sample_rate
+        )
+    if frame_type == _BINARY_TYPE_UPLINK_AUDIO:
+        return BinaryAudio(
+            kind="uplink_audio", turn_id=turn_id, pcm=pcm, sample_rate=sample_rate
         )
     raise ValueError(f"unknown binary audio frame type: {frame_type}")
