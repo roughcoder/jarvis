@@ -27,6 +27,15 @@ from dataclasses import dataclass
 import websockets
 from jarvis.brain.voice_modes import DEFAULT_MODE, STAY_MODE, normalize_mode
 from jarvis.config import Config
+from jarvis.device_diagnostics import (
+    check_tcp_port,
+    get_ip_address,
+    host_arg,
+    int_arg,
+    ping_host,
+    resolve_dns,
+    run_self_diagnostics,
+)
 from jarvis.intercom.audio import AudioIO, MicStream
 from jarvis.intercom.hardware import IntercomHardware
 from jarvis.intercom.metrics import IntercomReplyMetrics
@@ -295,7 +304,17 @@ class IntercomClient:
     async def _handle_device_request(self, ws, msg: DeviceRequest) -> None:  # noqa: ANN001
         try:
             if msg.action == "control_display":
-                result = self._panel.control(str(msg.args.get("action") or "status"))
+                result = await asyncio.to_thread(
+                    self._panel.control, str(msg.args.get("action") or "status")
+                )
+            elif msg.action in {
+                "run_self_diagnostics",
+                "get_ip_address",
+                "ping_host",
+                "resolve_dns",
+                "check_tcp_port",
+            }:
+                result = await self._handle_diagnostic_request(msg.action, msg.args)
             else:
                 result = await self._hardware.handle(msg.action, msg.args)
             resp = DeviceResponse(request_id=msg.request_id, ok=True, result=result)
@@ -303,6 +322,40 @@ class IntercomClient:
             resp = DeviceResponse(request_id=msg.request_id, ok=False, error=str(exc))
         with contextlib.suppress(Exception):
             await ws.send(encode(resp))
+
+    async def _handle_diagnostic_request(self, action: str, args: dict) -> dict[str, str]:
+        tools = self._cfg.tools
+        timeout = tools.self_diagnostic_timeout_s
+        if action == "run_self_diagnostics":
+            text = await run_self_diagnostics(
+                request_device_id=self._device_id,
+                configured_device_id=self._device_id,
+                timeout_s=timeout,
+                max_bytes=tools.self_max_bytes,
+            )
+        elif action == "get_ip_address":
+            text = await get_ip_address(
+                include_public=bool(args.get("include_public", True)),
+                timeout_s=min(max(timeout, 0.5), 3.0),
+            )
+        elif action == "ping_host":
+            host = host_arg(args.get("host"))
+            count = int_arg(args.get("count"), default=4, min_value=1, max_value=10)
+            text = await ping_host(
+                host=host,
+                count=count,
+                timeout_s=max(timeout * count, timeout + 2.0),
+                max_bytes=tools.self_max_bytes,
+            )
+        elif action == "resolve_dns":
+            text = await resolve_dns(host=host_arg(args.get("host")))
+        elif action == "check_tcp_port":
+            host = host_arg(args.get("host"))
+            port = int_arg(args.get("port"), default=443, min_value=1, max_value=65535)
+            text = await check_tcp_port(host=host, port=port, timeout_s=min(max(timeout, 0.5), 5.0))
+        else:
+            raise ValueError(f"unsupported diagnostic action {action!r}")
+        return {"text": text}
 
     async def _idle_then_turn(self, ws, mic: MicStream, inbound: asyncio.Queue) -> None:  # noqa: ANN001
         """Wait for the wake word OR a proactive push (alarm/notification); whichever

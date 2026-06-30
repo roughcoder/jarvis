@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 
 from jarvis.brain.context import RequestContext
@@ -74,7 +75,9 @@ def test_get_ip_address_can_skip_public_lookup() -> None:
         )
     }
 
-    out = tools["get_ip_address"].handler(_ctx("self.diagnostics"), {"include_public": False})
+    out = asyncio.run(
+        tools["get_ip_address"].handler(_ctx("self.diagnostics"), {"include_public": False})
+    )
 
     assert "host:" in out
     assert "local_ipv4:" in out
@@ -90,7 +93,7 @@ def test_resolve_dns_uses_local_resolver() -> None:
         )
     }
 
-    out = tools["resolve_dns"].handler(_ctx("self.diagnostics"), {"host": "localhost"})
+    out = asyncio.run(tools["resolve_dns"].handler(_ctx("self.diagnostics"), {"host": "localhost"}))
 
     assert "localhost resolves to:" in out
     assert "127.0.0.1" in out
@@ -105,9 +108,84 @@ def test_ping_host_rejects_shell_metacharacters() -> None:
         )
     }
 
-    out = tools["ping_host"].handler(_ctx("self.diagnostics"), {"host": "example.com;rm -rf /"})
+    out = asyncio.run(
+        tools["ping_host"].handler(_ctx("self.diagnostics"), {"host": "example.com;rm -rf /"})
+    )
 
     assert out == "error: host contains unsupported characters"
+
+
+def test_ping_host_accepts_hyphenated_host(monkeypatch) -> None:  # noqa: ANN001
+    def fake_run(argv, *, cwd, timeout_s, max_bytes):  # noqa: ANN001, ARG001
+        assert argv == ["ping", "-c", "1", "raspberry-pi.local"]
+        return "ping ok"
+
+    monkeypatch.setattr("jarvis.device_diagnostics.run_command", fake_run)
+    tools = {
+        t.name: t
+        for t in make_self_tools(
+            ToolsConfig(_env_file=None),
+            CapabilityConfig(_env_file=None),
+        )
+    }
+
+    out = asyncio.run(
+        tools["ping_host"].handler(
+            _ctx("self.diagnostics"), {"host": "raspberry-pi.local", "count": 1}
+        )
+    )
+
+    assert out == "ping ok"
+
+
+def test_diagnostics_targets_jarvis_pid(monkeypatch) -> None:  # noqa: ANN001
+    calls: list[list[str]] = []
+
+    def fake_run(argv, *, cwd, timeout_s, max_bytes):  # noqa: ANN001, ARG001
+        calls.append(argv)
+        return "$ " + " ".join(argv)
+
+    monkeypatch.setattr("jarvis.device_diagnostics.run_command", fake_run)
+    tools = {
+        t.name: t
+        for t in make_self_tools(
+            ToolsConfig(_env_file=None),
+            CapabilityConfig(_env_file=None),
+        )
+    }
+
+    out = asyncio.run(tools["run_self_diagnostics"].handler(_ctx("self.diagnostics"), {}))
+
+    assert ["ps", "-o", "pid,ppid,%cpu,%mem,comm", "-p", str(os.getpid())] in calls
+    assert "$$" not in out
+
+
+def test_remote_device_diagnostics_route_to_device_action() -> None:
+    calls: list[tuple[str, dict, float]] = []
+
+    async def action(ctx, name, args, timeout_s):  # noqa: ANN001
+        assert ctx.device_id == "kitchen-pi"
+        calls.append((name, args, timeout_s))
+        return {"text": "host: kitchen-pi\nlocal_ipv4: 192.168.1.20"}
+
+    tools = {
+        t.name: t
+        for t in make_self_tools(
+            ToolsConfig(_env_file=None),
+            CapabilityConfig(_env_file=None, device_id="brain-mac"),
+            device_action=action,
+        )
+    }
+
+    out = asyncio.run(
+        tools["get_ip_address"].handler(
+            RequestContext("kitchen-pi", "house", "house", frozenset({"self.diagnostics"})),
+            {"include_public": False},
+        )
+    )
+
+    assert calls == [("get_ip_address", {"include_public": False}, 4.0)]
+    assert "host: kitchen-pi" in out
 
 
 def test_check_tcp_port_reports_reachability() -> None:
@@ -123,8 +201,10 @@ def test_check_tcp_port_reports_reachability() -> None:
             )
         }
 
-        out = tools["check_tcp_port"].handler(
-            _ctx("self.diagnostics"), {"host": "127.0.0.1", "port": port}
+        out = asyncio.run(
+            tools["check_tcp_port"].handler(
+                _ctx("self.diagnostics"), {"host": "127.0.0.1", "port": port}
+            )
         )
 
     assert f"127.0.0.1:{port} is reachable." == out
