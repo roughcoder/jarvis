@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from jarvis.engines import normalize_engine_id, worker_supports_engine
@@ -59,6 +59,7 @@ class StartedWork:
     worker: WorkerProfile
     envelope: ExecutionEnvelope
     session: WorkerSessionLink
+    sessions: list[WorkerSessionLink] = field(default_factory=list)
 
 
 class OrchestrationService:
@@ -108,7 +109,7 @@ class OrchestrationService:
             store.set_phase(run.run_id, "needs_human", "Work item has no repo/default repo; cannot start a coding worker")
             raise MissingWorkRepoError(item, run.run_id)
         registry = WorkerRegistry(self.cfg.worker, profiles_path=self.cfg.orchestration.workers_path)
-        target_engine = normalize_engine_id(command.target_engine_id)
+        target_engine = normalize_engine_id(_first_engine(command.target_engine_id))
         if command.target_worker_id:
             worker = registry.get(command.target_worker_id, probe=True)
         elif target_engine:
@@ -118,6 +119,9 @@ class OrchestrationService:
         if worker is None or not _worker_is_eligible(worker, item.capability_requirements, engine=target_engine):
             raise NoEligibleWorkerError("No eligible worker found.")
         engine = target_engine or worker.default_engine or worker.agent
+        engines = _target_engines(command, worker, fallback_engine=engine)
+        if any(not worker_supports_engine(worker.supported_engines, target) for target in engines):
+            raise NoEligibleWorkerError("No eligible worker found.")
 
         try:
             envelope = executor.create_run_and_envelope(
@@ -132,12 +136,23 @@ class OrchestrationService:
             raise WorkAlreadyOwnedError(item, exc.owner) from exc
 
         try:
-            session = executor.start_worker_session(envelope, worker_cfg=self.cfg.worker, worker=worker, store=store)
+            if command.engine_strategy == "ensemble":
+                sessions = executor.start_worker_ensemble(
+                    envelope,
+                    engines=engines,
+                    worker_cfg=self.cfg.worker,
+                    worker=worker,
+                    store=store,
+                )
+                session = sessions[0]
+            else:
+                session = executor.start_worker_session(envelope, worker_cfg=self.cfg.worker, worker=worker, store=store)
+                sessions = [session]
         except Exception as exc:  # noqa: BLE001 - dispatch failure must release the local claim
             store.set_phase(envelope.run_id, "failed", f"Worker dispatch failed: {exc}")
             raise WorkerDispatchError(envelope.run_id, exc) from exc
 
-        return StartedWork(item=item, worker=worker, envelope=envelope, session=session)
+        return StartedWork(item=item, worker=worker, envelope=envelope, session=session, sessions=sessions)
 
     def resume_run(self, run_ref: str = "latest", *, prompt: str = "") -> StartedWork:
         self._require(required_for_command("resume_run", "jarvis"))
@@ -218,6 +233,22 @@ def _worker_is_eligible(worker: WorkerProfile, required: list[str] | None = None
     if engine and not worker_supports_engine(worker.supported_engines, engine):
         return False
     return set(required or []).issubset(set(worker.capabilities))
+
+
+def _first_engine(value: str) -> str:
+    return str(value or "").split(",", 1)[0].strip()
+
+
+def _target_engines(command: WorkCommand, worker: WorkerProfile, *, fallback_engine: str) -> list[str]:
+    if command.engine_strategy != "ensemble":
+        return [fallback_engine]
+    requested = [normalize_engine_id(x) for x in str(command.target_engine_id or "").split(",") if x.strip()]
+    engines = requested or list(worker.supported_engines or [fallback_engine])
+    result: list[str] = []
+    for engine in engines:
+        if engine and engine not in result:
+            result.append(engine)
+    return result or [fallback_engine]
 
 
 def _resolve_run(store: OrchestrationStore, run_ref: str):

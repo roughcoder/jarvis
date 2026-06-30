@@ -542,7 +542,26 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
     cfg = load_config()
     httpx, base, headers, timeout = _worker_http(cfg)
     try:
-        if args.events:
+        if args.requests:
+            path = "/sessions/requests" if args.requests == "all" else f"/sessions/{args.requests}/requests"
+            response = httpx.get(f"{base}{path}", headers=headers, timeout=timeout)
+        elif args.checkpoints:
+            response = httpx.get(
+                f"{base}/sessions/{args.checkpoints}/checkpoints",
+                headers=headers,
+                timeout=timeout,
+            )
+        elif args.restore_checkpoint:
+            response = httpx.post(
+                f"{base}/sessions/{args.restore_checkpoint}/checkpoints/restore",
+                headers=headers,
+                json={
+                    "checkpoint_id": args.checkpoint_id,
+                    "metadata": {"surface": "cli"},
+                },
+                timeout=timeout,
+            )
+        elif args.events:
             params = {}
             if args.after:
                 params["after"] = args.after
@@ -572,7 +591,7 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
             response = httpx.post(
                 f"{base}/sessions/{args.input}/input",
                 headers=headers,
-                json={"text": args.text, "metadata": {"surface": "cli"}},
+                json={"request_id": args.request_id, "text": args.text, "metadata": {"surface": "cli"}},
                 timeout=timeout,
             )
         elif args.approval:
@@ -613,6 +632,30 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
 
     if args.json:
         print(json.dumps(body, indent=2))
+        return 0
+    if "requests" in body:
+        requests = body.get("requests", [])
+        if not requests:
+            print("No pending session requests.")
+            return 0
+        for request in requests:
+            print(
+                f"{request.get('session_id', ''):<28} "
+                f"{request.get('kind', ''):<10} "
+                f"{request.get('request_id', '')}"
+            )
+        return 0
+    if "checkpoints" in body:
+        checkpoints = body.get("checkpoints", [])
+        if not checkpoints:
+            print("No checkpoints.")
+            return 0
+        for checkpoint in checkpoints:
+            restored = " restored" if checkpoint.get("restored") else ""
+            print(
+                f"{checkpoint.get('checkpoint_id', ''):<28} "
+                f"{checkpoint.get('label', '')}{restored}".rstrip()
+            )
         return 0
     if "sessions" in body:
         sessions = body.get("sessions", [])
@@ -702,6 +745,21 @@ def _cmd_runs(args: argparse.Namespace) -> int:
         else:
             for e in events:
                 print(f"{e.time} {e.type:<28} {e.message}")
+        return 0
+    if args.report:
+        from jarvis.orchestration.reports import build_run_report, format_run_report, public_status_comment
+
+        try:
+            report = build_run_report(store, args.report)
+        except KeyError:
+            print(f"No run found for {args.report!r}.")
+            return 1
+        if args.json:
+            print(json.dumps(report, indent=2))
+        elif args.public_comment:
+            print(public_status_comment(report))
+        else:
+            print(format_run_report(report))
         return 0
     if args.sync:
         from jarvis.orchestration.supervisor import sync_run_sessions
@@ -849,6 +907,8 @@ def _cmd_work(args: argparse.Namespace) -> int:
         command.target_worker_id = args.worker
     if getattr(args, "engine", ""):
         command.target_engine_id = args.engine
+    if getattr(args, "engine_strategy", ""):
+        command.engine_strategy = args.engine_strategy
     if getattr(args, "repo", ""):
         command.filters["repo"] = args.repo
     capabilities = resolve_capabilities(cfg.capabilities)
@@ -1166,7 +1226,8 @@ def _cmd_schedules(args: argparse.Namespace) -> int:
 
     from jarvis.brain.capabilities import resolve_capabilities
     from jarvis.orchestration.intent import parse_work_command
-    from jarvis.orchestration.schedules import Schedule, ScheduleStore
+    from jarvis.orchestration.service import OrchestrationService
+    from jarvis.orchestration.schedules import Schedule, ScheduleStore, dispatch_due_schedules
 
     cfg = load_config()
     capabilities = resolve_capabilities(cfg.capabilities)
@@ -1218,7 +1279,7 @@ def _cmd_schedules(args: argparse.Namespace) -> int:
         return 0
     if args.schedule_action == "tick":
         now = datetime.fromisoformat(args.now) if args.now else datetime.now().astimezone()
-        if args.ack:
+        if args.ack or args.dispatch:
             if not _has_orchestration_authority(
                 ["orchestration.schedules.write"],
                 capabilities,
@@ -1227,6 +1288,21 @@ def _cmd_schedules(args: argparse.Namespace) -> int:
             ):
                 return 1
         store = ScheduleStore(cfg.orchestration.schedules_path)
+        if args.dispatch:
+            service = OrchestrationService(cfg=cfg, capabilities=capabilities, source_factory=_work_source)
+            results = dispatch_due_schedules(
+                store,
+                now=now,
+                service=service,
+                run_store=_orch_store(cfg),
+            )
+            if args.json:
+                print(json.dumps([x.to_dict() for x in results], indent=2))
+            else:
+                for result in results:
+                    detail = result.run_id or result.message
+                    print(f"{result.schedule_id:<26} {result.status:<15} {detail}".rstrip())
+            return 1 if any(x.status == "failed" for x in results) else 0
         due = store.due(now)
         if args.ack:
             for schedule in due:
@@ -2250,13 +2326,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_sessions.add_argument("--events", metavar="SESSION_ID", help="Show events for a session")
     p_sessions.add_argument("--after", default="", help="Event cursor for --events")
     p_sessions.add_argument("--limit", type=int, default=0, help="Maximum events for --events")
+    p_sessions.add_argument(
+        "--requests",
+        metavar="SESSION_ID|all",
+        help="Show pending approval/input requests for a session or all sessions",
+    )
+    p_sessions.add_argument("--checkpoints", metavar="SESSION_ID", help="Show checkpoints for a session")
+    p_sessions.add_argument("--restore-checkpoint", metavar="SESSION_ID", help="Restore a session checkpoint")
+    p_sessions.add_argument("--checkpoint-id", default="", help="Checkpoint id for --restore-checkpoint")
     p_sessions.add_argument("--turn", metavar="SESSION_ID", help="Start a turn on a session")
     p_sessions.add_argument("--prompt", default="", help="Prompt for --turn")
     p_sessions.add_argument("--idempotency-key", default="", help="Idempotency key for --turn")
     p_sessions.add_argument("--input", metavar="SESSION_ID", help="Send user input to a session")
     p_sessions.add_argument("--text", default="", help="Text for --input")
     p_sessions.add_argument("--approval", metavar="SESSION_ID", help="Resolve an approval request")
-    p_sessions.add_argument("--request-id", default="", help="Approval request id")
+    p_sessions.add_argument("--request-id", default="", help="Input or approval request id")
     p_sessions.add_argument("--decision", choices=["approved", "denied"], default="approved")
     p_sessions.add_argument("--interrupt", metavar="SESSION_ID", help="Interrupt a running session")
     p_sessions.add_argument("--stop", metavar="SESSION_ID", help="Stop a session")
@@ -2268,6 +2352,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_runs.add_argument("run_id", nargs="?", help="Run id or unique prefix to show")
     p_runs.add_argument("--create", metavar="OBJECTIVE", help="Create a local fake run for inspection")
     p_runs.add_argument("--events", metavar="RUN_ID", help="Show append-only events for a run")
+    p_runs.add_argument("--report", metavar="RUN_ID", help="Build a public-safe run report")
+    p_runs.add_argument("--public-comment", action="store_true", help="Format --report as a public status comment")
     p_runs.add_argument("--sync", action="store_true", help="Refresh linked worker session status before listing/showing")
     p_runs.add_argument("-n", type=int, default=20, help="How many recent runs to list")
     p_runs.add_argument("--json", action="store_true", help="Print machine-readable JSON")
@@ -2296,6 +2382,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_work_next.add_argument("--repo", default="", help="Repository, e.g. roughcoder/jarvis")
     p_work_next.add_argument("--worker", default="", help="Explicit worker_id target")
     p_work_next.add_argument("--engine", default="", help="Explicit coding engine, e.g. codex or claude")
+    p_work_next.add_argument("--engine-strategy", choices=["single", "ensemble"], default="")
     p_work_next.add_argument("--start", action="store_true", help="Start a worker session for the selected item")
     p_work_next.add_argument("--json", action="store_true")
     p_work_next.set_defaults(func=_cmd_work)
@@ -2332,6 +2419,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sched_tick = sched_sub.add_parser("tick", help="Return schedules due at the current/simulated minute")
     p_sched_tick.add_argument("--now", default="", help="ISO datetime for deterministic checks")
     p_sched_tick.add_argument("--ack", action="store_true", help="Mark returned schedules fired after the caller handled them")
+    p_sched_tick.add_argument("--dispatch", action="store_true", help="Start due scheduled WorkCommands as sessions")
     p_sched_tick.add_argument("--json", action="store_true")
     p_sched_tick.set_defaults(func=_cmd_schedules)
     p_schedules.set_defaults(func=_cmd_schedules, schedule_action="list", json=False)

@@ -9,9 +9,10 @@ from jarvis.config import WorkerConfig, load_config
 from jarvis.orchestration.authority import allowed
 from jarvis.orchestration.campaign import CampaignPolicy, create_campaign
 from jarvis.orchestration.envelope import build_execution_envelope
-from jarvis.orchestration.executor import start_worker_job, start_worker_session
+from jarvis.orchestration.executor import start_worker_ensemble, start_worker_job, start_worker_session
 from jarvis.orchestration.intent import parse_work_command
 from jarvis.orchestration.models import (
+    Artifact,
     ExecutionEnvelope,
     LandingPolicy,
     WorkCommand,
@@ -20,7 +21,8 @@ from jarvis.orchestration.models import (
     WorkerSessionLink,
 )
 from jarvis.orchestration.policy import required_for_worker_dispatch
-from jarvis.orchestration.schedules import ScheduleStore
+from jarvis.orchestration.reports import build_run_report, public_status_comment
+from jarvis.orchestration.schedules import ScheduleStore, dispatch_due_schedules
 from jarvis.orchestration.service import MissingWorkRepoError, OrchestrationService, StartedWork
 from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource
 from jarvis.orchestration.store import ActiveWorkItemError, OrchestrationStore
@@ -632,6 +634,71 @@ def test_orchestration_service_selects_requested_engine(tmp_path, monkeypatch) -
     assert result.envelope.session_id
 
 
+def test_orchestration_service_starts_ensemble_sessions(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    cfg = load_config()
+
+    class Source:
+        def next(self, *, repo="", filters=None):  # noqa: ANN001, ANN201
+            return _item(id="#33")
+
+    def fake_choose(_self, _required=None, *, engine=""):  # noqa: ANN001, ANN202
+        assert engine == "codex"
+        return WorkerProfile(
+            worker_id="local-worker",
+            display_name="Local",
+            capabilities=["git"],
+            base_url="http://localhost:1",
+            status="online",
+            supported_engines=["codex", "claude"],
+        )
+
+    def fake_start_ensemble(envelope, *, engines, worker_cfg, worker=None, store=None, post=None):  # noqa: ANN001, ANN202
+        assert envelope.engine_strategy == "ensemble"
+        assert engines == ["codex", "claude"]
+        links = [
+            WorkerSessionLink(worker_id=envelope.worker_id, session_id="sess_codex", provider="codex", engine="codex"),
+            WorkerSessionLink(worker_id=envelope.worker_id, session_id="sess_claude", provider="claude", engine="claude"),
+        ]
+        for link in links:
+            store.link_session(envelope.run_id, link)
+        return links
+
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry.choose", fake_choose)
+    monkeypatch.setattr("jarvis.orchestration.executor.start_worker_ensemble", fake_start_ensemble)
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"work.github.issues.read", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: Source(),
+    )
+
+    result = service.next_work(
+        WorkCommand(
+            "start_next_work",
+            source="github",
+            start=True,
+            engine_strategy="ensemble",
+            target_engine_id="codex,claude",
+        ),
+        start=True,
+    )
+
+    assert isinstance(result, StartedWork)
+    assert [session.session_id for session in result.sessions] == ["sess_codex", "sess_claude"]
+    runs = OrchestrationStore(cfg.orchestration.workspace).list_runs()
+    assert len(runs) == 1
+    assert [session.engine for session in runs[0].sessions] == ["codex", "claude"]
+
+
 def test_orchestration_service_needs_human_for_start_without_repo(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     env_file = tmp_path / ".env"
     env_file.write_text(
@@ -810,6 +877,80 @@ def test_start_worker_session_links_run_graph(tmp_path) -> None:
     assert calls[1][1]["turn_id"].startswith("turn_")
     assert calls[1][1]["idempotency_key"] == f"{run.run_id}:{calls[1][1]['turn_id']}"
     assert store.get(run.run_id).sessions[0].session_id == "sess_123"  # type: ignore[union-attr]
+
+
+def test_start_worker_ensemble_uses_distinct_provider_branches(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Start ensemble")
+    envelope = ExecutionEnvelope(
+        run_id=run.run_id,
+        repo="roughcoder/jarvis",
+        prompt="x",
+        worker_id="local-worker",
+        engine="codex",
+        engine_strategy="ensemble",
+        branch_name="jarvis/example",
+        session_name="jarvis-example",
+    )
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, body: dict) -> None:
+            self._body = body
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self._body
+
+    def fake_post(url, **kwargs):  # noqa: ANN001
+        calls.append((url, kwargs["json"]))
+        if url.endswith("/sessions"):
+            engine = kwargs["json"]["engine"]
+            return Response(
+                {
+                    "ok": True,
+                    "session": {
+                        "session_id": f"sess_{engine}",
+                        "status": "created",
+                        "provider": engine,
+                        "engine": engine,
+                        "branch": kwargs["json"]["branch"],
+                    },
+                }
+            )
+        session_id = url.rsplit("/", 2)[-2]
+        engine = session_id.replace("sess_", "")
+        return Response(
+            {
+                "ok": True,
+                "turn_id": "turn_123",
+                "session": {
+                    "session_id": session_id,
+                    "status": "running",
+                    "provider": engine,
+                    "engine": engine,
+                    "branch": f"jarvis/example-{engine}",
+                },
+                "events": [{"event_id": f"event_{engine}", "type": "turn.started"}],
+            }
+        )
+
+    links = start_worker_ensemble(
+        envelope,
+        engines=["codex", "claude"],
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1, token=""),
+        store=store,
+        post=fake_post,
+    )
+
+    create_payloads = [payload for url, payload in calls if url.endswith("/sessions")]
+    assert [payload["branch"] for payload in create_payloads] == ["jarvis/example-codex", "jarvis/example-claude"]
+    assert [link.branch for link in links] == ["jarvis/example-codex", "jarvis/example-claude"]
+    assert any(event.type == "ensemble_sessions_started" for event in store.events(run.run_id))
 
 
 def test_store_updates_worker_job_link(tmp_path) -> None:
@@ -1616,6 +1757,115 @@ def test_cli_schedule_tick_ack_requires_write_capability(tmp_path, monkeypatch, 
     assert ScheduleStore(str(schedules_path)).list()[0].last_fired_date == ""
 
 
+def test_schedule_dispatch_starts_session_and_acks_after_success(tmp_path) -> None:
+    schedule_store = ScheduleStore(str(tmp_path / "schedules.json"))
+    run_store = OrchestrationStore(str(tmp_path / "runs"))
+    schedule = schedule_store.add(
+        "Daily",
+        WorkCommand("start_next_work", source="github", start=True),
+        hour=9,
+        minute=0,
+        weekdays=[0],
+        timezone="Europe/London",
+    )
+
+    class Service:
+        def next_work(self, command, *, start=False):  # noqa: ANN001, ANN201
+            run = run_store.create_run("Scheduled", work_items=[_item()])
+            return StartedWork(
+                item=_item(),
+                worker=WorkerProfile(worker_id="local-worker", display_name="Local"),
+                envelope=ExecutionEnvelope(run_id=run.run_id, repo="roughcoder/jarvis", prompt="x"),
+                session=WorkerSessionLink(worker_id="local-worker", session_id="sess_1", status="running"),
+            )
+
+    results = dispatch_due_schedules(
+        schedule_store,
+        now=datetime.fromisoformat("2026-06-29T09:00:00+01:00"),
+        service=Service(),
+        run_store=run_store,
+    )
+
+    assert results[0].status == "started"
+    assert results[0].session_id == "sess_1"
+    assert schedule_store.list()[0].last_fired_date == "2026-06-29"
+    assert any(event.type == "schedule_fired" for event in run_store.events(results[0].run_id))
+    assert schedule.schedule_id
+
+
+def test_schedule_dispatch_reports_no_work_and_does_not_ack_failures(tmp_path) -> None:
+    schedule_store = ScheduleStore(str(tmp_path / "schedules.json"))
+    run_store = OrchestrationStore(str(tmp_path / "runs"))
+    schedule_store.add(
+        "Daily",
+        WorkCommand("start_next_work", source="github", start=True),
+        hour=9,
+        minute=0,
+        weekdays=[0],
+        timezone="Europe/London",
+    )
+
+    class NoWorkService:
+        def next_work(self, command, *, start=False):  # noqa: ANN001, ANN201
+            return None
+
+    no_work = dispatch_due_schedules(
+        schedule_store,
+        now=datetime.fromisoformat("2026-06-29T09:00:00+01:00"),
+        service=NoWorkService(),
+        run_store=run_store,
+    )
+    assert no_work[0].status == "no_work"
+    assert no_work[0].run_id
+    assert schedule_store.list()[0].last_fired_date == "2026-06-29"
+
+    schedules = schedule_store.list()
+    schedules[0].last_fired_date = ""
+    schedule_store.save_all(schedules)
+
+    class FailingService:
+        def next_work(self, command, *, start=False):  # noqa: ANN001, ANN201
+            raise RuntimeError("worker offline")
+
+    failed = dispatch_due_schedules(
+        schedule_store,
+        now=datetime.fromisoformat("2026-06-29T09:00:00+01:00"),
+        service=FailingService(),
+        run_store=run_store,
+    )
+    assert failed[0].status == "failed"
+    assert schedule_store.list()[0].last_fired_date == ""
+
+
+def test_schedule_dispatch_skip_if_active(tmp_path) -> None:
+    schedule_store = ScheduleStore(str(tmp_path / "schedules.json"))
+    run_store = OrchestrationStore(str(tmp_path / "runs"))
+    schedule = schedule_store.add(
+        "Daily",
+        WorkCommand("start_next_work", source="github", start=True),
+        hour=9,
+        minute=0,
+        weekdays=[0],
+        timezone="Europe/London",
+    )
+    run = run_store.create_run("Existing")
+    run_store.append_event(run.run_id, "schedule_fired", "Already running", {"schedule_id": schedule.schedule_id})
+
+    class Service:
+        def next_work(self, command, *, start=False):  # noqa: ANN001, ANN201
+            raise AssertionError("must skip before dispatch")
+
+    results = dispatch_due_schedules(
+        schedule_store,
+        now=datetime.fromisoformat("2026-06-29T09:00:00+01:00"),
+        service=Service(),
+        run_store=run_store,
+    )
+
+    assert results[0].status == "skipped_active"
+    assert schedule_store.list()[0].last_fired_date == "2026-06-29"
+
+
 def test_campaign_creates_bounded_child_runs(tmp_path) -> None:
     store = OrchestrationStore(str(tmp_path))
     parent = create_campaign(
@@ -1627,6 +1877,73 @@ def test_campaign_creates_bounded_child_runs(tmp_path) -> None:
 
     assert len(parent.child_run_ids) == 2
     assert all(store.get(child_id) is not None for child_id in parent.child_run_ids)
+
+
+def test_campaign_can_start_bounded_child_sessions(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+
+    def start_child(child, item):  # noqa: ANN001, ANN202
+        link = WorkerSessionLink(
+            worker_id="local-worker",
+            session_id=f"sess_{item.id.strip('#')}",
+            status="running",
+            provider="fake",
+            engine="fake",
+        )
+        store.link_session(child.run_id, link)
+        return link
+
+    parent = create_campaign(
+        store,
+        objective="Clear bugs",
+        candidates=[_item(id="#1"), _item(id="#2"), _item(id="#3")],
+        policy=CampaignPolicy(max_items=3, max_concurrent_runs=2),
+        start_child=start_child,
+    )
+
+    assert len(parent.child_run_ids) == 2
+    child = store.get(parent.child_run_ids[0])
+    assert child is not None
+    assert child.sessions[0].session_id == "sess_1"
+    assert any(event.type == "campaign_child_session_started" for event in store.events(parent.run_id))
+
+
+def test_public_run_report_redacts_private_details(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run(
+        "Fix /Users/neilbarton/private lin_api_abcdefghijklmnopqrstuvwxyz",
+        work_items=[
+            _item(
+                title="Public title",
+                body="private body must not leak",
+                url="https://github.com/roughcoder/jarvis/issues/1",
+            )
+        ],
+    )
+    store.link_session(
+        run.run_id,
+        WorkerSessionLink(
+            worker_id="local-worker",
+            session_id="sess_1",
+            status="completed",
+            provider="codex",
+            engine="codex",
+            branch="jarvis/example",
+        ),
+    )
+    store.link_artifact(run.run_id, Artifact(type="pr", url="https://github.com/roughcoder/jarvis/pull/99"))
+    store.link_artifact(run.run_id, Artifact(type="log", name="/Users/neilbarton/private/log.txt", public=False))
+    store.set_phase(run.run_id, "completed", "Done in /Users/neilbarton/private")
+
+    report = build_run_report(store, run.run_id)
+    comment = public_status_comment(report)
+    encoded = json.dumps(report)
+
+    assert "<local-path>" in encoded
+    assert "<redacted-token>" in encoded
+    assert "private body must not leak" not in encoded
+    assert "log.txt" not in encoded
+    assert "https://github.com/roughcoder/jarvis/pull/99" in comment
 
 
 def test_authority_does_not_grant_public_writes_by_config() -> None:

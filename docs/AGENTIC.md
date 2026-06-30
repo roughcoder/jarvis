@@ -8,6 +8,11 @@ cycle**, then pulls that cycle apart into the primitives that power it. The
 missing primitives are called out, but always *in their place in the loop*, never
 as a standalone backlog: the point is the complete cycle, including them.
 
+The tracked implementation plan for the worker-session pivot is
+`docs/AGENTIC_WORKER_SESSION_PLAN.md`. That file preserves the plan, decision
+record, stage status, and continuation context that originally lived in ignored
+OMX runtime state.
+
 > The north-star use: *"review PR 27 on `<repo>` with Opus and GPT-5.5, combine,
 > and write the replies in the PR"* — or *"take the Linear ticket, build the
 > feature on my personal laptop, raise the PR, tell me when it's up"* — said to
@@ -458,9 +463,13 @@ POST /sessions
 GET  /sessions
 GET  /sessions/:id
 GET  /sessions/:id/events
+GET  /sessions/requests
+GET  /sessions/:id/requests
+GET  /sessions/:id/checkpoints
 POST /sessions/:id/turns
 POST /sessions/:id/input
 POST /sessions/:id/approval
+POST /sessions/:id/checkpoints/restore
 POST /sessions/:id/interrupt
 POST /sessions/:id/stop
 ```
@@ -499,7 +508,8 @@ Initial canonical event record:
 
 Canonical event types include `session.created`, `turn.started`,
 `assistant.delta`, `tool.call`, `approval.requested`, `input.requested`,
-`checkpoint.created`, `turn.completed`, `turn.failed`,
+`approval.resolved`, `input.received`, `checkpoint.created`,
+`checkpoint.restored`, `turn.completed`, `turn.failed`,
 `session.interrupted`, and `session.stopped`.
 
 Provider-specific events are projected into the canonical stream:
@@ -521,6 +531,40 @@ Provider adapters must enforce the `ExecutionEnvelope` outside prompt text. Real
 providers fail closed when session metadata does not include the required
 `worker.session.turn` authority, and unsupported provider ids are rejected rather
 than silently falling back to another engine.
+
+Approvals and user input are projected from the append-only event log. Surfaces
+must render `GET /sessions/requests` or `GET /sessions/:id/requests`, then answer
+through `/sessions/:id/input` or `/sessions/:id/approval`. The projection treats
+`approval.requested` / `input.requested` as pending until a matching
+`approval.resolved` / `input.received` event appears. This is the contract for
+CLI, voice, WhatsApp, and the T3 cockpit; none of those surfaces should scrape
+provider stdout.
+
+Checkpoints are also event-derived. Providers emit `checkpoint.created` with a
+provider checkpoint id; `/sessions/:id/checkpoints` lists them, and
+`/sessions/:id/checkpoints/restore` records `checkpoint.restored` after the
+provider adapter accepts the restore. Provider adapters that cannot roll back
+must fail closed or record an explicit unsupported error instead of pretending
+that state changed.
+
+Schedules and campaigns dispatch sessions, not old coding jobs. `jarvis
+schedules tick --dispatch` rechecks authority, starts due `WorkCommand`s through
+the orchestration service, reports run/session ids, and only acknowledges a
+schedule after a start, explicit skip, or recorded no-work result. Campaigns are
+parent runs with bounded child runs; a child run may attach one or more
+`WorkerSession` links, and parent events summarize started or blocked children.
+
+Multi-provider mode is opt-in through `engine_strategy: "ensemble"` and multiple
+target engines such as `codex,claude`. Jarvis keeps one run and attaches one
+session per provider. Writing sessions use provider-suffixed branches so Codex
+and Claude panels do not collide. Provider events remain evidence; a later
+synthesis step or human operator decides what lands.
+
+Landing/reporting produces public-safe reports before any public write. Reports
+include run id, work item reference, session ids, worker ids, branch/PR artifacts,
+recent events, terminal reason, and known gaps while redacting local paths,
+token-shaped secrets, and private artifact/body content. Source adapters may post
+that report only when existing authority and landing-policy gates allow it.
 
 Shared primitives used on both sides of the orchestration/worker boundary live in
 neutral modules (`jarvis.ids`, `jarvis.text`, `jarvis.capabilities`). The worker
@@ -1265,6 +1309,10 @@ P0), P7 cross-target recovery, and the not-yet-enforceable forge gate (I4).
   autonomy pre-granted per principal×repo. (P5/P9)
 
 ## Checkable implementation stages
+
+The durable stage plan and current branch context are in
+`docs/AGENTIC_WORKER_SESSION_PLAN.md`; this checklist is the condensed project
+map.
 
 - [x] **P0 safety prerequisite:** non-git worker jobs copy into worker-owned
       scratch; cleanup refuses non-worker-owned paths.

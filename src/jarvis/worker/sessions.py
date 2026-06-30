@@ -198,6 +198,53 @@ class SessionManager:
             events = events[:limit]
         return events
 
+    def pending_requests(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        sessions = [self.get(session_id)] if session_id else self.list()
+        pending: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for session in [x for x in sessions if x is not None]:
+            for event in self.events(session.session_id):
+                request_type = _request_type(event.type)
+                if request_type:
+                    request_id = str(event.data.get("request_id") or event.data.get("id") or event.event_id)
+                    pending[(session.session_id, request_type, request_id)] = {
+                        "session_id": session.session_id,
+                        "request_id": request_id,
+                        "kind": request_type,
+                        "status": "pending",
+                        "event": event.to_dict(),
+                    }
+                    continue
+                resolved_type = _resolved_request_type(event.type)
+                if resolved_type:
+                    request_id = str(event.data.get("request_id") or event.data.get("id") or "")
+                    if request_id:
+                        pending.pop((session.session_id, resolved_type, request_id), None)
+        return list(pending.values())
+
+    def checkpoints(self, session_id: str) -> list[dict[str, Any]]:
+        events = self.events(session_id)
+        restored = {
+            str(event.data.get("checkpoint_id") or "")
+            for event in events
+            if event.type == "checkpoint.restored" and event.data.get("checkpoint_id")
+        }
+        checkpoints: list[dict[str, Any]] = []
+        for event in events:
+            if event.type != "checkpoint.created":
+                continue
+            checkpoint_id = str(event.data.get("checkpoint_id") or event.event_id)
+            checkpoints.append(
+                {
+                    "session_id": session_id,
+                    "checkpoint_id": checkpoint_id,
+                    "label": str(event.data.get("label") or ""),
+                    "provider": str(event.data.get("provider") or ""),
+                    "event": event.to_dict(),
+                    "restored": checkpoint_id in restored,
+                }
+            )
+        return checkpoints
+
     def save(self, session: WorkerSession) -> None:
         directory = self.session_dir(session.session_id)
         directory.mkdir(parents=True, exist_ok=True)
@@ -244,6 +291,22 @@ def _valid_event_type(value: str) -> bool:
 def _clean_id(value: Any) -> str:
     text = str(value or "").strip().lower()
     return text if _valid_id(text) else "unknown"
+
+
+def _request_type(event_type: str) -> str:
+    if event_type == "approval.requested":
+        return "approval"
+    if event_type == "input.requested":
+        return "input"
+    return ""
+
+
+def _resolved_request_type(event_type: str) -> str:
+    if event_type == "approval.resolved":
+        return "approval"
+    if event_type == "input.received":
+        return "input"
+    return ""
 
 
 _IDEMPOTENT_EVENT_TYPES = {

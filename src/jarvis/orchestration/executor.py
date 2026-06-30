@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from collections.abc import Callable
 from typing import Any
 
@@ -167,6 +168,43 @@ def start_worker_session(
     if store is not None:
         store.link_session(envelope.run_id, link)
     return link
+
+
+def start_worker_ensemble(
+    envelope: ExecutionEnvelope,
+    *,
+    engines: list[str],
+    worker_cfg: WorkerConfig,
+    worker: WorkerProfile | None = None,
+    store: OrchestrationStore | None = None,
+    post: Callable[..., Any] | None = None,
+) -> list[WorkerSessionLink]:
+    links: list[WorkerSessionLink] = []
+    for engine in engines:
+        engine_envelope = replace(
+            envelope,
+            engine=engine,
+            engine_strategy="ensemble",
+            session_id="" if engine != envelope.engine else envelope.session_id,
+            session_name=f"{envelope.session_name}-{engine}" if envelope.session_name else "",
+            branch_name=f"{envelope.branch_name}-{engine}" if envelope.branch_name else "",
+        )
+        link = start_worker_session(
+            engine_envelope,
+            worker_cfg=worker_cfg,
+            worker=worker,
+            store=store,
+            post=post,
+        )
+        links.append(link)
+    if store is not None:
+        store.append_event(
+            envelope.run_id,
+            "ensemble_sessions_started",
+            f"Started {len(links)} worker session(s) for ensemble.",
+            {"session_ids": [x.session_id for x in links], "engines": engines},
+        )
+    return links
 
 
 def _job_name(envelope: ExecutionEnvelope) -> str:

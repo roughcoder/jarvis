@@ -58,3 +58,12 @@ class ProviderAdapter(Protocol):
         updated = sessions.update_status(session.session_id, "stopped")
         event = sessions.append_event(updated.session_id, "session.stopped", {"status": "stopped"})
         return updated, event
+
+    def restore_checkpoint(
+        self,
+        *,
+        session: WorkerSession,
+        request: dict[str, Any],
+        sessions: SessionManager,
+    ) -> SessionEvent:
+        return sessions.append_event(session.session_id, "checkpoint.restored", request)
