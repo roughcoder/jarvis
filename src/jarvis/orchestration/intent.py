@@ -52,5 +52,5 @@ def _worker_target(text: str) -> str:
 
 
 def _engine_target(text: str) -> str:
-    m = re.search(r"\b(?:with|using|via|on)\s+(codex|claude)\b", text)
-    return normalize_engine_id(m.group(1)) if m else ""
+    matches = list(re.finditer(r"\b(?:with|using|via|on)\s+(codex|claude)(?![-_a-z0-9])\b", text))
+    return normalize_engine_id(matches[-1].group(1)) if matches else ""

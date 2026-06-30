@@ -20,10 +20,8 @@ def engine_ids(value: str | Iterable[str], *, default_engine: str = ENGINE_CODEX
         if engine and engine not in engines:
             engines.append(engine)
     fallback = normalize_engine_id(default_engine) or ENGINE_CODEX
-    if not engines:
-        engines.append(fallback)
-    elif fallback not in engines:
-        engines.insert(0, fallback)
+    engines = [engine for engine in engines if engine != fallback]
+    engines.insert(0, fallback)
     return engines
 
 
