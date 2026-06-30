@@ -762,21 +762,39 @@ def _cmd_runs(args: argparse.Namespace) -> int:
             print(format_run_report(report))
         return 0
     if args.sync:
-        from jarvis.orchestration.supervisor import sync_run_sessions
+        from jarvis.orchestration.supervisor import SyncSummary, sync_run_jobs, sync_run_sessions
 
-        summary = sync_run_sessions(
+        job_summary = sync_run_jobs(
             store,
             worker_cfg=cfg.worker,
             workers_path=cfg.orchestration.workers_path,
             run_id=args.run_id or "",
+        )
+        session_summary = sync_run_sessions(
+            store,
+            worker_cfg=cfg.worker,
+            workers_path=cfg.orchestration.workers_path,
+            run_id=args.run_id or "",
+        )
+        summary = SyncSummary(
+            runs_seen=max(job_summary.runs_seen, session_summary.runs_seen),
+            jobs_seen=job_summary.jobs_seen,
+            jobs_updated=job_summary.jobs_updated,
+            sessions_seen=session_summary.sessions_seen,
+            sessions_updated=session_summary.sessions_updated,
+            session_events_seen=session_summary.session_events_seen,
+            runs_completed=job_summary.runs_completed + session_summary.runs_completed,
+            runs_failed=job_summary.runs_failed + session_summary.runs_failed,
+            errors=[*(job_summary.errors or []), *(session_summary.errors or [])],
         )
         if args.json and not args.run_id:
             print(json.dumps(summary.to_dict(), indent=2))
             return 0
         if not args.json:
             print(
-                f"Synced {summary.runs_seen} run(s), {summary.sessions_seen} session(s); "
-                f"{summary.sessions_updated} updated, {summary.runs_completed} completed, {summary.runs_failed} failed."
+                f"Synced {summary.runs_seen} run(s), {summary.jobs_seen} job(s), "
+                f"{summary.sessions_seen} session(s); {summary.jobs_updated + summary.sessions_updated} updated, "
+                f"{summary.runs_completed} completed, {summary.runs_failed} failed."
             )
         if not args.run_id:
             return 0

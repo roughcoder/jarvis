@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from jarvis.capabilities import WORKER_SESSION_STOP
 from jarvis.config import WorkerConfig, load_config
 from jarvis.orchestration.authority import allowed
 from jarvis.orchestration.campaign import CampaignPolicy, create_campaign
@@ -529,6 +530,15 @@ def test_execution_envelope_uses_central_dispatch_policy() -> None:
     assert "forge.write.local" not in envelope.allowed_actions
 
 
+def test_confirm_before_pr_dispatch_policy_includes_pr_authority() -> None:
+    assert required_for_worker_dispatch("confirm_before_pr") == [
+        "worker.session.create",
+        "worker.session.turn",
+        "forge.github.branch.push",
+        "forge.github.pr.create",
+    ]
+
+
 def test_orchestration_service_starts_next_work_through_shared_policy(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     env_file = tmp_path / ".env"
     env_file.write_text(
@@ -573,7 +583,13 @@ def test_orchestration_service_starts_next_work_through_shared_policy(tmp_path, 
     monkeypatch.setattr("jarvis.orchestration.executor.start_worker_session", fake_start)
     service = OrchestrationService(
         cfg=cfg,
-        capabilities={"work.github.issues.read", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        capabilities={
+            "work.github.issues.read",
+            "worker.session.create",
+            "worker.session.turn",
+            "worker.session.stop",
+            "forge.github.branch.push",
+        },
         source_factory=lambda _name, _cfg=None: Source(),
     )
 
@@ -645,7 +661,13 @@ def test_orchestration_service_selects_requested_engine(tmp_path, monkeypatch) -
     monkeypatch.setattr("jarvis.orchestration.executor.start_worker_session", fake_start)
     service = OrchestrationService(
         cfg=cfg,
-        capabilities={"work.github.issues.read", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        capabilities={
+            "work.github.issues.read",
+            "worker.session.create",
+            "worker.session.turn",
+            "worker.session.stop",
+            "forge.github.branch.push",
+        },
         source_factory=lambda _name, _cfg=None: Source(),
     )
 
@@ -693,6 +715,7 @@ def test_orchestration_service_starts_ensemble_sessions(tmp_path, monkeypatch) -
     def fake_start_ensemble(envelope, *, engines, worker_cfg, worker=None, store=None, post=None):  # noqa: ANN001, ANN202
         assert envelope.engine_strategy == "ensemble"
         assert engines == ["codex", "claude"]
+        assert WORKER_SESSION_STOP in envelope.allowed_actions
         links = [
             WorkerSessionLink(worker_id=envelope.worker_id, session_id="sess_codex", provider="codex", engine="codex"),
             WorkerSessionLink(worker_id=envelope.worker_id, session_id="sess_claude", provider="claude", engine="claude"),
@@ -705,7 +728,13 @@ def test_orchestration_service_starts_ensemble_sessions(tmp_path, monkeypatch) -
     monkeypatch.setattr("jarvis.orchestration.executor.start_worker_ensemble", fake_start_ensemble)
     service = OrchestrationService(
         cfg=cfg,
-        capabilities={"work.github.issues.read", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        capabilities={
+            "work.github.issues.read",
+            "worker.session.create",
+            "worker.session.turn",
+            "worker.session.stop",
+            "forge.github.branch.push",
+        },
         source_factory=lambda _name, _cfg=None: Source(),
     )
 
@@ -783,7 +812,13 @@ def test_orchestration_service_selects_worker_supporting_all_ensemble_engines(tm
     monkeypatch.setattr("jarvis.orchestration.executor.start_worker_ensemble", fake_start_ensemble)
     service = OrchestrationService(
         cfg=cfg,
-        capabilities={"work.github.issues.read", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        capabilities={
+            "work.github.issues.read",
+            "worker.session.create",
+            "worker.session.turn",
+            "worker.session.stop",
+            "forge.github.branch.push",
+        },
         source_factory=lambda _name, _cfg=None: Source(),
     )
 
@@ -1057,6 +1092,64 @@ def test_start_worker_session_reuses_dispatch_idempotency_key_on_retry(tmp_path)
     assert turn_payloads[0]["idempotency_key"] == turn_payloads[1]["idempotency_key"]
 
 
+def test_start_worker_session_links_created_session_before_turn_failure(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Start live session")
+    envelope = ExecutionEnvelope(
+        run_id=run.run_id,
+        repo="roughcoder/jarvis",
+        prompt="x",
+        worker_id="local-worker",
+        engine="codex",
+        branch_name="jarvis/live-session",
+        session_name="jarvis-live-session",
+    )
+
+    class Response:
+        def __init__(self, body: dict, status_code: int = 200) -> None:
+            self._body = body
+            self.status_code = status_code
+            self.text = body.get("error", "")
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise AssertionError("HTTP error should be converted before raise_for_status")
+
+        def json(self):
+            return self._body
+
+    def fake_post(url, **_kwargs):  # noqa: ANN001
+        if url.endswith("/sessions"):
+            return Response(
+                {
+                    "ok": True,
+                    "session": {
+                        "session_id": "sess_123",
+                        "status": "created",
+                        "provider": "codex",
+                        "engine": "codex",
+                        "branch": "jarvis/live-session",
+                    },
+                    "event": {"event_id": "event_created"},
+                }
+            )
+        return Response({"ok": False, "error": "unsupported provider"}, status_code=400)
+
+    with pytest.raises(RuntimeError, match="unsupported provider"):
+        start_worker_session(
+            envelope,
+            worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1, token=""),
+            store=store,
+            post=fake_post,
+        )
+
+    reloaded = store.get(run.run_id)
+    assert reloaded is not None
+    assert reloaded.sessions[0].session_id == "sess_123"
+    assert reloaded.sessions[0].status == "created"
+    assert reloaded.sessions[0].last_event_id == "event_created"
+
+
 def test_start_worker_ensemble_uses_distinct_provider_branches(tmp_path) -> None:
     store = OrchestrationStore(str(tmp_path))
     run = store.create_run("Start ensemble")
@@ -1208,6 +1301,83 @@ def test_start_worker_ensemble_stops_started_sessions_on_later_failure(tmp_path)
     assert store.get(run.run_id).sessions[0].status == "stopped"  # type: ignore[union-attr]
 
 
+def test_start_worker_ensemble_does_not_mark_session_stopped_when_rollback_fails(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Start ensemble")
+    envelope = ExecutionEnvelope(
+        run_id=run.run_id,
+        repo="roughcoder/jarvis",
+        prompt="x",
+        worker_id="local-worker",
+        engine="codex",
+        engine_strategy="ensemble",
+        branch_name="jarvis/example",
+        session_name="jarvis-example",
+    )
+
+    class Response:
+        def __init__(self, body: dict, status_code: int = 200) -> None:
+            self._body = body
+            self.status_code = status_code
+            self.text = body.get("error", "")
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self._body
+
+    def fake_post(url, **kwargs):  # noqa: ANN001
+        if url.endswith("/sessions/sess_codex/stop"):
+            return Response({"ok": False, "error": "missing worker.session.stop"}, status_code=400)
+        if url.endswith("/sessions"):
+            engine = kwargs["json"]["engine"]
+            if engine == "claude":
+                raise RuntimeError("claude worker unavailable")
+            return Response(
+                {
+                    "ok": True,
+                    "session": {
+                        "session_id": "sess_codex",
+                        "status": "created",
+                        "provider": "codex",
+                        "engine": "codex",
+                        "branch": "jarvis/example-codex",
+                    },
+                }
+            )
+        if url.endswith("/sessions/sess_codex/turns"):
+            return Response(
+                {
+                    "ok": True,
+                    "turn_id": "turn_123",
+                    "session": {
+                        "session_id": "sess_codex",
+                        "status": "running",
+                        "provider": "codex",
+                        "engine": "codex",
+                        "branch": "jarvis/example-codex",
+                    },
+                    "events": [],
+                }
+            )
+        raise AssertionError(url)
+
+    with pytest.raises(RuntimeError, match="claude worker unavailable"):
+        start_worker_ensemble(
+            envelope,
+            engines=["codex", "claude"],
+            worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1, token=""),
+            store=store,
+            post=fake_post,
+        )
+
+    reloaded = store.get(run.run_id)
+    assert reloaded is not None
+    assert reloaded.sessions[0].status == "running"
+    assert store.events(run.run_id)[-1].type == "session_rollback_stop_failed"
+
+
 def test_store_updates_worker_job_link(tmp_path) -> None:
     store = OrchestrationStore(str(tmp_path))
     run = store.create_run("Start work")
@@ -1253,6 +1423,47 @@ def test_store_links_worker_session_to_run_graph(tmp_path) -> None:
     assert updated.sessions[0].status == "waiting_input"
     assert updated.sessions[0].last_event_id == "ev_1"
     assert [event.type for event in store.events(run.run_id)][-2:] == ["session_started", "session_updated"]
+
+
+def test_store_reserves_session_if_idle_under_lock(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Resume live session")
+    store.link_session(
+        run.run_id,
+        WorkerSessionLink(
+            worker_id="local-worker",
+            session_id="sess_123",
+            status="completed",
+            provider="codex",
+            engine="codex",
+        ),
+    )
+
+    reserved = store.reserve_session_if_idle(
+        run.run_id,
+        WorkerSessionLink(
+            worker_id="local-worker",
+            session_id="sess_123",
+            status="running",
+            provider="codex",
+            engine="codex",
+        ),
+    )
+
+    assert reserved.sessions[0].status == "running"
+    assert reserved.phase == "running"
+    with pytest.raises(RuntimeError, match="already active"):
+        store.reserve_session_if_idle(
+            run.run_id,
+            WorkerSessionLink(
+                worker_id="local-worker",
+                session_id="sess_123",
+                status="running",
+                provider="codex",
+                engine="codex",
+            ),
+        )
+    assert store.events(run.run_id)[-1].type == "session_reserved"
 
 
 def test_sync_run_sessions_marks_completed_run_and_advances_event_cursor(tmp_path) -> None:
@@ -1607,6 +1818,8 @@ def test_orchestration_service_resume_run_dispatches_existing_session(tmp_path, 
 
     def fake_start(envelope, *, worker_cfg, worker=None, store=None, post=None):  # noqa: ANN001, ANN202
         seen["envelope"] = envelope
+        reserved = store.get(envelope.run_id)
+        assert reserved.sessions[0].status == "running"
         link = WorkerSessionLink(
             worker_id=envelope.worker_id,
             session_id=envelope.session_id,
@@ -2302,6 +2515,41 @@ def test_cli_runs_and_work_intent_smoke(tmp_path, monkeypatch, capsys) -> None: 
     data = json.loads(capsys.readouterr().out)
     assert data["operation"] == "start_next_work"
     assert data["source"] == "linear"
+
+
+def test_cli_runs_sync_refreshes_legacy_job_links(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis.cli import main
+
+    workspace = tmp_path / "orchestration"
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"ORCHESTRATION_WORKSPACE={workspace}\n")
+    store = OrchestrationStore(str(workspace))
+    run = store.create_run("Legacy job run")
+    store.link_job(run.run_id, WorkerJobLink(worker_id="local-worker", job_id="job123", status="running"))
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"id": "job123", "status": "done", "session_id": "legacy-session"}
+
+    def fake_get(url, **_kwargs):  # noqa: ANN001
+        assert url.endswith("/jobs/job123")
+        return Response()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    monkeypatch.setattr("jarvis.orchestration.supervisor.httpx.get", fake_get)
+
+    assert main(["runs", "--sync", "--json"]) == 0
+
+    summary = json.loads(capsys.readouterr().out)
+    reloaded = store.get(run.run_id)
+    assert summary["jobs_seen"] == 1
+    assert summary["jobs_updated"] == 1
+    assert reloaded is not None
+    assert reloaded.phase == "completed"
+    assert reloaded.jobs[0].session_id == "legacy-session"
 
 
 def test_cli_work_next_preserves_parsed_linear_source(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001

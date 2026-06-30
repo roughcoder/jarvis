@@ -8,13 +8,16 @@ from typing import Any
 
 from jarvis.ids import new_id, utc_now
 from jarvis.worker_session_contract import (
+    ACTIVE_SESSION_STATUSES,
     CHECKPOINT_ID_KEY,
     EVENT_CHECKPOINT_CREATED,
     EVENT_CHECKPOINT_RESTORED,
     EVENT_SESSION_CREATED,
+    EVENT_SESSION_INTERRUPTED,
     EVENT_TURN_STARTED,
     IDEMPOTENT_SESSION_EVENT_TYPES,
     SESSION_CREATED,
+    SESSION_INTERRUPTED,
     SESSION_RUNNING,
     request_type as contract_request_type,
     resolved_request_type as contract_resolved_request_type,
@@ -96,6 +99,7 @@ class SessionManager:
         self.root = pathlib.Path(store_dir).expanduser()
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._interrupt_stale_active_sessions()
 
     def create(self, data: dict[str, Any]) -> tuple[WorkerSession, SessionEvent]:
         with self._lock:
@@ -200,6 +204,8 @@ class SessionManager:
             existing = self._idempotent_event(session.session_id, EVENT_TURN_STARTED, data)
             if existing is not None:
                 return session, existing, False
+            if session.status in (ACTIVE_SESSION_STATUSES - {SESSION_CREATED}):
+                raise RuntimeError(f"worker session {session.session_id} already has an active turn")
             event = SessionEvent.create(session.session_id, EVENT_TURN_STARTED, data)
             with self.events_path(session.session_id).open("a") as f:
                 f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
@@ -207,6 +213,26 @@ class SessionManager:
             session.updated_at = event.time
             self.save(session)
             return session, event, True
+
+    def _interrupt_stale_active_sessions(self) -> None:
+        with self._lock:
+            for path in sorted(self.root.glob("*/session.json")):
+                try:
+                    session = WorkerSession.from_dict(json.loads(path.read_text()))
+                except (OSError, json.JSONDecodeError, ValueError, KeyError):
+                    continue
+                if session.status not in (ACTIVE_SESSION_STATUSES - {SESSION_CREATED}):
+                    continue
+                event = SessionEvent.create(
+                    session.session_id,
+                    EVENT_SESSION_INTERRUPTED,
+                    {"reason": "worker daemon restarted with active session state", "previous_status": session.status},
+                )
+                session.status = SESSION_INTERRUPTED
+                session.updated_at = event.time
+                self.save(session)
+                with self.events_path(session.session_id).open("a") as f:
+                    f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
 
     def events(self, session_id: str, *, after: str = "", limit: int | None = None) -> list[SessionEvent]:
         try:
