@@ -14,7 +14,7 @@ from jarvis.orchestration.intent import parse_work_command
 from jarvis.orchestration.models import WorkCommand, WorkItem, WorkerJobLink
 from jarvis.orchestration.policy import required_for_worker_dispatch
 from jarvis.orchestration.schedules import ScheduleStore
-from jarvis.orchestration.service import OrchestrationService, StartedWork
+from jarvis.orchestration.service import MissingWorkRepoError, OrchestrationService, StartedWork
 from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource
 from jarvis.orchestration.store import ActiveWorkItemError, OrchestrationStore
 from jarvis.orchestration.supervisor import sync_run_jobs
@@ -225,6 +225,15 @@ def test_parse_work_command_captures_engine_target() -> None:
     assert cmd.operation == "start_next_work"
     assert cmd.source == "linear"
     assert cmd.target_engine_id == "claude"
+
+
+def test_parse_work_command_handles_terse_linear_ticket_list() -> None:
+    cmd = parse_work_command("linear tickets")
+
+    assert cmd.operation == "inspect_work"
+    assert cmd.source == "linear"
+    assert cmd.kind == "ticket"
+    assert cmd.start is False
 
 
 def test_parse_work_command_ignores_engine_prefix_inside_worker_id() -> None:
@@ -586,6 +595,87 @@ def test_orchestration_service_selects_requested_engine(tmp_path, monkeypatch) -
     assert isinstance(result, StartedWork)
     assert seen == {"worker_id": "claude-worker", "engine": "claude"}
     assert result.envelope.engine_strategy == "single"
+
+
+def test_orchestration_service_needs_human_for_start_without_repo(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    cfg = load_config()
+
+    class Source:
+        def next(self, *, repo="", filters=None):  # noqa: ANN001, ANN201
+            return _item(source="linear", id="HL-254", repo="", kind="ticket")
+
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"work.linear.read", "worker.job.start", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: Source(),
+    )
+
+    with pytest.raises(MissingWorkRepoError) as exc:
+        service.next_work(WorkCommand("start_next_work", source="linear", start=True), start=True)
+
+    runs = OrchestrationStore(cfg.orchestration.workspace).list_runs()
+    assert len(runs) == 1
+    assert runs[0].phase == "needs_human"
+    assert runs[0].status == "terminal"
+    assert runs[0].jobs == []
+    assert exc.value.run_id == runs[0].run_id
+
+
+def test_orchestration_service_uses_default_repo_for_repo_less_item(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                "ORCHESTRATION_DEFAULT_REPO=roughcoder/jarvis",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    cfg = load_config()
+
+    class Source:
+        def next(self, *, repo="", filters=None):  # noqa: ANN001, ANN201
+            return _item(source="linear", id="HL-255", repo="", kind="ticket")
+
+    def fake_start(envelope, *, worker_cfg, worker=None, store=None, post=None):  # noqa: ANN001, ANN202
+        return WorkerJobLink(worker_id=envelope.worker_id, job_id="job255", branch=envelope.branch_name)
+
+    monkeypatch.setattr(
+        "jarvis.orchestration.workers.WorkerRegistry.choose",
+        lambda _self, _required=None: WorkerProfile(
+            worker_id="local-worker",
+            display_name="Local",
+            capabilities=["git"],
+            base_url="http://localhost:1",
+            status="online",
+            max_concurrent_jobs=1,
+            current_jobs=0,
+        ),
+    )
+    monkeypatch.setattr("jarvis.orchestration.executor.start_worker_job", fake_start)
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"work.linear.read", "worker.job.start", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: Source(),
+    )
+
+    result = service.next_work(WorkCommand("start_next_work", source="linear", start=True), start=True)
+
+    assert isinstance(result, StartedWork)
+    assert result.item.repo == "roughcoder/jarvis"
+    assert result.envelope.repo == "roughcoder/jarvis"
 
 
 def test_start_worker_job_links_run_graph(tmp_path) -> None:

@@ -657,6 +657,7 @@ def _cmd_work(args: argparse.Namespace) -> int:
         NoEligibleWorkerError,
         OrchestrationService,
         StartedWork,
+        MissingWorkRepoError,
         WorkAlreadyOwnedError,
         WorkerDispatchError,
     )
@@ -730,6 +731,9 @@ def _cmd_work(args: argparse.Namespace) -> int:
             return 0
         except NoEligibleWorkerError:
             print("No eligible worker found.")
+            return 1
+        except MissingWorkRepoError as exc:
+            print(f"{exc.item.source}:{exc.item.id} needs human input ({exc.run_id}): {exc}")
             return 1
         except WorkerDispatchError as exc:
             print(f"Worker dispatch failed for {exc.run_id}: {exc.cause}")

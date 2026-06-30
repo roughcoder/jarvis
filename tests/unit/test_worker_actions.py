@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import pathlib
+import sys
 
 from jarvis.worker.actions import cleanup_job, code_argv, prepare_worktree, run_exec, run_shell
 from jarvis.worker.jobs import JobManager
@@ -30,6 +31,13 @@ def test_run_exec_echo() -> None:
 def test_run_exec_missing_binary_returns_error() -> None:
     out = asyncio.run(run_exec(["definitely-not-a-real-binary-xyz"], None, 5))
     assert out.startswith("error:")
+
+
+def test_run_exec_nonzero_exit_returns_error() -> None:
+    out = asyncio.run(run_exec([sys.executable, "-c", "import sys; print('bad token'); sys.exit(7)"], None, 5))
+
+    assert out.startswith("error: command exited with 7")
+    assert "bad token" in out
 
 
 def test_code_argv_for_each_agent() -> None:
@@ -73,6 +81,16 @@ def test_job_manager_records_error() -> None:
     job = _drain(boom())
     assert job.status == "error"
     assert "kaboom" in job.output
+
+
+def test_job_manager_marks_error_output_as_error() -> None:
+    async def work() -> str:
+        return "error: command exited with 1\nFailed to authenticate."
+
+    job = _drain(work())
+
+    assert job.status == "error"
+    assert "Failed to authenticate" in job.output
 
 
 def test_jobs_persist_to_disk_and_reload(tmp_path) -> None:

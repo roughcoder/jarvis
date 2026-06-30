@@ -41,6 +41,13 @@ class WorkerDispatchError(RuntimeError):
         super().__init__(str(cause))
 
 
+class MissingWorkRepoError(RuntimeError):
+    def __init__(self, item: WorkItem, run_id: str) -> None:
+        self.item = item
+        self.run_id = run_id
+        super().__init__("work item has no repo/default repo; cannot start a coding worker")
+
+
 @dataclass
 class StartedWork:
     item: WorkItem
@@ -81,6 +88,9 @@ class OrchestrationService:
             return None
 
         store = OrchestrationStore(self.cfg.orchestration.workspace)
+        repo = self._repo(command)
+        if repo and not item.repo:
+            item.repo = repo
         existing = store.active_primary_owner(item)
         if existing:
             raise WorkAlreadyOwnedError(item, existing)
@@ -88,6 +98,10 @@ class OrchestrationService:
             return item
 
         self._require(required_for_worker_dispatch(self.cfg.orchestration.landing_mode))
+        if not item.repo:
+            run = store.create_run(str(item.title), work_items=[item])
+            store.set_phase(run.run_id, "needs_human", "Work item has no repo/default repo; cannot start a coding worker")
+            raise MissingWorkRepoError(item, run.run_id)
         registry = WorkerRegistry(self.cfg.worker, profiles_path=self.cfg.orchestration.workers_path)
         target_engine = normalize_engine_id(command.target_engine_id)
         if command.target_worker_id:

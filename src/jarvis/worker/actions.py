@@ -56,7 +56,7 @@ async def run_exec(
 ) -> str:
     """Run a binary with explicit args (no shell) — for coding agents/built-ins.
     `env` (if given) is layered ON TOP of the inherited environment. Never raises —
-    a missing binary / bad cwd comes back as an 'error:' string."""
+    a missing binary / bad cwd / non-zero exit comes back as an 'error:' string."""
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -72,7 +72,11 @@ async def run_exec(
     except (asyncio.TimeoutError, TimeoutError):
         proc.kill()
         return f"error: timed out after {timeout_s:.0f}s"
-    return out.decode("utf-8", "replace").strip() or "(no output)"
+    text = out.decode("utf-8", "replace").strip()
+    if proc.returncode:
+        suffix = f"\n{text}" if text else ""
+        return f"error: command exited with {proc.returncode}{suffix}"
+    return text or "(no output)"
 
 
 async def run_applescript(script: str, timeout_s: float) -> str:

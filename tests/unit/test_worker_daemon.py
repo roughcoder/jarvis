@@ -94,6 +94,35 @@ def test_daemon_code_dispatch_runs_a_job(tmp_path) -> None:
     assert len(listed["jobs"]) >= 1
 
 
+def test_daemon_code_dispatch_marks_nonzero_agent_exit_as_error(tmp_path) -> None:
+    agent = tmp_path / "bad-agent"
+    agent.write_text("#!/usr/bin/env python3\nimport sys\nprint('bad auth')\nsys.exit(1)\n")
+    agent.chmod(0o755)
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"), codex_bin=str(agent))
+
+    async def calls(base, c):  # noqa: ANN001
+        disp = (
+            await c.post(
+                base + "/run",
+                json={"action": "code", "args": {"prompt": "hello"}},
+            )
+        ).json()
+        jid = disp["job_id"]
+        job = {}
+        for _ in range(100):
+            job = (await c.get(f"{base}/jobs/{jid}")).json()
+            if job["status"] != "running":
+                break
+            await asyncio.sleep(0.02)
+        return job
+
+    job = asyncio.run(_with_server(cfg, 8820, calls))
+
+    assert job["status"] == "error"
+    assert "command exited with 1" in job["output"]
+    assert "bad auth" in job["output"]
+
+
 def test_daemon_health_advertises_supported_engines(tmp_path) -> None:
     cfg = WorkerConfig(
         _env_file=None,

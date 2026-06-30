@@ -126,7 +126,7 @@ class JobManager:
     async def _run(self, job: Job, coro: Awaitable[str]) -> None:
         try:
             job.output = await coro
-            job.status = "done"
+            job.status = "error" if _is_error_output(job.output) else "done"
         except Exception as exc:  # noqa: BLE001 - a job failure must not crash the daemon
             job.output = f"error: {exc}"
             job.status = "error"
@@ -165,3 +165,7 @@ class JobManager:
 
     def recent(self, n: int = 20) -> list[Job]:
         return list(self._jobs.values())[-n:]
+
+
+def _is_error_output(output: str) -> bool:
+    return output.lstrip().lower().startswith("error:")
