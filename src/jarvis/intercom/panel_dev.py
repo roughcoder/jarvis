@@ -22,9 +22,12 @@ from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
 
 from jarvis import __version__ as JARVIS_VERSION
+from jarvis.brain.voice_modes import DEFAULT_MODE, STAY_MODE
 
 
 DEFAULT_SLEEP_AFTER_S = 90.0
+USER_CLOSE_EXIT_CODE = 42
+VOICE_MODES = (DEFAULT_MODE, STAY_MODE)
 PANEL_STATES = (
     "idle",
     "connecting",
@@ -33,6 +36,7 @@ PANEL_STATES = (
     "thinking",
     "speaking",
     "disconnected",
+    "network",
     "sleep",
 )
 
@@ -40,16 +44,22 @@ PANEL_STATES = (
 @dataclass(frozen=True)
 class PreviewConfig:
     initial_state: str = "idle"
+    voice_mode: str = DEFAULT_MODE
     title: str = "Jarvis PiPanel"
     sleep_after_s: float = DEFAULT_SLEEP_AFTER_S
+    debug_controls: bool = True
 
 
 def render_panel_preview_html(cfg: PreviewConfig | None = None) -> str:
     cfg = cfg or PreviewConfig()
     state = cfg.initial_state if cfg.initial_state in PANEL_STATES else "idle"
     states = ",".join(f'"{item}"' for item in PANEL_STATES)
+    voice_modes = ",".join(f'"{item}"' for item in VOICE_MODES)
+    voice_mode = _voice_mode_or_default(cfg.voice_mode)
     sleep_after_ms = int(max(5.0, cfg.sleep_after_s) * 1000)
     version = _escape_html(JARVIS_VERSION)
+    debug_controls = "true" if cfg.debug_controls else "false"
+    controls_markup = '<div class="controls" id="controls" aria-label="preview states"></div>' if cfg.debug_controls else ""
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -108,34 +118,80 @@ body {{
   position: absolute;
   left: clamp(18px, 4vw, 34px);
   right: clamp(18px, 4vw, 34px);
-  top: clamp(16px, 4vh, 26px);
+  top: clamp(10px, 2.8vh, 18px);
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  min-height: 34px;
   z-index: 3;
 }}
 
 .version-label {{
   position: absolute;
-  left: clamp(8px, 2vw, 16px);
-  top: clamp(6px, 1.6vh, 12px);
+  right: clamp(8px, 2vw, 16px);
+  bottom: clamp(6px, 1.6vh, 12px);
   z-index: 4;
-  color: #909b91;
-  font-size: clamp(10px, 2vw, 13px);
-  font-weight: 760;
+  color: #30382f;
+  font-size: clamp(9px, 1.8vw, 12px);
+  font-weight: 700;
   line-height: 1;
   letter-spacing: 0;
+}}
+
+.mode-button {{
+  position: absolute;
+  left: clamp(8px, 2vw, 16px);
+  top: clamp(10px, 2.8vh, 18px);
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: clamp(11px, 2.2vw, 14px);
+  font-weight: 780;
+  letter-spacing: 0;
+  line-height: 1;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}}
+
+.mode-button small {{
+  color: #667266;
+  font-size: .72em;
+  font-weight: 760;
+  line-height: 1;
+}}
+
+.mode-button span {{
+  line-height: 1;
+}}
+
+.mode-button:active {{
+  transform: translateY(1px);
+}}
+
+.mode-button:focus-visible {{
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
 }}
 
 .state-pill {{
   display: flex;
   align-items: center;
   gap: 8px;
+  min-height: 34px;
   min-width: 104px;
   justify-content: flex-end;
   color: var(--accent);
   font-size: clamp(12px, 3vw, 16px);
   font-weight: 700;
+  line-height: 1;
 }}
 
 .state-pill i {{
@@ -360,6 +416,31 @@ body {{
 .screen.controls-open {{ --controls-opacity: 1; --controls-y: 0; }}
 .screen.controls-open .controls {{ pointer-events: auto; }}
 
+.confirm {{
+  position: absolute;
+  left: clamp(18px, 5vw, 44px);
+  right: clamp(18px, 5vw, 44px);
+  bottom: clamp(18px, 5vh, 32px);
+  z-index: 8;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid #30382f;
+  border-radius: var(--radius);
+  background: #101611;
+}}
+
+.screen.confirm-open .confirm {{
+  display: flex;
+}}
+
+.screen.confirm-open .controls {{
+  opacity: 0;
+  pointer-events: none;
+}}
+
 button {{
   appearance: none;
   border: 1px solid var(--line);
@@ -376,6 +457,27 @@ button[aria-pressed="true"] {{
   border-color: var(--accent);
   color: #07100b;
   background: var(--accent);
+}}
+
+.close-button {{
+  color: #b4bcad;
+  border-color: #30382f;
+}}
+
+.close-button.holding {{
+  color: #07100b;
+  background: #d8b84e;
+  border-color: #d8b84e;
+}}
+
+.confirm button {{
+  min-width: 86px;
+}}
+
+.confirm .danger {{
+  color: #07100b;
+  background: #d8b84e;
+  border-color: #d8b84e;
 }}
 
 .debug {{
@@ -508,6 +610,38 @@ button[aria-pressed="true"] {{
 
 [data-state="connecting"] .meter {{
   opacity: .25;
+}}
+
+[data-state="network"] {{
+  --accent: #d8b84e;
+}}
+
+[data-state="network"] .eyes {{
+  opacity: 0;
+  transform: scale(.9);
+}}
+
+[data-state="network"] .stage::before {{
+  display: block;
+  width: min(24vw, 120px);
+  aspect-ratio: 1;
+  border-radius: 999px;
+  border: min(2.8vw, 13px) solid color-mix(in srgb, var(--accent), transparent 62%);
+  border-top-color: var(--accent);
+  animation: connectSpin 1.3s linear infinite;
+}}
+
+[data-state="network"] .stage::after {{
+  display: block;
+  width: min(4.8vw, 24px);
+  height: min(26vw, 132px);
+  border-radius: 999px;
+  background: var(--accent);
+  transform: translate(-50%, -50%) rotate(-42deg);
+}}
+
+[data-state="network"] .meter {{
+  opacity: .18;
 }}
 
 [data-state="disconnected"] {{
@@ -710,8 +844,10 @@ button[aria-pressed="true"] {{
 </style>
 </head>
 <body>
-<main class="screen" data-state="{state}">
-  <div class="version-label" aria-label="Jarvis version">v{version}</div>
+<main class="screen" data-state="{state}" data-voice-mode="{voice_mode}">
+  <button class="mode-button" id="modeButton" type="button" aria-label="Speech mode">
+    <small>mode</small><span id="modeLabel">{voice_mode}</span>
+  </button>
   <div class="topline">
     <div class="state-pill"><i></i><span id="stateLabel">{state}</span></div>
   </div>
@@ -728,11 +864,17 @@ button[aria-pressed="true"] {{
     </div>
     <div class="sleep-zz" aria-hidden="true"><span>z</span><span>z</span><span>z</span></div>
   </section>
-  <div class="controls" id="controls" aria-label="preview states"></div>
+  {controls_markup}
+  <div class="confirm" id="closeConfirm" role="dialog" aria-modal="true" aria-label="Close Jarvis screen">
+    <button type="button" class="danger" id="confirmClose">close screen</button>
+    <button type="button" id="cancelClose">cancel</button>
+  </div>
   <div class="meter" id="meter" aria-hidden="true"></div>
+  <div class="version-label" aria-label="Jarvis version">v{version}</div>
 </main>
 <script>
 const states = [{states}];
+const voiceModes = [{voice_modes}];
 const labels = {{
   idle: "ready",
   connecting: "connecting",
@@ -741,13 +883,17 @@ const labels = {{
   thinking: "thinking",
   speaking: "speaking",
   disconnected: "offline",
+  network: "no internet",
   sleep: "resting"
 }};
 const sleepAfterMs = {sleep_after_ms};
+const debugControls = {debug_controls};
 const screen = document.querySelector(".screen");
 const controls = document.getElementById("controls");
 const meter = document.getElementById("meter");
 const stateLabel = document.getElementById("stateLabel");
+const modeButton = document.getElementById("modeButton");
+const modeLabel = document.getElementById("modeLabel");
 const tileVoice = document.getElementById("tileVoice");
 const eyes = [...document.querySelectorAll(".eye")];
 const pupils = [...document.querySelectorAll(".pupil")];
@@ -758,15 +904,28 @@ let demoTimer = 0;
 let speakingTimer = 0;
 let sleepPeekTimer = 0;
 let sleepTimer = 0;
+let closeHoldTimer = 0;
 let autoSleepActive = false;
+let voiceModeIndex = Math.max(0, voiceModes.indexOf(screen.dataset.voiceMode || "default"));
 
-for (const state of states) {{
-  const button = document.createElement("button");
-  button.type = "button";
-  button.textContent = labels[state];
-  button.dataset.state = state;
-  button.addEventListener("click", () => setState(state, {{ publish: true }}));
-  controls.append(button);
+if (debugControls && controls) {{
+  for (const state of states) {{
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = labels[state];
+    button.dataset.state = state;
+    button.addEventListener("click", () => setState(state, {{ publish: true }}));
+    controls.append(button);
+  }}
+}}
+
+let closeButton = null;
+if (debugControls && controls) {{
+  closeButton = document.createElement("button");
+  closeButton.type = "button";
+  closeButton.textContent = "hold close";
+  closeButton.className = "close-button";
+  controls.append(closeButton);
 }}
 
 for (let i = 0; i < 24; i += 1) {{
@@ -775,17 +934,25 @@ for (let i = 0; i < 24; i += 1) {{
   meter.append(bar);
 }}
 
-async function publishState(next) {{
+async function publishPanelPatch(payload) {{
   try {{
     await fetch("/state", {{
       method: "POST",
       headers: {{ "Content-Type": "application/json" }},
-      body: JSON.stringify({{ state: next }}),
+      body: JSON.stringify(payload),
       cache: "no-store"
     }});
   }} catch (_error) {{
     // Local preview still works if the state endpoint is unavailable.
   }}
+}}
+
+async function publishState(next) {{
+  await publishPanelPatch({{ state: next }});
+}}
+
+async function publishVoiceMode(next) {{
+  await publishPanelPatch({{ voice_mode: next }});
 }}
 
 function setState(next, options = {{}}) {{
@@ -795,11 +962,13 @@ function setState(next, options = {{}}) {{
   screen.dataset.state = next;
   clearSpeakingMotion();
   clearSleepPeek();
-  screen.classList.toggle("info", next === "disconnected");
+  screen.classList.toggle("info", next === "disconnected" || next === "network");
   stateLabel.textContent = labels[next];
   tileVoice.textContent = labels[next];
-  for (const button of controls.children) {{
-    button.setAttribute("aria-pressed", String(button.dataset.state === next));
+  if (controls) {{
+    for (const button of controls.children) {{
+      button.setAttribute("aria-pressed", String(button.dataset.state === next));
+    }}
   }}
   const params = new URLSearchParams(location.search);
   params.set("state", next);
@@ -813,6 +982,59 @@ function setState(next, options = {{}}) {{
   scheduleAutoSleep(next);
 }}
 
+function setVoiceMode(next, options = {{}}) {{
+  if (!voiceModes.includes(next)) return;
+  voiceModeIndex = voiceModes.indexOf(next);
+  screen.dataset.voiceMode = next;
+  modeLabel.textContent = next;
+  modeButton.setAttribute("aria-label", `Speech mode: ${{next}}`);
+  const params = new URLSearchParams(location.search);
+  params.set("mode", next);
+  if (!options.remote) history.replaceState(null, "", `${{location.pathname}}?${{params}}`);
+  if (options.publish) publishVoiceMode(next);
+}}
+
+function cycleVoiceMode() {{
+  setVoiceMode(voiceModes[(voiceModeIndex + 1) % voiceModes.length], {{ publish: true }});
+}}
+
+async function requestCloseScreen() {{
+  try {{
+    await fetch("/close", {{ method: "POST", cache: "no-store" }});
+  }} catch (_error) {{
+    // If the service is already closing there is nothing useful to show here.
+  }} finally {{
+    setTimeout(() => window.close(), 120);
+  }}
+}}
+
+function openCloseConfirm() {{
+  clearTimeout(controlsTimer);
+  screen.classList.add("confirm-open");
+}}
+
+function closeCloseConfirm() {{
+  screen.classList.remove("confirm-open");
+}}
+
+function startCloseHold(event) {{
+  event.preventDefault();
+  event.stopPropagation();
+  if (closeButton) closeButton.classList.add("holding");
+  clearTimeout(closeHoldTimer);
+  closeHoldTimer = setTimeout(() => {{
+    if (closeButton) closeButton.classList.remove("holding");
+    openCloseConfirm();
+  }}, 900);
+}}
+
+function cancelCloseHold(event) {{
+  event.preventDefault();
+  event.stopPropagation();
+  if (closeButton) closeButton.classList.remove("holding");
+  clearTimeout(closeHoldTimer);
+}}
+
 function scheduleAutoSleep(activeState = screen.dataset.state) {{
   clearTimeout(sleepTimer);
   if (activeState === "idle") {{
@@ -821,6 +1043,7 @@ function scheduleAutoSleep(activeState = screen.dataset.state) {{
 }}
 
 function showControls() {{
+  if (!debugControls) return;
   screen.classList.add("controls-open");
   clearTimeout(controlsTimer);
   controlsTimer = setTimeout(() => screen.classList.remove("controls-open"), 4200);
@@ -954,8 +1177,44 @@ function scheduleSleepPeek() {{
   }}, 3600 + Math.random() * 5200);
 }}
 
+function startScreenCloseHold(event) {{
+  if (debugControls) return;
+  if (event.target.closest("#modeButton") || event.target.closest("#closeConfirm")) return;
+  startCloseHold(event);
+}}
+
+function cancelScreenCloseHold(event) {{
+  if (debugControls) return;
+  if (event.target.closest("#modeButton") || event.target.closest("#closeConfirm")) return;
+  cancelCloseHold(event);
+}}
+
 screen.addEventListener("click", showControls);
+screen.addEventListener("pointerdown", startScreenCloseHold);
+screen.addEventListener("pointerup", cancelScreenCloseHold);
+screen.addEventListener("pointerleave", cancelScreenCloseHold);
+screen.addEventListener("pointercancel", cancelScreenCloseHold);
+modeButton.addEventListener("pointerdown", (event) => event.stopPropagation());
+modeButton.addEventListener("click", (event) => {{
+  event.stopPropagation();
+  cycleVoiceMode();
+}});
+if (closeButton) {{
+  closeButton.addEventListener("pointerdown", startCloseHold);
+  closeButton.addEventListener("pointerup", cancelCloseHold);
+  closeButton.addEventListener("pointerleave", cancelCloseHold);
+  closeButton.addEventListener("pointercancel", cancelCloseHold);
+}}
+document.getElementById("cancelClose").addEventListener("click", (event) => {{
+  event.stopPropagation();
+  closeCloseConfirm();
+}});
+document.getElementById("confirmClose").addEventListener("click", (event) => {{
+  event.stopPropagation();
+  requestCloseScreen();
+}});
 window.addEventListener("keydown", (event) => {{
+  if (!debugControls) return;
   if (event.key === "ArrowRight" || event.key === " ") cycle(1);
   if (event.key === "ArrowLeft") cycle(-1);
   if (event.key === "i") screen.classList.toggle("info");
@@ -967,6 +1226,8 @@ for (const z of sleepZs) {{
 }}
 
 const initialQueryState = new URLSearchParams(location.search).get("state");
+const initialQueryMode = new URLSearchParams(location.search).get("mode");
+setVoiceMode(initialQueryMode || screen.dataset.voiceMode || "default", {{ publish: Boolean(initialQueryMode) }});
 setState(initialQueryState || screen.dataset.state, {{ publish: Boolean(initialQueryState) }});
 async function pollState() {{
   try {{
@@ -976,6 +1237,9 @@ async function pollState() {{
       if (autoSleepActive && payload.state === "idle") return;
       if (payload.state && payload.state !== screen.dataset.state) {{
         setState(payload.state, {{ remote: true }});
+      }}
+      if (payload.voice_mode && payload.voice_mode !== screen.dataset.voiceMode) {{
+        setVoiceMode(payload.voice_mode, {{ remote: true }});
       }}
     }}
   }} catch (_error) {{
@@ -993,13 +1257,18 @@ tickMeter();
 
 
 class PanelStateStore:
-    def __init__(self, initial_state: str = "idle") -> None:
+    def __init__(self, initial_state: str = "idle", voice_mode: str = DEFAULT_MODE) -> None:
         self._state = initial_state if initial_state in PANEL_STATES else "idle"
+        self._voice_mode = _voice_mode_or_default(voice_mode)
         self._lock = threading.Lock()
 
     def get(self) -> str:
         with self._lock:
             return self._state
+
+    def snapshot(self) -> dict[str, str]:
+        with self._lock:
+            return {"state": self._state, "voice_mode": self._voice_mode}
 
     def set(self, state: str) -> bool:
         if state not in PANEL_STATES:
@@ -1008,11 +1277,57 @@ class PanelStateStore:
             self._state = state
         return True
 
+    def set_voice_mode(self, voice_mode: str) -> bool:
+        normalized = _valid_voice_mode(voice_mode)
+        if not normalized:
+            return False
+        with self._lock:
+            self._voice_mode = normalized
+        return True
+
+    def patch(self, *, state: str = "", voice_mode: str = "") -> bool:
+        if state and state not in PANEL_STATES:
+            return False
+        normalized_voice_mode = ""
+        if voice_mode:
+            normalized_voice_mode = _valid_voice_mode(voice_mode)
+            if not normalized_voice_mode:
+                return False
+        with self._lock:
+            if state:
+                self._state = state
+            if voice_mode:
+                self._voice_mode = normalized_voice_mode
+        return True
+
+
+class CloseSignal:
+    def __init__(self) -> None:
+        self._event = threading.Event()
+
+    def request(self) -> None:
+        self._event.set()
+
+    def wait(self, timeout: float) -> bool:
+        return self._event.wait(timeout)
+
+    @property
+    def requested(self) -> bool:
+        return self._event.is_set()
+
 
 class _PreviewHandler(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *args, html: str, state_store: PanelStateStore | None = None, **kwargs) -> None:  # noqa: ANN002, ANN003
+    def __init__(  # noqa: ANN002, ANN003
+        self,
+        *args,
+        html: str,
+        state_store: PanelStateStore | None = None,
+        close_signal: CloseSignal | None = None,
+        **kwargs,
+    ) -> None:
         self._html = html
         self._state_store = state_store or PanelStateStore()
+        self._close_signal = close_signal or CloseSignal()
         super().__init__(*args, directory="/", **kwargs)
 
     def do_GET(self) -> None:  # noqa: N802
@@ -1022,20 +1337,32 @@ class _PreviewHandler(http.server.SimpleHTTPRequestHandler):
         self._send_panel_response(include_body=False)
 
     def do_POST(self) -> None:  # noqa: N802
-        if urlparse(self.path).path != "/state":
+        path = urlparse(self.path).path
+        if path == "/close":
+            self._close_signal.request()
+            self._send_json_response({"closing": True}, include_body=True)
+            return
+        if path != "/state":
             self.send_error(404)
             return
         length = min(int(self.headers.get("Content-Length") or "0"), 4096)
         raw = self.rfile.read(length).decode("utf-8", errors="replace")
         state = ""
+        voice_mode = ""
         if self.headers.get("Content-Type", "").split(";")[0] == "application/json":
             with contextlib.suppress(json.JSONDecodeError):
                 payload = json.loads(raw or "{}")
                 if isinstance(payload, dict):
                     state = str(payload.get("state") or "")
+                    voice_mode = str(payload.get("voice_mode") or "")
         else:
-            state = parse_qs(raw).get("state", [""])[0]
-        if not self._state_store.set(state):
+            values = parse_qs(raw)
+            state = values.get("state", [""])[0]
+            voice_mode = values.get("voice_mode", [""])[0]
+        if not state and not voice_mode:
+            self.send_error(400, "empty panel state")
+            return
+        if not self._state_store.patch(state=state, voice_mode=voice_mode):
             self.send_error(400, "invalid panel state")
             return
         self._send_state_response(include_body=True)
@@ -1058,7 +1385,10 @@ class _PreviewHandler(http.server.SimpleHTTPRequestHandler):
         self.send_error(404)
 
     def _send_state_response(self, *, include_body: bool) -> None:
-        data = json.dumps({"state": self._state_store.get()}).encode("utf-8")
+        self._send_json_response(self._state_store.snapshot(), include_body=include_body)
+
+    def _send_json_response(self, payload: dict, *, include_body: bool) -> None:
+        data = json.dumps(payload).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -1078,6 +1408,15 @@ def _escape_html(value: str) -> str:
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
+
+
+def _valid_voice_mode(value: str | None) -> str:
+    mode = (value or "").strip().lower().replace("-", "_")
+    return mode if mode in VOICE_MODES else ""
+
+
+def _voice_mode_or_default(value: str | None) -> str:
+    return _valid_voice_mode(value) or DEFAULT_MODE
 
 
 def _launch_browser(url: str, *, kiosk: bool) -> subprocess.Popen | None:
@@ -1104,12 +1443,16 @@ def serve_preview(
     port: int = 8787,
     initial_state: str = "idle",
     sleep_after_s: float = DEFAULT_SLEEP_AFTER_S,
+    debug_controls: bool = True,
     open_browser: bool = False,
     kiosk: bool = False,
-) -> None:
-    html = render_panel_preview_html(PreviewConfig(initial_state=initial_state, sleep_after_s=sleep_after_s))
+    ) -> None:
+    html = render_panel_preview_html(
+        PreviewConfig(initial_state=initial_state, sleep_after_s=sleep_after_s, debug_controls=debug_controls)
+    )
     state_store = PanelStateStore(initial_state)
-    handler = functools.partial(_PreviewHandler, html=html, state_store=state_store)
+    close_signal = CloseSignal()
+    handler = functools.partial(_PreviewHandler, html=html, state_store=state_store, close_signal=close_signal)
     server = http.server.ThreadingHTTPServer((host, port), handler)
     url_host = "127.0.0.1" if host in {"", "0.0.0.0"} else host
     url = f"http://{url_host}:{server.server_port}/"
@@ -1121,8 +1464,8 @@ def serve_preview(
     thread = threading.Thread(target=server.serve_forever, name="jarvis-panel-preview", daemon=True)
     thread.start()
     try:
-        while thread.is_alive():
-            thread.join(0.5)
+        while thread.is_alive() and not close_signal.wait(0.5):
+            pass
     except KeyboardInterrupt:
         print("\nStopping PiPanel preview.")
     finally:
@@ -1131,6 +1474,9 @@ def serve_preview(
         if proc is not None:
             with contextlib.suppress(Exception):
                 proc.terminate()
+    if close_signal.requested:
+        print("PiPanel closed from screen.")
+        raise SystemExit(USER_CLOSE_EXIT_CODE)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1146,12 +1492,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--open", action="store_true", help="Open the preview in the default browser.")
     parser.add_argument("--kiosk", action="store_true", help="Launch Chromium/Chrome fullscreen kiosk.")
+    parser.add_argument("--no-debug-controls", action="store_true", help="Hide the development state controls.")
     args = parser.parse_args(argv)
     serve_preview(
         host=args.host,
         port=args.port,
         initial_state=args.state,
         sleep_after_s=args.sleep_after,
+        debug_controls=not args.no_debug_controls,
         open_browser=args.open,
         kiosk=args.kiosk,
     )

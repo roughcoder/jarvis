@@ -362,6 +362,9 @@ class IntercomConfig(_Base):
     websocket_close_timeout_s: float = 5.0
     network_recover_cmd: str = "/usr/local/bin/jarvis-network-recover"
     network_recover_timeout_s: float = 20.0
+    network_probe_host: str = "1.1.1.1"
+    network_probe_port: int = 53
+    network_probe_timeout_s: float = 0.75
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -849,6 +852,9 @@ class Config:
             "intercom.websocket_close_timeout_s": self.intercom.websocket_close_timeout_s,
             "intercom.network_recover_cmd": self.intercom.network_recover_cmd,
             "intercom.network_recover_timeout_s": self.intercom.network_recover_timeout_s,
+            "intercom.network_probe_host": self.intercom.network_probe_host,
+            "intercom.network_probe_port": self.intercom.network_probe_port,
+            "intercom.network_probe_timeout_s": self.intercom.network_probe_timeout_s,
             "intercom_device.camera": self.intercom_device.camera,
             "intercom_device.camera_bin": self.intercom_device.camera_bin or "<auto>",
             "intercom_device.pi_panel": self.intercom_device.pi_panel_setting,

@@ -7,6 +7,7 @@ ambient eyes are one view inside the panel, not the panel itself.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import queue
@@ -21,6 +22,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
 
+from jarvis.brain.voice_modes import DEFAULT_MODE, KNOWN_MODES
 from jarvis.config import IntercomDeviceConfig
 from jarvis.intercom.hardware import IntercomHardware, _enabled
 
@@ -45,6 +47,7 @@ _STATES = {
     "listening": EyeState("listening", 0.95, -0.08),
     "thinking": EyeState("thinking", 0.72, 0.03),
     "speaking": EyeState("speaking", 0.86, 0.0),
+    "network": EyeState("network", 0.5, 0.0),
 }
 
 
@@ -74,6 +77,12 @@ class PiPanel:
     def set(self, state: str) -> None:
         if self._thread is not None:
             self._events.put(state)
+
+    def set_voice_mode(self, _voice_mode: str) -> None:
+        return
+
+    def take_voice_mode(self) -> str | None:
+        return None
 
     def _run(self) -> None:
         try:
@@ -243,6 +252,9 @@ class PiPanel:
             if target.name == "connecting":
                 accent = "#9fb6c5"
                 _draw_status_banner(canvas, w, h, "connecting", "#9fb6c5")
+            if target.name == "network":
+                accent = "#d8b84e"
+                _draw_status_banner(canvas, w, h, "no internet", "#d8b84e")
             if target.name == "disconnected":
                 accent = "#ff6b57"
                 _draw_status_banner(canvas, w, h, "offline", "#ff6b57")
@@ -442,7 +454,8 @@ class WebPiPanel:
 
     def __init__(self, cfg: IntercomDeviceConfig) -> None:
         self._url = cfg.pi_panel_url.rstrip("/")
-        self._events: queue.Queue[str | None] = queue.Queue()
+        self._events: queue.Queue[dict[str, str] | None] = queue.Queue()
+        self._voice_mode_events: queue.Queue[str] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._warned = False
 
@@ -462,26 +475,58 @@ class WebPiPanel:
 
     def set(self, state: str) -> None:
         if self._thread is not None and state in _STATES:
-            self._events.put(state)
+            self._events.put({"state": state})
+
+    def set_voice_mode(self, voice_mode: str) -> None:
+        voice_mode = _valid_voice_mode(voice_mode)
+        if self._thread is not None and voice_mode in KNOWN_MODES:
+            self._events.put({"voice_mode": voice_mode})
+
+    def take_voice_mode(self) -> str | None:
+        try:
+            return self._voice_mode_events.get_nowait()
+        except queue.Empty:
+            return None
 
     def _run(self) -> None:
         last_state = ""
+        last_voice_mode = DEFAULT_MODE
+        next_poll = time.monotonic()
         while True:
-            state = self._events.get()
-            while state is not None:
+            try:
+                patch = self._events.get(timeout=0.2)
+            except queue.Empty:
+                patch = {}
+            while patch is not None:
                 with suppress(queue.Empty):
-                    state = self._events.get_nowait()
+                    next_patch = self._events.get_nowait()
+                    if next_patch is None:
+                        return
+                    patch.update(next_patch)
                     continue
                 break
-            if state is None:
+            if patch is None:
                 return
-            if state == last_state:
-                continue
-            if self._post_state(state):
-                last_state = state
+            if patch:
+                next_state = patch.get("state", "")
+                next_voice_mode = patch.get("voice_mode", "")
+                if next_state == last_state:
+                    patch.pop("state", None)
+                if next_voice_mode == last_voice_mode:
+                    patch.pop("voice_mode", None)
+                if patch and self._post_state(patch):
+                    last_state = patch.get("state", last_state)
+                    last_voice_mode = patch.get("voice_mode", last_voice_mode)
+            now = time.monotonic()
+            if now >= next_poll:
+                next_poll = now + 0.35
+                voice_mode = self._get_voice_mode()
+                if voice_mode and voice_mode != last_voice_mode:
+                    last_voice_mode = voice_mode
+                    self._voice_mode_events.put(voice_mode)
 
-    def _post_state(self, state: str) -> bool:
-        data = f'{{"state":"{state}"}}'.encode("utf-8")
+    def _post_state(self, patch: dict[str, str]) -> bool:
+        data = json.dumps(patch).encode("utf-8")
         req = urllib.request.Request(
             f"{self._url}/state",
             data=data,
@@ -496,6 +541,19 @@ class WebPiPanel:
                 print(f"  [web-pi-panel] couldn't publish state: {exc}")
                 self._warned = True
             return False
+
+    def _get_voice_mode(self) -> str:
+        req = urllib.request.Request(f"{self._url}/state", method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=0.25) as resp:  # noqa: S310 - local operator URL
+                if not (200 <= resp.status < 300):
+                    return ""
+                payload = json.loads(resp.read(4096).decode("utf-8"))
+        except (OSError, ValueError, urllib.error.URLError):
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+        return _valid_voice_mode(str(payload.get("voice_mode") or ""))
 
 
 class CompositePanel:
@@ -513,3 +571,19 @@ class CompositePanel:
     def set(self, state: str) -> None:
         for panel in self._panels:
             panel.set(state)
+
+    def set_voice_mode(self, voice_mode: str) -> None:
+        for panel in self._panels:
+            panel.set_voice_mode(voice_mode)
+
+    def take_voice_mode(self) -> str | None:
+        for panel in self._panels:
+            voice_mode = panel.take_voice_mode()
+            if voice_mode:
+                return voice_mode
+        return None
+
+
+def _valid_voice_mode(value: str | None) -> str:
+    mode = (value or "").strip().lower().replace("-", "_")
+    return mode if mode in KNOWN_MODES else ""

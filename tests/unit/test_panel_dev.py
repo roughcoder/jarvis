@@ -13,6 +13,8 @@ from jarvis.intercom.panel_dev import (
     PANEL_STATES,
     PanelStateStore,
     PreviewConfig,
+    CloseSignal,
+    USER_CLOSE_EXIT_CODE,
     _PreviewHandler,
     render_panel_preview_html,
 )
@@ -74,7 +76,7 @@ def test_intercom_client_only_publishes_runtime_panel_states() -> None:
         and isinstance(node.args[0].value, str)
     }
 
-    assert {"connecting", "disconnected", "idle", "awake", "listening", "thinking", "speaking"} <= states
+    assert {"connecting", "disconnected", "network", "idle", "awake", "listening", "thinking", "speaking"} <= states
     assert "sleep" not in states
     assert states <= set(PANEL_STATES)
 
@@ -105,22 +107,65 @@ def test_panel_preview_omits_brand_and_expression_copy() -> None:
     assert "tap for controls" not in html
 
 
-def test_panel_preview_shows_runtime_version_top_left() -> None:
+def test_panel_preview_shows_runtime_version_bottom_right() -> None:
     html = render_panel_preview_html()
 
     assert '<div class="version-label" aria-label="Jarvis version">' in html
     assert f">v{__version__}</div>" in html
     assert "position: absolute;" in html
-    assert "left: clamp(8px, 2vw, 16px);" in html
-    assert "top: clamp(6px, 1.6vh, 12px);" in html
+    assert "right: clamp(8px, 2vw, 16px);" in html
+    assert "bottom: clamp(6px, 1.6vh, 12px);" in html
+    assert "color: #30382f;" in html
     assert "letter-spacing: 0;" in html
+
+
+def test_panel_preview_shows_voice_mode_control_top_left() -> None:
+    html = render_panel_preview_html(PreviewConfig(voice_mode="stay"))
+
+    assert '<main class="screen" data-state="idle" data-voice-mode="stay">' in html
+    assert '<button class="mode-button" id="modeButton" type="button" aria-label="Speech mode">' in html
+    assert '<small>mode</small><span id="modeLabel">stay</span>' in html
+    assert 'const voiceModes = ["default","stay"];' in html
+    assert "modeButton.addEventListener(\"click\"" in html
+    assert "cycleVoiceMode();" in html
+    assert "body: JSON.stringify(payload)," in html
+    assert "publishPanelPatch({ voice_mode: next });" in html
+    assert "left: clamp(8px, 2vw, 16px);" in html
+    assert "top: clamp(10px, 2.8vh, 18px);" in html
+    assert "align-items: center;" in html
+    assert "min-height: 34px;" in html
+
+
+def test_panel_preview_has_hold_confirm_close_control() -> None:
+    html = render_panel_preview_html()
+
+    assert '<div class="controls" id="controls" aria-label="preview states"></div>' in html
+    assert 'class="confirm" id="closeConfirm"' in html
+    assert 'id="confirmClose">close screen</button>' in html
+    assert 'id="cancelClose">cancel</button>' in html
+    assert "const debugControls = true;" in html
+    assert 'closeButton.textContent = "hold close";' in html
+    assert 'closeHoldTimer = setTimeout(() =>' in html
+    assert "}, 900);" in html
+    assert 'await fetch("/close", { method: "POST", cache: "no-store" });' in html
+    assert "window.close()" in html
+
+
+def test_panel_production_hides_debug_controls_but_keeps_hold_close() -> None:
+    html = render_panel_preview_html(PreviewConfig(debug_controls=False))
+
+    assert '<div class="controls" id="controls" aria-label="preview states"></div>' not in html
+    assert 'class="confirm" id="closeConfirm"' in html
+    assert "const debugControls = false;" in html
+    assert "function startScreenCloseHold(event)" in html
+    assert 'closeButton.textContent = "hold close";' in html
 
 
 def test_panel_preview_sanitizes_title_and_falls_back_to_idle_state() -> None:
     html = render_panel_preview_html(PreviewConfig(initial_state="unknown", title='<Jarvis "panel">'))
 
     assert "<title>&lt;Jarvis &quot;panel&quot;&gt;</title>" in html
-    assert '<main class="screen" data-state="idle">' in html
+    assert '<main class="screen" data-state="idle" data-voice-mode="default">' in html
 
 
 def test_panel_preview_head_does_not_expose_host_filesystem() -> None:
@@ -177,10 +222,40 @@ def test_panel_state_endpoint_accepts_valid_states() -> None:
         thread.join(timeout=2)
 
     assert posted.status == 200
-    assert posted_body == '{"state": "listening"}'
+    assert posted_body == '{"state": "listening", "voice_mode": "default"}'
     assert fetched.status == 200
     assert fetched.getheader("Content-Type") == "application/json"
-    assert fetched_body == '{"state": "listening"}'
+    assert fetched_body == '{"state": "listening", "voice_mode": "default"}'
+
+
+def test_panel_state_endpoint_accepts_valid_voice_modes() -> None:
+    html = render_panel_preview_html()
+    store = PanelStateStore("idle")
+    handler = functools.partial(_PreviewHandler, html=html, state_store=store)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        conn.request("POST", "/state", '{"voice_mode":"stay"}', {"Content-Type": "application/json"})
+        posted = conn.getresponse()
+        posted_body = posted.read().decode()
+        conn.close()
+
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        conn.request("GET", "/state")
+        fetched = conn.getresponse()
+        fetched_body = fetched.read().decode()
+        conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert posted.status == 200
+    assert posted_body == '{"state": "idle", "voice_mode": "stay"}'
+    assert fetched.status == 200
+    assert fetched_body == '{"state": "idle", "voice_mode": "stay"}'
 
 
 def test_panel_state_endpoint_rejects_invalid_states() -> None:
@@ -201,6 +276,50 @@ def test_panel_state_endpoint_rejects_invalid_states() -> None:
         thread.join(timeout=2)
 
     assert response.status == 400
+
+
+def test_panel_state_endpoint_rejects_invalid_voice_modes() -> None:
+    html = render_panel_preview_html()
+    handler = functools.partial(_PreviewHandler, html=html, state_store=PanelStateStore("idle"))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        conn.request("POST", "/state", '{"voice_mode":"party"}', {"Content-Type": "application/json"})
+        response = conn.getresponse()
+        response.read()
+        conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert response.status == 400
+
+
+def test_panel_close_endpoint_sets_close_signal() -> None:
+    html = render_panel_preview_html()
+    close_signal = CloseSignal()
+    handler = functools.partial(_PreviewHandler, html=html, close_signal=close_signal)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        conn.request("POST", "/close")
+        response = conn.getresponse()
+        body = response.read().decode()
+        conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert USER_CLOSE_EXIT_CODE == 42
+    assert response.status == 200
+    assert body == '{"closing": true}'
+    assert close_signal.requested is True
 
 
 def test_web_pi_panel_publishes_state_to_local_panel_endpoint() -> None:
@@ -231,10 +350,54 @@ def test_web_pi_panel_publishes_state_to_local_panel_endpoint() -> None:
     assert store.get() == "speaking"
 
 
+def test_web_pi_panel_publishes_and_reads_voice_mode() -> None:
+    html = render_panel_preview_html()
+    store = PanelStateStore("idle")
+    handler = functools.partial(_PreviewHandler, html=html, state_store=store)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    panel = WebPiPanel(
+        IntercomDeviceConfig(
+            pi_panel_url=f"http://127.0.0.1:{server.server_port}",
+            _env_file=None,
+        )
+    )
+    try:
+        panel.start()
+        panel.set_voice_mode("stay")
+        deadline = time.monotonic() + 2
+        while store.snapshot()["voice_mode"] != "stay" and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        conn.request("POST", "/state", '{"voice_mode":"default"}', {"Content-Type": "application/json"})
+        response = conn.getresponse()
+        response.read()
+        conn.close()
+
+        seen = ""
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            seen = panel.take_voice_mode() or seen
+            if seen == "default":
+                break
+            time.sleep(0.02)
+    finally:
+        panel.stop()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert response.status == 200
+    assert store.snapshot()["voice_mode"] == "default"
+    assert seen == "default"
+
+
 def test_panel_preview_uses_spinner_pupils_for_thinking_state() -> None:
     html = render_panel_preview_html(PreviewConfig(initial_state="thinking"))
 
-    assert '<main class="screen" data-state="thinking">' in html
+    assert '<main class="screen" data-state="thinking" data-voice-mode="default">' in html
     assert "@keyframes pupilSpin" in html
     assert '[data-state="thinking"] .pupil' in html
     assert 'border-top-color: #080d0a;' in html
@@ -258,18 +421,30 @@ def test_panel_preview_uses_spinner_pupils_for_thinking_state() -> None:
 def test_panel_preview_connecting_is_spinner_only() -> None:
     html = render_panel_preview_html(PreviewConfig(initial_state="connecting"))
 
-    assert '<main class="screen" data-state="connecting">' in html
+    assert '<main class="screen" data-state="connecting" data-voice-mode="default">' in html
     assert "--accent: #f4d46a;" in html
     assert '[data-state="connecting"] .eyes' in html
     assert "@keyframes connectSpin" in html
-    assert 'screen.classList.toggle("info", next === "disconnected")' in html
+    assert 'screen.classList.toggle("info", next === "disconnected" || next === "network")' in html
     assert 'fetch("/state"' in html
+
+
+def test_panel_preview_network_state_is_not_brain_offline() -> None:
+    html = render_panel_preview_html(PreviewConfig(initial_state="network"))
+
+    assert '<main class="screen" data-state="network" data-voice-mode="default">' in html
+    assert 'network: "no internet"' in html
+    assert "--accent: #d8b84e;" in html
+    assert '[data-state="network"] .eyes' in html
+    assert '[data-state="network"] .stage::before' in html
+    assert '[data-state="network"] .stage::after' in html
+    assert 'screen.classList.toggle("info", next === "disconnected" || next === "network")' in html
 
 
 def test_panel_preview_disconnected_looks_angry_and_offline() -> None:
     html = render_panel_preview_html(PreviewConfig(initial_state="disconnected"))
 
-    assert '<main class="screen" data-state="disconnected">' in html
+    assert '<main class="screen" data-state="disconnected" data-voice-mode="default">' in html
     assert "--accent: #ff4b42;" in html
     assert "--eye-scale-y: .74;" in html
     assert "rotate(7deg)" not in html
@@ -319,7 +494,7 @@ def test_panel_preview_speaking_uses_soft_bright_pink() -> None:
 def test_panel_preview_speaking_randomizes_eye_motion() -> None:
     html = render_panel_preview_html(PreviewConfig(initial_state="speaking"))
 
-    assert '<main class="screen" data-state="speaking">' in html
+    assert '<main class="screen" data-state="speaking" data-voice-mode="default">' in html
     assert "scheduleSpeakingMotion" in html
     assert "applySpeakingPose" in html
     assert "--speak-brow-left" in html
@@ -336,7 +511,7 @@ def test_panel_preview_speaking_randomizes_eye_motion() -> None:
 def test_panel_preview_sleep_feels_resting_but_ready() -> None:
     html = render_panel_preview_html(PreviewConfig(initial_state="sleep"))
 
-    assert '<main class="screen" data-state="sleep">' in html
+    assert '<main class="screen" data-state="sleep" data-voice-mode="default">' in html
     assert "--accent: #c8d8ca;" in html
     assert "--brow-y: -58%;" in html
     assert "--brow-height: min(3vw, 18px);" in html
@@ -370,7 +545,7 @@ def test_panel_preview_sleep_feels_resting_but_ready() -> None:
 def test_panel_preview_listening_uses_bright_blue() -> None:
     html = render_panel_preview_html(PreviewConfig(initial_state="listening"))
 
-    assert '<main class="screen" data-state="listening">' in html
+    assert '<main class="screen" data-state="listening" data-voice-mode="default">' in html
     assert '[data-state="listening"]' in html
     assert "--accent: #8ddcff;" in html
     assert "--brow-y: -34%;" in html

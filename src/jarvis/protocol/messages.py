@@ -70,13 +70,26 @@ class Utterance(BaseModel):
     turn_id: str
     sample_rate: int
     pcm_b64: str
+    voice_mode: str = "default"
 
     def pcm(self) -> bytes:
         return base64.b64decode(self.pcm_b64)
 
     @classmethod
-    def of(cls, turn_id: str, sample_rate: int, pcm: bytes) -> "Utterance":
-        return cls(turn_id=turn_id, sample_rate=sample_rate, pcm_b64=_b64(pcm))
+    def of(
+        cls,
+        turn_id: str,
+        sample_rate: int,
+        pcm: bytes,
+        *,
+        voice_mode: str = "default",
+    ) -> "Utterance":
+        return cls(
+            turn_id=turn_id,
+            sample_rate=sample_rate,
+            pcm_b64=_b64(pcm),
+            voice_mode=voice_mode,
+        )
 
 
 class BargeIn(BaseModel):

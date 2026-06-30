@@ -27,11 +27,12 @@ from jarvis.protocol.messages import (
 
 def test_utterance_pcm_round_trip() -> None:
     pcm = bytes(range(256))
-    u = Utterance.of("t1", 16000, pcm)
+    u = Utterance.of("t1", 16000, pcm, voice_mode="stay")
     back = decode(encode(u))
     assert isinstance(back, Utterance)
     assert back.turn_id == "t1"
     assert back.sample_rate == 16000
+    assert back.voice_mode == "stay"
     assert back.pcm() == pcm
 
 

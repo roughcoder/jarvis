@@ -119,6 +119,19 @@ Existing installs using `INTERCOM_DEVICE_EYES` and
 `INTERCOM_DEVICE_EYES_SLEEP_AFTER_S` keep working as legacy aliases, but new Pi
 setups should use the PiPanel names.
 
+The intercom distinguishes a missing network route from a brain outage. When the
+Pi cannot reach its configured network probe, PiPanel shows **no internet**;
+when the probe succeeds but the brain cannot be reached, PiPanel uses the
+normal **connecting** / **offline** brain-link states. The default probe is
+`1.1.1.1:53`; LAN-only installs can point it at a router or disable it:
+
+```bash
+INTERCOM_NETWORK_PROBE_HOST=1.1.1.1
+INTERCOM_NETWORK_PROBE_PORT=53
+# Disable the probe and treat the network as available:
+INTERCOM_NETWORK_PROBE_HOST=none
+```
+
 ## Updating and checking the Pi
 
 The installer writes a Pi-specific helper:
@@ -128,6 +141,8 @@ sudo jarvis-pi update
 jarvis-pi status
 jarvis-pi logs
 jarvis-pi doctor
+sudo jarvis-pi panel-stop
+sudo jarvis-pi panel-start
 ```
 
 `update` refreshes the runtime from the configured public repository/ref, syncs
@@ -135,6 +150,8 @@ intercom dependencies, reloads systemd, and restarts the intercom service.
 `doctor` prints the configured brain/device, service state, microphone/speaker
 enumeration, display interface hints, and camera listing when `rpicam-hello`
 or legacy `libcamera-hello` is available.
+`panel-stop` closes the Pi screen service and browser window; `panel-start`
+opens it again. `panel-restart` is still useful after display or runtime changes.
 
 ## Playback performance traces
 
