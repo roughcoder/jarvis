@@ -768,15 +768,23 @@ class BrainServer:
             if text_only:  # text console / scripted test — reply text only, no TTS
                 await session.respond_text(text, trace, result)
             else:
-                async for pcm in session.respond(text, trace, result):
-                    try:
-                        await self._send_reply_audio(ws, turn_id, pcm)
-                        sent_audio_chunks += 1
-                        sent_audio_bytes += len(pcm)
-                    except Exception as exc:  # noqa: BLE001 - close the turn cleanly below
-                        trace.event("reply_audio_error", error=type(exc).__name__, phase="downlink")
-                        print(f"  [tts] reply audio send failed: {exc!r}")
-                        break
+                reply_stream = session.respond(text, trace, result)
+                try:
+                    async for pcm in reply_stream:
+                        try:
+                            await self._send_reply_audio(ws, turn_id, pcm)
+                            sent_audio_chunks += 1
+                            sent_audio_bytes += len(pcm)
+                        except Exception as exc:  # noqa: BLE001 - close the turn cleanly below
+                            trace.event(
+                                "reply_audio_error",
+                                error=type(exc).__name__,
+                                phase="downlink",
+                            )
+                            print(f"  [tts] reply audio send failed: {exc!r}")
+                            break
+                finally:
+                    await reply_stream.aclose()
         except asyncio.CancelledError:
             session.finalize(text, result, trace)  # remember what was actually said
             self._apply_cancelled_turn_result(channel, conn, result)

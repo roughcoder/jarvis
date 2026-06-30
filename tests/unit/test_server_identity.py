@@ -222,6 +222,21 @@ class _AudioSession:
         result.ended = True
 
 
+class _FinalizingAudioSession:
+    def set_voice_mode(self, _mode: str) -> None:
+        pass
+
+    async def respond(self, _text, _trace, result):  # noqa: ANN001
+        try:
+            yield b"pcm"
+        finally:
+            result.raw = "Recovered streamed text."
+
+    def finalize(self, _text, result, _trace=None) -> None:  # noqa: ANN001
+        result.reply = result.raw
+        result.ended = True
+
+
 def _turn_server(cfg, session):  # noqa: ANN001
     server = BrainServer(cfg)
     server._scheduler = _NoAlarmScheduler()  # type: ignore[assignment]
@@ -276,4 +291,24 @@ def test_downlink_audio_failure_keeps_text_reply_and_marks_missing_audio(cfg) ->
     trace = server._tracer.emitted[-1]
     assert trace["reply_audio_chunks"] == 0
     assert any(event["name"] == "reply_audio_missing" for event in trace["events"])
+    assert any(event["name"] == "reply_audio_error" for event in trace["events"])
+
+
+def test_downlink_failure_closes_reply_generator_before_finalize(cfg) -> None:  # noqa: ANN001
+    server = _turn_server(cfg, _FinalizingAudioSession())
+    ws = _TurnWS(fail_binary=True)
+    conn = {
+        "asserted": "",
+        "base_asserted": "",
+        "device_default": "house",
+        "voice_mode": "default",
+        "hardware": set(),
+    }
+
+    asyncio.run(server._do_turn(ws, "room-pi", "voice", conn, TextIn(turn_id="t1", text="hi")))
+
+    text = [decode(item) for item in ws.sent]
+    assert any(isinstance(item, ReplyText) and item.text == "Recovered streamed text." for item in text)
+    trace = server._tracer.emitted[-1]
+    assert trace["reply_audio_chunks"] == 0
     assert any(event["name"] == "reply_audio_error" for event in trace["events"])
