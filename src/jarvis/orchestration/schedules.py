@@ -185,7 +185,7 @@ def dispatch_due_schedules(
             )
             continue
         try:
-            started = service.next_work(schedule.command, start=True)
+            started = service.next_work(schedule.command, start=bool(schedule.command.start))
         except Exception as exc:  # noqa: BLE001 - a failed dispatch must not ack/drop the schedule
             results.append(
                 ScheduleDispatchResult(
@@ -193,6 +193,18 @@ def dispatch_due_schedules(
                     name=schedule.name,
                     status="failed",
                     message=str(exc),
+                    command=schedule.command.to_dict(),
+                )
+            )
+            continue
+        if not schedule.command.start and started is not None:
+            schedule_store.ack(schedule.schedule_id, now)
+            results.append(
+                ScheduleDispatchResult(
+                    schedule_id=schedule.schedule_id,
+                    name=schedule.name,
+                    status="inspected",
+                    message="Scheduled command inspected work without starting a worker session.",
                     command=schedule.command.to_dict(),
                 )
             )

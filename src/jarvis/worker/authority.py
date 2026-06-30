@@ -85,8 +85,6 @@ class WorkerSessionAuthority:
 
     @property
     def claude_permission_mode(self) -> str:
-        if WORKER_SESSION_APPROVE in self.allowed or WORKER_SESSION_INPUT in self.allowed:
-            return "default"
         return "dontAsk"
 
     @property
