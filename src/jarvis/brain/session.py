@@ -155,6 +155,34 @@ _INTERCOM_CAMERA_GUIDANCE = (
     "cannot see when `take_photo` is available."
 )
 
+_INTERCOM_DISPLAY_GUIDANCE = (
+    "This intercom has a PiPanel display. When the user asks to turn the screen off, "
+    "hide the screen, turn the screen on, show the screen, toggle it, or check whether "
+    "it is on, call `control_pi_panel`. Map 'off' to hide and 'on' to show."
+)
+
+_SELF_GUIDANCE = (
+    "Device awareness (when self.inspect is granted): use describe_device to know which "
+    "configured Jarvis device, identity, host runtime, and capability set this request is "
+    "running under. Do not reveal secrets, token values, private user files, or hidden "
+    "credentials."
+)
+
+_SELF_DIAGNOSTICS_GUIDANCE = (
+    "Basic diagnostics (when self.diagnostics is granted): use run_self_diagnostics for "
+    "quick fixed read-only terminal checks about this device and Jarvis process. Use "
+    "get_ip_address when asked for your IP address, ping_host for latency or packet loss "
+    "to a host, resolve_dns for DNS lookups, and check_tcp_port for simple reachability. "
+    "For arbitrary non-destructive terminal commands use run_shell if worker.shell is "
+    "granted."
+)
+
+_ENGINEERING_GUIDANCE = (
+    "Terminal work: run_shell executes a bounded shell command on the worker Mac. Prefer "
+    "read-only diagnostics first, and do not run destructive commands unless the user "
+    "explicitly asked for that specific destructive action."
+)
+
 
 _BACKGROUND_FRAMING = (
     "You are completing this task in the BACKGROUND — the user has already been told "
@@ -527,6 +555,14 @@ class BrainSession:
             parts.append(_GUI_GUIDANCE)
         if self._ctx.can("intercom.camera"):
             parts.append(_INTERCOM_CAMERA_GUIDANCE)
+        if self._ctx.can("intercom.display"):
+            parts.append(_INTERCOM_DISPLAY_GUIDANCE)
+        if self._ctx.can("self.inspect"):
+            parts.append(_SELF_GUIDANCE)
+        if self._ctx.can("self.diagnostics"):
+            parts.append(_SELF_DIAGNOSTICS_GUIDANCE)
+        if self._ctx.can("worker.shell"):
+            parts.append(_ENGINEERING_GUIDANCE)
         if self._ctx.can("worker.shell") and self._cfg.worker.shell_secrets:
             names = ", ".join(
                 n.strip() for n in self._cfg.worker.shell_secrets.split(",") if n.strip()
