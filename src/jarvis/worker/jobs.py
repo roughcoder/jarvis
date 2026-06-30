@@ -42,6 +42,7 @@ class Job:
     output: str = ""
     session_id: str | None = None  # the coding agent's session (for `codex resume`)
     session_name: str = ""  # stable human handle for engine session pickers
+    cleanup_owned: bool = True
     started: float = field(default_factory=time.time)
     ended: float | None = None
 
@@ -80,6 +81,7 @@ class JobManager:
                 output=d.get("output", ""),
                 session_id=d.get("session_id"),
                 session_name=d.get("session_name", ""),
+                cleanup_owned=bool(d.get("cleanup_owned", True)),
                 started=d.get("started", 0.0),
                 ended=d.get("ended"),
             )
@@ -113,6 +115,7 @@ class JobManager:
         repo: str = "",
         session_id: str | None = None,
         session_name: str = "",
+        cleanup_owned: bool = True,
     ) -> Job:
         job = Job(
             id=uuid.uuid4().hex[:12],
@@ -125,6 +128,7 @@ class JobManager:
             repo=repo,
             session_id=session_id,
             session_name=session_name,
+            cleanup_owned=cleanup_owned,
         )
         self._jobs[job.id] = job
         self._persist(job)

@@ -9,6 +9,7 @@ Skips if aiohttp (the `worker` extra) isn't installed.
 from __future__ import annotations
 
 import asyncio
+import pathlib
 
 import httpx
 import pytest
@@ -225,6 +226,182 @@ def test_daemon_code_dispatch_resumes_claude_session(tmp_path) -> None:
 
     assert job["session_id"] == session_id
     assert "-p --resume 550e8400-e29b-41d4-a716-446655440000 follow up" in job["output"]
+
+
+def test_daemon_resume_uses_worker_owned_cwd_without_cleanup_ownership(tmp_path) -> None:
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="",
+        workspace=str(tmp_path / "worker"),
+        claude_bin="echo",
+        supported_engines="codex,claude",
+    )
+    reused = tmp_path / "worker" / "worktrees" / "jarvis-existing"
+    reused.mkdir(parents=True)
+
+    async def calls(base, c):  # noqa: ANN001
+        disp = (
+            await c.post(
+                base + "/run",
+                json={
+                    "action": "code",
+                    "args": {
+                        "prompt": "follow up",
+                        "agent": "claude",
+                        "session_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "resume_session": True,
+                        "cwd": str(reused),
+                        "branch": "jarvis/existing",
+                    },
+                },
+            )
+        ).json()
+        jid = disp["job_id"]
+        job = {}
+        for _ in range(100):
+            job = (await c.get(f"{base}/jobs/{jid}")).json()
+            if job["status"] != "running":
+                break
+            await asyncio.sleep(0.02)
+        cleaned = (await c.post(base + "/run", json={"action": "cleanup", "args": {"job": jid}})).json()
+        return disp, job, cleaned
+
+    disp, job, cleaned = asyncio.run(_with_server(cfg, 8823, calls))
+
+    assert disp["cwd"] == str(reused)
+    assert disp["branch"] == "jarvis/existing"
+    assert job["cwd"] == str(reused)
+    assert job["cleanup_owned"] is False
+    assert cleaned["cleaned"] == [job["name"]]
+    assert reused.exists()
+
+
+def test_daemon_resume_cwd_requires_session_id(tmp_path) -> None:
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="",
+        workspace=str(tmp_path / "worker"),
+        claude_bin="echo",
+        supported_engines="codex,claude",
+    )
+    reused = tmp_path / "worker" / "worktrees" / "jarvis-existing"
+    reused.mkdir(parents=True)
+
+    async def calls(base, c):  # noqa: ANN001
+        return await c.post(
+            base + "/run",
+            json={
+                "action": "code",
+                "args": {
+                    "prompt": "follow up",
+                    "agent": "claude",
+                    "resume_session": True,
+                    "cwd": str(reused),
+                },
+            },
+        )
+
+    response = asyncio.run(_with_server(cfg, 8827, calls))
+
+    assert response.status_code == 400
+    assert "resume cwd requires session_id" in response.json()["error"]
+
+
+def test_daemon_prune_keeps_workspace_used_by_running_resume(tmp_path) -> None:
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init"], cwd=repo, check=True)
+    slow_agent = tmp_path / "slow-agent"
+    slow_agent.write_text("#!/usr/bin/env python3\nimport time\nprint('started')\ntime.sleep(2)\nprint('done')\n")
+    slow_agent.chmod(0o755)
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="",
+        workspace=str(tmp_path / "worker"),
+        codex_bin="echo",
+        claude_bin=str(slow_agent),
+        supported_engines="codex,claude",
+    )
+
+    async def calls(base, c):  # noqa: ANN001
+        original = (
+            await c.post(
+                base + "/run",
+                json={"action": "code", "args": {"prompt": "first", "agent": "codex", "repo": str(repo)}},
+            )
+        ).json()
+        original_job = {}
+        for _ in range(100):
+            original_job = (await c.get(f"{base}/jobs/{original['job_id']}")).json()
+            if original_job["status"] != "running":
+                break
+            await asyncio.sleep(0.02)
+        resumed = (
+            await c.post(
+                base + "/run",
+                json={
+                    "action": "code",
+                    "args": {
+                        "prompt": "follow up",
+                        "agent": "claude",
+                        "session_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "resume_session": True,
+                        "cwd": original_job["cwd"],
+                    },
+                },
+            )
+        ).json()
+        cleaned = (await c.post(base + "/run", json={"action": "cleanup", "args": {"job": "all"}})).json()
+        listed = (await c.get(base + "/jobs")).json()["jobs"]
+        for _ in range(100):
+            resumed_job = (await c.get(f"{base}/jobs/{resumed['job_id']}")).json()
+            if resumed_job["status"] != "running":
+                break
+            await asyncio.sleep(0.03)
+        return original_job, resumed, cleaned, listed
+
+    original_job, resumed, cleaned, listed = asyncio.run(_with_server(cfg, 8825, calls))
+
+    assert resumed["ok"]
+    assert cleaned["cleaned"] == []
+    assert any(job["id"] == original_job["id"] for job in listed)
+    assert any(job["id"] == resumed["job_id"] and job["status"] == "running" for job in listed)
+    assert pathlib.Path(original_job["cwd"]).exists()
+
+
+def test_daemon_resume_rejects_cwd_outside_worker_workspace(tmp_path) -> None:
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="",
+        workspace=str(tmp_path / "worker"),
+        claude_bin="echo",
+        supported_engines="codex,claude",
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    async def calls(base, c):  # noqa: ANN001
+        return await c.post(
+            base + "/run",
+            json={
+                "action": "code",
+                "args": {
+                    "prompt": "follow up",
+                    "agent": "claude",
+                    "session_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "resume_session": True,
+                    "cwd": str(outside),
+                },
+            },
+        )
+
+    response = asyncio.run(_with_server(cfg, 8824, calls))
+
+    assert response.status_code == 400
+    assert "refusing to resume outside worker-owned workspace" in response.json()["error"]
 
 
 def test_daemon_rejects_unsupported_code_engine(tmp_path) -> None:
