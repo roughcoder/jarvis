@@ -6,6 +6,8 @@ capabilities:
   - web.search
   - files.read
   - files.write
+  - self.inspect
+  - self.diagnostics
   - worker.code
   - worker.shell
   - skills.run

@@ -399,6 +399,12 @@ Commands:
   panel-logs
             Follow Pi display panel service logs
   doctor    Print basic Pi audio/camera/service readiness
+  panel-start
+            Start/reopen the PiPanel preview service
+  panel-stop
+            Stop/close the PiPanel preview service
+  panel-status
+            Show PiPanel preview service status
   recover-network
             Ask NetworkManager to reconnect the first autoconnect WiFi profile
 PISCRIPT_USAGE
@@ -516,13 +522,13 @@ PY
     require_root "\$cmd"
     systemctl restart "\$PANEL_SERVICE"
     ;;
-  panel-stop)
-    require_root "\$cmd"
-    systemctl stop "\$PANEL_SERVICE"
-    ;;
   panel-start)
     require_root "\$cmd"
     systemctl start "\$PANEL_SERVICE"
+    ;;
+  panel-stop)
+    require_root "\$cmd"
+    systemctl stop "\$PANEL_SERVICE"
     ;;
   panel-status)
     systemctl status "\$PANEL_SERVICE"

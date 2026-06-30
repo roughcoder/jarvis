@@ -13,6 +13,7 @@ import os
 import queue
 import random
 import re
+import shlex
 import subprocess
 import threading
 import time
@@ -58,6 +59,7 @@ class PiPanel:
         self._events: queue.Queue[str] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._visible = True
 
     @property
     def enabled(self) -> bool:
@@ -83,6 +85,95 @@ class PiPanel:
 
     def take_voice_mode(self) -> str | None:
         return None
+
+    def control(self, action: str) -> dict[str, object]:
+        """Show/hide the PiPanel window from a brain-requested device action."""
+        requested = (action or "status").strip().lower()
+        aliases = {
+            "on": "show",
+            "show": "show",
+            "wake": "show",
+            "open": "show",
+            "off": "hide",
+            "hide": "hide",
+            "sleep": "hide",
+            "close": "hide",
+            "toggle": "toggle",
+            "status": "status",
+        }
+        command = aliases.get(requested)
+        if command is None:
+            raise ValueError("display action must be one of: show, hide, toggle, status")
+        if command == "status":
+            command_result = self._run_panel_command("status")
+            return {
+                "status": "visible" if self._visible else "hidden",
+                "visible": self._visible,
+                "enabled": self.enabled,
+                "running": self._thread is not None,
+                "command": command_result,
+            }
+        if command == "toggle":
+            command = "hide" if self._visible else "show"
+        command_result = self._run_panel_command(command)
+        command_ok = not command_result or any(
+            "exit 0" in line for line in command_result.splitlines()
+        )
+        if not command_ok:
+            return {
+                "status": "command_failed",
+                "visible": self._visible,
+                "enabled": self.enabled,
+                "running": self._thread is not None,
+                "command": command_result,
+            }
+        self._visible = command == "show"
+        if self._thread is not None:
+            self._events.put(f"visibility:{command}")
+        return {
+            "status": "visible" if self._visible else "hidden",
+            "visible": self._visible,
+            "enabled": self.enabled,
+            "running": self._thread is not None,
+            "command": command_result,
+        }
+
+    def _run_panel_command(self, action: str) -> str:
+        command = {
+            "show": self._cfg.pi_panel_show_cmd,
+            "hide": self._cfg.pi_panel_hide_cmd,
+            "status": self._cfg.pi_panel_status_cmd,
+        }.get(action, "")
+        if not command.strip():
+            return ""
+        attempts = [command]
+        if action == "show":
+            attempts.append("sudo systemctl start jarvis-panel-preview.service")
+        elif action == "hide":
+            attempts.append("sudo systemctl stop jarvis-panel-preview.service")
+        elif action == "status":
+            attempts.append("sudo systemctl status jarvis-panel-preview.service --no-pager")
+        results: list[str] = []
+        for candidate in attempts:
+            try:
+                proc = subprocess.run(
+                    shlex.split(candidate),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=max(0.5, self._cfg.pi_panel_control_timeout_s),
+                )
+            except Exception as exc:  # noqa: BLE001 - surface the command failure
+                results.append(f"{candidate}: error: {exc}")
+                continue
+            output = (proc.stdout or proc.stderr or "").strip()
+            detail = f"{candidate}: exit {proc.returncode}"
+            if output:
+                detail += f": {output[:300]}"
+            results.append(detail)
+            if proc.returncode == 0:
+                break
+        return "\n".join(results)
 
     def _run(self) -> None:
         try:
@@ -172,6 +263,18 @@ class PiPanel:
                     if name == "stop":
                         root.destroy()
                         return
+                    if name == "visibility:hide":
+                        self._visible = False
+                        with suppress(Exception):
+                            root.withdraw()
+                        continue
+                    if name == "visibility:show":
+                        self._visible = True
+                        with suppress(Exception):
+                            root.deiconify()
+                        with suppress(Exception):
+                            root.lift()
+                        continue
                     target = _STATES.get(name, target)
                     if name != "sleep":
                         last_active = now

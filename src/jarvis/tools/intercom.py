@@ -13,6 +13,7 @@ from jarvis.runtime import RequestContext
 from jarvis.tools.base import Tool
 
 CAP_CAMERA = "intercom.camera"
+CAP_DISPLAY = "intercom.display"
 
 DeviceAction = Callable[[RequestContext, str, dict[str, Any], float], Awaitable[dict[str, Any]]]
 
@@ -24,6 +25,23 @@ def make_intercom_tools(action: DeviceAction) -> list[Tool]:
         if not image:
             return "error: no image captured"
         return str(image)
+
+    async def control_display(ctx: RequestContext, args: dict[str, Any]) -> str:
+        requested = str(args.get("action") or "status").strip().lower()
+        result = await action(ctx, "control_display", {"action": requested}, 5.0)
+        status = result.get("status") or "unknown"
+        command = str(result.get("command") or "").strip()
+        if requested == "status" and command:
+            return f"PiPanel screen status:\n{command}"
+        if status == "visible":
+            return "PiPanel screen is on."
+        if status == "hidden":
+            return "PiPanel screen is off."
+        if status == "unavailable":
+            return "PiPanel screen is unavailable on this device."
+        if status == "command_failed" and command:
+            return f"PiPanel screen command failed:\n{command}"
+        return f"PiPanel screen status: {status}."
 
     return [
         Tool(
@@ -53,5 +71,26 @@ def make_intercom_tools(action: DeviceAction) -> list[Tool]:
             announce=False,
             produces_image=True,
             timeout_s=12.0,
-        )
+        ),
+        Tool(
+            "control_pi_panel",
+            "Show, hide, toggle, or check the Raspberry Pi PiPanel screen. Use when "
+            "the user says turn the screen on/off, hide/show the screen, or asks "
+            "whether the PiPanel display is on.",
+            {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["show", "hide", "toggle", "status"],
+                        "description": "show/on, hide/off, toggle, or status.",
+                    }
+                },
+                "required": ["action"],
+            },
+            CAP_DISPLAY,
+            control_display,
+            announce=False,
+            timeout_s=6.0,
+        ),
     ]

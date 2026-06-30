@@ -92,6 +92,53 @@ def test_system_prompt_mentions_camera_when_available() -> None:
     assert "take_photo" in prompt
 
 
+def test_system_prompt_mentions_pi_panel_when_display_available() -> None:
+    sess = BrainSession(
+        load_config(),
+        RequestContext(
+            "kitchen-pi", "house", "house", frozenset({"intercom.display"}), channel="voice"
+        ),
+        gateway=None,
+        tts=None,
+        memory=None,
+        tracer=None,
+        registry=None,
+    )
+
+    prompt = sess._system_prompt("")
+
+    assert "PiPanel display" in prompt
+    assert "control_pi_panel" in prompt
+    assert "off' to hide" in prompt
+
+
+def test_system_prompt_mentions_self_tools_when_available() -> None:
+    sess = BrainSession(
+        load_config(),
+        RequestContext(
+            "local-mac",
+            "neil",
+            "personal",
+            frozenset({"self.inspect", "self.diagnostics", "worker.shell"}),
+            channel="voice",
+        ),
+        gateway=None,
+        tts=None,
+        memory=None,
+        tracer=None,
+        registry=None,
+    )
+
+    prompt = sess._system_prompt("")
+
+    assert "Device awareness" in prompt
+    assert "describe_device" in prompt
+    assert "run_self_diagnostics" in prompt
+    assert "get_ip_address" in prompt
+    assert "ping_host" in prompt
+    assert "Terminal work" in prompt
+
+
 def test_system_prompt_injects_now_last() -> None:
     prompt = _session()._system_prompt("")
     assert "Right now it's" in prompt

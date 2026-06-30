@@ -307,6 +307,10 @@ class ToolsConfig(_Base):
     heartbeat_interval_s: float = 1.2
     # files tool sandbox root (everything resolves within this; escapes rejected).
     files_root: str = "jarvis-workspace/files"
+    # Self-inspection tools (`self.inspect` / `self.diagnostics`) return concise,
+    # redacted local context. Keep output bounded so a voice turn cannot balloon.
+    self_max_bytes: int = 6000
+    self_diagnostic_timeout_s: float = 3.0
     # web_search provider + key (tavily). No key => the tool reports unconfigured.
     websearch_provider: str = "tavily"
     websearch_api_key: SecretStr = SecretStr("")
@@ -405,6 +409,10 @@ class IntercomDeviceConfig(_Base):
     pi_panel_sleep_after_s: float = 0.0
     pi_panel_geometry: str = ""
     pi_panel_url: str = ""
+    pi_panel_show_cmd: str = "sudo jarvis-pi panel-start"
+    pi_panel_hide_cmd: str = "sudo jarvis-pi panel-stop"
+    pi_panel_status_cmd: str = "sudo jarvis-pi panel-status"
+    pi_panel_control_timeout_s: float = 8.0
     eyes: str = "auto"
     eyes_sleep_after_s: float = 90.0
 

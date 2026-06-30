@@ -294,7 +294,10 @@ class IntercomClient:
 
     async def _handle_device_request(self, ws, msg: DeviceRequest) -> None:  # noqa: ANN001
         try:
-            result = await self._hardware.handle(msg.action, msg.args)
+            if msg.action == "control_display":
+                result = self._panel.control(str(msg.args.get("action") or "status"))
+            else:
+                result = await self._hardware.handle(msg.action, msg.args)
             resp = DeviceResponse(request_id=msg.request_id, ok=True, result=result)
         except Exception as exc:  # noqa: BLE001 - return failure over protocol
             resp = DeviceResponse(request_id=msg.request_id, ok=False, error=str(exc))

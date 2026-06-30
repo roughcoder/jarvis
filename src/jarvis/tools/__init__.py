@@ -25,6 +25,7 @@ from jarvis.tools.google import make_google_tools
 from jarvis.tools.fetch import make_fetch_tools
 from jarvis.tools.profile import make_profile_tools
 from jarvis.tools.remote import make_remote_tools
+from jarvis.tools.self_inspection import make_self_tools
 from jarvis.tools.web_search import make_web_search_tool
 from jarvis.tools.worker import make_worker_tools
 
@@ -51,6 +52,11 @@ def build_registry(
     path); the brain connects the bridge at startup, then registers the result."""
     reg = ToolRegistry()
     reg.register(make_web_search_tool(cfg))
+    for tool in make_self_tools(
+        cfg,
+        capabilities or CapabilityConfig(_env_file=None),
+    ):
+        reg.register(tool)
     for tool in make_files_tools(cfg):
         reg.register(tool)
     for tool in make_fetch_tools(cfg):  # generic: fetch a URL as clean text (for skills)

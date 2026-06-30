@@ -40,7 +40,10 @@ capabilities:
 The grant alone is not enough: at pairing the intercom also advertises live
 hardware (`camera`, `display`). The brain exposes `take_photo` only when both
 the profile grants `intercom.camera` and that connected device advertised a
-camera. That keeps Pis without cameras from seeing camera tools.
+camera. It exposes `control_pi_panel` only when `intercom.display` is granted
+and the Pi advertises a display, so voice commands like "turn off the screen"
+and "turn on the screen" target PiPanel only on display-equipped room devices.
+That keeps Pis without the matching hardware from seeing those tools.
 
 Run the brain through the app Setup window or `jarvis service start brain`.
 
@@ -132,6 +135,23 @@ INTERCOM_NETWORK_PROBE_PORT=53
 INTERCOM_NETWORK_PROBE_HOST=none
 ```
 
+Voice display control uses the `control_pi_panel` tool. It maps "turn off the
+screen" / "hide the screen" to PiPanel hide, and "turn on the screen" / "show
+the screen" to PiPanel show. By default it runs the same Pi-local helpers you
+would use by hand:
+
+```dotenv
+INTERCOM_DEVICE_PI_PANEL_SHOW_CMD="sudo jarvis-pi panel-start"
+INTERCOM_DEVICE_PI_PANEL_HIDE_CMD="sudo jarvis-pi panel-stop"
+INTERCOM_DEVICE_PI_PANEL_STATUS_CMD="sudo jarvis-pi panel-status"
+```
+
+`sudo jarvis-pi panel-start` reopens PiPanel. Older installs without that helper
+fall back to `sudo systemctl start jarvis-panel-preview.service`, with matching
+`stop` and `status` fallbacks. If command execution is disabled by config,
+Jarvis can still hide or show the already-running PiPanel Tk window with
+`withdraw` / `deiconify`.
+
 ## Updating and checking the Pi
 
 The installer writes a Pi-specific helper:
@@ -141,8 +161,11 @@ sudo jarvis-pi update
 jarvis-pi status
 jarvis-pi logs
 jarvis-pi doctor
-sudo jarvis-pi panel-stop
 sudo jarvis-pi panel-start
+sudo jarvis-pi panel-stop
+sudo jarvis-pi panel-restart
+sudo jarvis-pi panel-status
+sudo jarvis-pi panel-logs
 ```
 
 `update` refreshes the runtime from the configured public repository/ref, syncs

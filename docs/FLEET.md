@@ -333,6 +333,12 @@ against the combined virtual desktop. Grant `intercom.display` only on profiles
 for Pis that actually have a working screen. Existing `INTERCOM_DEVICE_EYES`
 values remain supported as legacy aliases.
 
+PiPanel can be reopened with `sudo jarvis-pi panel-start`; older installs can use
+`sudo systemctl start jarvis-panel-preview.service`. Check it with
+`sudo jarvis-pi panel-status`. Voice commands such as "turn off the screen" and
+"turn on the screen" use the same helpers through the `control_pi_panel` tool
+when `intercom.display` is granted and the Pi advertises display hardware.
+
 Post-update smoke:
 
 ```bash
