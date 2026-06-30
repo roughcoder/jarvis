@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from jarvis.config import load_config
 from jarvis.intercom.client import IntercomClient, _CapturedUtterance
 from jarvis.intercom.metrics import SCHEMA_VERSION, IntercomReplyMetrics, summary
@@ -44,6 +46,11 @@ class _WS:
 
     async def send(self, item: str | bytes) -> None:
         self.sent.append(item)
+
+
+class _FailingWS:
+    async def send(self, item: str | bytes) -> None:  # noqa: ARG002
+        raise RuntimeError("socket closed")
 
 
 class _Mic:
@@ -349,6 +356,25 @@ def test_reply_without_audio_records_missing_audio_event() -> None:
     assert "NO_REPLY_AUDIO" in summary(metrics.data)
 
 
+def test_streaming_capture_stops_worker_when_send_fails() -> None:
+    c = _client()
+    stopped: list[bool] = []
+
+    def fake_capture(_mic, send_chunk, *, stop_capture, initial_wait_ms):  # noqa: ANN001, ARG001
+        send_chunk(b"hello")
+        stopped.append(stop_capture.wait(1.0))
+        return {"pcm": b"hello", "capture_ms": 1.0}
+
+    c._capture_utterance_to_queue = fake_capture  # type: ignore[method-assign]
+
+    async def go() -> None:
+        with pytest.raises(RuntimeError, match="socket closed"):
+            await c._capture_streaming_utterance(_FailingWS(), _Mic())
+
+    asyncio.run(go())
+    assert stopped == [True]
+
+
 def test_interrupted_silence_sends_conversation_idle() -> None:
     c = _client()
     q: asyncio.Queue = asyncio.Queue()
@@ -377,7 +403,7 @@ def test_panel_selected_voice_mode_is_sent_with_next_audio_start() -> None:
     c = _client(panel)
     ws = _WS()
 
-    def fake_capture(_mic, send_chunk, *, initial_wait_ms):  # noqa: ANN001, ARG001
+    def fake_capture(_mic, send_chunk, *, stop_capture, initial_wait_ms):  # noqa: ANN001, ARG001
         send_chunk(b"hello")
         return {"pcm": b"hello", "capture_ms": 1.0}
 
