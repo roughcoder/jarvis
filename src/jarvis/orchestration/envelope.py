@@ -9,6 +9,7 @@ from jarvis.orchestration.models import (
     WorkCommand,
     WorkItem,
 )
+from jarvis.orchestration.policy import envelope_allowed_actions
 from jarvis.worker.jobs import slugify
 
 
@@ -34,7 +35,7 @@ def build_execution_envelope(
         worker_id=worker_id or command.target_worker_id or "local-worker",
         engine=engine,
         branch_name=branch,
-        allowed_actions=["worker.job.start", "forge.write.local"],
+        allowed_actions=envelope_allowed_actions(landing_mode),
         verification=VerificationPlan(
             minimum_rung=_minimum_rung(primary),
             repo_native=True,
