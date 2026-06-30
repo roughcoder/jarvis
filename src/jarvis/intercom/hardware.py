@@ -36,7 +36,7 @@ class IntercomHardware:
         caps: list[str] = []
         if _enabled(self._cfg.camera, auto=bool(self._camera_bin)):
             caps.append("camera")
-        if _enabled(self._cfg.pi_panel_setting, auto=self.display_available()):
+        if _enabled(self._cfg.pi_panel_setting, auto=self.display_available()) or self._cfg.pi_panel_url:
             caps.append("display")
         return caps
 

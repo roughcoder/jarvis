@@ -14,6 +14,7 @@ from jarvis.tools.base import Tool
 
 CAP_CAMERA = "intercom.camera"
 CAP_DISPLAY = "intercom.display"
+DISPLAY_TIMEOUT_S = 12.0
 
 DeviceAction = Callable[[RequestContext, str, dict[str, Any], float], Awaitable[dict[str, Any]]]
 
@@ -28,7 +29,7 @@ def make_intercom_tools(action: DeviceAction) -> list[Tool]:
 
     async def control_display(ctx: RequestContext, args: dict[str, Any]) -> str:
         requested = str(args.get("action") or "status").strip().lower()
-        result = await action(ctx, "control_display", {"action": requested}, 5.0)
+        result = await action(ctx, "control_display", {"action": requested}, DISPLAY_TIMEOUT_S)
         status = result.get("status") or "unknown"
         command = str(result.get("command") or "").strip()
         if requested == "status" and command:
@@ -91,6 +92,6 @@ def make_intercom_tools(action: DeviceAction) -> list[Tool]:
             CAP_DISPLAY,
             control_display,
             announce=False,
-            timeout_s=6.0,
+            timeout_s=DISPLAY_TIMEOUT_S + 1.0,
         ),
     ]

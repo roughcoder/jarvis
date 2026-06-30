@@ -1,4 +1,4 @@
-from jarvis.intercom.pi_panel import _configure_fullscreen_root
+from jarvis.intercom.pi_panel import CompositePanel, _configure_fullscreen_root
 
 
 class FakeRoot:
@@ -128,3 +128,29 @@ def test_pi_panel_control_reports_command_failure() -> None:
 
     assert result["status"] == "command_failed"
     assert "exit 1" in result["command"]
+
+
+def test_composite_panel_delegates_control() -> None:
+    class PassivePanel:
+        def start(self) -> None:
+            return
+
+        def stop(self) -> None:
+            return
+
+        def set(self, state: str) -> None:
+            del state
+
+        def set_voice_mode(self, voice_mode: str) -> None:
+            del voice_mode
+
+        def take_voice_mode(self) -> None:
+            return None
+
+    class ControllablePanel(PassivePanel):
+        def control(self, action: str) -> dict[str, object]:
+            return {"status": action}
+
+    panel = CompositePanel(PassivePanel(), ControllablePanel())
+
+    assert panel.control("show") == {"status": "show"}

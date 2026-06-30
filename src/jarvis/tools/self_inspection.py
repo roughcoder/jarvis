@@ -7,6 +7,7 @@ fixed allow-list only.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import platform
 import re
@@ -125,7 +126,7 @@ def make_self_tools(
             ]
         )
 
-    def run_diagnostics(ctx: RequestContext, args: dict[str, Any]) -> str:
+    async def run_diagnostics(ctx: RequestContext, args: dict[str, Any]) -> str:
         del args
         timeout = cfg.self_diagnostic_timeout_s
         max_bytes = cfg.self_max_bytes
@@ -137,24 +138,28 @@ def make_self_tools(
             ["sh", "-lc", "command -v vm_stat >/dev/null && vm_stat | head -20 || true"],
             ["sh", "-lc", "ps -o pid,ppid,%cpu,%mem,comm -p $$"],
         ]
-        checks = [
-            "basic_runtime:",
-            f"- host={socket.gethostname()} platform={platform.platform()} python={sys.version.split()[0]}",
-            f"- request_device_id={ctx.device_id} configured_device_id={capabilities.device_id}",
-            f"- cwd={Path.cwd()}",
-            "",
-            "tool_config:",
-            f"- timeout_s={cfg.timeout_s}",
-            f"- max_rounds={cfg.max_rounds}",
-            f"- diagnostic_timeout_s={cfg.self_diagnostic_timeout_s}",
-            "",
-            "terminal_checks:",
-            *[
+        command_results = await asyncio.to_thread(
+            lambda: [
                 _run(command, cwd=root, timeout_s=timeout, max_bytes=max_bytes)
                 for command in commands
-            ],
-        ]
-        return "\n".join(checks)
+            ]
+        )
+        return "\n".join(
+            [
+                "basic_runtime:",
+                f"- host={socket.gethostname()} platform={platform.platform()} python={sys.version.split()[0]}",
+                f"- request_device_id={ctx.device_id} configured_device_id={capabilities.device_id}",
+                f"- cwd={Path.cwd()}",
+                "",
+                "tool_config:",
+                f"- timeout_s={cfg.timeout_s}",
+                f"- max_rounds={cfg.max_rounds}",
+                f"- diagnostic_timeout_s={cfg.self_diagnostic_timeout_s}",
+                "",
+                "terminal_checks:",
+                *command_results,
+            ]
+        )
 
     def get_ip_address(ctx: RequestContext, args: dict[str, Any]) -> str:
         del ctx

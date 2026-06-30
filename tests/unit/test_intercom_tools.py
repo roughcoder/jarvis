@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from jarvis.brain.context import RequestContext
-from jarvis.tools.intercom import CAP_CAMERA, CAP_DISPLAY, make_intercom_tools
+from jarvis.tools.intercom import CAP_CAMERA, CAP_DISPLAY, DISPLAY_TIMEOUT_S, make_intercom_tools
 
 
 def test_take_photo_tool_is_camera_gated_and_image_producing() -> None:
@@ -29,7 +29,7 @@ def test_control_pi_panel_tool_is_display_gated() -> None:
         assert ctx.device_id == "kitchen-pi"
         assert name == "control_display"
         assert args == {"action": "hide"}
-        assert timeout_s == 5.0
+        assert timeout_s == DISPLAY_TIMEOUT_S
         return {"status": "hidden", "visible": False}
 
     tool = {t.name: t for t in make_intercom_tools(action)}["control_pi_panel"]
@@ -38,6 +38,7 @@ def test_control_pi_panel_tool_is_display_gated() -> None:
     result = asyncio.run(tool.handler(ctx, {"action": "hide"}))
 
     assert tool.required_capability == CAP_DISPLAY
+    assert tool.timeout_s == DISPLAY_TIMEOUT_S + 1.0
     assert result == "PiPanel screen is off."
 
 
