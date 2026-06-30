@@ -150,9 +150,31 @@ def _record_sync_error(store: OrchestrationStore, run_id: str, job_id: str, erro
 def _final_phase(run: OrchestrationRun) -> str:
     if not run.jobs or run.status == "terminal":
         return ""
-    statuses = {job.status for job in run.jobs}
+    statuses = _effective_terminal_statuses(run)
     if not statuses.issubset(TERMINAL_JOB_STATUSES):
         return ""
     if statuses == {"done"}:
         return "completed"
     return "failed"
+
+
+def _effective_terminal_statuses(run: OrchestrationRun) -> set[str]:
+    statuses: list[str] = []
+    for idx, job in enumerate(run.jobs):
+        if job.status in {"error", "interrupted"} and _superseded_by_successful_resume(job, run.jobs[idx + 1 :]):
+            continue
+        statuses.append(job.status)
+    return set(statuses)
+
+
+def _superseded_by_successful_resume(job, later_jobs) -> bool:  # noqa: ANN001
+    if not job.session_id and not job.cwd:
+        return False
+    for later in later_jobs:
+        if later.status != "done" or later.worker_id != job.worker_id:
+            continue
+        if job.session_id and later.session_id == job.session_id:
+            return True
+        if job.cwd and later.cwd == job.cwd:
+            return True
+    return False

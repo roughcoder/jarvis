@@ -396,14 +396,14 @@ def _resume_cwd(cwd: str, workspace: pathlib.Path) -> tuple[str, str]:
     return str(path), ""
 
 
-def _running_workspace_refs(items: list) -> set[tuple[str, str]]:
-    return {(job.cwd, job.branch or "") for job in items if job.status == "running" and job.cwd}
+def _running_workspace_refs(items: list) -> set[str]:
+    return {job.cwd for job in items if job.status == "running" and job.cwd}
 
 
-def _workspace_in_use(job, running_refs: set[tuple[str, str]]) -> bool:  # noqa: ANN001
+def _workspace_in_use(job, running_refs: set[str]) -> bool:  # noqa: ANN001
     if not job.cwd:
         return False
-    return (job.cwd, job.branch or "") in running_refs
+    return job.cwd in running_refs
 
 
 async def serve(cfg: WorkerConfig) -> None:

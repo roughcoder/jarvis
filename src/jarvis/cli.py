@@ -761,20 +761,21 @@ def _cmd_work(args: argparse.Namespace) -> int:
         return 0
 
     if args.work_action == "resume":
+        store = _orch_store(cfg)
+        run_ref, prompt = _resume_target_and_prompt(store, getattr(args, "resume_args", []))
         if args.inspect:
-            store = _orch_store(cfg)
-            if args.run_id in {"latest", "last"}:
+            if run_ref in {"latest", "last"}:
                 runs = store.list_runs()
                 run = next((r for r in reversed(runs) if r.jobs), runs[-1] if runs else None)
             else:
-                run = store.get(args.run_id)
+                run = store.get(run_ref)
             if run is None:
-                print(f"No run found for {args.run_id!r}.")
+                print(f"No run found for {run_ref!r}.")
                 return 1
             print(json.dumps(run.to_dict(), indent=2) if args.json else _format_run(run))
             return 0
         try:
-            result = service.resume_run(args.run_id, prompt=" ".join(args.phrase))
+            result = service.resume_run(run_ref, prompt=prompt)
         except MissingAuthorityError as exc:
             _print_missing_orchestration_authority(exc.actions, cfg, capabilities)
             return 1
@@ -799,6 +800,15 @@ def _cmd_work(args: argparse.Namespace) -> int:
 
     print(f"Unknown work action {args.work_action!r}.")
     return 1
+
+
+def _resume_target_and_prompt(store, tokens: list[str]) -> tuple[str, str]:  # noqa: ANN001
+    if not tokens:
+        return "latest", ""
+    first = tokens[0]
+    if first in {"latest", "last"} or store.get(first) is not None:
+        return first, " ".join(tokens[1:])
+    return "latest", " ".join(tokens)
 
 
 def _has_orchestration_authority(
@@ -2116,8 +2126,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_pr_comments.add_argument("--json", action="store_true")
     p_pr_comments.set_defaults(func=_cmd_work)
     p_work_resume = work_sub.add_parser("resume", help="Resume a prior orchestration run")
-    p_work_resume.add_argument("run_id", nargs="?", default="latest", help="Run id, unique prefix, latest, or last")
-    p_work_resume.add_argument("phrase", nargs="*", help="Optional follow-up instruction for the resumed session")
+    p_work_resume.add_argument(
+        "resume_args",
+        nargs="*",
+        help="Optional run id/prefix followed by follow-up instruction, or just a follow-up instruction for latest",
+    )
     p_work_resume.add_argument("--source", default="")
     p_work_resume.add_argument("--inspect", action="store_true", help="Show the run instead of starting a resume job")
     p_work_resume.add_argument("--json", action="store_true")

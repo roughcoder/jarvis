@@ -319,7 +319,6 @@ def test_daemon_prune_keeps_workspace_used_by_running_resume(tmp_path) -> None:
                         "session_id": "550e8400-e29b-41d4-a716-446655440000",
                         "resume_session": True,
                         "cwd": original_job["cwd"],
-                        "branch": original_job["branch"],
                     },
                 },
             )
