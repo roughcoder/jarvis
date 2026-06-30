@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 
 from jarvis.config import WorkerConfig
-from jarvis.engines import engine_ids, worker_supports_engine
+from jarvis.engines import engine_ids, normalize_engine_id, worker_supports_engine
 from jarvis.orchestration.models import WorkerProfile
 
 
@@ -45,8 +45,12 @@ class WorkerRegistry:
         preferred: list[str] | None = None,
         *,
         engine: str = "",
+        engines: list[str] | None = None,
     ) -> WorkerProfile | None:
         required_set = set(required or [])
+        required_engines = _required_engines(engines or [])
+        if engine and not required_engines:
+            required_engines = [engine]
         profiles = self.profiles(probe=True)
         if preferred:
             by_id = {p.worker_id: p for p in profiles}
@@ -56,7 +60,7 @@ class WorkerRegistry:
         for profile in ordered:
             if profile.status == "offline":
                 continue
-            if engine and not worker_supports_engine(profile.supported_engines, engine):
+            if any(not worker_supports_engine(profile.supported_engines, target) for target in required_engines):
                 continue
             if required_set.issubset(set(profile.capabilities)):
                 if profile.current_jobs < profile.max_concurrent_jobs:
@@ -112,12 +116,16 @@ class WorkerRegistry:
             jobs = self._http_get(f"{profile.base_url}/jobs", headers=headers, timeout=3)
             jobs.raise_for_status()
             job_data = jobs.json().get("jobs", [])
+            session_data = self._session_data(profile.base_url, headers)
         except Exception:  # noqa: BLE001 - status probe must not crash CLI
             profile.status = "offline"
             profile.current_jobs = 0
             return profile
         profile.status = "online"
-        profile.current_jobs = sum(1 for j in job_data if j.get("status") == "running")
+        active_sessions = {"created", "running", "waiting_provider", "waiting_input", "waiting_approval"}
+        profile.current_jobs = sum(1 for j in job_data if j.get("status") == "running") + sum(
+            1 for s in session_data if s.get("status") in active_sessions
+        )
         data = health.json()
         if data.get("agent"):
             profile.agent = data["agent"]
@@ -130,3 +138,21 @@ class WorkerRegistry:
             )
         profile.__post_init__()
         return profile
+
+    def _session_data(self, base_url: str, headers: dict[str, str]) -> list[dict[str, Any]]:
+        try:
+            sessions = self._http_get(f"{base_url}/sessions", headers=headers, timeout=3)
+            sessions.raise_for_status()
+            data = sessions.json().get("sessions", [])
+        except Exception:  # noqa: BLE001 - older workers may not expose sessions yet
+            return []
+        return [dict(item) for item in data if isinstance(item, dict)]
+
+
+def _required_engines(engines: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in engines:
+        engine = normalize_engine_id(value)
+        if engine and engine not in result:
+            result.append(engine)
+    return result

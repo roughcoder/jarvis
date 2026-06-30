@@ -110,8 +110,11 @@ class OrchestrationService:
             raise MissingWorkRepoError(item, run.run_id)
         registry = WorkerRegistry(self.cfg.worker, profiles_path=self.cfg.orchestration.workers_path)
         target_engine = normalize_engine_id(_first_engine(command.target_engine_id))
+        requested_engines = _requested_engines(command)
         if command.target_worker_id:
             worker = registry.get(command.target_worker_id, probe=True)
+        elif command.engine_strategy == "ensemble" and requested_engines:
+            worker = registry.choose(item.capability_requirements, engines=requested_engines)
         elif target_engine:
             worker = registry.choose(item.capability_requirements, engine=target_engine)
         else:
@@ -170,9 +173,11 @@ class OrchestrationService:
             run_id=run.run_id,
         )
         run = store.get(run.run_id) or run
-        running = next((session for session in reversed(run.sessions) if session.status == "running"), None)
+        running = next((session for session in reversed(run.sessions) if _session_is_active(session.status)), None)
         if running is not None:
-            raise ResumeRunError(f"Run {run.run_id} already has running worker session {running.session_id}.")
+            raise ResumeRunError(
+                f"Run {run.run_id} already has active worker session {running.session_id} ({running.status})."
+            )
         previous = _resume_session(run.sessions)
         if previous is None:
             raise ResumeRunError(f"Run {run.run_id} has no resumable worker session.")
@@ -235,8 +240,23 @@ def _worker_is_eligible(worker: WorkerProfile, required: list[str] | None = None
     return set(required or []).issubset(set(worker.capabilities))
 
 
+def _session_is_active(status: str) -> bool:
+    return status in {"created", "running", "waiting_provider", "waiting_input", "waiting_approval"}
+
+
 def _first_engine(value: str) -> str:
     return str(value or "").split(",", 1)[0].strip()
+
+
+def _requested_engines(command: WorkCommand) -> list[str]:
+    if command.engine_strategy != "ensemble":
+        return []
+    result: list[str] = []
+    for value in str(command.target_engine_id or "").split(","):
+        engine = normalize_engine_id(value)
+        if engine and engine not in result:
+            result.append(engine)
+    return result
 
 
 def _target_engines(command: WorkCommand, worker: WorkerProfile, *, fallback_engine: str) -> list[str]:
@@ -261,7 +281,7 @@ def _resolve_run(store: OrchestrationStore, run_ref: str):
 
 def _resume_session(sessions: list[WorkerSessionLink]) -> WorkerSessionLink | None:
     for session in reversed(sessions):
-        if session.session_id and session.status != "running":
+        if session.session_id and not _session_is_active(session.status):
             return session
     return None
 
