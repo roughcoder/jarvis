@@ -27,6 +27,11 @@ WorkCommand -> OrchestrationRun -> ExecutionEnvelope
 
 ### WorkerSession
 
+`session_id` is the Jarvis worker-session id used in `/sessions/:id` routes and
+orchestration run links. Provider-native resume ids are stored under
+`metadata.provider_session_id` or provider-specific metadata keys such as
+`metadata.codex_thread_id` and `metadata.claude_session_id`.
+
 ```json
 {
   "session_id": "sess_1760000000_abcd1234",

@@ -6,6 +6,7 @@ from typing import Any
 from jarvis.capabilities import (
     FORGE_BRANCH_PUSH,
     FORGE_PR_CREATE,
+    WORKER_SESSION_CREATE,
     WORKER_SESSION_APPROVE,
     WORKER_SESSION_INPUT,
     WORKER_SESSION_TURN,
@@ -19,16 +20,32 @@ class WorkerSessionAuthority:
     landing: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_session(cls, session: WorkerSession, *, provider: str = "") -> WorkerSessionAuthority:
-        metadata = session.metadata or {}
+    def from_metadata(
+        cls,
+        metadata: dict[str, Any],
+        *,
+        provider: str = "",
+        require_turn: bool = False,
+    ) -> WorkerSessionAuthority:
         envelope = metadata.get("execution_envelope")
         envelope_data = envelope if isinstance(envelope, dict) else {}
         allowed = _string_list(envelope_data.get("allowed_actions") or metadata.get("allowed_actions"))
-        if WORKER_SESSION_TURN not in allowed:
+        if require_turn and WORKER_SESSION_TURN not in allowed:
             raise RuntimeError(f"worker session missing required authority: {WORKER_SESSION_TURN}")
         landing = envelope_data.get("landing") or metadata.get("landing") or {}
         authority = cls(allowed_actions=allowed, landing=dict(landing) if isinstance(landing, dict) else {})
-        authority.validate(provider or session.provider)
+        authority.validate(provider)
+        return authority
+
+    @classmethod
+    def from_session(cls, session: WorkerSession, *, provider: str = "") -> WorkerSessionAuthority:
+        return cls.from_metadata(session.metadata or {}, provider=provider or session.provider, require_turn=True)
+
+    @classmethod
+    def for_session_create(cls, data: dict[str, Any]) -> WorkerSessionAuthority:
+        metadata = dict(data.get("metadata") or {})
+        authority = cls.from_metadata(metadata, provider=str(data.get("provider") or data.get("engine") or ""))
+        authority.require(WORKER_SESSION_CREATE)
         return authority
 
     def validate(self, provider: str) -> None:

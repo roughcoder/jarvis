@@ -977,9 +977,84 @@ def test_start_worker_session_links_run_graph(tmp_path) -> None:
     assert session.status == "waiting_provider"
     assert session.last_event_id == "event_2"
     assert calls[0][1]["metadata"]["execution_envelope"]["run_id"] == run.run_id
-    assert calls[1][1]["turn_id"].startswith("turn_")
-    assert calls[1][1]["idempotency_key"] == f"{run.run_id}:{calls[1][1]['turn_id']}"
+    assert calls[1][1]["turn_id"] == f"turn_{envelope.dispatch_id}"
+    assert calls[1][1]["idempotency_key"] == f"{run.run_id}:{envelope.dispatch_id}:turn"
     assert store.get(run.run_id).sessions[0].session_id == "sess_123"  # type: ignore[union-attr]
+
+
+def test_start_worker_session_reuses_dispatch_idempotency_key_on_retry(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Start live session")
+    envelope = ExecutionEnvelope(
+        run_id=run.run_id,
+        repo="roughcoder/jarvis",
+        prompt="x",
+        worker_id="local-worker",
+        engine="codex",
+        branch_name="jarvis/live-session",
+        session_name="jarvis-live-session",
+    )
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, body: dict) -> None:
+            self._body = body
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self._body
+
+    def fake_post(url, **kwargs):  # noqa: ANN001
+        calls.append((url, kwargs["json"]))
+        if url.endswith("/sessions"):
+            return Response(
+                {
+                    "ok": True,
+                    "session": {
+                        "session_id": "sess_123",
+                        "status": "created",
+                        "provider": "codex",
+                        "engine": "codex",
+                        "branch": "jarvis/live-session",
+                    },
+                }
+            )
+        return Response(
+            {
+                "ok": True,
+                "turn_id": kwargs["json"]["turn_id"],
+                "session": {
+                    "session_id": "sess_123",
+                    "status": "running",
+                    "provider": "codex",
+                    "engine": "codex",
+                    "branch": "jarvis/live-session",
+                },
+                "events": [{"event_id": "event_2", "type": "turn.started"}],
+            }
+        )
+
+    start_worker_session(
+        envelope,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1, token=""),
+        store=store,
+        post=fake_post,
+    )
+    start_worker_session(
+        envelope,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1, token=""),
+        store=store,
+        post=fake_post,
+    )
+
+    turn_payloads = [payload for url, payload in calls if url.endswith("/turns")]
+    assert len(turn_payloads) == 2
+    assert turn_payloads[0]["turn_id"] == turn_payloads[1]["turn_id"]
+    assert turn_payloads[0]["idempotency_key"] == turn_payloads[1]["idempotency_key"]
 
 
 def test_start_worker_ensemble_uses_distinct_provider_branches(tmp_path) -> None:
