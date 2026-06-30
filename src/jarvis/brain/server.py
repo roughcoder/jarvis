@@ -106,6 +106,9 @@ class BufferedAudioTurn:
     frame_bytes: int
     stream_ms: float
     voice_mode: str = DEFAULT_MODE
+    streaming_stt_task: asyncio.Task | None = None
+    streaming_stt_pcm_bytes: int = 0
+    streaming_stt_partial_runs: int = 0
 
 
 def _is_alarm_ack(text: str) -> bool:
@@ -518,6 +521,7 @@ class BrainServer:
                         if not ok:
                             await ws.close(code=1009, reason="uplink audio too large")
                             break
+                        self._maybe_schedule_streaming_stt(conn, binary.turn_id)
                     continue
                 try:
                     msg = decode(raw)
@@ -580,6 +584,10 @@ class BrainServer:
                 sample_rate * 2 * (_MAX_UPLINK_AUDIO_S + _MAX_UPLINK_AUDIO_SLACK_S)
             ),
             "started_at": time.perf_counter(),
+            "streaming_stt_task": None,
+            "streaming_stt_pcm_bytes": 0,
+            "streaming_stt_partial_runs": 0,
+            "streaming_stt_last_at": 0.0,
         }
         return True
 
@@ -617,7 +625,104 @@ class BrainServer:
             stream_ms=(time.perf_counter() - float(buf.get("started_at", time.perf_counter())))
             * 1000,
             voice_mode=normalize_mode(buf.get("voice_mode") or DEFAULT_MODE),
+            streaming_stt_task=buf.get("streaming_stt_task"),
+            streaming_stt_pcm_bytes=int(buf.get("streaming_stt_pcm_bytes") or 0),
+            streaming_stt_partial_runs=int(buf.get("streaming_stt_partial_runs") or 0),
         )
+
+    def _maybe_schedule_streaming_stt(self, conn: dict, turn_id: str) -> None:
+        if not self._cfg.brain.streaming_stt_enabled:
+            return
+        buffers = conn.get("audio_buffers", {})
+        buf = buffers.get(turn_id)
+        if buf is None:
+            return
+        task = buf.get("streaming_stt_task")
+        if task is not None and not task.done():
+            return
+        partial_runs = int(buf.get("streaming_stt_partial_runs") or 0)
+        if partial_runs >= max(0, self._cfg.brain.streaming_stt_max_partials):
+            return
+        sample_rate = int(buf.get("sample_rate") or 16000)
+        pcm_bytes = int(buf.get("pcm_bytes") or 0)
+        audio_s = pcm_bytes / 2 / sample_rate
+        if audio_s < max(0.0, self._cfg.brain.streaming_stt_min_audio_s):
+            return
+        now = time.perf_counter()
+        last_at = float(buf.get("streaming_stt_last_at") or 0.0)
+        if last_at and now - last_at < max(0.0, self._cfg.brain.streaming_stt_interval_s):
+            return
+        pcm = b"".join(buf.get("chunks", []))
+        if not pcm:
+            return
+        buf["streaming_stt_last_at"] = now
+        buf["streaming_stt_partial_runs"] = partial_runs + 1
+        buf["streaming_stt_pcm_bytes"] = len(pcm)
+        buf["streaming_stt_task"] = asyncio.create_task(
+            self._transcribe_snapshot(pcm, sample_rate)
+        )
+
+    async def _transcribe_snapshot(self, pcm: bytes, sample_rate: int) -> dict:
+        t0 = time.perf_counter()
+        text = await asyncio.to_thread(self._stt.transcribe, pcm, sample_rate=sample_rate)
+        ms = (time.perf_counter() - t0) * 1000
+        return {
+            "text": text,
+            "ms": round(ms, 1),
+            "pcm_bytes": len(pcm),
+            "audio_s": round(len(pcm) / 2 / sample_rate, 1),
+            "chars": len(text),
+        }
+
+    async def _transcribe_buffered_audio(
+        self, msg: BufferedAudioTurn, trace
+    ) -> tuple[str, float]:  # noqa: ANN001
+        pcm = msg.pcm
+        secs = len(pcm) / 2 / msg.sample_rate
+        task = msg.streaming_stt_task
+        partial: dict | None = None
+        if task is not None and (
+            task.done() or msg.streaming_stt_pcm_bytes == len(pcm)
+        ):
+            try:
+                partial = await task
+                trace.stage(
+                    "stt_stream",
+                    partial.get("ms", 0.0),
+                    audio_s=partial.get("audio_s", 0.0),
+                    chars=partial.get("chars", 0),
+                    pcm_bytes=partial.get("pcm_bytes", 0),
+                    partial_runs=msg.streaming_stt_partial_runs,
+                )
+            except Exception as exc:  # noqa: BLE001 - final STT below still recovers
+                trace.event("stt_stream_error", error=type(exc).__name__)
+                partial = None
+        if partial is not None and int(partial.get("pcm_bytes") or 0) == len(pcm):
+            trace.start("stt")
+            text = str(partial.get("text") or "")
+            trace.end(
+                "stt",
+                audio_s=round(secs, 1),
+                chars=len(text),
+                streaming=True,
+                reused_partial=True,
+                partial_runs=msg.streaming_stt_partial_runs,
+            )
+            return text, secs
+
+        trace.start("stt")
+        text = await asyncio.to_thread(
+            self._stt.transcribe, pcm, sample_rate=msg.sample_rate
+        )
+        trace.end(
+            "stt",
+            audio_s=round(secs, 1),
+            chars=len(text),
+            streaming=bool(msg.streaming_stt_partial_runs),
+            reused_partial=False,
+            partial_runs=msg.streaming_stt_partial_runs,
+        )
+        return text, secs
 
     @staticmethod
     async def _cancel(turn: asyncio.Task | None) -> None:
@@ -713,11 +818,7 @@ class BrainServer:
                 chunks=msg.chunks,
                 audio_s=round(secs, 1),
             )
-            trace.start("stt")
-            text = await asyncio.to_thread(
-                self._stt.transcribe, pcm, sample_rate=msg.sample_rate
-            )
-            trace.end("stt", audio_s=round(secs, 1), chars=len(text))
+            text, _secs = await self._transcribe_buffered_audio(msg, trace)
         else:  # TextIn
             text = msg.text
         if not text:
