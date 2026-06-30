@@ -237,6 +237,69 @@ def test_produces_image_tool_injects_image_and_switches_to_vision(tmp_path) -> N
     assert not any(isinstance(m.get("content"), list) for m in result.tool_messages)
 
 
+def test_vision_route_is_preserved_after_followup_tool_call() -> None:
+    from jarvis.tools.base import Tool, ToolRegistry
+
+    captured_models: list[str] = []
+
+    class _RecordingGateway:
+        def __init__(self, scripted) -> None:  # noqa: ANN001
+            self._scripted = scripted
+            self.calls = 0
+
+        async def complete_with_tools(self, messages, *, model=None, tools=None, usage_out=None):  # noqa: ANN001
+            captured_models.append(model)
+            msg = self._scripted[self.calls]
+            self.calls += 1
+            return msg
+
+    async def look(ctx, args):  # noqa: ANN001
+        return "FAKEB64DATA"
+
+    async def ping(ctx, args):  # noqa: ANN001
+        return "ok"
+
+    reg = ToolRegistry()
+    reg.register(Tool(
+        "look_at_screen", "see", {"type": "object", "properties": {}}, "worker.gui",
+        look, announce=False, produces_image=True,
+    ))
+    reg.register(Tool(
+        "ping", "ping", {"type": "object", "properties": {}}, "ping.use",
+        ping, announce=False,
+    ))
+    cfg = load_config()
+    cfg.gateway.fast_model = "fast-route"
+    cfg.gateway.voice_model = "voice-route"
+    cfg.gateway.strong_model = "strong-route"
+    cfg.gateway.vision_model = "vision-route"
+    ctx = RequestContext("dev", "neil", "personal", frozenset({"worker.gui", "ping.use"}))
+    gw = _RecordingGateway([
+        _FakeMsg(tool_calls=[_FakeToolCall("c1", "look_at_screen", "{}")]),
+        _FakeMsg(tool_calls=[_FakeToolCall("c2", "ping", "{}")]),
+        _FakeMsg(content="The screen is visible and the follow-up check is done."),
+    ])
+    session = BrainSession(cfg, ctx, gateway=gw, tts=None, memory=None, tracer=None, registry=reg)
+    result = TurnResult()
+    schemas = [t.openai_schema() for t in reg.available_for(ctx)]
+
+    async def go() -> None:
+        async for _ in session._run_tool_loop(
+            [{"role": "user", "content": "look then check"}],
+            cfg.gateway.fast_model, TurnTrace(room="x", speaker="neil"), schemas, result,
+        ):
+            pass
+
+    asyncio.run(go())
+
+    assert captured_models == [
+        cfg.gateway.fast_model,
+        cfg.gateway.vision_model,
+        cfg.gateway.vision_model,
+    ]
+    assert result.raw == "The screen is visible and the follow-up check is done."
+
+
 def test_no_tool_call_sets_reply_without_earcon(tmp_path) -> None:
     gateway = _FakeGateway([_FakeMsg(content="Two plus two is four.")])
     session = _session(tmp_path, gateway)
