@@ -42,6 +42,10 @@ class WorkerSessionAuthority:
         if provider == "claude" and self.codex_sandbox == "read-only":
             raise RuntimeError("claude provider cannot enforce read-only worker sessions")
 
+    def require(self, action: str) -> None:
+        if action not in self.allowed:
+            raise RuntimeError(f"worker session missing required authority: {action}")
+
     @property
     def allowed(self) -> set[str]:
         return set(self.allowed_actions)

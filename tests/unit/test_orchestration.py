@@ -2588,6 +2588,119 @@ def test_cli_sessions_requests_preserves_worker_response(monkeypatch, capsys) ->
     assert "input_1" in capsys.readouterr().out
 
 
+def test_cli_sessions_checkpoints_preserves_worker_response(monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis import cli
+
+    calls = []
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {"checkpoints": [{"checkpoint_id": "ckpt_1", "label": "before edit"}]}
+
+    class Http:
+        @staticmethod
+        def get(url, **_kwargs):  # noqa: ANN001
+            calls.append(url)
+            return Response()
+
+        @staticmethod
+        def post(*_args, **_kwargs):  # noqa: ANN001
+            raise AssertionError("post should not be called")
+
+    monkeypatch.setattr(cli, "load_config", lambda: None)
+    monkeypatch.setattr(cli, "_worker_http", lambda _cfg: (Http, "http://worker", {}, 1))
+
+    result = cli._cmd_sessions(
+        SimpleNamespace(
+            requests="",
+            checkpoints="sess_1",
+            restore_checkpoint="",
+            events="",
+            after="",
+            limit=0,
+            json=False,
+            turn="",
+            input="",
+            approval="",
+            interrupt="",
+            stop="",
+            session_id="",
+            prompt="",
+            idempotency_key="",
+            request_id="",
+            text="",
+            decision="",
+            checkpoint_id="",
+        )
+    )
+
+    assert result == 0
+    assert calls == ["http://worker/sessions/sess_1/checkpoints"]
+    assert "ckpt_1" in capsys.readouterr().out
+
+
+def test_cli_sessions_restore_checkpoint_preserves_worker_response(monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis import cli
+
+    calls = []
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {"event": {"event_id": "ev_1", "type": "checkpoint.restored"}}
+
+    class Http:
+        @staticmethod
+        def get(*_args, **_kwargs):  # noqa: ANN001
+            raise AssertionError("get should not be called")
+
+        @staticmethod
+        def post(url, **kwargs):  # noqa: ANN001
+            calls.append((url, kwargs.get("json")))
+            return Response()
+
+    monkeypatch.setattr(cli, "load_config", lambda: None)
+    monkeypatch.setattr(cli, "_worker_http", lambda _cfg: (Http, "http://worker", {}, 1))
+
+    result = cli._cmd_sessions(
+        SimpleNamespace(
+            requests="",
+            checkpoints="",
+            restore_checkpoint="sess_1",
+            events="",
+            after="",
+            limit=0,
+            json=False,
+            turn="",
+            input="",
+            approval="",
+            interrupt="",
+            stop="",
+            session_id="",
+            prompt="",
+            idempotency_key="",
+            request_id="",
+            text="",
+            decision="",
+            checkpoint_id="ckpt_1",
+        )
+    )
+
+    assert result == 0
+    assert calls == [
+        (
+            "http://worker/sessions/sess_1/checkpoints/restore",
+            {"checkpoint_id": "ckpt_1", "metadata": {"surface": "cli"}},
+        )
+    ]
+    assert "checkpoint.restored" in capsys.readouterr().out
+
+
 def test_cli_work_start_requires_landing_capabilities(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
     from jarvis import cli
 
