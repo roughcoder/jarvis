@@ -43,6 +43,11 @@ def parse_work_command(text: str) -> WorkCommand:
         if "pr" in t or "review" in t:
             kind = "pull_request"
         return WorkCommand("inspect_work", source=source, kind=kind, filters=filters, autonomy="read_only", target_worker_id=target, target_engine_id=engine)
+    if source != "direct":
+        kind = "ticket" if source == "linear" else "issue"
+        if "pr" in t or "review" in t:
+            kind = "pull_request"
+        return WorkCommand("inspect_work", source=source, kind=kind, filters=filters, autonomy="read_only", target_worker_id=target, target_engine_id=engine)
     return WorkCommand("direct_request", source="direct", filters={"text": text}, autonomy="read_only", target_worker_id=target, target_engine_id=engine)
 
 
