@@ -21,6 +21,7 @@ def build_execution_envelope(
     worker_id: str,
     landing_mode: str = "draft_pr",
     engine: str = "codex",
+    engine_strategy: str = "single",
 ) -> ExecutionEnvelope:
     primary = items[0] if items else WorkItem(source="direct", id=run_id, title=command.filters.get("text", "Direct request"))
     repo = primary.repo or str(command.filters.get("repo", ""))
@@ -34,6 +35,7 @@ def build_execution_envelope(
         prompt=prompt,
         worker_id=worker_id or command.target_worker_id or "local-worker",
         engine=engine,
+        engine_strategy=engine_strategy,
         branch_name=branch,
         allowed_actions=envelope_allowed_actions(landing_mode),
         verification=VerificationPlan(

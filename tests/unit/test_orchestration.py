@@ -127,6 +127,58 @@ def test_worker_registry_accepts_list_profile_file(tmp_path) -> None:
     assert "token_env" not in reg.profiles()[0].public()
 
 
+def test_worker_registry_advertises_supported_engines(tmp_path) -> None:
+    path = tmp_path / "workers.json"
+    path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "hive-worker",
+                        "display_name": "Hive",
+                        "agent": "codex",
+                        "supported_engines": ["codex", "claude"],
+                    }
+                ]
+            }
+        )
+    )
+    reg = WorkerRegistry(WorkerConfig(_env_file=None), profiles_path=str(path))
+    profile = reg.profiles()[0]
+
+    assert profile.default_engine == "codex"
+    assert profile.supported_engines == ["codex", "claude"]
+    assert profile.public()["supported_engines"] == ["codex", "claude"]
+
+
+def test_worker_registry_filters_by_engine(tmp_path) -> None:
+    path = tmp_path / "workers.json"
+    path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "codex-worker",
+                        "display_name": "Codex",
+                        "status": "online",
+                        "supported_engines": ["codex"],
+                    },
+                    {
+                        "worker_id": "claude-worker",
+                        "display_name": "Claude",
+                        "status": "online",
+                        "agent": "claude",
+                        "supported_engines": ["claude"],
+                    },
+                ]
+            }
+        )
+    )
+    reg = WorkerRegistry(WorkerConfig(_env_file=None), profiles_path=str(path))
+
+    assert reg.choose(engine="claude").worker_id == "claude-worker"
+
+
 @pytest.mark.parametrize(
     ("phrase", "operation", "source", "start"),
     [
@@ -142,6 +194,14 @@ def test_parse_work_command_initial_phrases(phrase: str, operation: str, source:
     assert cmd.operation == operation
     assert cmd.source == source
     assert cmd.start is start
+
+
+def test_parse_work_command_captures_engine_target() -> None:
+    cmd = parse_work_command("get next linear ticket with claude")
+
+    assert cmd.operation == "start_next_work"
+    assert cmd.source == "linear"
+    assert cmd.target_engine_id == "claude"
 
 
 def test_github_source_normalizes_issues() -> None:
@@ -428,6 +488,74 @@ def test_orchestration_service_starts_next_work_through_shared_policy(tmp_path, 
     runs = OrchestrationStore(cfg.orchestration.workspace).list_runs()
     assert len(runs) == 1
     assert runs[0].work_items[0].item.id == "#31"
+
+
+def test_orchestration_service_selects_requested_engine(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    workers_path = tmp_path / "workers.json"
+    workers_path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "codex-worker",
+                        "display_name": "Codex",
+                        "base_url": "http://codex.invalid",
+                        "status": "online",
+                        "agent": "codex",
+                        "supported_engines": ["codex"],
+                    },
+                    {
+                        "worker_id": "claude-worker",
+                        "display_name": "Claude",
+                        "base_url": "http://claude.invalid",
+                        "status": "online",
+                        "agent": "claude",
+                        "supported_engines": ["claude"],
+                    },
+                ]
+            }
+        )
+    )
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                f"ORCHESTRATION_WORKERS_PATH={workers_path}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    cfg = load_config()
+
+    class Source:
+        def next(self, *, repo="", filters=None):  # noqa: ANN001, ANN201
+            return _item(id="#32")
+
+    seen = {}
+
+    def fake_start(envelope, *, worker_cfg, worker=None, store=None, post=None):  # noqa: ANN001, ANN202
+        seen["worker_id"] = worker.worker_id
+        seen["engine"] = envelope.engine
+        return WorkerJobLink(worker_id=envelope.worker_id, job_id="job32", engine=envelope.engine)
+
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+    monkeypatch.setattr("jarvis.orchestration.executor.start_worker_job", fake_start)
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"work.github.issues.read", "worker.job.start", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: Source(),
+    )
+
+    result = service.next_work(
+        WorkCommand("start_next_work", source="github", start=True, target_engine_id="claude"),
+        start=True,
+    )
+
+    assert isinstance(result, StartedWork)
+    assert seen == {"worker_id": "claude-worker", "engine": "claude"}
+    assert result.envelope.engine_strategy == "single"
 
 
 def test_start_worker_job_links_run_graph(tmp_path) -> None:

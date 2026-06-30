@@ -35,8 +35,12 @@ def test_run_exec_missing_binary_returns_error() -> None:
 def test_code_argv_for_each_agent() -> None:
     assert code_argv("codex", "codex", "claude", "fix bug") == ["codex", "exec", "fix bug"]
     assert code_argv("claude", "codex", "claude", "fix bug") == ["claude", "-p", "fix bug"]
-    # unknown agent falls back to codex
-    assert code_argv("whatever", "codex", "claude", "x")[0] == "codex"
+    try:
+        code_argv("whatever", "codex", "claude", "x")
+    except ValueError as exc:
+        assert "unsupported coding engine" in str(exc)
+    else:
+        raise AssertionError("unknown engines must not silently fall back to codex")
 
 
 def _drain(coro) -> object:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from jarvis.engines import normalize_engine_id, worker_supports_engine
 from jarvis.orchestration import executor
 from jarvis.orchestration.authority import allowed
 from jarvis.orchestration.models import ExecutionEnvelope, WorkCommand, WorkItem, WorkerJobLink
@@ -88,13 +89,16 @@ class OrchestrationService:
 
         self._require(required_for_worker_dispatch(self.cfg.orchestration.landing_mode))
         registry = WorkerRegistry(self.cfg.worker, profiles_path=self.cfg.orchestration.workers_path)
-        worker = (
-            registry.get(command.target_worker_id, probe=True)
-            if command.target_worker_id
-            else registry.choose(item.capability_requirements)
-        )
-        if worker is None or not _worker_is_eligible(worker, item.capability_requirements):
+        target_engine = normalize_engine_id(command.target_engine_id)
+        if command.target_worker_id:
+            worker = registry.get(command.target_worker_id, probe=True)
+        elif target_engine:
+            worker = registry.choose(item.capability_requirements, engine=target_engine)
+        else:
+            worker = registry.choose(item.capability_requirements)
+        if worker is None or not _worker_is_eligible(worker, item.capability_requirements, engine=target_engine):
             raise NoEligibleWorkerError("No eligible worker found.")
+        engine = target_engine or worker.default_engine or worker.agent
 
         try:
             envelope = executor.create_run_and_envelope(
@@ -103,6 +107,7 @@ class OrchestrationService:
                 items=[item],
                 worker=worker,
                 landing_mode=self.cfg.orchestration.landing_mode,
+                engine=engine,
             )
         except ActiveWorkItemError as exc:
             raise WorkAlreadyOwnedError(item, exc.owner) from exc
@@ -132,9 +137,11 @@ class OrchestrationService:
         return str(command.filters.get("repo") or self.cfg.orchestration.default_repo)
 
 
-def _worker_is_eligible(worker: WorkerProfile, required: list[str] | None = None) -> bool:
+def _worker_is_eligible(worker: WorkerProfile, required: list[str] | None = None, *, engine: str = "") -> bool:
     if worker.status == "offline":
         return False
     if worker.current_jobs >= worker.max_concurrent_jobs:
+        return False
+    if engine and not worker_supports_engine(worker.supported_engines, engine):
         return False
     return set(required or []).issubset(set(worker.capabilities))

@@ -13,6 +13,8 @@ import shutil
 import time
 import uuid
 
+from jarvis.engines import code_engine_argv
+
 
 # A model-driven shell runs with ONLY these operational vars from the host env — never
 # the full process environment. Secrets are added explicitly via the WORKER_SHELL_SECRETS
@@ -138,9 +140,7 @@ async def capture_screen_jpeg_b64(timeout_s: float) -> tuple[str, str]:
 def code_argv(agent: str, codex_bin: str, claude_bin: str, prompt: str) -> list[str]:
     """The headless coding-agent command for `agent`. Both run non-interactively
     in the job's repo cwd; tune flags per your setup via the *_bin config."""
-    if agent == "claude":
-        return [claude_bin, "-p", prompt]
-    return [codex_bin, "exec", prompt]  # codex default
+    return code_engine_argv(agent, codex_bin, claude_bin, prompt)
 
 
 def list_repos(repo_root: str) -> list[str]:

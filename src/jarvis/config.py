@@ -427,6 +427,7 @@ class WorkerConfig(_Base):
     clone_missing: bool = True
     clone_timeout_s: float = 240.0
     agent: str = "codex"             # default coding agent: codex | claude
+    supported_engines: str = ""      # CSV; empty means the default agent only
     codex_bin: str = "codex"
     claude_bin: str = "claude"
     peekaboo_bin: str = "peekaboo"   # GUI automation (worker.gui; install + perms)
@@ -858,6 +859,7 @@ class Config:
             "worker.base_url": self.worker.base_url,
             "worker.token": mask(self.worker.token),
             "worker.agent": self.worker.agent,
+            "worker.supported_engines": self.worker.supported_engines or "<default agent only>",
             "worker.workspace": self.worker.workspace,
             "worker.repo_root": self.worker.repo_root or "<unset>",
             "remote.api_key": mask(self.remote.api_key),

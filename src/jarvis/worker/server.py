@@ -23,6 +23,7 @@ import uuid
 from aiohttp import web
 
 from jarvis.config import WorkerConfig
+from jarvis.engines import engine_ids, normalize_engine_id, worker_supports_engine
 from jarvis.worker.actions import (
     capture_screen_jpeg_b64,
     cleanup_job,
@@ -187,8 +188,14 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             policy_error = _code_policy_error(args)
             if policy_error:
                 return web.json_response({"ok": False, "error": policy_error}, status=403)
-            agent = args.get("agent") or cfg.agent
-            argv = code_argv(agent, cfg.codex_bin, cfg.claude_bin, args.get("prompt", ""))
+            agent = normalize_engine_id(args.get("agent") or cfg.agent)
+            supported_engines = engine_ids(cfg.supported_engines, default_engine=cfg.agent)
+            if not worker_supports_engine(supported_engines, agent):
+                return web.json_response({"ok": False, "error": f"worker does not support engine {agent!r}"}, status=400)
+            try:
+                argv = code_argv(agent, cfg.codex_bin, cfg.claude_bin, args.get("prompt", ""))
+            except ValueError as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=400)
             label = args.get("prompt", "")[:80] or agent
             slug = slugify(args.get("name") or args.get("prompt") or "job")
             branch = None
@@ -321,6 +328,8 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             {
                 "ok": True,
                 "agent": cfg.agent,
+                "default_engine": normalize_engine_id(cfg.agent),
+                "supported_engines": engine_ids(cfg.supported_engines, default_engine=cfg.agent),
                 "workspace": str(workspace),
                 "repo_root_configured": bool(cfg.repo_root),
                 "browser_enabled": browser_cfg.enabled,

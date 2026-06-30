@@ -94,6 +94,36 @@ def test_daemon_code_dispatch_runs_a_job(tmp_path) -> None:
     assert len(listed["jobs"]) >= 1
 
 
+def test_daemon_health_advertises_supported_engines(tmp_path) -> None:
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="",
+        workspace=str(tmp_path / "worker"),
+        agent="codex",
+        supported_engines="codex,claude",
+    )
+
+    async def calls(base, c):  # noqa: ANN001
+        return (await c.get(base + "/health")).json()
+
+    health = asyncio.run(_with_server(cfg, 8818, calls))
+
+    assert health["default_engine"] == "codex"
+    assert health["supported_engines"] == ["codex", "claude"]
+
+
+def test_daemon_rejects_unsupported_code_engine(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"), codex_bin="echo")
+
+    async def calls(base, c):  # noqa: ANN001
+        return await c.post(base + "/run", json={"action": "code", "args": {"prompt": "hello", "agent": "claude"}})
+
+    response = asyncio.run(_with_server(cfg, 8819, calls))
+
+    assert response.status_code == 400
+    assert "does not support engine 'claude'" in response.json()["error"]
+
+
 def test_daemon_refuses_worker_workspace_inside_git_checkout(tmp_path) -> None:
     import subprocess
 

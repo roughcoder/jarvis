@@ -628,10 +628,12 @@ def _cmd_workers(args: argparse.Namespace) -> int:
         pub = p.public()
         cap = ", ".join(pub["capabilities"]) or "<none>"
         capacity = pub["capacity"]
+        engines = ",".join(pub.get("supported_engines") or [pub["agent"]])
+        engine = pub.get("default_engine") or pub["agent"]
         print(
             f"{pub['worker_id']:<20} {pub['status']:<8} "
             f"{capacity['current_jobs']}/{capacity['max_concurrent_jobs']} jobs  "
-            f"{pub['agent']}  {cap}"
+            f"{engine} [{engines}]  {cap}"
         )
     return 0
 
@@ -678,6 +680,8 @@ def _cmd_work(args: argparse.Namespace) -> int:
         command.kind = "pull_request"
     if getattr(args, "worker", ""):
         command.target_worker_id = args.worker
+    if getattr(args, "engine", ""):
+        command.target_engine_id = args.engine
     if getattr(args, "repo", ""):
         command.filters["repo"] = args.repo
     capabilities = resolve_capabilities(cfg.capabilities)
@@ -739,7 +743,10 @@ def _cmd_work(args: argparse.Namespace) -> int:
         if not isinstance(result, StartedWork):
             print(json.dumps(result.to_dict(), indent=2) if args.json else _format_item(result))
             return 0
-        print(f"Started {result.envelope.run_id} on {result.worker.worker_id}: worker job {result.job.job_id}")
+        print(
+            f"Started {result.envelope.run_id} on {result.worker.worker_id} "
+            f"with {result.envelope.engine}: worker job {result.job.job_id}"
+        )
         if result.job.branch:
             print(f"Branch: {result.job.branch}")
         return 0
@@ -2061,6 +2068,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_work_next.add_argument("--source", choices=["github", "linear"], default="")
     p_work_next.add_argument("--repo", default="", help="Repository, e.g. roughcoder/jarvis")
     p_work_next.add_argument("--worker", default="", help="Explicit worker_id target")
+    p_work_next.add_argument("--engine", default="", help="Explicit coding engine, e.g. codex or claude")
     p_work_next.add_argument("--start", action="store_true", help="Start a worker job for the selected item")
     p_work_next.add_argument("--json", action="store_true")
     p_work_next.set_defaults(func=_cmd_work)
