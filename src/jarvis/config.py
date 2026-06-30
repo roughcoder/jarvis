@@ -12,6 +12,7 @@ All values load from environment / a local .env file. Nothing is hardcoded.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from pydantic import BaseModel, SecretStr, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -719,6 +720,7 @@ class Config:
     def __init__(self) -> None:
         env_file = os.environ.get("JARVIS_ENV_FILE") or ".env"
         source = {"_env_file": env_file}
+        state_base = _env_file_base(env_file)
 
         self.gateway = GatewayConfig(**source)
         self.memory = MemoryConfig(**source)
@@ -748,6 +750,22 @@ class Config:
         self.google = GoogleConfig(**source)
         self.orchestration = OrchestrationConfig(**source)
         self.linear = LinearConfig(**source)
+        self._resolve_private_state_paths(state_base)
+
+    def _resolve_private_state_paths(self, base_dir: Path) -> None:
+        self.capabilities.profiles_dir = _resolve_state_path(
+            self.capabilities.profiles_dir, base_dir
+        )
+        self.capabilities.users_dir = _resolve_state_path(self.capabilities.users_dir, base_dir)
+        self.orchestration.workspace = _resolve_state_path(
+            self.orchestration.workspace, base_dir
+        )
+        self.orchestration.workers_path = _resolve_state_path(
+            self.orchestration.workers_path, base_dir
+        )
+        self.orchestration.schedules_path = _resolve_state_path(
+            self.orchestration.schedules_path, base_dir
+        )
 
     def resolved(self) -> dict:
         """Flat, secret-masked view for the dry-run printout (Step 0 gate)."""
@@ -891,3 +909,17 @@ def insecure_bind(host: str, has_token: bool, allow_insecure: bool) -> bool:
 
 def load_config() -> Config:
     return Config()
+
+
+def _env_file_base(env_file: str) -> Path:
+    path = Path(env_file).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path.resolve(strict=False).parent
+
+
+def _resolve_state_path(value: str, base_dir: Path) -> str:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = base_dir / path
+    return str(path.resolve(strict=False))

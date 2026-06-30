@@ -987,3 +987,20 @@ def test_cli_linear_source_uses_configured_api_key(tmp_path, monkeypatch) -> Non
     source = cli._work_source("linear", load_config())
 
     assert source.api_key == "lin-secret"
+
+
+def test_cli_linear_missing_api_key_prints_friendly_error(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis import cli
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("CAPS_DEFAULT_CAPABILITIES=work.linear.read\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+
+    assert cli.main(["work", "check", "--source", "linear"]) == 1
+    out = capsys.readouterr().out
+
+    assert "Linear work source is not configured" in out
+    assert "LINEAR_API_KEY" in out
+    assert "Traceback" not in out
