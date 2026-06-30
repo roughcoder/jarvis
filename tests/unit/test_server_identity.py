@@ -12,7 +12,7 @@ import asyncio
 import pytest
 import websockets
 
-from jarvis.brain.server import BrainServer
+from jarvis.brain.server import BrainServer, BufferedAudioTurn
 from jarvis.brain.tracing import TurnTrace
 from jarvis.config import BrainConfig, CapabilityConfig, MCPConfig, load_config
 from jarvis.protocol.messages import (
@@ -227,6 +227,78 @@ class _TurnTracer:
 class _NoAlarmScheduler:
     def ringing_on(self, _device_id: str) -> bool:
         return False
+
+
+class _CountingSTT:
+    def __init__(self) -> None:
+        self.calls: list[bytes] = []
+
+    def transcribe(self, pcm: bytes, *, sample_rate: int = 16000) -> str:
+        self.calls.append(pcm)
+        return pcm.decode("utf-8")
+
+
+def test_streaming_stt_reuses_exact_partial(cfg) -> None:  # noqa: ANN001
+    async def go() -> tuple[str, dict, list[bytes]]:
+        server = BrainServer(cfg)
+        stt = _CountingSTT()
+        server._stt = stt  # type: ignore[assignment]
+        trace = TurnTrace(room="default", speaker="house")
+        task = asyncio.create_task(server._transcribe_snapshot(b"hello", 16000))
+        msg = BufferedAudioTurn(
+            turn_id="t1",
+            sample_rate=16000,
+            pcm=b"hello",
+            chunks=1,
+            frame_bytes=5,
+            stream_ms=10,
+            streaming_stt_task=task,
+            streaming_stt_pcm_bytes=5,
+            streaming_stt_partial_runs=1,
+        )
+
+        text, _secs = await server._transcribe_buffered_audio(msg, trace)
+        return text, trace.data, stt.calls
+
+    text, data, calls = asyncio.run(go())
+
+    assert text == "hello"
+    assert calls == [b"hello"]
+    assert data["stages"]["stt"]["streaming"] is True
+    assert data["stages"]["stt"]["reused_partial"] is True
+    assert data["stages"]["stt_stream"]["partial_runs"] == 1
+
+
+def test_streaming_stt_falls_back_when_partial_is_stale(cfg) -> None:  # noqa: ANN001
+    async def go() -> tuple[str, dict, list[bytes]]:
+        server = BrainServer(cfg)
+        stt = _CountingSTT()
+        server._stt = stt  # type: ignore[assignment]
+        trace = TurnTrace(room="default", speaker="house")
+        task = asyncio.create_task(server._transcribe_snapshot(b"hel", 16000))
+        await task
+        msg = BufferedAudioTurn(
+            turn_id="t1",
+            sample_rate=16000,
+            pcm=b"hello",
+            chunks=1,
+            frame_bytes=5,
+            stream_ms=10,
+            streaming_stt_task=task,
+            streaming_stt_pcm_bytes=3,
+            streaming_stt_partial_runs=1,
+        )
+
+        text, _secs = await server._transcribe_buffered_audio(msg, trace)
+        return text, trace.data, stt.calls
+
+    text, data, calls = asyncio.run(go())
+
+    assert text == "hello"
+    assert calls == [b"hel", b"hello"]
+    assert data["stages"]["stt"]["streaming"] is True
+    assert data["stages"]["stt"]["reused_partial"] is False
+    assert data["stages"]["stt_stream"]["pcm_bytes"] == 3
 
 
 class _Contexts:

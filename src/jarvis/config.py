@@ -346,6 +346,13 @@ class BrainConfig(_Base):
     websocket_max_size: int = 8 * 1024 * 1024
     websocket_ping_interval_s: float = 20.0
     websocket_ping_timeout_s: float = 60.0
+    # Local Faster-Whisper is not a native streaming decoder, so streaming STT
+    # runs bounded snapshot transcriptions while audio is still arriving and
+    # reuses one only when it exactly covers the final PCM.
+    streaming_stt_enabled: bool = True
+    streaming_stt_min_audio_s: float = 2.0
+    streaming_stt_interval_s: float = 1.0
+    streaming_stt_max_partials: int = 2
 
 
 class IntercomConfig(_Base):
@@ -760,6 +767,7 @@ class Config:
         self._resolve_private_state_paths(state_base)
 
     def _resolve_private_state_paths(self, base_dir: Path) -> None:
+        self.trace.path = _resolve_state_path(self.trace.path, base_dir)
         self.capabilities.profiles_dir = _resolve_state_path(
             self.capabilities.profiles_dir, base_dir
         )

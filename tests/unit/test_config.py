@@ -185,6 +185,7 @@ def test_private_state_paths_resolve_relative_to_jarvis_env_file(monkeypatch, tm
 
     c = Config()
 
+    assert c.trace.path == str(env_dir / ".cache/traces.jsonl")
     assert c.capabilities.profiles_dir == str(env_dir / "jarvis-workspace/profiles")
     assert c.capabilities.users_dir == str(env_dir / "jarvis-workspace/users")
     assert c.orchestration.workspace == str(env_dir / "jarvis-workspace/orchestration")
