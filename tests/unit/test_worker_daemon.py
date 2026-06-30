@@ -136,7 +136,7 @@ def test_worker_session_authority_maps_draft_pr_and_approval_modes() -> None:
 
     assert authority.codex_sandbox == "workspace-write"
     assert authority.codex_approval_policy == "on-request"
-    assert authority.claude_permission_mode == "default"
+    assert authority.claude_permission_mode == "dontAsk"
 
 
 def test_worker_session_authority_keeps_input_separate_from_codex_approval() -> None:

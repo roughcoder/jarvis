@@ -84,4 +84,8 @@ def required_for_worker_dispatch(landing_mode: str) -> list[str]:
 
 
 def envelope_allowed_actions(landing_mode: str) -> list[str]:
-    return required_for_worker_dispatch(landing_mode)
+    return [
+        *required_for_worker_dispatch(landing_mode),
+        WORKER_SESSION_INTERRUPT,
+        WORKER_SESSION_STOP,
+    ]

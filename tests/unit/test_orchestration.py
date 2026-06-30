@@ -22,7 +22,7 @@ from jarvis.orchestration.models import (
     WorkerJobLink,
     WorkerSessionLink,
 )
-from jarvis.orchestration.policy import required_for_worker_dispatch
+from jarvis.orchestration.policy import envelope_allowed_actions, required_for_worker_dispatch
 from jarvis.orchestration.reports import build_run_report, public_status_comment
 from jarvis.orchestration.schedules import ScheduleStore, dispatch_due_schedules
 from jarvis.orchestration.service import MissingWorkRepoError, NoEligibleWorkerError, OrchestrationService, StartedWork
@@ -526,7 +526,7 @@ def test_execution_envelope_uses_central_dispatch_policy() -> None:
         landing_mode="draft_pr",
     )
 
-    assert envelope.allowed_actions == required_for_worker_dispatch("draft_pr")
+    assert envelope.allowed_actions == envelope_allowed_actions("draft_pr")
     assert "forge.write.local" not in envelope.allowed_actions
 
 
@@ -557,8 +557,7 @@ def test_orchestration_service_starts_next_work_through_shared_policy(tmp_path, 
             return _item(id="#31", repo=repo or "roughcoder/jarvis")
 
     def fake_start(envelope, *, worker_cfg, worker=None, store=None, post=None):  # noqa: ANN001, ANN202
-        assert envelope.allowed_actions == required_for_worker_dispatch("branch_only")
-        assert envelope.allowed_actions == ["worker.session.create", "worker.session.turn", "forge.github.branch.push"]
+        assert envelope.allowed_actions == envelope_allowed_actions("branch_only")
         return WorkerSessionLink(
             worker_id=envelope.worker_id,
             session_id="sess31",
@@ -756,6 +755,13 @@ def test_orchestration_service_starts_ensemble_sessions(tmp_path, monkeypatch) -
     runs = OrchestrationStore(cfg.orchestration.workspace).list_runs()
     assert len(runs) == 1
     assert [session.engine for session in runs[0].sessions] == ["codex", "claude"]
+
+
+def test_worker_dispatch_policy_includes_operator_cleanup_authority() -> None:
+    actions = envelope_allowed_actions("branch_only")
+
+    assert "worker.session.interrupt" in actions
+    assert "worker.session.stop" in actions
 
 
 def test_orchestration_service_selects_worker_supporting_all_ensemble_engines(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -1183,7 +1189,10 @@ def test_start_worker_session_links_created_session_before_turn_failure(tmp_path
         def json(self):
             return self._body
 
-    def fake_post(url, **_kwargs):  # noqa: ANN001
+    calls = []
+
+    def fake_post(url, **kwargs):  # noqa: ANN001
+        calls.append((url, kwargs.get("json")))
         if url.endswith("/sessions"):
             return Response(
                 {
@@ -1198,6 +1207,8 @@ def test_start_worker_session_links_created_session_before_turn_failure(tmp_path
                     "event": {"event_id": "event_created"},
                 }
             )
+        if url.endswith("/sessions/sess_123/stop"):
+            return Response({"ok": True})
         return Response({"ok": False, "error": "unsupported provider"}, status_code=400)
 
     with pytest.raises(RuntimeError, match="unsupported provider"):
@@ -1211,8 +1222,10 @@ def test_start_worker_session_links_created_session_before_turn_failure(tmp_path
     reloaded = store.get(run.run_id)
     assert reloaded is not None
     assert reloaded.sessions[0].session_id == "sess_123"
-    assert reloaded.sessions[0].status == "created"
+    assert reloaded.sessions[0].status == "stopped"
     assert reloaded.sessions[0].last_event_id == "event_created"
+    stop_payload = next(payload for url, payload in calls if url.endswith("/sessions/sess_123/stop"))
+    assert "worker.session.stop" in stop_payload["metadata"]["execution_envelope"]["allowed_actions"]
 
 
 def test_start_worker_ensemble_uses_distinct_provider_branches(tmp_path) -> None:
@@ -2467,6 +2480,37 @@ def test_schedule_dispatch_starts_session_and_acks_after_success(tmp_path) -> No
     assert schedule_store.list()[0].last_fired_date == "2026-06-29"
     assert any(event.type == "schedule_fired" for event in run_store.events(results[0].run_id))
     assert schedule.schedule_id
+
+
+def test_schedule_dispatch_honors_read_only_commands(tmp_path) -> None:
+    schedule_store = ScheduleStore(str(tmp_path / "schedules.json"))
+    run_store = OrchestrationStore(str(tmp_path / "runs"))
+    schedule_store.add(
+        "Daily check",
+        WorkCommand("inspect_work", source="github", start=False),
+        hour=9,
+        minute=0,
+        weekdays=[0],
+        timezone="Europe/London",
+    )
+    seen = {}
+
+    class Service:
+        def next_work(self, command, *, start=False):  # noqa: ANN001, ANN201
+            seen["start"] = start
+            return _item(id="#88")
+
+    results = dispatch_due_schedules(
+        schedule_store,
+        now=datetime.fromisoformat("2026-06-29T09:00:00+01:00"),
+        service=Service(),
+        run_store=run_store,
+    )
+
+    assert seen["start"] is False
+    assert results[0].status == "inspected"
+    assert results[0].session_id == ""
+    assert schedule_store.list()[0].last_fired_date == "2026-06-29"
 
 
 def test_schedule_dispatch_reports_no_work_and_does_not_ack_failures(tmp_path) -> None:

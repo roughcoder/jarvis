@@ -154,10 +154,22 @@ def start_worker_session(
         headers=headers,
         timeout=worker_cfg.request_timeout_s,
     )
-    turn_body = _json_body(turn_response)
-    _raise_worker_error(turn_response, turn_body)
-    if not turn_body.get("ok"):
-        raise RuntimeError(turn_body.get("error") or "worker rejected session turn")
+    try:
+        turn_body = _json_body(turn_response)
+        _raise_worker_error(turn_response, turn_body)
+        if not turn_body.get("ok"):
+            raise RuntimeError(turn_body.get("error") or "worker rejected session turn")
+    except Exception:
+        if not envelope.resume_session:
+            _stop_created_session_after_turn_rejection(
+                session,
+                envelope=envelope,
+                worker_cfg=worker_cfg,
+                worker=worker,
+                post=post,
+                store=store,
+            )
+        raise
     current = turn_body.get("session") or session
     events = turn_body.get("events") or []
     link = WorkerSessionLink(
@@ -267,6 +279,49 @@ def _stop_started_sessions(
                     store.update_session(envelope.run_id, link.session_id, status=SESSION_STOPPED)
                 except Exception:  # noqa: BLE001 - best-effort rollback marker
                     pass
+
+
+def _stop_created_session_after_turn_rejection(
+    session: dict[str, Any],
+    *,
+    envelope: ExecutionEnvelope,
+    worker_cfg: WorkerConfig,
+    worker: WorkerProfile | None,
+    post: Callable[..., Any] | None,
+    store: OrchestrationStore | None,
+) -> None:
+    session_id = str(session.get("session_id") or "").strip()
+    if not session_id:
+        return
+    control_envelope = envelope.to_dict()
+    control_envelope["allowed_actions"] = sorted({*control_envelope.get("allowed_actions", []), WORKER_SESSION_STOP})
+    http_post = post or httpx.post
+    base_url, headers = _worker_endpoint(worker_cfg, worker)
+    try:
+        response = http_post(
+            f"{base_url}/sessions/{session_id}/stop",
+            json={"metadata": {"execution_envelope": control_envelope}},
+            headers=headers,
+            timeout=worker_cfg.request_timeout_s,
+        )
+        body = _json_body(response)
+        _raise_worker_error(response, body)
+        if not body.get("ok"):
+            raise RuntimeError(body.get("error") or "worker rejected turn-failure cleanup stop")
+    except Exception as exc:  # noqa: BLE001 - preserve the original turn rejection
+        if store is not None:
+            store.append_event(
+                envelope.run_id,
+                "session_turn_rejection_stop_failed",
+                f"Could not stop worker session {session_id} after turn rejection",
+                {"session_id": session_id, "error": str(exc)},
+            )
+        return
+    if store is not None:
+        try:
+            store.update_session(envelope.run_id, session_id, status=SESSION_STOPPED)
+        except Exception:  # noqa: BLE001 - cleanup already succeeded at worker boundary
+            pass
 
 
 def _session_link_from_body(
