@@ -152,6 +152,54 @@ def test_audio_buffer_rejects_turn_that_exceeds_pcm_cap() -> None:
     assert "t1" not in conn["audio_buffers"]
 
 
+def test_audio_buffer_accepts_final_frame_at_local_capture_limit() -> None:
+    sample_rate = 16000
+    frame_bytes = 512 * 2
+    local_limit_bytes = sample_rate * 2 * 30
+    local_frames_at_limit = local_limit_bytes // frame_bytes + 1
+    conn = {
+        "audio_buffers": {
+            "t1": {
+                "sample_rate": sample_rate,
+                "chunks": [],
+                "pcm_bytes": 0,
+                "frame_bytes": 0,
+                "max_pcm_bytes": sample_rate * 2 * 31,
+                "started_at": 1.0,
+            }
+        }
+    }
+
+    ok = True
+    for _ in range(local_frames_at_limit):
+        ok = BrainServer._buffer_audio_chunk(
+            conn,
+            BinaryAudio(
+                kind="uplink_audio",
+                turn_id="t1",
+                pcm=b"x" * frame_bytes,
+                sample_rate=sample_rate,
+            ),
+            frame_bytes=frame_bytes,
+        )
+
+    assert ok is True
+    assert conn["audio_buffers"]["t1"]["pcm_bytes"] == local_frames_at_limit * frame_bytes
+
+    too_much = BrainServer._buffer_audio_chunk(
+        conn,
+        BinaryAudio(
+            kind="uplink_audio",
+            turn_id="t1",
+            pcm=b"x" * (sample_rate * 2),
+            sample_rate=sample_rate,
+        ),
+        frame_bytes=sample_rate * 2,
+    )
+    assert too_much is False
+    assert "t1" not in conn["audio_buffers"]
+
+
 class _TurnTracer:
     def __init__(self) -> None:
         self.emitted: list[dict] = []

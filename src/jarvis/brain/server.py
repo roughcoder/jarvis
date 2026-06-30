@@ -93,6 +93,7 @@ _HARDWARE_CAPS = {
 
 _TURN_ERROR_REPLY = "I hit an error before I could answer that."
 _MAX_UPLINK_AUDIO_S = 30.0
+_MAX_UPLINK_AUDIO_SLACK_S = 1.0
 _MAX_UPLINK_SAMPLE_RATE = 48_000
 
 
@@ -530,7 +531,9 @@ class BrainServer:
                         "chunks": [],
                         "pcm_bytes": 0,
                         "frame_bytes": 0,
-                        "max_pcm_bytes": int(sample_rate * 2 * _MAX_UPLINK_AUDIO_S),
+                        "max_pcm_bytes": int(
+                            sample_rate * 2 * (_MAX_UPLINK_AUDIO_S + _MAX_UPLINK_AUDIO_SLACK_S)
+                        ),
                         "started_at": time.perf_counter(),
                     }
                 elif isinstance(msg, AudioEnd):
