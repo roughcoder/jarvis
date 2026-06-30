@@ -649,11 +649,15 @@ def _cmd_work(args: argparse.Namespace) -> int:
     import json
 
     from jarvis.brain.capabilities import resolve_capabilities
-    from jarvis.orchestration.authority import required_for_command
-    from jarvis.orchestration.executor import create_run_and_envelope, start_worker_job
     from jarvis.orchestration.intent import parse_work_command
-    from jarvis.orchestration.store import ActiveWorkItemError
-    from jarvis.orchestration.workers import WorkerRegistry
+    from jarvis.orchestration.service import (
+        MissingAuthorityError,
+        NoEligibleWorkerError,
+        OrchestrationService,
+        StartedWork,
+        WorkAlreadyOwnedError,
+        WorkerDispatchError,
+    )
 
     cfg = load_config()
     if args.work_action == "intent":
@@ -676,24 +680,15 @@ def _cmd_work(args: argparse.Namespace) -> int:
         command.target_worker_id = args.worker
     if getattr(args, "repo", ""):
         command.filters["repo"] = args.repo
-    source = _work_source(command.source, cfg)
     capabilities = resolve_capabilities(cfg.capabilities)
-    public_write_mode = cfg.orchestration.landing_mode
+    service = OrchestrationService(cfg=cfg, capabilities=capabilities, source_factory=_work_source)
 
     if args.work_action == "check":
-        if not _has_orchestration_authority(
-            required_for_command(command.operation, command.source),
-            capabilities,
-            cfg=cfg,
-            public_write_mode=public_write_mode,
-        ):
-            return 1
         try:
-            items = source.list(
-                repo=args.repo or cfg.orchestration.default_repo,
-                filters=command.filters,
-                limit=args.limit,
-            )
+            items = service.check_work(command, limit=args.limit)
+        except MissingAuthorityError as exc:
+            _print_missing_orchestration_authority(exc.actions, cfg, capabilities)
+            return 1
         except RuntimeError as exc:
             print(_work_source_error(command.source, exc))
             return 1
@@ -704,80 +699,49 @@ def _cmd_work(args: argparse.Namespace) -> int:
         return 0
 
     if args.work_action == "pr-comments":
-        if command.source != "github":
-            print("PR comments are currently a GitHub work source operation.")
+        try:
+            comments = service.inspect_pr_comments(command, number=args.number)
+        except ValueError as exc:
+            print(str(exc))
             return 1
-        if not _has_orchestration_authority(
-            required_for_command(command.operation, command.source),
-            capabilities,
-            cfg=cfg,
-            public_write_mode=public_write_mode,
-        ):
+        except MissingAuthorityError as exc:
+            _print_missing_orchestration_authority(exc.actions, cfg, capabilities)
             return 1
-        comments = source.pr_comments(args.repo or cfg.orchestration.default_repo, args.number)
+        repo = args.repo or cfg.orchestration.default_repo
         print(
             json.dumps(comments, indent=2)
             if args.json
-            else _format_pr_comments_summary(comments, repo=args.repo or cfg.orchestration.default_repo, number=args.number)
+            else _format_pr_comments_summary(comments, repo=repo, number=args.number)
         )
         return 0
 
     if args.work_action == "next":
-        if not _has_orchestration_authority(
-            required_for_command(command.operation, command.source),
-            capabilities,
-            cfg=cfg,
-            public_write_mode=public_write_mode,
-        ):
-            return 1
         try:
-            item = source.next(repo=args.repo or cfg.orchestration.default_repo, filters=command.filters)
+            result = service.next_work(command, start=args.start)
+        except MissingAuthorityError as exc:
+            _print_missing_orchestration_authority(exc.actions, cfg, capabilities)
+            return 1
+        except WorkAlreadyOwnedError as exc:
+            print(f"{exc.item.source}:{exc.item.id} is already owned by {exc.owner.run_id} ({exc.owner.phase}).")
+            return 0
+        except NoEligibleWorkerError:
+            print("No eligible worker found.")
+            return 1
+        except WorkerDispatchError as exc:
+            print(f"Worker dispatch failed for {exc.run_id}: {exc.cause}")
+            return 1
         except RuntimeError as exc:
             print(_work_source_error(command.source, exc))
             return 1
-        if item is None:
+        if result is None:
             print("No eligible work item found.")
             return 0
-        store = _orch_store(cfg)
-        existing = store.active_primary_owner(item)
-        if existing:
-            print(f"{item.source}:{item.id} is already owned by {existing.run_id} ({existing.phase}).")
+        if not isinstance(result, StartedWork):
+            print(json.dumps(result.to_dict(), indent=2) if args.json else _format_item(result))
             return 0
-        if not args.start:
-            print(json.dumps(item.to_dict(), indent=2) if args.json else _format_item(item))
-            return 0
-        if not _has_orchestration_authority(
-            ["worker.job.start", *_required_for_landing_mode(cfg.orchestration.landing_mode)],
-            capabilities,
-            cfg=cfg,
-            public_write_mode=public_write_mode,
-        ):
-            return 1
-        registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path)
-        worker = registry.get(command.target_worker_id, probe=True) if command.target_worker_id else registry.choose(item.capability_requirements)
-        if worker is None or not _worker_is_eligible(worker, item.capability_requirements):
-            print("No eligible worker found.")
-            return 1
-        try:
-            envelope = create_run_and_envelope(
-                store=store,
-                command=command,
-                items=[item],
-                worker=worker,
-                landing_mode=cfg.orchestration.landing_mode,
-            )
-        except ActiveWorkItemError as exc:
-            print(f"{item.source}:{item.id} is already owned by {exc.owner.run_id} ({exc.owner.phase}).")
-            return 0
-        try:
-            job = start_worker_job(envelope, worker_cfg=cfg.worker, worker=worker, store=store)
-        except Exception as exc:  # noqa: BLE001 - dispatch failure must release the local claim
-            store.set_phase(envelope.run_id, "failed", f"Worker dispatch failed: {exc}")
-            print(f"Worker dispatch failed for {envelope.run_id}: {exc}")
-            return 1
-        print(f"Started {envelope.run_id} on {worker.worker_id}: worker job {job.job_id}")
-        if job.branch:
-            print(f"Branch: {job.branch}")
+        print(f"Started {result.envelope.run_id} on {result.worker.worker_id}: worker job {result.job.job_id}")
+        if result.job.branch:
+            print(f"Branch: {result.job.branch}")
         return 0
 
     if args.work_action == "resume":
@@ -815,6 +779,11 @@ def _has_orchestration_authority(
     return True
 
 
+def _print_missing_orchestration_authority(actions: list[str], cfg, capabilities: set[str]) -> None:  # noqa: ANN001
+    print(f"Missing orchestration capability: {', '.join(actions)}")
+    print(_capability_hint(actions, cfg, capabilities))
+
+
 def _work_source_error(source: str, exc: RuntimeError) -> str:
     message = str(exc)
     if source == "linear" and "LINEAR_API_KEY" in message:
@@ -846,22 +815,6 @@ def _capability_hint(actions: list[str], cfg, capabilities: set[str]) -> str:  #
     return (
         f"{authority} Named worker capacity lives separately at {worker_profiles_display}."
     )
-
-
-def _required_for_landing_mode(mode: str) -> list[str]:
-    if mode in {"draft_pr", "ready_pr"}:
-        return ["forge.github.branch.push", "forge.github.pr.create"]
-    if mode == "branch_only":
-        return ["forge.github.branch.push"]
-    return []
-
-
-def _worker_is_eligible(worker, required: list[str] | None = None) -> bool:  # noqa: ANN001
-    if worker.status == "offline":
-        return False
-    if worker.current_jobs >= worker.max_concurrent_jobs:
-        return False
-    return set(required or []).issubset(set(worker.capabilities))
 
 
 def _format_item(item) -> str:  # noqa: ANN001
