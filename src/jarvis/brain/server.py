@@ -699,32 +699,21 @@ class BrainServer:
         task = msg.streaming_stt_task
         partial: dict | None = None
         if task is not None:
-            snapshot_stale = msg.streaming_stt_pcm_bytes != len(pcm)
-            if snapshot_stale and not task.done():
-                task.cancel()
-                task.add_done_callback(self._observe_abandoned_stt_snapshot)
-                trace.event(
-                    "stt_stream_abandoned",
-                    pcm_bytes=msg.streaming_stt_pcm_bytes,
-                    final_pcm_bytes=len(pcm),
+            try:
+                partial = await task
+                stale = int(partial.get("pcm_bytes") or 0) != len(pcm)
+                trace.stage(
+                    "stt_stream",
+                    partial.get("ms", 0.0),
+                    audio_s=partial.get("audio_s", 0.0),
+                    chars=partial.get("chars", 0),
+                    pcm_bytes=partial.get("pcm_bytes", 0),
                     partial_runs=msg.streaming_stt_partial_runs,
+                    stale=stale,
                 )
-            else:
-                try:
-                    partial = await task
-                    stale = int(partial.get("pcm_bytes") or 0) != len(pcm)
-                    trace.stage(
-                        "stt_stream",
-                        partial.get("ms", 0.0),
-                        audio_s=partial.get("audio_s", 0.0),
-                        chars=partial.get("chars", 0),
-                        pcm_bytes=partial.get("pcm_bytes", 0),
-                        partial_runs=msg.streaming_stt_partial_runs,
-                        stale=stale,
-                    )
-                except Exception as exc:  # noqa: BLE001 - final STT below still recovers
-                    trace.event("stt_stream_error", error=type(exc).__name__)
-                    partial = None
+            except Exception as exc:  # noqa: BLE001 - final STT below still recovers
+                trace.event("stt_stream_error", error=type(exc).__name__)
+                partial = None
         if partial is not None and int(partial.get("pcm_bytes") or 0) == len(pcm):
             trace.start("stt")
             text = str(partial.get("text") or "")

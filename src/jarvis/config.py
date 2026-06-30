@@ -349,7 +349,7 @@ class BrainConfig(_Base):
     # Local Faster-Whisper is not a native streaming decoder, so streaming STT
     # runs bounded snapshot transcriptions while audio is still arriving and
     # reuses one only when it exactly covers the final PCM.
-    streaming_stt_enabled: bool = True
+    streaming_stt_enabled: bool = False
     streaming_stt_min_audio_s: float = 2.0
     streaming_stt_interval_s: float = 1.0
     streaming_stt_max_partials: int = 2
