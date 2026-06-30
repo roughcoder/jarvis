@@ -190,6 +190,36 @@ def test_queued_proactive_preserves_stay_state_for_passive_playback() -> None:
     assert mic.drained == 1
 
 
+def test_queued_passive_proactive_does_not_exit_selected_stay_mode() -> None:
+    c = _client()
+    q: asyncio.Queue = asyncio.Queue()
+    ws = _WS()
+    mic = _Mic()
+    c._set_active_voice_mode("stay")
+    q.put_nowait(Proactive(text="notification", turn_id="pa-4", open_mic=False))
+    q.put_nowait(ReplyEnd(turn_id="pa-4"))
+    active_state = {
+        "ended": False,
+        "text": "Working session",
+        "continue_listening": True,
+        "voice_mode": "stay",
+        "close_reason": "stay_mode",
+    }
+
+    async def fake_play_stream(chunks, **_kwargs):  # noqa: ANN001
+        return [chunk async for chunk in chunks]
+
+    c._audio.play_stream = fake_play_stream  # type: ignore[attr-defined]
+
+    async def go() -> dict | None:
+        return await c._play_queued_proactive(ws, mic, q, active_state)
+
+    state = asyncio.run(go())
+    assert state == active_state
+    assert c._active_voice_mode == "stay"
+    assert mic.drained == 1
+
+
 def test_reply_audio_yields_pcm_and_records_state() -> None:
     c = _client()
     q: asyncio.Queue = asyncio.Queue()
@@ -267,6 +297,22 @@ def test_reply_audio_works_for_proactive_turn_id() -> None:
         return [pcm async for pcm in c._reply_audio(q, "pa-9", {"ended": False, "text": ""})]
 
     assert asyncio.run(go()) == [b"tone", b"talk"]
+
+
+def test_passive_proactive_reply_end_preserves_selected_voice_mode() -> None:
+    c = _client()
+    c._set_active_voice_mode("stay")
+    q: asyncio.Queue = asyncio.Queue()
+    q.put_nowait(ReplyEnd(turn_id="pa-10"))
+    state = {"ended": False, "text": "", "voice_mode": "stay", "continue_listening": True}
+
+    async def go() -> list[bytes]:
+        return [pcm async for pcm in c._reply_audio(q, "pa-10", state)]
+
+    assert asyncio.run(go()) == []
+    assert state["voice_mode"] == "stay"
+    assert state["continue_listening"] is False
+    assert c._active_voice_mode == "stay"
 
 
 def test_interrupted_silence_sends_conversation_idle() -> None:

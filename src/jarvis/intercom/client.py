@@ -60,8 +60,19 @@ def _is_passive_proactive_state(state: dict | None) -> bool:
         state
         and state.get("ended") is False
         and state.get("continue_listening") is False
-        and state.get("voice_mode") == "default"
+        and state.get("voice_mode") in {DEFAULT_MODE, STAY_MODE}
         and not state.get("close_reason")
+    )
+
+
+def _is_passive_proactive_end(turn_id: str, msg: ReplyEnd) -> bool:
+    """Passive proactive ReplyEnd defaults should not overwrite selected voice mode."""
+    return (
+        turn_id.startswith("pa-")
+        and msg.ended is False
+        and msg.continue_listening is False
+        and msg.voice_mode == DEFAULT_MODE
+        and not msg.close_reason
     )
 
 
@@ -517,11 +528,17 @@ class IntercomClient:
             elif isinstance(msg, ReplyText) and msg.turn_id == turn_id:
                 state["text"] = msg.text
             elif isinstance(msg, ReplyEnd) and msg.turn_id == turn_id:
+                voice_mode = (
+                    state.get("voice_mode", self._active_voice_mode)
+                    if _is_passive_proactive_end(turn_id, msg)
+                    else msg.voice_mode
+                )
                 state["ended"] = msg.ended
                 state["continue_listening"] = msg.continue_listening
-                state["voice_mode"] = msg.voice_mode
+                state["voice_mode"] = voice_mode
                 state["close_reason"] = msg.close_reason
-                self._set_active_voice_mode(msg.voice_mode)
+                if voice_mode == msg.voice_mode:
+                    self._set_active_voice_mode(msg.voice_mode)
                 return
             elif isinstance(msg, Cancel) and msg.turn_id == turn_id:
                 return
