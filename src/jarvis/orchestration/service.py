@@ -3,16 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from jarvis.capabilities import WORKER_SESSION_STOP
 from jarvis.engines import normalize_engine_id, worker_supports_engine
 from jarvis.orchestration import executor
 from jarvis.orchestration.authority import allowed
 from jarvis.orchestration.models import ExecutionEnvelope, LandingPolicy, WorkCommand, WorkItem, WorkerSessionLink
 from jarvis.orchestration.policy import required_for_command, required_for_worker_dispatch
 from jarvis.orchestration.sources import WorkSource
-from jarvis.orchestration.store import ActiveWorkItemError, OrchestrationStore
+from jarvis.orchestration.store import ActiveWorkerSessionError, ActiveWorkItemError, OrchestrationStore
 from jarvis.orchestration.supervisor import sync_run_sessions
 from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry
-from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES
+from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, SESSION_FAILED, SESSION_RUNNING
 
 
 class SourceFactory(Protocol):
@@ -104,7 +105,10 @@ class OrchestrationService:
         if not start:
             return item
 
-        self._require(required_for_worker_dispatch(self.cfg.orchestration.landing_mode))
+        dispatch_actions = required_for_worker_dispatch(self.cfg.orchestration.landing_mode)
+        if command.engine_strategy == "ensemble":
+            dispatch_actions = [*dispatch_actions, WORKER_SESSION_STOP]
+        self._require(dispatch_actions)
         if not item.repo:
             run = store.create_run(str(item.title), work_items=[item])
             store.set_phase(run.run_id, "needs_human", "Work item has no repo/default repo; cannot start a coding worker")
@@ -135,6 +139,7 @@ class OrchestrationService:
                 worker=worker,
                 landing_mode=self.cfg.orchestration.landing_mode,
                 engine=engine,
+                extra_allowed_actions=[WORKER_SESSION_STOP] if command.engine_strategy == "ensemble" else None,
             )
         except ActiveWorkItemError as exc:
             raise WorkAlreadyOwnedError(item, exc.owner) from exc
@@ -207,9 +212,26 @@ class OrchestrationService:
             landing=landing,
         )
         store.append_event(run.run_id, "execution_envelope_created", "Resume execution envelope created", envelope.to_dict())
+        reserved = WorkerSessionLink(
+            worker_id=previous.worker_id,
+            session_id=previous.session_id,
+            status=SESSION_RUNNING,
+            provider=previous.provider,
+            engine=previous.engine,
+            branch=previous.branch,
+            cwd=previous.cwd,
+            last_event_id=previous.last_event_id,
+        )
+        try:
+            store.reserve_session_if_idle(run.run_id, reserved)
+        except ActiveWorkerSessionError as exc:
+            raise ResumeRunError(
+                f"Run {run.run_id} already has active worker session {exc.session.session_id} ({exc.session.status})."
+            ) from exc
         try:
             session = executor.start_worker_session(envelope, worker_cfg=self.cfg.worker, worker=worker, store=store)
         except Exception as exc:  # noqa: BLE001 - dispatch failure must leave an inspectable run
+            store.update_session(run.run_id, previous.session_id, status=SESSION_FAILED)
             _record_failed_resume(store, run.run_id, str(exc))
             raise WorkerDispatchError(envelope.run_id, exc) from exc
         return StartedWork(item=item, worker=worker, envelope=envelope, session=session)

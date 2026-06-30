@@ -12,6 +12,7 @@ from jarvis.worker_session_contract import (
     EVENT_ASSISTANT_DELTA,
     EVENT_ASSISTANT_MESSAGE,
     EVENT_CHECKPOINT_CREATED,
+    EVENT_INPUT_RECEIVED,
     EVENT_INPUT_REQUESTED,
     EVENT_TURN_COMPLETED,
     EVENT_TURN_FAILED,
@@ -123,4 +124,15 @@ class FakeProviderAdapter:
             sessions.update_status(session.session_id, SESSION_BLOCKED)
         else:
             sessions.update_status(session.session_id, SESSION_RUNNING)
+        return event
+
+    def receive_input(
+        self,
+        *,
+        session: WorkerSession,
+        request: dict[str, Any],
+        sessions: SessionManager,
+    ) -> SessionEvent:
+        event = sessions.append_event(session.session_id, EVENT_INPUT_RECEIVED, request)
+        sessions.update_status(session.session_id, SESSION_COMPLETED)
         return event

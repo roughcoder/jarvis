@@ -214,6 +214,47 @@ def test_session_manager_reserves_idempotent_turn_once_under_concurrency(tmp_pat
     assert [event.type for event in sessions.events(session.session_id)].count("turn.started") == 1
 
 
+def test_session_manager_rejects_overlapping_active_turns(tmp_path) -> None:
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create({"provider": "fake", "engine": "fake"})
+
+    first_session, first_event, created = sessions.reserve_turn(
+        session.session_id,
+        {"turn_id": "turn_one", "prompt": "first", "idempotency_key": "idem_one"},
+    )
+
+    assert created is True
+    assert first_session.status == "running"
+    same_session, same_event, same_created = sessions.reserve_turn(
+        session.session_id,
+        {"turn_id": "turn_one", "prompt": "first", "idempotency_key": "idem_one"},
+    )
+    assert same_session.status == "running"
+    assert same_event.event_id == first_event.event_id
+    assert same_created is False
+    with pytest.raises(RuntimeError, match="active turn"):
+        sessions.reserve_turn(
+            session.session_id,
+            {"turn_id": "turn_two", "prompt": "second", "idempotency_key": "idem_two"},
+        )
+
+
+def test_session_manager_interrupts_stale_active_sessions_on_startup(tmp_path) -> None:
+    root = tmp_path / "sessions"
+    sessions = SessionManager(str(root))
+    session, _ = sessions.create({"provider": "codex", "engine": "codex"})
+    sessions.update_status(session.session_id, "waiting_input")
+
+    reloaded = SessionManager(str(root))
+
+    stale = reloaded.get(session.session_id)
+    assert stale is not None
+    assert stale.status == "interrupted"
+    events = reloaded.events(session.session_id)
+    assert events[-1].type == "session.interrupted"
+    assert events[-1].data["previous_status"] == "waiting_input"
+
+
 def test_codex_provider_revalidates_worker_owned_cwd(tmp_path) -> None:
     session = WorkerSession(
         session_id="sess_bad_cwd",
@@ -507,6 +548,41 @@ def test_daemon_session_create_rejects_caller_supplied_non_worker_cwd(tmp_path) 
     assert status_code == 400
     assert "worker-owned workspace" in body["error"]
     assert listed["sessions"] == []
+
+
+def test_daemon_session_turn_rejects_missing_provider_cwd_before_event_append(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+    cwd = pathlib.Path(_owned_worker_cwd(tmp_path, "codex-missing-cwd"))
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "provider": "codex",
+                    "engine": "codex",
+                    "cwd": str(cwd),
+                    "metadata": _authority_metadata("codex"),
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        cwd.rmdir()
+        turn = await c.post(
+            f"{base}/sessions/{session_id}/turns",
+            json={"prompt": "should fail before append", "idempotency_key": "idem_missing_cwd"},
+            headers=headers,
+        )
+        events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+        return turn.status_code, turn.json(), events
+
+    status_code, body, events = asyncio.run(_with_server(cfg, 8842, calls))
+
+    assert status_code == 400
+    assert "cwd does not exist" in body["error"]
+    assert [event["type"] for event in events] == ["session.created"]
 
 
 def test_daemon_session_controls_require_envelope_authority(tmp_path) -> None:

@@ -70,7 +70,7 @@ def required_for_command(operation: str, source: str) -> list[str]:
 
 
 def required_for_landing_mode(mode: str) -> list[str]:
-    if mode in {"draft_pr", "ready_pr"}:
+    if mode in {"draft_pr", "ready_pr", "confirm_before_pr"}:
         return [FORGE_BRANCH_PUSH, FORGE_PR_CREATE]
     if mode == "branch_only":
         return [FORGE_BRANCH_PUSH]

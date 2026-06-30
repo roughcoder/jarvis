@@ -16,6 +16,7 @@ from jarvis.orchestration.models import (
     WorkerJobLink,
     WorkerSessionLink,
 )
+from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES
 
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -31,6 +32,12 @@ class ActiveWorkerJobError(RuntimeError):
     def __init__(self, job: WorkerJobLink) -> None:
         super().__init__(f"worker job {job.job_id} is already running")
         self.job = job
+
+
+class ActiveWorkerSessionError(RuntimeError):
+    def __init__(self, session: WorkerSessionLink) -> None:
+        super().__init__(f"worker session {session.session_id} is already active")
+        self.session = session
 
 
 class OrchestrationStore:
@@ -207,6 +214,31 @@ class OrchestrationStore:
         self.save(run)
         self.append_event(run_id, "session_started", f"Worker session {session.session_id} started", session.to_dict())
         return run
+
+    def reserve_session_if_idle(self, run_id: str, session: WorkerSessionLink) -> OrchestrationRun:
+        with self._locked():
+            run = self.get(run_id)
+            if run is None:
+                raise KeyError(run_id)
+            active = next((x for x in run.sessions if x.status in ACTIVE_SESSION_STATUSES), None)
+            if active is not None:
+                raise ActiveWorkerSessionError(active)
+            existing = next((x for x in run.sessions if x.session_id == session.session_id), None)
+            if existing is None:
+                run.sessions.append(session)
+            else:
+                existing.status = session.status
+                existing.provider = session.provider
+                existing.engine = session.engine
+                existing.branch = session.branch
+                existing.cwd = session.cwd
+                existing.last_event_id = session.last_event_id
+            run.phase = "running"
+            run.status = "active"
+            run.terminal_reason = ""
+            self.save(run)
+            self.append_event(run_id, "session_reserved", f"Reserved worker session {session.session_id}", session.to_dict())
+            return run
 
     def update_session(self, run_id: str, session_id: str, **updates: str) -> OrchestrationRun:
         with self._locked():

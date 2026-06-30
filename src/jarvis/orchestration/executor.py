@@ -7,6 +7,7 @@ from typing import Any
 
 import httpx
 
+from jarvis.capabilities import WORKER_SESSION_STOP
 from jarvis.config import WorkerConfig
 from jarvis.orchestration.envelope import build_execution_envelope
 from jarvis.orchestration.models import ExecutionEnvelope, WorkCommand, WorkItem, WorkerJobLink, WorkerSessionLink
@@ -134,6 +135,8 @@ def start_worker_session(
         if not create_body.get("ok"):
             raise RuntimeError(create_body.get("error") or "worker rejected session")
         session = create_body["session"]
+        if store is not None:
+            store.link_session(envelope.run_id, _session_link_from_body(envelope, session, create_body.get("event")))
     turn_id = _turn_id(envelope)
     idempotency_key = _turn_idempotency_key(envelope)
     turn_response = post(
@@ -189,6 +192,7 @@ def start_worker_ensemble(
                 engine=engine,
                 engine_strategy="ensemble",
                 dispatch_id=f"{_dispatch_id(envelope)}-{engine}",
+                allowed_actions=sorted({*envelope.allowed_actions, WORKER_SESSION_STOP}),
                 session_id="" if engine != envelope.engine else envelope.session_id,
                 session_name=f"{envelope.session_name}-{engine}" if envelope.session_name else "",
                 branch_name=f"{envelope.branch_name}-{engine}" if envelope.branch_name else "",
@@ -229,19 +233,48 @@ def _stop_started_sessions(
     base_url, headers = _worker_endpoint(worker_cfg, worker)
     for link in reversed(links):
         try:
-            http_post(
+            response = http_post(
                 f"{base_url}/sessions/{link.session_id}/stop",
                 json={},
                 headers=headers,
                 timeout=worker_cfg.request_timeout_s,
             )
+            body = _json_body(response)
+            _raise_worker_error(response, body)
+            if not body.get("ok"):
+                raise RuntimeError(body.get("error") or "worker rejected rollback stop")
         except Exception:  # noqa: BLE001 - preserve original ensemble dispatch failure
+            if store is not None:
+                store.append_event(
+                    run_id,
+                    "session_rollback_stop_failed",
+                    f"Could not stop worker session {link.session_id} after ensemble dispatch failure",
+                    {"session_id": link.session_id},
+                )
             pass
-        if store is not None:
-            try:
-                store.update_session(run_id, link.session_id, status=SESSION_STOPPED)
-            except Exception:  # noqa: BLE001 - best-effort rollback marker
-                pass
+        else:
+            if store is not None:
+                try:
+                    store.update_session(run_id, link.session_id, status=SESSION_STOPPED)
+                except Exception:  # noqa: BLE001 - best-effort rollback marker
+                    pass
+
+
+def _session_link_from_body(
+    envelope: ExecutionEnvelope,
+    session: dict[str, Any],
+    event: dict[str, Any] | None = None,
+) -> WorkerSessionLink:
+    return WorkerSessionLink(
+        worker_id=envelope.worker_id,
+        session_id=session["session_id"],
+        status=session.get("status", SESSION_RUNNING),
+        provider=session.get("provider") or envelope.engine,
+        engine=session.get("engine") or envelope.engine,
+        branch=session.get("branch") or envelope.branch_name,
+        cwd=session.get("cwd") or envelope.cwd,
+        last_event_id=str((event or {}).get("event_id") or ""),
+    )
 
 
 def _job_name(envelope: ExecutionEnvelope) -> str:
@@ -307,6 +340,7 @@ def create_run_and_envelope(
     worker: WorkerProfile,
     landing_mode: str = "draft_pr",
     engine: str = "",
+    extra_allowed_actions: list[str] | None = None,
 ) -> ExecutionEnvelope:
     objective = items[0].title if items else command.filters.get("text", command.operation)
     run = store.create_run(str(objective), work_items=items)
@@ -320,5 +354,7 @@ def create_run_and_envelope(
         engine=engine or worker.default_engine or worker.agent,
         engine_strategy=command.engine_strategy,
     )
+    if extra_allowed_actions:
+        envelope.allowed_actions = [*envelope.allowed_actions, *[x for x in extra_allowed_actions if x not in envelope.allowed_actions]]
     store.append_event(run.run_id, "execution_envelope_created", "Execution envelope created", envelope.to_dict())
     return envelope

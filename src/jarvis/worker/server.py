@@ -52,7 +52,7 @@ from jarvis.worker.actions import (
 )
 from jarvis.worker.jobs import JobManager, slugify
 from jarvis.worker.providers import ProviderTurn, provider_for
-from jarvis.worker.sessions import SessionManager
+from jarvis.worker.sessions import SessionManager, WorkerSession
 from jarvis.worker_session_contract import (
     CHECKPOINT_ID_KEY,
     EVENT_APPROVAL_RESOLVED,
@@ -495,6 +495,9 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         authority_error = _require_session_authority(session, WORKER_SESSION_TURN)
         if authority_error is not None:
             return authority_error
+        cwd_error = _session_cwd_error(session, workspace)
+        if cwd_error:
+            return web.json_response({"ok": False, "error": cwd_error}, status=400)
         try:
             body = await request.json()
         except Exception:
@@ -523,7 +526,10 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             "metadata": dict(body.get("metadata") or {}),
             "idempotency_key": idempotency_key,
         }
-        session, started, reserved = sessions.reserve_turn(session.session_id, turn_data)
+        try:
+            session, started, reserved = sessions.reserve_turn(session.session_id, turn_data)
+        except RuntimeError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=409)
         if not reserved:
             return web.json_response(
                 {
@@ -788,6 +794,15 @@ def _worker_owned_cwd(cwd: str, workspace: pathlib.Path, *, action: str = "sessi
     if not path.is_dir():
         return "", f"{action} cwd does not exist: {cwd}"
     return str(path), ""
+
+
+def _session_cwd_error(session: WorkerSession, workspace: pathlib.Path) -> str:
+    if session.provider not in {"codex", "claude"}:
+        return ""
+    if not session.cwd:
+        return f"worker session cwd is required for {session.provider} provider turns"
+    _cwd, err = _worker_owned_cwd(session.cwd, workspace, action="start provider turn")
+    return err
 
 
 def _query_limit(value: str | None) -> int | None:
