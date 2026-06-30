@@ -276,6 +276,37 @@ def test_daemon_resume_uses_worker_owned_cwd_without_cleanup_ownership(tmp_path)
     assert reused.exists()
 
 
+def test_daemon_resume_cwd_requires_session_id(tmp_path) -> None:
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="",
+        workspace=str(tmp_path / "worker"),
+        claude_bin="echo",
+        supported_engines="codex,claude",
+    )
+    reused = tmp_path / "worker" / "worktrees" / "jarvis-existing"
+    reused.mkdir(parents=True)
+
+    async def calls(base, c):  # noqa: ANN001
+        return await c.post(
+            base + "/run",
+            json={
+                "action": "code",
+                "args": {
+                    "prompt": "follow up",
+                    "agent": "claude",
+                    "resume_session": True,
+                    "cwd": str(reused),
+                },
+            },
+        )
+
+    response = asyncio.run(_with_server(cfg, 8827, calls))
+
+    assert response.status_code == 400
+    assert "resume cwd requires session_id" in response.json()["error"]
+
+
 def test_daemon_prune_keeps_workspace_used_by_running_resume(tmp_path) -> None:
     import subprocess
 

@@ -808,6 +808,8 @@ def _resume_target_and_prompt(store, tokens: list[str]) -> tuple[str, str]:  # n
     first = tokens[0]
     if first in {"latest", "last"} or store.get(first) is not None:
         return first, " ".join(tokens[1:])
+    if first.startswith("run_"):
+        return first, " ".join(tokens[1:])
     return "latest", " ".join(tokens)
 
 

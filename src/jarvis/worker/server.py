@@ -213,6 +213,8 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             resolved = ""
             cleanup_owned = True
             if args.get("cwd") and resume_session:
+                if not session_id:
+                    return web.json_response({"ok": False, "error": "resume cwd requires session_id"}, status=400)
                 job_cwd, err = _resume_cwd(str(args["cwd"]), workspace)
                 if err:
                     return web.json_response({"ok": False, "error": err}, status=400)
