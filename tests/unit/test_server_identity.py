@@ -16,6 +16,7 @@ from jarvis.brain.server import BrainServer
 from jarvis.brain.tracing import TurnTrace
 from jarvis.config import BrainConfig, CapabilityConfig, MCPConfig, load_config
 from jarvis.protocol.messages import (
+    AudioStart,
     BinaryAudio,
     Hello,
     ReplyEnd,
@@ -120,6 +121,15 @@ def test_audio_buffers_are_connection_local_even_with_same_turn_id() -> None:
     assert buffered_b is not None
     assert buffered_b.pcm == b"bb"
     assert buffered_b.frame_bytes == len(frame_b)
+
+
+def test_audio_buffer_rejects_second_live_turn_on_same_connection() -> None:
+    conn = {"audio_buffers": {}}
+
+    assert BrainServer._start_audio_buffer(conn, AudioStart(turn_id="t1", sample_rate=16000))
+    assert not BrainServer._start_audio_buffer(conn, AudioStart(turn_id="t2", sample_rate=16000))
+
+    assert list(conn["audio_buffers"]) == ["t1"]
 
 
 def test_audio_buffer_rejects_turn_that_exceeds_pcm_cap() -> None:

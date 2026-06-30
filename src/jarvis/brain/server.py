@@ -524,18 +524,10 @@ class BrainServer:
                 except Exception:
                     continue
                 if isinstance(msg, AudioStart):
-                    sample_rate = max(1, min(msg.sample_rate, _MAX_UPLINK_SAMPLE_RATE))
-                    conn["audio_buffers"][msg.turn_id] = {
-                        "sample_rate": sample_rate,
-                        "voice_mode": normalize_mode(msg.voice_mode),
-                        "chunks": [],
-                        "pcm_bytes": 0,
-                        "frame_bytes": 0,
-                        "max_pcm_bytes": int(
-                            sample_rate * 2 * (_MAX_UPLINK_AUDIO_S + _MAX_UPLINK_AUDIO_SLACK_S)
-                        ),
-                        "started_at": time.perf_counter(),
-                    }
+                    ok = self._start_audio_buffer(conn, msg)
+                    if not ok:
+                        await ws.close(code=1009, reason="uplink audio already in progress")
+                        break
                 elif isinstance(msg, AudioEnd):
                     buffered = self._finish_audio_buffer(conn, msg.turn_id)
                     if buffered is not None:
@@ -571,6 +563,25 @@ class BrainServer:
                 if not conns:
                     self._device_conns.pop(device_id, None)
             await self._cancel(turn)
+
+    @staticmethod
+    def _start_audio_buffer(conn: dict, msg: AudioStart) -> bool:
+        buffers = conn.setdefault("audio_buffers", {})
+        if buffers and msg.turn_id not in buffers:
+            return False
+        sample_rate = max(1, min(msg.sample_rate, _MAX_UPLINK_SAMPLE_RATE))
+        buffers[msg.turn_id] = {
+            "sample_rate": sample_rate,
+            "voice_mode": normalize_mode(msg.voice_mode),
+            "chunks": [],
+            "pcm_bytes": 0,
+            "frame_bytes": 0,
+            "max_pcm_bytes": int(
+                sample_rate * 2 * (_MAX_UPLINK_AUDIO_S + _MAX_UPLINK_AUDIO_SLACK_S)
+            ),
+            "started_at": time.perf_counter(),
+        }
+        return True
 
     @staticmethod
     def _buffer_audio_chunk(conn: dict, binary: BinaryAudio, *, frame_bytes: int) -> bool:
