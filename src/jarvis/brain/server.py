@@ -91,6 +91,10 @@ _HARDWARE_CAPS = {
     "intercom.display": "display",
 }
 
+_TURN_ERROR_REPLY = "I hit an error before I could answer that."
+_MAX_UPLINK_AUDIO_S = 30.0
+_MAX_UPLINK_SAMPLE_RATE = 48_000
+
 
 @dataclasses.dataclass
 class BufferedAudioTurn:
@@ -509,18 +513,24 @@ class BrainServer:
                     except ValueError:
                         continue
                     if binary is not None and binary.kind == "uplink_audio":
-                        self._buffer_audio_chunk(conn, binary, frame_bytes=len(raw))
+                        ok = self._buffer_audio_chunk(conn, binary, frame_bytes=len(raw))
+                        if not ok:
+                            await ws.close(code=1009, reason="uplink audio too large")
+                            break
                     continue
                 try:
                     msg = decode(raw)
                 except Exception:
                     continue
                 if isinstance(msg, AudioStart):
+                    sample_rate = max(1, min(msg.sample_rate, _MAX_UPLINK_SAMPLE_RATE))
                     conn["audio_buffers"][msg.turn_id] = {
-                        "sample_rate": msg.sample_rate,
+                        "sample_rate": sample_rate,
                         "voice_mode": normalize_mode(msg.voice_mode),
                         "chunks": [],
+                        "pcm_bytes": 0,
                         "frame_bytes": 0,
+                        "max_pcm_bytes": int(sample_rate * 2 * _MAX_UPLINK_AUDIO_S),
                         "started_at": time.perf_counter(),
                     }
                 elif isinstance(msg, AudioEnd):
@@ -560,15 +570,22 @@ class BrainServer:
             await self._cancel(turn)
 
     @staticmethod
-    def _buffer_audio_chunk(conn: dict, binary: BinaryAudio, *, frame_bytes: int) -> None:
+    def _buffer_audio_chunk(conn: dict, binary: BinaryAudio, *, frame_bytes: int) -> bool:
         buffers = conn.get("audio_buffers", {})
         buf = buffers.get(binary.turn_id)
         if buf is None:
-            return
+            return True
+        pcm_bytes = int(buf.get("pcm_bytes") or 0) + len(binary.pcm)
+        max_pcm_bytes = int(buf.get("max_pcm_bytes") or 0)
+        if max_pcm_bytes and pcm_bytes > max_pcm_bytes:
+            buffers.pop(binary.turn_id, None)
+            return False
         buf["chunks"].append(binary.pcm)
+        buf["pcm_bytes"] = pcm_bytes
         buf["frame_bytes"] += frame_bytes
         if binary.sample_rate:
             buf["sample_rate"] = binary.sample_rate
+        return True
 
     @staticmethod
     def _finish_audio_buffer(conn: dict, turn_id: str) -> BufferedAudioTurn | None:
@@ -708,13 +725,9 @@ class BrainServer:
             print(f"  [alarm] acknowledged on device={device_id}")
             sent_audio_chunks = 0
             if not text_only:
-                try:
-                    async for pcm in self._tts.synthesize_stream(reply):
-                        sent_audio_chunks += 1
-                        await self._send_reply_audio(ws, turn_id, pcm)
-                except Exception as exc:  # noqa: BLE001 - still close the turn cleanly
-                    trace.event("reply_audio_error", error=type(exc).__name__)
-                    print(f"  [tts] alarm reply audio failed: {exc!r}")
+                sent_audio_chunks, _sent_audio_bytes = await self._synthesize_and_send_text(
+                    ws, turn_id, reply, trace, phase="alarm_reply"
+                )
                 if sent_audio_chunks == 0:
                     trace.event("reply_audio_missing", reply_chars=len(reply))
             end = self._alarm_ack_reply_end(turn_id, channel, conn)
@@ -756,19 +769,33 @@ class BrainServer:
                 await session.respond_text(text, trace, result)
             else:
                 async for pcm in session.respond(text, trace, result):
-                    sent_audio_chunks += 1
-                    sent_audio_bytes += len(pcm)
-                    await self._send_reply_audio(ws, turn_id, pcm)
+                    try:
+                        await self._send_reply_audio(ws, turn_id, pcm)
+                        sent_audio_chunks += 1
+                        sent_audio_bytes += len(pcm)
+                    except Exception as exc:  # noqa: BLE001 - close the turn cleanly below
+                        trace.event("reply_audio_error", error=type(exc).__name__, phase="downlink")
+                        print(f"  [tts] reply audio send failed: {exc!r}")
+                        break
         except asyncio.CancelledError:
             session.finalize(text, result, trace)  # remember what was actually said
             self._apply_cancelled_turn_result(channel, conn, result)
             self._tracer.emit(trace)
             raise
         except Exception as exc:  # noqa: BLE001 - keep the intercom from hanging
-            trace.event("turn_error", error=type(exc).__name__)
-            print(f"  [turn error] {exc!r}")
             if not result.raw:
-                result.raw = "I hit an error before I could say that out loud."
+                trace.event("turn_error", error=type(exc).__name__, recovered=True)
+                print(f"  [turn error] {exc!r}")
+                result.raw = _TURN_ERROR_REPLY
+                if not text_only:
+                    fallback_chunks, fallback_bytes = await self._synthesize_and_send_text(
+                        ws, turn_id, result.raw, trace, phase="fallback_reply"
+                    )
+                    sent_audio_chunks += fallback_chunks
+                    sent_audio_bytes += fallback_bytes
+            else:
+                trace.event("reply_audio_error", error=type(exc).__name__, phase="synthesis")
+                print(f"  [tts] reply audio failed: {exc!r}")
         session.finalize(text, result, trace)
         if not text_only and result.reply and sent_audio_chunks == 0:
             trace.event("reply_audio_missing", reply_chars=len(result.reply))
@@ -797,6 +824,27 @@ class BrainServer:
     @staticmethod
     async def _send_reply_audio(ws, turn_id: str, pcm: bytes) -> None:  # noqa: ANN001
         await ws.send(encode_reply_audio_binary(turn_id, pcm))
+
+    async def _synthesize_and_send_text(
+        self,
+        ws,
+        turn_id: str,
+        text: str,
+        trace,
+        *,
+        phase: str,
+    ) -> tuple[int, int]:  # noqa: ANN001
+        chunks = 0
+        n_bytes = 0
+        try:
+            async for pcm in self._tts.synthesize_stream(text):
+                await self._send_reply_audio(ws, turn_id, pcm)
+                chunks += 1
+                n_bytes += len(pcm)
+        except Exception as exc:  # noqa: BLE001 - caller still sends ReplyText/ReplyEnd
+            trace.event("reply_audio_error", error=type(exc).__name__, phase=phase)
+            print(f"  [tts] {phase} audio failed: {exc!r}")
+        return chunks, n_bytes
 
     async def _request_device_action(
         self, ctx: RequestContext, action: str, args: dict, timeout_s: float

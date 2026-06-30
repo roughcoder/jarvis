@@ -645,6 +645,7 @@ class IntercomClient:
         loop = asyncio.get_running_loop()
         out: asyncio.Queue[bytes | None] = asyncio.Queue()
         result: dict = {}
+        stop_capture = threading.Event()
 
         def capture() -> None:
             try:
@@ -652,6 +653,7 @@ class IntercomClient:
                     self._capture_utterance_to_queue(
                         mic,
                         lambda chunk: loop.call_soon_threadsafe(out.put_nowait, chunk),
+                        stop_capture=stop_capture,
                         initial_wait_ms=initial_wait_ms,
                     )
                 )
@@ -662,26 +664,32 @@ class IntercomClient:
         started = False
         uplink_bytes = 0
         uplink_chunks = 0
-        while True:
-            item = await out.get()
-            if item is None:
-                break
-            if not started:
-                await ws.send(
-                    encode(
-                        AudioStart(
-                            turn_id=turn_id,
-                            sample_rate=self._sr,
-                            voice_mode=self._active_voice_mode,
+        try:
+            while True:
+                item = await out.get()
+                if item is None:
+                    break
+                if not started:
+                    await ws.send(
+                        encode(
+                            AudioStart(
+                                turn_id=turn_id,
+                                sample_rate=self._sr,
+                                voice_mode=self._active_voice_mode,
+                            )
                         )
                     )
-                )
-                started = True
-            frame = encode_uplink_audio_binary(turn_id, self._sr, item)
-            uplink_bytes += len(frame)
-            uplink_chunks += 1
-            await ws.send(frame)
-        await worker
+                    started = True
+                frame = encode_uplink_audio_binary(turn_id, self._sr, item)
+                uplink_bytes += len(frame)
+                uplink_chunks += 1
+                await ws.send(frame)
+            await worker
+        except BaseException:
+            stop_capture.set()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(worker, timeout=1.0)
+            raise
         pcm = result.get("pcm", b"")
         if not pcm:
             return None
@@ -716,6 +724,7 @@ class IntercomClient:
         mic: MicStream,
         send_chunk: Callable[[bytes], None],
         *,
+        stop_capture: threading.Event | None = None,
         initial_wait_ms: float = 8000,
     ) -> dict:
         t0 = time.perf_counter()
@@ -729,8 +738,17 @@ class IntercomClient:
         )
         waited_ms = 0.0
         sent_len = 0
+        stop_capture = stop_capture or threading.Event()
         while True:
-            frame = mic.read()
+            if stop_capture.is_set():
+                return {
+                    "pcm": ep.audio if ep.started else b"",
+                    "capture_ms": (time.perf_counter() - t0) * 1000,
+                }
+            try:
+                frame = mic.read(timeout=0.1)
+            except queue.Empty:
+                continue
             done = ep.feed(frame, self._vad.prob(frame))
             if ep.started:
                 audio = ep.audio
