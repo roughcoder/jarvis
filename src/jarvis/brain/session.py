@@ -840,6 +840,7 @@ class BrainSession:
         first_tok: float | None = None
         llm_done: float | None = None
         tts_first: float | None = None
+        tts_bytes = 0
         full: list[str] = []
         steering: str | None = None
         usage: dict = {}
@@ -876,6 +877,7 @@ class BrainSession:
                 async for pcm in self._tts.synthesize_stream(tts_text):
                     if tts_first is None:
                         tts_first = time.perf_counter()
+                    tts_bytes += len(pcm)
                     yield pcm
         finally:
             result.raw = "".join(full)
@@ -895,6 +897,7 @@ class BrainSession:
                     "tts",
                     (end - (first_tok or t0)) * 1000,
                     ttfa_ms=round((tts_first - t0) * 1000, 1) if tts_first else None,
+                    bytes=tts_bytes,
                     voice=self._cfg.tts.voice,
                     provider=self._cfg.tts.provider,
                 )

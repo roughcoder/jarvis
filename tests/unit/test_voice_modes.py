@@ -17,7 +17,7 @@ from jarvis.brain.voice_modes import (
     strip_voice_controls,
 )
 from jarvis.config import load_config
-from jarvis.protocol.messages import ReplyEnd, Utterance, decode, encode
+from jarvis.protocol.messages import AudioStart, ReplyEnd, decode, encode
 
 
 class _Gateway:
@@ -559,17 +559,27 @@ def test_reply_end_carries_voice_mode_metadata() -> None:
     assert back.model_dump() == msg.model_dump()
 
 
-def test_brain_preserves_connection_mode_when_utterance_omits_voice_mode() -> None:
-    msg = decode('{"type":"utterance","turn_id":"t1","sample_rate":16000,"pcm_b64":""}')
+def test_brain_buffers_audio_start_voice_mode() -> None:
+    conn = {"audio_buffers": {}}
 
-    assert isinstance(msg, Utterance)
-    assert BrainServer._voice_mode_for_utterance(msg, current=STAY_MODE) == STAY_MODE
+    conn["audio_buffers"]["t1"] = {
+        "sample_rate": 16000,
+        "voice_mode": STAY_MODE,
+        "chunks": [],
+        "frame_bytes": 0,
+        "started_at": 1.0,
+    }
+    buffered = BrainServer._finish_audio_buffer(conn, "t1")
+
+    assert buffered is not None
+    assert buffered.voice_mode == STAY_MODE
 
 
-def test_brain_applies_explicit_utterance_voice_mode() -> None:
-    msg = Utterance.of("t1", 16000, b"", voice_mode=DEFAULT_MODE)
+def test_audio_start_voice_mode_round_trips() -> None:
+    msg = decode(encode(AudioStart(turn_id="t1", sample_rate=16000, voice_mode=DEFAULT_MODE)))
 
-    assert BrainServer._voice_mode_for_utterance(msg, current=STAY_MODE) == DEFAULT_MODE
+    assert isinstance(msg, AudioStart)
+    assert msg.voice_mode == DEFAULT_MODE
 
 
 def test_voice_conversation_reset_clears_temporary_identity_and_mode() -> None:

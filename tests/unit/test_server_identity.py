@@ -14,7 +14,14 @@ import websockets
 
 from jarvis.brain.server import BrainServer
 from jarvis.config import BrainConfig, CapabilityConfig, MCPConfig, load_config
-from jarvis.protocol.messages import Hello, Welcome, decode, encode
+from jarvis.protocol.messages import (
+    BinaryAudio,
+    Hello,
+    Welcome,
+    decode,
+    encode,
+    encode_uplink_audio_binary,
+)
 
 
 @pytest.fixture
@@ -61,3 +68,49 @@ def test_shared_device_resolves_to_house(cfg) -> None:  # noqa: ANN001
     assert w.scope == "house"
     assert "mcp.notion" not in w.capabilities  # no personal grants for an unknown speaker
     assert w.capabilities == ["web.search"]
+
+
+def test_audio_buffers_are_connection_local_even_with_same_turn_id() -> None:
+    conn_a = {
+        "audio_buffers": {
+            "same-turn": {
+                "sample_rate": 16000,
+                "chunks": [],
+                "frame_bytes": 0,
+                "started_at": 1.0,
+            }
+        }
+    }
+    conn_b = {
+        "audio_buffers": {
+            "same-turn": {
+                "sample_rate": 16000,
+                "chunks": [],
+                "frame_bytes": 0,
+                "started_at": 1.0,
+            }
+        }
+    }
+    frame_a = encode_uplink_audio_binary("same-turn", 16000, b"a")
+    frame_b = encode_uplink_audio_binary("same-turn", 16000, b"bb")
+
+    BrainServer._buffer_audio_chunk(
+        conn_a,
+        BinaryAudio(kind="uplink_audio", turn_id="same-turn", pcm=b"a", sample_rate=16000),
+        frame_bytes=len(frame_a),
+    )
+    BrainServer._buffer_audio_chunk(
+        conn_b,
+        BinaryAudio(kind="uplink_audio", turn_id="same-turn", pcm=b"bb", sample_rate=16000),
+        frame_bytes=len(frame_b),
+    )
+
+    buffered_a = BrainServer._finish_audio_buffer(conn_a, "same-turn")
+    buffered_b = BrainServer._finish_audio_buffer(conn_b, "same-turn")
+
+    assert buffered_a is not None
+    assert buffered_a.pcm == b"a"
+    assert buffered_a.frame_bytes == len(frame_a)
+    assert buffered_b is not None
+    assert buffered_b.pcm == b"bb"
+    assert buffered_b.frame_bytes == len(frame_b)

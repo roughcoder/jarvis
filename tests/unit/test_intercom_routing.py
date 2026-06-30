@@ -10,9 +10,10 @@ from __future__ import annotations
 import asyncio
 
 from jarvis.config import load_config
-from jarvis.intercom.client import IntercomClient
+from jarvis.intercom.client import IntercomClient, _CapturedUtterance
 from jarvis.intercom.metrics import SCHEMA_VERSION, IntercomReplyMetrics, summary
 from jarvis.protocol.messages import (
+    AudioStart,
     BinaryAudio,
     ConversationIdle,
     DeviceRequest,
@@ -22,7 +23,6 @@ from jarvis.protocol.messages import (
     ReplyEnd,
     ReplyText,
     Transcript,
-    Utterance,
     decode,
 )
 
@@ -40,9 +40,9 @@ class _Hardware:
 
 class _WS:
     def __init__(self) -> None:
-        self.sent: list[str] = []
+        self.sent: list[str | bytes] = []
 
-    async def send(self, item: str) -> None:
+    async def send(self, item: str | bytes) -> None:
         self.sent.append(item)
 
 
@@ -79,6 +79,20 @@ class _Panel:
 def _client(panel=None) -> IntercomClient:  # noqa: ANN001
     return IntercomClient(
         load_config(), audio=_Stub(), vad=_Stub(), wake=_Stub(), hardware=_Hardware(), panel=panel
+    )
+
+
+def _captured(turn_id: str = "t1", pcm: bytes = b"hello") -> _CapturedUtterance | None:
+    if not pcm:
+        return None
+    return _CapturedUtterance(
+        turn_id=turn_id,
+        pcm=pcm,
+        metrics=IntercomReplyMetrics(turn_id=turn_id, device_id="pi"),
+        capture_ms=0.0,
+        audio_ms=len(pcm) / 2 / 16000 * 1000,
+        uplink_bytes=len(pcm),
+        uplink_chunks=1,
     )
 
 
@@ -260,7 +274,7 @@ def test_reply_audio_yields_pcm_and_records_state() -> None:
 
 def test_intercom_metric_summary_reports_playback_baseline() -> None:
     metrics = IntercomReplyMetrics(turn_id="t1", device_id="kitchen-pi")
-    metrics.mark_utterance_sent(pcm_bytes=32000, frame_bytes=43000)
+    metrics.mark_utterance_sent(pcm_bytes=32000, frame_bytes=43000, protocol="test")
     metrics.record_audio_frame(
         protocol=REPLY_AUDIO_BINARY_V1,
         encoded_bytes=4,
@@ -277,6 +291,7 @@ def test_intercom_metric_summary_reports_playback_baseline() -> None:
     text = summary(metrics.data)
     assert "intercom/turn" in text
     assert "device=kitchen-pi" in text
+    assert "uplink=test/1ch 43000B" in text
     assert "first_frame=" in text
     assert "speech=420ms" in text
     assert "underruns=2" in text
@@ -315,6 +330,25 @@ def test_passive_proactive_reply_end_preserves_selected_voice_mode() -> None:
     assert c._active_voice_mode == "stay"
 
 
+def test_reply_without_audio_records_missing_audio_event() -> None:
+    c = _client()
+    q: asyncio.Queue = asyncio.Queue()
+    q.put_nowait(ReplyText(turn_id="t1", text="This should have been spoken."))
+    q.put_nowait(ReplyEnd(turn_id="t1"))
+
+    async def go() -> IntercomReplyMetrics:
+        state = {"ended": False, "text": ""}
+        metrics = IntercomReplyMetrics(turn_id="t1", device_id="pi")
+        chunks = [pcm async for pcm in c._reply_audio(q, "t1", state, metrics)]
+        assert chunks == []
+        assert state["text"] == "This should have been spoken."
+        return metrics
+
+    metrics = asyncio.run(go())
+    assert metrics.data["events"][0]["name"] == "reply_audio_missing"
+    assert "NO_REPLY_AUDIO" in summary(metrics.data)
+
+
 def test_interrupted_silence_sends_conversation_idle() -> None:
     c = _client()
     q: asyncio.Queue = asyncio.Queue()
@@ -325,40 +359,38 @@ def test_interrupted_silence_sends_conversation_idle() -> None:
         return True
 
     c._play_reply = fake_play  # type: ignore[method-assign]
-    c._capture_utterance = lambda *_args, **_kwargs: b""  # type: ignore[method-assign]
+    async def fake_capture(*_args, **_kwargs):  # noqa: ANN002
+        return None
+
+    c._capture_streaming_utterance = fake_capture  # type: ignore[method-assign]
 
     async def go() -> dict | None:
-        return await c._converse(ws, mic, q, b"hello")
+        return await c._converse(ws, mic, q, _captured())
 
     assert asyncio.run(go()) is None
     sent = [decode(item) for item in ws.sent]
     assert any(isinstance(item, ConversationIdle) and item.reason == "timeout" for item in sent)
 
 
-def test_panel_selected_voice_mode_is_sent_with_next_utterance() -> None:
+def test_panel_selected_voice_mode_is_sent_with_next_audio_start() -> None:
     panel = _Panel(["stay"])
     c = _client(panel)
-    q: asyncio.Queue = asyncio.Queue()
     ws = _WS()
-    mic = _Mic()
 
-    async def fake_play(*args):  # noqa: ANN002
-        state = args[4]
-        state["ended"] = True
-        state["voice_mode"] = "stay"
-        state["continue_listening"] = False
-        return False
+    def fake_capture(_mic, send_chunk, *, initial_wait_ms):  # noqa: ANN001, ARG001
+        send_chunk(b"hello")
+        return {"pcm": b"hello", "capture_ms": 1.0}
 
-    c._play_reply = fake_play  # type: ignore[method-assign]
+    c._capture_utterance_to_queue = fake_capture  # type: ignore[method-assign]
 
-    async def go() -> dict | None:
-        return await c._converse(ws, mic, q, b"hello")
+    async def go() -> None:
+        c._sync_panel_voice_mode()
+        await c._capture_streaming_utterance(ws, _Mic())
 
-    state = asyncio.run(go())
-    sent = [decode(item) for item in ws.sent]
-    utterances = [item for item in sent if isinstance(item, Utterance)]
-    assert state is not None
-    assert utterances and utterances[0].voice_mode == "stay"
+    asyncio.run(go())
+    sent = [decode(item) for item in ws.sent if isinstance(item, str)]
+    starts = [item for item in sent if isinstance(item, AudioStart)]
+    assert starts and starts[0].voice_mode == "stay"
     assert c._active_voice_mode == "stay"
     assert "stay" in panel.published_modes
 
@@ -458,7 +490,7 @@ def test_interrupted_stay_mode_silence_keeps_listening_without_idle() -> None:
     q: asyncio.Queue = asyncio.Queue()
     ws = _WS()
     mic = _Mic()
-    captures = iter([b"", b"exit stay mode"])
+    captures = iter([None, _captured("t2", b"exit stay mode")])
     replies = 0
 
     async def fake_play(*args):  # noqa: ANN002
@@ -476,10 +508,13 @@ def test_interrupted_stay_mode_silence_keeps_listening_without_idle() -> None:
         return False
 
     c._play_reply = fake_play  # type: ignore[method-assign]
-    c._capture_utterance = lambda *_args, **_kwargs: next(captures)  # type: ignore[method-assign]
+    async def fake_capture(*_args, **_kwargs):  # noqa: ANN002
+        return next(captures)
+
+    c._capture_streaming_utterance = fake_capture  # type: ignore[method-assign]
 
     async def go() -> dict | None:
-        return await c._converse(ws, mic, q, b"hello")
+        return await c._converse(ws, mic, q, _captured())
 
     state = asyncio.run(go())
     sent = [decode(item) for item in ws.sent]
@@ -494,7 +529,11 @@ def test_interrupted_stay_mode_without_reply_end_preserves_active_mode() -> None
     q: asyncio.Queue = asyncio.Queue()
     ws = _WS()
     mic = _Mic()
-    captures = iter([b"question", b"", b"exit stay mode"])
+    captures = iter([
+        _captured("t2", b"question"),
+        None,
+        _captured("t3", b"exit stay mode"),
+    ])
     replies = 0
 
     async def fake_play(*args):  # noqa: ANN002
@@ -514,10 +553,13 @@ def test_interrupted_stay_mode_without_reply_end_preserves_active_mode() -> None
         return False
 
     c._play_reply = fake_play  # type: ignore[method-assign]
-    c._capture_utterance = lambda *_args, **_kwargs: next(captures)  # type: ignore[method-assign]
+    async def fake_capture(*_args, **_kwargs):  # noqa: ANN002
+        return next(captures)
+
+    c._capture_streaming_utterance = fake_capture  # type: ignore[method-assign]
 
     async def go() -> dict | None:
-        return await c._converse(ws, mic, q, b"start stay")
+        return await c._converse(ws, mic, q, _captured(pcm=b"start stay"))
 
     state = asyncio.run(go())
     sent = [decode(item) for item in ws.sent]

@@ -21,6 +21,8 @@ import socket
 import threading
 import time
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import websockets
 from jarvis.brain.voice_modes import DEFAULT_MODE, STAY_MODE, normalize_mode
@@ -32,6 +34,8 @@ from jarvis.intercom.pi_panel import CompositePanel, PiPanel, WebPiPanel
 from jarvis.intercom.vad import Endpointer, SileroVAD
 from jarvis.intercom.wake import WakeWord
 from jarvis.protocol.messages import (
+    AudioEnd,
+    AudioStart,
     BargeIn,
     BinaryAudio,
     Cancel,
@@ -44,14 +48,26 @@ from jarvis.protocol.messages import (
     ReplyEnd,
     ReplyText,
     Transcript,
-    Utterance,
+    UPLINK_AUDIO_BINARY_V1,
     Welcome,
     decode_binary_audio,
     decode,
+    encode_uplink_audio_binary,
     encode,
 )
 
 FRAME_SAMPLES = 512
+
+
+@dataclass
+class _CapturedUtterance:
+    turn_id: str
+    pcm: bytes
+    metrics: IntercomReplyMetrics
+    capture_ms: float
+    audio_ms: float
+    uplink_bytes: int
+    uplink_chunks: int
 
 
 def _is_passive_proactive_state(state: dict | None) -> bool:
@@ -310,20 +326,16 @@ class IntercomClient:
         mic.drain()
         print("  listening…")
         self._panel.set("listening")
-        t0 = time.perf_counter()
-        pcm = await asyncio.to_thread(self._capture_utterance, mic)
-        capture_ms = (time.perf_counter() - t0) * 1000
+        captured = await self._capture_streaming_utterance(ws, mic)
         self._panel.set("thinking")
-        await self._converse(ws, mic, inbound, pcm, capture_ms=capture_ms)
+        await self._converse(ws, mic, inbound, captured)
 
     async def _converse(  # noqa: ANN001
         self,
         ws,
         mic: MicStream,
         inbound: asyncio.Queue,
-        pcm: bytes,
-        *,
-        capture_ms: float | None = None,
+        captured: _CapturedUtterance | None,
     ) -> dict | None:
         """Run turns until the conversation closes — shared by a wake-started turn and a
         proactive that opened the mic."""
@@ -331,37 +343,19 @@ class IntercomClient:
         active_voice_mode = self._sync_panel_voice_mode()
         while True:
             active_voice_mode = self._sync_panel_voice_mode()
-            if not pcm:
+            if captured is None:
                 print("  (nothing said)")
                 if conversation_started and active_voice_mode == STAY_MODE:
                     self._panel.set("listening")
-                    t0 = time.perf_counter()
-                    pcm = await asyncio.to_thread(self._capture_utterance, mic)
-                    capture_ms = (time.perf_counter() - t0) * 1000
+                    captured = await self._capture_streaming_utterance(ws, mic)
                     self._panel.set("thinking")
                     continue
                 if conversation_started:
                     with contextlib.suppress(Exception):
                         await ws.send(encode(ConversationIdle(reason="timeout")))
                 return None
-            turn_id = uuid.uuid4().hex
-            metrics = IntercomReplyMetrics(
-                turn_id=turn_id, device_id=self._device_id, kind="turn"
-            )
-            if capture_ms is not None:
-                metrics.mark_capture(
-                    capture_ms=capture_ms,
-                    audio_ms=len(pcm) / 2 / self._sr * 1000,
-                    pcm_bytes=len(pcm),
-                    streamed=False,
-                )
-            frame = encode(Utterance.of(turn_id, self._sr, pcm, voice_mode=active_voice_mode))
-            metrics.mark_utterance_sent(
-                pcm_bytes=len(pcm),
-                frame_bytes=len(frame),
-                protocol="json_base64_v1",
-            )
-            await ws.send(frame)
+            turn_id = captured.turn_id
+            metrics = captured.metrics
             conversation_started = True
             state = {
                 "ended": False,
@@ -379,9 +373,7 @@ class IntercomClient:
             if interrupted:
                 print("⊘ interrupted — listening…")
                 self._panel.set("listening")
-                t0 = time.perf_counter()
-                pcm = await asyncio.to_thread(self._capture_utterance, mic)
-                capture_ms = (time.perf_counter() - t0) * 1000
+                captured = await self._capture_streaming_utterance(ws, mic)
                 self._panel.set("thinking")
                 continue
             if state["ended"]:
@@ -406,15 +398,11 @@ class IntercomClient:
                 else:
                     print("  …(listening — keep talking, or stay quiet to sleep)")
                 self._panel.set("listening")
-                t0 = time.perf_counter()
-                pcm = await asyncio.to_thread(
-                    self._capture_utterance,
-                    mic,
-                    initial_wait_ms=self._cfg.vad.conversation_timeout_ms,
+                captured = await self._capture_streaming_utterance(
+                    ws, mic, initial_wait_ms=self._cfg.vad.conversation_timeout_ms
                 )
-                capture_ms = (time.perf_counter() - t0) * 1000
                 self._panel.set("thinking")
-                if pcm:
+                if captured is not None:
                     break
                 if state["voice_mode"] == STAY_MODE:
                     continue
@@ -495,16 +483,12 @@ class IntercomClient:
             mic.drain()
             print("  …(listening for your reply)")
             self._panel.set("listening")
-            t0 = time.perf_counter()
-            pcm = await asyncio.to_thread(
-                self._capture_utterance, mic, initial_wait_ms=self._cfg.vad.conversation_timeout_ms
+            captured = await self._capture_streaming_utterance(
+                ws, mic, initial_wait_ms=self._cfg.vad.conversation_timeout_ms
             )
-            capture_ms = (time.perf_counter() - t0) * 1000
-            if pcm:
+            if captured is not None:
                 self._panel.set("thinking")
-                nested_state = await self._converse(
-                    ws, mic, inbound, pcm, capture_ms=capture_ms
-                )
+                nested_state = await self._converse(ws, mic, inbound, captured)
                 if nested_state is not None:
                     self._set_active_voice_mode(nested_state.get("voice_mode", self._active_voice_mode))
                     return nested_state
@@ -543,6 +527,16 @@ class IntercomClient:
                 state["close_reason"] = msg.close_reason
                 if voice_mode == msg.voice_mode:
                     self._set_active_voice_mode(msg.voice_mode)
+                if (
+                    metrics is not None
+                    and state.get("text")
+                    and metrics.reply_audio_chunks == 0
+                ):
+                    metrics.mark_missing_reply_audio(text_chars=len(state["text"]))
+                    print(
+                        "  [intercom] reply ended without any audio frames "
+                        f"(turn={turn_id})"
+                    )
                 return
             elif isinstance(msg, Cancel) and msg.turn_id == turn_id:
                 return
@@ -641,7 +635,90 @@ class IntercomClient:
         return interrupted.is_set()
 
     # --- local capture (parallel to TurnLoop) ------------------------------
-    def _capture_utterance(self, mic: MicStream, *, initial_wait_ms: float = 8000) -> bytes:
+    async def _capture_streaming_utterance(
+        self, ws, mic: MicStream, *, initial_wait_ms: float = 8000  # noqa: ANN001
+    ) -> _CapturedUtterance | None:
+        turn_id = uuid.uuid4().hex
+        metrics = IntercomReplyMetrics(
+            turn_id=turn_id, device_id=self._device_id, kind="turn"
+        )
+        loop = asyncio.get_running_loop()
+        out: asyncio.Queue[bytes | None] = asyncio.Queue()
+        result: dict = {}
+
+        def capture() -> None:
+            try:
+                result.update(
+                    self._capture_utterance_to_queue(
+                        mic,
+                        lambda chunk: loop.call_soon_threadsafe(out.put_nowait, chunk),
+                        initial_wait_ms=initial_wait_ms,
+                    )
+                )
+            finally:
+                loop.call_soon_threadsafe(out.put_nowait, None)
+
+        worker = asyncio.create_task(asyncio.to_thread(capture))
+        started = False
+        uplink_bytes = 0
+        uplink_chunks = 0
+        while True:
+            item = await out.get()
+            if item is None:
+                break
+            if not started:
+                await ws.send(
+                    encode(
+                        AudioStart(
+                            turn_id=turn_id,
+                            sample_rate=self._sr,
+                            voice_mode=self._active_voice_mode,
+                        )
+                    )
+                )
+                started = True
+            frame = encode_uplink_audio_binary(turn_id, self._sr, item)
+            uplink_bytes += len(frame)
+            uplink_chunks += 1
+            await ws.send(frame)
+        await worker
+        pcm = result.get("pcm", b"")
+        if not pcm:
+            return None
+        if started:
+            await ws.send(encode(AudioEnd(turn_id=turn_id)))
+        capture_ms = float(result.get("capture_ms", 0.0))
+        audio_ms = len(pcm) / 2 / self._sr * 1000
+        metrics.mark_capture(
+            capture_ms=capture_ms,
+            audio_ms=audio_ms,
+            pcm_bytes=len(pcm),
+            streamed=True,
+        )
+        metrics.mark_utterance_sent(
+            pcm_bytes=len(pcm),
+            frame_bytes=uplink_bytes,
+            protocol=UPLINK_AUDIO_BINARY_V1,
+            chunks=uplink_chunks,
+        )
+        return _CapturedUtterance(
+            turn_id=turn_id,
+            pcm=pcm,
+            metrics=metrics,
+            capture_ms=capture_ms,
+            audio_ms=audio_ms,
+            uplink_bytes=uplink_bytes,
+            uplink_chunks=uplink_chunks,
+        )
+
+    def _capture_utterance_to_queue(
+        self,
+        mic: MicStream,
+        send_chunk: Callable[[bytes], None],
+        *,
+        initial_wait_ms: float = 8000,
+    ) -> dict:
+        t0 = time.perf_counter()
         frame_ms = FRAME_SAMPLES / self._sr * 1000.0
         self._vad.reset()
         ep = Endpointer(
@@ -651,15 +728,22 @@ class IntercomClient:
             min_speech_ms=self._cfg.vad.min_speech_ms,
         )
         waited_ms = 0.0
+        sent_len = 0
         while True:
             frame = mic.read()
             done = ep.feed(frame, self._vad.prob(frame))
-            if not ep.started:
+            if ep.started:
+                audio = ep.audio
+                chunk = audio[sent_len:]
+                sent_len = len(audio)
+                if chunk:
+                    send_chunk(chunk)
+            else:
                 waited_ms += frame_ms
                 if waited_ms >= initial_wait_ms:
-                    return b""
+                    return {"pcm": b"", "capture_ms": (time.perf_counter() - t0) * 1000}
             if done or len(ep.audio) / 2 / self._sr >= 30.0:
-                return ep.audio
+                return {"pcm": ep.audio, "capture_ms": (time.perf_counter() - t0) * 1000}
 
     async def _acknowledge(self) -> None:
         # Local wake confirmation only — the intercom has no TTS, so "speak" mode

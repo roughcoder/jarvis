@@ -338,8 +338,8 @@ class BrainConfig(_Base):
     # No-token auth is open (dev/local). On a NON-loopback bind that's unauthenticated
     # network access, so the brain refuses to start unless a token is set OR this is on.
     allow_insecure: bool = False
-    # Intercoms send captured utterances as JSON/base64 PCM. Long utterances can exceed
-    # websockets' 1 MiB default frame cap, so keep the server receive limit explicit.
+    # Intercom voice uplink uses binary PCM chunks. Keep the receive limit explicit
+    # for future larger control/device payloads and to avoid library-default drift.
     websocket_max_size: int = 8 * 1024 * 1024
     websocket_ping_interval_s: float = 20.0
     websocket_ping_timeout_s: float = 60.0
