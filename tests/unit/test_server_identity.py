@@ -302,8 +302,8 @@ def test_streaming_stt_falls_back_when_partial_is_stale(cfg) -> None:  # noqa: A
     assert data["stages"]["stt_stream"]["stale"] is True
 
 
-def test_streaming_stt_drains_stale_snapshot_before_final_stt(cfg) -> None:  # noqa: ANN001
-    async def go() -> tuple[bool, str, dict, list[bytes]]:
+def test_streaming_stt_abandons_running_stale_snapshot_before_final_stt(cfg) -> None:  # noqa: ANN001
+    async def go() -> tuple[bool, bool, str, dict, list[bytes]]:
         server = BrainServer(cfg)
         stt = _CountingSTT()
         server._stt = stt  # type: ignore[assignment]
@@ -338,14 +338,18 @@ def test_streaming_stt_drains_stale_snapshot_before_final_stt(cfg) -> None:  # n
         final_started_before_snapshot_finished = bool(stt.calls)
         release_snapshot.set()
         text, _secs = await running
-        return final_started_before_snapshot_finished, text, trace.data, stt.calls
+        snapshot_cancelled = task.cancelled()
+        return final_started_before_snapshot_finished, snapshot_cancelled, text, trace.data, stt.calls
 
-    final_started_early, text, data, calls = asyncio.run(go())
+    final_started_early, snapshot_cancelled, text, data, calls = asyncio.run(go())
 
-    assert final_started_early is False
+    assert final_started_early is True
+    assert snapshot_cancelled is True
     assert text == "hello"
     assert calls == [b"hello"]
-    assert data["stages"]["stt_stream"]["stale"] is True
+    assert "stt_stream" not in data["stages"]
+    assert data["events"][0]["name"] == "stt_stream_abandoned"
+    assert data["events"][0]["pcm_bytes"] == 3
     assert data["stages"]["stt"]["reused_partial"] is False
 
 
