@@ -7,6 +7,7 @@ grant — the capability gate is.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from jarvis.config import (
@@ -31,6 +32,8 @@ from jarvis.tools.worker import make_worker_tools
 
 __all__ = ["Tool", "ToolError", "ToolRegistry", "build_registry"]
 
+DeviceAction = Callable[[Any, str, dict[str, Any], float], Awaitable[dict[str, Any]]]
+
 
 def build_registry(
     cfg: ToolsConfig,
@@ -43,6 +46,7 @@ def build_registry(
     capabilities: CapabilityConfig | None = None,
     memory: Any | None = None,
     mcp: list[Tool] | None = None,
+    device_action: DeviceAction | None = None,
 ) -> ToolRegistry:
     """Register every tool. `worker` adds the local worker-daemon tools, `remote`
     the cloud (Managed Agents) tools, `mcp` the bridged MCP-server tools (built by
@@ -55,6 +59,7 @@ def build_registry(
     for tool in make_self_tools(
         cfg,
         capabilities or CapabilityConfig(_env_file=None),
+        device_action=device_action,
     ):
         reg.register(tool)
     for tool in make_files_tools(cfg):

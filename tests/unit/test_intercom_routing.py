@@ -8,6 +8,7 @@ is pure logic and pinned here.
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 
@@ -81,6 +82,16 @@ class _Panel:
 
     def take_voice_mode(self) -> str | None:
         return self.modes.pop(0) if self.modes else None
+
+
+class _ControllablePanel(_Panel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.control_thread_id: int | None = None
+
+    def control(self, action: str) -> dict[str, object]:
+        self.control_thread_id = threading.get_ident()
+        return {"status": action}
 
 
 def _client(panel=None) -> IntercomClient:  # noqa: ANN001
@@ -611,3 +622,52 @@ def test_device_request_returns_device_response() -> None:
     got = asyncio.run(go())
     assert got.ok is True
     assert got.result["image_b64"] == "JPEG"
+
+
+def test_panel_control_request_runs_off_event_loop() -> None:
+    panel = _ControllablePanel()
+    c = _client(panel=panel)
+    ws = _WS()
+    main_thread = threading.get_ident()
+
+    async def go() -> DeviceResponse:
+        await c._handle_device_request(
+            ws, DeviceRequest(request_id="r1", action="control_display", args={"action": "hide"})
+        )
+        assert ws.sent
+        msg = decode(ws.sent[0])
+        assert isinstance(msg, DeviceResponse)
+        return msg
+
+    got = asyncio.run(go())
+
+    assert got.ok is True
+    assert got.result["status"] == "hide"
+    assert panel.control_thread_id is not None
+    assert panel.control_thread_id != main_thread
+
+
+def test_device_request_can_run_intercom_local_ip_diagnostics() -> None:
+    c = _client()
+    ws = _WS()
+
+    async def go() -> DeviceResponse:
+        await c._handle_device_request(
+            ws,
+            DeviceRequest(
+                request_id="r1",
+                action="get_ip_address",
+                args={"include_public": False},
+            ),
+        )
+        assert ws.sent
+        msg = decode(ws.sent[0])
+        assert isinstance(msg, DeviceResponse)
+        return msg
+
+    got = asyncio.run(go())
+
+    assert got.ok is True
+    assert "host:" in got.result["text"]
+    assert "local_ipv4:" in got.result["text"]
+    assert "public_ipv4:" not in got.result["text"]

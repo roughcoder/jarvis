@@ -7,104 +7,54 @@ fixed allow-list only.
 
 from __future__ import annotations
 
-import asyncio
+from collections.abc import Awaitable, Callable
 import os
 import platform
-import re
 import socket
-import subprocess
 import sys
-import urllib.request
 from pathlib import Path
 from typing import Any
 
 from jarvis.config import CapabilityConfig, ToolsConfig
+from jarvis.device_diagnostics import (
+    check_tcp_port as check_tcp_port_local,
+    get_ip_address as get_ip_address_local,
+    host_arg,
+    int_arg,
+    ping_host as ping_host_local,
+    repo_root,
+    resolve_dns as resolve_dns_local,
+    run_self_diagnostics as run_self_diagnostics_local,
+)
 from jarvis.runtime import RequestContext
 from jarvis.tools.base import Tool
 
 
 CAP_INSPECT = "self.inspect"
 CAP_DIAGNOSTICS = "self.diagnostics"
-_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,252}$")
 
-
-def _repo_root() -> Path:
-    for parent in Path(__file__).resolve().parents:
-        if (parent / "pyproject.toml").exists() and (parent / "src" / "jarvis").exists():
-            return parent
-    return Path.cwd()
-
-
-def _run(argv: list[str], *, cwd: Path, timeout_s: float, max_bytes: int) -> str:
-    try:
-        proc = subprocess.run(
-            argv,
-            cwd=cwd,
-            text=True,
-            capture_output=True,
-            timeout=timeout_s,
-            check=False,
-        )
-    except FileNotFoundError:
-        return f"$ {' '.join(argv)}\nnot installed"
-    except subprocess.TimeoutExpired:
-        return f"$ {' '.join(argv)}\ntimed out after {timeout_s:.1f}s"
-    out = (proc.stdout or "").strip()
-    err = (proc.stderr or "").strip()
-    body = "\n".join(part for part in (out, err) if part).strip() or "(no output)"
-    if len(body.encode("utf-8")) > max_bytes:
-        body = body.encode("utf-8")[:max_bytes].decode("utf-8", errors="replace") + "\n...[truncated]"
-    return f"$ {' '.join(argv)}\nexit {proc.returncode}\n{body}"
-
-
-def _host_arg(raw: Any) -> str:
-    host = str(raw or "").strip()
-    if not host:
-        raise ValueError("empty host")
-    if "://" in host:
-        raise ValueError("use a hostname or IP address, not a URL")
-    if not _HOST_RE.match(host):
-        raise ValueError("host contains unsupported characters")
-    return host
-
-
-def _int_arg(raw: Any, *, default: int, min_value: int, max_value: int) -> int:
-    try:
-        value = int(raw if raw is not None else default)
-    except (TypeError, ValueError):
-        value = default
-    return max(min_value, min(max_value, value))
-
-
-def _local_ips() -> list[str]:
-    ips: set[str] = set()
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect(("8.8.8.8", 80))
-            ips.add(sock.getsockname()[0])
-    except OSError:
-        pass
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, family=socket.AF_INET):
-            ips.add(info[4][0])
-    except OSError:
-        pass
-    return sorted(ip for ip in ips if not ip.startswith("127."))
-
-
-def _public_ip(timeout_s: float) -> str:
-    try:
-        with urllib.request.urlopen("https://api.ipify.org", timeout=timeout_s) as response:
-            return response.read(64).decode("ascii", errors="replace").strip()
-    except Exception as exc:  # noqa: BLE001 - external network may be unavailable
-        return f"unavailable ({exc})"
+DeviceAction = Callable[[RequestContext, str, dict[str, Any], float], Awaitable[dict[str, Any]]]
 
 
 def make_self_tools(
     cfg: ToolsConfig,
     capabilities: CapabilityConfig,
+    *,
+    device_action: DeviceAction | None = None,
 ) -> list[Tool]:
-    root = _repo_root()
+    root = repo_root()
+
+    async def device_or_local(
+        ctx: RequestContext,
+        action: str,
+        args: dict[str, Any],
+        timeout_s: float,
+        local: Callable[[], Awaitable[str]],
+    ) -> str:
+        if device_action is not None and ctx.device_id != capabilities.device_id:
+            result = await device_action(ctx, action, args, timeout_s)
+            return str(result.get("text") or result)
+        return await local()
 
     def describe_device(ctx: RequestContext, args: dict[str, Any]) -> str:
         del args
@@ -130,91 +80,89 @@ def make_self_tools(
         del args
         timeout = cfg.self_diagnostic_timeout_s
         max_bytes = cfg.self_max_bytes
-        commands = [
-            ["uname", "-a"],
-            ["uptime"],
-            ["df", "-h", str(Path.cwd())],
-            ["sh", "-lc", "command -v pmset >/dev/null && pmset -g batt || true"],
-            ["sh", "-lc", "command -v vm_stat >/dev/null && vm_stat | head -20 || true"],
-            ["sh", "-lc", "ps -o pid,ppid,%cpu,%mem,comm -p $$"],
-        ]
-        command_results = await asyncio.to_thread(
-            lambda: [
-                _run(command, cwd=root, timeout_s=timeout, max_bytes=max_bytes)
-                for command in commands
-            ]
+        diagnostics = await device_or_local(
+            ctx,
+            "run_self_diagnostics",
+            {},
+            max(cfg.timeout_s, timeout * 6),
+            lambda: run_self_diagnostics_local(
+                request_device_id=ctx.device_id,
+                configured_device_id=capabilities.device_id,
+                timeout_s=timeout,
+                max_bytes=max_bytes,
+                root=root,
+            ),
         )
         return "\n".join(
             [
-                "basic_runtime:",
-                f"- host={socket.gethostname()} platform={platform.platform()} python={sys.version.split()[0]}",
-                f"- request_device_id={ctx.device_id} configured_device_id={capabilities.device_id}",
-                f"- cwd={Path.cwd()}",
+                diagnostics,
                 "",
                 "tool_config:",
                 f"- timeout_s={cfg.timeout_s}",
                 f"- max_rounds={cfg.max_rounds}",
                 f"- diagnostic_timeout_s={cfg.self_diagnostic_timeout_s}",
-                "",
-                "terminal_checks:",
-                *command_results,
             ]
         )
 
-    def get_ip_address(ctx: RequestContext, args: dict[str, Any]) -> str:
-        del ctx
+    async def get_ip_address(ctx: RequestContext, args: dict[str, Any]) -> str:
         include_public = bool(args.get("include_public", True))
         timeout = min(max(cfg.self_diagnostic_timeout_s, 0.5), 3.0)
-        local = _local_ips()
-        lines = [
-            f"host: {socket.gethostname()}",
-            "local_ipv4: " + (", ".join(local) if local else "unavailable"),
-        ]
-        if include_public:
-            lines.append(f"public_ipv4: {_public_ip(timeout)}")
-        return "\n".join(lines)
-
-    def ping_host(ctx: RequestContext, args: dict[str, Any]) -> str:
-        del ctx
-        try:
-            host = _host_arg(args.get("host"))
-        except ValueError as exc:
-            return f"error: {exc}"
-        count = _int_arg(args.get("count"), default=4, min_value=1, max_value=10)
-        timeout = max(cfg.self_diagnostic_timeout_s * count, cfg.self_diagnostic_timeout_s + 2.0)
-        return _run(
-            ["ping", "-c", str(count), host],
-            cwd=root,
-            timeout_s=timeout,
-            max_bytes=cfg.self_max_bytes,
+        return await device_or_local(
+            ctx,
+            "get_ip_address",
+            {"include_public": include_public},
+            timeout + 1.0,
+            lambda: get_ip_address_local(include_public=include_public, timeout_s=timeout),
         )
 
-    def resolve_dns(ctx: RequestContext, args: dict[str, Any]) -> str:
-        del ctx
+    async def ping_host(ctx: RequestContext, args: dict[str, Any]) -> str:
         try:
-            host = _host_arg(args.get("host"))
+            host = host_arg(args.get("host"))
         except ValueError as exc:
             return f"error: {exc}"
-        try:
-            infos = socket.getaddrinfo(host, None)
-        except OSError as exc:
-            return f"error: DNS lookup failed for {host}: {exc}"
-        addresses = sorted({item[4][0] for item in infos})
-        return f"{host} resolves to: " + (", ".join(addresses) if addresses else "(no addresses)")
+        count = int_arg(args.get("count"), default=4, min_value=1, max_value=10)
+        timeout = max(cfg.self_diagnostic_timeout_s * count, cfg.self_diagnostic_timeout_s + 2.0)
+        return await device_or_local(
+            ctx,
+            "ping_host",
+            {"host": host, "count": count},
+            timeout + 1.0,
+            lambda: ping_host_local(
+                host=host,
+                count=count,
+                timeout_s=timeout,
+                max_bytes=cfg.self_max_bytes,
+                root=root,
+            ),
+        )
 
-    def check_tcp_port(ctx: RequestContext, args: dict[str, Any]) -> str:
-        del ctx
+    async def resolve_dns(ctx: RequestContext, args: dict[str, Any]) -> str:
         try:
-            host = _host_arg(args.get("host"))
+            host = host_arg(args.get("host"))
         except ValueError as exc:
             return f"error: {exc}"
-        port = _int_arg(args.get("port"), default=443, min_value=1, max_value=65535)
-        timeout = min(max(cfg.self_diagnostic_timeout_s, 0.5), 5.0)
+        return await device_or_local(
+            ctx,
+            "resolve_dns",
+            {"host": host},
+            max(cfg.timeout_s, cfg.self_diagnostic_timeout_s + 1.0),
+            lambda: resolve_dns_local(host=host),
+        )
+
+    async def check_tcp_port(ctx: RequestContext, args: dict[str, Any]) -> str:
         try:
-            with socket.create_connection((host, port), timeout=timeout):
-                return f"{host}:{port} is reachable."
-        except OSError as exc:
-            return f"{host}:{port} is not reachable ({exc})."
+            host = host_arg(args.get("host"))
+        except ValueError as exc:
+            return f"error: {exc}"
+        port = int_arg(args.get("port"), default=443, min_value=1, max_value=65535)
+        timeout = min(max(cfg.self_diagnostic_timeout_s, 0.5), 5.0)
+        return await device_or_local(
+            ctx,
+            "check_tcp_port",
+            {"host": host, "port": port},
+            timeout + 1.0,
+            lambda: check_tcp_port_local(host=host, port=port, timeout_s=timeout),
+        )
 
     obj = "object"
     return [
