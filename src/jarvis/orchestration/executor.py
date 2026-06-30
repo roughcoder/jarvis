@@ -46,6 +46,10 @@ def start_worker_job(
     }
     if envelope.session_id:
         args["session_id"] = envelope.session_id
+    if envelope.cwd:
+        args["cwd"] = envelope.cwd
+    if envelope.branch_name:
+        args["branch"] = envelope.branch_name
     if envelope.repo:
         args["repo"] = envelope.repo
     response = post(
@@ -75,6 +79,7 @@ def start_worker_job(
         session_id=body.get("session_id") or envelope.session_id,
         session_name=body.get("session_name") or envelope.session_name,
         branch=body.get("branch") or "",
+        cwd=body.get("cwd") or envelope.cwd,
     )
     if store is not None:
         store.link_job(envelope.run_id, link)

@@ -660,6 +660,7 @@ def _cmd_work(args: argparse.Namespace) -> int:
         MissingAuthorityError,
         NoEligibleWorkerError,
         OrchestrationService,
+        ResumeRunError,
         StartedWork,
         MissingWorkRepoError,
         WorkAlreadyOwnedError,
@@ -760,12 +761,40 @@ def _cmd_work(args: argparse.Namespace) -> int:
         return 0
 
     if args.work_action == "resume":
-        store = _orch_store(cfg)
-        run = store.get(args.run_id)
-        if run is None:
-            print(f"No run found for {args.run_id!r}.")
+        if args.inspect:
+            store = _orch_store(cfg)
+            if args.run_id in {"latest", "last"}:
+                runs = store.list_runs()
+                run = next((r for r in reversed(runs) if r.jobs), runs[-1] if runs else None)
+            else:
+                run = store.get(args.run_id)
+            if run is None:
+                print(f"No run found for {args.run_id!r}.")
+                return 1
+            print(json.dumps(run.to_dict(), indent=2) if args.json else _format_run(run))
+            return 0
+        try:
+            result = service.resume_run(args.run_id, prompt=" ".join(args.phrase))
+        except MissingAuthorityError as exc:
+            _print_missing_orchestration_authority(exc.actions, cfg, capabilities)
             return 1
-        print(_format_run(run))
+        except NoEligibleWorkerError as exc:
+            print(str(exc) or "No eligible worker found.")
+            return 1
+        except ResumeRunError as exc:
+            print(str(exc))
+            return 1
+        except WorkerDispatchError as exc:
+            print(f"Worker resume failed for {exc.run_id}: {exc.cause}")
+            return 1
+        print(
+            f"Resumed {result.envelope.run_id} on {result.worker.worker_id} "
+            f"with {result.envelope.engine}: worker job {result.job.job_id}"
+        )
+        if result.job.session_name:
+            print(f"Session: {result.job.session_name}")
+        if result.job.branch:
+            print(f"Branch: {result.job.branch}")
         return 0
 
     print(f"Unknown work action {args.work_action!r}.")
@@ -2086,9 +2115,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_pr_comments.add_argument("--source", choices=["github"], default="")
     p_pr_comments.add_argument("--json", action="store_true")
     p_pr_comments.set_defaults(func=_cmd_work)
-    p_work_resume = work_sub.add_parser("resume", help="Show a run to resume or inspect")
-    p_work_resume.add_argument("run_id")
+    p_work_resume = work_sub.add_parser("resume", help="Resume a prior orchestration run")
+    p_work_resume.add_argument("run_id", nargs="?", default="latest", help="Run id, unique prefix, latest, or last")
+    p_work_resume.add_argument("phrase", nargs="*", help="Optional follow-up instruction for the resumed session")
     p_work_resume.add_argument("--source", default="")
+    p_work_resume.add_argument("--inspect", action="store_true", help="Show the run instead of starting a resume job")
+    p_work_resume.add_argument("--json", action="store_true")
     p_work_resume.set_defaults(func=_cmd_work)
 
     p_schedules = sub.add_parser("schedules", help="List/add/tick scheduled WorkCommands")

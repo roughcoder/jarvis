@@ -163,6 +163,7 @@ class ExecutionEnvelope:
     engine_strategy: str = "single"
     base_ref: str = "main"
     branch_name: str = ""
+    cwd: str = ""
     session_id: str = ""
     session_name: str = ""
     resume_session: bool = False

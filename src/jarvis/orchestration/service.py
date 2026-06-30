@@ -10,6 +10,7 @@ from jarvis.orchestration.models import ExecutionEnvelope, WorkCommand, WorkItem
 from jarvis.orchestration.policy import required_for_command, required_for_worker_dispatch
 from jarvis.orchestration.sources import WorkSource
 from jarvis.orchestration.store import ActiveWorkItemError, OrchestrationStore
+from jarvis.orchestration.supervisor import sync_run_jobs
 from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry
 
 
@@ -46,6 +47,10 @@ class MissingWorkRepoError(RuntimeError):
         self.item = item
         self.run_id = run_id
         super().__init__("work item has no repo/default repo; cannot start a coding worker")
+
+
+class ResumeRunError(RuntimeError):
+    pass
 
 
 @dataclass
@@ -134,6 +139,56 @@ class OrchestrationService:
 
         return StartedWork(item=item, worker=worker, envelope=envelope, job=job)
 
+    def resume_run(self, run_ref: str = "latest", *, prompt: str = "") -> StartedWork:
+        self._require(required_for_command("resume_run", "jarvis"))
+        self._require(required_for_worker_dispatch(self.cfg.orchestration.landing_mode))
+        store = OrchestrationStore(self.cfg.orchestration.workspace)
+        run = _resolve_run(store, run_ref)
+        if run is None:
+            raise ResumeRunError(f"No run found for {run_ref!r}.")
+
+        sync_run_jobs(store, worker_cfg=self.cfg.worker, run_id=run.run_id)
+        run = store.get(run.run_id) or run
+        running = next((job for job in reversed(run.jobs) if job.status == "running"), None)
+        if running is not None:
+            raise ResumeRunError(f"Run {run.run_id} already has running worker job {running.job_id}.")
+        previous = _resume_job(run.jobs)
+        if previous is None:
+            raise ResumeRunError(f"Run {run.run_id} has no resumable worker session.")
+        if not previous.cwd:
+            raise ResumeRunError(f"Run {run.run_id} has no worker cwd to resume.")
+
+        registry = WorkerRegistry(self.cfg.worker, profiles_path=self.cfg.orchestration.workers_path)
+        worker = registry.get(previous.worker_id, probe=True)
+        if worker is None:
+            raise NoEligibleWorkerError(f"Worker {previous.worker_id!r} is not configured.")
+        if not _worker_is_eligible(worker, engine=previous.engine):
+            raise NoEligibleWorkerError("No eligible worker found.")
+
+        item = run.work_items[0].item if run.work_items else WorkItem(source="jarvis", id=run.run_id, title=run.objective)
+        envelope = ExecutionEnvelope(
+            run_id=run.run_id,
+            repo=item.repo,
+            prompt=_resume_prompt(run.objective, prompt),
+            worker_id=previous.worker_id,
+            engine=previous.engine,
+            engine_strategy="single",
+            branch_name=previous.branch,
+            cwd=previous.cwd,
+            session_id=previous.session_id,
+            session_name=previous.session_name,
+            resume_session=True,
+            allowed_actions=required_for_worker_dispatch(self.cfg.orchestration.landing_mode),
+        )
+        store.append_event(run.run_id, "execution_envelope_created", "Resume execution envelope created", envelope.to_dict())
+        store.set_phase(run.run_id, "running", f"Resuming worker session {previous.session_name or previous.session_id}")
+        try:
+            job = executor.start_worker_job(envelope, worker_cfg=self.cfg.worker, worker=worker, store=store)
+        except Exception as exc:  # noqa: BLE001 - dispatch failure must leave an inspectable run
+            store.set_phase(envelope.run_id, "failed", f"Worker resume dispatch failed: {exc}")
+            raise WorkerDispatchError(envelope.run_id, exc) from exc
+        return StartedWork(item=item, worker=worker, envelope=envelope, job=job)
+
     def _require(self, actions: list[str]) -> None:
         denied = [
             action
@@ -159,3 +214,31 @@ def _worker_is_eligible(worker: WorkerProfile, required: list[str] | None = None
     if engine and not worker_supports_engine(worker.supported_engines, engine):
         return False
     return set(required or []).issubset(set(worker.capabilities))
+
+
+def _resolve_run(store: OrchestrationStore, run_ref: str):
+    ref = (run_ref or "latest").strip()
+    runs = store.list_runs()
+    if ref in {"latest", "last"}:
+        return next((run for run in reversed(runs) if run.jobs), runs[-1] if runs else None)
+    return store.get(ref)
+
+
+def _resume_job(jobs: list[WorkerJobLink]) -> WorkerJobLink | None:
+    for job in reversed(jobs):
+        if job.session_id and job.status != "running":
+            return job
+    return None
+
+
+def _resume_prompt(objective: str, prompt: str) -> str:
+    follow_up = prompt.strip() or "Continue the previous Jarvis worker job. Inspect the current workspace, continue from the existing state, run the appropriate verification, and report evidence plus known gaps."
+    return "\n".join(
+        [
+            "Resume this Jarvis orchestration run.",
+            f"Original objective: {objective}",
+            "",
+            "Follow-up instruction:",
+            follow_up,
+        ]
+    )

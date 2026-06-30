@@ -113,6 +113,13 @@ Default command semantics:
 - `resume`, `continue` -> find the existing run/session before starting new work.
 - `blocked`, `stalled`, `what's running` -> inspect Jarvis run graph state.
 
+Resume execution uses the run graph, not tracker state: Jarvis finds the prior
+run, syncs linked worker jobs, selects the latest completed/interrupted job with
+an engine `session_id`, and dispatches a follow-up job to the same `worker_id`,
+`engine`, `session_name`, `session_id`, branch, and worker-owned cwd with
+`resume_session: true`. If the prior job is still running, has no session id, or
+its workspace has been cleaned up, the run is not resumed automatically.
+
 ### Run graph
 
 The durable unit is an `OrchestrationRun`, not a one-ticket-one-PR record:

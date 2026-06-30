@@ -227,6 +227,86 @@ def test_daemon_code_dispatch_resumes_claude_session(tmp_path) -> None:
     assert "-p --resume 550e8400-e29b-41d4-a716-446655440000 follow up" in job["output"]
 
 
+def test_daemon_resume_uses_worker_owned_cwd_without_cleanup_ownership(tmp_path) -> None:
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="",
+        workspace=str(tmp_path / "worker"),
+        claude_bin="echo",
+        supported_engines="codex,claude",
+    )
+    reused = tmp_path / "worker" / "worktrees" / "jarvis-existing"
+    reused.mkdir(parents=True)
+
+    async def calls(base, c):  # noqa: ANN001
+        disp = (
+            await c.post(
+                base + "/run",
+                json={
+                    "action": "code",
+                    "args": {
+                        "prompt": "follow up",
+                        "agent": "claude",
+                        "session_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "resume_session": True,
+                        "cwd": str(reused),
+                        "branch": "jarvis/existing",
+                    },
+                },
+            )
+        ).json()
+        jid = disp["job_id"]
+        job = {}
+        for _ in range(100):
+            job = (await c.get(f"{base}/jobs/{jid}")).json()
+            if job["status"] != "running":
+                break
+            await asyncio.sleep(0.02)
+        cleaned = (await c.post(base + "/run", json={"action": "cleanup", "args": {"job": jid}})).json()
+        return disp, job, cleaned
+
+    disp, job, cleaned = asyncio.run(_with_server(cfg, 8823, calls))
+
+    assert disp["cwd"] == str(reused)
+    assert disp["branch"] == "jarvis/existing"
+    assert job["cwd"] == str(reused)
+    assert job["cleanup_owned"] is False
+    assert cleaned["cleaned"] == [job["name"]]
+    assert reused.exists()
+
+
+def test_daemon_resume_rejects_cwd_outside_worker_workspace(tmp_path) -> None:
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="",
+        workspace=str(tmp_path / "worker"),
+        claude_bin="echo",
+        supported_engines="codex,claude",
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    async def calls(base, c):  # noqa: ANN001
+        return await c.post(
+            base + "/run",
+            json={
+                "action": "code",
+                "args": {
+                    "prompt": "follow up",
+                    "agent": "claude",
+                    "session_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "resume_session": True,
+                    "cwd": str(outside),
+                },
+            },
+        )
+
+    response = asyncio.run(_with_server(cfg, 8824, calls))
+
+    assert response.status_code == 400
+    assert "refusing to resume outside worker-owned workspace" in response.json()["error"]
+
+
 def test_daemon_rejects_unsupported_code_engine(tmp_path) -> None:
     cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"), codex_bin="echo")
 

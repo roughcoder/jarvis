@@ -153,6 +153,9 @@ class OrchestrationStore:
         if phase in {"done", "completed", "failed", "blocked", "cancelled", "needs_human"}:
             run.status = "terminal"
             run.terminal_reason = message
+        else:
+            run.status = "active"
+            run.terminal_reason = ""
         self.save(run)
         self.append_event(run_id, "phase_changed", message or f"Phase changed to {phase}", {"phase": phase})
         return run
