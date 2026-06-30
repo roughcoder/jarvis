@@ -5,6 +5,15 @@ from typing import Any, Protocol
 
 from jarvis.config import WorkerConfig
 from jarvis.worker.sessions import SessionEvent, SessionManager, WorkerSession
+from jarvis.worker_session_contract import (
+    EVENT_APPROVAL_RESOLVED,
+    EVENT_CHECKPOINT_RESTORED,
+    EVENT_INPUT_RECEIVED,
+    EVENT_SESSION_INTERRUPTED,
+    EVENT_SESSION_STOPPED,
+    SESSION_INTERRUPTED,
+    SESSION_STOPPED,
+)
 
 
 @dataclass
@@ -38,7 +47,7 @@ class ProviderAdapter(Protocol):
         request: dict[str, Any],
         sessions: SessionManager,
     ) -> SessionEvent:
-        return sessions.append_event(session.session_id, "input.received", request)
+        return sessions.append_event(session.session_id, EVENT_INPUT_RECEIVED, request)
 
     def resolve_approval(
         self,
@@ -47,16 +56,16 @@ class ProviderAdapter(Protocol):
         request: dict[str, Any],
         sessions: SessionManager,
     ) -> SessionEvent:
-        return sessions.append_event(session.session_id, "approval.resolved", request)
+        return sessions.append_event(session.session_id, EVENT_APPROVAL_RESOLVED, request)
 
     def interrupt(self, *, session: WorkerSession, sessions: SessionManager) -> tuple[WorkerSession, SessionEvent]:
-        updated = sessions.update_status(session.session_id, "interrupted")
-        event = sessions.append_event(updated.session_id, "session.interrupted", {"status": "interrupted"})
+        updated = sessions.update_status(session.session_id, SESSION_INTERRUPTED)
+        event = sessions.append_event(updated.session_id, EVENT_SESSION_INTERRUPTED, {"status": SESSION_INTERRUPTED})
         return updated, event
 
     def stop(self, *, session: WorkerSession, sessions: SessionManager) -> tuple[WorkerSession, SessionEvent]:
-        updated = sessions.update_status(session.session_id, "stopped")
-        event = sessions.append_event(updated.session_id, "session.stopped", {"status": "stopped"})
+        updated = sessions.update_status(session.session_id, SESSION_STOPPED)
+        event = sessions.append_event(updated.session_id, EVENT_SESSION_STOPPED, {"status": SESSION_STOPPED})
         return updated, event
 
     def restore_checkpoint(
@@ -66,4 +75,4 @@ class ProviderAdapter(Protocol):
         request: dict[str, Any],
         sessions: SessionManager,
     ) -> SessionEvent:
-        return sessions.append_event(session.session_id, "checkpoint.restored", request)
+        return sessions.append_event(session.session_id, EVENT_CHECKPOINT_RESTORED, request)

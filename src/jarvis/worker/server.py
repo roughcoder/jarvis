@@ -52,6 +52,20 @@ from jarvis.worker.actions import (
 from jarvis.worker.jobs import JobManager, slugify
 from jarvis.worker.providers import ProviderTurn, provider_for
 from jarvis.worker.sessions import SessionManager
+from jarvis.worker_session_contract import (
+    CHECKPOINT_ID_KEY,
+    EVENT_APPROVAL_RESOLVED,
+    EVENT_CHECKPOINT_RESTORED,
+    EVENT_INPUT_RECEIVED,
+    EVENT_SESSION_INTERRUPTED,
+    EVENT_SESSION_STOPPED,
+    EVENT_TURN_FAILED,
+    EVENT_TURN_STARTED,
+    SESSION_FAILED,
+    SESSION_INTERRUPTED,
+    SESSION_RUNNING,
+    SESSION_STOPPED,
+)
 
 
 def _peekaboo_env(cfg: WorkerConfig) -> dict:
@@ -453,10 +467,10 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             body = await request.json()
         except Exception:
             return web.json_response({"error": "bad json"}, status=400)
-        checkpoint_id = str(body.get("checkpoint_id") or "").strip()
+        checkpoint_id = str(body.get(CHECKPOINT_ID_KEY) or "").strip()
         if not checkpoint_id:
             return web.json_response({"error": "checkpoint_id is required"}, status=400)
-        known = {x["checkpoint_id"] for x in sessions.checkpoints(session.session_id)}
+        known = {x[CHECKPOINT_ID_KEY] for x in sessions.checkpoints(session.session_id)}
         if checkpoint_id not in known:
             return web.json_response({"error": "no such checkpoint"}, status=404)
         try:
@@ -464,9 +478,9 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         except ValueError as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
         handler = getattr(adapter, "restore_checkpoint", None)
-        request_data = {"checkpoint_id": checkpoint_id, "metadata": dict(body.get("metadata") or {})}
+        request_data = {CHECKPOINT_ID_KEY: checkpoint_id, "metadata": dict(body.get("metadata") or {})}
         if handler is None:
-            event = sessions.append_event(session.session_id, "checkpoint.restored", request_data)
+            event = sessions.append_event(session.session_id, EVENT_CHECKPOINT_RESTORED, request_data)
         else:
             event = handler(session=session, request=request_data, sessions=sessions)
         return web.json_response({"ok": True, "event": event.to_dict()})
@@ -500,10 +514,10 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             adapter = provider_for(session.provider)
         except ValueError as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
-        sessions.update_status(session.session_id, "running")
+        sessions.update_status(session.session_id, SESSION_RUNNING)
         started = sessions.append_event(
             session.session_id,
-            "turn.started",
+            EVENT_TURN_STARTED,
             {
                 "turn_id": turn_id,
                 "prompt": str(body.get("prompt") or ""),
@@ -524,10 +538,10 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 worker_cfg=cfg,
             )
         except RuntimeError as exc:
-            sessions.update_status(session.session_id, "failed")
+            sessions.update_status(session.session_id, SESSION_FAILED)
             failed = sessions.append_event(
                 session.session_id,
-                "turn.failed",
+                EVENT_TURN_FAILED,
                 {"turn_id": turn_id, "idempotency_key": idempotency_key, "error": str(exc)},
             )
             return web.json_response(
@@ -651,7 +665,7 @@ async def _provider_control_event(
     else:
         handler = getattr(adapter, "receive_input", None)
     if handler is None:
-        event_type = "approval.resolved" if action == "approval" else "input.received"
+        event_type = EVENT_APPROVAL_RESOLVED if action == "approval" else EVENT_INPUT_RECEIVED
         event = sessions.append_event(session.session_id, event_type, dict(body or {}))
     else:
         try:
@@ -680,8 +694,8 @@ async def _provider_terminal_event(
         return web.json_response({"ok": False, "error": str(exc)}, status=400)
     handler = getattr(adapter, action, None)
     if handler is None:
-        status = "stopped" if action == "stop" else "interrupted"
-        event_type = "session.stopped" if action == "stop" else "session.interrupted"
+        status = SESSION_STOPPED if action == "stop" else SESSION_INTERRUPTED
+        event_type = EVENT_SESSION_STOPPED if action == "stop" else EVENT_SESSION_INTERRUPTED
         updated = sessions.update_status(session.session_id, status)
         event = sessions.append_event(session.session_id, event_type, {"status": status})
     else:
