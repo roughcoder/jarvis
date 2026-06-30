@@ -299,6 +299,54 @@ def test_streaming_stt_falls_back_when_partial_is_stale(cfg) -> None:  # noqa: A
     assert data["stages"]["stt"]["streaming"] is True
     assert data["stages"]["stt"]["reused_partial"] is False
     assert data["stages"]["stt_stream"]["pcm_bytes"] == 3
+    assert data["stages"]["stt_stream"]["stale"] is True
+
+
+def test_streaming_stt_drains_stale_snapshot_before_final_stt(cfg) -> None:  # noqa: ANN001
+    async def go() -> tuple[bool, str, dict, list[bytes]]:
+        server = BrainServer(cfg)
+        stt = _CountingSTT()
+        server._stt = stt  # type: ignore[assignment]
+        trace = TurnTrace(room="default", speaker="house")
+        release_snapshot = asyncio.Event()
+
+        async def stale_snapshot() -> dict:
+            await release_snapshot.wait()
+            return {
+                "text": "hel",
+                "ms": 12.0,
+                "pcm_bytes": 3,
+                "audio_s": 0.1,
+                "chars": 3,
+            }
+
+        task = asyncio.create_task(stale_snapshot())
+        msg = BufferedAudioTurn(
+            turn_id="t1",
+            sample_rate=16000,
+            pcm=b"hello",
+            chunks=1,
+            frame_bytes=5,
+            stream_ms=10,
+            streaming_stt_task=task,
+            streaming_stt_pcm_bytes=3,
+            streaming_stt_partial_runs=1,
+        )
+
+        running = asyncio.create_task(server._transcribe_buffered_audio(msg, trace))
+        await asyncio.sleep(0)
+        final_started_before_snapshot_finished = bool(stt.calls)
+        release_snapshot.set()
+        text, _secs = await running
+        return final_started_before_snapshot_finished, text, trace.data, stt.calls
+
+    final_started_early, text, data, calls = asyncio.run(go())
+
+    assert final_started_early is False
+    assert text == "hello"
+    assert calls == [b"hello"]
+    assert data["stages"]["stt_stream"]["stale"] is True
+    assert data["stages"]["stt"]["reused_partial"] is False
 
 
 class _Contexts:
