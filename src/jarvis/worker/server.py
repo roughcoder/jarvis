@@ -25,8 +25,15 @@ import uuid
 
 from aiohttp import web
 
+from jarvis.capabilities import (
+    WORKER_SESSION_APPROVE,
+    WORKER_SESSION_INPUT,
+    WORKER_SESSION_INTERRUPT,
+    WORKER_SESSION_STOP,
+)
 from jarvis.config import WorkerConfig
 from jarvis.engines import engine_ids, normalize_engine_id, worker_supports_engine
+from jarvis.worker.authority import WorkerSessionAuthority
 from jarvis.worker.actions import (
     capture_screen_jpeg_b64,
     cleanup_job,
@@ -627,6 +634,10 @@ async def _provider_control_event(
     session = sessions.get(session_id)
     if session is None:
         return web.json_response({"error": "no such session"}, status=404)
+    required_action = WORKER_SESSION_APPROVE if action == "approval" else WORKER_SESSION_INPUT
+    authority_error = _require_session_authority(session, required_action)
+    if authority_error:
+        return authority_error
     try:
         body = await request.json()
     except Exception:
@@ -659,6 +670,10 @@ async def _provider_terminal_event(
     session = sessions.get(session_id)
     if session is None:
         return web.json_response({"error": "no such session"}, status=404)
+    required_action = WORKER_SESSION_STOP if action == "stop" else WORKER_SESSION_INTERRUPT
+    authority_error = _require_session_authority(session, required_action)
+    if authority_error:
+        return authority_error
     try:
         adapter = provider_for(session.provider)
     except ValueError as exc:
@@ -672,6 +687,15 @@ async def _provider_terminal_event(
     else:
         updated, event = handler(session=session, sessions=sessions)
     return web.json_response({"ok": True, "session": updated.to_dict(), "event": event.to_dict()})
+
+
+def _require_session_authority(session, action: str) -> web.Response | None:  # noqa: ANN001
+    try:
+        authority = WorkerSessionAuthority.from_session(session, provider=session.provider)
+        authority.require(action)
+    except RuntimeError as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    return None
 
 
 async def _terminal_session_event(

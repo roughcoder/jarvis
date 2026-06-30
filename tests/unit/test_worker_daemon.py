@@ -24,6 +24,8 @@ from jarvis.capabilities import (  # noqa: E402
     FORGE_PR_CREATE,
     WORKER_SESSION_APPROVE,
     WORKER_SESSION_INPUT,
+    WORKER_SESSION_INTERRUPT,
+    WORKER_SESSION_STOP,
     WORKER_SESSION_TURN,
 )
 from jarvis.config import WorkerConfig  # noqa: E402
@@ -45,8 +47,9 @@ async def _with_server(cfg: WorkerConfig, port: int, fn):  # noqa: ANN001
         await runner.cleanup()
 
 
-def _authority_metadata(engine: str = "codex") -> dict:
+def _authority_metadata(engine: str = "codex", extra_actions: list[str] | None = None) -> dict:
     allowed_actions = ["worker.session.create", "worker.session.turn", "forge.github.branch.push"]
+    allowed_actions.extend(extra_actions or [])
     landing = {"mode": "branch_only", "allow_merge": False}
     return {
         "execution_envelope": {
@@ -242,6 +245,10 @@ def test_daemon_session_api_records_structured_events(tmp_path) -> None:
                     "repo": "roughcoder/jarvis",
                     "branch": "jarvis/live-session",
                     "title": "Fix worker sessions",
+                    "metadata": _authority_metadata(
+                        "fake",
+                        extra_actions=[WORKER_SESSION_APPROVE, WORKER_SESSION_INTERRUPT],
+                    ),
                 },
                 headers=headers,
             )
@@ -326,6 +333,52 @@ def test_daemon_session_api_records_structured_events(tmp_path) -> None:
     assert fetched["status"] == "interrupted"
 
 
+def test_daemon_session_controls_require_envelope_authority(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "provider": "fake",
+                    "engine": "fake",
+                    "title": "Missing control authority",
+                    "metadata": _authority_metadata("fake"),
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        approval = await c.post(
+            f"{base}/sessions/{session_id}/approval",
+            json={"request_id": "approval_1", "decision": "approved"},
+            headers=headers,
+        )
+        user_input = await c.post(
+            f"{base}/sessions/{session_id}/input",
+            json={"request_id": "input_1", "text": "continue"},
+            headers=headers,
+        )
+        interrupted = await c.post(f"{base}/sessions/{session_id}/interrupt", json={}, headers=headers)
+        stopped = await c.post(f"{base}/sessions/{session_id}/stop", json={}, headers=headers)
+        events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+        return approval, user_input, interrupted, stopped, events
+
+    approval, user_input, interrupted, stopped, events = asyncio.run(_with_server(cfg, 8838, calls))
+
+    assert approval.status_code == 400
+    assert user_input.status_code == 400
+    assert interrupted.status_code == 400
+    assert stopped.status_code == 400
+    assert WORKER_SESSION_APPROVE in approval.json()["error"]
+    assert WORKER_SESSION_INPUT in user_input.json()["error"]
+    assert WORKER_SESSION_INTERRUPT in interrupted.json()["error"]
+    assert WORKER_SESSION_STOP in stopped.json()["error"]
+    assert [event["type"] for event in events] == ["session.created"]
+
+
 def test_daemon_session_creation_provisions_repo_worktree(tmp_path) -> None:
     dev = tmp_path / "dev"
     repo = dev / "jarvis"
@@ -383,7 +436,15 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
         created = (
             await c.post(
                 base + "/sessions",
-                json={"provider": "fake", "engine": "fake", "title": "Pending request"},
+                json={
+                    "provider": "fake",
+                    "engine": "fake",
+                    "title": "Pending request",
+                    "metadata": _authority_metadata(
+                        "fake",
+                        extra_actions=[WORKER_SESSION_APPROVE, WORKER_SESSION_INPUT],
+                    ),
+                },
                 headers=headers,
             )
         ).json()
@@ -652,7 +713,7 @@ for line in sys.stdin:
                     "provider": "codex",
                     "engine": "codex",
                     "title": "Interrupt Codex",
-                    "metadata": _authority_metadata("codex"),
+                    "metadata": _authority_metadata("codex", extra_actions=[WORKER_SESSION_INTERRUPT]),
                 },
                 headers=headers,
             )
@@ -731,7 +792,7 @@ for line in sys.stdin:
                     "provider": "codex",
                     "engine": "codex",
                     "title": "Stop Codex",
-                    "metadata": _authority_metadata("codex"),
+                    "metadata": _authority_metadata("codex", extra_actions=[WORKER_SESSION_STOP]),
                 },
                 headers=headers,
             )
