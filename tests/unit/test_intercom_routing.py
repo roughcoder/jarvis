@@ -352,6 +352,28 @@ def test_network_probe_can_be_disabled_for_lan_only_installs() -> None:
     assert c._network_online() is True
 
 
+def test_network_probe_failure_does_not_block_brain_reconnect() -> None:
+    panel = _Panel()
+    c = _client(panel)
+    recovered = False
+
+    c._network_online = lambda: False  # type: ignore[method-assign]
+
+    async def fake_recover() -> None:
+        nonlocal recovered
+        recovered = True
+
+    c._recover_network_if_needed = fake_recover  # type: ignore[method-assign]
+
+    async def go() -> None:
+        await c._ensure_network_ready()
+
+    asyncio.run(go())
+
+    assert panel.states == ["network"]
+    assert recovered is True
+
+
 def test_interrupted_stay_mode_silence_keeps_listening_without_idle() -> None:
     c = _client()
     q: asyncio.Queue = asyncio.Queue()
