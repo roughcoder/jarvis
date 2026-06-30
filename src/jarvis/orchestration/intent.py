@@ -31,9 +31,9 @@ def parse_work_command(text: str) -> WorkCommand:
     if "blocked" in t or "stalled" in t:
         return WorkCommand("inspect_blocked", source="jarvis", autonomy="read_only", target_worker_id=target, target_engine_id=engine)
     if "fix" in t or "address" in t or "handle" in t:
-        kind = "pull_request" if _mentions_pr(t) or _has_word(t, "review") or _has_word(t, "comment") else "issue"
+        kind = "pull_request" if _mentions_pr(t) or _has_word(t, "review") or _mentions_comment(t) else "issue"
         return WorkCommand("start_selected_work", source=source, kind=kind, filters=filters, autonomy="start_if_unambiguous", start=True, target_worker_id=target, target_engine_id=engine)
-    if _has_word(t, "comment") and _mentions_pr(t):
+    if _mentions_comment(t) and _mentions_pr(t):
         return WorkCommand("inspect_pr_comments", source="github", kind="pull_request", filters=filters, autonomy="read_only", target_worker_id=target, target_engine_id=engine)
     if "get" in t or "take" in t or "pick up" in t or "start" in t or "work on" in t:
         kind = "ticket" if source == "linear" else "issue"
@@ -76,6 +76,10 @@ def _source_target(text: str) -> str:
 
 def _mentions_pr(text: str) -> bool:
     return bool(re.search(r"\b(?:pr|prs|pull request|pull requests)\b", text))
+
+
+def _mentions_comment(text: str) -> bool:
+    return bool(re.search(r"\bcomments?\b", text))
 
 
 def _has_word(text: str, word: str) -> bool:

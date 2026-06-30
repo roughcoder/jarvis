@@ -236,6 +236,16 @@ def test_parse_work_command_handles_terse_linear_ticket_list() -> None:
     assert cmd.start is False
 
 
+@pytest.mark.parametrize("phrase", ["pr comment", "show PR comments"])
+def test_parse_work_command_handles_pr_comment_singular_and_plural(phrase: str) -> None:
+    cmd = parse_work_command(phrase)
+
+    assert cmd.operation == "inspect_pr_comments"
+    assert cmd.source == "github"
+    assert cmd.kind == "pull_request"
+    assert cmd.start is False
+
+
 @pytest.mark.parametrize("phrase", ["improve performance", "project cleanup"])
 def test_parse_work_command_keeps_direct_phrases_with_pr_substrings_direct(phrase: str) -> None:
     cmd = parse_work_command(phrase)
