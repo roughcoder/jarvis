@@ -681,11 +681,10 @@ class BrainServer:
         secs = len(pcm) / 2 / msg.sample_rate
         task = msg.streaming_stt_task
         partial: dict | None = None
-        if task is not None and (
-            task.done() or msg.streaming_stt_pcm_bytes == len(pcm)
-        ):
+        if task is not None:
             try:
                 partial = await task
+                stale = int(partial.get("pcm_bytes") or 0) != len(pcm)
                 trace.stage(
                     "stt_stream",
                     partial.get("ms", 0.0),
@@ -693,6 +692,7 @@ class BrainServer:
                     chars=partial.get("chars", 0),
                     pcm_bytes=partial.get("pcm_bytes", 0),
                     partial_runs=msg.streaming_stt_partial_runs,
+                    stale=stale,
                 )
             except Exception as exc:  # noqa: BLE001 - final STT below still recovers
                 trace.event("stt_stream_error", error=type(exc).__name__)
