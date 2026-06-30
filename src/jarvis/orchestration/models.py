@@ -99,6 +99,25 @@ class WorkerJobLink:
 
 
 @dataclass
+class WorkerSessionLink:
+    worker_id: str
+    session_id: str
+    status: str = "created"
+    provider: str = "codex"
+    engine: str = "codex"
+    branch: str = ""
+    cwd: str = ""
+    last_event_id: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> WorkerSessionLink:
+        return _coerce(cls, data)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class Artifact:
     type: str
     id: str = ""
@@ -195,6 +214,7 @@ class OrchestrationRun:
     child_run_ids: list[str] = field(default_factory=list)
     work_items: list[WorkItemLink] = field(default_factory=list)
     jobs: list[WorkerJobLink] = field(default_factory=list)
+    sessions: list[WorkerSessionLink] = field(default_factory=list)
     artifacts: list[Artifact] = field(default_factory=list)
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
@@ -211,6 +231,7 @@ class OrchestrationRun:
             child_run_ids=list(data.get("child_run_ids", [])),
             work_items=[WorkItemLink.from_dict(x) for x in data.get("work_items", [])],
             jobs=[WorkerJobLink.from_dict(x) for x in data.get("jobs", [])],
+            sessions=[WorkerSessionLink.from_dict(x) for x in data.get("sessions", [])],
             artifacts=[Artifact.from_dict(x) for x in data.get("artifacts", [])],
             created_at=data.get("created_at", utc_now()),
             updated_at=data.get("updated_at", utc_now()),
@@ -227,6 +248,7 @@ class OrchestrationRun:
             "child_run_ids": self.child_run_ids,
             "work_items": [x.to_dict() for x in self.work_items],
             "jobs": [x.to_dict() for x in self.jobs],
+            "sessions": [x.to_dict() for x in self.sessions],
             "artifacts": [x.to_dict() for x in self.artifacts],
             "created_at": self.created_at,
             "updated_at": self.updated_at,

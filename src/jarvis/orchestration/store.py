@@ -13,6 +13,7 @@ from jarvis.orchestration.models import (
     WorkItem,
     WorkItemLink,
     WorkerJobLink,
+    WorkerSessionLink,
     new_id,
     utc_now,
 )
@@ -185,6 +186,52 @@ class OrchestrationStore:
         self.save(run)
         self.append_event(run_id, "job_started", f"Worker job {job.job_id} started", job.to_dict())
         return run
+
+    def link_session(self, run_id: str, session: WorkerSessionLink) -> OrchestrationRun:
+        run = self.get(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        existing = next((x for x in run.sessions if x.session_id == session.session_id), None)
+        if existing is None:
+            run.sessions.append(session)
+        else:
+            existing.status = session.status
+            existing.provider = session.provider
+            existing.engine = session.engine
+            existing.branch = session.branch
+            existing.cwd = session.cwd
+            existing.last_event_id = session.last_event_id
+        if run.phase in {"created", "claimed", "provisioned"}:
+            run.phase = "running"
+        self.save(run)
+        self.append_event(run_id, "session_started", f"Worker session {session.session_id} started", session.to_dict())
+        return run
+
+    def update_session(self, run_id: str, session_id: str, **updates: str) -> OrchestrationRun:
+        with self._locked():
+            run = self.get(run_id)
+            if run is None:
+                raise KeyError(run_id)
+            session = next((x for x in run.sessions if x.session_id == session_id), None)
+            if session is None:
+                raise KeyError(session_id)
+            changed: dict[str, str] = {}
+            for field in ("status", "provider", "engine", "branch", "cwd", "last_event_id"):
+                value = updates.get(field)
+                if value is None:
+                    continue
+                if getattr(session, field) != value:
+                    setattr(session, field, value)
+                    changed[field] = value
+            if changed:
+                self.save(run)
+                self.append_event(
+                    run_id,
+                    "session_updated",
+                    f"Worker session {session_id} updated",
+                    {"session_id": session_id, **changed},
+                )
+            return run
 
     def reserve_job_if_idle(self, run_id: str, job: WorkerJobLink) -> OrchestrationRun:
         with self._locked():

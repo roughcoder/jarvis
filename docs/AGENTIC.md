@@ -37,7 +37,7 @@ separate product features.
 
 ```
 WorkSource -> WorkCommand -> OrchestrationRun -> ExecutionEnvelope
-  -> WorkerJob(s) -> Branch/PR/comment artifacts -> WorkSource update -> Report
+  -> WorkerSession(s) -> Branch/PR/comment artifacts -> WorkSource update -> Report
 ```
 
 **Jarvis, not the tracker, owns orchestration state.** Linear/GitHub are public
@@ -127,7 +127,8 @@ The durable unit is an `OrchestrationRun`, not a one-ticket-one-PR record:
 ```
 OrchestrationRun
   -> WorkItems[]     # primary, related, blocks, blocked_by, follow_up
-  -> WorkerJobs[]    # worker_id + job_id + engine session/resume handle
+  -> WorkerSessions[] # live provider sessions and event streams
+  -> WorkerJobs[]    # compatibility path for one-shot CLI jobs
   -> Artifacts[]     # branches, PRs, comments, evidence
   -> Events[]        # append-only audit trail
   -> ChildRuns[]     # campaigns or split delivery
@@ -136,7 +137,9 @@ OrchestrationRun
 Rules:
 
 - One active **primary owner** run per work item.
-- A run may own many work items, jobs, and artifacts.
+- A run may own many work items, sessions, jobs, and artifacts.
+- New agentic work should prefer `WorkerSession`; `WorkerJob` remains the
+  compatibility path for one-shot CLI work and existing tools.
 - A work item may appear as related context in other runs.
 - Large objectives become parent campaign runs with bounded child runs.
 - `events.jsonl` is the audit trail; `run.json` is the current view.
@@ -163,6 +166,16 @@ Example run graph for one ticket producing one PR:
         "status": "In Progress",
         "labels": ["worker"]
       }
+    }
+  ],
+  "sessions": [
+    {
+      "worker_id": "macbook-worker",
+      "session_id": "sess_abc123",
+      "status": "running",
+      "provider": "codex",
+      "engine": "codex",
+      "branch": "jarvis/eng-42-worker-heartbeat"
     }
   ],
   "jobs": [
@@ -403,6 +416,92 @@ config only; they are not copied into public tracker comments or AGENTIC records
 `worker_id` answers where the job runs; `engine` answers which coding CLI or
 agent implementation runs inside that worker. Workers own their installed
 Codex/Claude credentials and advertise supported engine ids over `/health`.
+
+### WorkerSession
+
+The agentic work pivot is: **do not model coding agents as commands; model them
+as sessions.** `WorkerJob` remains for compatibility with one-shot CLI jobs, but
+new orchestration should target durable `WorkerSession`s with structured events.
+
+T3 Code is the architectural reference, not the source of truth. Its useful
+lesson is the provider-session boundary: a UI talks to a server that owns live
+provider sessions, checkpoints, approvals, interruptions, and event ingestion.
+Jarvis keeps the broader orchestration model:
+
+```text
+Voice / WhatsApp / T3 UI
+        |
+        v
+Jarvis Brain / OrchestrationRun
+        |
+        v
+Worker Session API
+        |
+        v
+Codex app-server / Claude SDK / provider adapters
+```
+
+The worker session API is specified in `docs/WORKER_SESSIONS_API.md`:
+
+```text
+POST /sessions
+GET  /sessions
+GET  /sessions/:id
+GET  /sessions/:id/events
+POST /sessions/:id/turns
+POST /sessions/:id/input
+POST /sessions/:id/approval
+POST /sessions/:id/interrupt
+POST /sessions/:id/stop
+```
+
+Initial session record:
+
+```json
+{
+  "session_id": "sess_1760000000_abcd1234",
+  "provider": "codex",
+  "engine": "codex",
+  "status": "created",
+  "run_id": "run_1760000000_abcd1234",
+  "repo": "roughcoder/jarvis",
+  "branch": "jarvis/eng-42-worker-heartbeat",
+  "metadata": {
+    "surface": "t3"
+  }
+}
+```
+
+Initial canonical event record:
+
+```json
+{
+  "event_id": "ev_1760000001_abcd1234",
+  "session_id": "sess_1760000000_abcd1234",
+  "type": "turn.started",
+  "time": "2026-06-30T18:00:01+00:00",
+  "data": {
+    "turn_id": "turn_1",
+    "prompt": "Continue from the current diff and run the tests."
+  }
+}
+```
+
+Canonical event types include `session.created`, `turn.started`,
+`assistant.delta`, `tool.call`, `approval.requested`, `input.requested`,
+`checkpoint.created`, `turn.completed`, `turn.failed`,
+`session.interrupted`, and `session.stopped`.
+
+Provider-specific events are projected into the canonical stream:
+
+- Codex adapter: wrap `codex app-server` and JSON-RPC over stdio.
+- Claude adapter: use a local boundary peer, likely a small TypeScript sidecar
+  around `@anthropic-ai/claude-agent-sdk`.
+- Cursor/OpenCode adapters: map their provider events into the same stream.
+
+Provider events are evidence, not authority. Jarvis still owns run ownership,
+allowed actions, landing policy, public writes, and human approval decisions.
+Provider adapters must enforce the `ExecutionEnvelope` outside prompt text.
 
 Example execution envelope:
 
@@ -1162,6 +1261,18 @@ P0), P7 cross-target recovery, and the not-yet-enforceable forge gate (I4).
       daily/weekly-style weekday selection and deterministic tick checks.
 - [x] **Campaign primitive:** parent run creates bounded child runs and stops
       cleanly on empty queues.
+- [x] **Worker session API foundation:** worker daemon exposes durable
+      `/sessions` records plus append-only session events for turns, input,
+      approvals, interrupts, and stops. This is the compatibility point for a
+      T3-style operator UI and the substrate for Codex/Claude provider adapters.
+- [ ] **Codex session adapter:** wrap `codex app-server` as a long-lived provider
+      session and project JSON-RPC events into canonical `SessionEvent`s.
+- [ ] **Claude session adapter:** add a local boundary peer, likely a small
+      TypeScript sidecar around `@anthropic-ai/claude-agent-sdk`, and project its
+      streaming/questions/permissions into the same session event stream.
+- [ ] **T3-style cockpit:** fork/integrate a UI over Jarvis runs, worker
+      sessions, event streams, approvals, interrupt/stop, artifacts, and reports
+      without making the UI the orchestration source of truth.
 
 ## Dogfood follow-up notes
 
