@@ -194,11 +194,15 @@ class CockpitReadHandlers:
                 http_get=self.ctx.get,
             )
         run_items = await asyncio.to_thread(self.ctx.store.list_runs)
-        requests = await asyncio.to_thread(
-            aggregate_requests,
-            worker_cfg=self.ctx.cfg.worker,
-            workers_path=self.ctx.cfg.orchestration.workers_path,
-            http_get=self.ctx.get,
+        requests = (
+            await asyncio.to_thread(
+                aggregate_requests,
+                worker_cfg=self.ctx.cfg.worker,
+                workers_path=self.ctx.cfg.orchestration.workers_path,
+                http_get=self.ctx.get,
+            )
+            if mode in {"fast", "probe"}
+            else []
         )
         artifacts = artifact_summaries(run_items)
         return web.json_response({"runs": [run_summary(run, requests=requests, artifacts=artifacts) for run in run_items]})
@@ -349,7 +353,7 @@ class CockpitWriteHandlers:
         proxied = _worker_control_body(body, required)
         path = f"/sessions/{ref.session_id}/{'checkpoints/restore' if action == 'restore_checkpoint' else action}"
         raw = await asyncio.to_thread(_worker_post_json, self.ctx.cfg, ref.worker_id, path, proxied, post=self.ctx.post)
-        response_body = await asyncio.to_thread(_session_write_packet, self.ctx.cfg, ref, raw, get=self.ctx.get)
+        response_body = await asyncio.to_thread(_session_write_packet, self.ctx.cfg, self.ctx.store, ref, raw, get=self.ctx.get)
         self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
         return web.json_response(response_body)
 
@@ -514,7 +518,7 @@ def _started_work_packet(store: OrchestrationStore, result: StartedWork) -> dict
     }
 
 
-def _session_write_packet(cfg: Config, ref, raw: dict[str, Any], *, get: HttpGet) -> dict[str, Any]:  # noqa: ANN001
+def _session_write_packet(cfg: Config, store: OrchestrationStore, ref, raw: dict[str, Any], *, get: HttpGet) -> dict[str, Any]:  # noqa: ANN001
     session_raw = _worker_get_json(cfg, ref.worker_id, f"/sessions/{ref.session_id}", get=get)
     row = _worker_session_row(session_raw, ref.worker_id)
     requests = _worker_session_requests(cfg, ref, get=get)
@@ -524,6 +528,7 @@ def _session_write_packet(cfg: Config, ref, raw: dict[str, Any], *, get: HttpGet
         events = [project_session_event(event, worker_id=ref.worker_id, run_id=str(row.get("run_id") or ""), sequence=idx + 1) for idx, event in enumerate(raw["events"])]
     elif isinstance(raw.get("event"), dict):
         events = [project_session_event(raw["event"], worker_id=ref.worker_id, run_id=str(row.get("run_id") or ""), sequence=1)]
+    _persist_session_write(store, ref, row, events)
     artifacts = []
     session_row = session_summary(row, requests=requests, checkpoints=checkpoints)
     return {
@@ -551,7 +556,7 @@ def _service_error(exc: Exception) -> CockpitError:
         code = "session_active" if "active worker session" in message else "validation_failed"
         return CockpitError(code, message, recoverable=True, status=409)
     if isinstance(exc, WorkerDispatchError):
-        return CockpitError("provider_unavailable", str(exc), recoverable=True, status=502)
+        return CockpitError("provider_unavailable", public_error_message(str(exc)), recoverable=True, status=502)
     return CockpitError("internal_error", str(exc), status=500)
 
 
@@ -607,6 +612,45 @@ def _resolve_session_ref(cfg: Config, store: OrchestrationStore, session_ref: st
             if session_id and make_session_ref(profile.worker_id, session_id) == session_ref:
                 return SessionRef(worker_id=profile.worker_id, session_id=session_id)
     raise CockpitError("not_found", "session not found", status=404)
+
+
+def _persist_session_write(store: OrchestrationStore, ref: SessionRef, row: dict[str, Any], events: list[dict[str, Any]]) -> None:
+    run_id = str(row.get("run_id") or "")
+    if not run_id:
+        return
+    try:
+        store.update_session(
+            run_id,
+            ref.session_id,
+            status=str(row.get("status") or ""),
+            provider=str(row.get("provider") or ""),
+            engine=str(row.get("engine") or ""),
+            branch=str(row.get("branch") or ""),
+            last_event_id=_latest_event_id(events),
+        )
+    except KeyError:
+        return
+    for event in events:
+        store.append_event(
+            run_id,
+            str(event.get("type") or "session.event"),
+            "",
+            {
+                "session_id": ref.session_id,
+                "event_id": str(event.get("event_id") or ""),
+                "turn_id": str(event.get("turn_id") or ""),
+                "message_id": str(event.get("message_id") or ""),
+                "data": dict(event.get("data") or {}),
+            },
+        )
+
+
+def _latest_event_id(events: list[dict[str, Any]]) -> str | None:
+    for event in reversed(events):
+        event_id = str(event.get("event_id") or "")
+        if event_id:
+            return event_id
+    return None
 
 
 def _worker_control_body(body: dict[str, Any], required: str) -> dict[str, Any]:
