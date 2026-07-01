@@ -16,6 +16,7 @@ import re
 import socket
 
 import httpx
+import httpcore
 
 from jarvis.runtime import RequestContext
 from jarvis.config import ToolsConfig
@@ -48,32 +49,54 @@ def html_to_text(html: str, *, max_chars: int = _MAX_CHARS) -> str:
     return s[:max_chars] + ("\n…(truncated)" if len(s) > max_chars else "")
 
 
-def _unsafe_address(address: str) -> bool:
-    ip = ipaddress.ip_address(address)
-    return (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
-    )
+def _public_ip(address: str) -> bool:
+    return ipaddress.ip_address(address).is_global
 
 
-async def _safe_fetch_url(url: str) -> httpx.URL:
-    parsed = httpx.URL(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.host:
-        raise ValueError("give a full http(s) URL to fetch")
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-
+async def _resolve_public_address(host: str, port: int) -> str:
     def resolve() -> list[str]:
-        infos = socket.getaddrinfo(parsed.host, port, type=socket.SOCK_STREAM)
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
         return [info[4][0] for info in infos]
 
     addresses = await asyncio.to_thread(resolve)
-    if not addresses or any(_unsafe_address(addr) for addr in addresses):
-        raise ValueError("blocked private or local network address")
+    if not addresses or any(not _public_ip(addr) for addr in addresses):
+        raise ValueError("blocked non-public network address")
+    return addresses[0]
+
+
+def _safe_fetch_url(url: str) -> httpx.URL:
+    parsed = httpx.URL(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.host:
+        raise ValueError("give a full http(s) URL to fetch")
     return parsed
+
+
+class _PublicOnlyNetworkBackend(httpcore.AsyncNetworkBackend):
+    def __init__(self) -> None:
+        self._backend = httpcore.AnyIOBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options=None,  # noqa: ANN001 - httpcore socket option tuple shape
+    ) -> httpcore.AsyncNetworkStream:
+        address = await _resolve_public_address(host, port)
+        return await self._backend.connect_tcp(
+            address,
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+
+class _PublicOnlyAsyncHTTPTransport(httpx.AsyncHTTPTransport):
+    def __init__(self) -> None:
+        super().__init__(trust_env=False)
+        self._pool = httpcore.AsyncConnectionPool(network_backend=_PublicOnlyNetworkBackend())
 
 
 def make_fetch_tools(cfg: ToolsConfig) -> list[Tool]:
@@ -82,10 +105,16 @@ def make_fetch_tools(cfg: ToolsConfig) -> list[Tool]:
         if not re.match(r"https?://", url):
             return "error: give a full http(s) URL to fetch."
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+            transport = _PublicOnlyAsyncHTTPTransport()
+            async with httpx.AsyncClient(
+                timeout=15.0,
+                follow_redirects=False,
+                transport=transport,
+                trust_env=False,
+            ) as client:
                 current = url
                 for _ in range(_MAX_REDIRECTS + 1):
-                    safe_url = await _safe_fetch_url(current)
+                    safe_url = _safe_fetch_url(current)
                     r = await client.get(
                         str(safe_url), headers={"User-Agent": "Mozilla/5.0 (Jarvis)"}
                     )

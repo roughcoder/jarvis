@@ -6,7 +6,13 @@ import asyncio
 
 from jarvis.brain.context import RequestContext
 from jarvis.config import ToolsConfig
-from jarvis.tools.fetch import _safe_fetch_url, html_to_text, make_fetch_tools
+from jarvis.tools.fetch import (
+    _PublicOnlyNetworkBackend,
+    _resolve_public_address,
+    _safe_fetch_url,
+    html_to_text,
+    make_fetch_tools,
+)
 
 
 def test_html_to_text_strips_and_breaks() -> None:
@@ -43,15 +49,40 @@ def test_fetch_rejects_private_local_and_link_local_hosts() -> None:
         "http://localhost:4000",
         "http://192.168.1.20",
         "http://10.0.0.5",
+        "http://100.64.0.1",
         "http://169.254.169.254/latest/meta-data",
     ]
     for url in blocked:
+        parsed = _safe_fetch_url(url)
+        port = parsed.port or 80
         try:
-            asyncio.run(_safe_fetch_url(url))
+            asyncio.run(_resolve_public_address(parsed.host, port))
         except ValueError as exc:
-            assert "blocked" in str(exc) or "local" in str(exc)
+            assert "blocked" in str(exc) or "non-public" in str(exc)
         else:  # pragma: no cover - explicit failure path
             raise AssertionError(f"{url} was not blocked")
+
+
+def test_fetch_backend_connects_to_vetted_ip(monkeypatch) -> None:  # noqa: ANN001
+    calls: list[str] = []
+
+    def fake_getaddrinfo(host, port, **_kwargs):  # noqa: ANN001
+        assert host == "example.com"
+        assert port == 443
+        return [(None, None, None, None, ("93.184.216.34", 443))]
+
+    class FakeBackend:
+        async def connect_tcp(self, host, port, **_kwargs):  # noqa: ANN001
+            calls.append(host)
+            return object()
+
+    monkeypatch.setattr("jarvis.tools.fetch.socket.getaddrinfo", fake_getaddrinfo)
+    backend = _PublicOnlyNetworkBackend()
+    backend._backend = FakeBackend()
+
+    asyncio.run(backend.connect_tcp("example.com", 443))
+
+    assert calls == ["93.184.216.34"]
 
 
 def test_fetch_tool_shape() -> None:
