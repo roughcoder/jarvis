@@ -97,10 +97,12 @@ def start_worker_session(
     store: OrchestrationStore | None = None,
     post: Callable[..., Any] | None = None,
     get: Callable[..., Any] | None = None,
+    created_session_ids: set[str] | None = None,
 ) -> WorkerSessionLink:
     post = post or httpx.post
     get = get or httpx.get
     base_url, headers = _worker_endpoint(worker_cfg, worker)
+    created_by_dispatch = False
     if envelope.resume_session and envelope.session_id:
         session = {
             "session_id": envelope.session_id,
@@ -153,6 +155,9 @@ def start_worker_session(
                 if not create_body.get("ok"):
                     raise RuntimeError(create_body.get("error") or "worker rejected session")
                 session = create_body["session"]
+                created_by_dispatch = True
+                if created_session_ids is not None:
+                    created_session_ids.add(str(session.get("session_id") or session_id))
             if store is not None:
                 store.link_session(envelope.run_id, _session_link_from_body(envelope, session, create_body.get("event")))
     turn_id = _turn_id(envelope)
@@ -178,7 +183,7 @@ def start_worker_session(
         if not turn_body.get("ok"):
             raise RuntimeError(turn_body.get("error") or "worker rejected session turn")
     except Exception:
-        if not envelope.resume_session:
+        if created_by_dispatch:
             _stop_created_session_after_turn_rejection(
                 session,
                 envelope=envelope,
@@ -213,8 +218,10 @@ def start_worker_ensemble(
     worker: WorkerProfile | None = None,
     store: OrchestrationStore | None = None,
     post: Callable[..., Any] | None = None,
+    get: Callable[..., Any] | None = None,
 ) -> list[WorkerSessionLink]:
     links: list[WorkerSessionLink] = []
+    created_session_ids: set[str] = set()
     try:
         for engine in engines:
             engine_envelope = replace(
@@ -233,6 +240,8 @@ def start_worker_ensemble(
                 worker=worker,
                 store=store,
                 post=post,
+                get=get,
+                created_session_ids=created_session_ids,
             )
             links.append(link)
     except Exception:
@@ -243,6 +252,7 @@ def start_worker_ensemble(
             worker=worker,
             post=post,
             store=store,
+            created_session_ids=created_session_ids,
         )
         raise
     if store is not None:
@@ -263,6 +273,7 @@ def _stop_started_sessions(
     worker: WorkerProfile | None,
     post: Callable[..., Any] | None,
     store: OrchestrationStore | None,
+    created_session_ids: set[str] | None = None,
 ) -> None:
     if not links:
         return
@@ -271,6 +282,8 @@ def _stop_started_sessions(
     control_envelope = envelope.to_dict()
     control_envelope["allowed_actions"] = sorted({*control_envelope.get("allowed_actions", []), WORKER_SESSION_STOP})
     for link in reversed(links):
+        if created_session_ids is not None and link.session_id not in created_session_ids:
+            continue
         try:
             response = http_post(
                 f"{base_url}/sessions/{link.session_id}/stop",
