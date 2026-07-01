@@ -45,9 +45,10 @@ Example:
 ```
 
 T3 routes by `session_ref`. Jarvis owns the lookup back to `worker_id` and
-`session_id`. The implementation uses a `sessref_` prefix plus a signed,
-deterministic, URL-safe token and resolves it against Jarvis state. Clients must
-not decode, construct, or compare subfields inside the ref.
+`session_id`. The implementation uses a `sessref_` prefix plus a deterministic,
+URL-safe opaque token and resolves it through Jarvis state, including a local
+session-ref index. Clients must not decode, construct, or compare subfields
+inside the ref.
 
 ## Endpoints
 
@@ -162,12 +163,12 @@ It is not current operational state.
       "display_name": "Codex",
       "description": "OpenAI Codex provider session",
       "supports": {
-        "streaming": true,
-        "resume": true,
-        "interrupt": true,
-        "approval_requests": true,
-        "input_requests": true,
-        "checkpoints": true
+        "streaming": false,
+        "resume": false,
+        "interrupt": false,
+        "approval_requests": false,
+        "input_requests": false,
+        "checkpoints": false
       }
     }
   ],
@@ -180,14 +181,13 @@ It is not current operational state.
   ],
   "work_sources": ["manual", "github", "linear"],
   "engine_strategies": ["single", "parallel"],
-  "branch_strategies": ["auto", "use_existing", "create", "none"],
-  "landing_policies": ["branch_only", "draft_pr", "ready_pr", "confirm_before_pr"],
   "request_kinds": ["approval", "input"]
 }
 ```
 
 The cockpit may display friendly public terms, but Jarvis maps them to internal
-policy and engine names.
+policy and engine names. Catalog engine rows are stable option labels only;
+current worker-specific engine capabilities come from `WorkerProfile.engines`.
 
 ## Snapshot
 
@@ -220,6 +220,9 @@ and large provider payloads stay behind lazy detail endpoints.
 ## WorkerProfile
 
 Worker profiles are public-safe rows for selectors and status displays.
+Engine `supports` values are published by the worker profile or worker health
+contract. Cockpit projection must not infer provider capabilities from engine
+names.
 
 ```json
 {
@@ -260,6 +263,27 @@ Worker profiles are public-safe rows for selectors and status displays.
   "public_metadata": {}
 }
 ```
+
+Workers may publish the source data as an `engine_supports` mapping:
+
+```json
+{
+  "engine_supports": {
+    "codex": {
+      "streaming": true,
+      "resume": true,
+      "interrupt": true,
+      "approval_requests": true,
+      "input_requests": true,
+      "checkpoints": true
+    }
+  }
+}
+```
+
+Workers may also publish engine rows with nested `supports` objects in a health
+response. If a worker does not publish support metadata, Jarvis returns `false`
+for each support flag rather than guessing from the engine name.
 
 Stable worker health values:
 
@@ -516,6 +540,11 @@ Response:
 }
 ```
 
+If `after` does not match a cursor/id in the current page source, Jarvis returns
+`400 validation_failed` instead of silently restarting pagination from the
+beginning. Clients should clear the cursor and refetch from the first page when
+they receive that error.
+
 ## Writes
 
 Every write accepts an idempotency key and public metadata:
@@ -629,8 +658,18 @@ It supports:
 
 - `Last-Event-ID`
 - `?after=<cursor>`
-- heartbeat comments
+- heartbeat comments, currently every 15 seconds while connected
 - snapshot fallback for stale or unknown cursors
+
+Jarvis computes each subscribed sync-mode snapshot once per API process refresh
+tick and fans it out to all matching SSE clients. It must not rebuild the full
+snapshot once per connected browser tab.
+
+Native browser `EventSource` cannot set an `Authorization` header. T3 should
+either proxy this endpoint through its server-side Jarvis client or use a
+fetch-based SSE client that can send the bearer token. Jarvis does not expose
+browser CORS as the primary auth path for v1; server-side proxying is the
+recommended integration.
 
 Each SSE event has both an SSE `id:` and a JSON `cursor`:
 
@@ -736,6 +775,13 @@ or breaking status, and migration notes.
   structured validation error instead of being silently dropped.
 - Clarified that checkpoint restore uses durable per-session `checkpoint_id`
   values, not page position or turn count.
+- Hardened the cockpit API before T3 dependency: SSE snapshots are refreshed
+  once per app process and fanned out to subscribers; exact-session refs resolve
+  through a local Jarvis index instead of worker sweeps; unknown pagination
+  cursors return `validation_failed`; worker-down session detail degrades to the
+  stored public row; idempotency records expire and corrupt records are treated
+  as misses; engine support flags come from worker-published metadata; browser
+  SSE auth is documented as a server-side proxy or fetch-SSE concern.
 
 ### 2026-07-01 - v1 Draft
 

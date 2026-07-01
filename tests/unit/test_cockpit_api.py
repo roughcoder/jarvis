@@ -16,7 +16,7 @@ import httpx  # noqa: E402
 from aiohttp import web  # noqa: E402
 
 from jarvis.config import Config  # noqa: E402
-from jarvis.orchestration.api import CockpitAppContext, IdempotencyStore, _command_from_body, _idempotency_scope, make_app, serve  # noqa: E402
+from jarvis.orchestration.api import CockpitAppContext, IdempotencyStore, SseSnapshotHub, _command_from_body, _idempotency_scope, make_app, serve  # noqa: E402
 from jarvis.orchestration.cockpit import make_session_ref  # noqa: E402
 from jarvis.orchestration.models import Artifact, ExecutionEnvelope, WorkItem, WorkerProfile, WorkerSessionLink  # noqa: E402
 from jarvis.orchestration.service import StartedWork  # noqa: E402
@@ -94,6 +94,24 @@ def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, caps: str = "", tok
                         "status": "online",
                         "agent": "codex",
                         "supported_engines": ["codex", "claude"],
+                        "engine_supports": {
+                            "codex": {
+                                "streaming": True,
+                                "resume": True,
+                                "interrupt": True,
+                                "approval_requests": True,
+                                "input_requests": True,
+                                "checkpoints": True,
+                            },
+                            "claude": {
+                                "streaming": True,
+                                "resume": True,
+                                "interrupt": False,
+                                "approval_requests": False,
+                                "input_requests": False,
+                                "checkpoints": False,
+                            },
+                        },
                     }
                 ]
             }
@@ -346,6 +364,9 @@ def test_cockpit_catalog_snapshot_and_worker_projection(tmp_path, monkeypatch) -
         assert "/Users/" not in json.dumps(snapshot)
         assert workers["workers"][0]["capacity"]["max_sessions"] == 4
         assert workers["workers"][0]["engines"][0]["engine"] == "codex"
+        assert workers["workers"][0]["engines"][0]["supports"]["checkpoints"] is True
+        assert workers["workers"][0]["engines"][1]["engine"] == "claude"
+        assert workers["workers"][0]["engines"][1]["supports"]["interrupt"] is False
 
     import asyncio
 
@@ -732,11 +753,14 @@ def test_cockpit_run_events_and_artifact_pagination(tmp_path, monkeypatch) -> No
         assert "internal_47" not in json.dumps(detail)
         assert "/Users/" not in json.dumps(detail)
         assert events["items"][0]["type"] == "run_created"
+        unknown_cursor = await client.get(f"{base}/v1/runs/{run_id}/events", params={"after": "evt_missing"})
         event_page = (await client.get(f"{base}/v1/runs/{run_id}/events")).json()
         assert "/Users/" not in json.dumps(event_page)
         assert "OPENAI_API_KEY" not in json.dumps(event_page)
         assert "cwd" not in json.dumps(event_page)
         assert events["has_more"] is True
+        assert unknown_cursor.status_code == 400
+        assert unknown_cursor.json()["error"]["code"] == "validation_failed"
         kinds = {item["kind"] for item in artifacts["items"]}
         report = [item for item in all_artifacts["items"] if item["kind"] == "report"][0]
         assert {"branch", "pull_request"}.issubset(kinds)
@@ -868,6 +892,65 @@ def test_cockpit_sse_preserves_requested_sync_mode(tmp_path, monkeypatch) -> Non
     asyncio.run(_with_server(cfg, calls, http_get=get))
 
 
+def test_cockpit_sse_hub_fans_out_one_refresh_to_multiple_subscribers(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _store, run_id = _seed_run(cfg)
+    state = {"pending": False}
+    request_calls = {"count": 0}
+
+    def get(url: str, **kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions/requests"):
+            request_calls["count"] += 1
+            if state["pending"]:
+                return Response(
+                    {
+                        "requests": [
+                            {
+                                "session_id": "sess_123",
+                                "request_id": "req_fanout",
+                                "kind": "approval",
+                                "status": "pending",
+                                "event": {"data": {"run_id": run_id, "title": "Approve fanout"}},
+                            }
+                        ]
+                    }
+                )
+            return Response({"requests": []})
+        return _fake_get(run_id)(url, **kwargs)
+
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=get,
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+
+    async def run_hub() -> None:
+        hub = SseSnapshotHub(ctx)
+        await hub.start()
+        try:
+            first = await hub.subscribe("fast")
+            second = await hub.subscribe("fast")
+            assert request_calls["count"] == 1
+            state["pending"] = True
+            first_event = await asyncio.wait_for(first.queue.get(), timeout=2)
+            second_event = await asyncio.wait_for(second.queue.get(), timeout=2)
+            assert first_event is not None
+            assert second_event is not None
+            assert first_event["cursor"] == second_event["cursor"]
+            assert request_calls["count"] == 2
+        finally:
+            await hub.stop()
+
+    import asyncio
+
+    asyncio.run(run_hub())
+
+
 def test_cockpit_auth_and_bad_session_ref_errors(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, token="secret")
 
@@ -908,6 +991,45 @@ def test_cockpit_session_ref_rejects_tampering(tmp_path, monkeypatch) -> None:  
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+
+def test_cockpit_unknown_session_ref_does_not_sweep_workers(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _store, _run_id = _seed_run(cfg)
+    unknown_ref = "sessref_unknown-but-url-safe"
+
+    def no_worker_get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        raise AssertionError(f"unknown session_ref should not sweep workers: {url}")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/sessions/{unknown_ref}")
+
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "not_found"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=no_worker_get))
+
+
+def test_cockpit_workers_reject_invalid_probe_value(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+
+    def no_worker_get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        raise AssertionError(f"invalid probe should fail before worker HTTP: {url}")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        list_response = await client.get(f"{base}/v1/workers", params={"probe": "probe"})
+        detail_response = await client.get(f"{base}/v1/workers/macbook-worker", params={"probe": "probe"})
+
+        assert list_response.status_code == 400
+        assert detail_response.status_code == 400
+        assert list_response.json()["error"]["code"] == "validation_failed"
+        assert detail_response.json()["error"]["code"] == "validation_failed"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=no_worker_get))
 
 
 def test_cockpit_run_events_filter_non_public_urls(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -969,12 +1091,12 @@ def test_cockpit_worker_error_messages_are_redacted(tmp_path, monkeypatch) -> No
         response = await client.get(f"{base}/v1/sessions/{ref}")
         body = response.json()
 
-        assert response.status_code == 502, body
-        assert body["error"]["code"] == "worker_unavailable"
-        assert "/Users/" not in body["error"]["message"]
-        assert fake_token not in body["error"]["message"]
-        assert "<local-path>" in body["error"]["message"]
-        assert "<redacted-token>" in body["error"]["message"]
+        assert response.status_code == 200, body
+        assert body["session"]["session_ref"] == ref
+        assert body["session"]["run_id"]
+        assert body["raw"] == {}
+        assert "/Users/" not in json.dumps(body)
+        assert fake_token not in json.dumps(body)
 
     import asyncio
 
@@ -1023,10 +1145,11 @@ def test_cockpit_worker_connection_errors_are_public_worker_unavailable(tmp_path
         response = await client.get(f"{base}/v1/sessions/{ref}")
         body = response.json()
 
-        assert response.status_code == 502
-        assert body["error"]["code"] == "worker_unavailable"
-        assert body["error"]["recoverable"] is True
-        assert "/Users/" not in body["error"]["message"]
+        assert response.status_code == 200
+        assert body["session"]["session_ref"] == ref
+        assert body["session"]["status"] == "running"
+        assert body["raw"] == {}
+        assert "/Users/" not in json.dumps(body)
 
     import asyncio
 
@@ -1290,6 +1413,54 @@ def test_cockpit_worker_only_sessions_include_checkpoint_counts(tmp_path, monkey
         assert snapshot["sessions"][0]["session_ref"] == ref
         assert snapshot["sessions"][0]["checkpoint_count"] == 1
         assert "checkpoint_restore" in snapshot["sessions"][0]["supported_controls"]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
+def test_cockpit_checkpoint_aggregation_uses_worker_bulk_endpoint(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    ref = make_session_ref("macbook-worker", "sess_worker_only")
+    calls_seen: list[str] = []
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        calls_seen.append(url)
+        if url.endswith("/health"):
+            return Response({"ok": True, "agent": "codex", "supported_engines": ["codex"]})
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions"):
+            return Response(
+                {
+                    "sessions": [
+                        {
+                            "session_id": "sess_worker_only",
+                            "provider": "codex",
+                            "engine": "codex",
+                            "status": "running",
+                            "repo": "roughcoder/jarvis",
+                            "title": "Worker-only session",
+                            "metadata": {"execution_envelope": {"allowed_actions": ["worker.session.turn", "worker.session.restore"]}},
+                        }
+                    ]
+                }
+            )
+        if url.endswith("/sessions/checkpoints"):
+            return Response({"checkpoints": [{"session_id": "sess_worker_only", "checkpoint_id": "ckpt_bulk", "label": "bulk"}]})
+        if url.endswith("/sessions/requests"):
+            return Response({"requests": []})
+        if url.endswith("/sessions/sess_worker_only/checkpoints"):
+            raise AssertionError("bulk checkpoint response should avoid per-session checkpoint calls")
+        raise AssertionError(url)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        snapshot = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+
+        assert snapshot["sessions"][0]["session_ref"] == ref
+        assert snapshot["sessions"][0]["checkpoint_count"] == 1
+        assert any(url.endswith("/sessions/checkpoints") for url in calls_seen)
+        assert not any(url.endswith("/sessions/sess_worker_only/checkpoints") for url in calls_seen)
 
     import asyncio
 
@@ -1730,6 +1901,22 @@ def test_cockpit_idempotency_scope_cleans_up_lock(tmp_path, monkeypatch) -> None
 
     assert ctx.idempotency_locks == {}
     assert ctx.idempotency_lock_refs == {}
+
+
+def test_cockpit_idempotency_store_treats_corrupt_or_expired_records_as_miss(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    store = IdempotencyStore(cfg.orchestration.workspace)
+    body = {"idempotency_key": "key", "prompt": "continue"}
+
+    corrupt_path = store._path("sessions/test/turns", "corrupt")  # noqa: SLF001
+    corrupt_path.write_text("{not-json")
+    assert store.get("sessions/test/turns", "corrupt", body) is None
+    assert not corrupt_path.exists()
+
+    expired_path = store._path("sessions/test/turns", "expired")  # noqa: SLF001
+    expired_path.write_text(json.dumps({"created_at": 0, "fingerprint": "ignored", "response": {"ok": True}}))
+    assert store.get("sessions/test/turns", "expired", body) is None
+    assert not expired_path.exists()
 
 
 def test_cockpit_session_updates_are_keyed_by_worker_and_session(tmp_path, monkeypatch) -> None:  # noqa: ANN001

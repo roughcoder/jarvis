@@ -309,6 +309,7 @@ class WorkerProfile:
     agent: str = "codex"
     default_engine: str = ""
     supported_engines: list[str] = field(default_factory=list)
+    engine_supports: dict[str, dict[str, bool]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.default_engine = default_engine(self.default_engine or self.agent, self.supported_engines)
@@ -338,5 +339,6 @@ class WorkerProfile:
             "agent": self.agent,
             "default_engine": self.default_engine,
             "supported_engines": self.supported_engines,
+            "engine_supports": self.engine_supports,
             "token_set": self.token_set,
         }

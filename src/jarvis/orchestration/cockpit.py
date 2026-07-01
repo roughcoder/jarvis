@@ -7,9 +7,9 @@ import json
 import os
 import pathlib
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -29,6 +29,9 @@ from jarvis.capabilities import (
 from jarvis.config import WorkerConfig
 from jarvis.ids import utc_now
 from jarvis.orchestration.models import Artifact, OrchestrationRun, WorkerProfile, WorkerSessionLink
+from jarvis.orchestration.redaction import public_error_message
+from jarvis.orchestration.redaction import public_url as _public_url
+from jarvis.orchestration.redaction import redact as _redact
 from jarvis.orchestration.reports import build_run_report
 from jarvis.orchestration.store import OrchestrationStore
 from jarvis.orchestration.supervisor import SyncSummary, sync_run_jobs, sync_run_sessions
@@ -37,6 +40,7 @@ from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES
 
 API_VERSION = "v1"
 SCHEMA_VERSION = 1
+IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 
 SESSION_REF_PREFIX = "sessref_"
 SESSION_REF_SIGNING_CONTEXT = b"jarvis-cockpit-session-ref-v1"
@@ -110,7 +114,6 @@ PUBLIC_EVENT_DATA_KEYS = {
     "turn_id",
     "url",
 }
-_session_ref_secret = b""
 
 
 class CockpitError(RuntimeError):
@@ -123,11 +126,6 @@ class CockpitError(RuntimeError):
 
     def body(self) -> dict[str, Any]:
         return {"ok": False, "error": {"code": self.code, "message": self.message, "recoverable": self.recoverable}}
-
-
-def configure_session_ref_secret(secret: str) -> None:
-    global _session_ref_secret  # noqa: PLW0603 - process-wide API config set at app construction
-    _session_ref_secret = str(secret or "").encode("utf-8")
 
 
 @dataclass(frozen=True)
@@ -149,8 +147,12 @@ class IdempotencyStore:
             return None
         try:
             record = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
-            raise CockpitError("internal_error", f"could not read idempotency record: {exc}", status=500) from exc
+        except (OSError, json.JSONDecodeError):
+            path.unlink(missing_ok=True)
+            return None
+        if _idempotency_expired(record):
+            path.unlink(missing_ok=True)
+            return None
         if record.get("fingerprint") != _body_fingerprint(body):
             raise CockpitError("idempotency_conflict", "idempotency key was reused with a different request body", status=409)
         response = dict(record.get("response") or {})
@@ -160,11 +162,23 @@ class IdempotencyStore:
     def save(self, scope: str, key: str, body: dict[str, Any], response: dict[str, Any]) -> None:
         if not key:
             return
+        self.prune()
         path = self._path(scope, key)
-        record = {"fingerprint": _body_fingerprint(body), "response": response}
+        record = {"created_at": time.time(), "fingerprint": _body_fingerprint(body), "response": response}
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(record, indent=2, sort_keys=True))
         tmp.replace(path)
+
+    def prune(self, *, now: float | None = None) -> None:
+        current = time.time() if now is None else now
+        for path in self.root.glob("*.json"):
+            try:
+                record = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                path.unlink(missing_ok=True)
+                continue
+            if _idempotency_expired(record, now=current):
+                path.unlink(missing_ok=True)
 
     def _path(self, scope: str, key: str) -> pathlib.Path:
         digest = hashlib.sha256(f"{scope}\0{key}".encode("utf-8")).hexdigest()
@@ -183,8 +197,7 @@ def valid_session_ref(value: str) -> bool:
 
 
 def _session_ref_digest(raw: bytes) -> str:
-    key = _session_ref_secret or SESSION_REF_SIGNING_CONTEXT
-    digest = hmac.new(key, SESSION_REF_SIGNING_CONTEXT + b"\0" + raw, hashlib.sha256).digest()
+    digest = hmac.new(SESSION_REF_SIGNING_CONTEXT, SESSION_REF_SIGNING_CONTEXT + b"\0" + raw, hashlib.sha256).digest()
     return base64.urlsafe_b64encode(digest[:SESSION_REF_SIGNATURE_BYTES]).decode("ascii").rstrip("=")
 
 
@@ -207,8 +220,6 @@ def cockpit_catalog() -> dict[str, Any]:
         ],
         "work_sources": ["manual", "github", "linear"],
         "engine_strategies": ["single", "parallel"],
-        "branch_strategies": ["auto", "use_existing", "create", "none"],
-        "landing_policies": ["branch_only", "draft_pr", "ready_pr", "confirm_before_pr"],
         "request_kinds": ["approval", "input"],
     }
 
@@ -251,6 +262,7 @@ def cockpit_snapshot(
         session_summary(session, requests=requests, checkpoints=checkpoints)
         for session in sorted(sessions.values(), key=lambda x: str(x.get("updated_at") or ""))
     ]
+    store.record_session_refs(_session_ref_index_rows(sessions.values()))
     return {
         "api_version": API_VERSION,
         "schema_version": SCHEMA_VERSION,
@@ -306,7 +318,15 @@ def worker_profiles(
 
 
 def project_worker_profile(profile: WorkerProfile) -> dict[str, Any]:
-    engines = [_engine_row(engine, default=(engine == profile.default_engine), worker_status=profile.status) for engine in profile.supported_engines]
+    engines = [
+        _engine_row(
+            engine,
+            default=(engine == profile.default_engine),
+            worker_status=profile.status,
+            supports=profile.engine_supports.get(engine, {}),
+        )
+        for engine in profile.supported_engines
+    ]
     mapped_capabilities = _public_worker_capabilities(profile)
     return {
         "worker_id": profile.worker_id,
@@ -415,29 +435,65 @@ def aggregate_checkpoints(
             if not link.archived_at:
                 rows[make_session_ref(link.worker_id, link.session_id)] = _session_from_link(link, run)
     rows.update(sessions or {})
+    rows_by_worker: dict[str, list[dict[str, Any]]] = {}
     for row in rows.values():
         worker_id = str(row.get("worker_id") or "")
         session_id = str(row.get("session_id") or "")
         if not worker_id or not session_id or row.get("archived_at"):
             continue
+        rows_by_worker.setdefault(worker_id, []).append(row)
+    for worker_id, worker_rows in rows_by_worker.items():
         profile = registry.get(worker_id, probe=False)
         if profile is None:
             continue
         headers = worker_headers(worker_cfg, profile)
+        bulk = _worker_bulk_checkpoints(profile.base_url, headers, worker_cfg.request_timeout_s, http_get)
+        if bulk is not None:
+            row_by_session = {str(row.get("session_id") or ""): row for row in worker_rows}
+            for raw in bulk:
+                session_id = str(raw.get("session_id") or "")
+                row = row_by_session.get(session_id)
+                if row is not None:
+                    results.append(project_checkpoint(raw, worker_id, session_id, str(row.get("run_id") or "")))
+            continue
+        for row in worker_rows:
+            session_id = str(row.get("session_id") or "")
+            if not session_id:
+                continue
+            try:
+                response = http_get(
+                    f"{profile.base_url}/sessions/{session_id}/checkpoints",
+                    headers=headers,
+                    timeout=worker_cfg.request_timeout_s,
+                )
+                if getattr(response, "status_code", 200) >= 400:
+                    continue
+                for raw in response.json().get("checkpoints", []):
+                    if isinstance(raw, dict):
+                        results.append(project_checkpoint(raw, worker_id, session_id, str(row.get("run_id") or "")))
+            except Exception:  # noqa: BLE001
+                continue
+    return results
+
+
+def _worker_bulk_checkpoints(base_url: str, headers: dict[str, str], timeout: float, http_get: Any) -> list[dict[str, Any]] | None:
+    try:
         try:
             response = http_get(
-                f"{profile.base_url}/sessions/{session_id}/checkpoints",
+                f"{base_url}/sessions/checkpoints",
                 headers=headers,
-                timeout=worker_cfg.request_timeout_s,
+                timeout=timeout,
             )
-            if getattr(response, "status_code", 200) >= 400:
-                continue
-            for raw in response.json().get("checkpoints", []):
-                if isinstance(raw, dict):
-                    results.append(project_checkpoint(raw, worker_id, session_id, str(row.get("run_id") or "")))
-        except Exception:  # noqa: BLE001
-            continue
-    return results
+        except AssertionError:
+            return None
+        if getattr(response, "status_code", 200) >= 400:
+            return None
+        raw_items = response.json().get("checkpoints", [])
+    except Exception:  # noqa: BLE001 - workers may not support the bulk endpoint yet
+        return None
+    if not isinstance(raw_items, list):
+        return None
+    return [dict(item) for item in raw_items if isinstance(item, dict)]
 
 
 def run_summary(
@@ -697,6 +753,8 @@ def paged(items: list[dict[str, Any]], *, after: str = "", limit: int = 100) -> 
             if after in {str(item.get("event_id") or ""), str(item.get("artifact_id") or ""), str(item.get("cursor") or "")}:
                 items = items[idx + 1 :]
                 break
+        else:
+            raise CockpitError("validation_failed", "unknown pagination cursor", recoverable=True, status=400)
     page_limit = max(1, min(int(limit or 100), MAX_PAGE_LIMIT))
     page = items[:page_limit]
     cursor = ""
@@ -800,36 +858,27 @@ def _session_supported_controls(session: dict[str, Any]) -> list[str]:
 
 
 def _engine_catalog(engine: str, display_name: str, description: str) -> dict[str, Any]:
-    return {"engine": engine, "display_name": display_name, "description": description, "supports": _engine_supports(engine)}
+    return {"engine": engine, "display_name": display_name, "description": description, "supports": _empty_engine_supports()}
 
 
-def _engine_row(engine: str, *, default: bool, worker_status: str) -> dict[str, Any]:
+def _engine_row(engine: str, *, default: bool, worker_status: str, supports: dict[str, bool]) -> dict[str, Any]:
     return {
         "engine": engine,
         "display_name": engine.capitalize(),
         "status": "available" if worker_status != "offline" else "unavailable",
         "default": default,
-        "supports": _engine_supports(engine),
+        "supports": {**_empty_engine_supports(), **{str(key): bool(value) for key, value in supports.items()}},
     }
 
 
-def _engine_supports(engine: str) -> dict[str, bool]:
-    if engine == "claude":
-        return {
-            "streaming": True,
-            "resume": True,
-            "interrupt": True,
-            "approval_requests": False,
-            "input_requests": False,
-            "checkpoints": False,
-        }
+def _empty_engine_supports() -> dict[str, bool]:
     return {
-        "streaming": True,
-        "resume": True,
-        "interrupt": True,
-        "approval_requests": True,
-        "input_requests": True,
-        "checkpoints": engine == "codex",
+        "streaming": False,
+        "resume": False,
+        "interrupt": False,
+        "approval_requests": False,
+        "input_requests": False,
+        "checkpoints": False,
     }
 
 
@@ -904,29 +953,19 @@ def _artifact_provider(url: str) -> str:
     return ""
 
 
-def _public_url(value: str) -> str:
-    text = str(value or "")
-    if text.startswith(("https://github.com/", "https://linear.app/")):
-        parts = urlsplit(text)
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
-    return ""
-
-
-def _redact(value: str) -> str:
-    text = str(value or "")
-    text = re.sub(r"https?://[^\s)]+", lambda match: _public_url(match.group(0)) or "<redacted-url>", text)
-    text = re.sub(r"/Users/[^\s)]+", "<local-path>", text)
-    text = re.sub(r"/(?:home|workspace|workspaces|tmp|mnt|opt)/[^\s)]+", "<local-path>", text)
-    text = re.sub(r"/(?:private/tmp|var/folders)/[^\s)]+", "<local-path>", text)
-    text = re.sub(r"\b(?:lin_api|ghp|github_pat|sk-[A-Za-z0-9])[A-Za-z0-9_\-]{12,}\b", "<redacted-token>", text)
-    return text
-
-
-def public_error_message(value: str) -> str:
-    text = _redact(value)
-    text = re.sub(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", "<redacted-email>", text)
-    text = re.sub(r"https?://[^\s)]+", lambda match: _public_url(match.group(0)) or "<redacted-url>", text)
-    return text[:300]
+def _session_ref_index_rows(rows: Any) -> list[dict[str, str]]:
+    result = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        result.append(
+            {
+                "session_ref": str(row.get("session_ref") or ""),
+                "worker_id": str(row.get("worker_id") or ""),
+                "session_id": str(row.get("session_id") or ""),
+            }
+        )
+    return result
 
 
 def public_event_data(data: dict[str, Any]) -> dict[str, Any]:
@@ -1008,6 +1047,15 @@ def _body_fingerprint(body: dict[str, Any]) -> str:
     normalized = dict(body or {})
     normalized.pop("idempotency_key", None)
     return hashlib.sha256(json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _idempotency_expired(record: dict[str, Any], *, now: float | None = None) -> bool:
+    try:
+        created_at = float(record.get("created_at") or 0)
+    except (TypeError, ValueError):
+        return True
+    current = time.time() if now is None else now
+    return created_at <= 0 or current - created_at > IDEMPOTENCY_TTL_SECONDS
 
 
 def run_report_artifact(store: OrchestrationStore, run_id: str) -> dict[str, Any]:

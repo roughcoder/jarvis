@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import json
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -33,9 +34,9 @@ from jarvis.orchestration.cockpit import (
     artifact_summaries,
     cockpit_catalog,
     cockpit_snapshot,
-    configure_session_ref_secret,
     make_session_ref,
     paged,
+    project_worker_profile,
     project_checkpoint,
     project_request,
     project_session_event,
@@ -69,11 +70,13 @@ from jarvis.orchestration.service import (
 )
 from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource, WorkSource
 from jarvis.orchestration.store import OrchestrationStore
+from jarvis.orchestration.supervisor import _final_session_phase
 from jarvis.orchestration.workers import WorkerRegistry
-from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, FAILED_SESSION_STATUSES, SUCCESS_SESSION_STATUSES
 
 HttpGet = Callable[..., Any]
 HttpPost = Callable[..., Any]
+SSE_REFRESH_INTERVAL_S = 1.0
+SSE_HEARTBEAT_INTERVAL_S = 15.0
 
 
 @dataclass(frozen=True)
@@ -89,11 +92,118 @@ class CockpitAppContext:
 
     def require_auth(self, request: web.Request) -> None:
         token = self.cfg.orchestration.api_token.get_secret_value()
-        if token and request.headers.get("Authorization", "") != f"Bearer {token}":
+        if token and not hmac.compare_digest(request.headers.get("Authorization", ""), f"Bearer {token}"):
             raise CockpitError("unauthorized", "unauthorized", status=401)
 
     def service(self, *, manual_item: WorkItem | None = None) -> OrchestrationService:
         return _service(self.cfg, self.source_factory, manual_item=manual_item)
+
+
+@dataclass(frozen=True)
+class SseSubscription:
+    subscription_id: int
+    mode: str
+    queue: asyncio.Queue[dict[str, Any] | None]
+    snapshot: dict[str, Any]
+
+
+class SseSnapshotHub:
+    def __init__(self, ctx: CockpitAppContext) -> None:
+        self.ctx = ctx
+        self._subscribers: dict[int, SseSubscription] = {}
+        self._snapshots: dict[str, dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+        self._next_id = 0
+        self._task: asyncio.Task[None] | None = None
+        self._stopping = asyncio.Event()
+
+    async def start(self) -> None:
+        if self._task is None:
+            self._task = asyncio.create_task(self._run(), name="cockpit-sse-snapshot-hub")
+
+    async def stop(self) -> None:
+        self._stopping.set()
+        if self._task is not None:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+
+    async def subscribe(self, mode: str) -> SseSubscription:
+        snapshot = await self._snapshot(mode)
+        async with self._lock:
+            self._next_id += 1
+            subscription = SseSubscription(
+                subscription_id=self._next_id,
+                mode=mode,
+                queue=asyncio.Queue(maxsize=8),
+                snapshot=snapshot,
+            )
+            self._subscribers[subscription.subscription_id] = subscription
+            return subscription
+
+    async def unsubscribe(self, subscription: SseSubscription) -> None:
+        async with self._lock:
+            self._subscribers.pop(subscription.subscription_id, None)
+
+    async def _snapshot(self, mode: str) -> dict[str, Any]:
+        cached = self._snapshots.get(mode)
+        if cached is not None:
+            return cached
+        body = await asyncio.to_thread(_cockpit_snapshot, self.ctx, mode)
+        async with self._lock:
+            return self._snapshots.setdefault(mode, body)
+
+    async def _run(self) -> None:
+        heartbeat_at = asyncio.get_running_loop().time() + SSE_HEARTBEAT_INTERVAL_S
+        while not self._stopping.is_set():
+            await asyncio.sleep(SSE_REFRESH_INTERVAL_S)
+            modes = await self._active_modes()
+            for mode in modes:
+                body = await asyncio.to_thread(_cockpit_snapshot, self.ctx, mode)
+                previous = self._snapshots.get(mode)
+                self._snapshots[mode] = body
+                if previous is None or previous.get("cursor") != body.get("cursor"):
+                    await self._broadcast(mode, body)
+            now = asyncio.get_running_loop().time()
+            if now >= heartbeat_at:
+                await self._broadcast_heartbeat()
+                heartbeat_at = now + SSE_HEARTBEAT_INTERVAL_S
+
+    async def _active_modes(self) -> list[str]:
+        async with self._lock:
+            return sorted({subscription.mode for subscription in self._subscribers.values()})
+
+    async def _broadcast(self, mode: str, body: dict[str, Any]) -> None:
+        async with self._lock:
+            subscribers = [subscription for subscription in self._subscribers.values() if subscription.mode == mode]
+        for subscription in subscribers:
+            _queue_latest(subscription.queue, body)
+
+    async def _broadcast_heartbeat(self) -> None:
+        async with self._lock:
+            subscribers = list(self._subscribers.values())
+        for subscription in subscribers:
+            _queue_latest(subscription.queue, None)
+
+
+SSE_SNAPSHOT_HUB_KEY = web.AppKey("sse_snapshot_hub", SseSnapshotHub)
+
+
+def _queue_latest(queue: asyncio.Queue[dict[str, Any] | None], item: dict[str, Any] | None) -> None:
+    if queue.full():
+        with contextlib.suppress(asyncio.QueueEmpty):
+            queue.get_nowait()
+    queue.put_nowait(item)
+
+
+async def _sse_snapshot_hub_context(app: web.Application):  # noqa: ANN202
+    hub = app[SSE_SNAPSHOT_HUB_KEY]
+    await hub.start()
+    try:
+        yield
+    finally:
+        await hub.stop()
 
 
 def make_app(
@@ -103,7 +213,6 @@ def make_app(
     http_post: HttpPost | None = None,
     source_factory: Callable[[str, Any], WorkSource] | None = None,
 ) -> web.Application:
-    configure_session_ref_secret(cfg.orchestration.session_ref_secret.get_secret_value())
     ctx = CockpitAppContext(
         cfg=cfg,
         get=http_get or httpx.get,
@@ -114,10 +223,14 @@ def make_app(
         idempotency_lock_refs={},
         source_factory=source_factory or _work_source,
     )
+    _rebuild_session_ref_index_from_store(ctx.store)
     app = web.Application(middlewares=[_error_middleware])
     reads = CockpitReadHandlers(ctx)
     writes = CockpitWriteHandlers(ctx)
     sse = SseHandlers(ctx)
+    hub = SseSnapshotHub(ctx)
+    app[SSE_SNAPSHOT_HUB_KEY] = hub
+    app.cleanup_ctx.append(_sse_snapshot_hub_context)
     app.add_routes([
         web.get("/v1/health", reads.health),
         web.get("/v1/cockpit/catalog", reads.catalog),
@@ -163,7 +276,7 @@ class CockpitReadHandlers:
 
     async def workers(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
-        probe = str(request.query.get("sync") or request.query.get("probe") or "none") == "probe" or request.query.get("probe") == "true"
+        probe = _worker_probe(request)
         return web.json_response(
             {
                 "api_version": API_VERSION,
@@ -181,17 +294,15 @@ class CockpitReadHandlers:
     async def worker_detail(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
         worker_id = request.match_info["worker_id"]
-        profiles = await asyncio.to_thread(
-            worker_profiles,
-            worker_cfg=self.ctx.cfg.worker,
-            workers_path=self.ctx.cfg.orchestration.workers_path,
-            probe=True,
-            http_get=self.ctx.get,
+        probe = _worker_probe(request)
+        profile = await asyncio.to_thread(
+            WorkerRegistry(self.ctx.cfg.worker, profiles_path=self.ctx.cfg.orchestration.workers_path, http_get=self.ctx.get).get,
+            worker_id,
+            probe=probe,
         )
-        worker = next((item for item in profiles if item.get("worker_id") == worker_id), None)
-        if worker is None:
+        if profile is None:
             raise CockpitError("not_found", "worker not found", status=404)
-        return web.json_response(worker)
+        return web.json_response(project_worker_profile(profile))
 
     async def runs(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
@@ -287,24 +398,32 @@ class CockpitReadHandlers:
                 workers_path=self.ctx.cfg.orchestration.workers_path,
                 http_get=self.ctx.get,
             )
+        self.ctx.store.record_session_refs(_session_ref_index_rows(session_rows.values()))
         return web.json_response({"sessions": [session_summary(row, requests=requests, checkpoints=checkpoints) for row in session_rows.values()]})
 
     async def session_detail(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
-        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.cfg, self.ctx.store, request.match_info["session_ref"], get=self.ctx.get)
-        raw = await asyncio.to_thread(_worker_get_json, self.ctx.cfg, ref.worker_id, f"/sessions/{ref.session_id}", get=self.ctx.get)
-        row = _overlay_session_row(_fallback_session_row(self.ctx.store, ref, {"session": raw}), _worker_session_row(raw, ref.worker_id))
-        requests = [
-            _request_with_run(request_item, row.get("run_id", ""))
-            for request_item in await asyncio.to_thread(_worker_session_requests, self.ctx.cfg, ref, get=self.ctx.get)
-        ]
-        checkpoints = await asyncio.to_thread(_worker_session_checkpoints, self.ctx.cfg, ref, run_id=str(row.get("run_id") or ""), get=self.ctx.get)
+        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
+        raw: dict[str, Any] = {}
+        row = await asyncio.to_thread(_fallback_session_row, self.ctx.store, ref, {})
+        with contextlib.suppress(CockpitError):
+            raw = await asyncio.to_thread(_worker_get_json, self.ctx.cfg, ref.worker_id, f"/sessions/{ref.session_id}", get=self.ctx.get)
+            row = _overlay_session_row(row, _worker_session_row(raw, ref.worker_id))
+        requests: list[dict[str, Any]] = []
+        checkpoints: list[dict[str, Any]] = []
+        with contextlib.suppress(CockpitError):
+            requests = [
+                _request_with_run(request_item, row.get("run_id", ""))
+                for request_item in await asyncio.to_thread(_worker_session_requests, self.ctx.cfg, ref, get=self.ctx.get)
+            ]
+        with contextlib.suppress(CockpitError):
+            checkpoints = await asyncio.to_thread(_worker_session_checkpoints, self.ctx.cfg, ref, run_id=str(row.get("run_id") or ""), get=self.ctx.get)
         return web.json_response({"session": session_summary(row, requests=requests, checkpoints=checkpoints), "raw": _public_session_detail(raw)})
 
     async def session_events(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
-        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.cfg, self.ctx.store, request.match_info["session_ref"], get=self.ctx.get)
-        run_id = await asyncio.to_thread(_session_run_id, self.ctx.cfg, ref, get=self.ctx.get)
+        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
+        run_id = await asyncio.to_thread(_session_run_id_from_store, self.ctx.store, ref)
         raw = await asyncio.to_thread(
             _worker_get_json,
             self.ctx.cfg,
@@ -321,8 +440,8 @@ class CockpitReadHandlers:
 
     async def session_requests(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
-        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.cfg, self.ctx.store, request.match_info["session_ref"], get=self.ctx.get)
-        run_id = await asyncio.to_thread(_session_run_id, self.ctx.cfg, ref, get=self.ctx.get)
+        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
+        run_id = await asyncio.to_thread(_session_run_id_from_store, self.ctx.store, ref)
         requests = [
             _request_with_run(request_item, run_id)
             for request_item in await asyncio.to_thread(_worker_session_requests, self.ctx.cfg, ref, get=self.ctx.get)
@@ -331,8 +450,8 @@ class CockpitReadHandlers:
 
     async def session_checkpoints(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
-        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.cfg, self.ctx.store, request.match_info["session_ref"], get=self.ctx.get)
-        run_id = await asyncio.to_thread(_session_run_id, self.ctx.cfg, ref, get=self.ctx.get)
+        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
+        run_id = await asyncio.to_thread(_session_run_id_from_store, self.ctx.store, ref)
         checkpoints = await asyncio.to_thread(_worker_session_checkpoints, self.ctx.cfg, ref, run_id=run_id, get=self.ctx.get)
         return web.json_response({"checkpoints": checkpoints})
 
@@ -395,7 +514,7 @@ class CockpitWriteHandlers:
     async def session_archive(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
         body = await _json_body(request)
-        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.cfg, self.ctx.store, request.match_info["session_ref"], get=self.ctx.get)
+        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
         scope = f"sessions/{ref.worker_id}/{ref.session_id}/archive"
         async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
             cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
@@ -409,7 +528,7 @@ class CockpitWriteHandlers:
 
     async def session_write(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
-        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.cfg, self.ctx.store, request.match_info["session_ref"], get=self.ctx.get)
+        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
         action = request.match_info.get("action", "restore_checkpoint")
         body = await _json_body(request)
         if action == "turns":
@@ -435,9 +554,11 @@ class SseHandlers:
 
     async def events(self, request: web.Request) -> web.StreamResponse:
         self.ctx.require_auth(request)
-        mode = str(request.query.get("sync") or "none")
+        mode = _sync_mode(request)
         client_cursor = str(request.query.get("after") or request.headers.get("Last-Event-ID") or "")
-        body = await asyncio.to_thread(_cockpit_snapshot, self.ctx, mode)
+        hub = request.app[SSE_SNAPSHOT_HUB_KEY]
+        subscription = await hub.subscribe(mode)
+        body = subscription.snapshot
         cursor = body["cursor"]
         response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
         await response.prepare(request)
@@ -445,16 +566,22 @@ class SseHandlers:
             await _write_sse(response, "snapshot", cursor, _sse_envelope(cursor, "snapshot", body))
         try:
             while True:
-                await asyncio.sleep(1)
-                next_body = await asyncio.to_thread(_cockpit_snapshot, self.ctx, mode)
-                next_cursor = next_body["cursor"]
+                event = await subscription.queue.get()
+                if event is None:
+                    await response.write(b": heartbeat\n\n")
+                    continue
+                next_cursor = event["cursor"]
                 if next_cursor != cursor:
                     cursor = next_cursor
-                    await _write_sse(response, "snapshot", cursor, _sse_envelope(cursor, "snapshot", next_body))
+                    await _write_sse(response, "snapshot", cursor, _sse_envelope(cursor, "snapshot", event))
                 else:
                     await response.write(b": heartbeat\n\n")
-        except (asyncio.CancelledError, ConnectionResetError, RuntimeError):
+        except asyncio.CancelledError:
+            raise
+        except (ConnectionResetError, RuntimeError):
             return response
+        finally:
+            await hub.unsubscribe(subscription)
 
 
 @web.middleware
@@ -579,6 +706,7 @@ def _started_work_packet(store: OrchestrationStore, result: StartedWork) -> dict
             "allowed_actions": list(session.allowed_actions),
         }
         sessions.append(session_summary(row))
+        store.record_session_refs(_session_ref_index_rows([row]))
     artifacts = artifact_summaries(runs)
     run_row = run_summary(run, artifacts=artifacts) if run else {}
     return {
@@ -742,12 +870,7 @@ def _archive_run(store: OrchestrationStore, run_id: str):
 
 
 def _archive_session(store: OrchestrationStore, ref: SessionRef):
-    archived = store.archive_worker_session(ref.worker_id, ref.session_id)
-    for run in store.list_runs():
-        for session in run.sessions:
-            if session.worker_id == ref.worker_id and session.session_id == ref.session_id:
-                return store.archive_session(run.run_id, ref.session_id, worker_id=ref.worker_id)
-    return archived
+    return store.archive_cockpit_session(ref.worker_id, ref.session_id)
 
 
 def _archive_run_packet(run) -> dict[str, Any]:  # noqa: ANN001
@@ -805,36 +928,53 @@ def _sync_mode(request: web.Request) -> str:
     return mode if mode in {"none", "fast", "probe"} else "none"
 
 
-def _resolve_session_ref(cfg: Config, store: OrchestrationStore, session_ref: str, *, get: HttpGet) -> SessionRef:
+def _worker_probe(request: web.Request) -> bool:
+    sync = request.query.get("sync")
+    probe = request.query.get("probe")
+    if sync not in (None, "", "none", "fast", "probe"):
+        raise CockpitError("validation_failed", "sync must be one of none, fast, or probe", recoverable=True, status=400)
+    if probe is not None and probe not in {"true", "false", "1", "0"}:
+        raise CockpitError("validation_failed", "probe must be true or false", recoverable=True, status=400)
+    return sync == "probe" or probe in {"true", "1"}
+
+
+def _resolve_session_ref(store: OrchestrationStore, session_ref: str) -> SessionRef:
     if not valid_session_ref(session_ref):
         raise CockpitError("not_found", "session not found", status=404)
+    record = store.resolve_session_ref(session_ref)
+    if record is None:
+        _rebuild_session_ref_index_from_store(store)
+        record = store.resolve_session_ref(session_ref)
+    if record is not None:
+        return SessionRef(worker_id=record["worker_id"], session_id=record["session_id"])
+    raise CockpitError("not_found", "session not found", status=404)
+
+
+def _rebuild_session_ref_index_from_store(store: OrchestrationStore) -> None:
+    rows: list[dict[str, str]] = []
     for run in store.list_runs():
         for link in run.sessions:
-            if make_session_ref(link.worker_id, link.session_id) == session_ref:
-                return SessionRef(worker_id=link.worker_id, session_id=link.session_id)
-    for item in store.archived_worker_sessions().values():
-        worker_id = str(item.get("worker_id") or "")
-        session_id = str(item.get("session_id") or "")
-        if worker_id and session_id and make_session_ref(worker_id, session_id) == session_ref:
-            return SessionRef(worker_id=worker_id, session_id=session_id)
-    registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path)
-    for profile in registry.profiles(probe=False):
-        if not profile.base_url:
+            rows.append({"session_ref": make_session_ref(link.worker_id, link.session_id), "worker_id": link.worker_id, "session_id": link.session_id})
+    rows.extend(
+        {"session_ref": make_session_ref(str(item.get("worker_id") or ""), str(item.get("session_id") or "")), "worker_id": str(item.get("worker_id") or ""), "session_id": str(item.get("session_id") or "")}
+        for item in store.archived_worker_sessions().values()
+    )
+    store.record_session_refs(rows)
+
+
+def _session_ref_index_rows(rows: Any) -> list[dict[str, str]]:
+    result = []
+    for row in rows:
+        if not isinstance(row, dict):
             continue
-        try:
-            response = get(f"{profile.base_url}/sessions", headers=worker_headers(cfg.worker, profile), timeout=cfg.worker.request_timeout_s)
-            if getattr(response, "status_code", 200) >= 400:
-                continue
-            sessions = response.json().get("sessions", [])
-        except Exception:  # noqa: BLE001 - unknown refs should not expose worker failure details
-            continue
-        for raw in sessions:
-            if not isinstance(raw, dict):
-                continue
-            session_id = str(raw.get("session_id") or "")
-            if session_id and make_session_ref(profile.worker_id, session_id) == session_ref:
-                return SessionRef(worker_id=profile.worker_id, session_id=session_id)
-    raise CockpitError("not_found", "session not found", status=404)
+        result.append(
+            {
+                "session_ref": str(row.get("session_ref") or ""),
+                "worker_id": str(row.get("worker_id") or ""),
+                "session_id": str(row.get("session_id") or ""),
+            }
+        )
+    return result
 
 
 def _persist_session_write(store: OrchestrationStore, ref: SessionRef, row: dict[str, Any], events: list[dict[str, Any]]) -> None:
@@ -855,19 +995,29 @@ def _persist_session_write(store: OrchestrationStore, ref: SessionRef, row: dict
         )
     except KeyError:
         return
+    existing_event_ids = {
+        str(existing.data.get("event_id") or "")
+        for existing in store.events(run_id)
+        if isinstance(existing.data, dict) and existing.data.get("event_id")
+    }
     for event in events:
+        event_id = str(event.get("event_id") or "")
+        if event_id and event_id in existing_event_ids:
+            continue
         store.append_event(
             run_id,
             str(event.get("type") or "session.event"),
             "",
             {
                 "session_id": ref.session_id,
-                "event_id": str(event.get("event_id") or ""),
+                "event_id": event_id,
                 "turn_id": str(event.get("turn_id") or ""),
                 "message_id": str(event.get("message_id") or ""),
                 "data": dict(event.get("data") or {}),
             },
         )
+        if event_id:
+            existing_event_ids.add(event_id)
     _finalize_session_run_if_terminal(store, run_id)
 
 
@@ -881,15 +1031,13 @@ def _latest_event_id(events: list[dict[str, Any]]) -> str | None:
 
 def _finalize_session_run_if_terminal(store: OrchestrationStore, run_id: str) -> None:
     run = store.get(run_id)
-    if run is None or run.status == "terminal" or not run.sessions:
+    if run is None:
         return
-    statuses = {session.status for session in run.sessions}
-    if statuses & ACTIVE_SESSION_STATUSES:
-        return
-    if statuses <= SUCCESS_SESSION_STATUSES:
+    final = _final_session_phase(run)
+    if final == "completed":
         store.set_phase(run_id, "completed", "All worker sessions completed")
         return
-    if statuses & FAILED_SESSION_STATUSES:
+    if final == "failed":
         store.set_phase(run_id, "failed", "At least one worker session failed, stopped, or was interrupted")
 
 
@@ -980,13 +1128,17 @@ def _worker_post_json(cfg: Config, worker_id: str, path: str, body: dict[str, An
             raise CockpitError(code, message, recoverable=True, status=409)
         if code == "request_not_pending":
             raise CockpitError(code, message, recoverable=True, status=409)
+        if code in {"session_active", "session_terminal", "checkpoint_not_found"}:
+            raise CockpitError(code, message, recoverable=True, status=409)
         if status == 401:
             raise CockpitError("worker_unavailable", message or "worker authentication failed", recoverable=True, status=502)
         if status == 403:
             raise CockpitError("forbidden", message, status=403)
         if status == 404:
             raise CockpitError("not_found", message, status=404)
-        raise CockpitError(code, message, recoverable=status in {400, 409}, status=409 if status == 409 else status)
+        if status in {400, 422}:
+            raise CockpitError("validation_failed", message, recoverable=True, status=400)
+        raise CockpitError("worker_unavailable", message, recoverable=True, status=502)
     return data if isinstance(data, dict) else {}
 
 
@@ -1033,7 +1185,7 @@ def _public_session_detail(raw: dict[str, Any]) -> dict[str, Any]:
                 "message_id": raw.get("last_event_id"),
             }
         ).items()
-        if value not in ("", [], {})
+        if value not in (None, "", [], {})
     }
 
 
@@ -1058,9 +1210,11 @@ def _request_with_run(item: dict[str, Any], run_id: str) -> dict[str, Any]:
     return item
 
 
-def _session_run_id(cfg: Config, ref, *, get: HttpGet) -> str:  # noqa: ANN001
-    raw = _worker_get_json(cfg, ref.worker_id, f"/sessions/{ref.session_id}", get=get)
-    return str(raw.get("run_id") or "")
+def _session_run_id_from_store(store: OrchestrationStore, ref: SessionRef) -> str:
+    for run in store.list_runs():
+        if any(link.worker_id == ref.worker_id and link.session_id == ref.session_id for link in run.sessions):
+            return run.run_id
+    return ""
 
 
 def _required_session_action(action: str) -> str:
