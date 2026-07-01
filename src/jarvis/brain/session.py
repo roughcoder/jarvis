@@ -265,6 +265,10 @@ class BrainSession:
         self._heartbeat_pcm: bytes | None = None  # cached tool-search pulse
         self._voice_mode = DEFAULT_MODE
 
+    @property
+    def pending_cold_tasks(self) -> tuple[asyncio.Task, ...]:
+        return tuple(self._cold_tasks)
+
     def set_voice_mode(self, mode: str) -> None:
         self._voice_mode = normalize_mode(mode)
 

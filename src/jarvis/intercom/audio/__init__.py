@@ -121,7 +121,9 @@ class _StreamingPlayer:
         # holds) plus a partial leftover view — NOT one growing array that
         # would need an O(n) copy under the realtime lock and starve playback.
         self._chunks: deque = deque()
-        self._leftover = np.empty(0, dtype=np.int16)
+        self._empty = np.empty(0, dtype=np.int16)
+        self._leftover = self._empty
+        self._leftover_pos = 0
         self._leftover_silence = False
         self._buffered = 0  # total queued samples
         # Prebuffer audio before consuming, to absorb network jitter and avoid
@@ -173,27 +175,36 @@ class _StreamingPlayer:
             self.metrics.aborted = True
             raise self._sd.CallbackAbort
         idx = 0
-        with self._lock:
-            if not self._ready:
-                # Hold output silent until enough is buffered (or input ended).
-                if self._buffered >= self._prebuffer or self._producer_done.is_set():
-                    self._ready = True
-                    self.metrics.mark_ready()
-                else:
-                    outdata[:, 0] = 0
-                    return
-            while idx < frames and (len(self._leftover) or self._chunks):
-                if len(self._leftover) == 0:
-                    self._leftover, self._leftover_silence = self._chunks.popleft()
-                take = min(frames - idx, len(self._leftover))
-                outdata[idx : idx + take, 0] = self._leftover[:take]
-                self.metrics.mark_output(speech=not self._leftover_silence)
-                self._leftover = self._leftover[take:]
+        done = False
+        while idx < frames:
+            with self._lock:
+                if not self._ready:
+                    # Hold output silent until enough is buffered (or input ended).
+                    if self._buffered >= self._prebuffer or self._producer_done.is_set():
+                        self._ready = True
+                        self.metrics.mark_ready()
+                    else:
+                        outdata[:, 0] = 0
+                        return
+                if self._leftover_pos >= len(self._leftover):
+                    if self._chunks:
+                        self._leftover, self._leftover_silence = self._chunks.popleft()
+                        self._leftover_pos = 0
+                    else:
+                        done = self._producer_done.is_set()
+                        break
+                start = self._leftover_pos
+                take = min(frames - idx, len(self._leftover) - start)
+                chunk = self._leftover
+                silence = self._leftover_silence
+                self._leftover_pos += take
+                if self._leftover_pos >= len(self._leftover):
+                    self._leftover = self._empty
+                    self._leftover_pos = 0
                 self._buffered -= take
-                idx += take
-            done = self._producer_done.is_set() and not self._chunks and not len(
-                self._leftover
-            )
+            outdata[idx : idx + take, 0] = chunk[start : start + take]
+            self.metrics.mark_output(speech=not silence)
+            idx += take
         if idx < frames:
             outdata[idx:, 0] = 0  # pad underflow with silence
             if done:

@@ -252,12 +252,14 @@ async def cleanup_job(
     """Tidy a finished job's working area: remove the worktree + delete the branch
     for a repo job, or delete worker-owned scratch. Never delete arbitrary
     user-supplied paths."""
+    roots = [pathlib.Path(p) for p in (owned_roots or []) if p]
     if repo and branch and cwd:
+        if roots and not _is_under(pathlib.Path(cwd), roots):
+            return f"refused to remove non-worker-owned path {cwd}"
         await run_exec(["git", "-C", repo, "worktree", "remove", "--force", cwd], None, timeout_s)
         await run_exec(["git", "-C", repo, "branch", "-D", branch], None, timeout_s)
         return f"removed worktree + branch {branch}"
     if cwd:
-        roots = [pathlib.Path(p) for p in (owned_roots or []) if p]
         if roots and not _is_under(pathlib.Path(cwd), roots):
             return f"refused to remove non-worker-owned path {cwd}"
         shutil.rmtree(cwd, ignore_errors=True)

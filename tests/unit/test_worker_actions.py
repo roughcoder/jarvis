@@ -226,6 +226,20 @@ def test_cleanup_refuses_non_worker_owned_paths(tmp_path) -> None:
     assert (user_dir / "keep.txt").exists()
 
 
+def test_cleanup_refuses_repo_worktree_outside_owned_roots(tmp_path) -> None:
+    user_dir = tmp_path / "user-worktree"
+    user_dir.mkdir()
+    (user_dir / "keep.txt").write_text("keep")
+    owned = tmp_path / "worker" / "worktrees"
+
+    out = asyncio.run(
+        cleanup_job(str(tmp_path), str(user_dir), "jarvis/job", 5, owned_roots=[str(owned)])
+    )
+
+    assert out.startswith("refused")
+    assert (user_dir / "keep.txt").exists()
+
+
 def test_jobs_named_and_findable() -> None:
     async def go():
         jm = JobManager()

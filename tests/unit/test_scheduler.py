@@ -70,6 +70,20 @@ def test_acknowledge_stops_the_ringing() -> None:
     assert s.ringing_on("mac") is False
 
 
+def test_acknowledge_all_stops_every_ringing_alarm_on_device() -> None:
+    s = Scheduler()
+    s.add(_alarm(due=100.0, label="tea"))
+    s.add(_alarm(due=100.0, label="pills"))
+    s.add(_alarm(due=100.0, label="other", device_id="pi"))
+    s.tick(100.0)
+
+    stopped = s.acknowledge_all("mac")
+
+    assert {alarm.label for alarm in stopped} == {"tea", "pills"}
+    assert s.ringing_on("mac") is False
+    assert s.ringing_on("pi") is True
+
+
 def test_acknowledge_only_a_ringing_alarm() -> None:
     s = Scheduler()
     s.add(_alarm(due=100.0))  # not yet ringing (pending)

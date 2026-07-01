@@ -8,9 +8,11 @@ forwards a proactive notification (Proactive with a `to`) OUT via wacli. No netw
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 
 from jarvis.connectors.whatsapp import (
     InboundMessage,
+    _remember_seen,
     _parse_messages,
     _user_numbers,
     add_whatsapp_number,
@@ -170,6 +172,21 @@ def test_forward_proactive_ignores_non_addressed() -> None:
     assert asyncio.run(forward_proactive(wacli, Proactive(text="device only"))) is False
     assert asyncio.run(forward_proactive(wacli, ReplyText(turn_id="t", text="x"))) is False
     assert wacli.sent == []
+
+
+def test_seen_messages_evict_oldest_not_random_recent() -> None:
+    seen: OrderedDict[str, None] = OrderedDict()
+
+    for i in range(1001):
+        _remember_seen(seen, f"m{i}")
+
+    assert "m0" not in seen
+    assert "m1" in seen
+    assert "m1000" in seen
+    _remember_seen(seen, "m1")
+    for i in range(1001, 2000):
+        _remember_seen(seen, f"m{i}")
+    assert "m1" in seen
 
 
 # --- Remote pairing / onboarding ------------------------------------------
