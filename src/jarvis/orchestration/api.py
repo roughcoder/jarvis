@@ -31,8 +31,11 @@ from jarvis.orchestration.cockpit import (
     make_session_ref,
     paged,
     parse_session_ref,
+    project_checkpoint,
     project_request,
     project_session_event,
+    public_error_message,
+    public_event_data,
     run_detail_projection,
     run_report_artifact,
     run_summary,
@@ -337,7 +340,7 @@ async def _error_middleware(request: web.Request, handler):  # noqa: ANN001
         raise
     except Exception as exc:  # noqa: BLE001
         return web.json_response(
-            {"ok": False, "error": {"code": "internal_error", "message": str(exc), "recoverable": False}},
+            {"ok": False, "error": {"code": "internal_error", "message": public_error_message(str(exc) or "internal server error"), "recoverable": False}},
             status=500,
         )
 
@@ -520,8 +523,8 @@ def _project_run_event(event, sequence: int) -> dict[str, Any]:  # noqa: ANN001
         "run_id": event.run_id,
         "type": event.type,
         "occurred_at": event.time,
-        "message": event.message,
-        "data": event.data,
+        "message": public_error_message(event.message),
+        "data": public_event_data(event.data),
         "cursor": f"{event.run_id}:{sequence}",
     }
 
@@ -563,7 +566,7 @@ def _worker_post_json(cfg: Config, worker_id: str, path: str, body: dict[str, An
     status = getattr(response, "status_code", 200)
     data = response.json() if hasattr(response, "json") else {}
     if status >= 400 or (isinstance(data, dict) and data.get("ok") is False):
-        message = str(data.get("error") or "worker write failed") if isinstance(data, dict) else "worker write failed"
+        message = public_error_message(str(data.get("error") or "worker write failed")) if isinstance(data, dict) else "worker write failed"
         if status == 401:
             raise CockpitError("unauthorized", message, status=401)
         if status == 403:
@@ -611,10 +614,7 @@ def _worker_session_checkpoints(cfg: Config, ref, *, run_id: str, get: HttpGet) 
     result = []
     for item in raw.get("checkpoints", []):
         if isinstance(item, dict):
-            next_item = dict(item)
-            next_item["session_ref"] = make_session_ref(ref.worker_id, ref.session_id)
-            next_item["run_id"] = run_id
-            result.append(next_item)
+            result.append(project_checkpoint(item, ref.worker_id, ref.session_id, run_id))
     return result
 
 
@@ -658,9 +658,9 @@ def _response_error(response: Any) -> str:
     try:
         data = response.json()
     except Exception:
-        return str(getattr(response, "text", "") or "")
+        return public_error_message(str(getattr(response, "text", "") or ""))
     if isinstance(data, dict):
-        return str(data.get("error") or data.get("message") or "")
+        return public_error_message(str(data.get("error") or data.get("message") or ""))
     return ""
 
 

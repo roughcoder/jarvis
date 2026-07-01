@@ -121,7 +121,16 @@ def _seed_run(cfg: Config) -> tuple[OrchestrationStore, str]:
             last_event_id="ev_2",
         ),
     )
-    store.append_event(run.run_id, "verification_started", "Running tests", {"command": "pytest"})
+    store.append_event(
+        run.run_id,
+        "verification_started",
+        "Running tests in /Users/example/private/jarvis",
+        {
+            "command": "pytest /Users/example/private/jarvis",
+            "cwd": "/Users/example/private/jarvis",
+            "token_env": "OPENAI_API_KEY",
+        },
+    )
     store.link_artifact(run.run_id, Artifact(type="pull_request", id="47", url="https://github.com/roughcoder/jarvis/pull/47", status="open"))
     return store, run.run_id
 
@@ -185,7 +194,15 @@ def _fake_get(run_id: str):  # noqa: ANN202
                             "session_id": "sess_123",
                             "type": "assistant.delta",
                             "time": "2026-07-01T11:00:01Z",
-                            "data": {"turn_id": "turn_1", "delta": "hello"},
+                            "data": {
+                                "turn_id": "turn_1",
+                                "delta": "hello",
+                                "command": "cat /Users/example/private/secret.txt",
+                                "cwd": "/Users/example/private/jarvis",
+                                "token_env": "OPENAI_API_KEY",
+                                "execution_envelope": {"allowed_actions": ["worker.session.turn"]},
+                                "metadata": {"provider_pid": 1234},
+                            },
                         },
                     ]
                 }
@@ -204,7 +221,16 @@ def _fake_get(run_id: str):  # noqa: ANN202
                                 "session_id": "sess_123",
                                 "type": "approval.requested",
                                 "time": "2026-07-01T11:01:00Z",
-                                "data": {"run_id": run_id, "title": "Approve file edits", "detail": "/Users/example/private/file"},
+                                "data": {
+                                    "run_id": run_id,
+                                    "title": "Approve file edits",
+                                    "detail": "/Users/example/private/file",
+                                    "payload": {
+                                        "request_kind": "file-change",
+                                        "cwd": "/Users/example/private/jarvis",
+                                        "token_env": "OPENAI_API_KEY",
+                                    },
+                                },
                             },
                         }
                     ]
@@ -220,6 +246,9 @@ def _fake_get(run_id: str):  # noqa: ANN202
                             "label": "before tests",
                             "provider": "codex",
                             "restored": False,
+                            "cwd": "/Users/example/private/jarvis",
+                            "metadata": {"provider_pid": 1234},
+                            "payload": {"command": "pytest /Users/example/private/jarvis", "token_env": "OPENAI_API_KEY"},
                         }
                     ]
                 }
@@ -256,6 +285,24 @@ def test_cockpit_catalog_snapshot_and_worker_projection(tmp_path, monkeypatch) -
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
+def test_cockpit_snapshot_none_does_not_poll_workers(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _store, _run_id = _seed_run(cfg)
+
+    def no_worker_get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        raise AssertionError(f"sync=none should not call worker HTTP: {url}")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        snapshot = (await client.get(f"{base}/v1/cockpit/snapshot")).json()
+
+        assert snapshot["sync"]["status"] == "stale"
+        assert snapshot["sessions"][0]["session_ref"].startswith("sessref_")
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=no_worker_get))
 
 
 def test_cockpit_snapshot_uses_stable_partial_sync_status(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -315,9 +362,19 @@ def test_cockpit_session_detail_events_requests_and_checkpoints(tmp_path, monkey
         all_events = (await client.get(f"{base}/v1/sessions/{ref}/events")).json()["items"]
         delta = [event for event in all_events if event["type"] == "assistant.delta"][0]
         assert delta["message_id"] == "msg_turn_1"
+        assert "hello" in json.dumps(delta)
+        assert "<local-path>" in json.dumps(delta)
+        assert "OPENAI_API_KEY" not in json.dumps(all_events)
+        assert "execution_envelope" not in json.dumps(all_events)
+        assert "provider_pid" not in json.dumps(all_events)
         assert requests["requests"][0]["title"] == "Approve file edits"
         assert "<local-path>" in requests["requests"][0]["detail"]
+        assert "OPENAI_API_KEY" not in json.dumps(requests)
+        assert "cwd" not in json.dumps(requests)
         assert checkpoints["checkpoints"][0]["session_ref"] == ref
+        assert "<local-path>" in json.dumps(checkpoints)
+        assert "provider_pid" not in json.dumps(checkpoints)
+        assert "OPENAI_API_KEY" not in json.dumps(checkpoints)
 
     import asyncio
 
@@ -332,15 +389,23 @@ def test_cockpit_run_events_and_artifact_pagination(tmp_path, monkeypatch) -> No
         detail = (await client.get(f"{base}/v1/runs/{run_id}")).json()
         events = (await client.get(f"{base}/v1/runs/{run_id}/events", params={"limit": 1})).json()
         artifacts = (await client.get(f"{base}/v1/runs/{run_id}/artifacts", params={"limit": 2})).json()
+        all_artifacts = (await client.get(f"{base}/v1/runs/{run_id}/artifacts")).json()
 
         assert detail["run"]["run_id"] == run_id
         assert "private implementation detail" not in json.dumps(detail)
         assert "internal_47" not in json.dumps(detail)
         assert "/Users/" not in json.dumps(detail)
         assert events["items"][0]["type"] == "run_created"
+        event_page = (await client.get(f"{base}/v1/runs/{run_id}/events")).json()
+        assert "/Users/" not in json.dumps(event_page)
+        assert "OPENAI_API_KEY" not in json.dumps(event_page)
+        assert "cwd" not in json.dumps(event_page)
         assert events["has_more"] is True
         kinds = {item["kind"] for item in artifacts["items"]}
+        report = [item for item in all_artifacts["items"] if item["kind"] == "report"][0]
         assert {"branch", "pull_request"}.issubset(kinds)
+        assert report["created_at"]
+        assert report["updated_at"]
         assert artifacts["has_more"] is True
 
     import asyncio
@@ -373,6 +438,11 @@ def test_cockpit_sse_emits_snapshot_with_cursor(tmp_path, monkeypatch) -> None: 
 def test_cockpit_sse_emits_snapshot_when_projection_cursor_changes(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch)
     store, run_id = _seed_run(cfg)
+    worker_calls: list[str] = []
+
+    def no_worker_poll_get(url: str, **kwargs) -> Response:  # noqa: ANN001
+        worker_calls.append(url)
+        return _fake_get(run_id)(url, **kwargs)
 
     async def calls(base: str, client: httpx.AsyncClient) -> None:
         current = (await client.get(f"{base}/v1/cockpit/snapshot")).json()["cursor"]
@@ -401,10 +471,11 @@ def test_cockpit_sse_emits_snapshot_when_projection_cursor_changes(tmp_path, mon
         assert '"occurred_at":' in seen
         assert f'"cursor": "{current}"' not in seen
         assert '"phase": "verifying"' in seen
+        assert worker_calls == []
 
     import asyncio
 
-    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+    asyncio.run(_with_server(cfg, calls, http_get=no_worker_poll_get))
 
 
 def test_cockpit_auth_and_bad_session_ref_errors(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -422,6 +493,34 @@ def test_cockpit_auth_and_bad_session_ref_errors(tmp_path, monkeypatch) -> None:
     import asyncio
 
     asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_worker_error_messages_are_redacted(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _store, _run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+    private_path = "/Users" + "/example/private/jarvis"
+    fake_token = "sk-" + "abcdefghijklmnopqrstuvwxyz"
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions/sess_123"):
+            return Response({"error": f"failed in {private_path} with {fake_token}"}, status_code=500)
+        return Response({})
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/sessions/{ref}")
+        body = response.json()
+
+        assert response.status_code == 502
+        assert body["error"]["code"] == "worker_unavailable"
+        assert "/Users/" not in body["error"]["message"]
+        assert fake_token not in body["error"]["message"]
+        assert "<local-path>" in body["error"]["message"]
+        assert "<redacted-token>" in body["error"]["message"]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
 
 
 def test_cockpit_api_refuses_unsafe_bind_with_nonzero_status(tmp_path, monkeypatch) -> None:  # noqa: ANN001

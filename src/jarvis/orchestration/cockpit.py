@@ -33,6 +33,55 @@ SCHEMA_VERSION = 1
 SESSION_REF_PREFIX = "sessref_"
 CURSOR_PREFIX = "evt_"
 MAX_PAGE_LIMIT = 500
+PRIVATE_PUBLIC_KEYS = {
+    "api_key",
+    "apikey",
+    "authorization",
+    "base_url",
+    "codex_thread_id",
+    "control_envelope",
+    "cwd",
+    "env",
+    "environment",
+    "execution_envelope",
+    "headers",
+    "metadata",
+    "password",
+    "provider_pid",
+    "provider_session_id",
+    "raw",
+    "secret",
+    "token",
+    "token_env",
+}
+PUBLIC_EVENT_DATA_KEYS = {
+    "branch",
+    "checkpoint_id",
+    "command",
+    "commit_sha",
+    "content",
+    "decision",
+    "delta",
+    "detail",
+    "exit_code",
+    "id",
+    "label",
+    "message_id",
+    "options",
+    "payload",
+    "provider",
+    "question",
+    "questions",
+    "request_id",
+    "request_kind",
+    "run_id",
+    "status",
+    "summary",
+    "text",
+    "title",
+    "turn_id",
+    "url",
+}
 
 
 class CockpitError(RuntimeError):
@@ -146,7 +195,8 @@ def cockpit_snapshot(
 ) -> dict[str, Any]:
     sync = sync_state(store=store, worker_cfg=worker_cfg, workers_path=workers_path, sync_mode=sync_mode, http_get=http_get)
     runs = store.list_runs()
-    workers = worker_profiles(worker_cfg=worker_cfg, workers_path=workers_path, probe=sync_mode == "probe", http_get=http_get)
+    include_worker_state = sync["mode"] in {"fast", "probe"}
+    workers = worker_profiles(worker_cfg=worker_cfg, workers_path=workers_path, probe=sync["mode"] == "probe", http_get=http_get)
     worker_by_id = {worker["worker_id"]: worker for worker in workers}
     sessions = aggregate_sessions(
         runs=runs,
@@ -154,9 +204,10 @@ def cockpit_snapshot(
         workers_path=workers_path,
         http_get=http_get,
         worker_by_id=worker_by_id,
+        include_worker_state=include_worker_state,
     )
-    requests = aggregate_requests(worker_cfg=worker_cfg, workers_path=workers_path, http_get=http_get)
-    checkpoints = aggregate_checkpoints(runs=runs, worker_cfg=worker_cfg, workers_path=workers_path, http_get=http_get)
+    requests = aggregate_requests(worker_cfg=worker_cfg, workers_path=workers_path, http_get=http_get) if include_worker_state else []
+    checkpoints = aggregate_checkpoints(runs=runs, worker_cfg=worker_cfg, workers_path=workers_path, http_get=http_get) if include_worker_state else []
     artifacts = artifact_summaries(runs)
     return {
         "api_version": API_VERSION,
@@ -235,6 +286,7 @@ def aggregate_sessions(
     workers_path: str,
     http_get: Any = httpx.get,
     worker_by_id: dict[str, dict[str, Any]] | None = None,
+    include_worker_state: bool = True,
 ) -> dict[str, dict[str, Any]]:
     sessions: dict[str, dict[str, Any]] = {}
     worker_by_id = worker_by_id or {}
@@ -243,6 +295,8 @@ def aggregate_sessions(
         for link in run.sessions:
             ref = make_session_ref(link.worker_id, link.session_id)
             sessions[ref] = _session_from_link(link, run)
+    if not include_worker_state:
+        return sessions
     registry = WorkerRegistry(worker_cfg, profiles_path=workers_path)
     for profile in registry.profiles(probe=False):
         if profile.status == "offline":
@@ -305,7 +359,7 @@ def aggregate_checkpoints(
                     continue
                 for raw in response.json().get("checkpoints", []):
                     if isinstance(raw, dict):
-                        item = dict(raw)
+                        item = project_checkpoint(raw, link.worker_id, link.session_id, run.run_id)
                         item["session_ref"] = make_session_ref(link.worker_id, link.session_id)
                         item["run_id"] = run.run_id
                         results.append(item)
@@ -421,7 +475,7 @@ def project_session_event(raw: dict[str, Any], *, worker_id: str, run_id: str = 
         "occurred_at": str(raw.get("time") or raw.get("occurred_at") or ""),
         "turn_id": turn_id,
         "message_id": _message_id(raw, data, turn_id),
-        "data": data,
+        "data": public_event_data(data),
     }
 
 
@@ -441,13 +495,29 @@ def project_request(raw: dict[str, Any], worker_id: str) -> dict[str, Any]:
         "detail": _redact(detail),
         "created_at": str(event.get("time") or data.get("created_at") or ""),
         "expires_at": data.get("expires_at"),
-        "payload": dict(data.get("payload") or data),
+        "payload": public_event_data(dict(data.get("payload") or data)),
     }
     if kind == "input":
         result["questions"] = data.get("questions") if isinstance(data.get("questions"), list) else [
             {"id": "response", "header": "Input", "question": str(data.get("question") or "Input needed"), "options": []}
         ]
     return result
+
+
+def project_checkpoint(raw: dict[str, Any], worker_id: str, session_id: str, run_id: str) -> dict[str, Any]:
+    checkpoint_id = str(raw.get("checkpoint_id") or raw.get("id") or "")
+    return {
+        "checkpoint_id": checkpoint_id,
+        "session_ref": make_session_ref(worker_id, session_id),
+        "run_id": run_id,
+        "label": _redact(str(raw.get("label") or "")),
+        "provider": _redact(str(raw.get("provider") or "")),
+        "status": _redact(str(raw.get("status") or "")),
+        "restored": bool(raw.get("restored", False)),
+        "created_at": str(raw.get("created_at") or raw.get("time") or ""),
+        "updated_at": str(raw.get("updated_at") or raw.get("time") or ""),
+        "payload": public_event_data(dict(raw.get("payload") or {})),
+    }
 
 
 def artifact_summaries(runs: list[OrchestrationRun]) -> list[dict[str, Any]]:
@@ -709,6 +779,44 @@ def _redact(value: str) -> str:
     return text
 
 
+def public_error_message(value: str) -> str:
+    text = _redact(value)
+    text = re.sub(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", "<redacted-email>", text)
+    return text[:300]
+
+
+def public_event_data(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): _public_value(value)
+        for key, value in data.items()
+        if _public_key(key) in PUBLIC_EVENT_DATA_KEYS and _public_value(value) not in ("", [], {})
+    }
+
+
+def _public_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _redact(value)
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int | float):
+        return value
+    if isinstance(value, list):
+        return [item for item in (_public_value(item) for item in value) if item not in ("", [], {})]
+    if isinstance(value, dict):
+        return {
+            str(key): item
+            for key, raw in value.items()
+            if _public_key(key) not in PRIVATE_PUBLIC_KEYS
+            for item in [_public_value(raw)]
+            if item not in ("", [], {})
+        }
+    return _redact(str(value))
+
+
+def _public_key(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
 def _merge_sync(left: SyncSummary, right: SyncSummary) -> SyncSummary:
     return SyncSummary(
         runs_seen=max(left.runs_seen, right.runs_seen),
@@ -731,6 +839,9 @@ def _body_fingerprint(body: dict[str, Any]) -> str:
 
 def run_report_artifact(store: OrchestrationStore, run_id: str) -> dict[str, Any]:
     report = build_run_report(store, run_id)
+    run = store.get(run_id)
+    created_at = run.created_at if run is not None else ""
+    updated_at = run.updated_at if run is not None else ""
     return {
         "artifact_id": artifact_id(run_id, "report", run_id),
         "run_id": run_id,
@@ -746,7 +857,7 @@ def run_report_artifact(store: OrchestrationStore, run_id: str) -> dict[str, Any
         "url": "",
         "branch": "",
         "commit_sha": "",
-        "created_at": "",
-        "updated_at": "",
+        "created_at": created_at,
+        "updated_at": updated_at,
         "metadata": {"report": report},
     }
