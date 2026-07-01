@@ -178,8 +178,8 @@ It is not current operational state.
       "maps_to": ["worker.session.create", "worker.session.turn"]
     }
   ],
-  "work_sources": ["manual", "github", "linear", "voice", "whatsapp"],
-  "engine_strategies": ["single", "parallel", "review_panel"],
+  "work_sources": ["manual", "github", "linear"],
+  "engine_strategies": ["single", "parallel"],
   "branch_strategies": ["auto", "use_existing", "create", "none"],
   "landing_policies": ["branch_only", "draft_pr", "ready_pr", "confirm_before_pr"],
   "request_kinds": ["approval", "input"]

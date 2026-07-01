@@ -8,6 +8,7 @@ import pathlib
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -528,15 +529,15 @@ def project_request(raw: dict[str, Any], worker_id: str) -> dict[str, Any]:
         "run_id": str(data.get("run_id") or ""),
         "kind": kind,
         "status": str(raw.get("status") or "pending"),
-        "title": str(data.get("title") or ("Approve action" if kind == "approval" else "Input needed")),
+        "title": _redact(str(data.get("title") or ("Approve action" if kind == "approval" else "Input needed"))),
         "detail": _redact(detail),
         "created_at": str(event.get("time") or data.get("created_at") or ""),
         "expires_at": data.get("expires_at"),
         "payload": public_event_data(dict(data.get("payload") or data)),
     }
     if kind == "input":
-        result["questions"] = data.get("questions") if isinstance(data.get("questions"), list) else [
-            {"id": "response", "header": "Input", "question": str(data.get("question") or "Input needed"), "options": []}
+        result["questions"] = _public_questions(data.get("questions")) or [
+            {"id": "response", "header": "Input", "question": _redact(str(data.get("question") or "Input needed")), "options": []}
         ]
     return result
 
@@ -605,19 +606,21 @@ def archived_session_refs_for_runs(runs: list[OrchestrationRun]) -> set[str]:
 
 def project_artifact(artifact: Artifact, run: OrchestrationRun) -> dict[str, Any]:
     kind = _artifact_kind(artifact.type)
+    public_url = _public_url(artifact.url)
+    title = _redact(artifact.name) or public_url or _redact(artifact.id) or kind
     return {
         "artifact_id": artifact.id or artifact_id(run.run_id, kind, artifact.url or artifact.name),
         "run_id": run.run_id,
         "session_ref": "",
         "kind": kind,
         "provider": _artifact_provider(artifact.url),
-        "external_id": artifact.id,
+        "external_id": _redact(artifact.id),
         "is_primary": kind in {"pull_request", "report"},
         "visibility": "public-safe",
-        "title": artifact.name or artifact.url or artifact.id or kind,
+        "title": title,
         "status": artifact.status,
         "summary": "",
-        "url": _public_url(artifact.url),
+        "url": public_url,
         "branch": "",
         "commit_sha": "",
         "created_at": run.created_at,
@@ -819,13 +822,17 @@ def _artifact_provider(url: str) -> str:
 def _public_url(value: str) -> str:
     text = str(value or "")
     if text.startswith(("https://github.com/", "https://linear.app/")):
-        return text
+        parts = urlsplit(text)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
     return ""
 
 
 def _redact(value: str) -> str:
     text = str(value or "")
+    text = re.sub(r"https?://[^\s)]+", lambda match: _public_url(match.group(0)) or "<redacted-url>", text)
     text = re.sub(r"/Users/[^\s)]+", "<local-path>", text)
+    text = re.sub(r"/(?:home|workspace|workspaces|tmp|mnt|opt)/[^\s)]+", "<local-path>", text)
+    text = re.sub(r"/(?:private/tmp|var/folders)/[^\s)]+", "<local-path>", text)
     text = re.sub(r"\b(?:lin_api|ghp|github_pat|sk-[A-Za-z0-9])[A-Za-z0-9_\-]{12,}\b", "<redacted-token>", text)
     return text
 
@@ -863,6 +870,23 @@ def _public_value(value: Any) -> Any:
             if item not in ("", [], {})
         }
     return _redact(str(value))
+
+
+def _public_questions(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    questions: list[dict[str, Any]] = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        question = {
+            "id": _redact(str(raw.get("id") or "")),
+            "header": _redact(str(raw.get("header") or "")),
+            "question": _redact(str(raw.get("question") or "")),
+            "options": _public_value(raw.get("options") if isinstance(raw.get("options"), list) else []),
+        }
+        questions.append({key: item for key, item in question.items() if item not in ("", [], {})})
+    return questions
 
 
 def _public_key(value: Any) -> str:
