@@ -120,20 +120,22 @@ class OrchestrationService:
             worker = registry.get(command.target_worker_id, probe=True)
         elif command.engine_strategy == "ensemble" and requested_engines:
             worker = registry.choose(item.capability_requirements, engines=requested_engines, slots=len(requested_engines))
+        elif command.engine_strategy == "ensemble":
+            worker = _choose_ensemble_worker(registry, item.capability_requirements, requested_engines)
         elif target_engine:
             worker = registry.choose(item.capability_requirements, engine=target_engine)
         else:
             worker = registry.choose(item.capability_requirements)
-        required_slots = len(requested_engines) if command.engine_strategy == "ensemble" and requested_engines else 1
+        engine = target_engine or (worker.default_engine if worker else "") or (worker.agent if worker else "")
+        engines = _target_engines(command, worker, fallback_engine=engine) if worker is not None else []
+        required_slots = len(engines) if command.engine_strategy == "ensemble" else 1
         if worker is None or not _worker_is_eligible(
             worker,
             item.capability_requirements,
-            engine=target_engine,
+            engine=target_engine if command.engine_strategy != "ensemble" else "",
             required_slots=required_slots,
         ):
             raise NoEligibleWorkerError("No eligible worker found.")
-        engine = target_engine or worker.default_engine or worker.agent
-        engines = _target_engines(command, worker, fallback_engine=engine)
         if any(not worker_supports_engine(worker.supported_engines, target) for target in engines):
             raise NoEligibleWorkerError("No eligible worker found.")
         if command.engine_strategy == "ensemble" and worker.current_jobs + len(engines) > worker.max_concurrent_jobs:
@@ -282,6 +284,26 @@ def _worker_is_eligible(
     return set(required or []).issubset(set(worker.capabilities))
 
 
+def _choose_ensemble_worker(
+    registry: WorkerRegistry,
+    required: list[str] | None,
+    requested_engines: list[str],
+) -> WorkerProfile | None:
+    required_set = set(required or [])
+    for worker in registry.profiles(probe=True):
+        if worker.status == "offline":
+            continue
+        if not required_set.issubset(set(worker.capabilities)):
+            continue
+        fallback = normalize_engine_id(worker.default_engine or worker.agent)
+        engines = requested_engines or _unique_engines(worker.supported_engines or [fallback])
+        if any(not worker_supports_engine(worker.supported_engines, engine) for engine in engines):
+            continue
+        if worker.current_jobs + max(1, len(engines)) <= worker.max_concurrent_jobs:
+            return worker
+    return None
+
+
 def _session_is_active(status: str) -> bool:
     return status in ACTIVE_SESSION_STATUSES
 
@@ -306,11 +328,16 @@ def _target_engines(command: WorkCommand, worker: WorkerProfile, *, fallback_eng
         return [fallback_engine]
     requested = [normalize_engine_id(x) for x in str(command.target_engine_id or "").split(",") if x.strip()]
     engines = requested or list(worker.supported_engines or [fallback_engine])
+    return _unique_engines(engines) or [fallback_engine]
+
+
+def _unique_engines(engines: list[str]) -> list[str]:
     result: list[str] = []
     for engine in engines:
-        if engine and engine not in result:
-            result.append(engine)
-    return result or [fallback_engine]
+        normalized = normalize_engine_id(engine)
+        if normalized and normalized not in result:
+            result.append(normalized)
+    return result
 
 
 def _resolve_run(store: OrchestrationStore, run_ref: str):

@@ -846,6 +846,84 @@ def test_orchestration_service_selects_worker_supporting_all_ensemble_engines(tm
     assert seen["worker_id"] == "multi-engine"
 
 
+def test_orchestration_service_selects_worker_for_expanded_ensemble_slots(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    workers_path = tmp_path / "workers.json"
+    workers_path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "multi-engine-full",
+                        "display_name": "Multi full",
+                        "base_url": "http://full.invalid",
+                        "status": "online",
+                        "agent": "codex",
+                        "supported_engines": ["codex", "claude"],
+                        "max_concurrent_jobs": 1,
+                    },
+                    {
+                        "worker_id": "multi-engine-open",
+                        "display_name": "Multi open",
+                        "base_url": "http://open.invalid",
+                        "status": "online",
+                        "agent": "codex",
+                        "supported_engines": ["codex", "claude"],
+                        "max_concurrent_jobs": 2,
+                    },
+                ]
+            }
+        )
+    )
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                f"ORCHESTRATION_WORKERS_PATH={workers_path}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    cfg = load_config()
+
+    class Source:
+        def next(self, *, repo="", filters=None):  # noqa: ANN001, ANN201
+            return _item(id="#35")
+
+    seen = {}
+
+    def fake_start_ensemble(envelope, *, engines, worker_cfg, worker=None, store=None, post=None):  # noqa: ANN001, ANN202
+        seen["worker_id"] = worker.worker_id
+        seen["engines"] = engines
+        links = [WorkerSessionLink(worker_id=worker.worker_id, session_id=f"sess_{engine}", engine=engine) for engine in engines]
+        for link in links:
+            store.link_session(envelope.run_id, link)
+        return links
+
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+    monkeypatch.setattr("jarvis.orchestration.executor.start_worker_ensemble", fake_start_ensemble)
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={
+            "work.github.issues.read",
+            "worker.session.create",
+            "worker.session.turn",
+            "worker.session.stop",
+            "forge.github.branch.push",
+        },
+        source_factory=lambda _name, _cfg=None: Source(),
+    )
+
+    result = service.next_work(
+        WorkCommand("start_next_work", source="github", start=True, engine_strategy="ensemble"),
+        start=True,
+    )
+
+    assert isinstance(result, StartedWork)
+    assert seen == {"worker_id": "multi-engine-open", "engines": ["codex", "claude"]}
+
+
 def test_orchestration_service_rejects_ensemble_when_worker_lacks_slots(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     env_file = tmp_path / ".env"
     workers_path = tmp_path / "workers.json"
@@ -1117,11 +1195,12 @@ def test_start_worker_session_reuses_dispatch_idempotency_key_on_retry(tmp_path)
     def fake_post(url, **kwargs):  # noqa: ANN001
         calls.append((url, kwargs["json"]))
         if url.endswith("/sessions"):
+            session_id = kwargs["json"]["session_id"]
             return Response(
                 {
                     "ok": True,
                     "session": {
-                        "session_id": "sess_123",
+                        "session_id": session_id,
                         "status": "created",
                         "provider": "codex",
                         "engine": "codex",
@@ -1134,7 +1213,7 @@ def test_start_worker_session_reuses_dispatch_idempotency_key_on_retry(tmp_path)
                 "ok": True,
                 "turn_id": kwargs["json"]["turn_id"],
                 "session": {
-                    "session_id": "sess_123",
+                    "session_id": url.rsplit("/", 2)[-2],
                     "status": "running",
                     "provider": "codex",
                     "engine": "codex",
@@ -1158,9 +1237,85 @@ def test_start_worker_session_reuses_dispatch_idempotency_key_on_retry(tmp_path)
     )
 
     turn_payloads = [payload for url, payload in calls if url.endswith("/turns")]
+    create_payloads = [payload for url, payload in calls if url.endswith("/sessions")]
+    assert len(create_payloads) == 1
     assert len(turn_payloads) == 2
     assert turn_payloads[0]["turn_id"] == turn_payloads[1]["turn_id"]
     assert turn_payloads[0]["idempotency_key"] == turn_payloads[1]["idempotency_key"]
+
+
+def test_start_worker_session_fetches_existing_session_after_duplicate_create(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Start live session")
+    envelope = ExecutionEnvelope(
+        run_id=run.run_id,
+        repo="roughcoder/jarvis",
+        prompt="x",
+        worker_id="local-worker",
+        engine="codex",
+        branch_name="jarvis/live-session",
+        session_name="jarvis-live-session",
+    )
+    expected_session_id = f"sess_{envelope.dispatch_id}"
+    calls = []
+
+    class Response:
+        def __init__(self, body: dict, status_code: int = 200) -> None:
+            self._body = body
+            self.status_code = status_code
+            self.text = body.get("error", "")
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self._body
+
+    def fake_post(url, **kwargs):  # noqa: ANN001
+        calls.append(("post", url, kwargs["json"]))
+        if url.endswith("/sessions"):
+            assert kwargs["json"]["session_id"] == expected_session_id
+            return Response({"ok": False, "error": f"worker session already exists: {expected_session_id}"}, status_code=400)
+        assert url.endswith(f"/sessions/{expected_session_id}/turns")
+        return Response(
+            {
+                "ok": True,
+                "turn_id": kwargs["json"]["turn_id"],
+                "session": {
+                    "session_id": expected_session_id,
+                    "status": "running",
+                    "provider": "codex",
+                    "engine": "codex",
+                    "branch": "jarvis/live-session",
+                },
+                "events": [{"event_id": "event_2", "type": "turn.started"}],
+            }
+        )
+
+    def fake_get(url, **_kwargs):  # noqa: ANN001
+        calls.append(("get", url, None))
+        assert url.endswith(f"/sessions/{expected_session_id}")
+        return Response(
+            {
+                "session_id": expected_session_id,
+                "status": "created",
+                "provider": "codex",
+                "engine": "codex",
+                "branch": "jarvis/live-session",
+            }
+        )
+
+    link = start_worker_session(
+        envelope,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1, token=""),
+        store=store,
+        post=fake_post,
+        get=fake_get,
+    )
+
+    assert link.session_id == expected_session_id
+    assert [call[0] for call in calls] == ["post", "get", "post"]
+    assert store.get(run.run_id).sessions[0].session_id == expected_session_id  # type: ignore[union-attr]
 
 
 def test_start_worker_session_links_created_session_before_turn_failure(tmp_path) -> None:

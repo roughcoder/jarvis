@@ -96,8 +96,10 @@ def start_worker_session(
     worker: WorkerProfile | None = None,
     store: OrchestrationStore | None = None,
     post: Callable[..., Any] | None = None,
+    get: Callable[..., Any] | None = None,
 ) -> WorkerSessionLink:
     post = post or httpx.post
+    get = get or httpx.get
     base_url, headers = _worker_endpoint(worker_cfg, worker)
     if envelope.resume_session and envelope.session_id:
         session = {
@@ -109,34 +111,50 @@ def start_worker_session(
             "cwd": envelope.cwd,
         }
     else:
-        create_response = post(
-            f"{base_url}/sessions",
-            json={
-                "run_id": envelope.run_id,
-                "provider": envelope.engine,
-                "engine": envelope.engine,
-                "repo": envelope.repo,
-                "branch": envelope.branch_name,
-                "cwd": envelope.cwd,
-                "title": envelope.session_name or _job_name(envelope),
-                "metadata": {
-                    "execution_envelope": envelope.to_dict(),
-                    "provision_workspace": bool(envelope.repo and not envelope.cwd and not envelope.resume_session),
-                    "allowed_actions": envelope.allowed_actions,
-                    "landing": envelope.landing.to_dict(),
-                    "verification": envelope.verification.to_dict(),
+        session_id = _worker_session_id(envelope)
+        existing = _linked_session(store, envelope.run_id, session_id)
+        if existing is not None:
+            session = existing
+        else:
+            create_response = post(
+                f"{base_url}/sessions",
+                json={
+                    "session_id": session_id,
+                    "run_id": envelope.run_id,
+                    "provider": envelope.engine,
+                    "engine": envelope.engine,
+                    "repo": envelope.repo,
+                    "branch": envelope.branch_name,
+                    "cwd": envelope.cwd,
+                    "title": envelope.session_name or _job_name(envelope),
+                    "metadata": {
+                        "execution_envelope": envelope.to_dict(),
+                        "provision_workspace": bool(envelope.repo and not envelope.cwd and not envelope.resume_session),
+                        "allowed_actions": envelope.allowed_actions,
+                        "landing": envelope.landing.to_dict(),
+                        "verification": envelope.verification.to_dict(),
+                    },
                 },
-            },
-            headers=headers,
-            timeout=worker_cfg.request_timeout_s,
-        )
-        create_body = _json_body(create_response)
-        _raise_worker_error(create_response, create_body)
-        if not create_body.get("ok"):
-            raise RuntimeError(create_body.get("error") or "worker rejected session")
-        session = create_body["session"]
-        if store is not None:
-            store.link_session(envelope.run_id, _session_link_from_body(envelope, session, create_body.get("event")))
+                headers=headers,
+                timeout=worker_cfg.request_timeout_s,
+            )
+            create_body = _json_body(create_response)
+            if _duplicate_session_response(create_response, create_body):
+                session = _fetch_existing_session(
+                    session_id,
+                    base_url=base_url,
+                    headers=headers,
+                    timeout=worker_cfg.request_timeout_s,
+                    get=get,
+                )
+                create_body = {"event": None}
+            else:
+                _raise_worker_error(create_response, create_body)
+                if not create_body.get("ok"):
+                    raise RuntimeError(create_body.get("error") or "worker rejected session")
+                session = create_body["session"]
+            if store is not None:
+                store.link_session(envelope.run_id, _session_link_from_body(envelope, session, create_body.get("event")))
     turn_id = _turn_id(envelope)
     idempotency_key = _turn_idempotency_key(envelope)
     turn_response = post(
@@ -324,6 +342,47 @@ def _stop_created_session_after_turn_rejection(
             pass
 
 
+def _linked_session(store: OrchestrationStore | None, run_id: str, session_id: str) -> dict[str, Any] | None:
+    if store is None:
+        return None
+    run = store.get(run_id)
+    if run is None:
+        return None
+    link = next((session for session in run.sessions if session.session_id == session_id), None)
+    if link is None:
+        return None
+    return {
+        "session_id": link.session_id,
+        "status": link.status,
+        "provider": link.provider,
+        "engine": link.engine,
+        "branch": link.branch,
+        "cwd": link.cwd,
+    }
+
+
+def _duplicate_session_response(response: Any, body: dict[str, Any]) -> bool:
+    status_code = getattr(response, "status_code", 200)
+    error = str(body.get("error") or "").lower()
+    return status_code in {400, 409} and "already exists" in error
+
+
+def _fetch_existing_session(
+    session_id: str,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    timeout: float,
+    get: Callable[..., Any],
+) -> dict[str, Any]:
+    response = get(f"{base_url}/sessions/{session_id}", headers=headers, timeout=timeout)
+    body = _json_body(response)
+    _raise_worker_error(response, body)
+    if not body.get("session_id"):
+        raise RuntimeError(f"worker duplicate session {session_id!r} could not be fetched")
+    return body
+
+
 def _session_link_from_body(
     envelope: ExecutionEnvelope,
     session: dict[str, Any],
@@ -360,6 +419,13 @@ def _turn_id(envelope: ExecutionEnvelope) -> str:
 
 def _turn_idempotency_key(envelope: ExecutionEnvelope) -> str:
     return f"{envelope.run_id}:{_dispatch_id(envelope)}:turn"
+
+
+def _worker_session_id(envelope: ExecutionEnvelope) -> str:
+    if envelope.session_id:
+        return envelope.session_id
+    clean = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in _dispatch_id(envelope))
+    return f"sess_{clean}"
 
 
 def _worker_endpoint(worker_cfg: WorkerConfig, worker: WorkerProfile | None) -> tuple[str, dict[str, str]]:
