@@ -61,6 +61,14 @@ PRIVATE_PUBLIC_KEYS = {
     "token",
     "token_env",
 }
+PRIVATE_PUBLIC_KEY_PATTERNS = (
+    "apikey",
+    "authorization",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
 PUBLIC_EVENT_DATA_KEYS = {
     "branch",
     "checkpoint_id",
@@ -889,7 +897,7 @@ def _public_value(value: Any) -> Any:
         return {
             str(key): item
             for key, raw in value.items()
-            if _public_key(key) not in PRIVATE_PUBLIC_KEYS
+            if not _private_public_key(key)
             for item in [_public_value(raw)]
             if item not in ("", [], {})
         }
@@ -915,6 +923,12 @@ def _public_questions(value: Any) -> list[dict[str, Any]]:
 
 def _public_key(value: Any) -> str:
     return str(value or "").strip().lower()
+
+
+def _private_public_key(value: Any) -> bool:
+    key = _public_key(value)
+    normalized = re.sub(r"[^a-z0-9]", "", key)
+    return key in PRIVATE_PUBLIC_KEYS or any(pattern in normalized for pattern in PRIVATE_PUBLIC_KEY_PATTERNS)
 
 
 def _public_event_value(key: Any, value: Any) -> Any:
