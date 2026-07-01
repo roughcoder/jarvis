@@ -204,6 +204,7 @@ def start_worker_session(
         branch=current.get("branch") or envelope.branch_name,
         cwd=current.get("cwd") or envelope.cwd,
         last_event_id=str(events[-1].get("event_id") or "") if events else "",
+        allowed_actions=list(envelope.allowed_actions),
     )
     if store is not None:
         store.link_session(envelope.run_id, link)
@@ -410,6 +411,7 @@ def _session_link_from_body(
         branch=session.get("branch") or envelope.branch_name,
         cwd=session.get("cwd") or envelope.cwd,
         last_event_id=str((event or {}).get("event_id") or ""),
+        allowed_actions=list(envelope.allowed_actions),
     )
 
 

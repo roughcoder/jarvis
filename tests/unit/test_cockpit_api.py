@@ -16,7 +16,7 @@ import httpx  # noqa: E402
 from aiohttp import web  # noqa: E402
 
 from jarvis.config import Config  # noqa: E402
-from jarvis.orchestration.api import CockpitAppContext, IdempotencyStore, _idempotency_scope, make_app, serve  # noqa: E402
+from jarvis.orchestration.api import CockpitAppContext, IdempotencyStore, _command_from_body, _idempotency_scope, make_app, serve  # noqa: E402
 from jarvis.orchestration.cockpit import make_session_ref  # noqa: E402
 from jarvis.orchestration.models import Artifact, ExecutionEnvelope, WorkItem, WorkerProfile, WorkerSessionLink  # noqa: E402
 from jarvis.orchestration.service import StartedWork  # noqa: E402
@@ -131,6 +131,14 @@ def _seed_run(cfg: Config) -> tuple[OrchestrationStore, str]:
             branch="jarvis/foo",
             cwd="/Users/example/private/jarvis",
             last_event_id="ev_2",
+            allowed_actions=[
+                "worker.session.turn",
+                "worker.session.input",
+                "worker.session.approve",
+                "worker.session.interrupt",
+                "worker.session.stop",
+                "worker.session.restore",
+            ],
         ),
     )
     store.append_event(
@@ -344,6 +352,17 @@ def test_cockpit_catalog_snapshot_and_worker_projection(tmp_path, monkeypatch) -
     asyncio.run(_with_server(cfg, calls, http_get=get))
 
 
+def test_cockpit_manual_work_without_key_gets_distinct_ids() -> None:
+    _command_a, item_a = _command_from_body({"source": "manual", "repo": "roughcoder/jarvis", "phrase": "task a"}, start=True)
+    _command_b, item_b = _command_from_body({"source": "manual", "repo": "roughcoder/jarvis", "phrase": "task b"}, start=True)
+
+    assert item_a is not None
+    assert item_b is not None
+    assert item_a.id.startswith("manual_")
+    assert item_b.id.startswith("manual_")
+    assert item_a.id != item_b.id
+
+
 def test_cockpit_snapshot_none_does_not_poll_workers(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch)
     _store, _run_id = _seed_run(cfg)
@@ -416,6 +435,7 @@ def test_cockpit_snapshot_probe_uses_probed_worker_status_for_worker_sessions(tm
         assert snapshot["workers"][0]["status"] == "online"
         assert snapshot["sessions"]
         assert snapshot["sessions"][0]["session_id"] == "sess_123"
+        assert snapshot["sessions"][0]["latest_event_cursor"] == "ev_2"
 
     import asyncio
 
@@ -605,6 +625,33 @@ def test_cockpit_session_detail_events_requests_and_checkpoints(tmp_path, monkey
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
 
 
+def test_cockpit_session_supported_controls_follow_allowed_actions(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    item = WorkItem(source="manual", id="manual_controls", title="Limited controls", repo="roughcoder/jarvis")
+    run = store.create_run("Limited controls", work_items=[item])
+    store.link_session(
+        run.run_id,
+        WorkerSessionLink(
+            worker_id="macbook-worker",
+            session_id="sess_limited",
+            status="running",
+            provider="codex",
+            engine="codex",
+            allowed_actions=["worker.session.turn", "worker.session.stop"],
+        ),
+    )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        snapshot = (await client.get(f"{base}/v1/cockpit/snapshot")).json()
+
+        assert snapshot["sessions"][0]["supported_controls"] == ["turn", "stop", "archive"]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run.run_id)))
+
+
 def test_cockpit_session_detail_raw_projection_is_redacted(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch)
     _store, run_id = _seed_run(cfg)
@@ -765,6 +812,60 @@ def test_cockpit_sse_emits_snapshot_when_projection_cursor_changes(tmp_path, mon
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=no_worker_poll_get))
+
+
+def test_cockpit_sse_preserves_requested_sync_mode(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _store, run_id = _seed_run(cfg)
+    state = {"pending": False}
+
+    def get(url: str, **kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions/requests"):
+            if not state["pending"]:
+                return Response({"requests": []})
+            return Response(
+                {
+                    "requests": [
+                        {
+                            "session_id": "sess_123",
+                            "request_id": "req_sse",
+                            "kind": "approval",
+                            "status": "pending",
+                            "event": {"data": {"run_id": run_id, "title": "Approve SSE state"}},
+                        }
+                    ]
+                }
+            )
+        return _fake_get(run_id)(url, **kwargs)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        current = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()["cursor"]
+
+        async def mutate_worker_request() -> None:
+            import asyncio
+
+            await asyncio.sleep(0.1)
+            state["pending"] = True
+
+        import asyncio
+
+        task = asyncio.create_task(mutate_worker_request())
+        seen = ""
+        async with client.stream("GET", f"{base}/v1/cockpit/events", params={"after": current, "sync": "fast"}) as response:
+            async for chunk in response.aiter_text():
+                seen += chunk
+                if '"pending_approval_count": 1' in seen:
+                    break
+        await task
+
+        assert "event: snapshot" in seen
+        assert '"mode": "fast"' in seen
+        assert '"status": "fresh"' in seen
+        assert '"pending_approval_count": 1' in seen
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
 
 
 def test_cockpit_auth_and_bad_session_ref_errors(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -1135,9 +1236,11 @@ def test_cockpit_archive_session_hides_it_without_archiving_run(tmp_path, monkey
     async def calls(base: str, client: httpx.AsyncClient) -> None:
         response = await client.post(f"{base}/v1/sessions/{ref}/archive", json={"idempotency_key": "archive_session_1"})
         snapshot = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+        detail = (await client.get(f"{base}/v1/sessions/{ref}")).json()
 
         assert response.status_code == 200
         assert response.json()["session"]["archived_at"]
+        assert detail["session"]["archived_at"]
         assert snapshot["runs"][0]["run_id"] == run_id
         assert snapshot["runs"][0]["session_count"] == 0
         assert snapshot["runs"][0]["pending_approval_count"] == 0
@@ -1148,6 +1251,49 @@ def test_cockpit_archive_session_hides_it_without_archiving_run(tmp_path, monkey
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+
+def test_cockpit_worker_only_sessions_include_checkpoint_counts(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    ref = make_session_ref("macbook-worker", "sess_worker_only")
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/health"):
+            return Response({"ok": True, "agent": "codex", "supported_engines": ["codex"]})
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions"):
+            return Response(
+                {
+                    "sessions": [
+                        {
+                            "session_id": "sess_worker_only",
+                            "provider": "codex",
+                            "engine": "codex",
+                            "status": "running",
+                            "repo": "roughcoder/jarvis",
+                            "title": "Worker-only session",
+                            "metadata": {"execution_envelope": {"allowed_actions": ["worker.session.turn", "worker.session.restore"]}},
+                        }
+                    ]
+                }
+            )
+        if url.endswith("/sessions/sess_worker_only/checkpoints"):
+            return Response({"checkpoints": [{"checkpoint_id": "ckpt_worker", "label": "worker only"}]})
+        if url.endswith("/sessions/requests"):
+            return Response({"requests": []})
+        raise AssertionError(url)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        snapshot = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+
+        assert snapshot["sessions"][0]["session_ref"] == ref
+        assert snapshot["sessions"][0]["checkpoint_count"] == 1
+        assert "checkpoint_restore" in snapshot["sessions"][0]["supported_controls"]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
 
 
 def test_cockpit_archive_worker_only_session_hides_it_from_worker_views(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -1311,6 +1457,48 @@ def test_cockpit_session_write_maps_worker_errors(tmp_path, monkeypatch) -> None
         assert response.status_code == 409
         assert body["ok"] is False
         assert body["error"]["code"] == "checkpoint_not_found"
+        assert body["error"]["recoverable"] is True
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id), http_post=post))
+
+
+def test_cockpit_session_write_maps_no_pending_codex_request(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="worker.session.approve")
+    _store, run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+
+    def post(_url: str, **_kwargs) -> Response:  # noqa: ANN001
+        return Response({"ok": False, "error": "no pending codex approval request req_stale"}, status_code=400)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(f"{base}/v1/sessions/{ref}/approval", json={"idempotency_key": "approve_stale", "request_id": "req_stale"})
+        body = response.json()
+
+        assert response.status_code == 409
+        assert body["error"]["code"] == "request_not_pending"
+        assert body["error"]["recoverable"] is True
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id), http_post=post))
+
+
+def test_cockpit_session_write_maps_worker_auth_failure_to_worker_unavailable(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="worker.session.stop")
+    _store, run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+
+    def post(_url: str, **_kwargs) -> Response:  # noqa: ANN001
+        return Response({"error": "unauthorized"}, status_code=401)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(f"{base}/v1/sessions/{ref}/stop", json={"idempotency_key": "stop_worker_unauthorized"})
+        body = response.json()
+
+        assert response.status_code == 502
+        assert body["error"]["code"] == "worker_unavailable"
         assert body["error"]["recoverable"] is True
 
     import asyncio
@@ -1521,6 +1709,21 @@ def test_cockpit_idempotency_scope_cleans_up_lock(tmp_path, monkeypatch) -> None
 
     assert ctx.idempotency_locks == {}
     assert ctx.idempotency_lock_refs == {}
+
+
+def test_cockpit_session_updates_are_keyed_by_worker_and_session(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    item = WorkItem(source="manual", id="manual_dup", title="Duplicate session ids", repo="roughcoder/jarvis")
+    run = store.create_run("Duplicate session ids", work_items=[item])
+    store.link_session(run.run_id, WorkerSessionLink(worker_id="worker-a", session_id="sess_dup", status="running"))
+    store.link_session(run.run_id, WorkerSessionLink(worker_id="worker-b", session_id="sess_dup", status="running"))
+
+    updated = store.update_session(run.run_id, "sess_dup", worker_id="worker-b", status="stopped")
+
+    statuses = {(session.worker_id, session.session_id): session.status for session in updated.sessions}
+    assert statuses[("worker-a", "sess_dup")] == "running"
+    assert statuses[("worker-b", "sess_dup")] == "stopped"
 
 
 def test_cockpit_work_resume_maps_active_session_error(tmp_path, monkeypatch) -> None:  # noqa: ANN001

@@ -258,7 +258,7 @@ class OrchestrationStore:
         run = self.get(run_id)
         if run is None:
             raise KeyError(run_id)
-        existing = next((x for x in run.sessions if x.session_id == session.session_id), None)
+        existing = next((x for x in run.sessions if x.worker_id == session.worker_id and x.session_id == session.session_id), None)
         if existing is None:
             run.sessions.append(session)
         else:
@@ -268,6 +268,7 @@ class OrchestrationStore:
             existing.branch = session.branch
             existing.cwd = session.cwd
             existing.last_event_id = session.last_event_id
+            existing.allowed_actions = list(session.allowed_actions)
         if run.phase in {"created", "claimed", "provisioned", "completed", "done", "failed", "blocked"}:
             run.phase = "running"
             run.status = "active"
@@ -284,7 +285,7 @@ class OrchestrationStore:
             active = next((x for x in run.sessions if x.status in ACTIVE_SESSION_STATUSES), None)
             if active is not None:
                 raise ActiveWorkerSessionError(active)
-            existing = next((x for x in run.sessions if x.session_id == session.session_id), None)
+            existing = next((x for x in run.sessions if x.worker_id == session.worker_id and x.session_id == session.session_id), None)
             if existing is None:
                 run.sessions.append(session)
             else:
@@ -294,6 +295,7 @@ class OrchestrationStore:
                 existing.branch = session.branch
                 existing.cwd = session.cwd
                 existing.last_event_id = session.last_event_id
+                existing.allowed_actions = list(session.allowed_actions)
             run.phase = "running"
             run.status = "active"
             run.terminal_reason = ""
@@ -301,16 +303,16 @@ class OrchestrationStore:
             self.append_event(run_id, "session_reserved", f"Reserved worker session {session.session_id}", session.to_dict())
             return run
 
-    def update_session(self, run_id: str, session_id: str, **updates: str) -> OrchestrationRun:
+    def update_session(self, run_id: str, session_id: str, *, worker_id: str = "", **updates: str | list[str]) -> OrchestrationRun:
         with self._locked():
             run = self.get(run_id)
             if run is None:
                 raise KeyError(run_id)
-            session = next((x for x in run.sessions if x.session_id == session_id), None)
+            session = next((x for x in run.sessions if x.session_id == session_id and (not worker_id or x.worker_id == worker_id)), None)
             if session is None:
                 raise KeyError(session_id)
-            changed: dict[str, str] = {}
-            for field in ("status", "provider", "engine", "branch", "cwd", "last_event_id"):
+            changed: dict[str, str | list[str]] = {}
+            for field in ("status", "provider", "engine", "branch", "cwd", "last_event_id", "allowed_actions"):
                 value = updates.get(field)
                 if value is None:
                     continue

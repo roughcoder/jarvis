@@ -18,7 +18,12 @@ from jarvis.capabilities import (
     FORGE_PR_COMMENT,
     FORGE_PR_CREATE,
     WORKER_JOB_START,
+    WORKER_SESSION_APPROVE,
     WORKER_SESSION_CREATE,
+    WORKER_SESSION_INPUT,
+    WORKER_SESSION_INTERRUPT,
+    WORKER_SESSION_RESTORE,
+    WORKER_SESSION_STOP,
     WORKER_SESSION_TURN,
 )
 from jarvis.config import WorkerConfig
@@ -39,7 +44,15 @@ SESSION_REF_SIGNATURE_BYTES = 12
 CURSOR_PREFIX = "evt_"
 MAX_PAGE_LIMIT = 500
 RUN_SUPPORTED_CONTROLS = ["archive"]
-SESSION_SUPPORTED_CONTROLS = ["turn", "input", "approval", "interrupt", "stop", "checkpoint_restore", "archive"]
+SESSION_CONTROL_ACTIONS = {
+    "turn": WORKER_SESSION_TURN,
+    "input": WORKER_SESSION_INPUT,
+    "approval": WORKER_SESSION_APPROVE,
+    "interrupt": WORKER_SESSION_INTERRUPT,
+    "stop": WORKER_SESSION_STOP,
+    "checkpoint_restore": WORKER_SESSION_RESTORE,
+}
+DEFAULT_SESSION_ALLOWED_ACTIONS = [WORKER_SESSION_TURN, WORKER_SESSION_INTERRUPT, WORKER_SESSION_STOP]
 PRIVATE_PUBLIC_KEYS = {
     "api_key",
     "apikey",
@@ -227,7 +240,11 @@ def cockpit_snapshot(
         archived_session_refs=archived_session_refs,
     )
     requests = aggregate_requests(worker_cfg=worker_cfg, workers_path=workers_path, http_get=http_get) if include_worker_state else []
-    checkpoints = aggregate_checkpoints(runs=runs, worker_cfg=worker_cfg, workers_path=workers_path, http_get=http_get) if include_worker_state else []
+    checkpoints = (
+        aggregate_checkpoints(runs=runs, sessions=sessions, worker_cfg=worker_cfg, workers_path=workers_path, http_get=http_get)
+        if include_worker_state
+        else []
+    )
     artifacts = artifact_summaries(runs)
     run_rows = [run_summary(run, requests=requests, artifacts=artifacts) for run in runs]
     session_rows = [
@@ -353,7 +370,13 @@ def aggregate_sessions(
                 if ref in archived_session_refs or str(raw.get("run_id") or "") in archived_run_ids:
                     continue
                 run = run_by_id.get(str(raw.get("run_id") or ""))
-                sessions[ref] = _session_from_worker(raw, profile.worker_id, run=run)
+                worker_row = _session_from_worker(raw, profile.worker_id, run=run)
+                if ref in sessions:
+                    stored = sessions[ref]
+                    worker_row["latest_event_cursor"] = worker_row.get("latest_event_cursor") or stored.get("latest_event_cursor", "")
+                    worker_row["archived_at"] = stored.get("archived_at") or worker_row.get("archived_at", "")
+                    worker_row["allowed_actions"] = worker_row.get("allowed_actions") or stored.get("allowed_actions", [])
+                sessions[ref] = worker_row
         except Exception:  # noqa: BLE001 - aggregate views must remain inspectable
             continue
     return sessions
@@ -379,36 +402,41 @@ def aggregate_requests(*, worker_cfg: WorkerConfig, workers_path: str, http_get:
 def aggregate_checkpoints(
     *,
     runs: list[OrchestrationRun],
+    sessions: dict[str, dict[str, Any]] | None = None,
     worker_cfg: WorkerConfig,
     workers_path: str,
     http_get: Any = httpx.get,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     registry = WorkerRegistry(worker_cfg, profiles_path=workers_path)
+    rows: dict[str, dict[str, Any]] = {}
     for run in runs:
         for link in run.sessions:
-            if link.archived_at:
+            if not link.archived_at:
+                rows[make_session_ref(link.worker_id, link.session_id)] = _session_from_link(link, run)
+    rows.update(sessions or {})
+    for row in rows.values():
+        worker_id = str(row.get("worker_id") or "")
+        session_id = str(row.get("session_id") or "")
+        if not worker_id or not session_id or row.get("archived_at"):
+            continue
+        profile = registry.get(worker_id, probe=False)
+        if profile is None:
+            continue
+        headers = worker_headers(worker_cfg, profile)
+        try:
+            response = http_get(
+                f"{profile.base_url}/sessions/{session_id}/checkpoints",
+                headers=headers,
+                timeout=worker_cfg.request_timeout_s,
+            )
+            if getattr(response, "status_code", 200) >= 400:
                 continue
-            profile = registry.get(link.worker_id, probe=False)
-            if profile is None:
-                continue
-            headers = worker_headers(worker_cfg, profile)
-            try:
-                response = http_get(
-                    f"{profile.base_url}/sessions/{link.session_id}/checkpoints",
-                    headers=headers,
-                    timeout=worker_cfg.request_timeout_s,
-                )
-                if getattr(response, "status_code", 200) >= 400:
-                    continue
-                for raw in response.json().get("checkpoints", []):
-                    if isinstance(raw, dict):
-                        item = project_checkpoint(raw, link.worker_id, link.session_id, run.run_id)
-                        item["session_ref"] = make_session_ref(link.worker_id, link.session_id)
-                        item["run_id"] = run.run_id
-                        results.append(item)
-            except Exception:  # noqa: BLE001
-                continue
+            for raw in response.json().get("checkpoints", []):
+                if isinstance(raw, dict):
+                    results.append(project_checkpoint(raw, worker_id, session_id, str(row.get("run_id") or "")))
+        except Exception:  # noqa: BLE001
+            continue
     return results
 
 
@@ -502,7 +530,7 @@ def session_summary(
     session_requests = [request for request in requests if request.get("session_ref") == ref]
     return {
         "authority": "jarvis",
-        "supported_controls": SESSION_SUPPORTED_CONTROLS,
+        "supported_controls": _session_supported_controls(session),
         "session_ref": ref,
         "worker_id": session.get("worker_id", ""),
         "session_id": session.get("session_id", ""),
@@ -722,6 +750,7 @@ def _session_from_link(link: WorkerSessionLink, run: OrchestrationRun) -> dict[s
         "created_at": run.created_at,
         "updated_at": run.updated_at,
         "archived_at": link.archived_at,
+        "allowed_actions": list(link.allowed_actions),
     }
 
 
@@ -743,7 +772,31 @@ def _session_from_worker(raw: dict[str, Any], worker_id: str, *, run: Orchestrat
         "created_at": str(raw.get("created_at") or (run.created_at if run else "")),
         "updated_at": str(raw.get("updated_at") or (run.updated_at if run else "")),
         "archived_at": "",
+        "allowed_actions": _allowed_actions_from_worker_session(raw),
     }
+
+
+def _allowed_actions_from_worker_session(raw: dict[str, Any]) -> list[str]:
+    direct = raw.get("allowed_actions")
+    if isinstance(direct, list):
+        return [str(item) for item in direct if item]
+    metadata = raw.get("metadata")
+    if not isinstance(metadata, dict):
+        return []
+    envelope = metadata.get("execution_envelope")
+    if isinstance(envelope, dict) and isinstance(envelope.get("allowed_actions"), list):
+        return [str(item) for item in envelope["allowed_actions"] if item]
+    metadata_actions = metadata.get("allowed_actions")
+    if isinstance(metadata_actions, list):
+        return [str(item) for item in metadata_actions if item]
+    return []
+
+
+def _session_supported_controls(session: dict[str, Any]) -> list[str]:
+    allowed_actions = set(session.get("allowed_actions") or DEFAULT_SESSION_ALLOWED_ACTIONS)
+    controls = [control for control, action in SESSION_CONTROL_ACTIONS.items() if action in allowed_actions]
+    controls.append("archive")
+    return controls
 
 
 def _engine_catalog(engine: str, display_name: str, description: str) -> dict[str, Any]:
