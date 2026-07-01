@@ -746,7 +746,7 @@ def _archive_session(store: OrchestrationStore, ref: SessionRef):
     for run in store.list_runs():
         for session in run.sessions:
             if session.worker_id == ref.worker_id and session.session_id == ref.session_id:
-                return store.archive_session(run.run_id, ref.session_id)
+                return store.archive_session(run.run_id, ref.session_id, worker_id=ref.worker_id)
     return archived
 
 
@@ -963,6 +963,12 @@ def _worker_post_json(cfg: Config, worker_id: str, path: str, body: dict[str, An
     try:
         data = response.json() if hasattr(response, "json") else {}
     except Exception:
+        data = {}
+        if status < 400:
+            raise CockpitError("worker_unavailable", "worker returned invalid JSON", recoverable=True, status=502) from None
+    if not isinstance(data, dict):
+        if status < 400:
+            raise CockpitError("worker_unavailable", "worker returned invalid JSON", recoverable=True, status=502)
         data = {}
     if status >= 400 or (isinstance(data, dict) and data.get("ok") is False):
         if status >= 500:

@@ -1530,6 +1530,27 @@ def test_cockpit_session_write_maps_non_json_worker_errors(tmp_path, monkeypatch
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id), http_post=post))
 
 
+def test_cockpit_session_write_rejects_invalid_success_worker_response(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="worker.session.stop")
+    _store, run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+
+    def post(_url: str, **_kwargs) -> TextResponse:  # noqa: ANN001
+        return TextResponse("not json", status_code=200)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(f"{base}/v1/sessions/{ref}/stop", json={"idempotency_key": "stop_invalid_success"})
+        body = response.json()
+
+        assert response.status_code == 502
+        assert body["error"]["code"] == "worker_unavailable"
+        assert body["error"]["recoverable"] is True
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id), http_post=post))
+
+
 def test_cockpit_work_start_rejects_unknown_sources_without_github_fallback(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, caps="worker.job.start,worker.session.create,worker.session.turn,forge.github.branch.push")
 
@@ -1724,6 +1745,21 @@ def test_cockpit_session_updates_are_keyed_by_worker_and_session(tmp_path, monke
     statuses = {(session.worker_id, session.session_id): session.status for session in updated.sessions}
     assert statuses[("worker-a", "sess_dup")] == "running"
     assert statuses[("worker-b", "sess_dup")] == "stopped"
+
+
+def test_cockpit_session_archives_are_keyed_by_worker_and_session(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    item = WorkItem(source="manual", id="manual_archive_dup", title="Duplicate archive ids", repo="roughcoder/jarvis")
+    run = store.create_run("Duplicate archive ids", work_items=[item])
+    store.link_session(run.run_id, WorkerSessionLink(worker_id="worker-a", session_id="sess_dup", status="running"))
+    store.link_session(run.run_id, WorkerSessionLink(worker_id="worker-b", session_id="sess_dup", status="running"))
+
+    archived = store.archive_session(run.run_id, "sess_dup", worker_id="worker-b")
+
+    archived_at = {(session.worker_id, session.session_id): session.archived_at for session in archived.sessions}
+    assert archived_at[("worker-a", "sess_dup")] == ""
+    assert archived_at[("worker-b", "sess_dup")]
 
 
 def test_cockpit_work_resume_maps_active_session_error(tmp_path, monkeypatch) -> None:  # noqa: ANN001

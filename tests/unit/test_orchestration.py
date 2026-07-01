@@ -1810,7 +1810,7 @@ def test_store_links_worker_session_to_run_graph(tmp_path) -> None:
             branch="jarvis/live-session",
         ),
     )
-    updated = store.update_session(run.run_id, "sess_123", status="waiting_input", last_event_id="ev_1")
+    updated = store.update_session(run.run_id, "sess_123", worker_id="macbook-worker", status="waiting_input", last_event_id="ev_1")
 
     assert linked.sessions[0].session_id == "sess_123"
     assert updated.sessions[0].status == "waiting_input"
@@ -1922,6 +1922,92 @@ def test_sync_run_sessions_marks_completed_run_and_advances_event_cursor(tmp_pat
     assert reloaded.phase == "completed"
     assert reloaded.sessions[0].last_event_id == "event_2"
     assert seen["http://localhost:1/sessions/sess_123/events"]["params"] == {"after": "event_1"}
+
+
+def test_sync_run_sessions_updates_matching_worker_session_when_ids_collide(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path / "store"))
+    workers_path = tmp_path / "workers.json"
+    workers_path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "remote-worker",
+                        "display_name": "Remote worker",
+                        "base_url": "http://remote.test",
+                        "status": "online",
+                    }
+                ]
+            }
+        )
+    )
+    run = store.create_run("Start duplicate sessions")
+    store.link_session(run.run_id, WorkerSessionLink(worker_id="local-worker", session_id="sess_dup", status="running", provider="codex", engine="codex"))
+    store.link_session(run.run_id, WorkerSessionLink(worker_id="remote-worker", session_id="sess_dup", status="running", provider="codex", engine="codex"))
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, body: dict) -> None:
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    def fake_get(url, **_kwargs):  # noqa: ANN001
+        if url.endswith("/events"):
+            return Response({"events": []})
+        if url.startswith("http://remote.test"):
+            return Response({"session_id": "sess_dup", "status": "completed", "provider": "codex", "engine": "codex"})
+        return Response({"session_id": "sess_dup", "status": "running", "provider": "codex", "engine": "codex"})
+
+    summary = sync_run_sessions(
+        store,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1, token="secret"),
+        workers_path=str(workers_path),
+        get=fake_get,
+    )
+
+    reloaded = store.get(run.run_id)
+    assert reloaded is not None
+    statuses = {(session.worker_id, session.session_id): session.status for session in reloaded.sessions}
+    assert statuses[("local-worker", "sess_dup")] == "running"
+    assert statuses[("remote-worker", "sess_dup")] == "completed"
+    assert summary.sessions_updated == 1
+
+
+def test_sync_run_sessions_finalizes_visible_sessions_when_archived_session_is_active(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Start archived mixed sessions")
+    store.link_session(run.run_id, WorkerSessionLink(worker_id="local-worker", session_id="sess_archived", status="running", provider="codex", engine="codex"))
+    store.link_session(run.run_id, WorkerSessionLink(worker_id="local-worker", session_id="sess_visible", status="running", provider="codex", engine="codex"))
+    store.archive_session(run.run_id, "sess_archived", worker_id="local-worker")
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, body: dict) -> None:
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    def fake_get(url, **_kwargs):  # noqa: ANN001
+        if url.endswith("/events"):
+            return Response({"events": [{"event_id": "event_done", "type": "turn.completed"}]})
+        assert url.endswith("/sessions/sess_visible")
+        return Response({"session_id": "sess_visible", "status": "completed", "provider": "codex", "engine": "codex"})
+
+    summary = sync_run_sessions(
+        store,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1),
+        get=fake_get,
+    )
+
+    reloaded = store.get(run.run_id)
+    assert summary.runs_completed == 1
+    assert reloaded is not None
+    assert reloaded.phase == "completed"
 
 
 def test_sync_run_sessions_marks_blocked_run_failed(tmp_path) -> None:

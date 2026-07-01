@@ -162,6 +162,7 @@ def sync_run_sessions(
             store.update_session(
                 run.run_id,
                 link.session_id,
+                worker_id=link.worker_id,
                 status=str(data.get("status") or link.status),
                 provider=str(data.get("provider") or link.provider or ""),
                 engine=str(data.get("engine") or link.engine or ""),
@@ -172,7 +173,7 @@ def sync_run_sessions(
             summary.session_events_seen += len(events)
             reloaded = store.get(run.run_id)
             if reloaded is not None:
-                updated = next((x for x in reloaded.sessions if x.session_id == link.session_id), link)
+                updated = next((x for x in reloaded.sessions if x.worker_id == link.worker_id and x.session_id == link.session_id), link)
                 if updated.to_dict() != before:
                     summary.sessions_updated += 1
                 run = reloaded
@@ -255,11 +256,12 @@ def _final_phase(run: OrchestrationRun) -> str:
 
 
 def _final_session_phase(run: OrchestrationRun) -> str:
-    if not run.sessions or run.status == "terminal":
+    visible_sessions = [session for session in run.sessions if not session.archived_at]
+    if not visible_sessions or run.status == "terminal":
         return ""
     if any(job.status not in TERMINAL_JOB_STATUSES for job in run.jobs):
         return ""
-    statuses = {session.status for session in run.sessions}
+    statuses = {session.status for session in visible_sessions}
     if statuses & ACTIVE_SESSION_STATUSES:
         return ""
     if statuses <= SUCCESS_SESSION_STATUSES:

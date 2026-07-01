@@ -185,18 +185,23 @@ class OrchestrationStore:
                 self.append_event(run_id, "run_archived", "Run archived from cockpit views")
             return run
 
-    def archive_session(self, run_id: str, session_id: str) -> OrchestrationRun:
+    def archive_session(self, run_id: str, session_id: str, *, worker_id: str) -> OrchestrationRun:
         with self._locked():
             run = self.get(run_id)
             if run is None:
                 raise KeyError(run_id)
-            session = next((x for x in run.sessions if x.session_id == session_id), None)
+            session = next((x for x in run.sessions if x.worker_id == worker_id and x.session_id == session_id), None)
             if session is None:
                 raise KeyError(session_id)
             if not session.archived_at:
                 session.archived_at = utc_now()
                 self.save(run)
-                self.append_event(run_id, "session_archived", f"Worker session {session_id} archived from cockpit views", {"session_id": session_id})
+                self.append_event(
+                    run_id,
+                    "session_archived",
+                    f"Worker session {worker_id}/{session_id} archived from cockpit views",
+                    {"worker_id": worker_id, "session_id": session_id},
+                )
             return run
 
     def archive_worker_session(self, worker_id: str, session_id: str) -> dict[str, str]:
@@ -303,12 +308,12 @@ class OrchestrationStore:
             self.append_event(run_id, "session_reserved", f"Reserved worker session {session.session_id}", session.to_dict())
             return run
 
-    def update_session(self, run_id: str, session_id: str, *, worker_id: str = "", **updates: str | list[str]) -> OrchestrationRun:
+    def update_session(self, run_id: str, session_id: str, *, worker_id: str, **updates: str | list[str]) -> OrchestrationRun:
         with self._locked():
             run = self.get(run_id)
             if run is None:
                 raise KeyError(run_id)
-            session = next((x for x in run.sessions if x.session_id == session_id and (not worker_id or x.worker_id == worker_id)), None)
+            session = next((x for x in run.sessions if x.worker_id == worker_id and x.session_id == session_id), None)
             if session is None:
                 raise KeyError(session_id)
             changed: dict[str, str | list[str]] = {}
