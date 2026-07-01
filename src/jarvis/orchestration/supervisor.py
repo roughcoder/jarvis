@@ -242,6 +242,8 @@ def _record_sync_error(store: OrchestrationStore, run_id: str, job_id: str, erro
 def _final_phase(run: OrchestrationRun) -> str:
     if not run.jobs or run.status == "terminal":
         return ""
+    if run.sessions:
+        return ""
     statuses = _effective_terminal_statuses(run)
     if not statuses.issubset(TERMINAL_JOB_STATUSES):
         return ""

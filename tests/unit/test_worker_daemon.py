@@ -34,6 +34,7 @@ from jarvis.config import WorkerConfig  # noqa: E402
 from jarvis.worker.server import make_app  # noqa: E402
 from jarvis.worker.authority import WorkerSessionAuthority  # noqa: E402
 from jarvis.worker.providers.codex import (  # noqa: E402
+    _deliver_pending_request,
     _approval_result,
     _input_result,
     _project_jsonrpc_message,
@@ -48,6 +49,7 @@ from jarvis.worker.sessions import WorkerSession  # noqa: E402
 from jarvis.worker.sessions import SessionManager  # noqa: E402
 from jarvis.worker_session_contract import (  # noqa: E402
     EVENT_APPROVAL_RESOLVED,
+    EVENT_TURN_COMPLETED,
     REQUEST_KIND_APPROVAL,
     SESSION_RUNNING,
     SESSION_STOPPED,
@@ -1463,6 +1465,31 @@ for line in sys.stdin:
     assert fetched["metadata"]["provider_session_id"] == "session_fake"
 
 
+def test_codex_turn_completed_does_not_overwrite_cancelled_session(tmp_path) -> None:
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _event = sessions.create(
+        {
+            "session_id": "sess_cancelled",
+            "provider": "codex",
+            "engine": "codex",
+            "metadata": _authority_metadata("codex"),
+        }
+    )
+    sessions.update_status(session.session_id, SESSION_STOPPED)
+
+    done = _project_jsonrpc_message(
+        object(),  # type: ignore[arg-type]
+        {"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"status": "completed"}}},
+        session_id=session.session_id,
+        turn=ProviderTurn(turn_id="turn_cancelled", prompt="x", idempotency_key="idem_cancelled"),
+        sessions=sessions,
+    )
+
+    assert done is True
+    assert sessions.get(session.session_id).status == SESSION_STOPPED  # type: ignore[union-attr]
+    assert all(event.type != EVENT_TURN_COMPLETED for event in sessions.events(session.session_id))
+
+
 def test_daemon_codex_interrupt_preserves_cancelled_status(tmp_path) -> None:
     agent = tmp_path / "fake-codex-slow"
     agent.write_text(
@@ -1766,6 +1793,61 @@ for line in sys.stdin:
     assert "assistant.message" in event_types
     assert "turn.completed" in event_types
     assert fetched["status"] == "completed"
+
+
+def test_codex_records_approval_resolution_only_after_delivery() -> None:
+    class ClosedStdin:
+        def write(self, _payload: str) -> None:
+            raise BrokenPipeError("closed")
+
+        def flush(self) -> None:
+            return None
+
+    class CaptureStdin:
+        def __init__(self) -> None:
+            self.payloads: list[str] = []
+
+        def write(self, payload: str) -> None:
+            self.payloads.append(payload)
+
+        def flush(self) -> None:
+            return None
+
+    class Process:
+        stdin = ClosedStdin()
+
+    process = Process()
+    recorded: list[str] = []
+    _track_pending_request(
+        "sess_delivery",
+        "approval_rpc",
+        kind=REQUEST_KIND_APPROVAL,
+        process=process,  # type: ignore[arg-type]
+        rpc_id="approval_rpc",
+    )
+
+    with pytest.raises(BrokenPipeError):
+        _deliver_pending_request(
+            "sess_delivery",
+            "approval_rpc",
+            kind=REQUEST_KIND_APPROVAL,
+            request={"request_id": "approval_rpc", "decision": "approved"},
+            before_send=lambda: recorded.append("recorded"),
+        )
+
+    assert recorded == []
+
+    capture = CaptureStdin()
+    process.stdin = capture
+    assert _deliver_pending_request(
+        "sess_delivery",
+        "approval_rpc",
+        kind=REQUEST_KIND_APPROVAL,
+        request={"request_id": "approval_rpc", "decision": "approved"},
+        before_send=lambda: recorded.append("recorded"),
+    )
+    assert capture.payloads
+    assert recorded == ["recorded"]
 
 
 def test_daemon_codex_input_waits_for_endpoint_response(tmp_path) -> None:

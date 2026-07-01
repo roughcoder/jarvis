@@ -588,6 +588,8 @@ def _project_jsonrpc_message(
             waiting_status = SESSION_WAITING_APPROVAL if pending.kind == REQUEST_KIND_APPROVAL else SESSION_WAITING_INPUT
             _restore_running_if_waiting(sessions, session_id, waiting_status)
     elif method == "turn/completed":
+        if _session_cancelled(sessions, session_id):
+            return True
         status = str(dict(params.get("turn") or {}).get("status") or "completed")
         event_type = EVENT_TURN_COMPLETED if status in {"completed", "done", "succeeded"} else EVENT_TURN_FAILED
         sessions.update_status(session_id, SESSION_COMPLETED if event_type == EVENT_TURN_COMPLETED else SESSION_FAILED)
@@ -649,9 +651,14 @@ def _deliver_pending_request(
     if pending is None or pending.kind != kind:
         return False
     result = _approval_result(request) if kind == REQUEST_KIND_APPROVAL else _input_result(request, pending.params)
+    try:
+        _send_json(pending.process, {"jsonrpc": "2.0", "id": pending.rpc_id, "result": result})
+    except Exception:
+        with _PENDING_LOCK:
+            _PENDING_REQUESTS.setdefault(key, pending)
+        raise
     if before_send is not None:
         before_send()
-    _send_json(pending.process, {"jsonrpc": "2.0", "id": pending.rpc_id, "result": result})
     return True
 
 
