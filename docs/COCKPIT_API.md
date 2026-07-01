@@ -667,9 +667,11 @@ snapshot once per connected browser tab.
 
 Native browser `EventSource` cannot set an `Authorization` header. T3 should
 either proxy this endpoint through its server-side Jarvis client or use a
-fetch-based SSE client that can send the bearer token. Jarvis does not expose
-browser CORS as the primary auth path for v1; server-side proxying is the
-recommended integration.
+fetch-based SSE client that can send the bearer token. Server-side proxying is
+the recommended integration. If direct browser access is required, configure
+`ORCHESTRATION_API_CORS_ORIGINS` as a comma-separated allow-list; Jarvis will
+answer matching `OPTIONS` preflights and attach CORS headers to matching
+responses.
 
 Each SSE event has both an SSE `id:` and a JSON `cursor`:
 
@@ -745,7 +747,8 @@ or breaking status, and migration notes.
 - Added the first Jarvis cockpit API server behind `jarvis api`.
 - Added env-driven listener settings: `ORCHESTRATION_API_HOST`,
   `ORCHESTRATION_API_PORT`, `ORCHESTRATION_API_BIND_HOST`,
-  `ORCHESTRATION_API_TOKEN`, and `ORCHESTRATION_API_ALLOW_INSECURE`.
+  `ORCHESTRATION_API_TOKEN`, `ORCHESTRATION_API_ALLOW_INSECURE`, and
+  `ORCHESTRATION_API_CORS_ORIGINS`.
 - Added a `cockpit` optional dependency extra for the API server's HTTP/SSE
   runtime.
 - Clarified that `session_ref` values are `sessref_` prefixed, URL-safe,

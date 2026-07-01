@@ -344,7 +344,8 @@ def _resolve_run(store: OrchestrationStore, run_ref: str):
     ref = (run_ref or "latest").strip()
     runs = store.list_runs()
     if ref in {"latest", "last"}:
-        return next((run for run in reversed(runs) if run.sessions), runs[-1] if runs else None)
+        visible = [run for run in runs if not run.archived_at]
+        return next((run for run in reversed(visible) if run.sessions), visible[-1] if visible else None)
     return store.get(ref)
 
 

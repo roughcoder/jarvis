@@ -60,7 +60,7 @@ async def _with_server(cfg: Config, fn: Callable[[str, httpx.AsyncClient], Any],
         await runner.cleanup()
 
 
-def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, caps: str = "", token: str = "") -> Config:
+def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, caps: str = "", token: str = "", cors_origins: str = "") -> Config:
     env = tmp_path / ".env"
     workspace = tmp_path / "orchestration"
     workers_path = workspace / "workers.json"
@@ -71,6 +71,7 @@ def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, caps: str = "", tok
                 f"ORCHESTRATION_WORKERS_PATH={workers_path}",
                 "ORCHESTRATION_LANDING_MODE=branch_only",
                 f"ORCHESTRATION_API_TOKEN={token}",
+                f"ORCHESTRATION_API_CORS_ORIGINS={cors_origins}",
                 f"CAPS_DEFAULT_CAPABILITIES={caps}",
                 "WORKER_HOST=worker.test",
                 "WORKER_PORT=8780",
@@ -962,6 +963,37 @@ def test_cockpit_auth_and_bad_session_ref_errors(tmp_path, monkeypatch) -> None:
         assert unauthorized.json()["error"]["code"] == "unauthorized"
         assert bad_ref.status_code == 404
         assert bad_ref.json()["error"]["code"] == "not_found"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_cors_preflight_uses_configured_origins(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, token="secret", cors_origins="https://cockpit.example")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        allowed = await client.options(
+            f"{base}/v1/cockpit/snapshot",
+            headers={
+                "Origin": "https://cockpit.example",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "Authorization",
+            },
+        )
+        denied = await client.options(
+            f"{base}/v1/cockpit/snapshot",
+            headers={
+                "Origin": "https://evil.example",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "Authorization",
+            },
+        )
+
+        assert allowed.status_code == 204
+        assert allowed.headers["Access-Control-Allow-Origin"] == "https://cockpit.example"
+        assert "Authorization" in allowed.headers["Access-Control-Allow-Headers"]
+        assert "Access-Control-Allow-Origin" not in denied.headers
 
     import asyncio
 

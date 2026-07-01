@@ -77,6 +77,7 @@ HttpGet = Callable[..., Any]
 HttpPost = Callable[..., Any]
 SSE_REFRESH_INTERVAL_S = 1.0
 SSE_HEARTBEAT_INTERVAL_S = 15.0
+CONFIG_KEY = web.AppKey("config", Config)
 
 
 @dataclass(frozen=True)
@@ -224,7 +225,8 @@ def make_app(
         source_factory=source_factory or _work_source,
     )
     _rebuild_session_ref_index_from_store(ctx.store)
-    app = web.Application(middlewares=[_error_middleware])
+    app = web.Application(middlewares=[_cors_middleware, _error_middleware])
+    app[CONFIG_KEY] = cfg
     reads = CockpitReadHandlers(ctx)
     writes = CockpitWriteHandlers(ctx)
     sse = SseHandlers(ctx)
@@ -585,6 +587,16 @@ class SseHandlers:
 
 
 @web.middleware
+async def _cors_middleware(request: web.Request, handler):  # noqa: ANN001
+    if request.method == "OPTIONS":
+        response = web.Response(status=204)
+    else:
+        response = await handler(request)
+    _apply_cors_headers(request, response)
+    return response
+
+
+@web.middleware
 async def _error_middleware(request: web.Request, handler):  # noqa: ANN001
     try:
         return await handler(request)
@@ -597,6 +609,29 @@ async def _error_middleware(request: web.Request, handler):  # noqa: ANN001
             {"ok": False, "error": {"code": "internal_error", "message": public_error_message(str(exc) or "internal server error"), "recoverable": False}},
             status=500,
         )
+
+
+def _apply_cors_headers(request: web.Request, response: web.StreamResponse) -> None:
+    origin = _allowed_cors_origin(request)
+    if not origin:
+        return
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Authorization,Content-Type,Last-Event-ID"
+    response.headers["Access-Control-Expose-Headers"] = "Content-Type"
+    response.headers["Access-Control-Max-Age"] = "600"
+
+
+def _allowed_cors_origin(request: web.Request) -> str:
+    origin = request.headers.get("Origin", "")
+    if not origin:
+        return ""
+    cfg = request.app[CONFIG_KEY]
+    allowed = [item.strip() for item in cfg.orchestration.api_cors_origins.split(",") if item.strip()]
+    if "*" in allowed:
+        return origin
+    return origin if origin in allowed else ""
 
 
 async def _write_sse(response: web.StreamResponse, event: str, cursor: str, data: dict[str, Any]) -> None:

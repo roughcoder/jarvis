@@ -2431,6 +2431,58 @@ def test_orchestration_service_resume_run_dispatches_existing_session(tmp_path, 
     assert reloaded.sessions[0].status == "running"
 
 
+def test_orchestration_service_resume_latest_skips_archived_runs(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    cfg = load_config()
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    visible = store.create_run("Visible resume", work_items=[_item(id="#visible")])
+    store.link_session(visible.run_id, WorkerSessionLink(worker_id="local-worker", session_id="sess_visible", status="completed", branch="jarvis/visible"))
+    store.set_phase(visible.run_id, "completed", "done")
+    archived = store.create_run("Archived resume", work_items=[_item(id="#archived")])
+    store.link_session(archived.run_id, WorkerSessionLink(worker_id="local-worker", session_id="sess_archived", status="completed", branch="jarvis/archived"))
+    store.set_phase(archived.run_id, "completed", "done")
+    store.archive_run(archived.run_id)
+    seen = {}
+
+    def fake_start(envelope, *, worker_cfg, worker=None, store=None, post=None):  # noqa: ANN001, ANN202
+        seen["run_id"] = envelope.run_id
+        return WorkerSessionLink(worker_id=envelope.worker_id, session_id=envelope.session_id, status="running", branch=envelope.branch_name)
+
+    monkeypatch.setattr("jarvis.orchestration.service.sync_run_sessions", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "jarvis.orchestration.workers.WorkerRegistry._probe",
+        lambda _self, profile: WorkerProfile(
+            worker_id=profile.worker_id,
+            display_name=profile.display_name,
+            capabilities=profile.capabilities,
+            base_url=profile.base_url,
+            status="online",
+            agent="codex",
+            supported_engines=["codex"],
+        ),
+    )
+    monkeypatch.setattr("jarvis.orchestration.executor.start_worker_session", fake_start)
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"orchestration.runs.read", "worker.job.start", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: None,
+    )
+
+    result = service.resume_run("latest")
+
+    assert result.envelope.run_id == visible.run_id
+    assert seen["run_id"] == visible.run_id
+
+
 def test_orchestration_service_resume_skips_failed_sessions_for_last_success(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     env_file = tmp_path / ".env"
     env_file.write_text(
