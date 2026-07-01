@@ -595,6 +595,10 @@ cockpit snapshot/list views. Archive state is owned by Jarvis, not by T3 local
 storage. Direct detail endpoints may still resolve archived objects by id/ref
 for reconciliation.
 
+Unarchive is unsupported in v1. If Jarvis adds unarchive later, it should use
+the same consolidated archive bookkeeping path instead of letting T3 mutate
+visibility locally.
+
 `POST /v1/sessions/{session_ref}/checkpoints/restore` uses `checkpoint_id`.
 Checkpoint IDs are durable and stable within a session. Clients must not restore
 by page position, turn count, or rendered list index.
