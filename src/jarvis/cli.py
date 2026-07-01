@@ -459,11 +459,10 @@ def _cmd_api(_args: argparse.Namespace) -> int:
     from jarvis.orchestration.api import serve
 
     try:
-        asyncio.run(serve(cfg))
+        return asyncio.run(serve(cfg))
     except KeyboardInterrupt:
         print("\n(stopped)")
         os._exit(0)
-    return 0
 
 
 def _cmd_jobs(args: argparse.Namespace) -> int:

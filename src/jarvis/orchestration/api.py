@@ -16,6 +16,7 @@ from jarvis.capabilities import (
     WORKER_SESSION_TURN,
 )
 from jarvis.config import Config, insecure_bind
+from jarvis.ids import utc_now
 from jarvis.orchestration.cockpit import (
     API_VERSION,
     SCHEMA_VERSION,
@@ -32,6 +33,7 @@ from jarvis.orchestration.cockpit import (
     parse_session_ref,
     project_request,
     project_session_event,
+    run_detail_projection,
     run_report_artifact,
     run_summary,
     session_summary,
@@ -98,7 +100,8 @@ def make_app(
         require_auth(request)
         mode = str(request.query.get("sync") or "none")
         return web.json_response(
-            cockpit_snapshot(
+            await asyncio.to_thread(
+                cockpit_snapshot,
                 store=store,
                 worker_cfg=cfg.worker,
                 workers_path=cfg.orchestration.workers_path,
@@ -111,7 +114,8 @@ def make_app(
         require_auth(request)
         mode = str(request.query.get("sync") or "none")
         client_cursor = str(request.query.get("after") or request.headers.get("Last-Event-ID") or "")
-        body = cockpit_snapshot(
+        body = await asyncio.to_thread(
+            cockpit_snapshot,
             store=store,
             worker_cfg=cfg.worker,
             workers_path=cfg.orchestration.workers_path,
@@ -122,11 +126,12 @@ def make_app(
         response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
         await response.prepare(request)
         if client_cursor != cursor:
-            await _write_sse(response, "snapshot", cursor, {"cursor": cursor, "type": "snapshot", "payload": body})
+            await _write_sse(response, "snapshot", cursor, _sse_envelope(cursor, "snapshot", body))
         try:
             while True:
                 await asyncio.sleep(1)
-                next_body = cockpit_snapshot(
+                next_body = await asyncio.to_thread(
+                    cockpit_snapshot,
                     store=store,
                     worker_cfg=cfg.worker,
                     workers_path=cfg.orchestration.workers_path,
@@ -136,7 +141,7 @@ def make_app(
                 next_cursor = next_body["cursor"]
                 if next_cursor != cursor:
                     cursor = next_cursor
-                    await _write_sse(response, "snapshot", cursor, {"cursor": cursor, "type": "snapshot", "payload": next_body})
+                    await _write_sse(response, "snapshot", cursor, _sse_envelope(cursor, "snapshot", next_body))
                 else:
                     await response.write(b": heartbeat\n\n")
         except (asyncio.CancelledError, ConnectionResetError, RuntimeError):
@@ -149,14 +154,20 @@ def make_app(
             {
                 "api_version": API_VERSION,
                 "schema_version": SCHEMA_VERSION,
-                "workers": worker_profiles(worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, probe=probe, http_get=get),
+                "workers": await asyncio.to_thread(
+                    worker_profiles,
+                    worker_cfg=cfg.worker,
+                    workers_path=cfg.orchestration.workers_path,
+                    probe=probe,
+                    http_get=get,
+                ),
             }
         )
 
     async def worker_detail(request: web.Request) -> web.Response:
         require_auth(request)
         worker_id = request.match_info["worker_id"]
-        profiles = worker_profiles(worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, probe=True, http_get=get)
+        profiles = await asyncio.to_thread(worker_profiles, worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, probe=True, http_get=get)
         worker = next((item for item in profiles if item.get("worker_id") == worker_id), None)
         if worker is None:
             raise CockpitError("not_found", "worker not found", status=404)
@@ -165,57 +176,60 @@ def make_app(
     async def runs(request: web.Request) -> web.Response:
         require_auth(request)
         if str(request.query.get("sync") or "none") in {"fast", "probe"}:
-            sync_state(store=store, worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, sync_mode=str(request.query["sync"]), http_get=get)
-        run_items = store.list_runs()
-        requests = aggregate_requests(worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, http_get=get)
+            await asyncio.to_thread(sync_state, store=store, worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, sync_mode=str(request.query["sync"]), http_get=get)
+        run_items = await asyncio.to_thread(store.list_runs)
+        requests = await asyncio.to_thread(aggregate_requests, worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, http_get=get)
         artifacts = artifact_summaries(run_items)
         return web.json_response({"runs": [run_summary(run, requests=requests, artifacts=artifacts) for run in run_items]})
 
     async def run_detail(request: web.Request) -> web.Response:
         require_auth(request)
-        run = _run_or_404(store, request.match_info["run_id"])
-        requests = aggregate_requests(worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, http_get=get)
+        run = await asyncio.to_thread(_run_or_404, store, request.match_info["run_id"])
+        requests = await asyncio.to_thread(aggregate_requests, worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, http_get=get)
         artifacts = artifact_summaries([run])
-        return web.json_response({"run": run.to_dict(), "summary": run_summary(run, requests=requests, artifacts=artifacts)})
+        detail = run_detail_projection(run, requests=requests, artifacts=artifacts)
+        return web.json_response({"run": detail, "summary": run_summary(run, requests=requests, artifacts=artifacts)})
 
     async def run_events(request: web.Request) -> web.Response:
         require_auth(request)
-        run = _run_or_404(store, request.match_info["run_id"])
-        events = [_project_run_event(event, idx + 1) for idx, event in enumerate(store.events(run.run_id))]
+        run = await asyncio.to_thread(_run_or_404, store, request.match_info["run_id"])
+        raw_events = await asyncio.to_thread(store.events, run.run_id)
+        events = [_project_run_event(event, idx + 1) for idx, event in enumerate(raw_events)]
         return web.json_response(paged(events, after=str(request.query.get("after") or ""), limit=_limit(request)))
 
     async def run_artifacts(request: web.Request) -> web.Response:
         require_auth(request)
-        run = _run_or_404(store, request.match_info["run_id"])
-        items = [*artifact_summaries([run]), run_report_artifact(store, run.run_id)]
+        run = await asyncio.to_thread(_run_or_404, store, request.match_info["run_id"])
+        report_artifact = await asyncio.to_thread(run_report_artifact, store, run.run_id)
+        items = [*artifact_summaries([run]), report_artifact]
         return web.json_response(paged(items, after=str(request.query.get("after") or ""), limit=_limit(request)))
 
     async def sessions(request: web.Request) -> web.Response:
         require_auth(request)
-        runs_list = store.list_runs()
-        session_rows = aggregate_sessions(runs=runs_list, worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, http_get=get)
-        requests = aggregate_requests(worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, http_get=get)
-        checkpoints = aggregate_checkpoints(runs=runs_list, worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, http_get=get)
+        runs_list = await asyncio.to_thread(store.list_runs)
+        session_rows = await asyncio.to_thread(aggregate_sessions, runs=runs_list, worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, http_get=get)
+        requests = await asyncio.to_thread(aggregate_requests, worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, http_get=get)
+        checkpoints = await asyncio.to_thread(aggregate_checkpoints, runs=runs_list, worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, http_get=get)
         return web.json_response({"sessions": [session_summary(row, requests=requests, checkpoints=checkpoints) for row in session_rows.values()]})
 
     async def session_detail(request: web.Request) -> web.Response:
         require_auth(request)
         ref = parse_session_ref(request.match_info["session_ref"])
-        raw = _worker_get_json(cfg, ref.worker_id, f"/sessions/{ref.session_id}", get=get)
+        raw = await asyncio.to_thread(_worker_get_json, cfg, ref.worker_id, f"/sessions/{ref.session_id}", get=get)
         row = _worker_session_row(raw, ref.worker_id)
-        requests = [_request_with_run(request_item, row.get("run_id", "")) for request_item in _worker_session_requests(cfg, ref, get=get)]
-        checkpoints = _worker_session_checkpoints(cfg, ref, run_id=str(row.get("run_id") or ""), get=get)
+        requests = [_request_with_run(request_item, row.get("run_id", "")) for request_item in await asyncio.to_thread(_worker_session_requests, cfg, ref, get=get)]
+        checkpoints = await asyncio.to_thread(_worker_session_checkpoints, cfg, ref, run_id=str(row.get("run_id") or ""), get=get)
         return web.json_response({"session": session_summary(row, requests=requests, checkpoints=checkpoints), "raw": _public_session_detail(raw)})
 
     async def session_events(request: web.Request) -> web.Response:
         require_auth(request)
         ref = parse_session_ref(request.match_info["session_ref"])
-        run_id = _session_run_id(cfg, ref, get=get)
-        raw = _worker_get_json(
+        run_id = await asyncio.to_thread(_session_run_id, cfg, ref, get=get)
+        raw = await asyncio.to_thread(
+            _worker_get_json,
             cfg,
             ref.worker_id,
             f"/sessions/{ref.session_id}/events",
-            params={"after": str(request.query.get("after") or ""), "limit": _limit(request)},
             get=get,
         )
         events = [
@@ -223,17 +237,19 @@ def make_app(
             for idx, event in enumerate(raw.get("events", []))
             if isinstance(event, dict)
         ]
-        return web.json_response(paged(events, limit=_limit(request)))
+        return web.json_response(paged(events, after=str(request.query.get("after") or ""), limit=_limit(request)))
 
     async def session_requests(request: web.Request) -> web.Response:
         require_auth(request)
         ref = parse_session_ref(request.match_info["session_ref"])
-        return web.json_response({"requests": _worker_session_requests(cfg, ref, get=get)})
+        return web.json_response({"requests": await asyncio.to_thread(_worker_session_requests, cfg, ref, get=get)})
 
     async def session_checkpoints(request: web.Request) -> web.Response:
         require_auth(request)
         ref = parse_session_ref(request.match_info["session_ref"])
-        return web.json_response({"checkpoints": _worker_session_checkpoints(cfg, ref, run_id=_session_run_id(cfg, ref, get=get), get=get)})
+        run_id = await asyncio.to_thread(_session_run_id, cfg, ref, get=get)
+        checkpoints = await asyncio.to_thread(_worker_session_checkpoints, cfg, ref, run_id=run_id, get=get)
+        return web.json_response({"checkpoints": checkpoints})
 
     async def work_start(request: web.Request) -> web.Response:
         require_auth(request)
@@ -244,7 +260,7 @@ def make_app(
         command, manual_item = _command_from_body(body, start=True)
         service = _service(cfg, source_factory, manual_item=manual_item)
         try:
-            result = service.next_work(command, start=True)
+            result = await asyncio.to_thread(service.next_work, command, start=True)
         except (MissingAuthorityError, NoEligibleWorkerError, WorkAlreadyOwnedError, MissingWorkRepoError, WorkerDispatchError) as exc:
             raise _service_error(exc) from exc
         if result is None or not isinstance(result, StartedWork):
@@ -261,7 +277,7 @@ def make_app(
             return web.json_response(cached)
         service = _service(cfg, source_factory)
         try:
-            result = service.resume_run(str(body.get("run_id") or "latest"), prompt=str(body.get("prompt") or ""))
+            result = await asyncio.to_thread(service.resume_run, str(body.get("run_id") or "latest"), prompt=str(body.get("prompt") or ""))
         except (MissingAuthorityError, NoEligibleWorkerError, ResumeRunError, WorkerDispatchError) as exc:
             raise _service_error(exc) from exc
         response_body = _started_work_packet(store, result)
@@ -282,8 +298,8 @@ def make_app(
         proxied = dict(body)
         proxied["allowed_actions"] = sorted(set(proxied.get("allowed_actions") or []) | {required})
         path = f"/sessions/{ref.session_id}/{'checkpoints/restore' if action == 'restore_checkpoint' else action}"
-        raw = _worker_post_json(cfg, ref.worker_id, path, proxied, post=post)
-        response_body = _session_write_packet(cfg, ref, raw, get=get)
+        raw = await asyncio.to_thread(_worker_post_json, cfg, ref.worker_id, path, proxied, post=post)
+        response_body = await asyncio.to_thread(_session_write_packet, cfg, ref, raw, get=get)
         idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
         return web.json_response(response_body)
 
@@ -329,6 +345,10 @@ async def _error_middleware(request: web.Request, handler):  # noqa: ANN001
 async def _write_sse(response: web.StreamResponse, event: str, cursor: str, data: dict[str, Any]) -> None:
     payload = json.dumps(data, sort_keys=True)
     await response.write(f"id: {cursor}\nevent: {event}\ndata: {payload}\n\n".encode("utf-8"))
+
+
+def _sse_envelope(cursor: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    return {"cursor": cursor, "occurred_at": utc_now(), "type": event_type, "payload": payload}
 
 
 def _work_source(name: str, cfg: Config | None = None) -> WorkSource:
@@ -657,7 +677,7 @@ def _worker_error_code(message: str) -> str:
     return "provider_unavailable"
 
 
-async def serve(cfg: Config) -> None:
+async def serve(cfg: Config) -> int:
     bind = cfg.orchestration.api_bind_host or cfg.orchestration.api_host
     token_set = bool(cfg.orchestration.api_token.get_secret_value())
     if insecure_bind(bind, token_set, cfg.orchestration.api_allow_insecure):
@@ -666,7 +686,7 @@ async def serve(cfg: Config) -> None:
             "ORCHESTRATION_API_TOKEN.\n"
             "  Set ORCHESTRATION_API_TOKEN, or ORCHESTRATION_API_ALLOW_INSECURE=true to override.\n"
         )
-        return
+        return 1
     app = make_app(cfg)
     runner = web.AppRunner(app)
     await runner.setup()
@@ -685,3 +705,4 @@ async def serve(cfg: Config) -> None:
         await stop.wait()
     finally:
         await runner.cleanup()
+    return 0

@@ -349,6 +349,34 @@ def run_summary(
     }
 
 
+def run_detail_projection(
+    run: OrchestrationRun,
+    *,
+    requests: list[dict[str, Any]] | None = None,
+    artifacts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    run_artifacts = [artifact for artifact in artifacts or [] if artifact.get("run_id") == run.run_id]
+    return {
+        **run_summary(run, requests=requests, artifacts=artifacts),
+        "work_items": [
+            {
+                "source": link.item.source,
+                "id": link.item.id,
+                "kind": link.item.kind,
+                "title": _redact(link.item.title),
+                "url": _public_url(link.item.url),
+                "role": link.role,
+                "status": link.item.status,
+                "priority": link.item.priority,
+                "labels": list(link.item.labels),
+            }
+            for link in run.work_items
+        ],
+        "sessions": [session_summary(_session_from_link(session, run), requests=requests, checkpoints=[]) for session in run.sessions],
+        "artifacts": run_artifacts,
+    }
+
+
 def session_summary(
     session: dict[str, Any],
     *,
