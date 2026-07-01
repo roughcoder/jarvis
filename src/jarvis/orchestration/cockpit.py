@@ -179,8 +179,8 @@ def cockpit_catalog() -> dict[str, Any]:
             {"capability": "github.pr.create", "display_name": "Create pull requests", "maps_to": [FORGE_PR_CREATE]},
             {"capability": "github.pr.comment", "display_name": "Comment on pull requests", "maps_to": [FORGE_PR_COMMENT]},
         ],
-        "work_sources": ["manual", "github", "linear", "voice", "whatsapp"],
-        "engine_strategies": ["single", "parallel", "review_panel"],
+        "work_sources": ["manual", "github", "linear"],
+        "engine_strategies": ["single", "parallel"],
         "branch_strategies": ["auto", "use_existing", "create", "none"],
         "landing_policies": ["branch_only", "draft_pr", "ready_pr", "confirm_before_pr"],
         "request_kinds": ["approval", "input"],
@@ -255,7 +255,7 @@ def sync_state(
         "mode": mode,
         "status": "fresh" if not summary.errors else "partial",
         "synced_at": utc_now(),
-        "errors": summary.errors or [],
+        "errors": [public_error_message(error) for error in summary.errors],
     }
 
 
@@ -793,14 +793,15 @@ def _redact(value: str) -> str:
 def public_error_message(value: str) -> str:
     text = _redact(value)
     text = re.sub(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", "<redacted-email>", text)
+    text = re.sub(r"https?://[^\s)]+", lambda match: _public_url(match.group(0)) or "<redacted-url>", text)
     return text[:300]
 
 
 def public_event_data(data: dict[str, Any]) -> dict[str, Any]:
     return {
-        str(key): _public_value(value)
+        str(key): _public_event_value(key, value)
         for key, value in data.items()
-        if _public_key(key) in PUBLIC_EVENT_DATA_KEYS and _public_value(value) not in ("", [], {})
+        if _public_key(key) in PUBLIC_EVENT_DATA_KEYS and _public_event_value(key, value) not in ("", [], {})
     }
 
 
@@ -826,6 +827,12 @@ def _public_value(value: Any) -> Any:
 
 def _public_key(value: Any) -> str:
     return str(value or "").strip().lower()
+
+
+def _public_event_value(key: Any, value: Any) -> Any:
+    if _public_key(key) == "url":
+        return _public_url(str(value or ""))
+    return _public_value(value)
 
 
 def _merge_sync(left: SyncSummary, right: SyncSummary) -> SyncSummary:
