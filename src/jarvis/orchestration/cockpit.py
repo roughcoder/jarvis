@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import pathlib
 import re
@@ -31,6 +32,8 @@ API_VERSION = "v1"
 SCHEMA_VERSION = 1
 
 SESSION_REF_PREFIX = "sessref_"
+SESSION_REF_SIGNING_CONTEXT = b"jarvis-cockpit-session-ref-v1"
+SESSION_REF_SIGNATURE_BYTES = 12
 CURSOR_PREFIX = "evt_"
 MAX_PAGE_LIMIT = 500
 PRIVATE_PUBLIC_KEYS = {
@@ -82,6 +85,7 @@ PUBLIC_EVENT_DATA_KEYS = {
     "turn_id",
     "url",
 }
+_session_ref_secret = b""
 
 
 class CockpitError(RuntimeError):
@@ -94,6 +98,11 @@ class CockpitError(RuntimeError):
 
     def body(self) -> dict[str, Any]:
         return {"ok": False, "error": {"code": self.code, "message": self.message, "recoverable": self.recoverable}}
+
+
+def configure_session_ref_secret(secret: str) -> None:
+    global _session_ref_secret  # noqa: PLW0603 - process-wide API config set at app construction
+    _session_ref_secret = str(secret or "").encode("utf-8")
 
 
 @dataclass(frozen=True)
@@ -139,26 +148,19 @@ class IdempotencyStore:
 
 def make_session_ref(worker_id: str, session_id: str) -> str:
     raw = f"{worker_id}\0{session_id}".encode("utf-8")
-    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-    return f"{SESSION_REF_PREFIX}{encoded}"
+    return f"{SESSION_REF_PREFIX}{_session_ref_digest(raw)}"
 
 
-def parse_session_ref(value: str) -> SessionRef:
+def valid_session_ref(value: str) -> bool:
     text = str(value or "")
-    if not text.startswith(SESSION_REF_PREFIX):
-        raise CockpitError("not_found", "session not found", status=404)
-    encoded = text[len(SESSION_REF_PREFIX):]
-    padding = "=" * (-len(encoded) % 4)
-    try:
-        decoded = base64.urlsafe_b64decode(f"{encoded}{padding}".encode("ascii")).decode("utf-8")
-    except Exception as exc:  # noqa: BLE001 - malformed public ids are just not found
-        raise CockpitError("not_found", "session not found", status=404) from exc
-    if "\0" not in decoded:
-        raise CockpitError("not_found", "session not found", status=404)
-    worker_id, session_id = decoded.split("\0", 1)
-    if not worker_id or not session_id:
-        raise CockpitError("not_found", "session not found", status=404)
-    return SessionRef(worker_id=worker_id, session_id=session_id)
+    token = text[len(SESSION_REF_PREFIX):] if text.startswith(SESSION_REF_PREFIX) else ""
+    return bool(token) and all(ch.isalnum() or ch in {"_", "-"} for ch in token)
+
+
+def _session_ref_digest(raw: bytes) -> str:
+    key = _session_ref_secret or SESSION_REF_SIGNING_CONTEXT
+    digest = hmac.new(key, SESSION_REF_SIGNING_CONTEXT + b"\0" + raw, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest[:SESSION_REF_SIGNATURE_BYTES]).decode("ascii").rstrip("=")
 
 
 def cockpit_catalog() -> dict[str, Any]:
@@ -209,17 +211,27 @@ def cockpit_snapshot(
     requests = aggregate_requests(worker_cfg=worker_cfg, workers_path=workers_path, http_get=http_get) if include_worker_state else []
     checkpoints = aggregate_checkpoints(runs=runs, worker_cfg=worker_cfg, workers_path=workers_path, http_get=http_get) if include_worker_state else []
     artifacts = artifact_summaries(runs)
+    run_rows = [run_summary(run, requests=requests, artifacts=artifacts) for run in runs]
+    session_rows = [
+        session_summary(session, requests=requests, checkpoints=checkpoints)
+        for session in sorted(sessions.values(), key=lambda x: str(x.get("updated_at") or ""))
+    ]
     return {
         "api_version": API_VERSION,
         "schema_version": SCHEMA_VERSION,
-        "cursor": snapshot_cursor(runs, sessions, artifacts),
+        "cursor": snapshot_cursor(
+            {
+                "sync": {"mode": sync["mode"], "status": sync["status"], "errors": sync["errors"]},
+                "runs": run_rows,
+                "sessions": session_rows,
+                "workers": [_cursor_worker(worker) for worker in workers],
+                "artifacts": artifacts,
+            }
+        ),
         "generated_at": utc_now(),
         "sync": sync,
-        "runs": [run_summary(run, requests=requests, artifacts=artifacts) for run in runs],
-        "sessions": [
-            session_summary(session, requests=requests, checkpoints=checkpoints)
-            for session in sorted(sessions.values(), key=lambda x: str(x.get("updated_at") or ""))
-        ],
+        "runs": run_rows,
+        "sessions": session_rows,
         "workers": workers,
         "artifacts": artifacts,
     }
@@ -600,14 +612,13 @@ def worker_headers(worker_cfg: WorkerConfig, profile: WorkerProfile) -> dict[str
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
-def snapshot_cursor(runs: list[OrchestrationRun], sessions: dict[str, dict[str, Any]], artifacts: list[dict[str, Any]]) -> str:
-    basis = {
-        "runs": [(run.run_id, run.updated_at, run.phase, run.status) for run in runs],
-        "sessions": [(ref, item.get("updated_at"), item.get("latest_event_cursor")) for ref, item in sorted(sessions.items())],
-        "artifacts": [(item.get("artifact_id"), item.get("updated_at")) for item in artifacts],
-    }
-    digest = hashlib.sha256(json.dumps(basis, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+def snapshot_cursor(public_projection: dict[str, Any]) -> str:
+    digest = hashlib.sha256(json.dumps(public_projection, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
     return f"{CURSOR_PREFIX}{digest}"
+
+
+def _cursor_worker(worker: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in worker.items() if key != "last_seen_at"}
 
 
 def artifact_id(run_id: str, kind: str, key: str) -> str:

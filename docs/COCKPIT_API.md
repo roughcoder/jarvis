@@ -38,15 +38,16 @@ Example:
 
 ```json
 {
-  "session_ref": "sessref_bWFjYm9vay13b3JrZXIAc2Vzc18xMjM",
+  "session_ref": "sessref_QF2r7mN8kT6vH3pa",
   "worker_id": "macbook-worker",
   "session_id": "sess_123"
 }
 ```
 
 T3 routes by `session_ref`. Jarvis owns the lookup back to `worker_id` and
-`session_id`. The current implementation uses a `sessref_` prefix plus a
-base64url payload, but clients must treat the whole string as opaque.
+`session_id`. The implementation uses a `sessref_` prefix plus a signed,
+deterministic, URL-safe token and resolves it against Jarvis state. Clients must
+not decode, construct, or compare subfields inside the ref.
 
 ## Endpoints
 
@@ -308,7 +309,7 @@ Session summaries appear in snapshots and session lists.
 
 ```json
 {
-  "session_ref": "sessref_bWFjYm9vay13b3JrZXIAc2Vzc18xMjM",
+  "session_ref": "sessref_QF2r7mN8kT6vH3pa",
   "worker_id": "macbook-worker",
   "session_id": "sess_123",
   "run_id": "run_123",
@@ -340,7 +341,7 @@ Approval request:
 ```json
 {
   "request_id": "req_123",
-  "session_ref": "sessref_bWFjYm9vay13b3JrZXIAc2Vzc18xMjM",
+  "session_ref": "sessref_QF2r7mN8kT6vH3pa",
   "run_id": "run_123",
   "kind": "approval",
   "status": "pending",
@@ -359,7 +360,7 @@ Input request:
 ```json
 {
   "request_id": "req_456",
-  "session_ref": "sessref_bWFjYm9vay13b3JrZXIAc2Vzc18xMjM",
+  "session_ref": "sessref_QF2r7mN8kT6vH3pa",
   "run_id": "run_123",
   "kind": "input",
   "status": "pending",
@@ -387,7 +388,7 @@ Session events are canonical, ordered, and renderable by T3.
 {
   "event_id": "ev_123",
   "sequence": 42,
-  "session_ref": "sessref_bWFjYm9vay13b3JrZXIAc2Vzc18xMjM",
+  "session_ref": "sessref_QF2r7mN8kT6vH3pa",
   "run_id": "run_123",
   "type": "assistant.delta",
   "occurred_at": "2026-07-01T12:00:00Z",
@@ -432,7 +433,7 @@ verification, logs, files, URLs, status comments, and provider evidence.
 {
   "artifact_id": "artifact_123",
   "run_id": "run_123",
-  "session_ref": "sessref_bWFjYm9vay13b3JrZXIAc2Vzc18xMjM",
+  "session_ref": "sessref_QF2r7mN8kT6vH3pa",
   "kind": "pull_request",
   "provider": "github",
   "external_id": "47",
@@ -470,7 +471,7 @@ Verification artifacts use first-class fields:
 {
   "artifact_id": "artifact_456",
   "run_id": "run_123",
-  "session_ref": "sessref_bWFjYm9vay13b3JrZXIAc2Vzc18xMjM",
+  "session_ref": "sessref_QF2r7mN8kT6vH3pa",
   "kind": "verification",
   "status": "passed",
   "command": "pnpm test",
@@ -595,7 +596,7 @@ Each SSE event has both an SSE `id:` and a JSON `cursor`:
 ```text
 id: evt_124
 event: session.event
-data: {"cursor":"evt_124","occurred_at":"2026-07-01T12:00:01Z","type":"session.event","run_id":"run_1","session_ref":"sessref_bWFjYm9vay13b3JrZXIAc2Vzc18x","payload":{}}
+data: {"cursor":"evt_124","occurred_at":"2026-07-01T12:00:01Z","type":"session.event","run_id":"run_1","session_ref":"sessref_K9vY2pQx7rN4Lm6A","payload":{}}
 ```
 
 Event envelope:
@@ -606,7 +607,7 @@ Event envelope:
   "occurred_at": "2026-07-01T12:00:01Z",
   "type": "session.event",
   "run_id": "run_1",
-  "session_ref": "sessref_bWFjYm9vay13b3JrZXIAc2Vzc18x",
+  "session_ref": "sessref_K9vY2pQx7rN4Lm6A",
   "payload": {}
 }
 ```
@@ -667,9 +668,8 @@ or breaking status, and migration notes.
   `ORCHESTRATION_API_TOKEN`, and `ORCHESTRATION_API_ALLOW_INSECURE`.
 - Added a `cockpit` optional dependency extra for the API server's HTTP/SSE
   runtime.
-- Clarified that `session_ref` values are `sessref_` prefixed, URL-safe, and
-  opaque. The implementation currently uses a base64url payload, but clients
-  must not decode it.
+- Clarified that `session_ref` values are `sessref_` prefixed, URL-safe,
+  signed, and opaque. Clients must not decode or construct them.
 - Clarified idempotency replay behavior: successful repeated writes with the same
   key/body may include `"idempotent": true`.
 - Implemented `/v1/cockpit/events` as a cursor-aware SSE stream that sends an

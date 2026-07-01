@@ -305,6 +305,51 @@ def test_cockpit_snapshot_none_does_not_poll_workers(tmp_path, monkeypatch) -> N
     asyncio.run(_with_server(cfg, calls, http_get=no_worker_get))
 
 
+def test_cockpit_snapshot_cursor_tracks_full_projection(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _store, run_id = _seed_run(cfg)
+    state = {"pending": False}
+
+    def get(url: str, **kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions/requests") and not state["pending"]:
+            return Response({"requests": []})
+        if url.endswith("/sessions/sess_123/checkpoints") and not state["pending"]:
+            return Response({"checkpoints": []})
+        return _fake_get(run_id)(url, **kwargs)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        first = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+        same = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+        state["pending"] = True
+        request_checkpoint_changed = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+
+        assert same["cursor"] == first["cursor"]
+        assert request_checkpoint_changed["cursor"] != first["cursor"]
+        assert request_checkpoint_changed["runs"][0]["pending_approval_count"] == 1
+        assert request_checkpoint_changed["sessions"][0]["checkpoint_count"] == 1
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
+def test_cockpit_snapshot_cursor_tracks_worker_projection(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _store, _run_id = _seed_run(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        first = (await client.get(f"{base}/v1/cockpit/snapshot")).json()
+        _set_worker_status(cfg, "offline")
+        changed = (await client.get(f"{base}/v1/cockpit/snapshot")).json()
+
+        assert changed["cursor"] != first["cursor"]
+        assert changed["workers"][0]["health"] == "unhealthy"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
 def test_cockpit_snapshot_uses_stable_partial_sync_status(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch)
     _store, run_id = _seed_run(cfg)
@@ -495,6 +540,31 @@ def test_cockpit_auth_and_bad_session_ref_errors(tmp_path, monkeypatch) -> None:
     asyncio.run(_with_server(cfg, calls))
 
 
+def test_cockpit_session_ref_rejects_tampering(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    ref = make_session_ref("macbook-worker", "sess_123")
+    tampered = f"{ref[:-2]}{'A' if ref[-2] != 'A' else 'B'}{ref[-1]}"
+
+    assert ref.startswith("sessref_")
+    assert "macbook-worker" not in ref
+    assert "sess_123" not in ref
+
+    _store, run_id = _seed_run(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        resolved = await client.get(f"{base}/v1/sessions/{ref}")
+        rejected = await client.get(f"{base}/v1/sessions/{tampered}")
+
+        assert resolved.status_code == 200
+        assert resolved.json()["session"]["session_ref"] == ref
+        assert rejected.status_code == 404
+        assert rejected.json()["error"]["code"] == "not_found"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+
 def test_cockpit_worker_error_messages_are_redacted(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch)
     _store, _run_id = _seed_run(cfg)
@@ -558,7 +628,18 @@ def test_cockpit_session_write_proxy_and_idempotency(tmp_path, monkeypatch) -> N
         )
 
     async def calls(base: str, client: httpx.AsyncClient) -> None:
-        body = {"idempotency_key": "t3_key", "prompt": "continue", "metadata": {"surface": "jarvis-cockpit"}}
+        body = {
+            "idempotency_key": "t3_key",
+            "prompt": "continue",
+            "metadata": {
+                "surface": "jarvis-cockpit",
+                "allowed_actions": ["worker.session.stop"],
+                "control_envelope": {"allowed_actions": ["worker.session.stop"]},
+                "execution_envelope": {"allowed_actions": ["worker.session.stop"]},
+            },
+            "execution_envelope": {"allowed_actions": ["worker.session.stop"]},
+            "allowed_actions": ["worker.session.stop"],
+        }
         first = (await client.post(f"{base}/v1/sessions/{ref}/turns", json=body)).json()
         second = (await client.post(f"{base}/v1/sessions/{ref}/turns", json=body)).json()
         conflict = await client.post(f"{base}/v1/sessions/{ref}/turns", json={**body, "prompt": "different"})
@@ -567,6 +648,10 @@ def test_cockpit_session_write_proxy_and_idempotency(tmp_path, monkeypatch) -> N
         assert first["events"][0]["event_id"] == "ev_turn"
         assert second["idempotent"] is True
         assert len(posts) == 1
+        assert posts[0]["json"]["allowed_actions"] == ["worker.session.turn"]
+        assert "execution_envelope" not in posts[0]["json"]
+        assert "allowed_actions" not in posts[0]["json"]["metadata"]
+        assert "control_envelope" not in posts[0]["json"]["metadata"]
         assert conflict.status_code == 409
         assert conflict.json()["error"]["code"] == "idempotency_conflict"
 
