@@ -27,6 +27,7 @@ from jarvis.orchestration.cockpit import (
     aggregate_checkpoints,
     aggregate_requests,
     aggregate_sessions,
+    archived_session_refs_for_runs,
     artifact_summaries,
     cockpit_catalog,
     cockpit_snapshot,
@@ -123,6 +124,8 @@ def make_app(
         web.get("/v1/sessions/{session_ref}/events", reads.session_events),
         web.get("/v1/sessions/{session_ref}/requests", reads.session_requests),
         web.get("/v1/sessions/{session_ref}/checkpoints", reads.session_checkpoints),
+        web.post("/v1/runs/{run_id}/archive", writes.run_archive),
+        web.post("/v1/sessions/{session_ref}/archive", writes.session_archive),
         web.post("/v1/sessions/{session_ref}/checkpoints/restore", writes.session_write, name="restore_checkpoint"),
         web.post("/v1/sessions/{session_ref}/{action:turns|input|approval|interrupt|stop}", writes.session_write),
         web.get("/v1/sessions/{session_ref}", reads.session_detail),
@@ -193,7 +196,7 @@ class CockpitReadHandlers:
                 sync_mode=mode,
                 http_get=self.ctx.get,
             )
-        run_items = await asyncio.to_thread(self.ctx.store.list_runs)
+        run_items = await asyncio.to_thread(_visible_runs, self.ctx.store)
         requests = (
             await asyncio.to_thread(
                 aggregate_requests,
@@ -236,13 +239,16 @@ class CockpitReadHandlers:
 
     async def sessions(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
-        runs_list = await asyncio.to_thread(self.ctx.store.list_runs)
+        all_runs = await asyncio.to_thread(self.ctx.store.list_runs)
+        runs_list = [run for run in all_runs if not run.archived_at]
         session_rows = await asyncio.to_thread(
             aggregate_sessions,
             runs=runs_list,
             worker_cfg=self.ctx.cfg.worker,
             workers_path=self.ctx.cfg.orchestration.workers_path,
             http_get=self.ctx.get,
+            archived_run_ids={run.run_id for run in all_runs if run.archived_at},
+            archived_session_refs=archived_session_refs_for_runs(all_runs),
         )
         requests = await asyncio.to_thread(
             aggregate_requests,
@@ -309,6 +315,7 @@ class CockpitWriteHandlers:
     async def work_start(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
         body = await _json_body(request)
+        _reject_attachments(body)
         cached = self.ctx.idempotency.get("work/start", str(body.get("idempotency_key") or ""), body)
         if cached is not None:
             return web.json_response(cached)
@@ -339,11 +346,40 @@ class CockpitWriteHandlers:
         self.ctx.idempotency.save("work/resume", str(body.get("idempotency_key") or ""), body, response_body)
         return web.json_response(response_body)
 
+    async def run_archive(self, request: web.Request) -> web.Response:
+        self.ctx.require_auth(request)
+        body = await _json_body(request)
+        run_id = request.match_info["run_id"]
+        cached = self.ctx.idempotency.get(f"runs/{run_id}/archive", str(body.get("idempotency_key") or ""), body)
+        if cached is not None:
+            return web.json_response(cached)
+        _require_capability(self.ctx.cfg, "orchestration.runs.write")
+        run = await asyncio.to_thread(_archive_run, self.ctx.store, run_id)
+        response_body = _archive_run_packet(run)
+        self.ctx.idempotency.save(f"runs/{run_id}/archive", str(body.get("idempotency_key") or ""), body, response_body)
+        return web.json_response(response_body)
+
+    async def session_archive(self, request: web.Request) -> web.Response:
+        self.ctx.require_auth(request)
+        body = await _json_body(request)
+        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.cfg, self.ctx.store, request.match_info["session_ref"], get=self.ctx.get)
+        scope = f"sessions/{ref.worker_id}/{ref.session_id}/archive"
+        cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
+        if cached is not None:
+            return web.json_response(cached)
+        _require_capability(self.ctx.cfg, "orchestration.runs.write")
+        run = await asyncio.to_thread(_archive_session, self.ctx.store, ref)
+        response_body = _archive_session_packet(run, ref)
+        self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+        return web.json_response(response_body)
+
     async def session_write(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.cfg, self.ctx.store, request.match_info["session_ref"], get=self.ctx.get)
         action = request.match_info.get("action", "restore_checkpoint")
         body = await _json_body(request)
+        if action == "turns":
+            _reject_attachments(body)
         scope = f"sessions/{ref.worker_id}/{ref.session_id}/{action}"
         cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
         if cached is not None:
@@ -570,11 +606,85 @@ async def _json_body(request: web.Request) -> dict[str, Any]:
     return body
 
 
+def _reject_attachments(body: dict[str, Any]) -> None:
+    attachments = body.get("attachments")
+    if attachments in (None, []):
+        return
+    raise CockpitError("validation_failed", "turn attachments are not supported by Jarvis cockpit API v1", recoverable=True, status=400)
+
+
 def _run_or_404(store: OrchestrationStore, run_id: str):
     run = store.get(run_id)
     if run is None:
         raise CockpitError("not_found", "run not found", status=404)
     return run
+
+
+def _visible_runs(store: OrchestrationStore):
+    return [run for run in store.list_runs() if not run.archived_at]
+
+
+def _archive_run(store: OrchestrationStore, run_id: str):
+    try:
+        return store.archive_run(run_id)
+    except KeyError as exc:
+        raise CockpitError("not_found", "run not found", status=404) from exc
+
+
+def _archive_session(store: OrchestrationStore, ref: SessionRef):
+    for run in store.list_runs():
+        for session in run.sessions:
+            if session.worker_id == ref.worker_id and session.session_id == ref.session_id:
+                return store.archive_session(run.run_id, ref.session_id)
+    raise CockpitError("not_found", "session not found", status=404)
+
+
+def _archive_run_packet(run) -> dict[str, Any]:  # noqa: ANN001
+    run_row = run_summary(run)
+    return {
+        "ok": True,
+        "cursor": snapshot_cursor({"run": run_row, "archived": True}),
+        "run": run_row,
+        "session": {},
+        "events": [],
+        "requests": [],
+        "artifacts": [],
+    }
+
+
+def _archive_session_packet(run, ref: SessionRef) -> dict[str, Any]:  # noqa: ANN001
+    session = next((item for item in run.sessions if item.worker_id == ref.worker_id and item.session_id == ref.session_id), None)
+    session_row = session_summary(_session_row_from_link(run, session)) if session is not None else {}
+    run_row = run_summary(run)
+    return {
+        "ok": True,
+        "cursor": snapshot_cursor({"run": run_row, "session": session_row, "archived": True}),
+        "run": run_row,
+        "session": session_row,
+        "events": [],
+        "requests": [],
+        "artifacts": [],
+    }
+
+
+def _session_row_from_link(run, session) -> dict[str, Any]:  # noqa: ANN001
+    return {
+        "session_ref": make_session_ref(session.worker_id, session.session_id),
+        "worker_id": session.worker_id,
+        "session_id": session.session_id,
+        "run_id": run.run_id,
+        "title": run.objective,
+        "provider": session.provider,
+        "engine": session.engine,
+        "status": session.status,
+        "repo": next((link.item.repo for link in run.work_items if link.item.repo), ""),
+        "branch": session.branch,
+        "cwd": session.cwd,
+        "latest_event_cursor": session.last_event_id,
+        "created_at": run.created_at,
+        "updated_at": run.updated_at,
+        "archived_at": session.archived_at,
+    }
 
 
 def _cockpit_snapshot(ctx: CockpitAppContext, mode: str) -> dict[str, Any]:

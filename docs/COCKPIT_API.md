@@ -79,6 +79,7 @@ GET /v1/runs
 GET /v1/runs/{run_id}
 GET /v1/runs/{run_id}/events?after=<cursor>&limit=100
 GET /v1/runs/{run_id}/artifacts?after=<cursor>&limit=100
+POST /v1/runs/{run_id}/archive
 ```
 
 ### Sessions
@@ -106,6 +107,7 @@ POST /v1/sessions/{session_ref}/input
 POST /v1/sessions/{session_ref}/approval
 POST /v1/sessions/{session_ref}/interrupt
 POST /v1/sessions/{session_ref}/stop
+POST /v1/sessions/{session_ref}/archive
 POST /v1/sessions/{session_ref}/checkpoints/restore
 ```
 
@@ -277,6 +279,8 @@ Run summaries appear in snapshots and run lists.
 
 ```json
 {
+  "authority": "jarvis",
+  "supported_controls": ["archive"],
   "run_id": "run_123",
   "title": "Build worker sessions",
   "objective": "Expose live worker sessions",
@@ -294,7 +298,8 @@ Run summaries appear in snapshots and run lists.
   "latest_cursor": "evt_123",
   "created_at": "2026-07-01T11:00:00Z",
   "updated_at": "2026-07-01T12:00:00Z",
-  "terminal_reason": null
+  "terminal_reason": null,
+  "archived_at": null
 }
 ```
 
@@ -309,6 +314,8 @@ Session summaries appear in snapshots and session lists.
 
 ```json
 {
+  "authority": "jarvis",
+  "supported_controls": ["turn", "input", "approval", "interrupt", "stop", "checkpoint_restore", "archive"],
   "session_ref": "sessref_QF2r7mN8kT6vH3pa",
   "worker_id": "macbook-worker",
   "session_id": "sess_123",
@@ -325,11 +332,14 @@ Session summaries appear in snapshots and session lists.
   "pending_approval_count": 1,
   "checkpoint_count": 2,
   "created_at": "2026-07-01T11:00:00Z",
-  "updated_at": "2026-07-01T12:00:00Z"
+  "updated_at": "2026-07-01T12:00:00Z",
+  "archived_at": null
 }
 ```
 
 Use `cwd_label`, not public absolute `cwd`.
+Use `authority` and `supported_controls` to route cockpit commands. T3 should
+not infer authority only from id shape.
 
 ## Request Object
 
@@ -529,6 +539,37 @@ resumable session for the selected run.
 `POST /v1/sessions/{session_ref}/turns` appends a prompt to one exact session. T3
 uses this for the thread composer once the operator is already inside a session.
 
+Turn attachments are explicitly unsupported in cockpit API v1. If
+`POST /v1/sessions/{session_ref}/turns` or `POST /v1/work/start` includes a
+non-empty `attachments` array, Jarvis returns `validation_failed` instead of
+silently dropping attachment data.
+
+Future attachment shape, if enabled in a later schema version:
+
+```json
+{
+  "prompt": "...",
+  "attachments": [
+    {
+      "kind": "image",
+      "mime_type": "image/png",
+      "name": "screenshot.png",
+      "data_url": "data:image/png;base64,..."
+    }
+  ]
+}
+```
+
+`POST /v1/runs/{run_id}/archive` and
+`POST /v1/sessions/{session_ref}/archive` hide the selected run or session from
+cockpit snapshot/list views. Archive state is owned by Jarvis, not by T3 local
+storage. Direct detail endpoints may still resolve archived objects by id/ref
+for reconciliation.
+
+`POST /v1/sessions/{session_ref}/checkpoints/restore` uses `checkpoint_id`.
+Checkpoint IDs are durable and stable within a session. Clients must not restore
+by page position, turn count, or rendered list index.
+
 Successful writes return a reconciliation packet:
 
 ```json
@@ -687,6 +728,14 @@ or breaking status, and migration notes.
   now redact private paths/tokens and avoid raw provider/store payloads.
 - Kept `sync=none` and SSE refresh snapshots store-only so connected cockpit
   clients do not poll workers once per stream.
+- Added Jarvis-owned archive controls for runs and sessions. Archived objects
+  are hidden from cockpit snapshot/list views without requiring T3-local hiding.
+- Added `authority` and `supported_controls` to run/session summaries so cockpit
+  command routing can use server-published capability metadata.
+- Clarified that turn/start attachments are unsupported in v1 and fail with a
+  structured validation error instead of being silently dropped.
+- Clarified that checkpoint restore uses durable per-session `checkpoint_id`
+  values, not page position or turn count.
 
 ### 2026-07-01 - v1 Draft
 

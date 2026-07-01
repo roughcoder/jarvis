@@ -278,8 +278,11 @@ def test_cockpit_catalog_snapshot_and_worker_projection(tmp_path, monkeypatch) -
         assert snapshot["schema_version"] == 1
         assert snapshot["sync"]["status"] == "fresh"
         assert snapshot["runs"][0]["run_id"] == run_id
+        assert snapshot["runs"][0]["authority"] == "jarvis"
+        assert "archive" in snapshot["runs"][0]["supported_controls"]
         assert snapshot["runs"][0]["pending_approval_count"] == 1
         assert snapshot["sessions"][0]["session_ref"].startswith("sessref_")
+        assert snapshot["sessions"][0]["authority"] == "jarvis"
         assert snapshot["sessions"][0]["cwd_label"] == "jarvis"
         assert "/Users/" not in json.dumps(snapshot)
         assert workers["workers"][0]["capacity"]["max_sessions"] == 4
@@ -442,6 +445,9 @@ def test_cockpit_session_detail_events_requests_and_checkpoints(tmp_path, monkey
         checkpoints = (await client.get(f"{base}/v1/sessions/{ref}/checkpoints")).json()
 
         assert detail["session"]["run_id"] == run_id
+        assert detail["session"]["authority"] == "jarvis"
+        assert "archive" in detail["session"]["supported_controls"]
+        assert "checkpoint_restore" in detail["session"]["supported_controls"]
         assert "cwd" not in detail["raw"]
         assert "metadata" not in detail["raw"]
         assert events["items"][0]["sequence"] == 1
@@ -462,6 +468,7 @@ def test_cockpit_session_detail_events_requests_and_checkpoints(tmp_path, monkey
         assert "OPENAI_API_KEY" not in json.dumps(requests)
         assert "cwd" not in json.dumps(requests)
         assert checkpoints["checkpoints"][0]["session_ref"] == ref
+        assert checkpoints["checkpoints"][0]["checkpoint_id"] == "ckpt_1"
         assert "<local-path>" in json.dumps(checkpoints)
         assert "provider_pid" not in json.dumps(checkpoints)
         assert "OPENAI_API_KEY" not in json.dumps(checkpoints)
@@ -811,6 +818,77 @@ def test_cockpit_session_write_persists_result_for_store_only_snapshots(tmp_path
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=get, http_post=post))
+
+
+def test_cockpit_archive_run_hides_it_from_views(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    _store, run_id = _seed_run(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(f"{base}/v1/runs/{run_id}/archive", json={"idempotency_key": "archive_run_1"})
+        snapshot = (await client.get(f"{base}/v1/cockpit/snapshot")).json()
+        runs = (await client.get(f"{base}/v1/runs")).json()
+        sessions = (await client.get(f"{base}/v1/sessions")).json()
+
+        assert response.status_code == 200
+        assert response.json()["run"]["archived_at"]
+        assert snapshot["runs"] == []
+        assert snapshot["sessions"] == []
+        assert runs["runs"] == []
+        assert sessions["sessions"] == []
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+
+def test_cockpit_archive_session_hides_it_without_archiving_run(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    _store, run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(f"{base}/v1/sessions/{ref}/archive", json={"idempotency_key": "archive_session_1"})
+        snapshot = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+
+        assert response.status_code == 200
+        assert response.json()["session"]["archived_at"]
+        assert snapshot["runs"][0]["run_id"] == run_id
+        assert snapshot["runs"][0]["session_count"] == 0
+        assert snapshot["sessions"] == []
+        assert all(artifact["kind"] != "branch" for artifact in snapshot["artifacts"])
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+
+def test_cockpit_turn_and_start_reject_attachments_in_v1(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="worker.session.turn,worker.job.start,worker.session.create,forge.github.branch.push")
+    _store, run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+
+    def post(_url: str, **_kwargs) -> Response:  # noqa: ANN001
+        raise AssertionError("attachment-bearing cockpit requests should fail before worker dispatch")
+
+    attachment = {"kind": "image", "mime_type": "image/png", "name": "screenshot.png", "data_url": "data:image/png;base64,AAAA"}
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        turn = await client.post(f"{base}/v1/sessions/{ref}/turns", json={"idempotency_key": "turn_attach", "prompt": "see this", "attachments": [attachment]})
+        start = await client.post(
+            f"{base}/v1/work/start",
+            json={"idempotency_key": "start_attach", "source": "manual", "repo": "roughcoder/jarvis", "phrase": "start", "attachments": [attachment]},
+        )
+
+        assert turn.status_code == 400
+        assert start.status_code == 400
+        assert turn.json()["error"]["code"] == "validation_failed"
+        assert start.json()["error"]["recoverable"] is True
+        assert "attachments are not supported" in start.json()["error"]["message"]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id), http_post=post))
 
 
 def test_cockpit_session_control_endpoints_proxy_with_action_capabilities(tmp_path, monkeypatch) -> None:  # noqa: ANN001

@@ -36,6 +36,7 @@ WRITE_ACTIONS = {
     FORGE_BRANCH_PUSH,
     FORGE_PR_CREATE,
     FORGE_PR_COMMENT,
+    "orchestration.runs.write",
     "orchestration.schedules.write",
 }
 

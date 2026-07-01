@@ -36,6 +36,8 @@ SESSION_REF_SIGNING_CONTEXT = b"jarvis-cockpit-session-ref-v1"
 SESSION_REF_SIGNATURE_BYTES = 12
 CURSOR_PREFIX = "evt_"
 MAX_PAGE_LIMIT = 500
+RUN_SUPPORTED_CONTROLS = ["archive"]
+SESSION_SUPPORTED_CONTROLS = ["turn", "input", "approval", "interrupt", "stop", "checkpoint_restore", "archive"]
 PRIVATE_PUBLIC_KEYS = {
     "api_key",
     "apikey",
@@ -178,6 +180,7 @@ def cockpit_catalog() -> dict[str, Any]:
             {"capability": "git.branch", "display_name": "Create branches", "maps_to": [FORGE_BRANCH_PUSH]},
             {"capability": "github.pr.create", "display_name": "Create pull requests", "maps_to": [FORGE_PR_CREATE]},
             {"capability": "github.pr.comment", "display_name": "Comment on pull requests", "maps_to": [FORGE_PR_COMMENT]},
+            {"capability": "cockpit.archive", "display_name": "Archive cockpit runs and sessions", "maps_to": ["orchestration.runs.write"]},
         ],
         "work_sources": ["manual", "github", "linear"],
         "engine_strategies": ["single", "parallel"],
@@ -196,7 +199,10 @@ def cockpit_snapshot(
     http_get: Any = httpx.get,
 ) -> dict[str, Any]:
     sync = sync_state(store=store, worker_cfg=worker_cfg, workers_path=workers_path, sync_mode=sync_mode, http_get=http_get)
-    runs = store.list_runs()
+    all_runs = store.list_runs()
+    archived_run_ids = {run.run_id for run in all_runs if run.archived_at}
+    archived_session_refs = archived_session_refs_for_runs(all_runs)
+    runs = [run for run in all_runs if not run.archived_at]
     include_worker_state = sync["mode"] in {"fast", "probe"}
     workers = worker_profiles(worker_cfg=worker_cfg, workers_path=workers_path, probe=sync["mode"] == "probe", http_get=http_get)
     worker_by_id = {worker["worker_id"]: worker for worker in workers}
@@ -207,6 +213,8 @@ def cockpit_snapshot(
         http_get=http_get,
         worker_by_id=worker_by_id,
         include_worker_state=include_worker_state,
+        archived_run_ids=archived_run_ids,
+        archived_session_refs=archived_session_refs,
     )
     requests = aggregate_requests(worker_cfg=worker_cfg, workers_path=workers_path, http_get=http_get) if include_worker_state else []
     checkpoints = aggregate_checkpoints(runs=runs, worker_cfg=worker_cfg, workers_path=workers_path, http_get=http_get) if include_worker_state else []
@@ -299,12 +307,20 @@ def aggregate_sessions(
     http_get: Any = httpx.get,
     worker_by_id: dict[str, dict[str, Any]] | None = None,
     include_worker_state: bool = True,
+    archived_run_ids: set[str] | None = None,
+    archived_session_refs: set[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     sessions: dict[str, dict[str, Any]] = {}
     worker_by_id = worker_by_id or {}
+    archived_run_ids = archived_run_ids or set()
+    archived_session_refs = archived_session_refs or set()
     run_by_id = {run.run_id: run for run in runs}
     for run in runs:
+        if run.archived_at:
+            continue
         for link in run.sessions:
+            if link.archived_at:
+                continue
             ref = make_session_ref(link.worker_id, link.session_id)
             sessions[ref] = _session_from_link(link, run)
     if not include_worker_state:
@@ -322,6 +338,8 @@ def aggregate_sessions(
                 if not isinstance(raw, dict):
                     continue
                 ref = make_session_ref(profile.worker_id, str(raw.get("session_id") or ""))
+                if ref in archived_session_refs or str(raw.get("run_id") or "") in archived_run_ids:
+                    continue
                 run = run_by_id.get(str(raw.get("run_id") or ""))
                 sessions[ref] = _session_from_worker(raw, profile.worker_id, run=run)
         except Exception:  # noqa: BLE001 - aggregate views must remain inspectable
@@ -391,9 +409,12 @@ def run_summary(
     run_session_refs = {make_session_ref(session.worker_id, session.session_id) for session in run.sessions}
     run_requests = [request for request in requests if request.get("run_id") == run.run_id or request.get("session_ref") in run_session_refs]
     run_artifacts = [artifact for artifact in artifacts if artifact.get("run_id") == run.run_id]
+    visible_sessions = [session for session in run.sessions if not session.archived_at]
     repo = _run_repo(run)
-    branch = next((session.branch for session in run.sessions if session.branch), "")
+    branch = next((session.branch for session in visible_sessions if session.branch), "")
     return {
+        "authority": "jarvis",
+        "supported_controls": RUN_SUPPORTED_CONTROLS,
         "run_id": run.run_id,
         "title": _title(run.objective),
         "objective": _redact(run.objective),
@@ -401,8 +422,8 @@ def run_summary(
         "phase": run.phase,
         "repo": repo,
         "branch": branch,
-        "session_count": len(run.sessions),
-        "active_session_count": sum(1 for session in run.sessions if session.status in ACTIVE_SESSION_STATUSES),
+        "session_count": len(visible_sessions),
+        "active_session_count": sum(1 for session in visible_sessions if session.status in ACTIVE_SESSION_STATUSES),
         "pending_input_count": sum(1 for request in run_requests if request.get("kind") == "input"),
         "pending_approval_count": sum(1 for request in run_requests if request.get("kind") == "approval"),
         "artifact_count": len(run_artifacts),
@@ -412,6 +433,7 @@ def run_summary(
         "created_at": run.created_at,
         "updated_at": run.updated_at,
         "terminal_reason": _redact(run.terminal_reason) or None,
+        "archived_at": run.archived_at or None,
     }
 
 
@@ -438,7 +460,7 @@ def run_detail_projection(
             }
             for link in run.work_items
         ],
-        "sessions": [session_summary(_session_from_link(session, run), requests=requests, checkpoints=[]) for session in run.sessions],
+        "sessions": [session_summary(_session_from_link(session, run), requests=requests, checkpoints=[]) for session in run.sessions if not session.archived_at],
         "artifacts": run_artifacts,
     }
 
@@ -454,6 +476,8 @@ def session_summary(
     ref = str(session["session_ref"])
     session_requests = [request for request in requests if request.get("session_ref") == ref]
     return {
+        "authority": "jarvis",
+        "supported_controls": SESSION_SUPPORTED_CONTROLS,
         "session_ref": ref,
         "worker_id": session.get("worker_id", ""),
         "session_id": session.get("session_id", ""),
@@ -471,6 +495,7 @@ def session_summary(
         "checkpoint_count": sum(1 for checkpoint in checkpoints if checkpoint.get("session_ref") == ref),
         "created_at": session.get("created_at", ""),
         "updated_at": session.get("updated_at", ""),
+        "archived_at": session.get("archived_at") or None,
     }
 
 
@@ -535,7 +560,11 @@ def project_checkpoint(raw: dict[str, Any], worker_id: str, session_id: str, run
 def artifact_summaries(runs: list[OrchestrationRun]) -> list[dict[str, Any]]:
     artifacts: list[dict[str, Any]] = []
     for run in runs:
+        if run.archived_at:
+            continue
         for session in run.sessions:
+            if session.archived_at:
+                continue
             if session.branch:
                 artifacts.append(
                     {
@@ -563,6 +592,15 @@ def artifact_summaries(runs: list[OrchestrationRun]) -> list[dict[str, Any]]:
                 continue
             artifacts.append(project_artifact(artifact, run))
     return artifacts
+
+
+def archived_session_refs_for_runs(runs: list[OrchestrationRun]) -> set[str]:
+    return {
+        make_session_ref(session.worker_id, session.session_id)
+        for run in runs
+        for session in run.sessions
+        if run.archived_at or session.archived_at
+    }
 
 
 def project_artifact(artifact: Artifact, run: OrchestrationRun) -> dict[str, Any]:
@@ -648,6 +686,7 @@ def _session_from_link(link: WorkerSessionLink, run: OrchestrationRun) -> dict[s
         "latest_event_cursor": link.last_event_id,
         "created_at": run.created_at,
         "updated_at": run.updated_at,
+        "archived_at": link.archived_at,
     }
 
 
@@ -668,6 +707,7 @@ def _session_from_worker(raw: dict[str, Any], worker_id: str, *, run: Orchestrat
         "latest_event_cursor": str(raw.get("last_event_id") or ""),
         "created_at": str(raw.get("created_at") or (run.created_at if run else "")),
         "updated_at": str(raw.get("updated_at") or (run.updated_at if run else "")),
+        "archived_at": "",
     }
 
 
