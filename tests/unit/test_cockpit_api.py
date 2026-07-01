@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -16,7 +18,8 @@ from aiohttp import web  # noqa: E402
 from jarvis.config import Config  # noqa: E402
 from jarvis.orchestration.api import make_app, serve  # noqa: E402
 from jarvis.orchestration.cockpit import make_session_ref  # noqa: E402
-from jarvis.orchestration.models import Artifact, WorkItem, WorkerSessionLink  # noqa: E402
+from jarvis.orchestration.models import Artifact, ExecutionEnvelope, WorkItem, WorkerProfile, WorkerSessionLink  # noqa: E402
+from jarvis.orchestration.service import StartedWork  # noqa: E402
 from jarvis.orchestration.store import OrchestrationStore  # noqa: E402
 
 
@@ -32,6 +35,15 @@ class Response:
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
             raise RuntimeError(self.text)
+
+
+class TextResponse:
+    def __init__(self, text: str, status_code: int = 500) -> None:
+        self.text = text
+        self.status_code = status_code
+
+    def json(self) -> dict[str, Any]:
+        raise ValueError("not json")
 
 
 async def _with_server(cfg: Config, fn: Callable[[str, httpx.AsyncClient], Any], *, http_get=None, http_post=None) -> Any:  # noqa: ANN001
@@ -157,7 +169,7 @@ def _fake_get(run_id: str):  # noqa: ANN202
                             "title": "Codex implementation",
                             "created_at": "2026-07-01T11:00:00Z",
                             "updated_at": "2026-07-01T12:00:00Z",
-                        }
+                        },
                     ]
                 }
             )
@@ -230,6 +242,34 @@ def _fake_get(run_id: str):  # noqa: ANN202
                                         "cwd": "/Users/example/private/jarvis",
                                         "token_env": "OPENAI_API_KEY",
                                     },
+                                },
+                            },
+                        },
+                        {
+                            "session_id": "sess_123",
+                            "request_id": "req_input",
+                            "kind": "input",
+                            "status": "pending",
+                            "event": {
+                                "event_id": "ev_input",
+                                "session_id": "sess_123",
+                                "type": "input.requested",
+                                "time": "2026-07-01T11:02:00Z",
+                                "data": {
+                                    "run_id": run_id,
+                                    "title": "Input needed for http://localhost:8780/callback?token=secret",
+                                    "question": "Use /workspace/private/jarvis?",
+                                    "questions": [
+                                        {
+                                            "id": "response",
+                                            "header": "Input",
+                                            "question": "Continue with /home/jarvis/private and http://localhost:8780/callback?token=secret?",
+                                            "options": [
+                                                {"label": "Use /workspace/private", "value": "http://localhost:8780/logs?token=secret"},
+                                                "Keep going from /tmp/private",
+                                            ],
+                                        }
+                                    ],
                                 },
                             },
                         }
@@ -450,6 +490,7 @@ def test_cockpit_session_detail_events_requests_and_checkpoints(tmp_path, monkey
         assert "checkpoint_restore" in detail["session"]["supported_controls"]
         assert "cwd" not in detail["raw"]
         assert "metadata" not in detail["raw"]
+        assert "provider_pid" not in json.dumps(detail["raw"])
         assert events["items"][0]["sequence"] == 1
         assert events["has_more"] is True
         next_events = (await client.get(f"{base}/v1/sessions/{ref}/events", params={"after": "ev_1"})).json()["items"]
@@ -465,6 +506,9 @@ def test_cockpit_session_detail_events_requests_and_checkpoints(tmp_path, monkey
         assert "provider_pid" not in json.dumps(all_events)
         assert requests["requests"][0]["title"] == "Approve file edits"
         assert "<local-path>" in requests["requests"][0]["detail"]
+        assert "<local-path>" in json.dumps(requests["requests"][1]["questions"])
+        assert "localhost" not in json.dumps(requests)
+        assert "token=secret" not in json.dumps(requests)
         assert "OPENAI_API_KEY" not in json.dumps(requests)
         assert "cwd" not in json.dumps(requests)
         assert checkpoints["checkpoints"][0]["session_ref"] == ref
@@ -476,6 +520,34 @@ def test_cockpit_session_detail_events_requests_and_checkpoints(tmp_path, monkey
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+
+def test_cockpit_session_detail_raw_projection_is_redacted(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _store, run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+
+    def get(url: str, **kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions/sess_123"):
+            data = _fake_get(run_id)(url, **kwargs).json()
+            data["title"] = "Continue in /home/jarvis/private with ghp_abcdefghijklmnopqrstuvwxyz"
+            data["raw"] = {"provider_prompt": "secret"}
+            return Response(data)
+        return _fake_get(run_id)(url, **kwargs)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        detail = (await client.get(f"{base}/v1/sessions/{ref}")).json()
+        text = json.dumps(detail["raw"])
+
+        assert "/home/" not in text
+        assert "ghp_abcdefghijklmnopqrstuvwxyz" not in text
+        assert "provider_prompt" not in text
+        assert "<local-path>" in text
+        assert "<redacted-token>" in text
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
 
 
 def test_cockpit_run_events_and_artifact_pagination(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -621,6 +693,7 @@ def test_cockpit_run_events_filter_non_public_urls(tmp_path, monkeypatch) -> Non
     cfg = _cfg(tmp_path, monkeypatch)
     store, run_id = _seed_run(cfg)
     store.link_artifact(run_id, Artifact(type="url", id="private", url="http://localhost:8780/logs?token=secret", status="open"))
+    store.append_event(run_id, "worker_link", "log at http://localhost:8780/logs?token=secret", {"summary": "open /workspace/private/log and http://localhost:8780/logs?token=secret"})
 
     async def calls(base: str, client: httpx.AsyncClient) -> None:
         events = (await client.get(f"{base}/v1/runs/{run_id}/events")).json()
@@ -628,6 +701,31 @@ def test_cockpit_run_events_filter_non_public_urls(tmp_path, monkeypatch) -> Non
 
         assert "localhost" not in text
         assert "token=secret" not in text
+        assert "/workspace/" not in text
+        assert "<redacted-url>" in text
+        assert "<local-path>" in text
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+
+def test_cockpit_artifact_titles_and_urls_are_public_safe(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    store, run_id = _seed_run(cfg)
+    store.link_artifact(run_id, Artifact(type="url", id="private", url="http://localhost:8780/logs?token=secret", status="open"))
+    store.link_artifact(run_id, Artifact(type="url", id="github", url="https://github.com/roughcoder/jarvis/pull/49?code=secret#frag", status="open"))
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        artifacts = (await client.get(f"{base}/v1/runs/{run_id}/artifacts")).json()
+        snapshot = (await client.get(f"{base}/v1/cockpit/snapshot")).json()
+        text = json.dumps({"artifacts": artifacts, "snapshot": snapshot})
+
+        assert "localhost" not in text
+        assert "token=secret" not in text
+        assert "code=secret" not in text
+        assert "#frag" not in text
+        assert "https://github.com/roughcoder/jarvis/pull/49" in text
 
     import asyncio
 
@@ -820,6 +918,73 @@ def test_cockpit_session_write_persists_result_for_store_only_snapshots(tmp_path
     asyncio.run(_with_server(cfg, calls, http_get=get, http_post=post))
 
 
+def test_cockpit_session_write_returns_best_effort_packet_when_reconcile_reads_fail(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="worker.session.stop")
+    _store, run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+    state = {"posted": False}
+
+    def get(url: str, **kwargs) -> Response:  # noqa: ANN001
+        if state["posted"] and url.endswith("/sessions/sess_123"):
+            return Response({"error": "session unavailable"}, status_code=503)
+        return _fake_get(run_id)(url, **kwargs)
+
+    def post(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        assert url.endswith("/sessions/sess_123/stop")
+        state["posted"] = True
+        return Response(
+            {
+                "ok": True,
+                "session": {"session_id": "sess_123", "status": "stopped"},
+                "event": {"event_id": "ev_stop_best_effort", "session_id": "sess_123", "type": "session.stopped"},
+            }
+        )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(f"{base}/v1/sessions/{ref}/stop", json={"idempotency_key": "stop_best_effort"})
+        replay = await client.post(f"{base}/v1/sessions/{ref}/stop", json={"idempotency_key": "stop_best_effort"})
+
+        assert response.status_code == 200
+        assert response.json()["session"]["status"] == "stopped"
+        assert response.json()["events"][0]["event_id"] == "ev_stop_best_effort"
+        assert replay.json()["idempotent"] is True
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get, http_post=post))
+
+
+def test_cockpit_session_write_finalizes_run_when_last_session_is_terminal(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="worker.session.stop")
+    _store, run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+    state = {"status": "running"}
+
+    def get(url: str, **kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions/sess_123"):
+            data = _fake_get(run_id)(url, **kwargs).json()
+            data["status"] = state["status"]
+            return Response(data)
+        return _fake_get(run_id)(url, **kwargs)
+
+    def post(_url: str, **_kwargs) -> Response:  # noqa: ANN001
+        state["status"] = "stopped"
+        return Response({"ok": True, "session": {"session_id": "sess_123", "status": "stopped"}})
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(f"{base}/v1/sessions/{ref}/stop", json={"idempotency_key": "stop_terminal"})
+        snapshot = (await client.get(f"{base}/v1/cockpit/snapshot")).json()
+
+        assert response.status_code == 200
+        assert snapshot["runs"][0]["status"] == "terminal"
+        assert snapshot["runs"][0]["phase"] == "failed"
+        assert snapshot["runs"][0]["terminal_reason"]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get, http_post=post))
+
+
 def test_cockpit_archive_run_hides_it_from_views(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
     _store, run_id = _seed_run(cfg)
@@ -985,6 +1150,30 @@ def test_cockpit_session_write_maps_worker_errors(tmp_path, monkeypatch) -> None
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id), http_post=post))
 
 
+def test_cockpit_session_write_maps_non_json_worker_errors(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="worker.session.stop")
+    _store, run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+
+    def post(_url: str, **_kwargs) -> TextResponse:  # noqa: ANN001
+        return TextResponse("failed at /workspace/private/log with sk-abcdefghijklmnopqrstuvwxyz", status_code=502)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(f"{base}/v1/sessions/{ref}/stop", json={"idempotency_key": "stop_text_error"})
+        body = response.json()
+
+        assert response.status_code == 502
+        assert body["error"]["code"] == "provider_unavailable"
+        assert "/workspace/" not in body["error"]["message"]
+        assert "sk-abcdefghijklmnopqrstuvwxyz" not in body["error"]["message"]
+        assert "<local-path>" in body["error"]["message"]
+        assert "<redacted-token>" in body["error"]["message"]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id), http_post=post))
+
+
 def test_cockpit_work_start_rejects_unknown_sources_without_github_fallback(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, caps="worker.job.start,worker.session.create,worker.session.turn,forge.github.branch.push")
 
@@ -1058,6 +1247,48 @@ def test_cockpit_work_start_manual_dispatches_worker_session(tmp_path, monkeypat
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get("")))
+
+
+def test_cockpit_work_start_idempotency_serializes_concurrent_dispatch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="worker.job.start,worker.session.create,worker.session.turn,forge.github.branch.push")
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    item = WorkItem(source="manual", id="manual_concurrent", title="Concurrent start", repo="roughcoder/jarvis")
+    run = store.create_run("Concurrent start", work_items=[item])
+    session = WorkerSessionLink(worker_id="macbook-worker", session_id="sess_concurrent", status="running", provider="codex", engine="codex")
+    store.link_session(run.run_id, session)
+    calls_seen = {"count": 0}
+    entered = threading.Event()
+
+    def next_work(_self, _command, *, start: bool = False):  # noqa: ANN001, FBT001, FBT002
+        calls_seen["count"] += 1
+        entered.set()
+        time.sleep(0.2)
+        return StartedWork(
+            item=item,
+            worker=WorkerProfile(worker_id="macbook-worker", display_name="MacBook Pro"),
+            envelope=ExecutionEnvelope(run_id=run.run_id, repo=item.repo, prompt=item.title, worker_id="macbook-worker", session_id=session.session_id),
+            session=session,
+        )
+
+    monkeypatch.setattr("jarvis.orchestration.service.OrchestrationService.next_work", next_work)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        import asyncio
+
+        body = {"idempotency_key": "concurrent_start", "source": "manual", "repo": "roughcoder/jarvis", "phrase": "start"}
+        first = asyncio.create_task(client.post(f"{base}/v1/work/start", json=body))
+        await asyncio.to_thread(entered.wait, 2)
+        second = asyncio.create_task(client.post(f"{base}/v1/work/start", json=body))
+        responses = await asyncio.gather(first, second)
+        payloads = [response.json() for response in responses]
+
+        assert all(response.status_code == 200 for response in responses)
+        assert calls_seen["count"] == 1
+        assert [payload.get("idempotent") for payload in payloads].count(True) == 1
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run.run_id)))
 
 
 def test_cockpit_work_resume_maps_active_session_error(tmp_path, monkeypatch) -> None:  # noqa: ANN001

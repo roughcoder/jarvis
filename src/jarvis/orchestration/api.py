@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -66,6 +67,7 @@ from jarvis.orchestration.service import (
 from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource, WorkSource
 from jarvis.orchestration.store import OrchestrationStore
 from jarvis.orchestration.workers import WorkerRegistry
+from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, FAILED_SESSION_STATUSES, SUCCESS_SESSION_STATUSES
 
 HttpGet = Callable[..., Any]
 HttpPost = Callable[..., Any]
@@ -78,6 +80,7 @@ class CockpitAppContext:
     post: HttpPost
     store: OrchestrationStore
     idempotency: IdempotencyStore
+    idempotency_locks: dict[str, asyncio.Lock]
     source_factory: Callable[[str, Any], WorkSource]
 
     def require_auth(self, request: web.Request) -> None:
@@ -103,6 +106,7 @@ def make_app(
         post=http_post or httpx.post,
         store=OrchestrationStore(cfg.orchestration.workspace),
         idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
         source_factory=source_factory or _work_source,
     )
     app = web.Application(middlewares=[_error_middleware])
@@ -316,47 +320,51 @@ class CockpitWriteHandlers:
         self.ctx.require_auth(request)
         body = await _json_body(request)
         _reject_attachments(body)
-        cached = self.ctx.idempotency.get("work/start", str(body.get("idempotency_key") or ""), body)
-        if cached is not None:
-            return web.json_response(cached)
-        command, manual_item = _command_from_body(body, start=True)
-        service = self.ctx.service(manual_item=manual_item)
-        try:
-            result = await asyncio.to_thread(service.next_work, command, start=True)
-        except (MissingAuthorityError, NoEligibleWorkerError, WorkAlreadyOwnedError, MissingWorkRepoError, WorkerDispatchError) as exc:
-            raise _service_error(exc) from exc
-        if result is None or not isinstance(result, StartedWork):
-            raise CockpitError("not_found", "no eligible work item found", recoverable=True, status=404)
-        response_body = _started_work_packet(self.ctx.store, result)
-        self.ctx.idempotency.save("work/start", str(body.get("idempotency_key") or ""), body, response_body)
+        async with _idempotency_scope(self.ctx, "work/start", str(body.get("idempotency_key") or "")):
+            cached = self.ctx.idempotency.get("work/start", str(body.get("idempotency_key") or ""), body)
+            if cached is not None:
+                return web.json_response(cached)
+            command, manual_item = _command_from_body(body, start=True)
+            service = self.ctx.service(manual_item=manual_item)
+            try:
+                result = await asyncio.to_thread(service.next_work, command, start=True)
+            except (MissingAuthorityError, NoEligibleWorkerError, WorkAlreadyOwnedError, MissingWorkRepoError, WorkerDispatchError) as exc:
+                raise _service_error(exc) from exc
+            if result is None or not isinstance(result, StartedWork):
+                raise CockpitError("not_found", "no eligible work item found", recoverable=True, status=404)
+            response_body = _started_work_packet(self.ctx.store, result)
+            self.ctx.idempotency.save("work/start", str(body.get("idempotency_key") or ""), body, response_body)
         return web.json_response(response_body)
 
     async def work_resume(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
         body = await _json_body(request)
-        cached = self.ctx.idempotency.get("work/resume", str(body.get("idempotency_key") or ""), body)
-        if cached is not None:
-            return web.json_response(cached)
-        service = self.ctx.service()
-        try:
-            result = await asyncio.to_thread(service.resume_run, str(body.get("run_id") or "latest"), prompt=str(body.get("prompt") or ""))
-        except (MissingAuthorityError, NoEligibleWorkerError, ResumeRunError, WorkerDispatchError) as exc:
-            raise _service_error(exc) from exc
-        response_body = _started_work_packet(self.ctx.store, result)
-        self.ctx.idempotency.save("work/resume", str(body.get("idempotency_key") or ""), body, response_body)
+        async with _idempotency_scope(self.ctx, "work/resume", str(body.get("idempotency_key") or "")):
+            cached = self.ctx.idempotency.get("work/resume", str(body.get("idempotency_key") or ""), body)
+            if cached is not None:
+                return web.json_response(cached)
+            service = self.ctx.service()
+            try:
+                result = await asyncio.to_thread(service.resume_run, str(body.get("run_id") or "latest"), prompt=str(body.get("prompt") or ""))
+            except (MissingAuthorityError, NoEligibleWorkerError, ResumeRunError, WorkerDispatchError) as exc:
+                raise _service_error(exc) from exc
+            response_body = _started_work_packet(self.ctx.store, result)
+            self.ctx.idempotency.save("work/resume", str(body.get("idempotency_key") or ""), body, response_body)
         return web.json_response(response_body)
 
     async def run_archive(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
         body = await _json_body(request)
         run_id = request.match_info["run_id"]
-        cached = self.ctx.idempotency.get(f"runs/{run_id}/archive", str(body.get("idempotency_key") or ""), body)
-        if cached is not None:
-            return web.json_response(cached)
-        _require_capability(self.ctx.cfg, "orchestration.runs.write")
-        run = await asyncio.to_thread(_archive_run, self.ctx.store, run_id)
-        response_body = _archive_run_packet(run)
-        self.ctx.idempotency.save(f"runs/{run_id}/archive", str(body.get("idempotency_key") or ""), body, response_body)
+        scope = f"runs/{run_id}/archive"
+        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
+            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
+            if cached is not None:
+                return web.json_response(cached)
+            _require_capability(self.ctx.cfg, "orchestration.runs.write")
+            run = await asyncio.to_thread(_archive_run, self.ctx.store, run_id)
+            response_body = _archive_run_packet(run)
+            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
         return web.json_response(response_body)
 
     async def session_archive(self, request: web.Request) -> web.Response:
@@ -364,13 +372,14 @@ class CockpitWriteHandlers:
         body = await _json_body(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.cfg, self.ctx.store, request.match_info["session_ref"], get=self.ctx.get)
         scope = f"sessions/{ref.worker_id}/{ref.session_id}/archive"
-        cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
-        if cached is not None:
-            return web.json_response(cached)
-        _require_capability(self.ctx.cfg, "orchestration.runs.write")
-        run = await asyncio.to_thread(_archive_session, self.ctx.store, ref)
-        response_body = _archive_session_packet(run, ref)
-        self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
+            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
+            if cached is not None:
+                return web.json_response(cached)
+            _require_capability(self.ctx.cfg, "orchestration.runs.write")
+            run = await asyncio.to_thread(_archive_session, self.ctx.store, ref)
+            response_body = _archive_session_packet(run, ref)
+            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
         return web.json_response(response_body)
 
     async def session_write(self, request: web.Request) -> web.Response:
@@ -381,16 +390,17 @@ class CockpitWriteHandlers:
         if action == "turns":
             _reject_attachments(body)
         scope = f"sessions/{ref.worker_id}/{ref.session_id}/{action}"
-        cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
-        if cached is not None:
-            return web.json_response(cached)
-        required = _required_session_action(action)
-        _require_capability(self.ctx.cfg, required)
-        proxied = _worker_control_body(body, required)
-        path = f"/sessions/{ref.session_id}/{'checkpoints/restore' if action == 'restore_checkpoint' else action}"
-        raw = await asyncio.to_thread(_worker_post_json, self.ctx.cfg, ref.worker_id, path, proxied, post=self.ctx.post)
-        response_body = await asyncio.to_thread(_session_write_packet, self.ctx.cfg, self.ctx.store, ref, raw, get=self.ctx.get)
-        self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
+            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
+            if cached is not None:
+                return web.json_response(cached)
+            required = _required_session_action(action)
+            _require_capability(self.ctx.cfg, required)
+            proxied = _worker_control_body(body, required)
+            path = f"/sessions/{ref.session_id}/{'checkpoints/restore' if action == 'restore_checkpoint' else action}"
+            raw = await asyncio.to_thread(_worker_post_json, self.ctx.cfg, ref.worker_id, path, proxied, post=self.ctx.post)
+            response_body = await asyncio.to_thread(_session_write_packet, self.ctx.cfg, self.ctx.store, ref, raw, get=self.ctx.get)
+            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
         return web.json_response(response_body)
 
 
@@ -554,12 +564,29 @@ def _started_work_packet(store: OrchestrationStore, result: StartedWork) -> dict
     }
 
 
+@contextlib.asynccontextmanager
+async def _idempotency_scope(ctx: CockpitAppContext, scope: str, key: str):  # noqa: ANN202
+    if not key:
+        yield
+        return
+    lock_key = f"{scope}\0{key}"
+    lock = ctx.idempotency_locks.setdefault(lock_key, asyncio.Lock())
+    async with lock:
+        yield
+
+
 def _session_write_packet(cfg: Config, store: OrchestrationStore, ref, raw: dict[str, Any], *, get: HttpGet) -> dict[str, Any]:  # noqa: ANN001
-    session_raw = _worker_get_json(cfg, ref.worker_id, f"/sessions/{ref.session_id}", get=get)
-    row = _worker_session_row(session_raw, ref.worker_id)
-    requests = _worker_session_requests(cfg, ref, get=get)
-    checkpoints = _worker_session_checkpoints(cfg, ref, run_id=str(row.get("run_id") or ""), get=get)
-    events = []
+    row = _fallback_session_row(store, ref, raw)
+    requests: list[dict[str, Any]] = []
+    checkpoints: list[dict[str, Any]] = []
+    with contextlib.suppress(CockpitError):
+        session_raw = _worker_get_json(cfg, ref.worker_id, f"/sessions/{ref.session_id}", get=get)
+        row.update(_worker_session_row(session_raw, ref.worker_id))
+    with contextlib.suppress(CockpitError):
+        requests = _worker_session_requests(cfg, ref, get=get)
+    with contextlib.suppress(CockpitError):
+        checkpoints = _worker_session_checkpoints(cfg, ref, run_id=str(row.get("run_id") or ""), get=get)
+    events: list[dict[str, Any]] = []
     if isinstance(raw.get("events"), list):
         events = [project_session_event(event, worker_id=ref.worker_id, run_id=str(row.get("run_id") or ""), sequence=idx + 1) for idx, event in enumerate(raw["events"])]
     elif isinstance(raw.get("event"), dict):
@@ -575,6 +602,47 @@ def _session_write_packet(cfg: Config, store: OrchestrationStore, ref, raw: dict
         "events": events,
         "requests": requests,
         "artifacts": artifacts,
+    }
+
+
+def _fallback_session_row(store: OrchestrationStore, ref: SessionRef, raw: dict[str, Any]) -> dict[str, Any]:
+    session_raw = raw.get("session") if isinstance(raw.get("session"), dict) else {}
+    for run in store.list_runs():
+        for link in run.sessions:
+            if link.worker_id == ref.worker_id and link.session_id == ref.session_id:
+                return {
+                    "session_ref": make_session_ref(link.worker_id, link.session_id),
+                    "worker_id": link.worker_id,
+                    "session_id": link.session_id,
+                    "run_id": run.run_id,
+                    "title": run.objective,
+                    "provider": str(session_raw.get("provider") or link.provider),
+                    "engine": str(session_raw.get("engine") or link.engine),
+                    "status": str(session_raw.get("status") or link.status),
+                    "repo": next((item.item.repo for item in run.work_items if item.item.repo), ""),
+                    "branch": str(session_raw.get("branch") or link.branch),
+                    "cwd": str(session_raw.get("cwd") or link.cwd),
+                    "latest_event_cursor": str(session_raw.get("last_event_id") or link.last_event_id),
+                    "created_at": run.created_at,
+                    "updated_at": run.updated_at,
+                    "archived_at": link.archived_at,
+                }
+    session_id = str(session_raw.get("session_id") or ref.session_id)
+    return {
+        "session_ref": make_session_ref(ref.worker_id, session_id),
+        "worker_id": ref.worker_id,
+        "session_id": session_id,
+        "run_id": str(session_raw.get("run_id") or ""),
+        "title": str(session_raw.get("title") or ""),
+        "provider": str(session_raw.get("provider") or ""),
+        "engine": str(session_raw.get("engine") or session_raw.get("provider") or ""),
+        "status": str(session_raw.get("status") or ""),
+        "repo": str(session_raw.get("repo") or ""),
+        "branch": str(session_raw.get("branch") or ""),
+        "cwd": str(session_raw.get("cwd") or ""),
+        "latest_event_cursor": str(session_raw.get("last_event_id") or ""),
+        "created_at": str(session_raw.get("created_at") or ""),
+        "updated_at": str(session_raw.get("updated_at") or ""),
     }
 
 
@@ -753,6 +821,7 @@ def _persist_session_write(store: OrchestrationStore, ref: SessionRef, row: dict
                 "data": dict(event.get("data") or {}),
             },
         )
+    _finalize_session_run_if_terminal(store, run_id)
 
 
 def _latest_event_id(events: list[dict[str, Any]]) -> str | None:
@@ -761,6 +830,20 @@ def _latest_event_id(events: list[dict[str, Any]]) -> str | None:
         if event_id:
             return event_id
     return None
+
+
+def _finalize_session_run_if_terminal(store: OrchestrationStore, run_id: str) -> None:
+    run = store.get(run_id)
+    if run is None or run.status == "terminal" or not run.sessions:
+        return
+    statuses = {session.status for session in run.sessions}
+    if statuses & ACTIVE_SESSION_STATUSES:
+        return
+    if statuses <= SUCCESS_SESSION_STATUSES:
+        store.set_phase(run_id, "completed", "All worker sessions completed")
+        return
+    if statuses & FAILED_SESSION_STATUSES:
+        store.set_phase(run_id, "failed", "At least one worker session failed, stopped, or was interrupted")
 
 
 def _worker_control_body(body: dict[str, Any], required: str) -> dict[str, Any]:
@@ -830,9 +913,13 @@ def _worker_post_json(cfg: Config, worker_id: str, path: str, body: dict[str, An
         message = public_error_message(str(exc) or "worker write failed")
         raise CockpitError("worker_unavailable", message, recoverable=True, status=502) from exc
     status = getattr(response, "status_code", 200)
-    data = response.json() if hasattr(response, "json") else {}
+    try:
+        data = response.json() if hasattr(response, "json") else {}
+    except Exception:
+        data = {}
     if status >= 400 or (isinstance(data, dict) and data.get("ok") is False):
-        message = public_error_message(str(data.get("error") or "worker write failed")) if isinstance(data, dict) else "worker write failed"
+        message = public_error_message(str(data.get("error") or data.get("message") or "")) if isinstance(data, dict) else ""
+        message = message or _response_error(response) or "worker write failed"
         code = _worker_error_code(message)
         if status == 404 and code == "checkpoint_not_found":
             raise CockpitError(code, message, recoverable=True, status=409)
@@ -867,10 +954,21 @@ def _worker_session_row(raw: dict[str, Any], worker_id: str) -> dict[str, Any]:
 
 
 def _public_session_detail(raw: dict[str, Any]) -> dict[str, Any]:
-    data = dict(raw)
-    data.pop("cwd", None)
-    data.pop("metadata", None)
-    return data
+    return {
+        key: value
+        for key, value in public_event_data(
+            {
+                "id": raw.get("session_id"),
+                "run_id": raw.get("run_id"),
+                "title": raw.get("title"),
+                "provider": raw.get("provider"),
+                "status": raw.get("status"),
+                "branch": raw.get("branch"),
+                "message_id": raw.get("last_event_id"),
+            }
+        ).items()
+        if value not in ("", [], {})
+    }
 
 
 def _worker_session_requests(cfg: Config, ref, *, get: HttpGet) -> list[dict[str, Any]]:  # noqa: ANN001
