@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import pathlib
 import re
 from dataclasses import dataclass
@@ -202,7 +203,7 @@ def cockpit_snapshot(
     sync = sync_state(store=store, worker_cfg=worker_cfg, workers_path=workers_path, sync_mode=sync_mode, http_get=http_get)
     all_runs = store.list_runs()
     archived_run_ids = {run.run_id for run in all_runs if run.archived_at}
-    archived_session_refs = archived_session_refs_for_runs(all_runs)
+    archived_session_refs = archived_session_refs_for_store(store, all_runs)
     runs = [run for run in all_runs if not run.archived_at]
     include_worker_state = sync["mode"] in {"fast", "probe"}
     workers = worker_profiles(worker_cfg=worker_cfg, workers_path=workers_path, probe=sync["mode"] == "probe", http_get=http_get)
@@ -328,7 +329,9 @@ def aggregate_sessions(
         return sessions
     registry = WorkerRegistry(worker_cfg, profiles_path=workers_path)
     for profile in registry.profiles(probe=False):
-        if profile.status == "offline":
+        projected_worker = worker_by_id.get(profile.worker_id, {})
+        effective_status = str(projected_worker.get("status") or profile.status)
+        if effective_status == "offline":
             continue
         headers = worker_headers(worker_cfg, profile)
         try:
@@ -376,6 +379,8 @@ def aggregate_checkpoints(
     registry = WorkerRegistry(worker_cfg, profiles_path=workers_path)
     for run in runs:
         for link in run.sessions:
+            if link.archived_at:
+                continue
             profile = registry.get(link.worker_id, probe=False)
             if profile is None:
                 continue
@@ -407,10 +412,14 @@ def run_summary(
 ) -> dict[str, Any]:
     requests = requests or []
     artifacts = artifacts or []
-    run_session_refs = {make_session_ref(session.worker_id, session.session_id) for session in run.sessions}
-    run_requests = [request for request in requests if request.get("run_id") == run.run_id or request.get("session_ref") in run_session_refs]
-    run_artifacts = [artifact for artifact in artifacts if artifact.get("run_id") == run.run_id]
     visible_sessions = [session for session in run.sessions if not session.archived_at]
+    run_session_refs = {make_session_ref(session.worker_id, session.session_id) for session in visible_sessions}
+    run_requests = [
+        request
+        for request in requests
+        if _request_visible_for_run(request, run.run_id, run_session_refs)
+    ]
+    run_artifacts = [artifact for artifact in artifacts if artifact.get("run_id") == run.run_id]
     repo = _run_repo(run)
     branch = next((session.branch for session in visible_sessions if session.branch), "")
     return {
@@ -436,6 +445,13 @@ def run_summary(
         "terminal_reason": _redact(run.terminal_reason) or None,
         "archived_at": run.archived_at or None,
     }
+
+
+def _request_visible_for_run(request: dict[str, Any], run_id: str, visible_session_refs: set[str]) -> bool:
+    session_ref = str(request.get("session_ref") or "")
+    if session_ref and session_ref not in visible_session_refs:
+        return False
+    return request.get("run_id") == run_id or session_ref in visible_session_refs
 
 
 def run_detail_projection(
@@ -604,6 +620,16 @@ def archived_session_refs_for_runs(runs: list[OrchestrationRun]) -> set[str]:
     }
 
 
+def archived_session_refs_for_store(store: OrchestrationStore, runs: list[OrchestrationRun] | None = None) -> set[str]:
+    refs = archived_session_refs_for_runs(runs if runs is not None else store.list_runs())
+    refs.update(
+        make_session_ref(item["worker_id"], item["session_id"])
+        for item in store.archived_worker_sessions().values()
+        if item.get("worker_id") and item.get("session_id")
+    )
+    return refs
+
+
 def project_artifact(artifact: Artifact, run: OrchestrationRun) -> dict[str, Any]:
     kind = _artifact_kind(artifact.type)
     public_url = _public_url(artifact.url)
@@ -645,8 +671,6 @@ def paged(items: list[dict[str, Any]], *, after: str = "", limit: int = 100) -> 
 
 
 def worker_headers(worker_cfg: WorkerConfig, profile: WorkerProfile) -> dict[str, str]:
-    import os
-
     token = os.environ.get(profile.token_env, "") if profile.token_env else ""
     if not token and profile.worker_id == "local-worker":
         token = worker_cfg.token.get_secret_value()

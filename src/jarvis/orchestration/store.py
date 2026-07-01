@@ -52,6 +52,7 @@ class OrchestrationStore:
         self.runs_dir = self.root / "runs"
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self._lock_path = self.root / ".lock"
+        self._archived_sessions_path = self.root / "archived-sessions.json"
 
     def run_dir(self, run_id: str) -> pathlib.Path:
         if not _RUN_ID.fullmatch(run_id):
@@ -197,6 +198,41 @@ class OrchestrationStore:
                 self.save(run)
                 self.append_event(run_id, "session_archived", f"Worker session {session_id} archived from cockpit views", {"session_id": session_id})
             return run
+
+    def archive_worker_session(self, worker_id: str, session_id: str) -> dict[str, str]:
+        with self._locked():
+            archived = self.archived_worker_sessions()
+            key = f"{worker_id}\0{session_id}"
+            existing = archived.get(key)
+            if existing is not None:
+                return existing
+            item = {"worker_id": worker_id, "session_id": session_id, "archived_at": utc_now()}
+            archived[key] = item
+            self._archived_sessions_path.write_text(json.dumps(list(archived.values()), indent=2, sort_keys=True))
+            return item
+
+    def archived_worker_sessions(self) -> dict[str, dict[str, str]]:
+        if not self._archived_sessions_path.exists():
+            return {}
+        try:
+            data = json.loads(self._archived_sessions_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+        result: dict[str, dict[str, str]] = {}
+        if not isinstance(data, list):
+            return result
+        for raw in data:
+            if not isinstance(raw, dict):
+                continue
+            worker_id = str(raw.get("worker_id") or "")
+            session_id = str(raw.get("session_id") or "")
+            if worker_id and session_id:
+                result[f"{worker_id}\0{session_id}"] = {
+                    "worker_id": worker_id,
+                    "session_id": session_id,
+                    "archived_at": str(raw.get("archived_at") or ""),
+                }
+        return result
 
     def link_work_item(self, run_id: str, item: WorkItem, role: str = "related") -> OrchestrationRun:
         run = self.get(run_id)

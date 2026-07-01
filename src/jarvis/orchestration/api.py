@@ -21,6 +21,7 @@ from jarvis.config import Config, insecure_bind
 from jarvis.ids import utc_now
 from jarvis.orchestration.cockpit import (
     API_VERSION,
+    MAX_PAGE_LIMIT,
     SCHEMA_VERSION,
     CockpitError,
     IdempotencyStore,
@@ -28,7 +29,7 @@ from jarvis.orchestration.cockpit import (
     aggregate_checkpoints,
     aggregate_requests,
     aggregate_sessions,
-    archived_session_refs_for_runs,
+    archived_session_refs_for_store,
     artifact_summaries,
     cockpit_catalog,
     cockpit_snapshot,
@@ -40,6 +41,7 @@ from jarvis.orchestration.cockpit import (
     project_session_event,
     public_error_message,
     public_event_data,
+    _session_from_link,
     run_detail_projection,
     run_report_artifact,
     run_summary,
@@ -243,30 +245,44 @@ class CockpitReadHandlers:
 
     async def sessions(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
+        mode = _sync_mode(request)
+        include_worker_state = mode in {"fast", "probe"}
         all_runs = await asyncio.to_thread(self.ctx.store.list_runs)
         runs_list = [run for run in all_runs if not run.archived_at]
+        workers = await asyncio.to_thread(
+            worker_profiles,
+            worker_cfg=self.ctx.cfg.worker,
+            workers_path=self.ctx.cfg.orchestration.workers_path,
+            probe=mode == "probe",
+            http_get=self.ctx.get,
+        )
         session_rows = await asyncio.to_thread(
             aggregate_sessions,
             runs=runs_list,
             worker_cfg=self.ctx.cfg.worker,
             workers_path=self.ctx.cfg.orchestration.workers_path,
             http_get=self.ctx.get,
+            worker_by_id={worker["worker_id"]: worker for worker in workers},
+            include_worker_state=include_worker_state,
             archived_run_ids={run.run_id for run in all_runs if run.archived_at},
-            archived_session_refs=archived_session_refs_for_runs(all_runs),
+            archived_session_refs=archived_session_refs_for_store(self.ctx.store, all_runs),
         )
-        requests = await asyncio.to_thread(
-            aggregate_requests,
-            worker_cfg=self.ctx.cfg.worker,
-            workers_path=self.ctx.cfg.orchestration.workers_path,
-            http_get=self.ctx.get,
-        )
-        checkpoints = await asyncio.to_thread(
-            aggregate_checkpoints,
-            runs=runs_list,
-            worker_cfg=self.ctx.cfg.worker,
-            workers_path=self.ctx.cfg.orchestration.workers_path,
-            http_get=self.ctx.get,
-        )
+        requests = []
+        checkpoints = []
+        if include_worker_state:
+            requests = await asyncio.to_thread(
+                aggregate_requests,
+                worker_cfg=self.ctx.cfg.worker,
+                workers_path=self.ctx.cfg.orchestration.workers_path,
+                http_get=self.ctx.get,
+            )
+            checkpoints = await asyncio.to_thread(
+                aggregate_checkpoints,
+                runs=runs_list,
+                worker_cfg=self.ctx.cfg.worker,
+                workers_path=self.ctx.cfg.orchestration.workers_path,
+                http_get=self.ctx.get,
+            )
         return web.json_response({"sessions": [session_summary(row, requests=requests, checkpoints=checkpoints) for row in session_rows.values()]})
 
     async def session_detail(self, request: web.Request) -> web.Response:
@@ -302,7 +318,12 @@ class CockpitReadHandlers:
     async def session_requests(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.cfg, self.ctx.store, request.match_info["session_ref"], get=self.ctx.get)
-        return web.json_response({"requests": await asyncio.to_thread(_worker_session_requests, self.ctx.cfg, ref, get=self.ctx.get)})
+        run_id = await asyncio.to_thread(_session_run_id, self.ctx.cfg, ref, get=self.ctx.get)
+        requests = [
+            _request_with_run(request_item, run_id)
+            for request_item in await asyncio.to_thread(_worker_session_requests, self.ctx.cfg, ref, get=self.ctx.get)
+        ]
+        return web.json_response({"requests": requests})
 
     async def session_checkpoints(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
@@ -512,6 +533,8 @@ def _command_from_body(body: dict[str, Any], *, start: bool) -> tuple[WorkComman
     if body.get("engine_strategy"):
         strategy = str(body["engine_strategy"])
         command.engine_strategy = "ensemble" if strategy == "parallel" else strategy
+    elif command.engine_strategy == "parallel":
+        command.engine_strategy = "ensemble"
     command.start = start
     manual_item = None
     if command.source == "manual" or isinstance(body.get("work_item"), dict):
@@ -700,11 +723,12 @@ def _archive_run(store: OrchestrationStore, run_id: str):
 
 
 def _archive_session(store: OrchestrationStore, ref: SessionRef):
+    archived = store.archive_worker_session(ref.worker_id, ref.session_id)
     for run in store.list_runs():
         for session in run.sessions:
             if session.worker_id == ref.worker_id and session.session_id == ref.session_id:
                 return store.archive_session(run.run_id, ref.session_id)
-    raise CockpitError("not_found", "session not found", status=404)
+    return archived
 
 
 def _archive_run_packet(run) -> dict[str, Any]:  # noqa: ANN001
@@ -721,9 +745,21 @@ def _archive_run_packet(run) -> dict[str, Any]:  # noqa: ANN001
 
 
 def _archive_session_packet(run, ref: SessionRef) -> dict[str, Any]:  # noqa: ANN001
-    session = next((item for item in run.sessions if item.worker_id == ref.worker_id and item.session_id == ref.session_id), None)
-    session_row = session_summary(_session_row_from_link(run, session)) if session is not None else {}
-    run_row = run_summary(run)
+    if hasattr(run, "sessions"):
+        session = next((item for item in run.sessions if item.worker_id == ref.worker_id and item.session_id == ref.session_id), None)
+        session_row = session_summary(_session_from_link(session, run)) if session is not None else {}
+        run_row = run_summary(run)
+    else:
+        session_row = session_summary(
+            {
+                "session_ref": make_session_ref(ref.worker_id, ref.session_id),
+                "worker_id": ref.worker_id,
+                "session_id": ref.session_id,
+                "status": "archived",
+                "archived_at": str(run.get("archived_at") or utc_now()) if isinstance(run, dict) else utc_now(),
+            }
+        )
+        run_row = {}
     return {
         "ok": True,
         "cursor": snapshot_cursor({"run": run_row, "session": session_row, "archived": True}),
@@ -732,26 +768,6 @@ def _archive_session_packet(run, ref: SessionRef) -> dict[str, Any]:  # noqa: AN
         "events": [],
         "requests": [],
         "artifacts": [],
-    }
-
-
-def _session_row_from_link(run, session) -> dict[str, Any]:  # noqa: ANN001
-    return {
-        "session_ref": make_session_ref(session.worker_id, session.session_id),
-        "worker_id": session.worker_id,
-        "session_id": session.session_id,
-        "run_id": run.run_id,
-        "title": run.objective,
-        "provider": session.provider,
-        "engine": session.engine,
-        "status": session.status,
-        "repo": next((link.item.repo for link in run.work_items if link.item.repo), ""),
-        "branch": session.branch,
-        "cwd": session.cwd,
-        "latest_event_cursor": session.last_event_id,
-        "created_at": run.created_at,
-        "updated_at": run.updated_at,
-        "archived_at": session.archived_at,
     }
 
 
@@ -765,6 +781,11 @@ def _cockpit_snapshot(ctx: CockpitAppContext, mode: str) -> dict[str, Any]:
     )
 
 
+def _sync_mode(request: web.Request) -> str:
+    mode = str(request.query.get("sync") or "none")
+    return mode if mode in {"none", "fast", "probe"} else "none"
+
+
 def _resolve_session_ref(cfg: Config, store: OrchestrationStore, session_ref: str, *, get: HttpGet) -> SessionRef:
     if not valid_session_ref(session_ref):
         raise CockpitError("not_found", "session not found", status=404)
@@ -772,6 +793,11 @@ def _resolve_session_ref(cfg: Config, store: OrchestrationStore, session_ref: st
         for link in run.sessions:
             if make_session_ref(link.worker_id, link.session_id) == session_ref:
                 return SessionRef(worker_id=link.worker_id, session_id=link.session_id)
+    for item in store.archived_worker_sessions().values():
+        worker_id = str(item.get("worker_id") or "")
+        session_id = str(item.get("session_id") or "")
+        if worker_id and session_id and make_session_ref(worker_id, session_id) == session_ref:
+            return SessionRef(worker_id=worker_id, session_id=session_id)
     registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path)
     for profile in registry.profiles(probe=False):
         if not profile.base_url:
@@ -1016,7 +1042,7 @@ def _require_capability(cfg: Config, action: str) -> None:
 
 def _limit(request: web.Request) -> int:
     try:
-        return max(1, min(int(request.query.get("limit") or 100), 500))
+        return max(1, min(int(request.query.get("limit") or 100), MAX_PAGE_LIMIT))
     except ValueError:
         return 100
 
