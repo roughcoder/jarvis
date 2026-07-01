@@ -83,6 +83,7 @@ class CockpitAppContext:
     store: OrchestrationStore
     idempotency: IdempotencyStore
     idempotency_locks: dict[str, asyncio.Lock]
+    idempotency_lock_refs: dict[str, int]
     source_factory: Callable[[str, Any], WorkSource]
 
     def require_auth(self, request: web.Request) -> None:
@@ -109,6 +110,7 @@ def make_app(
         store=OrchestrationStore(cfg.orchestration.workspace),
         idempotency=IdempotencyStore(cfg.orchestration.workspace),
         idempotency_locks={},
+        idempotency_lock_refs={},
         source_factory=source_factory or _work_source,
     )
     app = web.Application(middlewares=[_error_middleware])
@@ -594,8 +596,18 @@ async def _idempotency_scope(ctx: CockpitAppContext, scope: str, key: str):  # n
         return
     lock_key = f"{scope}\0{key}"
     lock = ctx.idempotency_locks.setdefault(lock_key, asyncio.Lock())
-    async with lock:
-        yield
+    ctx.idempotency_lock_refs[lock_key] = ctx.idempotency_lock_refs.get(lock_key, 0) + 1
+    try:
+        async with lock:
+            yield
+    finally:
+        remaining = ctx.idempotency_lock_refs.get(lock_key, 1) - 1
+        if remaining <= 0:
+            ctx.idempotency_lock_refs.pop(lock_key, None)
+            if ctx.idempotency_locks.get(lock_key) is lock:
+                ctx.idempotency_locks.pop(lock_key, None)
+        else:
+            ctx.idempotency_lock_refs[lock_key] = remaining
 
 
 def _session_write_packet(cfg: Config, store: OrchestrationStore, ref, raw: dict[str, Any], *, get: HttpGet) -> dict[str, Any]:  # noqa: ANN001
@@ -944,6 +956,8 @@ def _worker_post_json(cfg: Config, worker_id: str, path: str, body: dict[str, An
     except Exception:
         data = {}
     if status >= 400 or (isinstance(data, dict) and data.get("ok") is False):
+        if status >= 500:
+            raise CockpitError("worker_unavailable", _response_error(response) or "worker write failed", recoverable=True, status=502)
         message = public_error_message(str(data.get("error") or data.get("message") or "")) if isinstance(data, dict) else ""
         message = message or _response_error(response) or "worker write failed"
         code = _worker_error_code(message)

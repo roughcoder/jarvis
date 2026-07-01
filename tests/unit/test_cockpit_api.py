@@ -16,7 +16,7 @@ import httpx  # noqa: E402
 from aiohttp import web  # noqa: E402
 
 from jarvis.config import Config  # noqa: E402
-from jarvis.orchestration.api import make_app, serve  # noqa: E402
+from jarvis.orchestration.api import CockpitAppContext, IdempotencyStore, _idempotency_scope, make_app, serve  # noqa: E402
 from jarvis.orchestration.cockpit import make_session_ref  # noqa: E402
 from jarvis.orchestration.models import Artifact, ExecutionEnvelope, WorkItem, WorkerProfile, WorkerSessionLink  # noqa: E402
 from jarvis.orchestration.service import StartedWork  # noqa: E402
@@ -241,6 +241,11 @@ def _fake_get(run_id: str):  # noqa: ANN202
                                         "request_kind": "file-change",
                                         "cwd": "/Users/example/private/jarvis",
                                         "token_env": "OPENAI_API_KEY",
+                                        "access_token": "oauth_access_secret",
+                                        "refresh-token": "oauth_refresh_secret",
+                                        "client_secret": "oauth_client_secret",
+                                        "Authorization": "Bearer oauth_authorization_secret",
+                                        "credential": "oauth_credential_secret",
                                     },
                                 },
                             },
@@ -288,7 +293,13 @@ def _fake_get(run_id: str):  # noqa: ANN202
                             "restored": False,
                             "cwd": "/Users/example/private/jarvis",
                             "metadata": {"provider_pid": 1234},
-                            "payload": {"command": "pytest /Users/example/private/jarvis", "token_env": "OPENAI_API_KEY"},
+                            "payload": {
+                                "command": "pytest /Users/example/private/jarvis",
+                                "token_env": "OPENAI_API_KEY",
+                                "api-key": "provider_api_key_secret",
+                                "clientSecret": "provider_client_secret",
+                                "refresh_token": "provider_refresh_secret",
+                            },
                         }
                     ]
                 }
@@ -574,12 +585,20 @@ def test_cockpit_session_detail_events_requests_and_checkpoints(tmp_path, monkey
         assert "localhost" not in json.dumps(requests)
         assert "token=secret" not in json.dumps(requests)
         assert "OPENAI_API_KEY" not in json.dumps(requests)
+        assert "oauth_access_secret" not in json.dumps(requests)
+        assert "oauth_refresh_secret" not in json.dumps(requests)
+        assert "oauth_client_secret" not in json.dumps(requests)
+        assert "oauth_authorization_secret" not in json.dumps(requests)
+        assert "oauth_credential_secret" not in json.dumps(requests)
         assert "cwd" not in json.dumps(requests)
         assert checkpoints["checkpoints"][0]["session_ref"] == ref
         assert checkpoints["checkpoints"][0]["checkpoint_id"] == "ckpt_1"
         assert "<local-path>" in json.dumps(checkpoints)
         assert "provider_pid" not in json.dumps(checkpoints)
         assert "OPENAI_API_KEY" not in json.dumps(checkpoints)
+        assert "provider_api_key_secret" not in json.dumps(checkpoints)
+        assert "provider_client_secret" not in json.dumps(checkpoints)
+        assert "provider_refresh_secret" not in json.dumps(checkpoints)
 
     import asyncio
 
@@ -1312,7 +1331,7 @@ def test_cockpit_session_write_maps_non_json_worker_errors(tmp_path, monkeypatch
         body = response.json()
 
         assert response.status_code == 502
-        assert body["error"]["code"] == "provider_unavailable"
+        assert body["error"]["code"] == "worker_unavailable"
         assert "/workspace/" not in body["error"]["message"]
         assert "sk-abcdefghijklmnopqrstuvwxyz" not in body["error"]["message"]
         assert "<local-path>" in body["error"]["message"]
@@ -1476,6 +1495,32 @@ def test_cockpit_work_start_idempotency_serializes_concurrent_dispatch(tmp_path,
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run.run_id)))
+
+
+def test_cockpit_idempotency_scope_cleans_up_lock(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: Response({}),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+
+    async def run_scope() -> None:
+        async with _idempotency_scope(ctx, "work.start", "same-key"):
+            assert len(ctx.idempotency_locks) == 1
+            assert len(ctx.idempotency_lock_refs) == 1
+
+    import asyncio
+
+    asyncio.run(run_scope())
+
+    assert ctx.idempotency_locks == {}
+    assert ctx.idempotency_lock_refs == {}
 
 
 def test_cockpit_work_resume_maps_active_session_error(tmp_path, monkeypatch) -> None:  # noqa: ANN001
