@@ -726,6 +726,11 @@ class OrchestrationConfig(_Base):
     default_repo: str = ""
     default_timezone: str = "Europe/London"
     landing_mode: str = "draft_pr"
+    api_host: str = "localhost"
+    api_port: int = 8790
+    api_bind_host: str = ""
+    api_token: SecretStr = SecretStr("")
+    api_allow_insecure: bool = False
 
 
 class LinearConfig(_Base):
@@ -920,6 +925,9 @@ class Config:
             "orchestration.schedules_path": self.orchestration.schedules_path,
             "orchestration.default_repo": self.orchestration.default_repo or "<unset>",
             "orchestration.landing_mode": self.orchestration.landing_mode,
+            "orchestration.api_host": self.orchestration.api_host,
+            "orchestration.api_port": self.orchestration.api_port,
+            "orchestration.api_token": mask(self.orchestration.api_token),
             "linear.api_key": mask(self.linear.api_key),
         }
 

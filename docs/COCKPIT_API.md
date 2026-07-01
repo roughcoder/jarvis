@@ -38,14 +38,15 @@ Example:
 
 ```json
 {
-  "session_ref": "sessref_macbook-worker_sess_123",
+  "session_ref": "sessref_bWFjYm9vay13b3JrZXIAc2Vzc18xMjM",
   "worker_id": "macbook-worker",
   "session_id": "sess_123"
 }
 ```
 
 T3 routes by `session_ref`. Jarvis owns the lookup back to `worker_id` and
-`session_id`.
+`session_id`. The current implementation uses a `sessref_` prefix plus a
+base64url payload, but clients must treat the whole string as opaque.
 
 ## Endpoints
 
@@ -67,26 +68,26 @@ GET /v1/cockpit/events?after=<cursor>
 
 ```text
 GET /v1/workers
-GET /v1/workers/:worker_id
+GET /v1/workers/{worker_id}
 ```
 
 ### Runs
 
 ```text
 GET /v1/runs
-GET /v1/runs/:run_id
-GET /v1/runs/:run_id/events?after=<cursor>&limit=100
-GET /v1/runs/:run_id/artifacts?after=<cursor>&limit=100
+GET /v1/runs/{run_id}
+GET /v1/runs/{run_id}/events?after=<cursor>&limit=100
+GET /v1/runs/{run_id}/artifacts?after=<cursor>&limit=100
 ```
 
 ### Sessions
 
 ```text
 GET /v1/sessions
-GET /v1/sessions/:session_ref
-GET /v1/sessions/:session_ref/events?after=<cursor>&limit=100
-GET /v1/sessions/:session_ref/requests
-GET /v1/sessions/:session_ref/checkpoints
+GET /v1/sessions/{session_ref}
+GET /v1/sessions/{session_ref}/events?after=<cursor>&limit=100
+GET /v1/sessions/{session_ref}/requests
+GET /v1/sessions/{session_ref}/checkpoints
 ```
 
 ### Work
@@ -99,12 +100,12 @@ POST /v1/work/resume
 ### Session Controls
 
 ```text
-POST /v1/sessions/:session_ref/turns
-POST /v1/sessions/:session_ref/input
-POST /v1/sessions/:session_ref/approval
-POST /v1/sessions/:session_ref/interrupt
-POST /v1/sessions/:session_ref/stop
-POST /v1/sessions/:session_ref/checkpoints/restore
+POST /v1/sessions/{session_ref}/turns
+POST /v1/sessions/{session_ref}/input
+POST /v1/sessions/{session_ref}/approval
+POST /v1/sessions/{session_ref}/interrupt
+POST /v1/sessions/{session_ref}/stop
+POST /v1/sessions/{session_ref}/checkpoints/restore
 ```
 
 ## Sync Modes
@@ -281,7 +282,7 @@ Session summaries appear in snapshots and session lists.
 
 ```json
 {
-  "session_ref": "sessref_macbook-worker_sess_123",
+  "session_ref": "sessref_bWFjYm9vay13b3JrZXIAc2Vzc18xMjM",
   "worker_id": "macbook-worker",
   "session_id": "sess_123",
   "run_id": "run_123",
@@ -313,7 +314,7 @@ Approval request:
 ```json
 {
   "request_id": "req_123",
-  "session_ref": "sessref_macbook-worker_sess_123",
+  "session_ref": "sessref_bWFjYm9vay13b3JrZXIAc2Vzc18xMjM",
   "run_id": "run_123",
   "kind": "approval",
   "status": "pending",
@@ -332,7 +333,7 @@ Input request:
 ```json
 {
   "request_id": "req_456",
-  "session_ref": "sessref_macbook-worker_sess_123",
+  "session_ref": "sessref_bWFjYm9vay13b3JrZXIAc2Vzc18xMjM",
   "run_id": "run_123",
   "kind": "input",
   "status": "pending",
@@ -360,7 +361,7 @@ Session events are canonical, ordered, and renderable by T3.
 {
   "event_id": "ev_123",
   "sequence": 42,
-  "session_ref": "sessref_macbook-worker_sess_123",
+  "session_ref": "sessref_bWFjYm9vay13b3JrZXIAc2Vzc18xMjM",
   "run_id": "run_123",
   "type": "assistant.delta",
   "occurred_at": "2026-07-01T12:00:00Z",
@@ -405,7 +406,7 @@ verification, logs, files, URLs, status comments, and provider evidence.
 {
   "artifact_id": "artifact_123",
   "run_id": "run_123",
-  "session_ref": "sessref_macbook-worker_sess_123",
+  "session_ref": "sessref_bWFjYm9vay13b3JrZXIAc2Vzc18xMjM",
   "kind": "pull_request",
   "provider": "github",
   "external_id": "47",
@@ -443,7 +444,7 @@ Verification artifacts use first-class fields:
 {
   "artifact_id": "artifact_456",
   "run_id": "run_123",
-  "session_ref": "sessref_macbook-worker_sess_123",
+  "session_ref": "sessref_bWFjYm9vay13b3JrZXIAc2Vzc18xMjM",
   "kind": "verification",
   "status": "passed",
   "command": "pnpm test",
@@ -460,9 +461,9 @@ Verification artifacts use first-class fields:
 Large detail endpoints return paginated lists:
 
 ```text
-GET /v1/runs/:run_id/events?after=<cursor>&limit=100
-GET /v1/runs/:run_id/artifacts?after=<cursor>&limit=100
-GET /v1/sessions/:session_ref/events?after=<cursor>&limit=100
+GET /v1/runs/{run_id}/events?after=<cursor>&limit=100
+GET /v1/runs/{run_id}/artifacts?after=<cursor>&limit=100
+GET /v1/sessions/{session_ref}/events?after=<cursor>&limit=100
 ```
 
 Response:
@@ -495,7 +496,7 @@ and validates authority.
 `POST /v1/work/resume` is a high-level resume intent. Jarvis chooses the best
 resumable session for the selected run.
 
-`POST /v1/sessions/:session_ref/turns` appends a prompt to one exact session. T3
+`POST /v1/sessions/{session_ref}/turns` appends a prompt to one exact session. T3
 uses this for the thread composer once the operator is already inside a session.
 
 Successful writes return a reconciliation packet:
@@ -512,6 +513,10 @@ Successful writes return a reconciliation packet:
 }
 ```
 
+If a write is replayed with the same `idempotency_key` and the same request
+body, Jarvis may return the stored reconciliation packet with an additional
+`"idempotent": true` field.
+
 Rejected writes return structured errors:
 
 ```json
@@ -525,7 +530,7 @@ Rejected writes return structured errors:
 }
 ```
 
-Standard error codes:
+## Standard Error Codes
 
 ```text
 unauthorized
@@ -561,7 +566,7 @@ Each SSE event has both an SSE `id:` and a JSON `cursor`:
 ```text
 id: evt_124
 event: session.event
-data: {"cursor":"evt_124","occurred_at":"2026-07-01T12:00:01Z","type":"session.event","run_id":"run_1","session_ref":"sessref_macbook-worker_sess_1","payload":{}}
+data: {"cursor":"evt_124","occurred_at":"2026-07-01T12:00:01Z","type":"session.event","run_id":"run_1","session_ref":"sessref_bWFjYm9vay13b3JrZXIAc2Vzc18x","payload":{}}
 ```
 
 Event envelope:
@@ -572,7 +577,7 @@ Event envelope:
   "occurred_at": "2026-07-01T12:00:01Z",
   "type": "session.event",
   "run_id": "run_1",
-  "session_ref": "sessref_macbook-worker_sess_1",
+  "session_ref": "sessref_bWFjYm9vay13b3JrZXIAc2Vzc18x",
   "payload": {}
 }
 ```
@@ -624,6 +629,20 @@ view.
 
 Future API changes should be appended here with date, schema version, compatible
 or breaking status, and migration notes.
+
+### 2026-07-01 - v1 Implementation Start
+
+- Added the first Jarvis cockpit API server behind `jarvis api`.
+- Added env-driven listener settings: `ORCHESTRATION_API_HOST`,
+  `ORCHESTRATION_API_PORT`, `ORCHESTRATION_API_BIND_HOST`,
+  `ORCHESTRATION_API_TOKEN`, and `ORCHESTRATION_API_ALLOW_INSECURE`.
+- Added a `cockpit` optional dependency extra for the API server's HTTP/SSE
+  runtime.
+- Clarified that `session_ref` values are `sessref_` prefixed, URL-safe, and
+  opaque. The implementation currently uses a base64url payload, but clients
+  must not decode it.
+- Clarified idempotency replay behavior: successful repeated writes with the same
+  key/body may include `"idempotent": true`.
 
 ### 2026-07-01 - v1 Draft
 

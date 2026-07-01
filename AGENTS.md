@@ -107,6 +107,7 @@ Secrets to put in `.env` (gitignored): `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
 | `jarvis brain` | run the brain WebSocket server (Phase 3 W4) |
 | `jarvis run [--no-bargein] [--local] [--brain H:P]` | hands-free loop: thin intercom → brain (`--local` = one process) |
 | `jarvis worker [--doctor]` | run the deep-work daemon (codex/claude jobs, shell, screenshot, GUI); `--doctor` checks peekaboo |
+| `jarvis api` | run the Jarvis Cockpit API (`/v1`) for T3-style operator UIs |
 | `jarvis whatsapp` | run the WhatsApp connector (bridge wacli ↔ brain, 3b) |
 | `jarvis text [--once MSG]` | text console: drive the brain from the terminal (no mic/STT/TTS); the headless dev + test harness |
 | `jarvis status` | is the brain reachable + what is this device allowed to do? (§3) |
