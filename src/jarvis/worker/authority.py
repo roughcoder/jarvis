@@ -13,6 +13,8 @@ from jarvis.capabilities import (
 )
 from jarvis.worker.sessions import WorkerSession
 
+REAL_SESSION_PROVIDERS = {"codex", "claude"}
+
 
 @dataclass(frozen=True)
 class WorkerSessionAuthority:
@@ -28,11 +30,18 @@ class WorkerSessionAuthority:
         require_turn: bool = False,
     ) -> WorkerSessionAuthority:
         envelope = metadata.get("execution_envelope")
-        envelope_data = envelope if isinstance(envelope, dict) else {}
-        allowed = _string_list(envelope_data.get("allowed_actions") or metadata.get("allowed_actions"))
+        if provider in REAL_SESSION_PROVIDERS and not isinstance(envelope, dict):
+            raise RuntimeError(f"worker session execution_envelope is required for {provider} provider")
+        envelope_data = envelope if isinstance(envelope, dict) else None
+        if envelope_data is not None:
+            allowed = _string_list(envelope_data.get("allowed_actions"))
+            landing_source = envelope_data.get("landing")
+        else:
+            allowed = _string_list(metadata.get("allowed_actions"))
+            landing_source = metadata.get("landing")
         if require_turn and WORKER_SESSION_TURN not in allowed:
             raise RuntimeError(f"worker session missing required authority: {WORKER_SESSION_TURN}")
-        landing = envelope_data.get("landing") or metadata.get("landing") or {}
+        landing = landing_source or {}
         authority = cls(allowed_actions=allowed, landing=dict(landing) if isinstance(landing, dict) else {})
         authority.validate(provider)
         return authority

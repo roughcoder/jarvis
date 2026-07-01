@@ -15,10 +15,12 @@ from jarvis.worker_session_contract import (
     EVENT_SESSION_CREATED,
     EVENT_SESSION_INTERRUPTED,
     EVENT_TURN_STARTED,
+    FAILED_SESSION_STATUSES,
     IDEMPOTENT_SESSION_EVENT_TYPES,
     SESSION_CREATED,
     SESSION_INTERRUPTED,
     SESSION_RUNNING,
+    SUCCESS_SESSION_STATUSES,
     TURN_RESUMABLE_SESSION_STATUSES,
     TURN_STARTABLE_SESSION_STATUSES,
     request_type as contract_request_type,
@@ -283,6 +285,8 @@ class SessionManager:
         sessions = [self.get(session_id)] if session_id else self.list()
         pending: dict[tuple[str, str, str], dict[str, Any]] = {}
         for session in [x for x in sessions if x is not None]:
+            if session.status in FAILED_SESSION_STATUSES or session.status in SUCCESS_SESSION_STATUSES:
+                continue
             for event in self.events(session.session_id):
                 request_type = contract_request_type(event.type)
                 if request_type:
