@@ -99,6 +99,7 @@ class WorkerSessionLink:
     branch: str = ""
     cwd: str = ""
     last_event_id: str = ""
+    archived_at: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> WorkerSessionLink:
@@ -211,6 +212,7 @@ class OrchestrationRun:
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     terminal_reason: str = ""
+    archived_at: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> OrchestrationRun:
@@ -228,6 +230,7 @@ class OrchestrationRun:
             created_at=data.get("created_at", utc_now()),
             updated_at=data.get("updated_at", utc_now()),
             terminal_reason=data.get("terminal_reason", ""),
+            archived_at=data.get("archived_at", ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -245,6 +248,7 @@ class OrchestrationRun:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "terminal_reason": self.terminal_reason,
+            "archived_at": self.archived_at,
         }
 
 

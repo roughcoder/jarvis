@@ -173,6 +173,31 @@ class OrchestrationStore:
         self.append_event(run_id, "phase_changed", message or f"Phase changed to {phase}", {"phase": phase})
         return run
 
+    def archive_run(self, run_id: str) -> OrchestrationRun:
+        with self._locked():
+            run = self.get(run_id)
+            if run is None:
+                raise KeyError(run_id)
+            if not run.archived_at:
+                run.archived_at = utc_now()
+                self.save(run)
+                self.append_event(run_id, "run_archived", "Run archived from cockpit views")
+            return run
+
+    def archive_session(self, run_id: str, session_id: str) -> OrchestrationRun:
+        with self._locked():
+            run = self.get(run_id)
+            if run is None:
+                raise KeyError(run_id)
+            session = next((x for x in run.sessions if x.session_id == session_id), None)
+            if session is None:
+                raise KeyError(session_id)
+            if not session.archived_at:
+                session.archived_at = utc_now()
+                self.save(run)
+                self.append_event(run_id, "session_archived", f"Worker session {session_id} archived from cockpit views", {"session_id": session_id})
+            return run
+
     def link_work_item(self, run_id: str, item: WorkItem, role: str = "related") -> OrchestrationRun:
         run = self.get(run_id)
         if run is None:
