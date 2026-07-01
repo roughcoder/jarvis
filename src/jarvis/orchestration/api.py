@@ -407,12 +407,14 @@ def _sse_envelope(cursor: str, event_type: str, payload: dict[str, Any]) -> dict
 
 
 def _work_source(name: str, cfg: Config | None = None) -> WorkSource:
+    if name == "github":
+        return GitHubWorkSource()
     if name == "linear":
         api_key = cfg.linear.api_key.get_secret_value() if cfg is not None else None
         return LinearWorkSource(api_key)
     if name == "manual":
         return _ManualWorkSource(None)
-    return GitHubWorkSource()
+    raise CockpitError("validation_failed", f"unsupported work source: {name}", recoverable=True, status=400)
 
 
 class _ManualWorkSource:
@@ -648,7 +650,11 @@ def _worker_get_json(
     get: HttpGet,
 ) -> dict[str, Any]:
     profile = _worker_profile(cfg, worker_id)
-    response = get(f"{profile.base_url}{path}", headers=worker_headers(cfg.worker, profile), params=params or {}, timeout=cfg.worker.request_timeout_s)
+    try:
+        response = get(f"{profile.base_url}{path}", headers=worker_headers(cfg.worker, profile), params=params or {}, timeout=cfg.worker.request_timeout_s)
+    except Exception as exc:  # noqa: BLE001 - exact session reads should return the public cockpit error contract
+        message = public_error_message(str(exc) or "worker request failed")
+        raise CockpitError("worker_unavailable", message, recoverable=True, status=502) from exc
     status = getattr(response, "status_code", 200)
     if status == 404:
         raise CockpitError("not_found", "worker resource not found", status=404)
@@ -664,18 +670,25 @@ def _worker_get_json(
 
 def _worker_post_json(cfg: Config, worker_id: str, path: str, body: dict[str, Any], *, post: HttpPost) -> dict[str, Any]:
     profile = _worker_profile(cfg, worker_id)
-    response = post(f"{profile.base_url}{path}", headers=worker_headers(cfg.worker, profile), json=body, timeout=cfg.worker.request_timeout_s)
+    try:
+        response = post(f"{profile.base_url}{path}", headers=worker_headers(cfg.worker, profile), json=body, timeout=cfg.worker.request_timeout_s)
+    except Exception as exc:  # noqa: BLE001
+        message = public_error_message(str(exc) or "worker write failed")
+        raise CockpitError("worker_unavailable", message, recoverable=True, status=502) from exc
     status = getattr(response, "status_code", 200)
     data = response.json() if hasattr(response, "json") else {}
     if status >= 400 or (isinstance(data, dict) and data.get("ok") is False):
         message = public_error_message(str(data.get("error") or "worker write failed")) if isinstance(data, dict) else "worker write failed"
+        code = _worker_error_code(message)
+        if status == 404 and code == "checkpoint_not_found":
+            raise CockpitError(code, message, recoverable=True, status=409)
         if status == 401:
             raise CockpitError("unauthorized", message, status=401)
         if status == 403:
             raise CockpitError("forbidden", message, status=403)
         if status == 404:
             raise CockpitError("not_found", message, status=404)
-        raise CockpitError(_worker_error_code(message), message, recoverable=status in {400, 409}, status=409 if status == 409 else status)
+        raise CockpitError(code, message, recoverable=status in {400, 409}, status=409 if status == 409 else status)
     return data if isinstance(data, dict) else {}
 
 

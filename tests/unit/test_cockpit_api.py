@@ -593,6 +593,30 @@ def test_cockpit_worker_error_messages_are_redacted(tmp_path, monkeypatch) -> No
     asyncio.run(_with_server(cfg, calls, http_get=get))
 
 
+def test_cockpit_worker_connection_errors_are_public_worker_unavailable(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _store, _run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions/sess_123"):
+            raise httpx.ConnectError("connection refused at /Users/example/private/socket")
+        return Response({})
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/sessions/{ref}")
+        body = response.json()
+
+        assert response.status_code == 502
+        assert body["error"]["code"] == "worker_unavailable"
+        assert body["error"]["recoverable"] is True
+        assert "/Users/" not in body["error"]["message"]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
 def test_cockpit_api_refuses_unsafe_bind_with_nonzero_status(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch)
     cfg.orchestration.api_host = "0.0.0.0"
@@ -735,7 +759,7 @@ def test_cockpit_session_write_maps_worker_errors(tmp_path, monkeypatch) -> None
     ref = make_session_ref("macbook-worker", "sess_123")
 
     def post(_url: str, **_kwargs) -> Response:  # noqa: ANN001
-        return Response({"ok": False, "error": "no such checkpoint: ckpt_missing"}, status_code=409)
+        return Response({"ok": False, "error": "no such checkpoint: ckpt_missing"}, status_code=404)
 
     async def calls(base: str, client: httpx.AsyncClient) -> None:
         response = await client.post(
@@ -752,6 +776,32 @@ def test_cockpit_session_write_maps_worker_errors(tmp_path, monkeypatch) -> None
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id), http_post=post))
+
+
+def test_cockpit_work_start_rejects_unknown_sources_without_github_fallback(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="worker.job.start,worker.session.create,worker.session.turn,forge.github.branch.push")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(
+            f"{base}/v1/work/start",
+            json={
+                "idempotency_key": "voice_1",
+                "source": "voice",
+                "repo": "roughcoder/jarvis",
+                "phrase": "next work",
+            },
+        )
+        body = response.json()
+
+        assert response.status_code == 400
+        assert body["ok"] is False
+        assert body["error"]["code"] == "validation_failed"
+        assert body["error"]["recoverable"] is True
+        assert "voice" in body["error"]["message"]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get("")))
 
 
 def test_cockpit_work_start_manual_dispatches_worker_session(tmp_path, monkeypatch) -> None:  # noqa: ANN001
