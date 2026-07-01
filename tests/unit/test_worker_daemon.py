@@ -42,6 +42,7 @@ from jarvis.worker.providers.codex import (  # noqa: E402
     _track_pending_request,
     _terminate_provider_process as codex_terminate_provider_process,
 )
+from jarvis.worker.providers.claude import _claude_session_id, _run_claude_turn  # noqa: E402
 from jarvis.worker.providers.base import ProviderTurn  # noqa: E402
 from jarvis.worker.sessions import WorkerSession  # noqa: E402
 from jarvis.worker.sessions import SessionManager  # noqa: E402
@@ -165,6 +166,30 @@ def test_worker_session_authority_keeps_input_separate_from_codex_approval() -> 
     assert authority.can_resolve_approval is False
 
 
+def test_worker_session_authority_requires_envelope_for_real_providers() -> None:
+    metadata = {
+        "allowed_actions": [WORKER_SESSION_CREATE, WORKER_SESSION_TURN, FORGE_BRANCH_PUSH],
+        "landing": {"mode": "branch_only", "allow_merge": False},
+    }
+
+    with pytest.raises(RuntimeError, match="execution_envelope is required"):
+        WorkerSessionAuthority.from_metadata(metadata, provider="codex")
+
+
+def test_worker_session_authority_does_not_override_envelope_denial() -> None:
+    metadata = {
+        "execution_envelope": {
+            "allowed_actions": [],
+            "landing": {"mode": "branch_only", "allow_merge": False},
+        },
+        "allowed_actions": [WORKER_SESSION_CREATE, WORKER_SESSION_TURN, FORGE_BRANCH_PUSH],
+        "landing": {"mode": "branch_only", "allow_merge": False},
+    }
+
+    with pytest.raises(RuntimeError, match=FORGE_BRANCH_PUSH):
+        WorkerSessionAuthority.from_metadata(metadata, provider="codex")
+
+
 def test_codex_protocol_response_shapes_match_app_server_contract() -> None:
     assert _approval_result({"decision": "approved"}) == {"decision": "accept"}
     assert _approval_result({"decision": "denied"}) == {"decision": "decline"}
@@ -239,6 +264,46 @@ def test_codex_turn_rechecks_cancellation_before_launch(tmp_path, monkeypatch) -
         ProviderTurn(turn_id="turn_cancelled", prompt="x"),
         sessions,
         WorkerConfig(_env_file=None, workspace=str(tmp_path / "worker")),
+        authority,
+    )
+
+    assert "provider.process.started" not in [event.type for event in sessions.events(session.session_id)]
+
+
+def test_claude_session_id_ignores_caller_metadata_session_id() -> None:
+    session = WorkerSession(
+        session_id="sess_untrusted",
+        provider="claude",
+        engine="claude",
+        metadata={"session_id": "caller-native-session"},
+    )
+
+    assert _claude_session_id(session) != "caller-native-session"
+
+
+def test_claude_turn_rechecks_cancellation_before_launch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    def fail_popen(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("cancelled sessions must not launch claude")
+
+    monkeypatch.setattr("jarvis.worker.providers.claude.subprocess.Popen", fail_popen)
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "claude",
+            "engine": "claude",
+            "cwd": _owned_worker_cwd(tmp_path, "claude-cancel-before-launch"),
+            "metadata": _authority_metadata("claude"),
+        }
+    )
+    sessions.update_status(session.session_id, SESSION_STOPPED)
+    authority = WorkerSessionAuthority.from_session(session, provider="claude")
+
+    _run_claude_turn(
+        session.session_id,
+        ProviderTurn(turn_id="turn_cancelled", prompt="x"),
+        sessions,
+        WorkerConfig(_env_file=None, workspace=str(tmp_path / "worker")),
+        "claude-native-session",
         authority,
     )
 
@@ -326,6 +391,19 @@ def test_session_manager_strips_provider_owned_metadata_on_create(tmp_path) -> N
     assert "codex_thread_id" not in session.metadata
     assert "provider_session_id" not in session.metadata
     assert "execution_envelope" in session.metadata
+
+
+def test_session_manager_hides_pending_requests_for_terminal_sessions(tmp_path) -> None:
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create({"provider": "fake", "engine": "fake", "metadata": _authority_metadata("fake")})
+    sessions.append_event(session.session_id, "approval.requested", {"request_id": "approval_1"})
+
+    assert sessions.pending_requests(session.session_id)[0]["request_id"] == "approval_1"
+
+    sessions.update_status(session.session_id, "stopped")
+
+    assert sessions.pending_requests(session.session_id) == []
+    assert sessions.pending_requests() == []
 
 
 def test_session_manager_rejects_duplicate_session_id_without_overwriting(tmp_path) -> None:
@@ -973,6 +1051,69 @@ def test_daemon_session_creation_provisions_repo_worktree(tmp_path) -> None:
     assert cwd != repo
     assert created["session"]["branch"].startswith("jarvis/")
     assert created["session"]["metadata"]["source_repo"] == str(repo)
+
+
+def test_daemon_duplicate_session_id_rejects_before_worktree_provisioning(tmp_path) -> None:
+    dev = tmp_path / "dev"
+    repo = dev / "jarvis"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    (repo / "README.md").write_text("hello\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="tkn",
+        workspace=str(tmp_path / "worker"),
+        repo_root=str(dev),
+        clone_missing=False,
+    )
+    headers = {"Authorization": "Bearer tkn"}
+    metadata = {**_authority_metadata("fake"), "provision_workspace": True}
+
+    async def calls(base, c):  # noqa: ANN001
+        first = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "session_id": "sess_duplicate_repo",
+                    "run_id": "run_repo",
+                    "provider": "fake",
+                    "engine": "fake",
+                    "repo": "roughcoder/jarvis",
+                    "title": "Fix worker sessions",
+                    "metadata": metadata,
+                },
+                headers=headers,
+            )
+        ).json()
+        duplicate = await c.post(
+            base + "/sessions",
+            json={
+                "session_id": "sess_duplicate_repo",
+                "run_id": "run_repo",
+                "provider": "fake",
+                "engine": "fake",
+                "repo": "roughcoder/jarvis",
+                "title": "Fix worker sessions duplicate",
+                "metadata": metadata,
+            },
+            headers=headers,
+        )
+        return first, duplicate.status_code, duplicate.json()
+
+    first, status_code, duplicate = asyncio.run(_with_server(cfg, 8846, calls))
+
+    assert first["ok"] is True
+    assert status_code == 400
+    assert "already exists" in duplicate["error"]
+    worktrees = [path for path in (tmp_path / "worker" / "worktrees").iterdir() if path.is_dir()]
+    assert len(worktrees) == 1
 
 
 def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path) -> None:
@@ -1803,7 +1944,7 @@ def test_daemon_real_provider_requires_execution_envelope_authority(tmp_path) ->
 
     assert status_code == 400
     assert body["ok"] is False
-    assert "worker.session.create" in body["error"]
+    assert "execution_envelope is required" in body["error"]
     assert listed["sessions"] == []
 
 

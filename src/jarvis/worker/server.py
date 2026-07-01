@@ -395,6 +395,9 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         try:
             body = await request.json()
             WorkerSessionAuthority.for_session_create(body or {})
+            session_id = str((body or {}).get("session_id") or "").strip()
+            if session_id and sessions.session_path(session_id).exists():
+                raise ValueError(f"worker session already exists: {session_id}")
             body = await _prepare_session_body(body or {}, cfg, workspace)
             session, event = sessions.create(body or {})
         except (RuntimeError, ValueError) as exc:

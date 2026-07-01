@@ -253,6 +253,8 @@ def _final_phase(run: OrchestrationRun) -> str:
 def _final_session_phase(run: OrchestrationRun) -> str:
     if not run.sessions or run.status == "terminal":
         return ""
+    if any(job.status not in TERMINAL_JOB_STATUSES for job in run.jobs):
+        return ""
     statuses = {session.status for session in run.sessions}
     if statuses & ACTIVE_SESSION_STATUSES:
         return ""

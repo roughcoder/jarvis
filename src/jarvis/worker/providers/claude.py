@@ -125,7 +125,11 @@ def _run_claude_turn(
         session = sessions.get(session_id)
         if session is None:
             return
+        if _session_cancelled(sessions, session_id):
+            return
         cwd = _session_cwd(session, worker_cfg)
+        if _session_cancelled(sessions, session_id):
+            return
         resume = bool(str(session.metadata.get("claude_session_started") or "").strip())
         argv = [
             worker_cfg.claude_bin,
@@ -226,6 +230,8 @@ def _read_until_turn_done(
         if message is None:
             if process.poll() is not None:
                 if process.returncode == 0:
+                    if _session_cancelled(sessions, session_id):
+                        return
                     sessions.update_status(session_id, SESSION_COMPLETED)
                     sessions.append_event(
                         session_id,
@@ -311,6 +317,8 @@ def _project_claude_message(
                 sessions.append_event(session_id, EVENT_TOOL_RESULT, {**common, "item": item})
     elif message_type == "result":
         is_error = subtype not in {"success", "done", "completed"}
+        if _session_cancelled(sessions, session_id):
+            return True
         event_type = EVENT_TURN_FAILED if is_error else EVENT_TURN_COMPLETED
         sessions.update_status(session_id, SESSION_FAILED if is_error else SESSION_COMPLETED)
         sessions.append_event(session_id, event_type, {**common, "provider_status": subtype or message_type, "raw": message})
@@ -406,7 +414,6 @@ def _claude_session_id(session: WorkerSession) -> str:
     value = str(
         session.metadata.get("claude_session_id")
         or session.metadata.get("provider_session_id")
-        or session.metadata.get("session_id")
         or ""
     ).strip()
     if value:

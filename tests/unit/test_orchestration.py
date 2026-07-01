@@ -1804,6 +1804,49 @@ def test_sync_run_sessions_marks_blocked_run_failed(tmp_path) -> None:
     assert store.get(run.run_id).phase == "failed"  # type: ignore[union-attr]
 
 
+def test_sync_run_sessions_waits_for_active_legacy_jobs(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Start live session")
+    store.link_job(run.run_id, WorkerJobLink(worker_id="local-worker", job_id="job-running", status="running"))
+    store.link_session(
+        run.run_id,
+        WorkerSessionLink(
+            worker_id="local-worker",
+            session_id="sess_123",
+            status="running",
+            provider="fake",
+            engine="fake",
+        ),
+    )
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, body: dict) -> None:
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    def fake_get(url, **_kwargs):  # noqa: ANN001
+        if url.endswith("/events"):
+            return Response({"events": [{"event_id": "event_2", "type": "turn.completed"}]})
+        return Response({"session_id": "sess_123", "status": "completed", "provider": "fake", "engine": "fake"})
+
+    summary = sync_run_sessions(
+        store,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1),
+        get=fake_get,
+    )
+
+    reloaded = store.get(run.run_id)
+    assert summary.runs_completed == 0
+    assert reloaded is not None
+    assert reloaded.status == "active"
+    assert reloaded.phase == "running"
+    assert reloaded.sessions[0].status == "completed"
+
+
 def test_sync_run_jobs_marks_completed_run(tmp_path) -> None:
     store = OrchestrationStore(str(tmp_path))
     run = store.create_run("Start work")
@@ -2112,6 +2155,125 @@ def test_orchestration_service_resume_run_dispatches_existing_session(tmp_path, 
     assert reloaded.phase == "running"
     assert [session.session_id for session in reloaded.sessions] == ["550e8400-e29b-41d4-a716-446655440000"]
     assert reloaded.sessions[0].status == "running"
+
+
+def test_orchestration_service_resume_skips_failed_sessions_for_last_success(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    cfg = load_config()
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    run = store.create_run("Fix worker", work_items=[_item(id="#62")])
+    store.link_session(
+        run.run_id,
+        WorkerSessionLink(
+            worker_id="local-worker",
+            session_id="sess_success",
+            status="completed",
+            provider="codex",
+            engine="codex",
+            branch="jarvis/62-success",
+            cwd="/worker/worktrees/62",
+        ),
+    )
+    store.link_session(
+        run.run_id,
+        WorkerSessionLink(
+            worker_id="local-worker",
+            session_id="sess_failed",
+            status="failed",
+            provider="codex",
+            engine="codex",
+            branch="jarvis/62-failed",
+            cwd="/worker/worktrees/62-failed",
+        ),
+    )
+    store.set_phase(run.run_id, "failed", "last attempt failed")
+    seen = {}
+
+    def fake_start(envelope, *, worker_cfg, worker=None, store=None, post=None):  # noqa: ANN001, ANN202
+        seen["envelope"] = envelope
+        return WorkerSessionLink(
+            worker_id=envelope.worker_id,
+            session_id=envelope.session_id,
+            status="running",
+            provider=envelope.engine,
+            engine=envelope.engine,
+            branch=envelope.branch_name,
+            cwd=envelope.cwd,
+        )
+
+    monkeypatch.setattr("jarvis.orchestration.service.sync_run_sessions", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        "jarvis.orchestration.workers.WorkerRegistry._probe",
+        lambda _self, profile: WorkerProfile(
+            worker_id=profile.worker_id,
+            display_name=profile.display_name,
+            capabilities=profile.capabilities,
+            base_url=profile.base_url,
+            status="online",
+            agent="codex",
+            supported_engines=["codex"],
+        ),
+    )
+    monkeypatch.setattr("jarvis.orchestration.executor.start_worker_session", fake_start)
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"orchestration.runs.read", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: None,
+    )
+
+    service.resume_run(run.run_id)
+
+    assert seen["envelope"].session_id == "sess_success"
+    assert seen["envelope"].branch_name == "jarvis/62-success"
+
+
+def test_orchestration_service_resume_reports_no_successful_sessions(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.service import ResumeRunError
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    cfg = load_config()
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    run = store.create_run("Fix worker", work_items=[_item(id="#63")])
+    store.link_session(
+        run.run_id,
+        WorkerSessionLink(
+            worker_id="local-worker",
+            session_id="sess_failed",
+            status="failed",
+            provider="codex",
+            engine="codex",
+            branch="jarvis/63",
+            cwd="/worker/worktrees/63",
+        ),
+    )
+    store.set_phase(run.run_id, "failed", "failed")
+    monkeypatch.setattr("jarvis.orchestration.service.sync_run_sessions", lambda *_a, **_kw: None)
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"orchestration.runs.read", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: None,
+    )
+
+    with pytest.raises(ResumeRunError, match="no resumable worker session"):
+        service.resume_run(run.run_id)
 
 
 def test_orchestration_service_resume_preserves_original_landing_policy(tmp_path, monkeypatch) -> None:  # noqa: ANN001

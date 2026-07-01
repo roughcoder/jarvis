@@ -13,7 +13,7 @@ from jarvis.orchestration.sources import WorkSource
 from jarvis.orchestration.store import ActiveWorkerSessionError, ActiveWorkItemError, OrchestrationStore
 from jarvis.orchestration.supervisor import sync_run_sessions
 from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry
-from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, SESSION_RUNNING
+from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, SESSION_RUNNING, TURN_RESUMABLE_SESSION_STATUSES
 
 
 class SourceFactory(Protocol):
@@ -350,7 +350,7 @@ def _resolve_run(store: OrchestrationStore, run_ref: str):
 
 def _resume_session(sessions: list[WorkerSessionLink]) -> WorkerSessionLink | None:
     for session in reversed(sessions):
-        if session.session_id and not _session_is_active(session.status):
+        if session.session_id and session.status in TURN_RESUMABLE_SESSION_STATUSES:
             return session
     return None
 
