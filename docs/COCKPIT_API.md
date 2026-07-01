@@ -132,6 +132,18 @@ Snapshot responses include visible freshness state:
 }
 ```
 
+Stable sync statuses:
+
+```text
+fresh
+partial
+stale
+failed
+```
+
+`sync=none` returns `stale` because Jarvis did not probe current worker state.
+Recoverable worker sync errors return `partial` with details in `errors`.
+
 ## Catalog
 
 `GET /v1/cockpit/catalog` returns stable UI option data for forms and selectors.
@@ -244,6 +256,15 @@ Worker profiles are public-safe rows for selectors and status displays.
   ],
   "public_metadata": {}
 }
+```
+
+Stable worker health values:
+
+```text
+healthy
+degraded
+unhealthy
+unknown
 ```
 
 Do not include private worker base URLs, token env names, local absolute paths,
@@ -655,6 +676,9 @@ or breaking status, and migration notes.
   projections, blocking worker/store calls are kept off the aiohttp event loop,
   session event sequence numbers remain stable across pagination, unsafe API
   bind refusal exits non-zero, and SSE events include `occurred_at`.
+- Normalized public enum vocabularies before merge: sync status now uses
+  `fresh|partial|stale|failed`, and worker health uses
+  `healthy|degraded|unhealthy|unknown`.
 
 ### 2026-07-01 - v1 Draft
 

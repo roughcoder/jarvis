@@ -90,6 +90,13 @@ def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, caps: str = "", tok
     return Config()
 
 
+def _set_worker_status(cfg: Config, status: str) -> None:
+    workers_path = Path(cfg.orchestration.workers_path)
+    data = json.loads(workers_path.read_text())
+    data["workers"][0]["status"] = status
+    workers_path.write_text(json.dumps(data))
+
+
 def _seed_run(cfg: Config) -> tuple[OrchestrationStore, str]:
     store = OrchestrationStore(cfg.orchestration.workspace)
     item = WorkItem(
@@ -229,11 +236,13 @@ def test_cockpit_catalog_snapshot_and_worker_projection(tmp_path, monkeypatch) -
 
     async def calls(base: str, client: httpx.AsyncClient) -> None:
         catalog = (await client.get(f"{base}/v1/cockpit/catalog")).json()
+        stale_snapshot = (await client.get(f"{base}/v1/cockpit/snapshot")).json()
         snapshot = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "probe"})).json()
         workers = (await client.get(f"{base}/v1/workers", params={"sync": "probe"})).json()
 
         assert catalog["api_version"] == "v1"
         assert "manual" in catalog["work_sources"]
+        assert stale_snapshot["sync"]["status"] == "stale"
         assert snapshot["schema_version"] == 1
         assert snapshot["sync"]["status"] == "fresh"
         assert snapshot["runs"][0]["run_id"] == run_id
@@ -247,6 +256,41 @@ def test_cockpit_catalog_snapshot_and_worker_projection(tmp_path, monkeypatch) -
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
+def test_cockpit_snapshot_uses_stable_partial_sync_status(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _store, run_id = _seed_run(cfg)
+
+    def degraded_get(url: str, **kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions/sess_123"):
+            return Response({"error": "temporarily unavailable"}, status_code=503)
+        return _fake_get(run_id)(url, **kwargs)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        snapshot = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+
+        assert snapshot["sync"]["status"] == "partial"
+        assert snapshot["sync"]["errors"]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=degraded_get))
+
+
+def test_cockpit_worker_health_uses_stable_unhealthy_status(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _set_worker_status(cfg, "offline")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        workers = (await client.get(f"{base}/v1/workers")).json()
+
+        assert workers["workers"][0]["status"] == "offline"
+        assert workers["workers"][0]["health"] == "unhealthy"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
 
 
 def test_cockpit_session_detail_events_requests_and_checkpoints(tmp_path, monkeypatch) -> None:  # noqa: ANN001
