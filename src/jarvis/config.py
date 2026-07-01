@@ -731,7 +731,7 @@ class OrchestrationConfig(_Base):
     api_bind_host: str = ""
     api_token: SecretStr = SecretStr("")
     api_allow_insecure: bool = False
-    session_ref_secret: SecretStr = SecretStr("")
+    api_cors_origins: str = ""
 
 
 class LinearConfig(_Base):
@@ -929,7 +929,6 @@ class Config:
             "orchestration.api_host": self.orchestration.api_host,
             "orchestration.api_port": self.orchestration.api_port,
             "orchestration.api_token": mask(self.orchestration.api_token),
-            "orchestration.session_ref_secret": mask(self.orchestration.session_ref_secret),
             "linear.api_key": mask(self.linear.api_key),
         }
 
