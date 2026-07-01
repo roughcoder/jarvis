@@ -453,6 +453,19 @@ def _cmd_worker(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_api(_args: argparse.Namespace) -> int:
+    """Run the Jarvis cockpit API for T3-style operator UIs."""
+    cfg = load_config()
+    from jarvis.orchestration.api import serve
+
+    try:
+        asyncio.run(serve(cfg))
+    except KeyboardInterrupt:
+        print("\n(stopped)")
+        os._exit(0)
+    return 0
+
+
 def _cmd_jobs(args: argparse.Namespace) -> int:
     """List the worker daemon's recent jobs (deep-work jobs + their results)."""
     import datetime
@@ -2287,6 +2300,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Report mac GUI control (peekaboo) readiness and exit",
     )
     p_worker.set_defaults(func=_cmd_worker)
+
+    p_api = sub.add_parser(
+        "api", help="Run the Jarvis cockpit API for T3-style operator UIs"
+    )
+    p_api.set_defaults(func=_cmd_api)
 
     p_whatsapp = sub.add_parser(
         "whatsapp", help="Run the WhatsApp connector (bridge wacli <-> brain, 3b)"

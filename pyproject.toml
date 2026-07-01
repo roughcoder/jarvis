@@ -45,6 +45,10 @@ memory = [
 worker = [
     "aiohttp>=3.9",
 ]
+# Cockpit API for T3-style operator UIs. Central orchestration-side HTTP/SSE.
+cockpit = [
+    "aiohttp>=3.9",
+]
 # MCP bridge (Phase 3 §6) — the native MCP client. Brain-side only; provides the
 # stdio + streamable-http transports. Pure-Python, fine on the supported Python range.
 mcp = [
