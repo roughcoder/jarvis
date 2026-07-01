@@ -250,6 +250,38 @@ def test_session_manager_strips_provider_owned_metadata_on_create(tmp_path) -> N
     assert "execution_envelope" in session.metadata
 
 
+def test_session_manager_rejects_duplicate_session_id_without_overwriting(tmp_path) -> None:
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    original, _ = sessions.create(
+        {
+            "session_id": "sess_duplicate",
+            "provider": "codex",
+            "engine": "codex",
+            "cwd": "/worker/worktrees/original",
+            "metadata": {"allowed_actions": ["worker.session.turn"]},
+        }
+    )
+
+    with pytest.raises(ValueError, match="already exists"):
+        sessions.create(
+            {
+                "session_id": original.session_id,
+                "provider": "claude",
+                "engine": "claude",
+                "cwd": "/worker/worktrees/replaced",
+                "metadata": {"allowed_actions": ["worker.session.stop"]},
+            }
+        )
+
+    fetched = sessions.get(original.session_id)
+    assert fetched is not None
+    assert fetched.provider == "codex"
+    assert fetched.engine == "codex"
+    assert fetched.cwd == "/worker/worktrees/original"
+    assert fetched.metadata == {"allowed_actions": ["worker.session.turn"]}
+    assert [event.type for event in sessions.events(original.session_id)] == ["session.created"]
+
+
 def test_session_manager_lists_past_corrupt_or_legacy_session_json(tmp_path) -> None:
     sessions = SessionManager(str(tmp_path / "sessions"))
     good, _ = sessions.create({"provider": "fake", "engine": "fake"})
@@ -312,6 +344,36 @@ def test_session_manager_rejects_overlapping_active_turns(tmp_path) -> None:
             session.session_id,
             {"turn_id": "turn_two", "prompt": "second", "idempotency_key": "idem_two"},
         )
+
+
+def test_session_manager_rejects_turns_for_terminal_sessions(tmp_path) -> None:
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    for status in ("stopped", "failed", "interrupted", "blocked"):
+        session, _ = sessions.create({"session_id": f"sess_{status}", "provider": "fake", "engine": "fake"})
+        sessions.update_status(session.session_id, status)
+
+        with pytest.raises(RuntimeError, match="does not accept new turns"):
+            sessions.reserve_turn(session.session_id, {"turn_id": f"turn_{status}"})
+
+        assert [event.type for event in sessions.events(session.session_id)] == ["session.created"]
+
+
+def test_session_manager_requires_resume_metadata_for_completed_session_turns(tmp_path) -> None:
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create({"provider": "fake", "engine": "fake"})
+    sessions.update_status(session.session_id, "completed")
+
+    with pytest.raises(RuntimeError, match="does not accept new turns"):
+        sessions.reserve_turn(session.session_id, {"turn_id": "turn_without_resume"})
+
+    resumed, event, created = sessions.reserve_turn(
+        session.session_id,
+        {"turn_id": "turn_resume", "metadata": {"resume_session": True}},
+    )
+
+    assert resumed.status == "running"
+    assert event.type == "turn.started"
+    assert created is True
 
 
 def test_session_manager_interrupts_stale_active_sessions_on_startup(tmp_path) -> None:
@@ -441,14 +503,22 @@ def test_daemon_session_api_records_structured_events(tmp_path) -> None:
         retry = (
             await c.post(
                 f"{base}/sessions/{session_id}/turns",
-                json={"prompt": "inspect the repo again", "idempotency_key": "idem_fake"},
+                json={
+                    "prompt": "inspect the repo again",
+                    "idempotency_key": "idem_fake",
+                    "metadata": {"resume_session": True},
+                },
                 headers=headers,
             )
         ).json()
         retry_again = (
             await c.post(
                 f"{base}/sessions/{session_id}/turns",
-                json={"prompt": "inspect the repo a third time", "idempotency_key": "idem_fake"},
+                json={
+                    "prompt": "inspect the repo a third time",
+                    "idempotency_key": "idem_fake",
+                    "metadata": {"resume_session": True},
+                },
                 headers=headers,
             )
         ).json()
@@ -799,6 +869,10 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
     headers = {"Authorization": "Bearer tkn"}
 
     async def calls(base, c):  # noqa: ANN001
+        metadata = _authority_metadata(
+            "fake",
+            extra_actions=[WORKER_SESSION_APPROVE, WORKER_SESSION_INPUT, WORKER_SESSION_RESTORE],
+        )
         created = (
             await c.post(
                 base + "/sessions",
@@ -806,10 +880,7 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
                     "provider": "fake",
                     "engine": "fake",
                     "title": "Pending request",
-                    "metadata": _authority_metadata(
-                        "fake",
-                        extra_actions=[WORKER_SESSION_APPROVE, WORKER_SESSION_INPUT, WORKER_SESSION_RESTORE],
-                    ),
+                    "metadata": metadata,
                 },
                 headers=headers,
             )
@@ -836,17 +907,31 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
             )
         ).json()
         pending_after = (await c.get(f"{base}/sessions/{session_id}/requests", headers=headers)).json()
+        approval_events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+        input_created = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "provider": "fake",
+                    "engine": "fake",
+                    "title": "Input request",
+                    "metadata": metadata,
+                },
+                headers=headers,
+            )
+        ).json()
+        input_session_id = input_created["session"]["session_id"]
         input_turn = (
             await c.post(
-                f"{base}/sessions/{session_id}/turns",
+                f"{base}/sessions/{input_session_id}/turns",
                 json={"turn_id": "turn_need_input", "prompt": "request input"},
                 headers=headers,
             )
         ).json()
-        input_pending = (await c.get(f"{base}/sessions/{session_id}/requests", headers=headers)).json()
+        input_pending = (await c.get(f"{base}/sessions/{input_session_id}/requests", headers=headers)).json()
         input_reply = (
             await c.post(
-                f"{base}/sessions/{session_id}/input",
+                f"{base}/sessions/{input_session_id}/input",
                 json={
                     "request_id": "input_turn_need_input",
                     "text": "continue",
@@ -855,18 +940,22 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
                 headers=headers,
             )
         ).json()
-        input_pending_after = (await c.get(f"{base}/sessions/{session_id}/requests", headers=headers)).json()
+        input_pending_after = (await c.get(f"{base}/sessions/{input_session_id}/requests", headers=headers)).json()
         checkpoint_turn = (
             await c.post(
-                f"{base}/sessions/{session_id}/turns",
-                json={"turn_id": "turn_checkpoint", "prompt": "complete normally"},
+                f"{base}/sessions/{input_session_id}/turns",
+                json={
+                    "turn_id": "turn_checkpoint",
+                    "prompt": "complete normally",
+                    "metadata": {"resume_session": True},
+                },
                 headers=headers,
             )
         ).json()
-        checkpoints = (await c.get(f"{base}/sessions/{session_id}/checkpoints", headers=headers)).json()
+        checkpoints = (await c.get(f"{base}/sessions/{input_session_id}/checkpoints", headers=headers)).json()
         restored = (
             await c.post(
-                f"{base}/sessions/{session_id}/checkpoints/restore",
+                f"{base}/sessions/{input_session_id}/checkpoints/restore",
                 json={
                     "checkpoint_id": "ckpt_turn_checkpoint",
                     "metadata": _control_metadata(WORKER_SESSION_RESTORE),
@@ -874,14 +963,15 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
                 headers=headers,
             )
         ).json()
-        checkpoints_after_restore = (await c.get(f"{base}/sessions/{session_id}/checkpoints", headers=headers)).json()
-        events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+        checkpoints_after_restore = (await c.get(f"{base}/sessions/{input_session_id}/checkpoints", headers=headers)).json()
+        events = (await c.get(f"{base}/sessions/{input_session_id}/events", headers=headers)).json()["events"]
         return (
             approval_turn,
             pending_before,
             global_pending,
             denied,
             pending_after,
+            approval_events,
             input_turn,
             input_pending,
             input_reply,
@@ -899,6 +989,7 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
         global_pending,
         denied,
         pending_after,
+        approval_events,
         input_turn,
         input_pending,
         input_reply,
@@ -916,6 +1007,7 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
     assert global_pending["requests"][0]["session_id"] == pending_before["requests"][0]["session_id"]
     assert denied["event"]["type"] == "approval.resolved"
     assert pending_after["requests"] == []
+    assert "turn.failed" in [event["type"] for event in approval_events]
     assert [event["type"] for event in input_turn["events"]] == ["turn.started", "input.requested"]
     assert input_pending["requests"][0]["request_id"] == "input_turn_need_input"
     assert input_reply["event"]["type"] == "input.received"
@@ -930,7 +1022,6 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
     assert checkpoints["checkpoints"][0]["checkpoint_id"] == "ckpt_turn_checkpoint"
     assert restored["event"]["type"] == "checkpoint.restored"
     assert checkpoints_after_restore["checkpoints"][0]["restored"] is True
-    assert "turn.failed" in [event["type"] for event in events]
 
 
 def test_daemon_checkpoint_restore_requires_envelope_authority(tmp_path) -> None:
@@ -1652,7 +1743,11 @@ emit({"type": "result", "subtype": "success", "session_id": session_id, "total_c
         second = (
             await c.post(
                 f"{base}/sessions/{session_id}/turns",
-                json={"prompt": "resume and reply again", "idempotency_key": "idem_claude_2"},
+                json={
+                    "prompt": "resume and reply again",
+                    "idempotency_key": "idem_claude_2",
+                    "metadata": {"resume_session": True},
+                },
                 headers=headers,
             )
         ).json()

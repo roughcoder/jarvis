@@ -19,6 +19,8 @@ from jarvis.worker_session_contract import (
     SESSION_CREATED,
     SESSION_INTERRUPTED,
     SESSION_RUNNING,
+    TURN_RESUMABLE_SESSION_STATUSES,
+    TURN_STARTABLE_SESSION_STATUSES,
     request_type as contract_request_type,
     resolved_request_type as contract_resolved_request_type,
 )
@@ -118,6 +120,8 @@ class SessionManager:
             session_id = str(data.get("session_id") or new_id("sess"))
             if not _valid_id(session_id):
                 raise ValueError(f"invalid session id {session_id!r}")
+            if self.session_path(session_id).exists():
+                raise ValueError(f"worker session already exists: {session_id}")
             session = WorkerSession(
                 session_id=session_id,
                 provider=provider,
@@ -214,8 +218,15 @@ class SessionManager:
             existing = self._idempotent_event(session.session_id, EVENT_TURN_STARTED, data)
             if existing is not None:
                 return session, existing, False
-            if session.status in (ACTIVE_SESSION_STATUSES - {SESSION_CREATED}):
+            if session.status in (ACTIVE_SESSION_STATUSES - TURN_STARTABLE_SESSION_STATUSES):
                 raise RuntimeError(f"worker session {session.session_id} already has an active turn")
+            resume = bool(dict(data.get("metadata") or {}).get("resume_session"))
+            if session.status not in TURN_STARTABLE_SESSION_STATUSES and not (
+                resume and session.status in TURN_RESUMABLE_SESSION_STATUSES
+            ):
+                raise RuntimeError(
+                    f"worker session {session.session_id} is {session.status} and does not accept new turns"
+                )
             event = SessionEvent.create(session.session_id, EVENT_TURN_STARTED, data)
             with self.events_path(session.session_id).open("a") as f:
                 f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")

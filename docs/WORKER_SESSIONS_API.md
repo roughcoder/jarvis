@@ -1,18 +1,19 @@
 # Worker Sessions API
 
 Jarvis worker sessions are the live-agent execution contract for operator UIs,
-voice, WhatsApp, and future provider adapters. They supersede one-shot coding
-jobs as the primary agentic execution model. The existing `/run` worker jobs API
-may remain as an internal transition/debug path, but new coding orchestration
-should target `/sessions`, which owns long-lived provider sessions and structured
-events.
+orchestration, WhatsApp, and future provider adapters. They supersede one-shot
+coding jobs as the primary agentic execution model. The existing `/run` worker
+jobs API remains as a legacy transition/debug path and still backs the current
+voice/tool coding shortcut; new `WorkCommand` / `ExecutionEnvelope`
+orchestration should target `/sessions`, which owns structured events and
+provider resume metadata.
 
 The implementation plan and continuation context for this pivot live in
 `docs/AGENTIC_WORKER_SESSION_PLAN.md`.
 
-No new agentic coding path may dispatch through `/run` or `WorkerJob`. Any
-remaining `/run` use must be non-agentic shell, scratch, or explicit debug
-plumbing outside `WorkCommand` / `ExecutionEnvelope` coding flows.
+No new orchestration coding path may dispatch through `/run` or `WorkerJob`.
+Any remaining `/run` coding use is transitional legacy client plumbing until
+that surface can supply a full worker-session envelope.
 
 Jarvis remains the orchestration source of truth. A UI such as a T3 fork should
 read Jarvis runs and worker sessions; it should not create its own separate
@@ -74,12 +75,16 @@ All endpoints use the worker daemon bearer token when `WORKER_TOKEN` is set.
 
 Create a worker session record. The first implementation records durable state
 and emits `session.created`; provider adapters attach behind this contract.
-Codex sessions use `codex app-server` JSON-RPC. Claude sessions currently use
-`claude -p --output-format stream-json` with durable `--session-id` / `--resume`
-metadata, with a Claude Agent SDK sidecar planned as the richer live runtime.
+Codex sessions use `codex app-server` JSON-RPC with durable provider thread
+metadata, but the worker currently starts one app-server process per turn.
+Claude sessions currently use `claude -p --output-format stream-json` with
+durable `--session-id` / `--resume` metadata, with a Claude Agent SDK sidecar
+planned as the richer live runtime.
 Real provider sessions must include an `ExecutionEnvelope` authority context in
 session metadata. Unknown provider ids are rejected when a turn is started rather
 than falling back to a default provider.
+Caller-supplied `session_id` values are accepted only when they do not already
+exist; duplicate ids are rejected rather than overwriting the existing session.
 Provider adapters consume this through the worker-side `WorkerSessionAuthority`
 boundary object; shared ids, slugging, and capability constants live in neutral
 `jarvis.*` modules so orchestration and worker packages remain boundary peers.
@@ -193,6 +198,10 @@ Start or enqueue a provider turn. Jarvis records `turn.started`, then the
 selected provider adapter appends canonical session events as the provider
 streams progress. Real providers fail closed if the session metadata does not
 grant `worker.session.turn` through the `ExecutionEnvelope` authority context.
+Initial turns are accepted only from `created` sessions. Completed sessions
+require resume metadata from the orchestration resume path. `stopped`,
+`interrupted`, `failed`, and `blocked` sessions are terminal and reject new
+turns.
 
 Request:
 
@@ -314,9 +323,12 @@ Initial event vocabulary:
 - `session.interrupted`
 - `session.stopped`
 
-Provider-specific payloads go under `data.provider_payload`. Common fields stay
-at the top of `data` so voice, WhatsApp, and web UIs can render them without
-knowing provider internals.
+Provider-specific payloads should move toward `data.provider_payload`. Some
+current provider adapters still expose raw provider details in top-level fields
+such as `raw` or `item`; consumers should treat those as provider-specific until
+the event payload normalization pass is complete. Common fields stay at the top
+of `data` so voice, WhatsApp, and web UIs can render them without knowing
+provider internals.
 
 ## UI Integration Notes
 
