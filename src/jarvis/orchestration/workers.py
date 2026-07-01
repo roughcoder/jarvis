@@ -13,6 +13,9 @@ from jarvis.engines import engine_ids, normalize_engine_id, worker_supports_engi
 from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, SESSION_RUNNING
 from jarvis.orchestration.models import WorkerProfile
 
+_PROFILE_CACHE_TTL_S = 2.0
+_PROFILE_CACHE: dict[str, tuple[int, float, list[dict[str, Any]]]] = {}
+
 
 class WorkerRegistry:
     def __init__(
@@ -86,10 +89,26 @@ class WorkerRegistry:
         if self.profiles_path is None or not self.profiles_path.exists():
             return []
         try:
-            raw = json.loads(self.profiles_path.read_text())
+            stat = self.profiles_path.stat()
+            cache_key = str(self.profiles_path)
+            cached = _PROFILE_CACHE.get(cache_key)
+            now = time_monotonic()
+            if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] > now:
+                items = cached[2]
+            else:
+                raw = json.loads(self.profiles_path.read_text())
+                if isinstance(raw, list):
+                    items = raw
+                elif isinstance(raw, dict):
+                    items = raw.get("workers", [])
+                else:
+                    items = []
+                if not isinstance(items, list):
+                    items = []
+                items = [dict(item) for item in items if isinstance(item, dict)]
+                _PROFILE_CACHE[cache_key] = (stat.st_mtime_ns, now + _PROFILE_CACHE_TTL_S, items)
         except (OSError, json.JSONDecodeError):
             return []
-        items = raw if isinstance(raw, list) else raw.get("workers", [])
         profiles: list[WorkerProfile] = []
         for item in items:
             try:
@@ -137,6 +156,10 @@ class WorkerRegistry:
                 data["supported_engines"],
                 default_engine=profile.default_engine or profile.agent,
             )
+        if isinstance(data.get("engine_supports"), dict):
+            profile.engine_supports = _engine_supports_from_mapping(data["engine_supports"])
+        elif isinstance(data.get("engines"), list):
+            profile.engine_supports = _engine_supports_from_rows(data["engines"])
         profile.__post_init__()
         return profile
 
@@ -156,4 +179,30 @@ def _required_engines(engines: list[str]) -> list[str]:
         engine = normalize_engine_id(value)
         if engine and engine not in result:
             result.append(engine)
+    return result
+
+
+def time_monotonic() -> float:
+    import time
+
+    return time.monotonic()
+
+
+def _engine_supports_from_mapping(raw: dict[str, Any]) -> dict[str, dict[str, bool]]:
+    result: dict[str, dict[str, bool]] = {}
+    for engine, supports in raw.items():
+        if isinstance(supports, dict):
+            result[str(engine)] = {str(key): bool(value) for key, value in supports.items()}
+    return result
+
+
+def _engine_supports_from_rows(rows: list[Any]) -> dict[str, dict[str, bool]]:
+    result: dict[str, dict[str, bool]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        engine = str(row.get("engine") or "")
+        supports = row.get("supports")
+        if engine and isinstance(supports, dict):
+            result[engine] = {str(key): bool(value) for key, value in supports.items()}
     return result

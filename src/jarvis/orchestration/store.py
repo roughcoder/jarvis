@@ -53,6 +53,7 @@ class OrchestrationStore:
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self._lock_path = self.root / ".lock"
         self._archived_sessions_path = self.root / "archived-sessions.json"
+        self._session_refs_path = self.root / "session-refs.json"
 
     def run_dir(self, run_id: str) -> pathlib.Path:
         if not _RUN_ID.fullmatch(run_id):
@@ -204,17 +205,30 @@ class OrchestrationStore:
                 )
             return run
 
+    def archive_cockpit_session(self, worker_id: str, session_id: str) -> OrchestrationRun | dict[str, str]:
+        """Archive a session consistently across run links and worker-only indexes."""
+
+        with self._locked():
+            archived = self._archive_worker_session_unlocked(worker_id, session_id)
+            for run in self.list_runs():
+                session = next((x for x in run.sessions if x.worker_id == worker_id and x.session_id == session_id), None)
+                if session is None:
+                    continue
+                if not session.archived_at:
+                    session.archived_at = archived["archived_at"]
+                    self.save(run)
+                    self.append_event(
+                        run.run_id,
+                        "session_archived",
+                        f"Worker session {worker_id}/{session_id} archived from cockpit views",
+                        {"worker_id": worker_id, "session_id": session_id},
+                    )
+                return run
+            return archived
+
     def archive_worker_session(self, worker_id: str, session_id: str) -> dict[str, str]:
         with self._locked():
-            archived = self.archived_worker_sessions()
-            key = f"{worker_id}\0{session_id}"
-            existing = archived.get(key)
-            if existing is not None:
-                return existing
-            item = {"worker_id": worker_id, "session_id": session_id, "archived_at": utc_now()}
-            archived[key] = item
-            self._archived_sessions_path.write_text(json.dumps(list(archived.values()), indent=2, sort_keys=True))
-            return item
+            return self._archive_worker_session_unlocked(worker_id, session_id)
 
     def archived_worker_sessions(self) -> dict[str, dict[str, str]]:
         if not self._archived_sessions_path.exists():
@@ -238,6 +252,57 @@ class OrchestrationStore:
                     "archived_at": str(raw.get("archived_at") or ""),
                 }
         return result
+
+    def record_session_refs(self, rows: list[dict[str, str]]) -> None:
+        clean_rows = []
+        for row in rows:
+            session_ref = str(row.get("session_ref") or "")
+            worker_id = str(row.get("worker_id") or "")
+            session_id = str(row.get("session_id") or "")
+            if session_ref and worker_id and session_id:
+                clean_rows.append(
+                    {
+                        "session_ref": session_ref,
+                        "worker_id": worker_id,
+                        "session_id": session_id,
+                        "updated_at": utc_now(),
+                    }
+                )
+        if not clean_rows:
+            return
+        with self._locked():
+            index = self.session_ref_index()
+            for row in clean_rows:
+                index[row["session_ref"]] = row
+            _atomic_write_json(self._session_refs_path, list(index.values()))
+
+    def session_ref_index(self) -> dict[str, dict[str, str]]:
+        if not self._session_refs_path.exists():
+            return {}
+        try:
+            data = json.loads(self._session_refs_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+        result: dict[str, dict[str, str]] = {}
+        if not isinstance(data, list):
+            return result
+        for raw in data:
+            if not isinstance(raw, dict):
+                continue
+            session_ref = str(raw.get("session_ref") or "")
+            worker_id = str(raw.get("worker_id") or "")
+            session_id = str(raw.get("session_id") or "")
+            if session_ref and worker_id and session_id:
+                result[session_ref] = {
+                    "session_ref": session_ref,
+                    "worker_id": worker_id,
+                    "session_id": session_id,
+                    "updated_at": str(raw.get("updated_at") or ""),
+                }
+        return result
+
+    def resolve_session_ref(self, session_ref: str) -> dict[str, str] | None:
+        return self.session_ref_index().get(session_ref)
 
     def link_work_item(self, run_id: str, item: WorkItem, role: str = "related") -> OrchestrationRun:
         run = self.get(run_id)
@@ -433,6 +498,17 @@ class OrchestrationStore:
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
+    def _archive_worker_session_unlocked(self, worker_id: str, session_id: str) -> dict[str, str]:
+        archived = self.archived_worker_sessions()
+        key = f"{worker_id}\0{session_id}"
+        existing = archived.get(key)
+        if existing is not None:
+            return existing
+        item = {"worker_id": worker_id, "session_id": session_id, "archived_at": utc_now()}
+        archived[key] = item
+        _atomic_write_json(self._archived_sessions_path, list(archived.values()))
+        return item
+
 
 def _same_work_item(left: WorkItem, right: WorkItem) -> bool:
     if left.source != right.source:
@@ -442,3 +518,10 @@ def _same_work_item(left: WorkItem, right: WorkItem) -> bool:
     left_id = left.source_internal_id or left.id
     right_id = right.source_internal_id or right.id
     return left_id == right_id
+
+
+def _atomic_write_json(path: pathlib.Path, data: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f"{path.suffix}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
+    tmp.replace(path)
