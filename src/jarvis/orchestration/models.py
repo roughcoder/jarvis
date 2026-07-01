@@ -100,6 +100,7 @@ class WorkerSessionLink:
     cwd: str = ""
     last_event_id: str = ""
     archived_at: str = ""
+    allowed_actions: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> WorkerSessionLink:

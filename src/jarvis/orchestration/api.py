@@ -18,7 +18,7 @@ from jarvis.capabilities import (
     WORKER_SESSION_TURN,
 )
 from jarvis.config import Config, insecure_bind
-from jarvis.ids import utc_now
+from jarvis.ids import new_id, utc_now
 from jarvis.orchestration.cockpit import (
     API_VERSION,
     MAX_PAGE_LIMIT,
@@ -41,6 +41,7 @@ from jarvis.orchestration.cockpit import (
     project_session_event,
     public_error_message,
     public_event_data,
+    _allowed_actions_from_worker_session,
     _session_from_link,
     run_detail_projection,
     run_report_artifact,
@@ -157,7 +158,7 @@ class CockpitReadHandlers:
 
     async def snapshot(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
-        mode = str(request.query.get("sync") or "none")
+        mode = _sync_mode(request)
         return web.json_response(await asyncio.to_thread(_cockpit_snapshot, self.ctx, mode))
 
     async def workers(self, request: web.Request) -> web.Response:
@@ -281,6 +282,7 @@ class CockpitReadHandlers:
             checkpoints = await asyncio.to_thread(
                 aggregate_checkpoints,
                 runs=runs_list,
+                sessions=session_rows,
                 worker_cfg=self.ctx.cfg.worker,
                 workers_path=self.ctx.cfg.orchestration.workers_path,
                 http_get=self.ctx.get,
@@ -291,7 +293,7 @@ class CockpitReadHandlers:
         self.ctx.require_auth(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.cfg, self.ctx.store, request.match_info["session_ref"], get=self.ctx.get)
         raw = await asyncio.to_thread(_worker_get_json, self.ctx.cfg, ref.worker_id, f"/sessions/{ref.session_id}", get=self.ctx.get)
-        row = _worker_session_row(raw, ref.worker_id)
+        row = _overlay_session_row(_fallback_session_row(self.ctx.store, ref, {"session": raw}), _worker_session_row(raw, ref.worker_id))
         requests = [
             _request_with_run(request_item, row.get("run_id", ""))
             for request_item in await asyncio.to_thread(_worker_session_requests, self.ctx.cfg, ref, get=self.ctx.get)
@@ -444,7 +446,7 @@ class SseHandlers:
         try:
             while True:
                 await asyncio.sleep(1)
-                next_body = await asyncio.to_thread(_cockpit_snapshot, self.ctx, "none")
+                next_body = await asyncio.to_thread(_cockpit_snapshot, self.ctx, mode)
                 next_cursor = next_body["cursor"]
                 if next_cursor != cursor:
                     cursor = next_cursor
@@ -543,7 +545,7 @@ def _command_from_body(body: dict[str, Any], *, start: bool) -> tuple[WorkComman
         raw = dict(body.get("work_item") or {})
         manual_item = WorkItem(
             source="manual",
-            id=str(raw.get("id") or body.get("idempotency_key") or "manual"),
+            id=str(raw.get("id") or body.get("idempotency_key") or new_id("manual")),
             title=str(raw.get("title") or body.get("title") or body.get("phrase") or "Manual cockpit work"),
             body=str(raw.get("body") or body.get("prompt") or ""),
             repo=str(raw.get("repo") or body.get("repo") or ""),
@@ -574,6 +576,7 @@ def _started_work_packet(store: OrchestrationStore, result: StartedWork) -> dict
             "latest_event_cursor": session.last_event_id,
             "created_at": run.created_at if run else "",
             "updated_at": run.updated_at if run else "",
+            "allowed_actions": list(session.allowed_actions),
         }
         sessions.append(session_summary(row))
     artifacts = artifact_summaries(runs)
@@ -616,7 +619,7 @@ def _session_write_packet(cfg: Config, store: OrchestrationStore, ref, raw: dict
     checkpoints: list[dict[str, Any]] = []
     with contextlib.suppress(CockpitError):
         session_raw = _worker_get_json(cfg, ref.worker_id, f"/sessions/{ref.session_id}", get=get)
-        row.update(_worker_session_row(session_raw, ref.worker_id))
+        row = _overlay_session_row(row, _worker_session_row(session_raw, ref.worker_id))
     with contextlib.suppress(CockpitError):
         requests = _worker_session_requests(cfg, ref, get=get)
     with contextlib.suppress(CockpitError):
@@ -661,8 +664,10 @@ def _fallback_session_row(store: OrchestrationStore, ref: SessionRef, raw: dict[
                     "created_at": run.created_at,
                     "updated_at": run.updated_at,
                     "archived_at": link.archived_at,
+                    "allowed_actions": list(link.allowed_actions),
                 }
     session_id = str(session_raw.get("session_id") or ref.session_id)
+    archived = store.archived_worker_sessions().get(f"{ref.worker_id}\0{session_id}", {})
     return {
         "session_ref": make_session_ref(ref.worker_id, session_id),
         "worker_id": ref.worker_id,
@@ -678,6 +683,8 @@ def _fallback_session_row(store: OrchestrationStore, ref: SessionRef, raw: dict[
         "latest_event_cursor": str(session_raw.get("last_event_id") or ""),
         "created_at": str(session_raw.get("created_at") or ""),
         "updated_at": str(session_raw.get("updated_at") or ""),
+        "archived_at": archived.get("archived_at") or "",
+        "allowed_actions": _allowed_actions_from_worker_session(session_raw),
     }
 
 
@@ -838,11 +845,13 @@ def _persist_session_write(store: OrchestrationStore, ref: SessionRef, row: dict
         store.update_session(
             run_id,
             ref.session_id,
+            worker_id=ref.worker_id,
             status=str(row.get("status") or ""),
             provider=str(row.get("provider") or ""),
             engine=str(row.get("engine") or ""),
             branch=str(row.get("branch") or ""),
             last_event_id=_latest_event_id(events),
+            allowed_actions=list(row.get("allowed_actions") or []),
         )
     except KeyError:
         return
@@ -934,7 +943,7 @@ def _worker_get_json(
     if status == 404:
         raise CockpitError("not_found", "worker resource not found", status=404)
     if status == 401:
-        raise CockpitError("unauthorized", "worker unauthorized", status=401)
+        raise CockpitError("worker_unavailable", "worker authentication failed", recoverable=True, status=502)
     if status >= 400:
         raise CockpitError("worker_unavailable", _response_error(response) or "worker request failed", recoverable=True, status=502)
     data = response.json()
@@ -963,8 +972,10 @@ def _worker_post_json(cfg: Config, worker_id: str, path: str, body: dict[str, An
         code = _worker_error_code(message)
         if status == 404 and code == "checkpoint_not_found":
             raise CockpitError(code, message, recoverable=True, status=409)
+        if code == "request_not_pending":
+            raise CockpitError(code, message, recoverable=True, status=409)
         if status == 401:
-            raise CockpitError("unauthorized", message, status=401)
+            raise CockpitError("worker_unavailable", message or "worker authentication failed", recoverable=True, status=502)
         if status == 403:
             raise CockpitError("forbidden", message, status=403)
         if status == 404:
@@ -990,7 +1001,16 @@ def _worker_session_row(raw: dict[str, Any], worker_id: str) -> dict[str, Any]:
         "latest_event_cursor": "",
         "created_at": str(raw.get("created_at") or ""),
         "updated_at": str(raw.get("updated_at") or ""),
+        "allowed_actions": _allowed_actions_from_worker_session(raw),
     }
+
+
+def _overlay_session_row(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    row = dict(base)
+    for key, value in overlay.items():
+        if key in {"session_ref", "worker_id", "session_id"} or value not in ("", [], {}):
+            row[key] = value
+    return row
 
 
 def _public_session_detail(raw: dict[str, Any]) -> dict[str, Any]:
@@ -1079,7 +1099,7 @@ def _worker_error_code(message: str) -> str:
         return "session_terminal"
     if "checkpoint" in text and "no such" in text:
         return "checkpoint_not_found"
-    if "not pending" in text:
+    if "not pending" in text or ("no pending" in text and "request" in text):
         return "request_not_pending"
     return "provider_unavailable"
 
