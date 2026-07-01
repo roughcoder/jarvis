@@ -539,11 +539,23 @@ def _session_control_metadata(action: str) -> dict:
     return {"surface": "cli", "allowed_actions": [action]}
 
 
+def _check_session_control_authority(action: str, cfg, capabilities: set[str]) -> bool:  # noqa: ANN001
+    return _has_orchestration_authority(
+        [action],
+        capabilities,
+        cfg=cfg,
+        public_write_mode=cfg.orchestration.landing_mode,
+    )
+
+
 def _cmd_sessions(args: argparse.Namespace) -> int:
     """Inspect and control live worker provider sessions."""
     import json
 
+    from jarvis.brain.capabilities import resolve_capabilities
+
     cfg = load_config()
+    capabilities = resolve_capabilities(cfg.capabilities) if cfg is not None else set()
     httpx, base, headers, timeout = _worker_http(cfg)
     try:
         if args.requests:
@@ -556,6 +568,8 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
                 timeout=timeout,
             )
         elif args.restore_checkpoint:
+            if not _check_session_control_authority("worker.session.restore", cfg, capabilities):
+                return 1
             response = httpx.post(
                 f"{base}/sessions/{args.restore_checkpoint}/checkpoints/restore",
                 headers=headers,
@@ -581,6 +595,8 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
             body = response.json()
             return _print_session_events(body.get("events", []), json_output=args.json)
         elif args.turn:
+            if not _check_session_control_authority("worker.session.turn", cfg, capabilities):
+                return 1
             response = httpx.post(
                 f"{base}/sessions/{args.turn}/turns",
                 headers=headers,
@@ -592,6 +608,8 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
                 timeout=timeout,
             )
         elif args.input:
+            if not _check_session_control_authority("worker.session.input", cfg, capabilities):
+                return 1
             response = httpx.post(
                 f"{base}/sessions/{args.input}/input",
                 headers=headers,
@@ -603,6 +621,8 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
                 timeout=timeout,
             )
         elif args.approval:
+            if not _check_session_control_authority("worker.session.approve", cfg, capabilities):
+                return 1
             response = httpx.post(
                 f"{base}/sessions/{args.approval}/approval",
                 headers=headers,
@@ -614,6 +634,8 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
                 timeout=timeout,
             )
         elif args.interrupt:
+            if not _check_session_control_authority("worker.session.interrupt", cfg, capabilities):
+                return 1
             response = httpx.post(
                 f"{base}/sessions/{args.interrupt}/interrupt",
                 headers=headers,
@@ -621,6 +643,8 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
                 timeout=timeout,
             )
         elif args.stop:
+            if not _check_session_control_authority("worker.session.stop", cfg, capabilities):
+                return 1
             response = httpx.post(
                 f"{base}/sessions/{args.stop}/stop",
                 headers=headers,

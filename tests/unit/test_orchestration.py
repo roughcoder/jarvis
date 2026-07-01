@@ -3134,6 +3134,26 @@ def test_campaign_can_start_bounded_child_sessions(tmp_path) -> None:
     assert any(event.type == "campaign_child_session_started" for event in store.events(parent.run_id))
 
 
+def test_campaign_counts_only_started_child_sessions_for_concurrency(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+
+    def start_child(_child, item):  # noqa: ANN001, ANN202
+        if item.id == "#1":
+            return None
+        return WorkerSessionLink(worker_id="local-worker", session_id=f"sess_{item.id.strip('#')}", status="running")
+
+    parent = create_campaign(
+        store,
+        objective="Clear bugs",
+        candidates=[_item(id="#1"), _item(id="#2"), _item(id="#3")],
+        policy=CampaignPolicy(max_items=3, max_concurrent_runs=1),
+        start_child=start_child,
+    )
+
+    assert len(parent.child_run_ids) == 2
+    assert [event.type for event in store.events(parent.run_id)].count("campaign_child_session_started") == 1
+
+
 def test_public_run_report_redacts_private_details(tmp_path) -> None:
     store = OrchestrationStore(str(tmp_path))
     run = store.create_run(
@@ -3646,7 +3666,7 @@ def test_cli_sessions_checkpoints_preserves_worker_response(monkeypatch, capsys)
     assert "ckpt_1" in capsys.readouterr().out
 
 
-def test_cli_sessions_restore_checkpoint_preserves_worker_response(monkeypatch, capsys) -> None:  # noqa: ANN001
+def test_cli_sessions_restore_checkpoint_preserves_worker_response(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
     from jarvis import cli
 
     calls = []
@@ -3668,7 +3688,15 @@ def test_cli_sessions_restore_checkpoint_preserves_worker_response(monkeypatch, 
             calls.append((url, kwargs.get("json")))
             return Response()
 
-    monkeypatch.setattr(cli, "load_config", lambda: None)
+    cfg = SimpleNamespace(
+        capabilities=SimpleNamespace(
+            profiles_dir=str(tmp_path / "profiles"),
+            device_id="local-mac",
+            default_capabilities="worker.session.restore",
+        ),
+        orchestration=SimpleNamespace(landing_mode="branch_only", workers_path=str(tmp_path / "workers.json")),
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
     monkeypatch.setattr(cli, "_worker_http", lambda _cfg: (Http, "http://worker", {}, 1))
 
     result = cli._cmd_sessions(
@@ -3706,6 +3734,54 @@ def test_cli_sessions_restore_checkpoint_preserves_worker_response(monkeypatch, 
         )
     ]
     assert "checkpoint.restored" in capsys.readouterr().out
+
+
+def test_cli_sessions_stop_requires_matching_capability(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    from jarvis import cli
+
+    class Http:
+        @staticmethod
+        def post(*_args, **_kwargs):  # noqa: ANN001
+            raise AssertionError("post should not be called without stop authority")
+
+    cfg = SimpleNamespace(
+        capabilities=SimpleNamespace(
+            profiles_dir=str(tmp_path / "profiles"),
+            device_id="local-mac",
+            default_capabilities="worker.session.turn",
+        ),
+        orchestration=SimpleNamespace(landing_mode="branch_only", workers_path=str(tmp_path / "workers.json")),
+    )
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    monkeypatch.setattr(cli, "_worker_http", lambda _cfg: (Http, "http://worker", {}, 1))
+
+    result = cli._cmd_sessions(
+        SimpleNamespace(
+            requests="",
+            checkpoints="",
+            restore_checkpoint="",
+            events="",
+            after="",
+            limit=0,
+            json=False,
+            turn="",
+            input="",
+            approval="",
+            interrupt="",
+            stop="sess_1",
+            session_id="",
+            prompt="",
+            idempotency_key="",
+            request_id="",
+            text="",
+            decision="",
+            checkpoint_id="",
+        )
+    )
+
+    out = capsys.readouterr().out
+    assert result == 1
+    assert "Missing orchestration capability: worker.session.stop" in out
 
 
 def test_cli_work_start_requires_landing_capabilities(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001

@@ -212,6 +212,9 @@ def _run_codex_turn(
             bufsize=1,
         )
         _track_provider_process(session_id, process)
+        if _session_cancelled(sessions, session_id):
+            _terminate_provider_process(session)
+            return
         line_queue = _start_line_readers(process)
         sessions.update_metadata(
             session_id,
@@ -448,7 +451,11 @@ def _read_until_turn_done(
     timeout_s: float,
 ) -> None:
     deadline = time.time() + timeout_s
-    while time.time() < deadline:
+    while True:
+        if _has_pending_requests(session_id):
+            deadline = time.time() + timeout_s
+        elif time.time() >= deadline:
+            break
         message = _read_message(
             process,
             line_queue=line_queue,
