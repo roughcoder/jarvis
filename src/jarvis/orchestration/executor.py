@@ -308,7 +308,7 @@ def _stop_started_sessions(
         else:
             if store is not None:
                 try:
-                    store.update_session(envelope.run_id, link.session_id, status=SESSION_STOPPED)
+                    store.update_session(envelope.run_id, link.session_id, worker_id=link.worker_id, status=SESSION_STOPPED)
                 except Exception:  # noqa: BLE001 - best-effort rollback marker
                     pass
 
@@ -351,7 +351,7 @@ def _stop_created_session_after_turn_rejection(
         return
     if store is not None:
         try:
-            store.update_session(envelope.run_id, session_id, status=SESSION_STOPPED)
+            store.update_session(envelope.run_id, session_id, worker_id=envelope.worker_id, status=SESSION_STOPPED)
         except Exception:  # noqa: BLE001 - cleanup already succeeded at worker boundary
             pass
 

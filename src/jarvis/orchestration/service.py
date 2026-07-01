@@ -245,7 +245,7 @@ class OrchestrationService:
             session = executor.start_worker_session(envelope, worker_cfg=self.cfg.worker, worker=worker, store=store)
         except Exception as exc:  # noqa: BLE001 - dispatch failure must leave an inspectable run
             previous_updates = {key: value for key, value in previous_state.items() if key not in {"worker_id", "session_id"}}
-            store.update_session(run.run_id, previous.session_id, **previous_updates)
+            store.update_session(run.run_id, previous.session_id, worker_id=previous.worker_id, **previous_updates)
             store.set_phase(run.run_id, previous_phase, previous_terminal_reason)
             _record_failed_resume(store, run.run_id, str(exc))
             raise WorkerDispatchError(envelope.run_id, exc) from exc
