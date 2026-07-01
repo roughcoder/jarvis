@@ -310,6 +310,42 @@ def test_cockpit_sse_emits_snapshot_with_cursor(tmp_path, monkeypatch) -> None: 
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
 
 
+def test_cockpit_sse_emits_snapshot_when_projection_cursor_changes(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    store, run_id = _seed_run(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        current = (await client.get(f"{base}/v1/cockpit/snapshot")).json()["cursor"]
+
+        async def mutate_run() -> None:
+            import asyncio
+
+            await asyncio.sleep(0.1)
+            run = store.get(run_id)
+            assert run is not None
+            run.phase = "verifying"
+            store.save(run)
+
+        import asyncio
+
+        task = asyncio.create_task(mutate_run())
+        seen = ""
+        async with client.stream("GET", f"{base}/v1/cockpit/events", params={"after": current}) as response:
+            async for chunk in response.aiter_text():
+                seen += chunk
+                if "event: snapshot" in seen:
+                    break
+        await task
+
+        assert "event: snapshot" in seen
+        assert f'"cursor": "{current}"' not in seen
+        assert '"phase": "verifying"' in seen
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+
 def test_cockpit_auth_and_bad_session_ref_errors(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, token="secret")
 
