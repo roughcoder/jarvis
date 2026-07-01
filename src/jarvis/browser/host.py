@@ -151,6 +151,7 @@ class BrowserHost:
         async with self._lock:
             b = self._browsers.pop(context, None)
             self._tabs.pop(context, None)
+            self._urls.pop(context, None)
             self._frames.pop(context, None)
         if b is not None:
             try:
@@ -160,14 +161,14 @@ class BrowserHost:
 
     async def _recover(self, context: str) -> bool:
         """A dropped CDP connection: relaunch the browser and re-navigate the last URL."""
-        url = self._urls.get(context)
+        url = await self._url(context)
         await self._reset(context)
         if not url:
             return False
         try:
             b = await self._browser(context)
             tab = await asyncio.wait_for(b.get(url), self._cfg.nav_timeout_s)
-            self._tabs[context] = tab
+            await self._set_tab(context, tab, url)
             await self._settle(tab)
             return True
         except Exception:  # noqa: BLE001
@@ -208,10 +209,28 @@ class BrowserHost:
             await asyncio.sleep(interval)
 
     async def _tab(self, context: str):  # noqa: ANN202
-        tab = self._tabs.get(context)
+        async with self._lock:
+            tab = self._tabs.get(context)
         if tab is None:
             raise RuntimeError(f"no open page in the {context!r} browser — open a URL first")
         return tab
+
+    async def _url(self, context: str) -> str:
+        async with self._lock:
+            return self._urls.get(context, "")
+
+    async def _set_tab(self, context: str, tab, url: str) -> None:  # noqa: ANN001
+        async with self._lock:
+            self._tabs[context] = tab
+            self._urls[context] = url
+
+    async def _set_frames(self, context: str, frames: dict[int, object]) -> None:
+        async with self._lock:
+            self._frames[context] = frames
+
+    async def _frame(self, context: str, ref: int):  # noqa: ANN202
+        async with self._lock:
+            return self._frames.get(context, {}).get(int(ref))
 
     async def _where(self, tab) -> tuple[str, str]:  # noqa: ANN001 - (url, title)
         return (await tab.evaluate(_URL_JS) or ""), (await tab.evaluate(_TITLE_JS) or "")
@@ -239,8 +258,7 @@ class BrowserHost:
             try:
                 b = await self._browser(context)
                 tab = await asyncio.wait_for(b.get(url), self._cfg.nav_timeout_s)
-                self._tabs[context] = tab
-                self._urls[context] = url
+                await self._set_tab(context, tab, url)
                 await self._settle(tab)
                 cur, title = await self._where(tab)
                 return {"ok": True, "context": context, "url": cur, "title": title}
@@ -278,7 +296,7 @@ class BrowserHost:
                         frame_map[int(m.group(1))] = doc
                         lines.append(ln + ("  (in frame)" if di > 0 else ""))
                 offset += len(doc_lines)
-            self._frames[context] = frame_map
+            await self._set_frames(context, frame_map)
             cur, title = await self._where(tab)
             elements = "\n".join(lines) or "(no interactive elements found)"
             return {"ok": True, "context": context, "url": cur, "title": title, "elements": elements}
@@ -288,7 +306,7 @@ class BrowserHost:
     async def _resolve(self, context: str, tab, ref: int):  # noqa: ANN001, ANN202
         """Find element [ref] in whichever document (main page or a frame) the last
         snapshot tagged it in — so click/type reach inside frames transparently."""
-        doc = self._frames.get(context, {}).get(int(ref)) or tab
+        doc = await self._frame(context, ref) or tab
         try:
             return doc, await doc.select(f'[data-jref="{ref}"]', timeout=5)
         except Exception:  # noqa: BLE001 - not found / timed out
@@ -371,7 +389,7 @@ class BrowserHost:
 
             doc = tab
             if ref is not None:
-                doc = self._frames.get(context, {}).get(int(ref)) or tab
+                doc = await self._frame(context, ref) or tab
                 with contextlib.suppress(Exception):
                     await doc.evaluate(
                         f'(() => {{ const e = document.querySelector(\'[data-jref="{int(ref)}"]\'); if (e) e.focus(); }})()'
@@ -401,12 +419,14 @@ class BrowserHost:
         return await self._run(context, fn)
 
     async def aclose(self) -> None:
-        for b in self._browsers.values():
+        async with self._lock:
+            browsers = list(self._browsers.values())
+            self._browsers.clear()
+            self._tabs.clear()
+            self._urls.clear()
+            self._frames.clear()
+        for b in browsers:
             try:
                 b.stop()
             except Exception:  # noqa: BLE001 - best-effort teardown
                 pass
-        self._browsers.clear()
-        self._tabs.clear()
-        self._urls.clear()
-        self._frames.clear()

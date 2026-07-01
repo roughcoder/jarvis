@@ -21,6 +21,7 @@ import random
 import re
 import string
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
@@ -38,6 +39,8 @@ from jarvis.protocol.messages import (
 )
 from jarvis.users import add_whatsapp_number as _add_whatsapp_number
 from jarvis.users import user_whatsapp_numbers
+
+_SEEN_LIMIT = 1000
 
 
 @dataclass(frozen=True)
@@ -72,6 +75,15 @@ def _parse_messages(obj: dict) -> list[InboundMessage]:
 
 def _now_rfc3339() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _remember_seen(seen: OrderedDict[str, None], msg_id: str | None) -> None:
+    if not msg_id:
+        return
+    seen[msg_id] = None
+    seen.move_to_end(msg_id)
+    while len(seen) > _SEEN_LIMIT:
+        seen.popitem(last=False)
 
 
 def _digits(num: str) -> str:
@@ -330,7 +342,7 @@ class WhatsAppConnector:
         self._allowed = {_digits(n) for n in wa.allow_from.split(",") if _digits(n)}
         self._allowed |= _user_numbers(self._cfg.capabilities.users_dir)
         self._cursor = _now_rfc3339()  # only react to messages from now on (no history replay)
-        self._seen: set[str] = set()
+        self._seen: OrderedDict[str, None] = OrderedDict()
         sync = await self._wacli.start_sync()
         try:
             while True:  # reconnect loop — survive brain restarts/outages
@@ -405,8 +417,6 @@ class WhatsAppConnector:
                     await self._handle_dm(ws, inbound, msg)  # DM: allowlist + pairing
                 # Advance the cursor only AFTER a message is handled, so a brain drop
                 # mid-handle re-delivers it on reconnect rather than silently losing it.
-                self._seen.add(msg.msg_id)
+                _remember_seen(self._seen, msg.msg_id)
                 if msg.ts:
                     self._cursor = max(self._cursor, msg.ts)
-            if len(self._seen) > 1000:  # bound the dedup set
-                self._seen = set(list(self._seen)[-500:])

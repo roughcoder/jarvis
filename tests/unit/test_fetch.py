@@ -6,7 +6,7 @@ import asyncio
 
 from jarvis.brain.context import RequestContext
 from jarvis.config import ToolsConfig
-from jarvis.tools.fetch import html_to_text, make_fetch_tools
+from jarvis.tools.fetch import _safe_fetch_url, html_to_text, make_fetch_tools
 
 
 def test_html_to_text_strips_and_breaks() -> None:
@@ -35,6 +35,23 @@ def test_fetch_handler_rejects_non_url() -> None:
     ctx = RequestContext("dev", "house", "house", frozenset({"web.search"}))
     out = asyncio.run(tool.handler(ctx, {"url": "not a url"}))
     assert out.startswith("error:") and "http" in out
+
+
+def test_fetch_rejects_private_local_and_link_local_hosts() -> None:
+    blocked = [
+        "http://127.0.0.1:4000",
+        "http://localhost:4000",
+        "http://192.168.1.20",
+        "http://10.0.0.5",
+        "http://169.254.169.254/latest/meta-data",
+    ]
+    for url in blocked:
+        try:
+            asyncio.run(_safe_fetch_url(url))
+        except ValueError as exc:
+            assert "blocked" in str(exc) or "local" in str(exc)
+        else:  # pragma: no cover - explicit failure path
+            raise AssertionError(f"{url} was not blocked")
 
 
 def test_fetch_tool_shape() -> None:

@@ -857,8 +857,8 @@ class BrainServer:
         # Alarm acknowledgement: if one is ringing on this device and the user says
         # stop/dismiss/etc, silence it without a full LLM turn.
         if self._scheduler.ringing_on(device_id) and _is_alarm_ack(text):
-            stopped = self._scheduler.acknowledge(device_id)
-            reply = "Alarm off." if stopped else "Okay."
+            stopped = self._scheduler.acknowledge_all(device_id)
+            reply = "Alarms off." if len(stopped) > 1 else ("Alarm off." if stopped else "Okay.")
             print(f"  [alarm] acknowledged on device={device_id}")
             sent_audio_chunks = 0
             if not text_only:

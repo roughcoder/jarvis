@@ -69,6 +69,31 @@ def test_stdio_server_is_shared_regardless_of_user(tmp_path) -> None:  # noqa: A
     assert asyncio.run(b.call("ctx_q", {}, user="neil")) == "shared:q"
 
 
+def test_lazy_oauth_connect_serializes_concurrent_first_calls(tmp_path) -> None:  # noqa: ANN001
+    b = MCPBridge(MCPConfig(_env_file=None, enabled=True, auth_dir=str(tmp_path)))
+    b._spec["notion"] = MCPServerSpec(name="notion", transport="http", url="https://x/mcp")
+    b._routes["notion_search"] = ("notion", "search")
+    b._has_token = lambda _spec, _principal: True
+    calls = 0
+
+    async def connect(principal: str, spec: MCPServerSpec, **_kwargs) -> None:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.01)
+        b._clients[(principal, spec.name)] = _FakeClient(principal)
+
+    b._connect = connect
+
+    async def go() -> list[str]:
+        return await asyncio.gather(
+            b.call("notion_search", {}, user="neil"),
+            b.call("notion_search", {}, user="neil"),
+        )
+
+    assert asyncio.run(go()) == ["neil:search", "neil:search"]
+    assert calls == 1
+
+
 def test_registered_matches_server_not_tool_name(tmp_path) -> None:  # noqa: ANN001
     # Regression: _registered must compare the SERVER, not the tool name — else a
     # connected server is reported "no authorized user" and re-registers per user.

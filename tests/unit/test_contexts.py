@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import types
+import asyncio
 
 from jarvis.brain.context import RequestContext
 from jarvis.brain.contexts import ContextStore
@@ -78,3 +79,35 @@ def test_context_store_rebuilds_when_capabilities_change() -> None:
     assert s1 is not s2
     assert s2._ctx.can("intercom.camera")
     assert len(store) == 1
+
+
+def test_context_store_eviction_retains_pending_cold_path() -> None:
+    async def go() -> None:
+        done = asyncio.Event()
+
+        async def wait_forever() -> None:
+            await done.wait()
+
+        sessions = []
+
+        def make(ctx: RequestContext):  # noqa: ANN202
+            task = asyncio.create_task(wait_forever())
+            session = types.SimpleNamespace(_ctx=ctx, pending_cold_tasks=(task,))
+            sessions.append(session)
+            return session
+
+        store = ContextStore(make, max_sessions=1)
+        first = RequestContext("mac", "neil", "personal", frozenset(), peer="neil")
+        second = RequestContext("mac", "jules", "personal", frozenset(), peer="jules")
+
+        old = store.get(first)
+        store.get(second)
+
+        assert len(store) == 1
+        assert old in store._retired
+        done.set()
+        await sessions[0].pending_cold_tasks[0]
+        store.get(second)  # prune completed retired sessions on the next access
+        assert store._retired == []
+
+    asyncio.run(go())

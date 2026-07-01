@@ -9,8 +9,11 @@ the tool; this is for reading server-rendered content. Gated `web.search`.
 
 from __future__ import annotations
 
+import asyncio
 import html as _html
+import ipaddress
 import re
+import socket
 
 import httpx
 
@@ -20,6 +23,7 @@ from jarvis.tools.base import Tool
 
 _CAP = "web.search"
 _MAX_CHARS = 6000
+_MAX_REDIRECTS = 5
 
 _DROP = re.compile(r"<(script|style|head|noscript|svg)\b.*?</\1>", re.DOTALL | re.IGNORECASE)
 _COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -44,19 +48,63 @@ def html_to_text(html: str, *, max_chars: int = _MAX_CHARS) -> str:
     return s[:max_chars] + ("\n…(truncated)" if len(s) > max_chars else "")
 
 
+def _unsafe_address(address: str) -> bool:
+    ip = ipaddress.ip_address(address)
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+async def _safe_fetch_url(url: str) -> httpx.URL:
+    parsed = httpx.URL(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.host:
+        raise ValueError("give a full http(s) URL to fetch")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    def resolve() -> list[str]:
+        infos = socket.getaddrinfo(parsed.host, port, type=socket.SOCK_STREAM)
+        return [info[4][0] for info in infos]
+
+    addresses = await asyncio.to_thread(resolve)
+    if not addresses or any(_unsafe_address(addr) for addr in addresses):
+        raise ValueError("blocked private or local network address")
+    return parsed
+
+
 def make_fetch_tools(cfg: ToolsConfig) -> list[Tool]:
     async def fetch_page(ctx: RequestContext, args: dict) -> str:
         url = (args.get("url") or "").strip()
         if not re.match(r"https?://", url):
             return "error: give a full http(s) URL to fetch."
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                r = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (Jarvis)"})
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+                current = url
+                for _ in range(_MAX_REDIRECTS + 1):
+                    safe_url = await _safe_fetch_url(current)
+                    r = await client.get(
+                        str(safe_url), headers={"User-Agent": "Mozilla/5.0 (Jarvis)"}
+                    )
+                    if not r.is_redirect:
+                        break
+                    location = r.headers.get("location")
+                    if not location:
+                        break
+                    current = str(r.url.join(location))
+                else:
+                    return "error: too many redirects."
                 r.raise_for_status()
                 text = html_to_text(r.text)
+                final_url = str(r.url)
+        except ValueError as exc:
+            return f"error: {exc}."
         except Exception as exc:  # noqa: BLE001 - network/HTTP — never break the turn
             return f"error: couldn't fetch that page ({type(exc).__name__})."
-        return f"[{url}]\n{text}" if text else f"[{url}] (no readable text)"
+        return f"[{final_url}]\n{text}" if text else f"[{final_url}] (no readable text)"
 
     return [
         Tool(

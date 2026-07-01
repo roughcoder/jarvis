@@ -128,11 +128,16 @@ class Scheduler:
         return alarm.label
 
     def acknowledge(self, device_id: str) -> Alarm | None:
+        stopped = self.acknowledge_all(device_id)
+        return stopped[0] if stopped else None
+
+    def acknowledge_all(self, device_id: str) -> list[Alarm]:
+        stopped: list[Alarm] = []
         for alarm in list(self._alarms.values()):
             if alarm.device_id == device_id and alarm._last_cycle >= 0:
                 del self._alarms[alarm.id]
-                return alarm
-        return None
+                stopped.append(alarm)
+        return stopped
 
     def ringing_on(self, device_id: str) -> bool:
         return any(alarm.device_id == device_id and alarm._last_cycle >= 0 for alarm in self._alarms.values())

@@ -60,9 +60,11 @@ def make_alarm_tools(scheduler: Scheduler, cfg: Config) -> list[Tool]:
     async def cancel_alarm(ctx: RequestContext, args: dict) -> str:
         ref = (args.get("which") or "").strip()
         if not ref:  # cancel whatever is ringing on this device, else the soonest pending one
-            stopped = scheduler.acknowledge(ctx.device_id)
+            stopped = scheduler.acknowledge_all(ctx.device_id)
             if stopped:
-                return f"Stopped the {stopped.label!r} alarm."
+                if len(stopped) == 1:
+                    return f"Stopped the {stopped[0].label!r} alarm."
+                return f"Stopped {len(stopped)} ringing alarms."
             mine = [a for a in scheduler.all() if a.device_id == ctx.device_id]
             if not mine:
                 return "There are no alarms set."

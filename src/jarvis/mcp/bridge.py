@@ -51,6 +51,7 @@ class MCPBridge:
         # Principals to pre-connect OAuth servers for (house + known users).
         self._principals = list(dict.fromkeys(["house", *principals]))
         self._clients: dict[tuple[str, str], MCPClient] = {}  # (principal, server) -> client
+        self._client_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._routes: dict[str, tuple[str, str]] = {}  # offered name -> (server, tool)
         self._spec: dict[str, MCPServerSpec] = {}  # server name -> spec
         self.tools: list[BridgedTool] = []
@@ -123,6 +124,18 @@ class MCPBridge:
             for t in self._select(spec, discovered):
                 self._add(spec, t)
 
+    async def _connect_once(
+        self, principal: str, spec: MCPServerSpec, *, register: bool
+    ) -> MCPClient | None:
+        key = (principal, spec.name)
+        lock = self._client_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            client = self._clients.get(key)
+            if client is not None:
+                return client
+            await self._connect(principal, spec, register=register)
+            return self._clients.get(key)
+
     def _select(self, spec: MCPServerSpec, discovered: list[MCPToolSpec]) -> list[MCPToolSpec]:
         tools = discovered
         if spec.include:
@@ -172,8 +185,7 @@ class MCPBridge:
             # token, else tell them to log in (never fall back to another user).
             spec = self._spec[server]
             if self._has_token(spec, principal):
-                await self._connect(principal, spec, register=False)
-                client = self._clients.get((principal, server))
+                client = await self._connect_once(principal, spec, register=False)
             if client is None:
                 raise RuntimeError(
                     f"{user} isn't signed in to {server!r} — run "
@@ -185,6 +197,7 @@ class MCPBridge:
         for client in self._clients.values():
             await _safe_close(client)
         self._clients = {}
+        self._client_locks = {}
         self._routes = {}
         self._spec = {}
         self.tools = []
