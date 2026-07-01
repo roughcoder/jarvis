@@ -482,6 +482,9 @@ Verification artifacts use first-class fields:
 }
 ```
 
+Artifact `created_at` and `updated_at` are always present strings. For generated
+Jarvis report artifacts, Jarvis uses the owning run's timestamps.
+
 ## Pagination
 
 Large detail endpoints return paginated lists:
@@ -679,6 +682,11 @@ or breaking status, and migration notes.
 - Normalized public enum vocabularies before merge: sync status now uses
   `fresh|partial|stale|failed`, and worker health uses
   `healthy|degraded|unhealthy|unknown`.
+- Hardened provider/store projections before merge: session events, run events,
+  requests, checkpoints, worker error messages, and generated report artifacts
+  now redact private paths/tokens and avoid raw provider/store payloads.
+- Kept `sync=none` and SSE refresh snapshots store-only so connected cockpit
+  clients do not poll workers once per stream.
 
 ### 2026-07-01 - v1 Draft
 
