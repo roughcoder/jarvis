@@ -276,6 +276,11 @@ Run summaries appear in snapshots and run lists.
 }
 ```
 
+`GET /v1/runs/{run_id}` returns a public-safe run detail projection. It extends
+`RunSummary` with projected `work_items`, `sessions`, and `artifacts`; it must
+not expose raw work item bodies, source-internal IDs, worker `cwd` paths, or raw
+provider metadata.
+
 ## SessionSummary
 
 Session summaries appear in snapshots and session lists.
@@ -646,6 +651,10 @@ or breaking status, and migration notes.
 - Implemented `/v1/cockpit/events` as a cursor-aware SSE stream that sends an
   initial or stale-cursor snapshot, heartbeat comments, and fresh snapshot
   reconciliation packets when the projected cockpit cursor changes.
+- Hardened review findings before merge: run detail responses are public-safe
+  projections, blocking worker/store calls are kept off the aiohttp event loop,
+  session event sequence numbers remain stable across pagination, unsafe API
+  bind refusal exits non-zero, and SSE events include `occurred_at`.
 
 ### 2026-07-01 - v1 Draft
 

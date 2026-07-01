@@ -14,7 +14,7 @@ import httpx  # noqa: E402
 from aiohttp import web  # noqa: E402
 
 from jarvis.config import Config  # noqa: E402
-from jarvis.orchestration.api import make_app  # noqa: E402
+from jarvis.orchestration.api import make_app, serve  # noqa: E402
 from jarvis.orchestration.cockpit import make_session_ref  # noqa: E402
 from jarvis.orchestration.models import Artifact, WorkItem, WorkerSessionLink  # noqa: E402
 from jarvis.orchestration.store import OrchestrationStore  # noqa: E402
@@ -92,7 +92,14 @@ def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, caps: str = "", tok
 
 def _seed_run(cfg: Config) -> tuple[OrchestrationStore, str]:
     store = OrchestrationStore(cfg.orchestration.workspace)
-    item = WorkItem(source="github", id="#47", title="Build worker sessions", repo="roughcoder/jarvis")
+    item = WorkItem(
+        source="github",
+        id="#47",
+        title="Build worker sessions",
+        repo="roughcoder/jarvis",
+        body="private implementation detail",
+        source_internal_id="internal_47",
+    )
     run = store.create_run("Expose live worker sessions", work_items=[item])
     store.link_session(
         run.run_id,
@@ -258,6 +265,9 @@ def test_cockpit_session_detail_events_requests_and_checkpoints(tmp_path, monkey
         assert "metadata" not in detail["raw"]
         assert events["items"][0]["sequence"] == 1
         assert events["has_more"] is True
+        next_events = (await client.get(f"{base}/v1/sessions/{ref}/events", params={"after": "ev_1"})).json()["items"]
+        assert next_events[0]["event_id"] == "ev_2"
+        assert next_events[0]["sequence"] == 2
         all_events = (await client.get(f"{base}/v1/sessions/{ref}/events")).json()["items"]
         delta = [event for event in all_events if event["type"] == "assistant.delta"][0]
         assert delta["message_id"] == "msg_turn_1"
@@ -275,9 +285,14 @@ def test_cockpit_run_events_and_artifact_pagination(tmp_path, monkeypatch) -> No
     _store, run_id = _seed_run(cfg)
 
     async def calls(base: str, client: httpx.AsyncClient) -> None:
+        detail = (await client.get(f"{base}/v1/runs/{run_id}")).json()
         events = (await client.get(f"{base}/v1/runs/{run_id}/events", params={"limit": 1})).json()
         artifacts = (await client.get(f"{base}/v1/runs/{run_id}/artifacts", params={"limit": 2})).json()
 
+        assert detail["run"]["run_id"] == run_id
+        assert "private implementation detail" not in json.dumps(detail)
+        assert "internal_47" not in json.dumps(detail)
+        assert "/Users/" not in json.dumps(detail)
         assert events["items"][0]["type"] == "run_created"
         assert events["has_more"] is True
         kinds = {item["kind"] for item in artifacts["items"]}
@@ -304,6 +319,7 @@ def test_cockpit_sse_emits_snapshot_with_cursor(tmp_path, monkeypatch) -> None: 
         assert "event: snapshot" in first
         assert "id: evt_" in first
         assert '"type": "snapshot"' in first
+        assert '"occurred_at":' in first
 
     import asyncio
 
@@ -338,6 +354,7 @@ def test_cockpit_sse_emits_snapshot_when_projection_cursor_changes(tmp_path, mon
         await task
 
         assert "event: snapshot" in seen
+        assert '"occurred_at":' in seen
         assert f'"cursor": "{current}"' not in seen
         assert '"phase": "verifying"' in seen
 
@@ -361,6 +378,15 @@ def test_cockpit_auth_and_bad_session_ref_errors(tmp_path, monkeypatch) -> None:
     import asyncio
 
     asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_api_refuses_unsafe_bind_with_nonzero_status(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    cfg.orchestration.api_host = "0.0.0.0"
+
+    import asyncio
+
+    assert asyncio.run(serve(cfg)) == 1
 
 
 def test_cockpit_session_write_proxy_and_idempotency(tmp_path, monkeypatch) -> None:  # noqa: ANN001
