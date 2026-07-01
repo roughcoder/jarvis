@@ -586,7 +586,7 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
                 headers=headers,
                 json={
                     "prompt": args.prompt,
-                    "metadata": {"surface": "cli"},
+                    "metadata": _session_control_metadata("worker.session.turn"),
                     "idempotency_key": args.idempotency_key,
                 },
                 timeout=timeout,

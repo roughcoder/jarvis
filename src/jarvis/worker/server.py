@@ -498,16 +498,16 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         session = sessions.get(session_id)
         if session is None:
             return web.json_response({"error": "no such session"}, status=404)
-        authority_error = _require_session_authority(session, WORKER_SESSION_TURN)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "bad json"}, status=400)
+        authority_error = _require_session_control_authority(session, WORKER_SESSION_TURN, body)
         if authority_error is not None:
             return authority_error
         cwd_error = _session_cwd_error(session, workspace)
         if cwd_error:
             return web.json_response({"ok": False, "error": cwd_error}, status=400)
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"error": "bad json"}, status=400)
         turn_id = _clean_request_id(body.get("turn_id") or uuid.uuid4().hex, "turn")
         idempotency_key = str(body.get("idempotency_key") or "").strip()
         existing_events = _events_for_idempotency(sessions, session.session_id, idempotency_key)

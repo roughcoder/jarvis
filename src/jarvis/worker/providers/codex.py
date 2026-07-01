@@ -7,7 +7,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from jarvis.config import WorkerConfig
 from jarvis.worker.authority import WorkerSessionAuthority
@@ -117,16 +117,24 @@ class CodexProviderAdapter:
         if not authority.can_resolve_approval:
             raise RuntimeError("worker session missing required authority: worker.session.approve")
         request_id = _control_request_id(request)
+        event: SessionEvent | None = None
+
+        def record_resolution() -> None:
+            nonlocal event
+            event = sessions.append_event(session.session_id, EVENT_APPROVAL_RESOLVED, {**request, "request_id": request_id})
+            _restore_running_if_waiting(sessions, session.session_id, SESSION_WAITING_APPROVAL)
+
         delivered = _deliver_pending_request(
             session.session_id,
             request_id,
             kind=REQUEST_KIND_APPROVAL,
             request=request,
+            before_send=record_resolution,
         )
         if not delivered:
             raise RuntimeError(f"no pending codex approval request {request_id!r}")
-        event = sessions.append_event(session.session_id, EVENT_APPROVAL_RESOLVED, {**request, "request_id": request_id})
-        sessions.update_status(session.session_id, SESSION_RUNNING)
+        if event is None:
+            raise RuntimeError(f"no pending codex approval request {request_id!r}")
         return event
 
     def receive_input(
@@ -140,16 +148,24 @@ class CodexProviderAdapter:
         if not authority.can_receive_input:
             raise RuntimeError("worker session missing required authority: worker.session.input")
         request_id = _control_request_id(request)
+        event: SessionEvent | None = None
+
+        def record_input() -> None:
+            nonlocal event
+            event = sessions.append_event(session.session_id, EVENT_INPUT_RECEIVED, {**request, "request_id": request_id})
+            _restore_running_if_waiting(sessions, session.session_id, SESSION_WAITING_INPUT)
+
         delivered = _deliver_pending_request(
             session.session_id,
             request_id,
             kind=REQUEST_KIND_INPUT,
             request=request,
+            before_send=record_input,
         )
         if not delivered:
             raise RuntimeError(f"no pending codex input request {request_id!r}")
-        event = sessions.append_event(session.session_id, EVENT_INPUT_RECEIVED, {**request, "request_id": request_id})
-        sessions.update_status(session.session_id, SESSION_RUNNING)
+        if event is None:
+            raise RuntimeError(f"no pending codex input request {request_id!r}")
         return event
 
 
@@ -181,7 +197,11 @@ def _run_codex_turn(
         session = sessions.get(session_id)
         if session is None:
             return
+        if _session_cancelled(sessions, session_id):
+            return
         cwd = _session_cwd(session, worker_cfg)
+        if _session_cancelled(sessions, session_id):
+            return
         process = subprocess.Popen(
             [worker_cfg.codex_bin, "app-server", "--stdio"],
             cwd=cwd,
@@ -555,6 +575,18 @@ def _project_jsonrpc_message(
         )
         sessions.append_event(session_id, EVENT_INPUT_REQUESTED, {**common, **params, "request_id": request_id})
         sessions.update_status(session_id, SESSION_WAITING_INPUT)
+    elif method == "serverRequest/resolved":
+        request_id = _message_request_id(message, params)
+        pending = _forget_pending_request(session_id, request_id, process=process)
+        if pending is not None:
+            event_type = EVENT_APPROVAL_RESOLVED if pending.kind == REQUEST_KIND_APPROVAL else EVENT_INPUT_RECEIVED
+            sessions.append_event(
+                session_id,
+                event_type,
+                {**common, **params, "request_id": request_id, "provider_resolved": True},
+            )
+            waiting_status = SESSION_WAITING_APPROVAL if pending.kind == REQUEST_KIND_APPROVAL else SESSION_WAITING_INPUT
+            _restore_running_if_waiting(sessions, session_id, waiting_status)
     elif method == "turn/completed":
         status = str(dict(params.get("turn") or {}).get("status") or "completed")
         event_type = EVENT_TURN_COMPLETED if status in {"completed", "done", "succeeded"} else EVENT_TURN_FAILED
@@ -571,7 +603,7 @@ def _project_jsonrpc_message(
 
 
 def _message_request_id(message: dict[str, Any], params: dict[str, Any]) -> str:
-    return str(params.get("request_id") or params.get("id") or message.get("id") or "").strip()
+    return str(params.get("requestId") or params.get("request_id") or params.get("id") or message.get("id") or "").strip()
 
 
 def _control_request_id(request: dict[str, Any]) -> str:
@@ -601,7 +633,14 @@ def _track_pending_request(
         )
 
 
-def _deliver_pending_request(session_id: str, request_id: str, *, kind: str, request: dict[str, Any]) -> bool:
+def _deliver_pending_request(
+    session_id: str,
+    request_id: str,
+    *,
+    kind: str,
+    request: dict[str, Any],
+    before_send: Callable[[], None] | None = None,
+) -> bool:
     with _PENDING_LOCK:
         key = (session_id, request_id)
         pending = _PENDING_REQUESTS.get(key)
@@ -610,8 +649,34 @@ def _deliver_pending_request(session_id: str, request_id: str, *, kind: str, req
     if pending is None or pending.kind != kind:
         return False
     result = _approval_result(request) if kind == REQUEST_KIND_APPROVAL else _input_result(request, pending.params)
+    if before_send is not None:
+        before_send()
     _send_json(pending.process, {"jsonrpc": "2.0", "id": pending.rpc_id, "result": result})
     return True
+
+
+def _forget_pending_request(
+    session_id: str,
+    request_id: str,
+    *,
+    process: subprocess.Popen[str],
+) -> _PendingCodexRequest | None:
+    with _PENDING_LOCK:
+        pending = _PENDING_REQUESTS.get((session_id, request_id))
+        if pending is None or pending.process is not process:
+            return None
+        return _PENDING_REQUESTS.pop((session_id, request_id), None)
+
+
+def _has_pending_requests(session_id: str) -> bool:
+    with _PENDING_LOCK:
+        return any(key[0] == session_id for key in _PENDING_REQUESTS)
+
+
+def _restore_running_if_waiting(sessions: SessionManager, session_id: str, waiting_status: str) -> None:
+    session = sessions.get(session_id)
+    if session is not None and session.status == waiting_status and not _has_pending_requests(session_id):
+        sessions.update_status(session_id, SESSION_RUNNING)
 
 
 def _clear_pending_requests(session_id: str, process: subprocess.Popen[str]) -> None:

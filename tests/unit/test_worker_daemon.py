@@ -36,11 +36,22 @@ from jarvis.worker.authority import WorkerSessionAuthority  # noqa: E402
 from jarvis.worker.providers.codex import (  # noqa: E402
     _approval_result,
     _input_result,
+    _project_jsonrpc_message,
+    _run_codex_turn,
     _session_cwd as codex_session_cwd,
+    _track_pending_request,
     _terminate_provider_process as codex_terminate_provider_process,
 )
+from jarvis.worker.providers.base import ProviderTurn  # noqa: E402
 from jarvis.worker.sessions import WorkerSession  # noqa: E402
 from jarvis.worker.sessions import SessionManager  # noqa: E402
+from jarvis.worker_session_contract import (  # noqa: E402
+    EVENT_APPROVAL_RESOLVED,
+    REQUEST_KIND_APPROVAL,
+    SESSION_RUNNING,
+    SESSION_STOPPED,
+    SESSION_WAITING_APPROVAL,
+)
 
 
 async def _with_server(cfg: WorkerConfig, port: int, fn):  # noqa: ANN001
@@ -71,8 +82,10 @@ def _authority_metadata(engine: str = "codex", extra_actions: list[str] | None =
     }
 
 
-def _control_metadata(action: str) -> dict:
-    return {"allowed_actions": [action]}
+def _control_metadata(action: str, **extra: object) -> dict:
+    metadata = {"allowed_actions": [action]}
+    metadata.update(extra)
+    return metadata
 
 
 def _owned_worker_cwd(tmp_path, name: str = "session") -> str:  # noqa: ANN001
@@ -165,6 +178,71 @@ def test_codex_protocol_response_shapes_match_app_server_contract() -> None:
         {"answers": {"details": "use pytest"}},
         {"questions": [{"id": "details"}]},
     ) == {"answers": {"details": {"answers": ["use pytest"]}}}
+
+
+def test_codex_server_request_resolved_clears_pending_request(tmp_path) -> None:
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "codex",
+            "engine": "codex",
+            "metadata": _authority_metadata("codex", extra_actions=[WORKER_SESSION_APPROVE]),
+        }
+    )
+    process = object()
+    turn = ProviderTurn(turn_id="turn_1", prompt="x", idempotency_key="idem_1")
+    _track_pending_request(
+        session.session_id,
+        "approval_rpc",
+        kind=REQUEST_KIND_APPROVAL,
+        process=process,  # type: ignore[arg-type]
+        rpc_id="approval_rpc",
+        params={"command": "pytest"},
+    )
+    sessions.update_status(session.session_id, SESSION_WAITING_APPROVAL)
+
+    done = _project_jsonrpc_message(
+        process,  # type: ignore[arg-type]
+        {"jsonrpc": "2.0", "method": "serverRequest/resolved", "params": {"requestId": "approval_rpc"}},
+        session_id=session.session_id,
+        turn=turn,
+        sessions=sessions,
+    )
+
+    assert done is False
+    assert sessions.pending_requests(session.session_id) == []
+    assert sessions.get(session.session_id).status == SESSION_RUNNING  # type: ignore[union-attr]
+    resolved = [event for event in sessions.events(session.session_id) if event.type == EVENT_APPROVAL_RESOLVED]
+    assert resolved[-1].data["request_id"] == "approval_rpc"
+    assert resolved[-1].data["provider_resolved"] is True
+
+
+def test_codex_turn_rechecks_cancellation_before_launch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    def fail_popen(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("cancelled sessions must not launch codex")
+
+    monkeypatch.setattr("jarvis.worker.providers.codex.subprocess.Popen", fail_popen)
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "codex",
+            "engine": "codex",
+            "cwd": _owned_worker_cwd(tmp_path, "cancel-before-launch"),
+            "metadata": _authority_metadata("codex"),
+        }
+    )
+    sessions.update_status(session.session_id, SESSION_STOPPED)
+    authority = WorkerSessionAuthority.from_session(session, provider="codex")
+
+    _run_codex_turn(
+        session.session_id,
+        ProviderTurn(turn_id="turn_cancelled", prompt="x"),
+        sessions,
+        WorkerConfig(_env_file=None, workspace=str(tmp_path / "worker")),
+        authority,
+    )
+
+    assert "provider.process.started" not in [event.type for event in sessions.events(session.session_id)]
 
 
 def test_codex_stop_ignores_caller_supplied_provider_pid(monkeypatch) -> None:  # noqa: ANN001
@@ -496,7 +574,7 @@ def test_daemon_session_api_records_structured_events(tmp_path) -> None:
         turn = (
             await c.post(
                 f"{base}/sessions/{session_id}/turns",
-                json={"prompt": "inspect the repo", "metadata": {"surface": "test"}},
+                json={"prompt": "inspect the repo", "metadata": _control_metadata(WORKER_SESSION_TURN, surface="test")},
                 headers=headers,
             )
         ).json()
@@ -506,7 +584,7 @@ def test_daemon_session_api_records_structured_events(tmp_path) -> None:
                 json={
                     "prompt": "inspect the repo again",
                     "idempotency_key": "idem_fake",
-                    "metadata": {"resume_session": True},
+                    "metadata": _control_metadata(WORKER_SESSION_TURN, resume_session=True),
                 },
                 headers=headers,
             )
@@ -517,7 +595,7 @@ def test_daemon_session_api_records_structured_events(tmp_path) -> None:
                 json={
                     "prompt": "inspect the repo a third time",
                     "idempotency_key": "idem_fake",
-                    "metadata": {"resume_session": True},
+                    "metadata": _control_metadata(WORKER_SESSION_TURN, resume_session=True),
                 },
                 headers=headers,
             )
@@ -680,6 +758,35 @@ def test_daemon_session_turn_requires_authority_before_event_append(tmp_path) ->
     assert [event["type"] for event in events] == ["session.created"]
 
 
+def test_daemon_session_turn_requires_current_request_authority(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={"provider": "fake", "engine": "fake", "metadata": _authority_metadata("fake")},
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        turn = await c.post(
+            f"{base}/sessions/{session_id}/turns",
+            json={"prompt": "caller did not carry turn authority", "idempotency_key": "idem_missing_caller_turn"},
+            headers=headers,
+        )
+        events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+        return turn.status_code, turn.json(), events
+
+    status_code, body, events = asyncio.run(_with_server(cfg, 8844, calls))
+
+    assert status_code == 400
+    assert "caller control authority denied" in body["error"]
+    assert WORKER_SESSION_TURN in body["error"]
+    assert [event["type"] for event in events] == ["session.created"]
+
+
 def test_daemon_session_create_rejects_caller_supplied_non_worker_cwd(tmp_path) -> None:
     cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
     headers = {"Authorization": "Bearer tkn"}
@@ -727,7 +834,11 @@ def test_daemon_session_turn_rejects_missing_provider_cwd_before_event_append(tm
         cwd.rmdir()
         turn = await c.post(
             f"{base}/sessions/{session_id}/turns",
-            json={"prompt": "should fail before append", "idempotency_key": "idem_missing_cwd"},
+            json={
+                "prompt": "should fail before append",
+                "idempotency_key": "idem_missing_cwd",
+                "metadata": _control_metadata(WORKER_SESSION_TURN),
+            },
             headers=headers,
         )
         events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
@@ -889,7 +1000,11 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
         approval_turn = (
             await c.post(
                 f"{base}/sessions/{session_id}/turns",
-                json={"turn_id": "turn_need_approval", "prompt": "request approval"},
+                json={
+                    "turn_id": "turn_need_approval",
+                    "prompt": "request approval",
+                    "metadata": _control_metadata(WORKER_SESSION_TURN),
+                },
                 headers=headers,
             )
         ).json()
@@ -924,7 +1039,11 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
         input_turn = (
             await c.post(
                 f"{base}/sessions/{input_session_id}/turns",
-                json={"turn_id": "turn_need_input", "prompt": "request input"},
+                json={
+                    "turn_id": "turn_need_input",
+                    "prompt": "request input",
+                    "metadata": _control_metadata(WORKER_SESSION_TURN),
+                },
                 headers=headers,
             )
         ).json()
@@ -947,7 +1066,7 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
                 json={
                     "turn_id": "turn_checkpoint",
                     "prompt": "complete normally",
-                    "metadata": {"resume_session": True},
+                    "metadata": _control_metadata(WORKER_SESSION_TURN, resume_session=True),
                 },
                 headers=headers,
             )
@@ -1170,7 +1289,11 @@ for line in sys.stdin:
         turn = (
             await c.post(
                 f"{base}/sessions/{session_id}/turns",
-                json={"prompt": "reply with hello", "idempotency_key": "idem_codex"},
+                json={
+                    "prompt": "reply with hello",
+                    "idempotency_key": "idem_codex",
+                    "metadata": _control_metadata(WORKER_SESSION_TURN),
+                },
                 headers=headers,
             )
         ).json()
@@ -1257,7 +1380,11 @@ for line in sys.stdin:
         session_id = created["session"]["session_id"]
         await c.post(
             f"{base}/sessions/{session_id}/turns",
-            json={"prompt": "wait", "idempotency_key": "idem_codex_interrupt"},
+            json={
+                "prompt": "wait",
+                "idempotency_key": "idem_codex_interrupt",
+                "metadata": _control_metadata(WORKER_SESSION_TURN),
+            },
             headers=headers,
         )
         events = []
@@ -1343,7 +1470,11 @@ for line in sys.stdin:
         session_id = created["session"]["session_id"]
         await c.post(
             f"{base}/sessions/{session_id}/turns",
-            json={"prompt": "wait", "idempotency_key": "idem_codex_stop"},
+            json={
+                "prompt": "wait",
+                "idempotency_key": "idem_codex_stop",
+                "metadata": _control_metadata(WORKER_SESSION_TURN),
+            },
             headers=headers,
         )
         events = []
@@ -1448,7 +1579,11 @@ for line in sys.stdin:
         session_id = created["session"]["session_id"]
         await c.post(
             f"{base}/sessions/{session_id}/turns",
-            json={"prompt": "ask approval", "idempotency_key": "idem_codex_approval"},
+            json={
+                "prompt": "ask approval",
+                "idempotency_key": "idem_codex_approval",
+                "metadata": _control_metadata(WORKER_SESSION_TURN),
+            },
             headers=headers,
         )
         pending = {}
@@ -1568,7 +1703,11 @@ for line in sys.stdin:
         session_id = created["session"]["session_id"]
         await c.post(
             f"{base}/sessions/{session_id}/turns",
-            json={"prompt": "ask input", "idempotency_key": "idem_codex_input"},
+            json={
+                "prompt": "ask input",
+                "idempotency_key": "idem_codex_input",
+                "metadata": _control_metadata(WORKER_SESSION_TURN),
+            },
             headers=headers,
         )
         pending = {}
@@ -1633,7 +1772,7 @@ def test_daemon_rejects_unknown_session_provider(tmp_path) -> None:
         turn = (
             await c.post(
                 f"{base}/sessions/{session_id}/turns",
-                json={"prompt": "should not run"},
+                json={"prompt": "should not run", "metadata": _control_metadata(WORKER_SESSION_TURN)},
                 headers=headers,
             )
         )
@@ -1730,7 +1869,11 @@ emit({"type": "result", "subtype": "success", "session_id": session_id, "total_c
         first = (
             await c.post(
                 f"{base}/sessions/{session_id}/turns",
-                json={"prompt": "reply with hello", "idempotency_key": "idem_claude_1"},
+                json={
+                    "prompt": "reply with hello",
+                    "idempotency_key": "idem_claude_1",
+                    "metadata": _control_metadata(WORKER_SESSION_TURN),
+                },
                 headers=headers,
             )
         ).json()
@@ -1746,7 +1889,7 @@ emit({"type": "result", "subtype": "success", "session_id": session_id, "total_c
                 json={
                     "prompt": "resume and reply again",
                     "idempotency_key": "idem_claude_2",
-                    "metadata": {"resume_session": True},
+                    "metadata": _control_metadata(WORKER_SESSION_TURN, resume_session=True),
                 },
                 headers=headers,
             )
