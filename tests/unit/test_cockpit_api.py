@@ -371,6 +371,70 @@ def test_cockpit_runs_none_does_not_poll_worker_requests(tmp_path, monkeypatch) 
     asyncio.run(_with_server(cfg, calls, http_get=no_worker_get))
 
 
+def test_cockpit_sessions_none_does_not_poll_workers(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _store, run_id = _seed_run(cfg)
+
+    def no_worker_get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        raise AssertionError(f"sync=none session list should not call worker HTTP: {url}")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/sessions")
+        body = response.json()
+
+        assert response.status_code == 200
+        assert body["sessions"][0]["run_id"] == run_id
+        assert body["sessions"][0]["pending_approval_count"] == 0
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=no_worker_get))
+
+
+def test_cockpit_snapshot_probe_uses_probed_worker_status_for_worker_sessions(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _set_worker_status(cfg, "offline")
+    _store, run_id = _seed_run(cfg)
+
+    def get(url: str, **kwargs) -> Response:  # noqa: ANN001
+        return _fake_get(run_id)(url, **kwargs)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        snapshot = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "probe"})).json()
+
+        assert snapshot["workers"][0]["status"] == "online"
+        assert snapshot["sessions"]
+        assert snapshot["sessions"][0]["session_id"] == "sess_123"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
+def test_cockpit_archived_run_is_not_worker_synced(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    _store, run_id = _seed_run(cfg)
+    calls_seen: list[str] = []
+
+    def get(url: str, **kwargs) -> Response:  # noqa: ANN001
+        calls_seen.append(url)
+        if "/sessions/sess_123" in url or "/jobs/" in url:
+            raise AssertionError(f"archived runs should not sync linked worker resources: {url}")
+        return _fake_get(run_id)(url, **kwargs)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        archive = await client.post(f"{base}/v1/runs/{run_id}/archive", json={"idempotency_key": "archive_sync_skip"})
+        snapshot = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+
+        assert archive.status_code == 200
+        assert snapshot["runs"] == []
+        assert all("/sessions/sess_123" not in url for url in calls_seen)
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
 def test_cockpit_snapshot_cursor_tracks_full_projection(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch)
     _store, run_id = _seed_run(cfg)
@@ -544,6 +608,43 @@ def test_cockpit_session_detail_raw_projection_is_redacted(tmp_path, monkeypatch
         assert "provider_prompt" not in text
         assert "<local-path>" in text
         assert "<redacted-token>" in text
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
+def test_cockpit_exact_session_requests_include_run_id(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _store, run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+
+    def get(url: str, **kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions/sess_123/requests"):
+            return Response(
+                {
+                    "requests": [
+                        {
+                            "session_id": "sess_123",
+                            "request_id": "req_without_run",
+                            "kind": "approval",
+                            "status": "pending",
+                            "event": {
+                                "event_id": "ev_req_without_run",
+                                "session_id": "sess_123",
+                                "type": "approval.requested",
+                                "data": {"title": "Approve edits"},
+                            },
+                        }
+                    ]
+                }
+            )
+        return _fake_get(run_id)(url, **kwargs)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        requests = (await client.get(f"{base}/v1/sessions/{ref}/requests")).json()["requests"]
+
+        assert requests[0]["run_id"] == run_id
 
     import asyncio
 
@@ -1020,12 +1121,60 @@ def test_cockpit_archive_session_hides_it_without_archiving_run(tmp_path, monkey
         assert response.json()["session"]["archived_at"]
         assert snapshot["runs"][0]["run_id"] == run_id
         assert snapshot["runs"][0]["session_count"] == 0
+        assert snapshot["runs"][0]["pending_approval_count"] == 0
+        assert snapshot["runs"][0]["pending_input_count"] == 0
         assert snapshot["sessions"] == []
         assert all(artifact["kind"] != "branch" for artifact in snapshot["artifacts"])
 
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+
+def test_cockpit_archive_worker_only_session_hides_it_from_worker_views(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    ref = make_session_ref("macbook-worker", "sess_worker_only")
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/health"):
+            return Response({"ok": True, "agent": "codex", "supported_engines": ["codex"]})
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions"):
+            return Response(
+                {
+                    "sessions": [
+                        {
+                            "session_id": "sess_worker_only",
+                            "provider": "codex",
+                            "engine": "codex",
+                            "status": "running",
+                            "repo": "roughcoder/jarvis",
+                            "branch": "jarvis/worker-only",
+                            "title": "Worker-only session",
+                            "created_at": "2026-07-01T11:00:00Z",
+                            "updated_at": "2026-07-01T12:00:00Z",
+                        }
+                    ]
+                }
+            )
+        raise AssertionError(url)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        before = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+        response = await client.post(f"{base}/v1/sessions/{ref}/archive", json={"idempotency_key": "archive_worker_only"})
+        replay = await client.post(f"{base}/v1/sessions/{ref}/archive", json={"idempotency_key": "archive_worker_only"})
+        after = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+
+        assert before["sessions"][0]["session_ref"] == ref
+        assert response.status_code == 200
+        assert response.json()["session"]["archived_at"]
+        assert replay.json()["idempotent"] is True
+        assert after["sessions"] == []
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
 
 
 def test_cockpit_turn_and_start_reject_attachments_in_v1(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -1198,6 +1347,44 @@ def test_cockpit_work_start_rejects_unknown_sources_without_github_fallback(tmp_
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get("")))
+
+
+def test_cockpit_work_start_normalizes_nested_parallel_strategy(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="worker.job.start,worker.session.create,worker.session.turn,forge.github.branch.push")
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    item = WorkItem(source="manual", id="manual_parallel", title="Parallel start", repo="roughcoder/jarvis")
+    run = store.create_run("Parallel start", work_items=[item])
+    session = WorkerSessionLink(worker_id="macbook-worker", session_id="sess_parallel", status="running", provider="codex", engine="codex")
+    store.link_session(run.run_id, session)
+    strategies_seen: list[str] = []
+
+    def next_work(_self, command, *, start: bool = False):  # noqa: ANN001, FBT001, FBT002
+        strategies_seen.append(command.engine_strategy)
+        return StartedWork(
+            item=item,
+            worker=WorkerProfile(worker_id="macbook-worker", display_name="MacBook Pro"),
+            envelope=ExecutionEnvelope(run_id=run.run_id, repo=item.repo, prompt=item.title, worker_id="macbook-worker", session_id=session.session_id),
+            session=session,
+        )
+
+    monkeypatch.setattr("jarvis.orchestration.service.OrchestrationService.next_work", next_work)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(
+            f"{base}/v1/work/start",
+            json={
+                "idempotency_key": "nested_parallel",
+                "command": {"operation": "start_next_work", "source": "manual", "engine_strategy": "parallel"},
+                "work_item": {"id": "manual_parallel", "title": "Parallel start", "repo": "roughcoder/jarvis"},
+            },
+        )
+
+        assert response.status_code == 200
+        assert strategies_seen == ["ensemble"]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run.run_id)))
 
 
 def test_cockpit_work_start_manual_dispatches_worker_session(tmp_path, monkeypatch) -> None:  # noqa: ANN001

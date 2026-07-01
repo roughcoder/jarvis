@@ -123,6 +123,8 @@ def sync_run_sessions(
     summary.runs_seen = len(runs)
     for run in runs:
         for link in run.sessions:
+            if link.archived_at:
+                continue
             summary.sessions_seen += 1
             profile = _profile_for_job(registry, worker_cfg, link.worker_id)
             if profile is None:
@@ -187,15 +189,15 @@ def sync_run_sessions(
 def _runs_to_sync(store: OrchestrationStore, run_id: str) -> list[OrchestrationRun]:
     if run_id:
         run = store.get(run_id)
-        return [] if run is None else [run]
-    return [run for run in store.list_runs() if run.status != "terminal" and run.jobs]
+        return [] if run is None or run.archived_at else [run]
+    return [run for run in store.list_runs() if not run.archived_at and run.status != "terminal" and run.jobs]
 
 
 def _session_runs_to_sync(store: OrchestrationStore, run_id: str) -> list[OrchestrationRun]:
     if run_id:
         run = store.get(run_id)
-        return [] if run is None else [run]
-    return [run for run in store.list_runs() if run.status != "terminal" and run.sessions]
+        return [] if run is None or run.archived_at else [run]
+    return [run for run in store.list_runs() if not run.archived_at and run.status != "terminal" and any(not session.archived_at for session in run.sessions)]
 
 
 def _profile_for_job(registry: WorkerRegistry, worker_cfg: WorkerConfig, worker_id: str) -> WorkerProfile | None:
