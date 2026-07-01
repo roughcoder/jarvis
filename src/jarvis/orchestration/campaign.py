@@ -58,6 +58,7 @@ def create_campaign(
                 break
             continue
         if session is not None:
+            active_children += 1
             store.append_event(
                 parent.run_id,
                 "campaign_child_session_started",
@@ -68,7 +69,6 @@ def create_campaign(
                     "worker_id": getattr(session, "worker_id", ""),
                 },
             )
-        active_children += 1
     parent = store.get(parent.run_id) or parent
     store.append_event(
         parent.run_id,

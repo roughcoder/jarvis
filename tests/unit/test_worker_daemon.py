@@ -38,6 +38,7 @@ from jarvis.worker.providers.codex import (  # noqa: E402
     _approval_result,
     _input_result,
     _project_jsonrpc_message,
+    _read_until_turn_done,
     _run_codex_turn,
     _session_cwd as codex_session_cwd,
     _track_pending_request,
@@ -269,6 +270,59 @@ def test_codex_turn_rechecks_cancellation_before_launch(tmp_path, monkeypatch) -
         authority,
     )
 
+    assert "provider.process.started" not in [event.type for event in sessions.events(session.session_id)]
+
+
+def test_codex_turn_rechecks_cancellation_after_process_tracking(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.worker.providers import codex
+
+    class Process:
+        pid = 12345
+        stdin = None
+        stdout = None
+        stderr = None
+        terminated = False
+
+        def poll(self):
+            return -15 if self.terminated else None
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def wait(self, timeout=None):  # noqa: ANN001, ANN202
+            self.terminated = True
+            return -15
+
+    process = Process()
+    monkeypatch.setattr("jarvis.worker.providers.codex.subprocess.Popen", lambda *_args, **_kwargs: process)
+    original_track = codex._track_provider_process
+
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "codex",
+            "engine": "codex",
+            "cwd": _owned_worker_cwd(tmp_path, "cancel-after-track"),
+            "metadata": _authority_metadata("codex"),
+        }
+    )
+
+    def cancel_after_tracking(session_id, tracked_process):  # noqa: ANN001
+        original_track(session_id, tracked_process)
+        sessions.update_status(session_id, SESSION_STOPPED)
+
+    monkeypatch.setattr(codex, "_track_provider_process", cancel_after_tracking)
+    authority = WorkerSessionAuthority.from_session(session, provider="codex")
+
+    _run_codex_turn(
+        session.session_id,
+        ProviderTurn(turn_id="turn_cancelled", prompt="x"),
+        sessions,
+        WorkerConfig(_env_file=None, workspace=str(tmp_path / "worker")),
+        authority,
+    )
+
+    assert process.terminated is True
     assert "provider.process.started" not in [event.type for event in sessions.events(session.session_id)]
 
 
@@ -1848,6 +1902,56 @@ def test_codex_records_approval_resolution_only_after_delivery() -> None:
     )
     assert capture.payloads
     assert recorded == ["recorded"]
+
+
+def test_codex_turn_timeout_pauses_while_request_pending(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.worker.providers import codex
+
+    class Process:
+        def poll(self):
+            return None
+
+    process = Process()
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _event = sessions.create(
+        {
+            "session_id": "sess_waiting",
+            "provider": "codex",
+            "engine": "codex",
+            "metadata": _authority_metadata("codex"),
+        }
+    )
+    turn = ProviderTurn(turn_id="turn_waiting", prompt="x", idempotency_key="idem_waiting")
+    _track_pending_request(
+        session.session_id,
+        "approval_rpc",
+        kind=REQUEST_KIND_APPROVAL,
+        process=process,  # type: ignore[arg-type]
+        rpc_id="approval_rpc",
+    )
+    calls = 0
+
+    def fake_read_message(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            return None
+        codex._forget_pending_request(session.session_id, "approval_rpc", process=process)  # type: ignore[arg-type]
+        return {"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"status": "completed"}}}
+
+    monkeypatch.setattr(codex, "_read_message", fake_read_message)
+
+    _read_until_turn_done(
+        process,  # type: ignore[arg-type]
+        session_id=session.session_id,
+        turn=turn,
+        sessions=sessions,
+        line_queue=asyncio.Queue(),  # type: ignore[arg-type]
+        timeout_s=0,
+    )
+
+    assert calls == 3
+    assert sessions.get(session.session_id).status == "completed"  # type: ignore[union-attr]
 
 
 def test_daemon_codex_input_waits_for_endpoint_response(tmp_path) -> None:
