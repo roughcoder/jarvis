@@ -110,6 +110,7 @@ def make_app(
     async def events(request: web.Request) -> web.StreamResponse:
         require_auth(request)
         mode = str(request.query.get("sync") or "none")
+        client_cursor = str(request.query.get("after") or request.headers.get("Last-Event-ID") or "")
         body = cockpit_snapshot(
             store=store,
             worker_cfg=cfg.worker,
@@ -120,11 +121,24 @@ def make_app(
         cursor = body["cursor"]
         response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
         await response.prepare(request)
-        await _write_sse(response, "snapshot", cursor, {"cursor": cursor, "type": "snapshot", "payload": body})
+        if client_cursor != cursor:
+            await _write_sse(response, "snapshot", cursor, {"cursor": cursor, "type": "snapshot", "payload": body})
         try:
             while True:
                 await asyncio.sleep(1)
-                await response.write(b": heartbeat\n\n")
+                next_body = cockpit_snapshot(
+                    store=store,
+                    worker_cfg=cfg.worker,
+                    workers_path=cfg.orchestration.workers_path,
+                    sync_mode="none",
+                    http_get=get,
+                )
+                next_cursor = next_body["cursor"]
+                if next_cursor != cursor:
+                    cursor = next_cursor
+                    await _write_sse(response, "snapshot", cursor, {"cursor": cursor, "type": "snapshot", "payload": next_body})
+                else:
+                    await response.write(b": heartbeat\n\n")
         except (asyncio.CancelledError, ConnectionResetError, RuntimeError):
             return response
 

@@ -643,6 +643,9 @@ or breaking status, and migration notes.
   must not decode it.
 - Clarified idempotency replay behavior: successful repeated writes with the same
   key/body may include `"idempotent": true`.
+- Implemented `/v1/cockpit/events` as a cursor-aware SSE stream that sends an
+  initial or stale-cursor snapshot, heartbeat comments, and fresh snapshot
+  reconciliation packets when the projected cockpit cursor changes.
 
 ### 2026-07-01 - v1 Draft
 
