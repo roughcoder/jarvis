@@ -184,13 +184,13 @@ def sync_state(
 ) -> dict[str, Any]:
     mode = sync_mode if sync_mode in {"none", "fast", "probe"} else "none"
     if mode == "none":
-        return {"mode": mode, "status": "skipped", "synced_at": "", "errors": []}
+        return {"mode": mode, "status": "stale", "synced_at": "", "errors": []}
     job_summary = sync_run_jobs(store, worker_cfg=worker_cfg, workers_path=workers_path, get=http_get)
     session_summary_result = sync_run_sessions(store, worker_cfg=worker_cfg, workers_path=workers_path, get=http_get)
     summary = _merge_sync(job_summary, session_summary_result)
     return {
         "mode": mode,
-        "status": "fresh" if not summary.errors else "degraded",
+        "status": "fresh" if not summary.errors else "partial",
         "synced_at": utc_now(),
         "errors": summary.errors or [],
     }
@@ -645,8 +645,10 @@ def _public_worker_capabilities(profile: WorkerProfile) -> list[str]:
 def _worker_health(status: str) -> str:
     if status == "online":
         return "healthy"
+    if status == "degraded":
+        return "degraded"
     if status == "offline":
-        return "unreachable"
+        return "unhealthy"
     return "unknown"
 
 
