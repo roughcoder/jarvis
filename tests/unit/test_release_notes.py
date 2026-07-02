@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 
 
@@ -314,6 +316,43 @@ brew upgrade jarvis
     errors = release_notes.validate_release_markdown(notes)
 
     assert errors == ["Fixed has 9 bullets; group related changes down to 8 or fewer"]
+
+
+def test_deterministic_notes_cap_noisy_sections_before_strict_validation() -> None:
+    payload = {
+        "tag": "v1.2.3",
+        "summary": {
+            "breaking": [],
+            "features": [],
+            "fixes": [f"Fixed operator issue {index}." for index in range(12)],
+            "performance": [],
+            "other": [],
+            "env": [],
+            "operator_action": [],
+            "docs": [],
+        },
+        "env_diff": {"added": [], "removed": []},
+    }
+
+    notes = release_notes.deterministic_notes(payload)
+    errors = release_notes.validate_release_markdown(notes)
+
+    assert errors == []
+    assert "- Additional fixed updates:" in notes
+
+
+def test_describe_ai_error_includes_http_response_body() -> None:
+    error = urllib.error.HTTPError(
+        url="https://api.openai.com/v1/chat/completions",
+        code=400,
+        msg="Bad Request",
+        hdrs={},
+        fp=io.BytesIO(b'{"error":{"message":"invalid model"}}'),
+    )
+
+    assert release_notes.describe_ai_error(error) == (
+        'HTTP Error 400: Bad Request: {"error":{"message":"invalid model"}}'
+    )
 
 
 def test_release_runtime_refuses_local_publish(monkeypatch) -> None:

@@ -289,6 +289,17 @@ def bullet_lines(items: list[str]) -> list[str]:
     return [f"- {item}" for item in dict.fromkeys(item for item in items if item.strip())]
 
 
+def capped_bullet_lines(items: list[str], section: str, *, limit: int = QUALITY_SECTION_LIMIT) -> list[str]:
+    bullets = bullet_lines(items)
+    if len(bullets) <= limit:
+        return bullets
+
+    visible = bullets[: limit - 1]
+    overflow = [bullet.removeprefix("- ").strip().rstrip(".") for bullet in bullets[limit - 1 :]]
+    visible.append(f"- Additional {section.lower()} updates: {'; '.join(overflow)}.")
+    return visible
+
+
 def deterministic_notes(payload: dict[str, object]) -> str:
     tag = str(payload["tag"])
     summary = payload["summary"]
@@ -311,7 +322,10 @@ def deterministic_notes(payload: dict[str, object]) -> str:
         ("Other Changes", summary.get("other", [])),
     ]
     for title, values in sections:
-        bullets = bullet_lines(list(values))
+        if title in {"Changed", "Fixed", "Performance", "Other Changes"}:
+            bullets = capped_bullet_lines(list(values), title)
+        else:
+            bullets = bullet_lines(list(values))
         if bullets:
             lines.extend([f"## {title}", "", *bullets, ""])
 
@@ -498,9 +512,22 @@ def ai_notes(payload: dict[str, object]) -> str:
         return content + "\n"
     except (urllib.error.URLError, KeyError, IndexError, ValueError, json.JSONDecodeError) as exc:
         if os.environ.get("JARVIS_RELEASE_NOTES_AI", "auto").lower() == "always":
-            raise SystemExit(f"AI release notes failed: {exc}") from exc
-        print(f"AI release notes unavailable, using deterministic fallback: {exc}", file=sys.stderr)
+            raise SystemExit(f"AI release notes failed: {describe_ai_error(exc)}") from exc
+        print(f"AI release notes unavailable, using deterministic fallback: {describe_ai_error(exc)}", file=sys.stderr)
         return fallback
+
+
+def describe_ai_error(exc: BaseException) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            body = exc.read().decode("utf-8", errors="replace").strip()
+        except OSError:
+            body = ""
+        detail = f"HTTP Error {exc.code}: {exc.reason}"
+        if body:
+            return f"{detail}: {body[:1000]}"
+        return detail
+    return str(exc)
 
 
 def build_notes(version: str, base_tag: str, head_ref: str, ai_mode: str, *, strict: bool = False) -> str:
