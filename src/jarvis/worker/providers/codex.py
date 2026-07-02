@@ -599,8 +599,12 @@ def _project_jsonrpc_message(
             return True
         status = str(dict(params.get("turn") or {}).get("status") or "completed")
         event_type = EVENT_TURN_COMPLETED if status in {"completed", "done", "succeeded"} else EVENT_TURN_FAILED
-        sessions.update_status(session_id, SESSION_COMPLETED if event_type == EVENT_TURN_COMPLETED else SESSION_FAILED)
-        sessions.append_event(session_id, event_type, {**common, "provider_status": status, "raw": params})
+        sessions.append_event_with_status(
+            session_id,
+            SESSION_COMPLETED if event_type == EVENT_TURN_COMPLETED else SESSION_FAILED,
+            event_type,
+            {**common, "provider_status": status, "raw": params},
+        )
         return True
     elif method == "turn/started":
         sessions.append_event(session_id, EVENT_PROVIDER_TURN_STARTED, {**common, "raw": params})

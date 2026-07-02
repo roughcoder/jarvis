@@ -100,9 +100,8 @@ class FakeProviderAdapter:
                 EVENT_CHECKPOINT_CREATED,
                 {**common, CHECKPOINT_ID_KEY: f"ckpt_{turn.turn_id}", "label": "fake checkpoint"},
             ),
-            sessions.append_event(session.session_id, EVENT_TURN_COMPLETED, common),
+            sessions.append_event_with_status(session.session_id, SESSION_COMPLETED, EVENT_TURN_COMPLETED, common),
         ]
-        sessions.update_status(session.session_id, SESSION_COMPLETED)
         return events
 
     def resolve_approval(
