@@ -1084,6 +1084,16 @@ def test_cockpit_cors_preflight_uses_configured_origins(tmp_path, monkeypatch) -
                 "Access-Control-Request-Headers": "Authorization",
             },
         )
+        async with client.stream(
+            "GET",
+            f"{base}/v1/cockpit/events",
+            headers={"Origin": "https://cockpit.example", "Authorization": "Bearer secret"},
+        ) as sse:
+            first = ""
+            async for chunk in sse.aiter_text():
+                first += chunk
+                if "\n\n" in first:
+                    break
 
         assert allowed.status_code == 204
         assert allowed.headers["Access-Control-Allow-Origin"] == "https://cockpit.example"
@@ -1091,6 +1101,8 @@ def test_cockpit_cors_preflight_uses_configured_origins(tmp_path, monkeypatch) -
         assert "Authorization" in allowed.headers["Access-Control-Allow-Headers"]
         assert "Access-Control-Allow-Origin" not in denied.headers
         assert unknown.status_code == 404
+        assert sse.headers["Access-Control-Allow-Origin"] == "https://cockpit.example"
+        assert "event: snapshot" in first
 
     import asyncio
 
@@ -1467,6 +1479,8 @@ def test_cockpit_archive_run_hides_it_from_views(tmp_path, monkeypatch) -> None:
         snapshot = (await client.get(f"{base}/v1/cockpit/snapshot")).json()
         runs = (await client.get(f"{base}/v1/runs")).json()
         sessions = (await client.get(f"{base}/v1/sessions")).json()
+        detail = (await client.get(f"{base}/v1/runs/{run_id}")).json()
+        artifacts = (await client.get(f"{base}/v1/runs/{run_id}/artifacts")).json()
 
         assert response.status_code == 200
         assert response.json()["run"]["archived_at"]
@@ -1474,6 +1488,9 @@ def test_cockpit_archive_run_hides_it_from_views(tmp_path, monkeypatch) -> None:
         assert snapshot["sessions"] == []
         assert runs["runs"] == []
         assert sessions["sessions"] == []
+        assert detail["summary"]["artifact_count"] >= 2
+        assert detail["run"]["artifacts"]
+        assert {"branch", "pull_request"}.issubset({item["kind"] for item in artifacts["items"]})
 
     import asyncio
 
@@ -1927,6 +1944,28 @@ def test_cockpit_work_start_rejects_unknown_sources_without_github_fallback(tmp_
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get("")))
 
 
+def test_cockpit_work_start_caches_side_effecting_failures(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="worker.job.start,worker.session.create,worker.session.turn,forge.github.branch.push")
+    body = {"idempotency_key": "missing_repo_once", "source": "manual", "phrase": "Start work without repo"}
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        first = await client.post(f"{base}/v1/work/start", json=body)
+        second = await client.post(f"{base}/v1/work/start", json=body)
+        runs = OrchestrationStore(cfg.orchestration.workspace).list_runs()
+
+        assert first.status_code == 400
+        assert first.json()["error"]["code"] == "validation_failed"
+        assert second.status_code == 200
+        assert second.json()["ok"] is False
+        assert second.json()["idempotent"] is True
+        assert len(runs) == 1
+        assert runs[0].phase == "needs_human"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get("")))
+
+
 def test_cockpit_work_start_normalizes_nested_parallel_strategy(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, caps="worker.job.start,worker.session.create,worker.session.turn,forge.github.branch.push")
     store = OrchestrationStore(cfg.orchestration.workspace)
@@ -2096,6 +2135,11 @@ def test_cockpit_idempotency_store_treats_corrupt_or_expired_records_as_miss(tmp
     expired_path.write_text(json.dumps({"created_at": 0, "fingerprint": "ignored", "response": {"ok": True}}))
     assert store.get("sessions/test/turns", "expired", body) is None
     assert not expired_path.exists()
+
+    non_object_path = store._path("sessions/test/turns", "non-object")  # noqa: SLF001
+    non_object_path.write_text("[]")
+    assert store.get("sessions/test/turns", "non-object", body) is None
+    assert not non_object_path.exists()
 
 
 def test_cockpit_session_updates_are_keyed_by_worker_and_session(tmp_path, monkeypatch) -> None:  # noqa: ANN001

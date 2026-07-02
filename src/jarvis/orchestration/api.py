@@ -358,7 +358,7 @@ class CockpitReadHandlers:
             workers_path=self.ctx.cfg.orchestration.workers_path,
             http_get=self.ctx.get,
         )
-        artifacts = artifact_summaries([run])
+        artifacts = artifact_summaries([run], include_archived=True)
         detail = run_detail_projection(run, requests=requests, artifacts=artifacts)
         return web.json_response({"run": detail, "summary": run_summary(run, requests=requests, artifacts=artifacts)})
 
@@ -373,7 +373,7 @@ class CockpitReadHandlers:
         self.ctx.require_auth(request)
         run = await asyncio.to_thread(_run_or_404, self.ctx.store, request.match_info["run_id"])
         report_artifact = await asyncio.to_thread(run_report_artifact, self.ctx.store, run.run_id)
-        items = [*artifact_summaries([run]), report_artifact]
+        items = [*artifact_summaries([run], include_archived=True), report_artifact]
         return web.json_response(paged(items, after=str(request.query.get("after") or ""), limit=_limit(request)))
 
     async def sessions(self, request: web.Request) -> web.Response:
@@ -496,7 +496,10 @@ class CockpitWriteHandlers:
             try:
                 result = await asyncio.to_thread(service.next_work, command, start=True)
             except (MissingAuthorityError, NoEligibleWorkerError, WorkAlreadyOwnedError, MissingWorkRepoError, WorkerDispatchError) as exc:
-                raise _service_error(exc) from exc
+                error = _service_error(exc)
+                if isinstance(exc, (MissingWorkRepoError, WorkerDispatchError)):
+                    self.ctx.idempotency.save("work/start", str(body.get("idempotency_key") or ""), body, error.body())
+                raise error from exc
             if result is None or not isinstance(result, StartedWork):
                 raise CockpitError("not_found", "no eligible work item found", recoverable=True, status=404)
             response_body = _started_work_packet(self.ctx.store, result)
@@ -584,6 +587,7 @@ class SseHandlers:
         body = subscription.snapshot
         cursor = body["cursor"]
         response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
+        _apply_cors_headers(request, response)
         await response.prepare(request)
         if client_cursor != cursor:
             await _write_sse(response, "snapshot", cursor, _sse_envelope(cursor, "snapshot", body))
@@ -637,6 +641,8 @@ async def _error_middleware(request: web.Request, handler):  # noqa: ANN001
 
 
 def _apply_cors_headers(request: web.Request, response: web.StreamResponse) -> None:
+    if response.prepared:
+        return
     origin = _allowed_cors_origin(request)
     if not origin:
         return
