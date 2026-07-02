@@ -70,6 +70,32 @@ def _strip_wav_header(pcm: bytes) -> bytes:
 class InworldTTS:
     def __init__(self, cfg: TTSConfig) -> None:
         self._cfg = cfg
+        # One pooled client for the process: sentence-by-sentence streaming makes
+        # several requests per turn, and a fresh TCP+TLS handshake per request
+        # costs 100-300ms of time-to-first-audio. Keep-alive amortises it.
+        self._client: httpx.AsyncClient | None = None
+
+    def _http(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    self._cfg.request_timeout_s, connect=self._cfg.connect_timeout_s
+                ),
+                limits=httpx.Limits(max_keepalive_connections=4, keepalive_expiry=90.0),
+            )
+        return self._client
+
+    async def prewarm(self) -> None:
+        """Open (or refresh) a pooled TLS connection off the hot path, so the
+        turn's first synthesis call skips the handshake. Best-effort."""
+        try:
+            await self._http().options(self._cfg.base_url)
+        except Exception:  # noqa: BLE001 - warming must never break anything
+            pass
+
+    async def aclose(self) -> None:
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
 
     async def synthesize_stream(
         self, text: str, *, voice: str | None = None
@@ -94,25 +120,21 @@ class InworldTTS:
         }
 
         buffer = ""
-        timeout = httpx.Timeout(
-            self._cfg.request_timeout_s, connect=self._cfg.connect_timeout_s
-        )
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream("POST", url, headers=headers, json=body) as resp:
-                if resp.status_code != 200:
-                    detail = (await resp.aread()).decode("utf-8", "replace")
-                    raise RuntimeError(f"Inworld TTS {resp.status_code}: {detail[:300]}")
-                async for raw in resp.aiter_bytes():
-                    buffer += raw.decode("utf-8", "replace")
-                    objs, buffer = _extract_json_objects(buffer)
-                    for obj in objs:
-                        try:
-                            data = json.loads(obj)
-                        except json.JSONDecodeError:
-                            continue
-                        b64 = (data.get("result") or {}).get("audioContent")
-                        if not b64:
-                            continue
-                        pcm = _strip_wav_header(base64.b64decode(b64))
-                        if pcm:
-                            yield pcm
+        async with self._http().stream("POST", url, headers=headers, json=body) as resp:
+            if resp.status_code != 200:
+                detail = (await resp.aread()).decode("utf-8", "replace")
+                raise RuntimeError(f"Inworld TTS {resp.status_code}: {detail[:300]}")
+            async for raw in resp.aiter_bytes():
+                buffer += raw.decode("utf-8", "replace")
+                objs, buffer = _extract_json_objects(buffer)
+                for obj in objs:
+                    try:
+                        data = json.loads(obj)
+                    except json.JSONDecodeError:
+                        continue
+                    b64 = (data.get("result") or {}).get("audioContent")
+                    if not b64:
+                        continue
+                    pcm = _strip_wav_header(base64.b64decode(b64))
+                    if pcm:
+                        yield pcm

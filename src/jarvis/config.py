@@ -161,8 +161,10 @@ class VADConfig(_Base):
     # engine: "silero" for Mac accuracy, "webrtc" for lightweight Raspberry Pi installs.
     engine: str = "silero"
     webrtc_aggressiveness: int = 2  # 0-3, higher is stricter
-    # Tunables exposed from the start (spec §8).
-    endpoint_silence_ms: int = 900        # trailing silence -> end of speech
+    # Tunables exposed from the start (spec §8). 700ms trailing silence is the
+    # felt gap before Jarvis starts thinking — with streaming STT overlapping the
+    # window, a shorter endpoint no longer costs transcription accuracy.
+    endpoint_silence_ms: int = 700        # trailing silence -> end of speech
     speech_threshold: float = 0.5         # endpointing sensitivity
     # Barge-in needs an AEC input path (AEC mic or headphones); without one,
     # the speakers leak into the mic and Jarvis interrupts itself. Toggle off
@@ -215,6 +217,14 @@ class AudioConfig(_Base):
     # TTS), or "none".
     ack_mode: str = "beep"
     ack_phrase: str = "Yes?"
+    # Streaming playback (see intercom/audio _StreamingPlayer). blocksize sets the
+    # per-callback budget (~85ms at 24k — the device offers only ~20ms of hardware
+    # buffer); preroll is the silent warmup before the first audible sample;
+    # prebuffer is how much REAL audio must be queued before speech starts (jitter
+    # absorption at the sentence onset).
+    playback_blocksize: int = 2048
+    playback_preroll_ms: int = 300
+    playback_prebuffer_ms: int = 200
 
 
 class PersonaConfig(_Base):
@@ -226,6 +236,10 @@ class PersonaConfig(_Base):
     # Skills (§7): self-authored markdown recipes composing tools. Index = SKILLS.md.
     skills_dir: str = "jarvis-workspace/skills"
     history_messages: int = 16      # rolling shared context window (user+assistant)
+    # Tool results carried into that window are truncated to this many chars — a
+    # browsed page or search dump would otherwise inflate every later turn's
+    # prompt (and its latency). 0 = keep full results.
+    history_tool_result_chars: int = 1500
     expressive: bool = True         # let replies use Inworld TTS-2 emotion cues
     # IANA tz name (e.g. "Europe/London") injected so Jarvis knows "now" without
     # a tool/search. Empty = the host's local timezone.
@@ -352,11 +366,13 @@ class BrainConfig(_Base):
     websocket_ping_timeout_s: float = 60.0
     # Local Faster-Whisper is not a native streaming decoder, so streaming STT
     # runs bounded snapshot transcriptions while audio is still arriving and
-    # reuses one only when it exactly covers the final PCM.
-    streaming_stt_enabled: bool = False
-    streaming_stt_min_audio_s: float = 2.0
-    streaming_stt_interval_s: float = 1.0
-    streaming_stt_max_partials: int = 2
+    # reuses one when only endpoint silence arrived after it (the missing tail is
+    # silence by definition — the VAD endpointed on it). Snapshots self-throttle:
+    # a new one is never scheduled while the previous is still running.
+    streaming_stt_enabled: bool = True
+    streaming_stt_min_audio_s: float = 1.0
+    streaming_stt_interval_s: float = 0.5
+    streaming_stt_max_partials: int = 8
 
 
 class IntercomConfig(_Base):

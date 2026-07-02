@@ -112,7 +112,9 @@ class BufferedAudioTurn:
 
 
 def _is_alarm_ack(text: str) -> bool:
-    return bool(_ALARM_ACK.search(text or ""))
+    """Only short utterances count as an ack — "okay, set another timer for five
+    minutes" during a ring is a request, not a dismissal, and must reach the LLM."""
+    return len((text or "").split()) <= 6 and bool(_ALARM_ACK.search(text or ""))
 
 
 def _dir_mtime(users_dir: str) -> float:
@@ -276,6 +278,8 @@ class BrainServer:
                 if t is not None:
                     t.cancel()
             await self._mcp.aclose()
+            with contextlib.suppress(Exception):
+                await self._tts.aclose()  # release the pooled TTS connections
 
     async def _proactive_loop(self) -> None:
         """Tick alarms (deliver rings to the setting device) and flush held
@@ -327,14 +331,22 @@ class BrainServer:
     async def _broadcast(self, text: str) -> None:
         """Push a proactive notification (heartbeat / background completion) to every
         connected intercom — chime + spoken text, and open the mic so the user can reply
-        (turn it into a chat). Best-effort; a dead socket is skipped, never fatal."""
+        (turn it into a chat). A device mid-turn gets it HELD instead — an intercom
+        playing a reply discards foreign-turn audio, so pushing now would lose it; the
+        proactive tick flushes once the device goes idle. Best-effort; a dead socket is
+        skipped, never fatal."""
         if self._quiet_now():
             print(f"  [proactive] heartbeat suppressed (quiet hours): {text}")
             return
         print(f"  [proactive] notify → {len(self._connections)} intercom(s): {text}")
-        await self._deliver_proactive(
-            self._connections, text, kind="notification", open_mic=True, speak=True, tone=True
-        )
+        for device_id, conns in list(self._device_conns.items()):
+            if device_id in self._busy:
+                self._pending.setdefault(device_id, []).append((text, "notification", True))
+                print(f"  [proactive] held for device={device_id} (busy): {text}")
+                continue
+            await self._deliver_proactive(
+                conns, text, kind="notification", open_mic=True, speak=True, tone=True
+            )
 
     async def _deliver_proactive(self, conns, text, *, kind="notification", open_mic=False,  # noqa: ANN001
                                  speak=True, tone=True) -> int:
@@ -578,7 +590,10 @@ class BrainServer:
         buffers[msg.turn_id] = {
             "sample_rate": sample_rate,
             "voice_mode": normalize_mode(msg.voice_mode),
-            "chunks": [],
+            # One growing bytearray (amortised O(1) appends) — a chunk list would
+            # need a full re-join for every streaming-STT snapshot.
+            "pcm": bytearray(),
+            "chunk_count": 0,
             "pcm_bytes": 0,
             "frame_bytes": 0,
             "max_pcm_bytes": int(
@@ -603,7 +618,8 @@ class BrainServer:
         if max_pcm_bytes and pcm_bytes > max_pcm_bytes:
             BrainServer._discard_audio_buffer(buffers.pop(binary.turn_id, None))
             return False
-        buf["chunks"].append(binary.pcm)
+        buf["pcm"].extend(binary.pcm)
+        buf["chunk_count"] += 1
         buf["pcm_bytes"] = pcm_bytes
         buf["frame_bytes"] += frame_bytes
         if binary.sample_rate:
@@ -615,13 +631,12 @@ class BrainServer:
         buf = conn.get("audio_buffers", {}).pop(turn_id, None)
         if buf is None:
             return None
-        chunks = list(buf.get("chunks", []))
-        pcm = b"".join(chunks)
+        pcm = bytes(buf.get("pcm", b""))
         return BufferedAudioTurn(
             turn_id=turn_id,
             sample_rate=int(buf.get("sample_rate") or 16000),
             pcm=pcm,
-            chunks=len(chunks),
+            chunks=int(buf.get("chunk_count") or 0),
             frame_bytes=int(buf.get("frame_bytes") or len(pcm)),
             stream_ms=(time.perf_counter() - float(buf.get("started_at", time.perf_counter())))
             * 1000,
@@ -669,7 +684,7 @@ class BrainServer:
         last_at = float(buf.get("streaming_stt_last_at") or 0.0)
         if last_at and now - last_at < max(0.0, self._cfg.brain.streaming_stt_interval_s):
             return
-        pcm = b"".join(buf.get("chunks", []))
+        pcm = bytes(buf.get("pcm", b""))
         if not pcm:
             return
         buf["streaming_stt_last_at"] = now
@@ -697,11 +712,19 @@ class BrainServer:
         pcm = msg.pcm
         secs = len(pcm) / 2 / msg.sample_rate
         task = msg.streaming_stt_task
-        partial: dict | None = None
-        if task is not None:
+        # A partial is reusable when the audio it's missing is ONLY trailing
+        # endpoint silence: the edge VAD closed the utterance on endpoint_silence_ms
+        # of quiet, so any bytes that arrived after the snapshot within that window
+        # carry no speech (100ms safety margin for clock/threshold skew). Decide by
+        # SIZE before awaiting — waiting on a stale snapshot and then transcribing
+        # from scratch would serialise the two.
+        allowance_ms = max(0, self._cfg.vad.endpoint_silence_ms - 100)
+        allowance = int(msg.sample_rate * 2 * allowance_ms / 1000)
+        missing = len(pcm) - msg.streaming_stt_pcm_bytes
+        if task is not None and 0 <= missing <= allowance:
+            partial: dict | None = None
             try:
                 partial = await task
-                stale = int(partial.get("pcm_bytes") or 0) != len(pcm)
                 trace.stage(
                     "stt_stream",
                     partial.get("ms", 0.0),
@@ -709,23 +732,28 @@ class BrainServer:
                     chars=partial.get("chars", 0),
                     pcm_bytes=partial.get("pcm_bytes", 0),
                     partial_runs=msg.streaming_stt_partial_runs,
-                    stale=stale,
+                    missing_tail_ms=round(missing / 2 / msg.sample_rate * 1000, 1),
                 )
             except Exception as exc:  # noqa: BLE001 - final STT below still recovers
                 trace.event("stt_stream_error", error=type(exc).__name__)
-                partial = None
-        if partial is not None and int(partial.get("pcm_bytes") or 0) == len(pcm):
-            trace.start("stt")
-            text = str(partial.get("text") or "")
-            trace.end(
-                "stt",
-                audio_s=round(secs, 1),
-                chars=len(text),
-                streaming=True,
-                reused_partial=True,
-                partial_runs=msg.streaming_stt_partial_runs,
-            )
-            return text, secs
+            if partial is not None:
+                trace.start("stt")
+                text = str(partial.get("text") or "")
+                trace.end(
+                    "stt",
+                    audio_s=round(secs, 1),
+                    chars=len(text),
+                    streaming=True,
+                    reused_partial=True,
+                    partial_runs=msg.streaming_stt_partial_runs,
+                )
+                return text, secs
+        elif task is not None:
+            # Too stale to reuse. Cancel detaches it (a running Whisper pass can't
+            # be stopped mid-thread) — the point is to start the real transcription
+            # NOW instead of serialising behind a result we'd throw away.
+            task.cancel()
+            task.add_done_callback(self._observe_abandoned_stt_snapshot)
 
         trace.start("stt")
         text = await asyncio.to_thread(
