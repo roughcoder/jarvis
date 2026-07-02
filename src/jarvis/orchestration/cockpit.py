@@ -347,8 +347,43 @@ def project_worker_profile(profile: WorkerProfile) -> dict[str, Any]:
             "active_sessions": profile.current_jobs,
             "queued_sessions": 0,
         },
+        "system": project_worker_system(profile.system),
         "repositories": [],
         "public_metadata": {},
+    }
+
+
+def project_worker_system(system: Any) -> dict[str, Any]:
+    if not isinstance(system, dict):
+        system = {}
+    disks = []
+    for disk in system.get("disk") or []:
+        if not isinstance(disk, dict):
+            continue
+        disks.append(
+            {
+                "mount": disk.get("mount"),
+                "total_bytes": disk.get("total_bytes"),
+                "available_bytes": disk.get("available_bytes"),
+                "used_percent": disk.get("used_percent"),
+            }
+        )
+    return {
+        "hostname": system.get("hostname"),
+        "platform": system.get("platform"),
+        "arch": system.get("arch"),
+        "os_name": system.get("os_name"),
+        "os_version": system.get("os_version"),
+        "cpu_model": system.get("cpu_model"),
+        "cpu_cores_physical": system.get("cpu_cores_physical"),
+        "cpu_cores_logical": system.get("cpu_cores_logical"),
+        "memory_total_bytes": system.get("memory_total_bytes"),
+        "memory_available_bytes": system.get("memory_available_bytes"),
+        "memory_used_percent": system.get("memory_used_percent"),
+        "load_average": system.get("load_average") or [None, None, None],
+        "uptime_seconds": system.get("uptime_seconds"),
+        "disk": disks,
+        "checked_at": system.get("checked_at"),
     }
 
 
@@ -782,7 +817,11 @@ def snapshot_cursor(public_projection: dict[str, Any]) -> str:
 
 
 def _cursor_worker(worker: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in worker.items() if key != "last_seen_at"}
+    row = {key: value for key, value in worker.items() if key != "last_seen_at"}
+    system = row.get("system")
+    if isinstance(system, dict):
+        row["system"] = {key: value for key, value in system.items() if key != "checked_at"}
+    return row
 
 
 def artifact_id(run_id: str, kind: str, key: str) -> str:

@@ -55,6 +55,7 @@ from jarvis.worker.actions import (
 from jarvis.worker.jobs import JobManager, slugify
 from jarvis.worker.providers import ProviderTurn, provider_for
 from jarvis.worker.sessions import SessionManager, WorkerSession
+from jarvis.system_info import system_info_cached
 from jarvis.worker_session_contract import (
     CHECKPOINT_ID_KEY,
     EVENT_APPROVAL_RESOLVED,
@@ -625,21 +626,22 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             return web.json_response({"error": "unauthorized"}, status=401)
         return await _provider_terminal_event(request, sessions, "stop")
 
-    async def health(_request: web.Request) -> web.Response:
+    async def health(request: web.Request) -> web.Response:
         supported_engines = engine_ids(cfg.supported_engines, default_engine=cfg.agent)
-        return web.json_response(
-            {
-                "ok": True,
-                "agent": cfg.agent,
-                "default_engine": normalize_engine_id(cfg.agent),
-                "supported_engines": supported_engines,
-                "engine_supports": _engine_supports(supported_engines),
-                "workspace": str(workspace),
-                "repo_root_configured": bool(cfg.repo_root),
-                "browser_enabled": browser_cfg.enabled,
-                "gui_provider_configured": bool(cfg.peekaboo_ai_providers),
-            }
-        )
+        body = {
+            "ok": True,
+            "agent": cfg.agent,
+            "default_engine": normalize_engine_id(cfg.agent),
+            "supported_engines": supported_engines,
+            "engine_supports": _engine_supports(supported_engines),
+            "workspace": str(workspace),
+            "repo_root_configured": bool(cfg.repo_root),
+            "browser_enabled": browser_cfg.enabled,
+            "gui_provider_configured": bool(cfg.peekaboo_ai_providers),
+        }
+        if authorised(request):
+            body["system"] = system_info_cached()
+        return web.json_response(body)
 
     app = web.Application()
     app["browser_holder"] = browser_holder  # for clean shutdown in serve()

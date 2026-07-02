@@ -38,6 +38,7 @@ from jarvis.orchestration.cockpit import (
     make_session_ref,
     paged,
     project_worker_profile,
+    project_worker_system,
     project_checkpoint,
     project_request,
     project_session_event,
@@ -73,6 +74,7 @@ from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource, Wor
 from jarvis.orchestration.store import OrchestrationStore
 from jarvis.orchestration.supervisor import final_session_phase
 from jarvis.orchestration.workers import WorkerRegistry
+from jarvis.system_info import system_info_cached
 
 HttpGet = Callable[..., Any]
 HttpPost = Callable[..., Any]
@@ -282,7 +284,15 @@ class CockpitReadHandlers:
 
     async def health(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
-        return web.json_response({"ok": True, "api_version": API_VERSION, "schema_version": SCHEMA_VERSION})
+        system = await asyncio.to_thread(system_info_cached)
+        return web.json_response(
+            {
+                "ok": True,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "system": project_worker_system(system),
+            }
+        )
 
     async def catalog(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)

@@ -634,10 +634,76 @@ def test_daemon_health_shell_and_auth(tmp_path) -> None:
 
     health, noauth, shell, bad, unknown = asyncio.run(_with_server(cfg, 8802, calls))
     assert health["ok"] is True
+    assert "system" not in health
     assert noauth == 401  # missing token
     assert bad == 401  # wrong token
     assert shell["output"] == "worker-ok"
     assert unknown == 400  # unknown action
+
+
+def test_daemon_health_includes_best_effort_system_block(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(
+        "jarvis.worker.server.system_info_cached",
+        lambda: {
+            "hostname": "neil-laptop",
+            "platform": "darwin",
+            "arch": "arm64",
+            "os_name": "macOS",
+            "os_version": "15.5",
+            "kernel_version": "24.5.0",
+            "cpu_model": "Apple M4 Pro",
+            "cpu_cores_physical": 12,
+            "cpu_cores_logical": 12,
+            "memory_total_bytes": 51539607552,
+            "memory_available_bytes": 21474836480,
+            "memory_used_bytes": 30064771072,
+            "memory_used_percent": 58.3,
+            "load_average": [2.12, 2.44, 2.19],
+            "uptime_seconds": 384220,
+            "disk": [
+                {
+                    "mount": "/",
+                    "filesystem": "apfs",
+                    "total_bytes": 994662584320,
+                    "available_bytes": 420118257664,
+                    "used_bytes": 574544326656,
+                    "used_percent": 57.8,
+                }
+            ],
+            "gpu": [{"name": "Apple M4 Pro", "memory_total_bytes": None}],
+            "checked_at": "2026-07-02T23:35:00Z",
+        },
+    )
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"))
+
+    async def calls(base, c):  # noqa: ANN001
+        return (await c.get(base + "/health")).json()
+
+    health = asyncio.run(_with_server(cfg, 8818, calls))
+
+    assert health["system"]["hostname"] == "neil-laptop"
+    assert health["system"]["disk"][0]["filesystem"] == "apfs"
+    assert health["system"]["gpu"][0]["name"] == "Apple M4 Pro"
+    assert health["system"]["checked_at"] == "2026-07-02T23:35:00Z"
+
+
+def test_daemon_health_returns_system_block_only_for_authorized_callers(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(
+        "jarvis.worker.server.system_info_cached",
+        lambda: {"hostname": "worker-laptop", "checked_at": "2026-07-02T23:35:00Z"},
+    )
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+
+    async def calls(base, c):  # noqa: ANN001
+        public_health = (await c.get(base + "/health")).json()
+        private_health = (await c.get(base + "/health", headers={"Authorization": "Bearer tkn"})).json()
+        return public_health, private_health
+
+    public_health, private_health = asyncio.run(_with_server(cfg, 8819, calls))
+
+    assert public_health["ok"] is True
+    assert "system" not in public_health
+    assert private_health["system"]["hostname"] == "worker-laptop"
 
 
 def test_daemon_shell_uses_expanded_default_workspace(tmp_path, monkeypatch) -> None:  # noqa: ANN001

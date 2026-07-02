@@ -310,11 +310,14 @@ class WorkerProfile:
     default_engine: str = ""
     supported_engines: list[str] = field(default_factory=list)
     engine_supports: dict[str, dict[str, bool]] = field(default_factory=dict)
+    system: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.default_engine = default_engine(self.default_engine or self.agent, self.supported_engines)
         self.supported_engines = engine_ids(self.supported_engines, default_engine=self.default_engine)
         self.agent = self.default_engine
+        if not isinstance(self.system, dict):
+            self.system = {}
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> WorkerProfile:
@@ -340,5 +343,6 @@ class WorkerProfile:
             "default_engine": self.default_engine,
             "supported_engines": self.supported_engines,
             "engine_supports": self.engine_supports,
+            "system": self.system,
             "token_set": self.token_set,
         }
