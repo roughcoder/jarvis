@@ -150,6 +150,9 @@ class IdempotencyStore:
         except (OSError, json.JSONDecodeError):
             path.unlink(missing_ok=True)
             return None
+        if not isinstance(record, dict):
+            path.unlink(missing_ok=True)
+            return None
         if _idempotency_expired(record):
             path.unlink(missing_ok=True)
             return None
@@ -175,6 +178,9 @@ class IdempotencyStore:
             try:
                 record = json.loads(path.read_text())
             except (OSError, json.JSONDecodeError):
+                path.unlink(missing_ok=True)
+                continue
+            if not isinstance(record, dict):
                 path.unlink(missing_ok=True)
                 continue
             if _idempotency_expired(record, now=current):
@@ -665,13 +671,13 @@ def project_checkpoint(raw: dict[str, Any], worker_id: str, session_id: str, run
     }
 
 
-def artifact_summaries(runs: list[OrchestrationRun]) -> list[dict[str, Any]]:
+def artifact_summaries(runs: list[OrchestrationRun], *, include_archived: bool = False) -> list[dict[str, Any]]:
     artifacts: list[dict[str, Any]] = []
     for run in runs:
-        if run.archived_at:
+        if run.archived_at and not include_archived:
             continue
         for session in run.sessions:
-            if session.archived_at:
+            if session.archived_at and not include_archived:
                 continue
             if session.branch:
                 artifacts.append(
