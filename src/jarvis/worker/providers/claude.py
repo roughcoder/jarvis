@@ -320,8 +320,12 @@ def _project_claude_message(
         if _session_cancelled(sessions, session_id):
             return True
         event_type = EVENT_TURN_FAILED if is_error else EVENT_TURN_COMPLETED
-        sessions.update_status(session_id, SESSION_FAILED if is_error else SESSION_COMPLETED)
-        sessions.append_event(session_id, event_type, {**common, "provider_status": subtype or message_type, "raw": message})
+        sessions.append_event_with_status(
+            session_id,
+            SESSION_FAILED if is_error else SESSION_COMPLETED,
+            event_type,
+            {**common, "provider_status": subtype or message_type, "raw": message},
+        )
         return True
     elif message_type:
         sessions.append_event(session_id, EVENT_PROVIDER_EVENT, {**common, "raw": message})

@@ -212,6 +212,32 @@ class SessionManager:
             self.save(session)
             return event
 
+    def append_event_with_status(
+        self,
+        session_id: str,
+        status: str,
+        event_type: str,
+        data: dict[str, Any] | None = None,
+    ) -> SessionEvent:
+        with self._lock:
+            session = self.get(session_id)
+            if session is None:
+                raise KeyError(session_id)
+            if not _valid_event_type(event_type):
+                raise ValueError(f"invalid event type {event_type!r}")
+            existing = self._idempotent_event(session.session_id, event_type, data or {})
+            session.status = status
+            session.updated_at = utc_now()
+            self.save(session)
+            if existing is not None:
+                return existing
+            event = SessionEvent.create(session.session_id, event_type, data)
+            with self.events_path(session.session_id).open("a") as f:
+                f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
+            session.updated_at = event.time
+            self.save(session)
+            return event
+
     def reserve_turn(self, session_id: str, data: dict[str, Any]) -> tuple[WorkerSession, SessionEvent, bool]:
         with self._lock:
             session = self.get(session_id)
