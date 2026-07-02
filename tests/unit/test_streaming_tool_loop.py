@@ -11,9 +11,11 @@ Also pins the history compaction of big tool results and the sticky MCP offer.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 from jarvis.brain.context import RequestContext
 from jarvis.brain.session import BrainSession, TurnResult
+from jarvis.brain.tracing import TurnTrace
 from jarvis.config import load_config
 from jarvis.tools.base import Tool, ToolRegistry
 
@@ -76,12 +78,12 @@ def _session(gateway, tts=None, registry=None) -> BrainSession:  # noqa: ANN001
     )
 
 
-def _drive(session, tool_schemas, result, *, speak=True, stop_after=None):  # noqa: ANN001
+def _drive(session, tool_schemas, result, *, speak=True, stop_after=None, trace=None):  # noqa: ANN001
     chunks: list[bytes] = []
 
     async def go() -> None:
         gen = session._run_tool_loop(
-            [{"role": "user", "content": "hi"}], "fast", None, tool_schemas, result,
+            [{"role": "user", "content": "hi"}], "fast", trace, tool_schemas, result,
             speak=speak,
         )
         try:
@@ -162,7 +164,64 @@ def test_bargein_mid_stream_leaves_partial_raw() -> None:
     chunks = _drive(_session(gw, tts), [], result, stop_after=1)
 
     assert chunks == [b"PCM:First sentence spoken aloud."]
-    assert result.raw.startswith("First sentence spoken aloud.")
+    # raw holds ONLY what was audibly delivered — the second sentence was
+    # generated (and maybe synthesising) but never reached the speaker.
+    assert result.raw == "First sentence spoken aloud."
+
+
+def test_bargein_before_any_audio_leaves_raw_empty() -> None:
+    """result.raw is what was actually SAID: a barge-in while the first
+    sentence's synthesis is still warming must not put unsaid text into
+    history/memory via finalize()."""
+
+    class _StuckTTS:
+        async def synthesize_stream(self, text, *, voice=None):  # noqa: ANN001
+            await asyncio.Event().wait()  # never produces a chunk
+            yield b""  # pragma: no cover
+
+    gw = _StreamGateway([[("text", "This sentence never reaches the speaker.")]])
+    session = _session(gw, _StuckTTS())
+    result = TurnResult()
+
+    async def go() -> None:
+        gen = session._run_tool_loop(
+            [{"role": "user", "content": "hi"}], "fast", None, [], result, speak=True
+        )
+
+        async def consume() -> None:
+            async for _ in gen:
+                pass
+
+        task = asyncio.create_task(consume())
+        await asyncio.sleep(0.05)  # stream ends; loop blocks on the stuck pump
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        await gen.aclose()
+
+    asyncio.run(go())
+
+    assert result.raw == ""
+
+
+def test_llm_stage_excludes_tts_drain_time() -> None:
+    """The llm trace stage ends when the model stream ends — the sentence-pump
+    drain that follows is TTS time and must not inflate it."""
+
+    class _SlowTTS:
+        async def synthesize_stream(self, text, *, voice=None):  # noqa: ANN001
+            await asyncio.sleep(0.15)
+            yield b"PCM"
+
+    gw = _StreamGateway([[("text", "Quick answer for the trace test.")]])
+    result = TurnResult()
+    trace = TurnTrace(room="x", speaker="neil")
+    _drive(_session(gw, _SlowTTS()), [], result, trace=trace)
+
+    llm_ms = trace.data["stages"]["llm"]["ms"]
+    tts_ms = trace.data["stages"]["tts"]["ms"]
+    assert llm_ms < 100  # ended at stream end, not after the 150ms synthesis
+    assert tts_ms > llm_ms
 
 
 def test_speak_false_streams_text_without_tts() -> None:
@@ -225,3 +284,22 @@ def test_mcp_offer_is_sticky_within_a_conversation() -> None:
     assert "notion_search" in first  # keyword match brought it in
     assert "notion_search" in second  # sticky kept it (stable cached prefix)
     assert "notion_search" not in third  # cleared at conversation end
+
+
+def test_sticky_offers_cleared_after_non_voice_turns() -> None:
+    """Messaging turns never set result.ended, so without a channel check a text
+    session would accrete MCP servers forever and defeat the relevance filter."""
+    cfg = load_config()
+    ctx = RequestContext("dev", "neil", "personal", frozenset(), channel="text")
+    session = BrainSession(
+        cfg, ctx, gateway=None, tts=None, memory=None, tracer=None,
+        registry=ToolRegistry(),
+    )
+    session._fire_cold_path = lambda *_args: None  # type: ignore[method-assign]
+    session._sticky_servers.add("notion")
+
+    result = TurnResult(raw="Sure thing.")
+    session.finalize("thanks", result)
+
+    assert result.ended is False  # each text message is a discrete turn
+    assert session._sticky_servers == set()  # but sticky offers still reset
