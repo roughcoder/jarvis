@@ -418,8 +418,12 @@ class BrainSession:
                     assistant_asked_followup=transition.assistant_asked_followup,
                 )
         self._remember(user_text, result)
-        if result.ended:
-            self._sticky_servers.clear()  # next conversation re-narrows the offer
+        # Sticky offers live for one voice conversation (cache-prefix stability
+        # between open-mic turns). Messaging turns never set ended, so without
+        # the channel check a text session would accrete servers forever and
+        # defeat the relevance filter.
+        if result.ended or self._ctx.channel != "voice":
+            self._sticky_servers.clear()
         if result.reply:
             self._fire_cold_path(user_text, result.reply)
 
@@ -647,9 +651,11 @@ class BrainSession:
         self._cold_tasks.add(task)
         task.add_done_callback(self._cold_tasks.discard)
 
-    def _start_tts_pump(self, text: str) -> tuple[asyncio.Task, asyncio.Queue]:
+    def _start_tts_pump(self, text: str, raw_sent: str) -> dict:
         """Kick off synthesis of one sentence NOW; chunks land in a queue the
-        caller drains in order. Lets sentence N+1 synthesise while N streams."""
+        caller drains in order. Lets sentence N+1 synthesise while N streams.
+        Carries the raw sentence so it can be marked as spoken only once its
+        audio is actually delivered."""
         q: asyncio.Queue = asyncio.Queue()
 
         async def run() -> None:
@@ -661,16 +667,21 @@ class BrainSession:
             finally:
                 q.put_nowait(None)
 
-        return asyncio.create_task(run()), q
+        return {"task": asyncio.create_task(run()), "q": q, "raw": raw_sent, "spoken": False}
 
     async def _drain_pumps(
-        self, pumps: deque, meta: dict, *, block: bool, only_head: bool = False
+        self, pumps: deque, meta: dict, *, block: bool, only_head: bool = False,
+        on_spoken=None,  # noqa: ANN001 - called with the raw sentence once its audio flows
     ) -> AsyncIterator[bytes]:
         """Yield PCM from the pump queue heads, strictly in sentence order.
         Non-blocking mode stops at the first empty queue (used between LLM
-        deltas); blocking mode drains to the end (or just the head sentence)."""
+        deltas); blocking mode drains to the end (or just the head sentence).
+        A sentence counts as SPOKEN at its first delivered chunk (or clean,
+        chunkless completion) — never on error, and never if a barge-in closes
+        the caller before its audio started."""
         while pumps:
-            _task, q = pumps[0]
+            pump = pumps[0]
+            q = pump["q"]
             while True:
                 if block:
                     item = await q.get()
@@ -684,11 +695,19 @@ class BrainSession:
                 if isinstance(item, Exception):
                     pumps.popleft()
                     raise item
+                if not pump["spoken"]:
+                    pump["spoken"] = True
+                    if on_spoken is not None:
+                        on_spoken(pump["raw"])
                 if meta.get("first") is None:
                     meta["first"] = time.perf_counter()
                 meta["bytes"] = meta.get("bytes", 0) + len(item)
                 yield item
             pumps.popleft()
+            if not pump["spoken"]:  # completed cleanly with no audio (rare)
+                pump["spoken"] = True
+                if on_spoken is not None:
+                    on_spoken(pump["raw"])
             if only_head:
                 return
 
@@ -711,9 +730,10 @@ class BrainSession:
         gateway = self._gateway_for()
         use_stream = self._cfg.gateway.stream and hasattr(gateway, "stream_with_tools")
         first_tok: float | None = None
-        spoken: list[str] = []  # sentences streamed for speech, across rounds
+        llm_done: float | None = None  # model stream end — BEFORE the TTS drain
+        spoken: list[str] = []  # sentences whose audio was actually delivered
         steering: str | None = None
-        pumps: deque = deque()  # in-flight sentence TTS: (task, queue)
+        pumps: deque = deque()  # in-flight sentence TTS pumps
         tts_meta: dict = {"first": None, "bytes": 0, "chars": 0, "t0": None}
 
         def _stage_text(sent: str) -> str:
@@ -725,26 +745,36 @@ class BrainSession:
                 return ""
             return f"{steering} {text}" if steering else text
 
-        async def emit(sent: str):  # yields PCM for one completed sentence
+        def mark_spoken(sent: str) -> None:
             spoken.append(sent)
             result.raw = " ".join(spoken)
+
+        async def emit(sent: str):  # yields PCM for one completed sentence
             if not (speak and self._tts is not None):
+                mark_spoken(sent)  # text turn: the reply IS the text
                 return
             text = _stage_text(sent)
             if not text:
+                mark_spoken(sent)  # nothing speakable (e.g. a bare [[END]] marker)
                 return
             if tts_meta["t0"] is None:
                 tts_meta["t0"] = time.perf_counter()
             tts_meta["chars"] += len(text)
             while len(pumps) >= 3:  # cap in-flight TTS requests
-                async for pcm in self._drain_pumps(pumps, tts_meta, block=True, only_head=True):
+                async for pcm in self._drain_pumps(
+                    pumps, tts_meta, block=True, only_head=True, on_spoken=mark_spoken
+                ):
                     yield pcm
-            pumps.append(self._start_tts_pump(text))
-            async for pcm in self._drain_pumps(pumps, tts_meta, block=False):
+            # raw is updated by mark_spoken when this sentence's audio flows,
+            # not here — result.raw must only ever hold what was actually said.
+            pumps.append(self._start_tts_pump(text, sent))
+            async for pcm in self._drain_pumps(
+                pumps, tts_meta, block=False, on_spoken=mark_spoken
+            ):
                 yield pcm
 
         async def stream_round(tools, calls: list, parts: list):  # yields PCM
-            nonlocal first_tok
+            nonlocal first_tok, llm_done
             buf = ""
             async for delta in gateway.stream_with_tools(
                 messages, model=model, tools=tools, usage_out=usage, tool_calls_out=calls
@@ -763,13 +793,18 @@ class BrainSession:
                     if sent.strip():
                         async for pcm in emit(sent):
                             yield pcm
-                async for pcm in self._drain_pumps(pumps, tts_meta, block=False):
+                async for pcm in self._drain_pumps(
+                    pumps, tts_meta, block=False, on_spoken=mark_spoken
+                ):
                     yield pcm
+            llm_done = time.perf_counter()  # the drain below is TTS time, not LLM
             if not calls and buf.strip():
                 async for pcm in emit(buf.strip()):
                     yield pcm
             # Speech settles before tools run / before the turn ends.
-            async for pcm in self._drain_pumps(pumps, tts_meta, block=True):
+            async for pcm in self._drain_pumps(
+                pumps, tts_meta, block=True, on_spoken=mark_spoken
+            ):
                 yield pcm
 
         try:
@@ -787,12 +822,16 @@ class BrainSession:
                     msg = await gateway.complete_with_tools(
                         messages, model=model, tools=tools, usage_out=usage
                     )
+                    llm_done = time.perf_counter()
                     content = msg.content or ""
                     calls = [
                         {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments}
                         for tc in (msg.tool_calls or [])
                     ]
                 if not calls or final_round:
+                    self._record_llm(
+                        trace, t0, model, content, n_tools, usage, first_tok, end=llm_done
+                    )
                     if not use_stream:
                         result.raw = content
                         if speak and self._tts is not None:
@@ -800,9 +839,8 @@ class BrainSession:
                             if text:
                                 async for pcm in self._tts_source(text, trace):
                                     yield pcm
-                    elif not spoken:
+                    elif not spoken and not pumps:
                         result.raw = content  # e.g. an all-whitespace stream
-                    self._record_llm(trace, t0, model, result.raw, n_tools, usage, first_tok)
                     self._record_tts(trace, tts_meta, t0, first_tok)
                     return
                 assistant_msg = {
@@ -877,14 +915,17 @@ class BrainSession:
                         messages.append(tool_msg)
                         result.tool_messages.append(tool_msg)  # carry into history
         finally:
-            for task, _q in pumps:  # barge-in / error: kill in-flight synthesis
-                task.cancel()
+            for pump in pumps:  # barge-in / error: kill in-flight synthesis
+                pump["task"].cancel()
 
     @staticmethod
     def _record_llm(  # noqa: ANN001
         trace, t0: float, model: str, content: str, n_tools: int,
         usage: dict | None = None, first_tok: float | None = None,
+        end: float | None = None,
     ) -> None:
+        """`end` is when the model stream finished — passed explicitly so the
+        stage never absorbs the TTS pump drain that follows it."""
         if trace is not None:
             extra = {}
             if usage:  # prompt-cache visibility (§9)
@@ -893,7 +934,7 @@ class BrainSession:
                 extra["ttft_ms"] = round((first_tok - t0) * 1000, 1)
             trace.stage(
                 "llm",
-                (time.perf_counter() - t0) * 1000,
+                ((end or time.perf_counter()) - t0) * 1000,
                 model=model,
                 chars=len(content),
                 tools=n_tools,
