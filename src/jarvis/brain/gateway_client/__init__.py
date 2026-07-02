@@ -59,6 +59,21 @@ class _AttributedGateway:
             attribution=self._attribution,
         )
 
+    async def stream_with_tools(
+        self,
+        messages: list[dict],
+        *,
+        model: str | None = None,
+        tools: list[dict] | None = None,
+        usage_out: dict | None = None,
+        tool_calls_out: list | None = None,
+    ) -> AsyncIterator[str]:
+        async for delta in self._base.stream_with_tools(
+            messages, model=model, tools=tools, usage_out=usage_out,
+            tool_calls_out=tool_calls_out, attribution=self._attribution,
+        ):
+            yield delta
+
     async def embed(self, texts: list[str], *, model: str | None = None) -> list[list[float]]:
         return await self._base.embed(texts, model=model, attribution=self._attribution)
 
@@ -196,6 +211,58 @@ class GatewayClient:
         if usage_out is not None:
             usage_out.update(_usage_dict(getattr(resp, "usage", None)))
         return resp.choices[0].message
+
+    async def stream_with_tools(
+        self,
+        messages: list[dict],
+        *,
+        model: str | None = None,
+        tools: list[dict] | None = None,
+        usage_out: dict | None = None,
+        tool_calls_out: list | None = None,
+        attribution: LLMAttribution | None = None,
+    ) -> AsyncIterator[str]:
+        """Streaming tool-aware completion: yields text deltas as they arrive so
+        the caller can start speaking before the completion finishes. Tool-call
+        deltas are accumulated LIVE into `tool_calls_out` as dicts
+        ({id, name, arguments}) — an entry appears the moment the model starts a
+        call, so the caller can stop treating streamed text as the final answer."""
+        kwargs: dict = {
+            "model": self._resolve(model),
+            "messages": messages,
+            "stream": True,
+            "user": self._end_user(attribution),
+            "extra_body": self._extra_body(attribution),
+            "extra_headers": self._extra_headers(attribution),
+        }
+        if tools:
+            kwargs["tools"] = tools
+        if usage_out is not None:
+            kwargs["stream_options"] = {"include_usage": True}
+        stream = await self._client.chat.completions.create(**kwargs)
+        async for chunk in stream:
+            if usage_out is not None and getattr(chunk, "usage", None) is not None:
+                usage_out.update(_usage_dict(chunk.usage))
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            for tcd in delta.tool_calls or []:
+                if tool_calls_out is None:
+                    continue
+                idx = getattr(tcd, "index", 0) or 0
+                while len(tool_calls_out) <= idx:
+                    tool_calls_out.append({"id": "", "name": "", "arguments": ""})
+                entry = tool_calls_out[idx]
+                if tcd.id:
+                    entry["id"] = tcd.id
+                fn = getattr(tcd, "function", None)
+                if fn is not None:
+                    if fn.name:
+                        entry["name"] += fn.name
+                    if fn.arguments:
+                        entry["arguments"] += fn.arguments
+            if delta.content:
+                yield delta.content
 
     async def embed(
         self,

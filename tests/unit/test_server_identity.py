@@ -82,7 +82,8 @@ def test_audio_buffers_are_connection_local_even_with_same_turn_id() -> None:
         "audio_buffers": {
             "same-turn": {
                 "sample_rate": 16000,
-                "chunks": [],
+                "pcm": bytearray(),
+                "chunk_count": 0,
                 "frame_bytes": 0,
                 "started_at": 1.0,
             }
@@ -92,7 +93,8 @@ def test_audio_buffers_are_connection_local_even_with_same_turn_id() -> None:
         "audio_buffers": {
             "same-turn": {
                 "sample_rate": 16000,
-                "chunks": [],
+                "pcm": bytearray(),
+                "chunk_count": 0,
                 "frame_bytes": 0,
                 "started_at": 1.0,
             }
@@ -139,7 +141,8 @@ def test_audio_buffer_rejects_turn_that_exceeds_pcm_cap() -> None:
             "audio_buffers": {
                 "t1": {
                     "sample_rate": 16000,
-                    "chunks": [],
+                    "pcm": bytearray(),
+                    "chunk_count": 0,
                     "pcm_bytes": 0,
                     "frame_bytes": 0,
                     "max_pcm_bytes": 3,
@@ -198,7 +201,8 @@ def test_audio_buffer_accepts_final_frame_at_local_capture_limit() -> None:
         "audio_buffers": {
             "t1": {
                 "sample_rate": sample_rate,
-                "chunks": [],
+                "pcm": bytearray(),
+                "chunk_count": 0,
                 "pcm_bytes": 0,
                 "frame_bytes": 0,
                 "max_pcm_bytes": sample_rate * 2 * 31,
@@ -296,7 +300,9 @@ def test_streaming_stt_reuses_exact_partial(cfg) -> None:  # noqa: ANN001
     assert data["stages"]["stt_stream"]["partial_runs"] == 1
 
 
-def test_streaming_stt_falls_back_when_partial_is_stale(cfg) -> None:  # noqa: ANN001
+def test_streaming_stt_reuses_partial_when_only_endpoint_silence_follows(cfg) -> None:  # noqa: ANN001
+    """The missing tail is smaller than the endpoint-silence window — it's silence
+    by definition (the VAD endpointed on it), so the partial IS the transcript."""
     async def go() -> tuple[str, dict, list[bytes]]:
         server = BrainServer(cfg)
         stt = _CountingSTT()
@@ -307,7 +313,7 @@ def test_streaming_stt_falls_back_when_partial_is_stale(cfg) -> None:  # noqa: A
         msg = BufferedAudioTurn(
             turn_id="t1",
             sample_rate=16000,
-            pcm=b"hello",
+            pcm=b"hello",  # 2 bytes past the snapshot — well inside the window
             chunks=1,
             frame_bytes=5,
             stream_ms=10,
@@ -321,59 +327,84 @@ def test_streaming_stt_falls_back_when_partial_is_stale(cfg) -> None:  # noqa: A
 
     text, data, calls = asyncio.run(go())
 
-    assert text == "hello"
-    assert calls == [b"hel", b"hello"]
+    assert text == "hel"
+    assert calls == [b"hel"]  # no second full pass
     assert data["stages"]["stt"]["streaming"] is True
-    assert data["stages"]["stt"]["reused_partial"] is False
+    assert data["stages"]["stt"]["reused_partial"] is True
     assert data["stages"]["stt_stream"]["pcm_bytes"] == 3
-    assert data["stages"]["stt_stream"]["stale"] is True
 
 
-def test_streaming_stt_serializes_running_stale_snapshot_before_final_stt(cfg) -> None:  # noqa: ANN001
-    async def go() -> tuple[bool, str, dict, list[bytes]]:
+def test_streaming_stt_falls_back_when_partial_is_stale(cfg) -> None:  # noqa: ANN001
+    async def go() -> tuple[str, dict, list[bytes], bytes]:
         server = BrainServer(cfg)
         stt = _CountingSTT()
         server._stt = stt  # type: ignore[assignment]
         trace = TurnTrace(room="default", speaker="house")
-        release_snapshot = asyncio.Event()
-
-        async def stale_snapshot() -> dict:
-            await release_snapshot.wait()
-            return {
-                "text": "hel",
-                "ms": 12.0,
-                "pcm_bytes": 3,
-                "audio_s": 0.1,
-                "chars": 3,
-            }
-
-        task = asyncio.create_task(stale_snapshot())
+        task = asyncio.create_task(server._transcribe_snapshot(b"hel", 16000))
+        await task
+        # Two full seconds of audio arrived after the snapshot — far more than
+        # the endpoint-silence window, so it may contain speech: not reusable.
+        pcm = b"hel" + b"x" * (16000 * 2 * 2)
         msg = BufferedAudioTurn(
             turn_id="t1",
             sample_rate=16000,
-            pcm=b"hello",
+            pcm=pcm,
             chunks=1,
-            frame_bytes=5,
+            frame_bytes=len(pcm),
             stream_ms=10,
             streaming_stt_task=task,
             streaming_stt_pcm_bytes=3,
             streaming_stt_partial_runs=1,
         )
 
-        running = asyncio.create_task(server._transcribe_buffered_audio(msg, trace))
-        await asyncio.sleep(0)
-        final_started_before_snapshot_finished = bool(stt.calls)
-        release_snapshot.set()
-        text, _secs = await running
-        return final_started_before_snapshot_finished, text, trace.data, stt.calls
+        text, _secs = await server._transcribe_buffered_audio(msg, trace)
+        return text, trace.data, stt.calls, pcm
 
-    final_started_early, text, data, calls = asyncio.run(go())
+    text, data, calls, pcm = asyncio.run(go())
 
-    assert final_started_early is False
-    assert text == "hello"
-    assert calls == [b"hello"]
-    assert data["stages"]["stt_stream"]["stale"] is True
+    assert text == pcm.decode("utf-8")
+    assert calls == [b"hel", pcm]  # the snapshot ran, then the full pass
+    assert data["stages"]["stt"]["streaming"] is True
     assert data["stages"]["stt"]["reused_partial"] is False
+
+
+def test_streaming_stt_cancels_running_stale_snapshot_instead_of_waiting(cfg) -> None:  # noqa: ANN001
+    """A still-running snapshot that's too stale to reuse must be cancelled so the
+    final transcription starts NOW — waiting on it would serialise the two."""
+    async def go() -> tuple[bool, str, list[bytes], bytes]:
+        server = BrainServer(cfg)
+        stt = _CountingSTT()
+        server._stt = stt  # type: ignore[assignment]
+        trace = TurnTrace(room="default", speaker="house")
+
+        async def stale_snapshot() -> dict:
+            await asyncio.Event().wait()  # never finishes on its own
+            raise AssertionError("unreachable")
+
+        task = asyncio.create_task(stale_snapshot())
+        await asyncio.sleep(0)
+        pcm = b"hel" + b"x" * (16000 * 2 * 2)
+        msg = BufferedAudioTurn(
+            turn_id="t1",
+            sample_rate=16000,
+            pcm=pcm,
+            chunks=1,
+            frame_bytes=len(pcm),
+            stream_ms=10,
+            streaming_stt_task=task,
+            streaming_stt_pcm_bytes=3,
+            streaming_stt_partial_runs=1,
+        )
+
+        text, _secs = await server._transcribe_buffered_audio(msg, trace)
+        await asyncio.sleep(0)
+        return task.cancelled(), text, stt.calls, pcm
+
+    cancelled, text, calls, pcm = asyncio.run(go())
+
+    assert cancelled is True  # not awaited — detached so the real pass starts now
+    assert text == pcm.decode("utf-8")
+    assert calls == [pcm]
 
 
 class _Contexts:

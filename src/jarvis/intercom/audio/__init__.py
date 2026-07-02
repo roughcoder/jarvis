@@ -108,7 +108,15 @@ class _StreamingPlayer:
       discarding buffered audio immediately (well under 100ms).
     """
 
-    def __init__(self, sample_rate: int, output_device: int | None = None) -> None:
+    def __init__(
+        self,
+        sample_rate: int,
+        output_device: int | None = None,
+        *,
+        blocksize: int = 2048,
+        preroll_ms: int = 300,
+        prebuffer_ms: int = 200,
+    ) -> None:
         from collections import deque
 
         import numpy as np
@@ -124,26 +132,26 @@ class _StreamingPlayer:
         self._empty = np.empty(0, dtype=np.int16)
         self._leftover = self._empty
         self._leftover_pos = 0
-        self._leftover_silence = False
-        self._buffered = 0  # total queued samples
-        # Prebuffer audio before consuming, to absorb network jitter and avoid
-        # startup underruns (interference at the start that "cleans up" once the
-        # producer gets ahead). TTS chunks arrive faster than realtime, so this
-        # barely adds to time-to-first-audio. Does NOT affect barge-in latency:
-        # a stop aborts the software buffer; only the small low-latency hardware
-        # buffer plays out.
-        self._prebuffer = int(sample_rate * 0.30)
+        self._buffered = 0  # queued REAL (fed) samples
+        # Two gates hold output silent before the first audible sample:
+        #  - preroll: the callback outputs zeros for at least this long so the
+        #    cold-start warmup (the device offers only ~20ms of hardware buffer)
+        #    lands on silence, not the first words.
+        #  - prebuffer: at least this much REAL audio must be queued, to absorb
+        #    network jitter at speech onset. Only fed samples count — silence
+        #    must not satisfy it, or the guard silently does nothing.
+        # Both overlap the TTS time-to-first-audio, so they add ~nothing to felt
+        # latency, and neither affects barge-in: a stop aborts the software
+        # buffer and only the tiny hardware buffer plays out.
+        self._preroll = int(sample_rate * max(0, preroll_ms) / 1000)
+        self._prebuffer = int(sample_rate * max(0, prebuffer_ms) / 1000)
+        self._warmed = 0  # silent samples emitted while waiting to go ready
         self._ready = False
-        # Pre-roll of silence so the cold-start callback warmup (the device
-        # offers only ~20ms of hardware buffer) lands on silence, not the first
-        # words. Seeded at start().
-        self._preroll = int(sample_rate * 0.30)
         self._stop = threading.Event()
         self._producer_done = threading.Event()
         self._finished = threading.Event()
         self._stop_at: float | None = None
         self.cut_latency_ms: float | None = None  # audible barge-in cut latency
-        blocksize = 2048
         self.metrics = PlaybackMetrics(
             sample_rate=sample_rate,
             blocksize=blocksize,
@@ -179,16 +187,22 @@ class _StreamingPlayer:
         while idx < frames:
             with self._lock:
                 if not self._ready:
-                    # Hold output silent until enough is buffered (or input ended).
-                    if self._buffered >= self._prebuffer or self._producer_done.is_set():
+                    # Hold output silent until BOTH the warmup window has passed
+                    # and enough real audio is buffered (or the input ended).
+                    warmed = self._warmed >= self._preroll
+                    buffered = (
+                        self._buffered >= self._prebuffer or self._producer_done.is_set()
+                    )
+                    if warmed and buffered:
                         self._ready = True
                         self.metrics.mark_ready()
                     else:
                         outdata[:, 0] = 0
+                        self._warmed += frames
                         return
                 if self._leftover_pos >= len(self._leftover):
                     if self._chunks:
-                        self._leftover, self._leftover_silence = self._chunks.popleft()
+                        self._leftover = self._chunks.popleft()
                         self._leftover_pos = 0
                     else:
                         done = self._producer_done.is_set()
@@ -196,14 +210,13 @@ class _StreamingPlayer:
                 start = self._leftover_pos
                 take = min(frames - idx, len(self._leftover) - start)
                 chunk = self._leftover
-                silence = self._leftover_silence
                 self._leftover_pos += take
                 if self._leftover_pos >= len(self._leftover):
                     self._leftover = self._empty
                     self._leftover_pos = 0
                 self._buffered -= take
             outdata[idx : idx + take, 0] = chunk[start : start + take]
-            self.metrics.mark_output(speech=not silence)
+            self.metrics.mark_output(speech=True)
             idx += take
         if idx < frames:
             outdata[idx:, 0] = 0  # pad underflow with silence
@@ -213,12 +226,6 @@ class _StreamingPlayer:
                 self.metrics.underruns += 1
 
     def start(self) -> None:
-        # Seed silence so cold-start callbacks consume silence, not speech.
-        if self._preroll > 0:
-            silence = self._np.zeros(self._preroll, dtype=self._np.int16)
-            with self._lock:
-                self._chunks.append((silence, True))
-                self._buffered += self._preroll
         self._stream.start()
 
     def feed(self, pcm: bytes) -> None:
@@ -227,7 +234,7 @@ class _StreamingPlayer:
         arr = self._np.frombuffer(pcm, dtype=self._np.int16)
         self.metrics.mark_feed(len(pcm))
         with self._lock:
-            self._chunks.append((arr, False))
+            self._chunks.append(arr)
             self._buffered += len(arr)
 
     def mark_producer_done(self) -> None:
@@ -390,7 +397,13 @@ class AudioIO:
         both aborts the audio AND cancels the in-flight TTS request (spec §7),
         unwinding the network generator cleanly.
         """
-        player = _StreamingPlayer(sample_rate, self._cfg.output_device)
+        player = _StreamingPlayer(
+            sample_rate,
+            self._cfg.output_device,
+            blocksize=self._cfg.playback_blocksize,
+            preroll_ms=self._cfg.playback_preroll_ms,
+            prebuffer_ms=self._cfg.playback_prebuffer_ms,
+        )
         player.start()
         self._player = player
 

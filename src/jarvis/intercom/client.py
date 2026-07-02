@@ -378,11 +378,18 @@ class IntercomClient:
                 break
         print("● wake")
         self._panel.set("awake")
-        await self._acknowledge()
+        # Drain BEFORE the ack and capture THROUGH it: draining after the beep
+        # discarded anything said during it, clipping the head off "Hey Jarvis,
+        # what's the time" spoken in one breath. The beep may leak into the clip
+        # (no AEC), but Whisper shrugs off a two-note earcon; lost words it can't
+        # recover.
         mic.drain()
+        ack = asyncio.create_task(self._acknowledge())
         print("  listening…")
         self._panel.set("listening")
         captured = await self._capture_streaming_utterance(ws, mic)
+        with contextlib.suppress(Exception):
+            await ack
         self._panel.set("thinking")
         await self._converse(ws, mic, inbound, captured)
 
@@ -596,6 +603,11 @@ class IntercomClient:
                 return
             elif isinstance(msg, Cancel) and msg.turn_id == turn_id:
                 return
+            elif isinstance(msg, Proactive):
+                # Shouldn't normally happen — the brain holds notifications while
+                # this device is mid-turn — but if one slips through it IS lost
+                # (its audio frames are foreign-turn and dropped below), so say so.
+                print(f"  [intercom] proactive dropped mid-reply: {msg.text[:80]!r}")
             # Frames for another turn id (e.g. a proactive arriving mid-turn) are
             # dropped for now; idle-aware queuing is the next layer (#3).
 
@@ -792,7 +804,6 @@ class IntercomClient:
             speech_threshold=self._cfg.vad.speech_threshold,
             min_speech_ms=self._cfg.vad.min_speech_ms,
         )
-        waited_ms = 0.0
         sent_len = 0
         stop_capture = stop_capture or threading.Event()
         while True:
@@ -801,6 +812,10 @@ class IntercomClient:
                     "pcm": ep.audio if ep.started else b"",
                     "capture_ms": (time.perf_counter() - t0) * 1000,
                 }
+            # Wall clock, not a frame count: if the mic stops delivering (device
+            # dropped), the initial wait must still time out rather than spin.
+            if not ep.started and (time.perf_counter() - t0) * 1000 >= initial_wait_ms:
+                return {"pcm": b"", "capture_ms": (time.perf_counter() - t0) * 1000}
             try:
                 frame = mic.read(timeout=0.1)
             except queue.Empty:
@@ -812,10 +827,6 @@ class IntercomClient:
                 sent_len = len(audio)
                 if chunk:
                     send_chunk(chunk)
-            else:
-                waited_ms += frame_ms
-                if waited_ms >= initial_wait_ms:
-                    return {"pcm": b"", "capture_ms": (time.perf_counter() - t0) * 1000}
             if done or len(ep.audio) / 2 / self._sr >= 30.0:
                 return {"pcm": ep.audio, "capture_ms": (time.perf_counter() - t0) * 1000}
 

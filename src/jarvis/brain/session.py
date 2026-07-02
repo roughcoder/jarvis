@@ -18,8 +18,10 @@ import asyncio
 import json
 import pathlib
 import time
+from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 from jarvis.runtime import RequestContext
 from jarvis.brain.dialog import (
@@ -74,8 +76,10 @@ _BACKGROUND_GUIDANCE = (
     "Slow work goes to the background: for anything that takes more than a few seconds — "
     "driving the Mac through several steps, a multi-page web task, deep research, a "
     "booking — hand it to run_in_background and tell the user you're on it, rather than "
-    "making them wait through it on this turn. You'll report the outcome to them "
-    "proactively when it's done. Do it inline only when it's genuinely quick."
+    "making them wait through it on this turn. That includes slow [skill] tools (news "
+    "briefings, multi-step recipes that browse several pages): run those via "
+    "run_in_background too. You'll report the outcome to them proactively when it's "
+    "done. Do it inline only when it's genuinely quick."
 )
 
 _PROFILE_GUIDANCE = (
@@ -264,6 +268,11 @@ class BrainSession:
         self._cold_tasks: set[asyncio.Task] = set()
         self._heartbeat_pcm: bytes | None = None  # cached tool-search pulse
         self._voice_mode = DEFAULT_MODE
+        # MCP servers already offered this conversation stay offered (sticky): the
+        # tool list is part of the provider's cached prompt prefix, so a set that
+        # flickers turn-to-turn forces a full prompt-cache miss. Cleared when the
+        # conversation ends.
+        self._sticky_servers: set[str] = set()
 
     @property
     def pending_cold_tasks(self) -> tuple[asyncio.Task, ...]:
@@ -302,6 +311,7 @@ class BrainSession:
         `result`. Hot path reads the LOCAL cached representation only (a fast file
         read), never a live memory reasoning call (spec §3.2). Call finalize()
         afterwards (even on barge-in) to detect end + remember."""
+        self._prewarm_tts()  # open the TTS connection while we think
         if self._ctx.channel == "voice":
             action = local_voice_action(user_text, self._voice_mode)
             if action is not None:
@@ -334,37 +344,17 @@ class BrainSession:
             *self._history,  # shared context: the conversation so far
             {"role": "user", "content": user_text},
         ]
-        available = self._registry.available_for(self._ctx)
-        # Relevance prefilter (§9): keep the per-turn tool list lean so TTFT/selection
-        # don't pay for 100+ MCP schemas every utterance. All tools stay registered.
-        # Embedding scorer when configured (semantic, with keyword fallback); else the
-        # instant keyword matcher.
-        if self._relevance is not None:
-            offered = await self._relevance.select(available, user_text)
-        else:
-            offered = select_tools(
-                available,
-                user_text,
-                enabled=self._cfg.tools.relevance_filter,
-                extra_keywords=self._server_keywords,
-            )
-        self._log_offered(available, offered)
-        # Canonical (name-sorted) order so an unchanged tool set is byte-identical
-        # turn to turn — a stable prefix the gateway/provider can cache (§9).
-        tool_schemas = [t.openai_schema() for t in sorted(offered, key=lambda t: t.name)]
+        tool_schemas = await self._offer_tools(user_text)
 
-        if tool_schemas:
-            # Tool turn: run the tool loop (which yields a short "looking that up"
-            # earcon into the audio stream when a tool fires), then speak the final
-            # answer. Casual no-tool setups never enter this branch, so their
-            # streaming TTFT is unchanged.
-            async for pcm in self._run_tool_loop(messages, model, trace, tool_schemas, result):
+        if tool_schemas or self._cfg.gateway.stream:
+            # One speaking core for tool turns AND plain streamed turns: the loop
+            # streams each completion, segments the final answer into sentences,
+            # and synthesises them as they arrive — speech starts on sentence one,
+            # not after the full reply. Yields earcon pulses while tools run.
+            async for pcm in self._run_tool_loop(
+                messages, model, trace, tool_schemas, result, speak=True
+            ):
                 yield pcm
-            async for pcm in self._tts_source(self._clean_reply(result.raw), trace):
-                yield pcm
-        elif self._cfg.gateway.stream:
-            async for pcm in self._stream_speech(messages, model, trace, result):
-                yield pcm  # result.raw set inside _stream_speech's finally
         else:
             trace.start("llm")
             raw = await self._gateway_for().complete(messages, model=model)
@@ -428,6 +418,12 @@ class BrainSession:
                     assistant_asked_followup=transition.assistant_asked_followup,
                 )
         self._remember(user_text, result)
+        # Sticky offers live for one voice conversation (cache-prefix stability
+        # between open-mic turns). Messaging turns never set ended, so without
+        # the channel check a text session would accrete servers forever and
+        # defeat the relevance filter.
+        if result.ended or self._ctx.channel != "voice":
+            self._sticky_servers.clear()
         if result.reply:
             self._fire_cold_path(user_text, result.reply)
 
@@ -443,16 +439,7 @@ class BrainSession:
             *self._history,
             {"role": "user", "content": user_text},
         ]
-        available = self._registry.available_for(self._ctx)
-        if self._relevance is not None:
-            offered = await self._relevance.select(available, user_text)
-        else:
-            offered = select_tools(
-                available, user_text, enabled=self._cfg.tools.relevance_filter,
-                extra_keywords=self._server_keywords,
-            )
-        self._log_offered(available, offered)
-        tool_schemas = [t.openai_schema() for t in sorted(offered, key=lambda t: t.name)]
+        tool_schemas = await self._offer_tools(user_text)
         if tool_schemas:
             # Drain the tool loop's PCM (earcons / vision) — a text client never plays it.
             async for _pcm in self._run_tool_loop(messages, model, trace, tool_schemas, result):
@@ -480,15 +467,8 @@ class BrainSession:
             {"role": "user", "content": task},
         ]
         model = self._cfg.gateway.strong_model
-        available = self._registry.available_for(self._ctx)
-        if self._relevance is not None:
-            offered = await self._relevance.select(available, task)
-        else:
-            offered = select_tools(
-                available, task, enabled=self._cfg.tools.relevance_filter,
-                extra_keywords=self._server_keywords,
-            )
-        tool_schemas = [t.openai_schema() for t in sorted(offered, key=lambda t: t.name)]
+        # One-shot background task — no conversation to keep a sticky offer for.
+        tool_schemas = await self._offer_tools(task, sticky=False)
         gateway = self._gateway_for(kind="background")
         for _ in range(max(1, max_rounds)):
             msg = await gateway.complete_with_tools(
@@ -629,111 +609,353 @@ class BrainSession:
             return g.strong_model
         return g.voice_model or g.fast_model
 
-    async def _run_tool_loop(self, messages, model, trace, tool_schemas, result):  # noqa: ANN001
+    async def _offer_tools(self, user_text: str, *, sticky: bool = True) -> list[dict]:
+        """The turn's tool offer: capability-filtered, relevance-narrowed (§9), and
+        conversation-sticky — once an MCP server is offered it stays offered until
+        the conversation ends, so the tool list (part of the provider's cached
+        prompt prefix) doesn't flicker turn-to-turn and break the cache. Returns
+        name-sorted OpenAI schemas (a byte-identical prefix when unchanged)."""
+        available = self._registry.available_for(self._ctx)
+        if self._relevance is not None:
+            offered = await self._relevance.select(available, user_text)
+        else:
+            offered = select_tools(
+                available,
+                user_text,
+                enabled=self._cfg.tools.relevance_filter,
+                extra_keywords=self._server_keywords,
+            )
+        if sticky:
+            names = {t.name for t in offered}
+            offered = list(offered) + [
+                t
+                for t in available
+                if t.required_capability.startswith("mcp.")
+                and t.required_capability[len("mcp.") :] in self._sticky_servers
+                and t.name not in names
+            ]
+            self._sticky_servers.update(
+                t.required_capability[len("mcp.") :]
+                for t in offered
+                if t.required_capability.startswith("mcp.")
+            )
+        self._log_offered(available, offered)
+        return [t.openai_schema() for t in sorted(offered, key=lambda t: t.name)]
+
+    def _prewarm_tts(self) -> None:
+        """Fire-and-forget: open the pooled TTS connection while STT/LLM run, so
+        the turn's first synthesis call skips the TLS handshake."""
+        if self._tts is None or not hasattr(self._tts, "prewarm"):
+            return
+        task = asyncio.create_task(self._tts.prewarm())
+        self._cold_tasks.add(task)
+        task.add_done_callback(self._cold_tasks.discard)
+
+    def _start_tts_pump(self, text: str, raw_sent: str) -> dict:
+        """Kick off synthesis of one sentence NOW; chunks land in a queue the
+        caller drains in order. Lets sentence N+1 synthesise while N streams.
+        Carries the raw sentence so it can be marked as spoken only once its
+        audio is actually delivered."""
+        q: asyncio.Queue = asyncio.Queue()
+
+        async def run() -> None:
+            try:
+                async for chunk in self._tts.synthesize_stream(text):
+                    await q.put(chunk)
+            except Exception as exc:  # noqa: BLE001 - surfaced on the consumer side
+                q.put_nowait(exc)
+            finally:
+                q.put_nowait(None)
+
+        return {"task": asyncio.create_task(run()), "q": q, "raw": raw_sent, "spoken": False}
+
+    async def _drain_pumps(
+        self, pumps: deque, meta: dict, *, block: bool, only_head: bool = False,
+        on_spoken=None,  # noqa: ANN001 - called with the raw sentence once its audio flows
+    ) -> AsyncIterator[bytes]:
+        """Yield PCM from the pump queue heads, strictly in sentence order.
+        Non-blocking mode stops at the first empty queue (used between LLM
+        deltas); blocking mode drains to the end (or just the head sentence).
+        A sentence counts as SPOKEN at its first delivered chunk (or clean,
+        chunkless completion) — never on error, and never if a barge-in closes
+        the caller before its audio started."""
+        while pumps:
+            pump = pumps[0]
+            q = pump["q"]
+            while True:
+                if block:
+                    item = await q.get()
+                else:
+                    try:
+                        item = q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        return
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    pumps.popleft()
+                    raise item
+                if not pump["spoken"]:
+                    pump["spoken"] = True
+                    if on_spoken is not None:
+                        on_spoken(pump["raw"])
+                if meta.get("first") is None:
+                    meta["first"] = time.perf_counter()
+                meta["bytes"] = meta.get("bytes", 0) + len(item)
+                yield item
+            pumps.popleft()
+            if not pump["spoken"]:  # completed cleanly with no audio (rare)
+                pump["spoken"] = True
+                if on_spoken is not None:
+                    on_spoken(pump["raw"])
+            if only_head:
+                return
+
+    async def _run_tool_loop(  # noqa: ANN001
+        self, messages, model, trace, tool_schemas, result, *, speak: bool = False
+    ):
         """Tool-aware completion: let the model call gated tools, feed results
-        back, repeat until it answers. Sets `result.raw` to the final text. While a
-        slow/announced tool runs it yields a soft heartbeat pulse into the audio
-        stream (instant local tools stay silent). Each tool is capability-checked
-        and hard-timeout-bounded; a tool error is fed back rather than breaking the
+        back, repeat until it answers. Sets `result.raw` to the text spoken so far
+        (safe to read after a barge-in). While a slow/announced tool runs it yields
+        a soft heartbeat pulse into the audio stream (instant local tools stay
+        silent). When the gateway supports streaming (GATEWAY_STREAM), each round
+        streams and — with `speak` on — the answer is segmented into sentences and
+        synthesised as it arrives, so speech starts on sentence one instead of
+        after the full completion. Each tool is capability-checked and
+        hard-timeout-bounded; a tool error is fed back rather than breaking the
         turn."""
         t0 = time.perf_counter()
         n_tools = 0
         usage: dict = {}
         gateway = self._gateway_for()
-        for _ in range(max(1, self._cfg.tools.max_rounds)):
-            msg = await gateway.complete_with_tools(
-                messages, model=model, tools=tool_schemas, usage_out=usage
-            )
-            if not msg.tool_calls:
-                result.raw = msg.content or ""
-                self._record_llm(trace, t0, model, result.raw, n_tools, usage)
+        use_stream = self._cfg.gateway.stream and hasattr(gateway, "stream_with_tools")
+        first_tok: float | None = None
+        llm_done: float | None = None  # model stream end — BEFORE the TTS drain
+        spoken: list[str] = []  # sentences whose audio was actually delivered
+        steering: str | None = None
+        pumps: deque = deque()  # in-flight sentence TTS pumps
+        tts_meta: dict = {"first": None, "bytes": 0, "chars": 0, "t0": None}
+
+        def _stage_text(sent: str) -> str:
+            nonlocal steering
+            if steering is None:  # capture the leading directive once
+                steering, sent = _extract_steering(sent)
+            text = self._clean_reply(sent)  # never speak control markers
+            if not text:
+                return ""
+            return f"{steering} {text}" if steering else text
+
+        def mark_spoken(sent: str) -> None:
+            spoken.append(sent)
+            result.raw = " ".join(spoken)
+
+        async def emit(sent: str):  # yields PCM for one completed sentence
+            if not (speak and self._tts is not None):
+                mark_spoken(sent)  # text turn: the reply IS the text
                 return
-            assistant_msg = {
-                "role": "assistant",
-                "content": msg.content or "",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in msg.tool_calls
-                ],
-            }
-            messages.append(assistant_msg)
-            result.tool_messages.append(assistant_msg)  # carry into history
-            # Escalate to the strong model once real work (tools) is underway: it
-            # reasons over tool results — a browsed departure board, search hits —
-            # and writes the final answer far more reliably than the fast model,
-            # which tends to fumble multi-step browsing and answer from stale
-            # snippets. Plain no-tool chat stays on fast (this code only runs when
-            # the model chose to call a tool).
-            fast_tool_routes = {
-                self._cfg.gateway.fast_model,
-                self._cfg.gateway.voice_model or self._cfg.gateway.fast_model,
-            }
-            if (
-                model in fast_tool_routes
-                and model != self._cfg.gateway.strong_model
-                and model != self._cfg.gateway.vision_model
+            text = _stage_text(sent)
+            if not text:
+                mark_spoken(sent)  # nothing speakable (e.g. a bare [[END]] marker)
+                return
+            if tts_meta["t0"] is None:
+                tts_meta["t0"] = time.perf_counter()
+            tts_meta["chars"] += len(text)
+            while len(pumps) >= 3:  # cap in-flight TTS requests
+                async for pcm in self._drain_pumps(
+                    pumps, tts_meta, block=True, only_head=True, on_spoken=mark_spoken
+                ):
+                    yield pcm
+            # raw is updated by mark_spoken when this sentence's audio flows,
+            # not here — result.raw must only ever hold what was actually said.
+            pumps.append(self._start_tts_pump(text, sent))
+            async for pcm in self._drain_pumps(
+                pumps, tts_meta, block=False, on_spoken=mark_spoken
             ):
-                model = self._cfg.gateway.strong_model
-            for tc in msg.tool_calls:
-                n_tools += 1
-                tool = self._registry.get(tc.function.name)
-                if tool is not None and tool.announce:
-                    # Slow/remote tool (web search): a soft heartbeat pulses while
-                    # it runs so the user hears the search is happening.
-                    tool_result = ""
-                    async for item in self._execute_with_heartbeat(tc):
-                        if isinstance(item, bytes):
-                            yield item
-                        else:
-                            tool_result = item
+                yield pcm
+
+        async def stream_round(tools, calls: list, parts: list):  # yields PCM
+            nonlocal first_tok, llm_done
+            buf = ""
+            async for delta in gateway.stream_with_tools(
+                messages, model=model, tools=tools, usage_out=usage, tool_calls_out=calls
+            ):
+                if first_tok is None:
+                    first_tok = time.perf_counter()
+                parts.append(delta)
+                if calls:
+                    continue  # a tool call started — this text is loop-internal now
+                buf += delta
+                while True:
+                    split = _next_sentence(buf)
+                    if split is None:
+                        break
+                    sent, buf = split
+                    if sent.strip():
+                        async for pcm in emit(sent):
+                            yield pcm
+                async for pcm in self._drain_pumps(
+                    pumps, tts_meta, block=False, on_spoken=mark_spoken
+                ):
+                    yield pcm
+            llm_done = time.perf_counter()  # the drain below is TTS time, not LLM
+            if not calls and buf.strip():
+                async for pcm in emit(buf.strip()):
+                    yield pcm
+            # Speech settles before tools run / before the turn ends.
+            async for pcm in self._drain_pumps(
+                pumps, tts_meta, block=True, on_spoken=mark_spoken
+            ):
+                yield pcm
+
+        try:
+            for round_no in range(max(1, self._cfg.tools.max_rounds) + 1):
+                final_round = round_no >= max(1, self._cfg.tools.max_rounds)
+                # Out of tool rounds — force a final answer, no further tool calls.
+                tools = None if final_round else tool_schemas or None
+                calls: list[dict] = []
+                parts: list[str] = []
+                if use_stream:
+                    async for pcm in stream_round(tools, calls, parts):
+                        yield pcm
+                    content = "".join(parts)
                 else:
-                    tool_result = await self._execute_call(tc)  # instant: no pulse
-                self._log_tool_call(tool, tc, tool_result)
-                if trace is not None:
-                    trace.event("tool", tool=tc.function.name)
-                if tool is not None and tool.produces_image and not tool_result.startswith("error"):
-                    # Native vision: the tool returned a base64 image. Acknowledge the
-                    # tool call as text, then hand the image to the model as a user
-                    # message so it can SEE it, and switch to the vision route. The
-                    # image is NOT carried into long-term history (it's large).
-                    ack = {"role": "tool", "tool_call_id": tc.id, "content": "(image captured — image below)"}
-                    messages.append(ack)
-                    result.tool_messages.append(ack)
-                    messages.append({
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "This is the captured image:"},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{tool_result}"}},
-                        ],
-                    })
-                    model = self._cfg.gateway.vision_model or model
-                else:
-                    tool_msg = {"role": "tool", "tool_call_id": tc.id, "content": tool_result}
-                    messages.append(tool_msg)
-                    result.tool_messages.append(tool_msg)  # carry into history
-        # Out of tool rounds — force a final answer with no further tool calls.
-        msg = await gateway.complete_with_tools(messages, model=model, tools=None, usage_out=usage)
-        result.raw = msg.content or ""
-        self._record_llm(trace, t0, model, result.raw, n_tools, usage)
+                    msg = await gateway.complete_with_tools(
+                        messages, model=model, tools=tools, usage_out=usage
+                    )
+                    llm_done = time.perf_counter()
+                    content = msg.content or ""
+                    calls = [
+                        {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments}
+                        for tc in (msg.tool_calls or [])
+                    ]
+                if not calls or final_round:
+                    self._record_llm(
+                        trace, t0, model, content, n_tools, usage, first_tok, end=llm_done
+                    )
+                    if not use_stream:
+                        result.raw = content
+                        if speak and self._tts is not None:
+                            text = self._clean_reply(content)
+                            if text:
+                                async for pcm in self._tts_source(text, trace):
+                                    yield pcm
+                    elif not spoken and not pumps:
+                        result.raw = content  # e.g. an all-whitespace stream
+                    self._record_tts(trace, tts_meta, t0, first_tok)
+                    return
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": [
+                        {
+                            "id": c["id"],
+                            "type": "function",
+                            "function": {"name": c["name"], "arguments": c["arguments"]},
+                        }
+                        for c in calls
+                    ],
+                }
+                messages.append(assistant_msg)
+                result.tool_messages.append(assistant_msg)  # carry into history
+                # Escalate to the strong model once real work (tools) is underway: it
+                # reasons over tool results — a browsed departure board, search hits —
+                # and writes the final answer far more reliably than the fast model,
+                # which tends to fumble multi-step browsing and answer from stale
+                # snippets. Plain no-tool chat stays on fast (this code only runs when
+                # the model chose to call a tool).
+                fast_tool_routes = {
+                    self._cfg.gateway.fast_model,
+                    self._cfg.gateway.voice_model or self._cfg.gateway.fast_model,
+                }
+                if (
+                    model in fast_tool_routes
+                    and model != self._cfg.gateway.strong_model
+                    and model != self._cfg.gateway.vision_model
+                ):
+                    model = self._cfg.gateway.strong_model
+                for c in calls:
+                    tc = SimpleNamespace(
+                        id=c["id"],
+                        function=SimpleNamespace(name=c["name"], arguments=c["arguments"]),
+                    )
+                    n_tools += 1
+                    tool = self._registry.get(tc.function.name)
+                    if tool is not None and tool.announce:
+                        # Slow/remote tool (web search): a soft heartbeat pulses while
+                        # it runs so the user hears the search is happening.
+                        tool_result = ""
+                        async for item in self._execute_with_heartbeat(tc):
+                            if isinstance(item, bytes):
+                                yield item
+                            else:
+                                tool_result = item
+                    else:
+                        tool_result = await self._execute_call(tc)  # instant: no pulse
+                    self._log_tool_call(tool, tc, tool_result)
+                    if trace is not None:
+                        trace.event("tool", tool=tc.function.name)
+                    if tool is not None and tool.produces_image and not tool_result.startswith("error"):
+                        # Native vision: the tool returned a base64 image. Acknowledge the
+                        # tool call as text, then hand the image to the model as a user
+                        # message so it can SEE it, and switch to the vision route. The
+                        # image is NOT carried into long-term history (it's large).
+                        ack = {"role": "tool", "tool_call_id": tc.id, "content": "(image captured — image below)"}
+                        messages.append(ack)
+                        result.tool_messages.append(ack)
+                        messages.append({
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "This is the captured image:"},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{tool_result}"}},
+                            ],
+                        })
+                        model = self._cfg.gateway.vision_model or model
+                    else:
+                        tool_msg = {"role": "tool", "tool_call_id": tc.id, "content": tool_result}
+                        messages.append(tool_msg)
+                        result.tool_messages.append(tool_msg)  # carry into history
+        finally:
+            for pump in pumps:  # barge-in / error: kill in-flight synthesis
+                pump["task"].cancel()
 
     @staticmethod
-    def _record_llm(trace, t0: float, model: str, content: str, n_tools: int, usage: dict | None = None) -> None:  # noqa: ANN001
+    def _record_llm(  # noqa: ANN001
+        trace, t0: float, model: str, content: str, n_tools: int,
+        usage: dict | None = None, first_tok: float | None = None,
+        end: float | None = None,
+    ) -> None:
+        """`end` is when the model stream finished — passed explicitly so the
+        stage never absorbs the TTS pump drain that follows it."""
         if trace is not None:
             extra = {}
             if usage:  # prompt-cache visibility (§9)
                 extra = {k: usage[k] for k in ("prompt_tokens", "cached_tokens") if k in usage}
+            if first_tok is not None:
+                extra["ttft_ms"] = round((first_tok - t0) * 1000, 1)
             trace.stage(
                 "llm",
-                (time.perf_counter() - t0) * 1000,
+                ((end or time.perf_counter()) - t0) * 1000,
                 model=model,
                 chars=len(content),
                 tools=n_tools,
                 **extra,
             )
+
+    def _record_tts(self, trace, meta: dict, t0: float, first_tok: float | None) -> None:  # noqa: ANN001
+        """One aggregate TTS stage for the sentence-streamed reply (mirrors what
+        _tts_source records for a single synthesis call)."""
+        if trace is None or not meta.get("bytes"):
+            return
+        first = meta.get("first")
+        trace.stage(
+            "tts",
+            (time.perf_counter() - (first_tok or meta.get("t0") or t0)) * 1000,
+            ttfa_ms=round((first - t0) * 1000, 1) if first else None,
+            bytes=meta.get("bytes", 0),
+            chars=meta.get("chars", 0),
+            voice=self._cfg.tts.voice,
+            provider=self._cfg.tts.provider,
+        )
 
     async def _execute_call(self, tc) -> str:  # noqa: ANN001
         """Run one tool call to its result string. Never raises — a tool error is
@@ -805,14 +1027,25 @@ class BrainSession:
     def _remember(self, user_text: str, result: TurnResult) -> None:
         """Append the full turn to the rolling shared-context window — user, any
         tool calls + results (so the next turn knows what was done), then the
-        spoken reply."""
+        spoken reply. Big tool results are truncated on the way in: the model saw
+        the full output THIS turn; later turns only need the gist, not a browsed
+        page re-billed into every prompt."""
         if not (result.reply or result.tool_messages):
             return
         self._history.append({"role": "user", "content": user_text})
-        self._history.extend(result.tool_messages)
+        self._history.extend(self._compact_tool_message(m) for m in result.tool_messages)
         if result.reply:
             self._history.append({"role": "assistant", "content": result.reply})
         self._trim_history()
+
+    def _compact_tool_message(self, msg: dict) -> dict:
+        limit = max(0, self._cfg.persona.history_tool_result_chars)
+        if not limit or msg.get("role") != "tool":
+            return msg
+        content = str(msg.get("content") or "")
+        if len(content) <= limit:
+            return msg
+        return {**msg, "content": content[:limit] + f"… [truncated {len(content) - limit} chars]"}
 
     def _trim_history(self) -> None:
         limit = max(0, self._cfg.persona.history_messages)
@@ -880,73 +1113,3 @@ class BrainSession:
                     provider=self._cfg.tts.provider,
                 )
 
-    async def _stream_speech(self, messages, model, trace, result) -> AsyncIterator[bytes]:  # noqa: ANN001
-        """Stream the LLM, segment into sentences, synthesise each through TTS,
-        and yield a single continuous PCM stream — so speech starts on sentence 1
-        while later sentences are still generating. Captures the full reply into
-        result.raw (even on barge-in) and records LLM/TTS timings."""
-        t0 = time.perf_counter()
-        first_tok: float | None = None
-        llm_done: float | None = None
-        tts_first: float | None = None
-        tts_bytes = 0
-        full: list[str] = []
-        steering: str | None = None
-        usage: dict = {}
-        gateway = self._gateway_for()
-
-        async def sentences() -> AsyncIterator[str]:
-            nonlocal first_tok, llm_done
-            buf = ""
-            async for delta in gateway.stream(messages, model=model, usage_out=usage):
-                if first_tok is None:
-                    first_tok = time.perf_counter()
-                full.append(delta)
-                buf += delta
-                while True:
-                    split = _next_sentence(buf)
-                    if split is None:
-                        break
-                    sent, buf = split
-                    if sent.strip():
-                        yield sent
-            llm_done = time.perf_counter()
-            if buf.strip():
-                yield buf
-
-        try:
-            async for sent in sentences():
-                if steering is None:  # capture the leading directive once
-                    steering, sent = _extract_steering(sent)
-                tts_text = self._clean_reply(sent)  # never speak control markers
-                if not tts_text:
-                    continue
-                if steering:
-                    tts_text = f"{steering} {tts_text}"
-                async for pcm in self._tts.synthesize_stream(tts_text):
-                    if tts_first is None:
-                        tts_first = time.perf_counter()
-                    tts_bytes += len(pcm)
-                    yield pcm
-        finally:
-            result.raw = "".join(full)
-            if trace is not None:
-                end = time.perf_counter()
-                if first_tok is not None:
-                    cache = {k: usage[k] for k in ("prompt_tokens", "cached_tokens") if k in usage}
-                    trace.stage(
-                        "llm",
-                        ((llm_done or end) - t0) * 1000,
-                        model=model,
-                        ttft_ms=round((first_tok - t0) * 1000, 1),
-                        chars=len(result.raw),
-                        **cache,
-                    )
-                trace.stage(
-                    "tts",
-                    (end - (first_tok or t0)) * 1000,
-                    ttfa_ms=round((tts_first - t0) * 1000, 1) if tts_first else None,
-                    bytes=tts_bytes,
-                    voice=self._cfg.tts.voice,
-                    provider=self._cfg.tts.provider,
-                )

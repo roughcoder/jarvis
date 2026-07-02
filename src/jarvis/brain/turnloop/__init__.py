@@ -203,10 +203,25 @@ class TurnLoop:
         await asyncio.to_thread(self._wait_for_wake, mic)
         self.state = State.ACTIVE
         print("● wake")
-        await self._acknowledge()
-        mic.drain()  # discard the ack's own audio before listening
+        ack: asyncio.Task | None = None
+        if self._cfg.audio.ack_mode == "speak":
+            # A SPOKEN ack must finish before listening — the endpointer would
+            # capture Jarvis's own "Yes?" as the utterance.
+            await self._acknowledge()
+            mic.drain()
+        else:
+            # Beep (or none): drain BEFORE the ack and capture THROUGH it, so
+            # words spoken in the same breath as "Hey Jarvis" aren't clipped.
+            # The earcon may leak into the clip (no AEC); Whisper shrugs it off.
+            mic.drain()
+            ack = asyncio.create_task(self._acknowledge())
         print("  listening…")
         pcm = await asyncio.to_thread(self._capture_utterance, mic)
+        if ack is not None:
+            try:
+                await ack
+            except Exception:  # noqa: BLE001 - the ack is cosmetic
+                pass
 
         # Conversation continues as long as the user barges in (spec §5): a
         # barge-in re-enters ACTIVE directly, NOT PASSIVE.
