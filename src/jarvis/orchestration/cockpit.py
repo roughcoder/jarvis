@@ -478,17 +478,16 @@ def aggregate_checkpoints(
 
 def _worker_bulk_checkpoints(base_url: str, headers: dict[str, str], timeout: float, http_get: Any) -> list[dict[str, Any]] | None:
     try:
-        try:
-            response = http_get(
-                f"{base_url}/sessions/checkpoints",
-                headers=headers,
-                timeout=timeout,
-            )
-        except AssertionError:
-            return None
+        response = http_get(
+            f"{base_url}/sessions/checkpoints",
+            headers=headers,
+            timeout=timeout,
+        )
         if getattr(response, "status_code", 200) >= 400:
             return None
         raw_items = response.json().get("checkpoints", [])
+    except AssertionError:
+        raise
     except Exception:  # noqa: BLE001 - workers may not support the bulk endpoint yet
         return None
     if not isinstance(raw_items, list):

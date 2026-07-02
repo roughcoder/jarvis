@@ -345,13 +345,13 @@ def _resolve_run(store: OrchestrationStore, run_ref: str):
     runs = store.list_runs()
     if ref in {"latest", "last"}:
         visible = [run for run in runs if not run.archived_at]
-        return next((run for run in reversed(visible) if run.sessions), visible[-1] if visible else None)
+        return next((run for run in reversed(visible) if any(not session.archived_at for session in run.sessions)), visible[-1] if visible else None)
     return store.get(ref)
 
 
 def _resume_session(sessions: list[WorkerSessionLink]) -> WorkerSessionLink | None:
     for session in reversed(sessions):
-        if session.session_id and session.status in TURN_RESUMABLE_SESSION_STATUSES:
+        if not session.archived_at and session.session_id and session.status in TURN_RESUMABLE_SESSION_STATUSES:
             return session
     return None
 

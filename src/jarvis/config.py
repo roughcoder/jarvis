@@ -732,6 +732,8 @@ class OrchestrationConfig(_Base):
     api_token: SecretStr = SecretStr("")
     api_allow_insecure: bool = False
     api_cors_origins: str = ""
+    sse_refresh_interval_s: float = 1.0
+    sse_heartbeat_interval_s: float = 15.0
 
 
 class LinearConfig(_Base):

@@ -135,6 +135,24 @@ def _worker_workspace(cfg: WorkerConfig) -> pathlib.Path:
     return workspace
 
 
+def _engine_supports(engines: list[str]) -> dict[str, dict[str, bool]]:
+    supports: dict[str, dict[str, bool]] = {}
+    for engine in engines:
+        try:
+            capabilities = provider_for(engine).capabilities()
+        except ValueError:
+            capabilities = {}
+        supports[engine] = {
+            "streaming": bool(capabilities.get("streaming")),
+            "resume": bool(capabilities.get("resume")),
+            "interrupt": bool(capabilities.get("interrupt")),
+            "approval_requests": bool(capabilities.get("approval_requests", capabilities.get("approvals"))),
+            "input_requests": bool(capabilities.get("input_requests", capabilities.get("questions"))),
+            "checkpoints": bool(capabilities.get("checkpoints")),
+        }
+    return supports
+
+
 def make_app(cfg: WorkerConfig) -> web.Application:
     workspace = _worker_workspace(cfg)
     # Persist jobs to disk under the workspace so they survive a daemon restart.
@@ -608,12 +626,14 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         return await _provider_terminal_event(request, sessions, "stop")
 
     async def health(_request: web.Request) -> web.Response:
+        supported_engines = engine_ids(cfg.supported_engines, default_engine=cfg.agent)
         return web.json_response(
             {
                 "ok": True,
                 "agent": cfg.agent,
                 "default_engine": normalize_engine_id(cfg.agent),
-                "supported_engines": engine_ids(cfg.supported_engines, default_engine=cfg.agent),
+                "supported_engines": supported_engines,
+                "engine_supports": _engine_supports(supported_engines),
                 "workspace": str(workspace),
                 "repo_root_configured": bool(cfg.repo_root),
                 "browser_enabled": browser_cfg.enabled,

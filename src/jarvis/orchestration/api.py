@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import hmac
 import json
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -70,14 +71,14 @@ from jarvis.orchestration.service import (
 )
 from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource, WorkSource
 from jarvis.orchestration.store import OrchestrationStore
-from jarvis.orchestration.supervisor import _final_session_phase
+from jarvis.orchestration.supervisor import final_session_phase
 from jarvis.orchestration.workers import WorkerRegistry
 
 HttpGet = Callable[..., Any]
 HttpPost = Callable[..., Any]
-SSE_REFRESH_INTERVAL_S = 1.0
-SSE_HEARTBEAT_INTERVAL_S = 15.0
 CONFIG_KEY = web.AppKey("config", Config)
+logger = logging.getLogger(__name__)
+SSE_REFRESH_ERROR_LOG_INTERVAL_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -117,6 +118,7 @@ class SseSnapshotHub:
         self._next_id = 0
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
+        self._next_refresh_error_log_at = 0.0
 
     async def start(self) -> None:
         if self._task is None:
@@ -156,20 +158,35 @@ class SseSnapshotHub:
             return self._snapshots.setdefault(mode, body)
 
     async def _run(self) -> None:
-        heartbeat_at = asyncio.get_running_loop().time() + SSE_HEARTBEAT_INTERVAL_S
+        refresh_interval = max(0.1, float(self.ctx.cfg.orchestration.sse_refresh_interval_s))
+        heartbeat_interval = max(1.0, float(self.ctx.cfg.orchestration.sse_heartbeat_interval_s))
+        heartbeat_at = asyncio.get_running_loop().time() + heartbeat_interval
         while not self._stopping.is_set():
-            await asyncio.sleep(SSE_REFRESH_INTERVAL_S)
-            modes = await self._active_modes()
-            for mode in modes:
-                body = await asyncio.to_thread(_cockpit_snapshot, self.ctx, mode)
-                previous = self._snapshots.get(mode)
-                self._snapshots[mode] = body
-                if previous is None or previous.get("cursor") != body.get("cursor"):
-                    await self._broadcast(mode, body)
+            await asyncio.sleep(refresh_interval)
+            try:
+                modes = await self._active_modes()
+                for mode in modes:
+                    body = await asyncio.to_thread(_cockpit_snapshot, self.ctx, mode)
+                    previous = self._snapshots.get(mode)
+                    self._snapshots[mode] = body
+                    if previous is None or previous.get("cursor") != body.get("cursor"):
+                        await self._broadcast(mode, body)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                now = asyncio.get_running_loop().time()
+                if now >= self._next_refresh_error_log_at:
+                    logger.exception("cockpit SSE snapshot refresh failed")
+                    self._next_refresh_error_log_at = now + SSE_REFRESH_ERROR_LOG_INTERVAL_S
             now = asyncio.get_running_loop().time()
             if now >= heartbeat_at:
-                await self._broadcast_heartbeat()
-                heartbeat_at = now + SSE_HEARTBEAT_INTERVAL_S
+                try:
+                    await self._broadcast_heartbeat()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("cockpit SSE heartbeat broadcast failed")
+                heartbeat_at = now + heartbeat_interval
 
     async def _active_modes(self) -> list[str]:
         async with self._lock:
@@ -407,10 +424,14 @@ class CockpitReadHandlers:
         self.ctx.require_auth(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
         raw: dict[str, Any] = {}
+        has_stored_projection = await asyncio.to_thread(_has_stored_session_projection, self.ctx.store, ref)
         row = await asyncio.to_thread(_fallback_session_row, self.ctx.store, ref, {})
-        with contextlib.suppress(CockpitError):
+        try:
             raw = await asyncio.to_thread(_worker_get_json, self.ctx.cfg, ref.worker_id, f"/sessions/{ref.session_id}", get=self.ctx.get)
             row = _overlay_session_row(row, _worker_session_row(raw, ref.worker_id))
+        except CockpitError as exc:
+            if exc.code == "not_found" and not has_stored_projection:
+                raise
         requests: list[dict[str, Any]] = []
         checkpoints: list[dict[str, Any]] = []
         with contextlib.suppress(CockpitError):
@@ -589,7 +610,11 @@ class SseHandlers:
 @web.middleware
 async def _cors_middleware(request: web.Request, handler):  # noqa: ANN001
     if request.method == "OPTIONS":
-        response = web.Response(status=204)
+        match_info = await request.app.router.resolve(request)
+        if isinstance(match_info.http_exception, web.HTTPNotFound):
+            response = web.Response(status=404)
+        else:
+            response = web.Response(status=204)
     else:
         response = await handler(request)
     _apply_cors_headers(request, response)
@@ -616,11 +641,18 @@ def _apply_cors_headers(request: web.Request, response: web.StreamResponse) -> N
     if not origin:
         return
     response.headers["Access-Control-Allow-Origin"] = origin
-    response.headers["Vary"] = "Origin"
+    response.headers["Vary"] = _append_vary(response.headers.get("Vary", ""), "Origin")
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Authorization,Content-Type,Last-Event-ID"
     response.headers["Access-Control-Expose-Headers"] = "Content-Type"
     response.headers["Access-Control-Max-Age"] = "600"
+
+
+def _append_vary(existing: str, value: str) -> str:
+    values = [item.strip() for item in existing.split(",") if item.strip()]
+    if not any(item.lower() == value.lower() for item in values):
+        values.append(value)
+    return ", ".join(values)
 
 
 def _allowed_cors_origin(request: web.Request) -> str:
@@ -851,6 +883,13 @@ def _fallback_session_row(store: OrchestrationStore, ref: SessionRef, raw: dict[
     }
 
 
+def _has_stored_session_projection(store: OrchestrationStore, ref: SessionRef) -> bool:
+    for run in store.list_runs():
+        if any(link.worker_id == ref.worker_id and link.session_id == ref.session_id for link in run.sessions):
+            return True
+    return f"{ref.worker_id}\0{ref.session_id}" in store.archived_worker_sessions()
+
+
 def _service_error(exc: Exception) -> CockpitError:
     if isinstance(exc, MissingAuthorityError):
         return CockpitError("forbidden", f"missing authority: {', '.join(exc.actions)}", status=403)
@@ -1068,7 +1107,7 @@ def _finalize_session_run_if_terminal(store: OrchestrationStore, run_id: str) ->
     run = store.get(run_id)
     if run is None:
         return
-    final = _final_session_phase(run)
+    final = final_session_phase(run)
     if final == "completed":
         store.set_phase(run_id, "completed", "All worker sessions completed")
         return
