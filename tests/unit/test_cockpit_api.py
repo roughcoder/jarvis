@@ -16,6 +16,7 @@ import httpx  # noqa: E402
 from aiohttp import web  # noqa: E402
 
 from jarvis.config import Config  # noqa: E402
+import jarvis.orchestration.api as cockpit_api_module  # noqa: E402
 from jarvis.orchestration.api import CockpitAppContext, IdempotencyStore, SseSnapshotHub, _command_from_body, _idempotency_scope, make_app, serve  # noqa: E402
 from jarvis.orchestration.cockpit import make_session_ref  # noqa: E402
 from jarvis.orchestration.models import Artifact, ExecutionEnvelope, WorkItem, WorkerProfile, WorkerSessionLink  # noqa: E402
@@ -308,7 +309,7 @@ def _fake_get(run_id: str):  # noqa: ANN202
                     ]
                 }
             )
-        if url.endswith("/sessions/sess_123/checkpoints"):
+        if url.endswith("/sessions/checkpoints") or url.endswith("/sessions/sess_123/checkpoints"):
             return Response(
                 {
                     "checkpoints": [
@@ -952,6 +953,92 @@ def test_cockpit_sse_hub_fans_out_one_refresh_to_multiple_subscribers(tmp_path, 
     asyncio.run(run_hub())
 
 
+def test_cockpit_sse_hub_survives_snapshot_refresh_exception(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    cfg.orchestration.sse_refresh_interval_s = 0.1
+    calls = {"count": 0}
+
+    def snapshot(_ctx, _mode):  # noqa: ANN001
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {"cursor": "evt_initial"}
+        if calls["count"] == 2:
+            raise OSError("bad run file")
+        return {"cursor": "evt_recovered"}
+
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_snapshot", snapshot)
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: Response({}),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+
+    async def run_hub() -> None:
+        hub = SseSnapshotHub(ctx)
+        await hub.start()
+        try:
+            subscription = await hub.subscribe("none")
+            event = await asyncio.wait_for(subscription.queue.get(), timeout=1)
+            assert event == {"cursor": "evt_recovered"}
+            assert calls["count"] >= 3
+        finally:
+            await hub.stop()
+
+    import asyncio
+
+    asyncio.run(run_hub())
+
+
+def test_cockpit_sse_hub_throttles_repeated_refresh_exception_logs(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    cfg.orchestration.sse_refresh_interval_s = 0.1
+    calls = {"count": 0}
+    logs = []
+
+    def snapshot(_ctx, _mode):  # noqa: ANN001
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return {"cursor": "evt_initial"}
+        raise OSError("bad run file")
+
+    def log_exception(message: str) -> None:
+        logs.append(message)
+
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_snapshot", snapshot)
+    monkeypatch.setattr(cockpit_api_module.logger, "exception", log_exception)
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: Response({}),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+
+    async def run_hub() -> None:
+        hub = SseSnapshotHub(ctx)
+        await hub.start()
+        try:
+            await hub.subscribe("none")
+            await asyncio.sleep(0.35)
+        finally:
+            await hub.stop()
+
+    import asyncio
+
+    asyncio.run(run_hub())
+
+    assert calls["count"] >= 3
+    assert logs == ["cockpit SSE snapshot refresh failed"]
+
+
 def test_cockpit_auth_and_bad_session_ref_errors(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, token="secret")
 
@@ -989,11 +1076,21 @@ def test_cockpit_cors_preflight_uses_configured_origins(tmp_path, monkeypatch) -
                 "Access-Control-Request-Headers": "Authorization",
             },
         )
+        unknown = await client.options(
+            f"{base}/v1/nope",
+            headers={
+                "Origin": "https://cockpit.example",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "Authorization",
+            },
+        )
 
         assert allowed.status_code == 204
         assert allowed.headers["Access-Control-Allow-Origin"] == "https://cockpit.example"
+        assert allowed.headers["Vary"] == "Origin"
         assert "Authorization" in allowed.headers["Access-Control-Allow-Headers"]
         assert "Access-Control-Allow-Origin" not in denied.headers
+        assert unknown.status_code == 404
 
     import asyncio
 
@@ -1435,6 +1532,8 @@ def test_cockpit_worker_only_sessions_include_checkpoint_counts(tmp_path, monkey
             )
         if url.endswith("/sessions/sess_worker_only/checkpoints"):
             return Response({"checkpoints": [{"checkpoint_id": "ckpt_worker", "label": "worker only"}]})
+        if url.endswith("/sessions/checkpoints"):
+            return Response({"error": "not found"}, status_code=404)
         if url.endswith("/sessions/requests"):
             return Response({"requests": []})
         raise AssertionError(url)
@@ -1499,6 +1598,50 @@ def test_cockpit_checkpoint_aggregation_uses_worker_bulk_endpoint(tmp_path, monk
     asyncio.run(_with_server(cfg, calls, http_get=get))
 
 
+def test_cockpit_session_detail_returns_not_found_for_stale_worker_only_ref(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    ref = make_session_ref("macbook-worker", "sess_worker_only")
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/health"):
+            return Response({"ok": True, "agent": "codex", "supported_engines": ["codex"]})
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions"):
+            return Response(
+                {
+                    "sessions": [
+                        {
+                            "session_id": "sess_worker_only",
+                            "provider": "codex",
+                            "engine": "codex",
+                            "status": "running",
+                            "repo": "roughcoder/jarvis",
+                            "title": "Worker-only session",
+                        }
+                    ]
+                }
+            )
+        if url.endswith("/sessions/requests") or url.endswith("/sessions/checkpoints"):
+            return Response({"requests": [], "checkpoints": []})
+        if url.endswith("/sessions/sess_worker_only"):
+            return Response({"error": "gone"}, status_code=404)
+        raise AssertionError(url)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        snapshot = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+        assert snapshot["sessions"][0]["session_ref"] == ref
+
+        response = await client.get(f"{base}/v1/sessions/{ref}")
+
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "not_found"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
 def test_cockpit_archive_worker_only_session_hides_it_from_worker_views(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
     ref = make_session_ref("macbook-worker", "sess_worker_only")
@@ -1526,6 +1669,10 @@ def test_cockpit_archive_worker_only_session_hides_it_from_worker_views(tmp_path
                     ]
                 }
             )
+        if url.endswith("/sessions/requests"):
+            return Response({"requests": []})
+        if url.endswith("/sessions/checkpoints"):
+            return Response({"checkpoints": []})
         raise AssertionError(url)
 
     async def calls(base: str, client: httpx.AsyncClient) -> None:

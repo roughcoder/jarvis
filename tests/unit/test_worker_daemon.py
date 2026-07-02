@@ -2292,6 +2292,11 @@ def test_daemon_health_advertises_supported_engines(tmp_path) -> None:
 
     assert health["default_engine"] == "codex"
     assert health["supported_engines"] == ["codex", "claude"]
+    assert health["engine_supports"]["codex"]["approval_requests"] is True
+    assert health["engine_supports"]["codex"]["input_requests"] is True
+    assert health["engine_supports"]["codex"]["checkpoints"] is True
+    assert health["engine_supports"]["claude"]["resume"] is True
+    assert health["engine_supports"]["claude"]["checkpoints"] is False
 
 
 def test_daemon_code_dispatch_persists_engine_session_metadata(tmp_path) -> None:

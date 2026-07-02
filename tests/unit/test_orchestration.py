@@ -8,6 +8,7 @@ import pytest
 
 from jarvis.capabilities import WORKER_SESSION_STOP
 from jarvis.config import WorkerConfig, load_config
+from jarvis.orchestration import store as store_module
 from jarvis.orchestration.authority import allowed
 from jarvis.orchestration.campaign import CampaignPolicy, create_campaign
 from jarvis.orchestration.envelope import build_execution_envelope
@@ -54,6 +55,31 @@ def test_run_graph_persists_run_and_events(tmp_path) -> None:
     assert reloaded.phase == "running"
     assert reloaded.work_items[0].item.id == "#1"
     assert [e.type for e in store.events(run.run_id)] == ["run_created", "phase_changed"]
+
+
+def test_session_ref_index_skips_unchanged_mapping_writes(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    store = OrchestrationStore(str(tmp_path))
+    writes = []
+    real_write = store_module._atomic_write_json  # noqa: SLF001
+
+    def write_json(path, data):  # noqa: ANN001
+        writes.append(list(data))
+        real_write(path, data)
+
+    monkeypatch.setattr(store_module, "_atomic_write_json", write_json)
+    row = {"session_ref": "sessref_123", "worker_id": "worker-a", "session_id": "sess_1"}
+
+    store.record_session_refs([row])
+    first_updated_at = store.session_ref_index()["sessref_123"]["updated_at"]
+    store.record_session_refs([row])
+
+    assert len(writes) == 1
+    assert store.session_ref_index()["sessref_123"]["updated_at"] == first_updated_at
+
+    store.record_session_refs([{**row, "worker_id": "worker-b"}])
+
+    assert len(writes) == 2
+    assert store.session_ref_index()["sessref_123"]["worker_id"] == "worker-b"
 
 
 def test_active_primary_owner_prevents_duplicate_work(tmp_path) -> None:
@@ -1325,6 +1351,60 @@ def test_start_worker_session_fetches_existing_session_after_duplicate_create(tm
     assert store.get(run.run_id).sessions[0].session_id == expected_session_id  # type: ignore[union-attr]
 
 
+def test_start_worker_session_reuses_linked_session_for_matching_worker(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Start duplicate worker session")
+    store.link_session(
+        run.run_id,
+        WorkerSessionLink(worker_id="worker-a", session_id="sess_dup", status="created", provider="codex", engine="codex", branch="jarvis/worker-a"),
+    )
+    store.link_session(
+        run.run_id,
+        WorkerSessionLink(worker_id="worker-b", session_id="sess_dup", status="created", provider="codex", engine="codex", branch="jarvis/worker-b"),
+    )
+    envelope = ExecutionEnvelope(
+        run_id=run.run_id,
+        repo="roughcoder/jarvis",
+        prompt="x",
+        worker_id="worker-b",
+        engine="codex",
+        session_id="sess_dup",
+    )
+    calls = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, body: dict) -> None:
+            self._body = body
+            self.text = json.dumps(body)
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self._body
+
+    def fake_post(url, **kwargs):  # noqa: ANN001
+        calls.append((url, kwargs["json"]))
+        assert not url.endswith("/sessions")
+        assert url.endswith("/sessions/sess_dup/turns")
+        return Response({"ok": True, "events": []})
+
+    link = start_worker_session(
+        envelope,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1, token=""),
+        worker=WorkerProfile(worker_id="worker-b", display_name="Worker B", base_url="http://worker-b"),
+        store=store,
+        post=fake_post,
+    )
+
+    assert link.worker_id == "worker-b"
+    assert link.session_id == "sess_dup"
+    assert link.branch == "jarvis/worker-b"
+    assert len(calls) == 1
+
+
 def test_start_worker_session_links_created_session_before_turn_failure(tmp_path) -> None:
     store = OrchestrationStore(str(tmp_path))
     run = store.create_run("Start live session")
@@ -2451,6 +2531,61 @@ def test_orchestration_service_resume_latest_skips_archived_runs(tmp_path, monke
     store.link_session(archived.run_id, WorkerSessionLink(worker_id="local-worker", session_id="sess_archived", status="completed", branch="jarvis/archived"))
     store.set_phase(archived.run_id, "completed", "done")
     store.archive_run(archived.run_id)
+    seen = {}
+
+    def fake_start(envelope, *, worker_cfg, worker=None, store=None, post=None):  # noqa: ANN001, ANN202
+        seen["run_id"] = envelope.run_id
+        return WorkerSessionLink(worker_id=envelope.worker_id, session_id=envelope.session_id, status="running", branch=envelope.branch_name)
+
+    monkeypatch.setattr("jarvis.orchestration.service.sync_run_sessions", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "jarvis.orchestration.workers.WorkerRegistry._probe",
+        lambda _self, profile: WorkerProfile(
+            worker_id=profile.worker_id,
+            display_name=profile.display_name,
+            capabilities=profile.capabilities,
+            base_url=profile.base_url,
+            status="online",
+            agent="codex",
+            supported_engines=["codex"],
+        ),
+    )
+    monkeypatch.setattr("jarvis.orchestration.executor.start_worker_session", fake_start)
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"orchestration.runs.read", "worker.job.start", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: None,
+    )
+
+    result = service.resume_run("latest")
+
+    assert result.envelope.run_id == visible.run_id
+    assert seen["run_id"] == visible.run_id
+
+
+def test_orchestration_service_resume_latest_skips_runs_with_only_archived_sessions(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    cfg = load_config()
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    visible = store.create_run("Visible resume", work_items=[_item(id="#visible")])
+    store.link_session(visible.run_id, WorkerSessionLink(worker_id="local-worker", session_id="sess_visible", status="completed", branch="jarvis/visible"))
+    store.set_phase(visible.run_id, "completed", "done")
+    archived_only = store.create_run("Only archived sessions", work_items=[_item(id="#archived-only")])
+    store.link_session(
+        archived_only.run_id,
+        WorkerSessionLink(worker_id="local-worker", session_id="sess_archived_only", status="completed", branch="jarvis/archived-only"),
+    )
+    store.set_phase(archived_only.run_id, "completed", "done")
+    store.archive_session(archived_only.run_id, "sess_archived_only", worker_id="local-worker")
     seen = {}
 
     def fake_start(envelope, *, worker_cfg, worker=None, store=None, post=None):  # noqa: ANN001, ANN202

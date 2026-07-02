@@ -662,12 +662,14 @@ It supports:
 
 - `Last-Event-ID`
 - `?after=<cursor>`
-- heartbeat comments, currently every 15 seconds while connected
+- heartbeat comments, every 15 seconds by default while connected
 - snapshot fallback for stale or unknown cursors
 
 Jarvis computes each subscribed sync-mode snapshot once per API process refresh
 tick and fans it out to all matching SSE clients. It must not rebuild the full
-snapshot once per connected browser tab.
+snapshot once per connected browser tab. Operators can tune the app-level
+refresh and heartbeat cadence with `ORCHESTRATION_SSE_REFRESH_INTERVAL_S` and
+`ORCHESTRATION_SSE_HEARTBEAT_INTERVAL_S`.
 
 Native browser `EventSource` cannot set an `Authorization` header. T3 should
 either proxy this endpoint through its server-side Jarvis client or use a
@@ -753,6 +755,9 @@ or breaking status, and migration notes.
   `ORCHESTRATION_API_PORT`, `ORCHESTRATION_API_BIND_HOST`,
   `ORCHESTRATION_API_TOKEN`, `ORCHESTRATION_API_ALLOW_INSECURE`, and
   `ORCHESTRATION_API_CORS_ORIGINS`.
+- Added env-driven cockpit SSE cadence settings:
+  `ORCHESTRATION_SSE_REFRESH_INTERVAL_S` and
+  `ORCHESTRATION_SSE_HEARTBEAT_INTERVAL_S`.
 - Added a `cockpit` optional dependency extra for the API server's HTTP/SSE
   runtime.
 - Clarified that `session_ref` values are `sessref_` prefixed, URL-safe,

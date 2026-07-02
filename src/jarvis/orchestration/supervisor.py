@@ -177,7 +177,7 @@ def sync_run_sessions(
                 if updated.to_dict() != before:
                     summary.sessions_updated += 1
                 run = reloaded
-        final = _final_session_phase(run)
+        final = final_session_phase(run)
         if final == "completed":
             store.set_phase(run.run_id, "completed", "All worker sessions completed")
             summary.runs_completed += 1
@@ -255,7 +255,7 @@ def _final_phase(run: OrchestrationRun) -> str:
     return "failed"
 
 
-def _final_session_phase(run: OrchestrationRun) -> str:
+def final_session_phase(run: OrchestrationRun) -> str:
     visible_sessions = [session for session in run.sessions if not session.archived_at]
     if not visible_sessions or run.status == "terminal":
         return ""

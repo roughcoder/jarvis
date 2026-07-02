@@ -114,7 +114,7 @@ def start_worker_session(
         }
     else:
         session_id = _worker_session_id(envelope)
-        existing = _linked_session(store, envelope.run_id, session_id)
+        existing = _linked_session(store, envelope.run_id, envelope.worker_id, session_id)
         if existing is not None:
             session = existing
         else:
@@ -356,13 +356,13 @@ def _stop_created_session_after_turn_rejection(
             pass
 
 
-def _linked_session(store: OrchestrationStore | None, run_id: str, session_id: str) -> dict[str, Any] | None:
+def _linked_session(store: OrchestrationStore | None, run_id: str, worker_id: str, session_id: str) -> dict[str, Any] | None:
     if store is None:
         return None
     run = store.get(run_id)
     if run is None:
         return None
-    link = next((session for session in run.sessions if session.session_id == session_id), None)
+    link = next((session for session in run.sessions if session.worker_id == worker_id and session.session_id == session_id), None)
     if link is None:
         return None
     return {

@@ -254,26 +254,31 @@ class OrchestrationStore:
         return result
 
     def record_session_refs(self, rows: list[dict[str, str]]) -> None:
-        clean_rows = []
+        clean_rows: dict[str, dict[str, str]] = {}
         for row in rows:
             session_ref = str(row.get("session_ref") or "")
             worker_id = str(row.get("worker_id") or "")
             session_id = str(row.get("session_id") or "")
             if session_ref and worker_id and session_id:
-                clean_rows.append(
-                    {
-                        "session_ref": session_ref,
-                        "worker_id": worker_id,
-                        "session_id": session_id,
-                        "updated_at": utc_now(),
-                    }
-                )
+                clean_rows[session_ref] = {"session_ref": session_ref, "worker_id": worker_id, "session_id": session_id}
         if not clean_rows:
             return
         with self._locked():
             index = self.session_ref_index()
-            for row in clean_rows:
-                index[row["session_ref"]] = row
+            changed = False
+            updated_at = utc_now()
+            for session_ref, row in clean_rows.items():
+                existing = index.get(session_ref)
+                if (
+                    existing is not None
+                    and existing.get("worker_id") == row["worker_id"]
+                    and existing.get("session_id") == row["session_id"]
+                ):
+                    continue
+                index[session_ref] = {**row, "updated_at": updated_at}
+                changed = True
+            if not changed:
+                return
             _atomic_write_json(self._session_refs_path, list(index.values()))
 
     def session_ref_index(self) -> dict[str, dict[str, str]]:
