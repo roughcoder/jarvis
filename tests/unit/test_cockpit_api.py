@@ -175,10 +175,49 @@ def _seed_run(cfg: Config) -> tuple[OrchestrationStore, str]:
     return store, run.run_id
 
 
+def _worker_system_health() -> dict[str, Any]:
+    return {
+        "hostname": "neil-laptop",
+        "platform": "darwin",
+        "arch": "arm64",
+        "os_name": "macOS",
+        "os_version": "15.5",
+        "kernel_version": "24.5.0",
+        "cpu_model": "Apple M4 Pro",
+        "cpu_cores_physical": 12,
+        "cpu_cores_logical": 12,
+        "memory_total_bytes": 51539607552,
+        "memory_available_bytes": 21474836480,
+        "memory_used_bytes": 30064771072,
+        "memory_used_percent": 58.3,
+        "load_average": [2.12, 2.44, 2.19],
+        "uptime_seconds": 384220,
+        "disk": [
+            {
+                "mount": "/",
+                "filesystem": "apfs",
+                "total_bytes": 994662584320,
+                "available_bytes": 420118257664,
+                "used_bytes": 574544326656,
+                "used_percent": 57.8,
+            }
+        ],
+        "gpu": [{"name": "Apple M4 Pro", "memory_total_bytes": None}],
+        "checked_at": "2026-07-02T23:35:00Z",
+    }
+
+
 def _fake_get(run_id: str):  # noqa: ANN202
     def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
         if url.endswith("/health"):
-            return Response({"ok": True, "agent": "codex", "supported_engines": ["codex", "claude"]})
+            return Response(
+                {
+                    "ok": True,
+                    "agent": "codex",
+                    "supported_engines": ["codex", "claude"],
+                    "system": _worker_system_health(),
+                }
+            )
         if url.endswith("/jobs"):
             return Response({"jobs": []})
         if url.endswith("/sessions"):
@@ -347,6 +386,7 @@ def test_cockpit_catalog_snapshot_and_worker_projection(tmp_path, monkeypatch) -
         stale_snapshot = (await client.get(f"{base}/v1/cockpit/snapshot")).json()
         snapshot = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "probe"})).json()
         workers = (await client.get(f"{base}/v1/workers", params={"sync": "probe"})).json()
+        worker_detail = (await client.get(f"{base}/v1/workers/macbook-worker", params={"sync": "probe"})).json()
 
         assert catalog["api_version"] == "v1"
         assert "manual" in catalog["work_sources"]
@@ -369,6 +409,20 @@ def test_cockpit_catalog_snapshot_and_worker_projection(tmp_path, monkeypatch) -
         assert workers["workers"][0]["engines"][0]["supports"]["checkpoints"] is True
         assert workers["workers"][0]["engines"][1]["engine"] == "claude"
         assert workers["workers"][0]["engines"][1]["supports"]["interrupt"] is False
+        assert snapshot["workers"][0]["system"]["cpu_model"] == "Apple M4 Pro"
+        assert workers["workers"][0]["system"] == worker_detail["system"]
+        assert workers["workers"][0]["system"]["disk"] == [
+            {
+                "mount": "/",
+                "total_bytes": 994662584320,
+                "available_bytes": 420118257664,
+                "used_percent": 57.8,
+            }
+        ]
+        assert "kernel_version" not in workers["workers"][0]["system"]
+        assert "memory_used_bytes" not in workers["workers"][0]["system"]
+        assert "filesystem" not in workers["workers"][0]["system"]["disk"][0]
+        assert "gpu" not in workers["workers"][0]["system"]
 
     import asyncio
 
@@ -550,6 +604,49 @@ def test_cockpit_snapshot_cursor_tracks_worker_projection(tmp_path, monkeypatch)
 
         assert changed["cursor"] != first["cursor"]
         assert changed["workers"][0]["health"] == "unhealthy"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_worker_projection_tolerates_null_system(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    workers_path = Path(cfg.orchestration.workers_path)
+    data = json.loads(workers_path.read_text())
+    data["workers"][0]["system"] = None
+    workers_path.write_text(json.dumps(data))
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/workers")
+        body = response.json()
+
+        assert response.status_code == 200
+        assert body["workers"][0]["system"]["hostname"] is None
+        assert body["workers"][0]["system"]["disk"] == []
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_snapshot_cursor_ignores_worker_checked_at(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _store, _run_id = _seed_run(cfg)
+    workers_path = Path(cfg.orchestration.workers_path)
+    data = json.loads(workers_path.read_text())
+    data["workers"][0]["system"] = _worker_system_health()
+    workers_path.write_text(json.dumps(data))
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        first = (await client.get(f"{base}/v1/cockpit/snapshot")).json()
+        data["workers"][0]["system"]["checked_at"] = "2026-07-02T23:36:00Z"
+        workers_path.write_text(json.dumps(data))
+        same = (await client.get(f"{base}/v1/cockpit/snapshot")).json()
+
+        assert first["workers"][0]["system"]["checked_at"] == "2026-07-02T23:35:00Z"
+        assert same["workers"][0]["system"]["checked_at"] == "2026-07-02T23:36:00Z"
+        assert same["cursor"] == first["cursor"]
 
     import asyncio
 
@@ -1037,6 +1134,35 @@ def test_cockpit_sse_hub_throttles_repeated_refresh_exception_logs(tmp_path, mon
 
     assert calls["count"] >= 3
     assert logs == ["cockpit SSE snapshot refresh failed"]
+
+
+def test_cockpit_health_includes_brain_system_projection(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    monkeypatch.setattr(cockpit_api_module, "system_info_cached", _worker_system_health)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/health")
+        body = response.json()
+
+        assert response.status_code == 200
+        assert body["ok"] is True
+        assert body["system"]["cpu_model"] == "Apple M4 Pro"
+        assert body["system"]["disk"] == [
+            {
+                "mount": "/",
+                "total_bytes": 994662584320,
+                "available_bytes": 420118257664,
+                "used_percent": 57.8,
+            }
+        ]
+        assert "kernel_version" not in body["system"]
+        assert "memory_used_bytes" not in body["system"]
+        assert "filesystem" not in body["system"]["disk"][0]
+        assert "gpu" not in body["system"]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
 
 
 def test_cockpit_auth_and_bad_session_ref_errors(tmp_path, monkeypatch) -> None:  # noqa: ANN001

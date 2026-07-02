@@ -141,7 +141,27 @@ def test_worker_registry_redacts_private_connection_details(monkeypatch) -> None
 
     def fake_get(url, **_kw):  # noqa: ANN001
         if url.endswith("/health"):
-            return Response({"ok": True, "agent": "codex"})
+            return Response(
+                {
+                    "ok": True,
+                    "agent": "codex",
+                    "system": {
+                        "hostname": "worker-laptop",
+                        "platform": "darwin",
+                        "disk": [
+                            {
+                                "mount": "/Users/example/private",
+                                "filesystem": "apfs",
+                                "total_bytes": "1000",
+                                "available_bytes": "400",
+                                "used_bytes": "600",
+                                "used_percent": "60.0",
+                            }
+                        ],
+                        "checked_at": "2026-07-02T23:35:00Z",
+                    },
+                }
+            )
         return Response({"jobs": [{"status": "running"}, {"status": "done"}]})
 
     cfg = WorkerConfig(_env_file=None, token="secret", host="private-host", port=9999)
@@ -151,7 +171,9 @@ def test_worker_registry_redacts_private_connection_details(monkeypatch) -> None
     assert public["worker_id"] == "local-worker"
     assert public["status"] == "online"
     assert public["capacity"]["current_jobs"] == 1
+    assert public["system"]["disk"][0]["mount"] is None
     assert "private-host" not in json.dumps(public)
+    assert "/Users/example" not in json.dumps(public)
     assert "secret" not in json.dumps(public)
 
 

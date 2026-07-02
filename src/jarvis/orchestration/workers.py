@@ -160,6 +160,7 @@ class WorkerRegistry:
             profile.engine_supports = _engine_supports_from_mapping(data["engine_supports"])
         elif isinstance(data.get("engines"), list):
             profile.engine_supports = _engine_supports_from_rows(data["engines"])
+        profile.system = _system_from_health(data.get("system"))
         profile.__post_init__()
         return profile
 
@@ -206,3 +207,105 @@ def _engine_supports_from_rows(rows: list[Any]) -> dict[str, dict[str, bool]]:
         if engine and isinstance(supports, dict):
             result[engine] = {str(key): bool(value) for key, value in supports.items()}
     return result
+
+
+def _system_from_health(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, Any] = {
+        "hostname": _string_or_none(raw.get("hostname")),
+        "platform": _string_or_none(raw.get("platform")),
+        "arch": _string_or_none(raw.get("arch")),
+        "os_name": _string_or_none(raw.get("os_name")),
+        "os_version": _string_or_none(raw.get("os_version")),
+        "kernel_version": _string_or_none(raw.get("kernel_version")),
+        "cpu_model": _string_or_none(raw.get("cpu_model")),
+        "cpu_cores_physical": _int_or_none(raw.get("cpu_cores_physical")),
+        "cpu_cores_logical": _int_or_none(raw.get("cpu_cores_logical")),
+        "memory_total_bytes": _int_or_none(raw.get("memory_total_bytes")),
+        "memory_available_bytes": _int_or_none(raw.get("memory_available_bytes")),
+        "memory_used_bytes": _int_or_none(raw.get("memory_used_bytes")),
+        "memory_used_percent": _float_or_none(raw.get("memory_used_percent")),
+        "load_average": _load_average(raw.get("load_average")),
+        "uptime_seconds": _int_or_none(raw.get("uptime_seconds")),
+        "disk": _system_disks(raw.get("disk")),
+        "gpu": _system_gpu(raw.get("gpu")),
+        "checked_at": _string_or_none(raw.get("checked_at")),
+    }
+    return result
+
+
+def _system_disks(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    disks: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        disks.append(
+            {
+                "mount": _safe_mount(item.get("mount")),
+                "filesystem": _string_or_none(item.get("filesystem")),
+                "total_bytes": _int_or_none(item.get("total_bytes")),
+                "available_bytes": _int_or_none(item.get("available_bytes")),
+                "used_bytes": _int_or_none(item.get("used_bytes")),
+                "used_percent": _float_or_none(item.get("used_percent")),
+            }
+        )
+    return disks
+
+
+def _system_gpu(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in raw:
+        if isinstance(item, dict):
+            result.append(
+                {
+                    "name": _string_or_none(item.get("name")),
+                    "memory_total_bytes": _int_or_none(item.get("memory_total_bytes")),
+                }
+            )
+    return result
+
+
+def _load_average(raw: Any) -> list[float | None]:
+    if not isinstance(raw, list):
+        return [None, None, None]
+    values = [_float_or_none(value) for value in raw[:3]]
+    return [*values, *([None] * (3 - len(values)))]
+
+
+def _safe_mount(raw: Any) -> str | None:
+    text = _string_or_none(raw)
+    if not text:
+        return None
+    if text == "/":
+        return "/"
+    return None
+
+
+def _string_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
