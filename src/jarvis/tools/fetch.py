@@ -10,6 +10,7 @@ the tool; this is for reading server-rendered content. Gated `web.search`.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import html as _html
 import ipaddress
 import re
@@ -25,6 +26,8 @@ from jarvis.tools.base import Tool
 _CAP = "web.search"
 _MAX_CHARS = 6000
 _MAX_REDIRECTS = 5
+_DNS_TIMEOUT_S = 5.0
+_DNS_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="jarvis-fetch-dns")
 
 _DROP = re.compile(r"<(script|style|head|noscript|svg)\b.*?</\1>", re.DOTALL | re.IGNORECASE)
 _COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -50,18 +53,36 @@ def html_to_text(html: str, *, max_chars: int = _MAX_CHARS) -> str:
 
 
 def _public_ip(address: str) -> bool:
-    return ipaddress.ip_address(address).is_global
+    ip = ipaddress.ip_address(address)
+    return (
+        ip.is_global
+        and not ip.is_private
+        and not ip.is_loopback
+        and not ip.is_link_local
+        and not ip.is_multicast
+        and not ip.is_reserved
+        and not ip.is_unspecified
+    )
 
 
-async def _resolve_public_address(host: str, port: int) -> str:
+async def _resolve_public_addresses(
+    host: str,
+    port: int,
+    *,
+    timeout_s: float = _DNS_TIMEOUT_S,
+) -> list[str]:
     def resolve() -> list[str]:
         infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        return [info[4][0] for info in infos]
+        return list(dict.fromkeys(info[4][0] for info in infos))
 
-    addresses = await asyncio.to_thread(resolve)
+    loop = asyncio.get_running_loop()
+    addresses = await asyncio.wait_for(
+        loop.run_in_executor(_DNS_EXECUTOR, resolve),
+        timeout=timeout_s,
+    )
     if not addresses or any(not _public_ip(addr) for addr in addresses):
         raise ValueError("blocked non-public network address")
-    return addresses[0]
+    return addresses
 
 
 def _safe_fetch_url(url: str) -> httpx.URL:
@@ -83,14 +104,21 @@ class _PublicOnlyNetworkBackend(httpcore.AsyncNetworkBackend):
         local_address: str | None = None,
         socket_options=None,  # noqa: ANN001 - httpcore socket option tuple shape
     ) -> httpcore.AsyncNetworkStream:
-        address = await _resolve_public_address(host, port)
-        return await self._backend.connect_tcp(
-            address,
-            port,
-            timeout=timeout,
-            local_address=local_address,
-            socket_options=socket_options,
-        )
+        addresses = await _resolve_public_addresses(host, port)
+        last_exc: Exception | None = None
+        for address in addresses:
+            try:
+                return await self._backend.connect_tcp(
+                    address,
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except Exception as exc:  # noqa: BLE001 - try the next vetted address
+                last_exc = exc
+        assert last_exc is not None
+        raise last_exc
 
 
 class _PublicOnlyAsyncHTTPTransport(httpx.AsyncHTTPTransport):
