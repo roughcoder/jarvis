@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
+from jarvis.brain.dialog import _norm, _only_filler_remains, _REQUEST_CUE
+
 
 DEFAULT_MODE = "default"
 STAY_MODE = "stay"
@@ -42,10 +44,6 @@ PROFILES = {
     ),
 }
 
-_REQUEST_CUE = re.compile(
-    r"\b(tell|what|whats|how|why|when|where|who|which|show|give|explain|"
-    r"recommend|suggest|find|search|list|define|describe|help|can you|could you)\b"
-)
 _MODE_CONTROL_RE = re.compile(
     r"\s*\[\[\s*(?P<kind>conversation|voice_mode)\s*:"
     r"\s*(?P<value>[a-z_ -]+?)\s*(?::\s*(?P<reason>[a-z_ -]+?)\s*)?\]\]\s*",
@@ -65,6 +63,10 @@ _EXIT_STAY = re.compile(
     r"go back to default|back to default"
     r")\b"
 )
+# NOTE: intentionally a DIFFERENT list from dialog._SIGNOFF_ANCHOR. This one
+# gates the pre-LLM local action (canned reply, no model call) so it holds only
+# unmistakable commands; softer sign-offs ('no thanks') go to the LLM for a
+# warm farewell and are caught post-turn by dialog's net.
 _HARD_EXIT = re.compile(
     r"\b("
     r"stop listening|go to sleep|go to bed|goodbye|bye bye|bye|goodnight|"
@@ -260,7 +262,8 @@ def assistant_requests_followup(reply: str) -> bool:
     return bool(
         text
         and (
-            _FOLLOWUP_QUESTION_REPLY.search(text)
+            text.rstrip().endswith("?")  # the reply ENDS on a question to the user
+            or _FOLLOWUP_QUESTION_REPLY.search(text)
             or _FOLLOWUP_FINAL_QUESTION_REPLY.search(text)
             or _FOLLOWUP_REQUEST_REPLY.search(text)
         )
@@ -286,7 +289,15 @@ def classify_voice_turn(
     requested_mode = normalize_mode(control.mode or active_mode)
     marker_seen = control.conversation is not None or control.mode is not None
     assistant_followup = assistant_requests_followup(raw_reply)
-    soft_close = should_soft_close_default(user_text)
+    # A bare ack ('thanks', 'ok', 'cool') closes only when nothing says the
+    # exchange is still in flight: an explicit goodbye always closes, but a
+    # soft ack yields to a reply that asks the user something and to the
+    # model's own [[CONVERSATION:open:...]] judgement.
+    soft_close = (
+        should_soft_close_default(user_text)
+        and not assistant_followup
+        and control.conversation != "open"
+    )
     default_user_closed = explicit_close or soft_close
 
     if active_mode == STAY_MODE and requested_mode == STAY_MODE:
@@ -325,7 +336,10 @@ def classify_voice_turn(
             assistant_asked_followup=assistant_followup,
         )
 
-    if tool_completes_voice_turn(tool_messages):
+    # A completed alarm/timer command closes the turn — unless the reply asks
+    # the user something (e.g. 'Alarm set — weekdays only?'), which must not
+    # hang up on its own question.
+    if tool_completes_voice_turn(tool_messages) and not assistant_followup:
         return VoiceStateTransition(
             mode=DEFAULT_MODE,
             ended=True,
@@ -511,20 +525,19 @@ def voice_mode_instruction(mode: str) -> str:
         "when the user is clearly exploring, planning, troubleshooting, or asking "
         "a multi-step question. If unsure, prefer a brief follow-up listen rather "
         "than going straight to sleep. Append exactly one conversation marker at the end: "
-        "[[CONVERSATION:closed:task_complete]] when the turn is complete, or "
-        "[[CONVERSATION:open:followup_expected]] when a real follow-up is expected. "
+        "[[CONVERSATION:closed:task_complete]] when the turn is complete, "
+        "[[CONVERSATION:closed:user_closed]] when the user said goodbye or declined "
+        "more help, or [[CONVERSATION:open:followup_expected]] when a real follow-up "
+        "is expected. "
         "If the user asks for stay mode, append [[VOICE_MODE:stay:mode_enter]] "
         "and [[CONVERSATION:open:mode_enter]]."
     )
 
 
-def _norm(text: str) -> str:
-    text = (text or "").lower().replace("'", "")
-    text = re.sub(r"[^\w\s]", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+# Deliberately SMALLER than dialog's sign-off filler: a local action bypasses
+# the LLM entirely (canned reply), so only unmistakable padding is ignored.
+_LOCAL_CONTROL_FILLER = frozenset({"hey", "jarvis", "please", "ok", "okay", "and", "then"})
 
 
 def _is_pure_voice_control(text: str, pattern: re.Pattern[str]) -> bool:
-    remainder = pattern.sub(" ", text)
-    remainder = re.sub(r"\b(hey|jarvis|please|ok|okay|and|then)\b", " ", remainder)
-    return not re.sub(r"\s+", " ", remainder).strip()
+    return _only_filler_remains(text, pattern, _LOCAL_CONTROL_FILLER)

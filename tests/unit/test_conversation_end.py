@@ -30,6 +30,10 @@ CLEAR_SIGNOFFS = [
     "no, that's good, thanks",  # the exact example from the END instruction
     "okay, that's all then",
     "thanks, that's all",
+    "we're good",               # END-instruction decline example
+    "I'm good, thanks",         # END-instruction decline example
+    "no worries, bye",
+    "right then, that's all, thanks very much",
 ]
 
 NOT_SIGNOFFS = [
@@ -42,6 +46,16 @@ NOT_SIGNOFFS = [
     "ok",                       # bare ack
     "cool",                     # bare ack
     "great",                    # bare ack
+    # 'no' + closer word but the middle is a COMMAND — must keep listening
+    "no, cancel it, thanks",
+    "nah, book the earlier one, cheers",
+    "no, turn it off, thanks",
+    "no, play the other one, thanks",
+    # farewell phrase inside a substantive sentence — not a sign-off
+    "see you at the station at 5, is that ok",
+    "I'm good at chess",
+    "stop the music",
+    "go to sleep after you set the alarm",
 ]
 
 
@@ -62,6 +76,8 @@ REPLY_FAREWELLS = [
     "Good night, sleep well.",
     "Take care.",
     "Bye for now.",
+    "It's booked for eight. Goodnight.",    # substantive reply ENDING on a farewell
+    "[say warmly] Sleep well. [[END]]",     # tags/markers stripped before the check
 ]
 
 REPLY_CONTINUATIONS = [
@@ -69,6 +85,11 @@ REPLY_CONTINUATIONS = [
     "Sure, what else can I do for you?",
     "Take care, and let me know if you need anything else.",
     "The weather is sunny today.",          # not a farewell at all
+    # farewell WORD inside a substantive final sentence — must not hang up
+    "Take care with that pan, it gets hot fast.",
+    "The song is Bye Bye Bye by NSYNC.",
+    "Talk soon means they will call back.",
+    "Goodnight is how you say it in English.",
 ]
 
 
