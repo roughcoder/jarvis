@@ -38,6 +38,7 @@ from jarvis.brain.dialog import (
 )
 from jarvis.brain.gateway_client import GatewayClient, LLMAttribution
 from jarvis.brain.memory_client import MemoryClient
+from jarvis.brain.soul import read_soul
 from jarvis.users import format_facts, read_facts
 from jarvis.brain.tracing import Tracer
 from jarvis.brain.voice_modes import (
@@ -282,10 +283,15 @@ class BrainSession:
         self._voice_mode = normalize_mode(mode)
 
     def load_soul(self) -> None:
-        path = pathlib.Path(self._cfg.persona.soul_path)
-        if path.exists():
-            self._soul = path.read_text(encoding="utf-8").strip()
+        path = self._cfg.persona.soul_path
+        self._soul = read_soul(path)
+        if self._soul:
             print(f"Soul loaded from {path} ({len(self._soul)} chars).")
+        else:
+            # SOUL.md is authoritative for personality (AGENTS.md invariant) —
+            # running without it is almost certainly a misconfiguration.
+            print(f"  ⚠ SOUL MISSING: no personality loaded from {path} — "
+                  "Jarvis will answer without his persona. Check PERSONA_SOUL_PATH.")
 
     def _gateway_for(self, *, kind: str = "turn"):  # noqa: ANN202
         """Return the gateway with per-context LiteLLM attribution when supported.
@@ -359,9 +365,17 @@ class BrainSession:
             trace.start("llm")
             raw = await self._gateway_for().complete(messages, model=model)
             trace.end("llm", model=model, chars=len(raw or ""), memory=bool(memory))
-            result.raw = raw
+            # Single-shot TTS: count the reply as said at its first delivered
+            # chunk (mirrors _drain_pumps), so a barge-in BEFORE any audio never
+            # remembers words the user did not hear.
+            spoke = False
             async for pcm in self._tts_source(self._clean_reply(raw), trace):
+                if not spoke:
+                    spoke = True
+                    result.raw = raw
                 yield pcm
+            if not spoke:
+                result.raw = raw  # chunkless (e.g. empty/marker-only reply)
 
     def finalize(self, user_text: str, result: TurnResult, trace=None) -> None:  # noqa: ANN001
         """End-detection + remember + cold-path. Safe to call after a barge-in —
@@ -525,9 +539,16 @@ class BrainSession:
             parts.append(_MESSAGING_FORMAT)
         # End-detection only matters for an open-mic voice conversation; on a
         # messaging surface every inbound message is already a discrete turn.
-        if include_voice_controls and self._cfg.vad.conversation_mode and self._ctx.channel == "voice":
+        # (The mode-specific marker instruction is appended near the END of the
+        # prompt — it changes when the mode flips, and a mid-prompt change would
+        # invalidate the provider's cached prefix for everything after it.)
+        voice_controls = (
+            include_voice_controls
+            and self._cfg.vad.conversation_mode
+            and self._ctx.channel == "voice"
+        )
+        if voice_controls:
             parts.append(_END_INSTRUCTION)
-            parts.append(voice_mode_instruction(self._voice_mode))
         parts.append(_AGENCY)  # act-by-default + persistence (stable, cacheable)
         if self._ctx.can("background.run"):
             parts.append(_BACKGROUND_GUIDANCE)
@@ -581,8 +602,11 @@ class BrainSession:
                 "What you already know about the user (use it naturally only if "
                 f"relevant; do not recite it):\n{memory}"
             )
-        # Most volatile (changes each minute) → last, so the stable prefix above
-        # stays cacheable. Lets Jarvis answer time/date instantly, no tool needed.
+        # Volatile parts last, so the stable prefix above stays cacheable: the
+        # mode instruction changes when the voice mode flips, and the now-line
+        # changes each minute (it also lets Jarvis answer time/date instantly).
+        if voice_controls:
+            parts.append(voice_mode_instruction(self._voice_mode))
         parts.append(_now_line(self._cfg.persona.timezone))
         return "\n\n".join(parts)
 
@@ -833,12 +857,32 @@ class BrainSession:
                         trace, t0, model, content, n_tools, usage, first_tok, end=llm_done
                     )
                     if not use_stream:
-                        result.raw = content
                         if speak and self._tts is not None:
-                            text = self._clean_reply(content)
-                            if text:
-                                async for pcm in self._tts_source(text, trace):
+                            # Same sentence-pump core as streaming: raw is built
+                            # by mark_spoken as audio is delivered, so a barge-in
+                            # never remembers unsaid sentences.
+                            buf = content
+                            while True:
+                                split = _next_sentence(buf)
+                                if split is None:
+                                    break
+                                sent, buf = split
+                                if sent.strip():
+                                    async for pcm in emit(sent):
+                                        yield pcm
+                            if buf.strip():
+                                async for pcm in emit(buf.strip()):
                                     yield pcm
+                            async for pcm in self._drain_pumps(
+                                pumps, tts_meta, block=True, on_spoken=mark_spoken
+                            ):
+                                yield pcm
+                            if not spoken:
+                                result.raw = content  # nothing speakable
+                        else:
+                            # Text turn: delivery is atomic (no audio), so the
+                            # full reply is exactly what the user receives.
+                            result.raw = content
                     elif not spoken and not pumps:
                         result.raw = content  # e.g. an all-whitespace stream
                     self._record_tts(trace, tts_meta, t0, first_tok)
