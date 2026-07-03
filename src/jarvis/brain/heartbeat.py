@@ -41,8 +41,15 @@ def is_silent(text: str, sentinel: str) -> bool:
 
 def make_heartbeat_think(cfg: Config) -> Callable[[], Awaitable[str]]:
     """The default `think`: read HEARTBEAT.md and ask the model whether anything is
-    worth saying (returns the sentinel when not). Built around the gateway client."""
+    worth saying (returns the sentinel when not). Built around the gateway client.
+
+    The prompt composes like a voice turn — soul (personality) + spoken format
+    rules + the now-line — so a proactive line sounds like Jarvis and can judge
+    time-based checklist items. Deliberately NO user memory: the broadcast is
+    house-scoped, and memory is strictly user-scoped (the privacy wall)."""
+    from jarvis.brain.dialog import compose_spoken_prompt
     from jarvis.brain.gateway_client import GatewayClient, LLMAttribution
+    from jarvis.brain.soul import read_soul
 
     gateway = GatewayClient(cfg.gateway)
     heartbeat_gateway = gateway.with_attribution(
@@ -54,8 +61,13 @@ def make_heartbeat_think(cfg: Config) -> Callable[[], Awaitable[str]]:
         checklist = path.read_text(encoding="utf-8") if path.exists() else ""
         if not checklist.strip():
             return cfg.heartbeat.sentinel
+        system = compose_spoken_prompt(
+            read_soul(cfg.persona.soul_path),  # per tick — soul edits apply live
+            tz=cfg.persona.timezone,
+            extra=_HEARTBEAT_PROMPT.format(sentinel=cfg.heartbeat.sentinel),
+        )
         messages = [
-            {"role": "system", "content": _HEARTBEAT_PROMPT.format(sentinel=cfg.heartbeat.sentinel)},
+            {"role": "system", "content": system},
             {"role": "user", "content": checklist},
         ]
         return await heartbeat_gateway.complete(messages, model=cfg.gateway.fast_model)

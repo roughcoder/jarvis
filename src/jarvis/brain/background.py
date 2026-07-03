@@ -99,13 +99,22 @@ class BackgroundRunner:
             )
             job.status, job.result = "done", (result or "").strip()
             if not job.result:
-                job.result = f"I finished the background task: {_short(job.task)}."
+                job.result = f"I've finished what you asked — {_short(job.task)}."
+        # Fallbacks stay DETERMINISTIC (failure reporting must never depend on
+        # the stack that just failed) and spoken-safe: the raw exception goes to
+        # the log, never to TTS.
         except asyncio.TimeoutError:
             job.status = "error"
-            job.result = f"I ran out of time on the background task “{_short(job.task)}” and had to stop."
+            job.result = (
+                f"I had to stop “{_short(job.task)}” — it was taking longer than "
+                "I allow. Say the word if you'd like me to try again."
+            )
         except Exception as exc:  # noqa: BLE001 - background work must never crash the brain
             job.status = "error"
-            job.result = f"I hit a snag on the background task “{_short(job.task)}”: {exc}"
+            job.result = (
+                f"I couldn't finish “{_short(job.task)}” — something went wrong "
+                "partway through. I can have another go if you like."
+            )
             print(f"  [background] job #{job.id} failed: {exc}")
         await self._deliver(job)
 

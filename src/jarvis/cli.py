@@ -193,11 +193,19 @@ def _cmd_listen_safe(args: argparse.Namespace) -> int:
         return 130
 
 
-_VOICE_SYSTEM_PROMPT = (
-    "You are Jarvis, a concise spoken voice assistant. Answer in one or two "
-    "short sentences meant to be read aloud. Use plain text only — no markdown, "
-    "lists, code blocks, or emoji."
-)
+def _voice_system_prompt(cfg) -> str:  # noqa: ANN001
+    """Compose the Step-4 test prompt from the SAME building blocks as the brain
+    (soul + spoken format + now-line), so `jarvis chat` smoke-tests
+    production-shaped prompting rather than a divergent mini-persona."""
+    from jarvis.brain.dialog import compose_spoken_prompt
+    from jarvis.brain.soul import read_soul
+
+    soul = read_soul(
+        cfg.persona.soul_path, fallback="You are Jarvis, a concise spoken voice assistant."
+    )
+    return compose_spoken_prompt(
+        soul, tz=cfg.persona.timezone, expressive=cfg.persona.expressive
+    )
 
 
 def _cmd_chat(args: argparse.Namespace) -> int:
@@ -244,7 +252,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
             cfg.gateway.strong_model if len(user_text) > 120 else cfg.gateway.fast_model
         )
         messages = [
-            {"role": "system", "content": _VOICE_SYSTEM_PROMPT},
+            {"role": "system", "content": _voice_system_prompt(cfg)},
             {"role": "user", "content": user_text},
         ]
         reply = await gateway.complete(messages, model=model)
