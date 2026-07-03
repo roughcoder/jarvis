@@ -39,6 +39,7 @@ from jarvis.worker.providers.codex import (  # noqa: E402
     _input_result,
     _project_jsonrpc_message,
     _read_until_turn_done,
+    _restore_running_if_waiting,
     _run_codex_turn,
     _session_cwd as codex_session_cwd,
     _track_pending_request,
@@ -52,9 +53,11 @@ from jarvis.worker_session_contract import (  # noqa: E402
     EVENT_APPROVAL_RESOLVED,
     EVENT_TURN_COMPLETED,
     REQUEST_KIND_APPROVAL,
+    SESSION_COMPLETED,
     SESSION_RUNNING,
     SESSION_STOPPED,
     SESSION_WAITING_APPROVAL,
+    SESSION_WAITING_INPUT,
 )
 
 
@@ -243,6 +246,23 @@ def test_codex_server_request_resolved_clears_pending_request(tmp_path) -> None:
     resolved = [event for event in sessions.events(session.session_id) if event.type == EVENT_APPROVAL_RESOLVED]
     assert resolved[-1].data["request_id"] == "approval_rpc"
     assert resolved[-1].data["provider_resolved"] is True
+
+
+def test_codex_restore_running_does_not_revive_terminal_turn(tmp_path) -> None:
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "codex",
+            "engine": "codex",
+            "metadata": _authority_metadata("codex", extra_actions=[WORKER_SESSION_INPUT]),
+        }
+    )
+    sessions.append_event_with_status(session.session_id, SESSION_COMPLETED, EVENT_TURN_COMPLETED)
+    sessions.update_status(session.session_id, SESSION_WAITING_INPUT)
+
+    _restore_running_if_waiting(sessions, session.session_id, SESSION_WAITING_INPUT)
+
+    assert sessions.get(session.session_id).status == SESSION_COMPLETED  # type: ignore[union-attr]
 
 
 def test_codex_turn_rechecks_cancellation_before_launch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
