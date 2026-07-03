@@ -315,9 +315,9 @@ def test_default_mode_respects_closed_marker_when_answer_lists_question_text() -
     assert result.close_reason == "task_complete"
 
 
-def test_default_mode_soft_close_overrides_open_marker() -> None:
+def test_default_mode_soft_close_ends_plain_ack_turn() -> None:
     sess = _session(DEFAULT_MODE)
-    result = TurnResult(raw="No problem. [[CONVERSATION:open:followup_expected]]")
+    result = TurnResult(raw="No problem. [[CONVERSATION:closed:task_complete]]")
 
     sess.finalize("thanks", result)
 
@@ -326,6 +326,30 @@ def test_default_mode_soft_close_overrides_open_marker() -> None:
     assert result.continue_listening is False
     assert result.close_reason == "user_closed"
     assert result.voice_mode == DEFAULT_MODE
+
+
+def test_default_mode_soft_ack_yields_to_open_marker() -> None:
+    # A bare 'thanks' is context-sensitive: the model's explicit open marker
+    # (mid-flow judgement) outranks the soft close.
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(raw="No problem. [[CONVERSATION:open:followup_expected]]")
+
+    sess.finalize("thanks", result)
+
+    assert result.ended is False
+    assert result.continue_listening is True
+    assert result.voice_mode == DEFAULT_MODE
+
+
+def test_default_mode_soft_ack_yields_to_reply_question() -> None:
+    # 'thanks' while Jarvis is asking the user something must not hang up.
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(raw="Sure — what time should I book the table for?")
+
+    sess.finalize("thanks", result)
+
+    assert result.ended is False
+    assert result.continue_listening is True
 
 
 def test_signoff_closes_even_when_model_marks_open() -> None:
@@ -388,6 +412,26 @@ def test_stay_mode_keeps_listening_after_soft_acknowledgement() -> None:
     assert result.continue_listening is True
     assert result.voice_mode == STAY_MODE
     assert result.close_reason == "stay_mode"
+
+
+def test_alarm_tool_close_yields_to_reply_question() -> None:
+    # A successful set_alarm must not close the mic while the reply is asking
+    # the user a question.
+    sess = _session(DEFAULT_MODE)
+    result = TurnResult(raw="Alarm set for seven. Want it weekdays only?")
+    result.tool_messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "1", "function": {"name": "set_alarm", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "1", "content": "alarm set for 07:00"},
+    ]
+
+    sess.finalize("wake me at seven", result)
+
+    assert result.ended is False
+    assert result.continue_listening is True
 
 
 def test_alarm_tools_force_voice_turn_closed() -> None:

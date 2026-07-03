@@ -95,107 +95,155 @@ _MESSAGING_FORMAT = (
     "dates are fine ('23', 'Friday the 26th'), and you may use WhatsApp formatting (*bold*, "
     "_italic_, a short list) and the occasional emoji where it genuinely fits. Send links as "
     "plain URLs. No headings, no code fences, no TTS-style [cues]. "
-    "Don't pad replies with filler like 'let me know if you need anything else'. And never "
-    "tell the user to go look something up or do it themselves — if you have a tool for it "
-    "(web search, the browser, etc.), use the tool and give them the actual answer. For "
-    "anything live or specific (train times, opening hours, prices, availability), use the "
-    "browser to fetch the real current value rather than guessing or giving stale figures."
+    "Don't pad replies with filler like 'let me know if you need anything else'."
 )
+# Tool-use behaviour (act-don't-advise, live data via the browser) is NOT part
+# of the format layer — it lives in _AGENCY and the capability-gated guidance
+# blocks, so a context without those tools is never told to use them.
+
+def compose_spoken_prompt(
+    soul: str, *, tz: str, expressive: bool = False, extra: str = ""
+) -> str:
+    """One composer for every spoken prompt outside BrainSession (heartbeat,
+    the `jarvis chat` smoke test): soul + the spoken format rules + an optional
+    task-specific block + the now-line, in the same order the session uses.
+    Pure — callers read SOUL.md themselves (dialog does no I/O)."""
+    fmt = _VOICE_FORMAT_EXPRESSIVE if expressive else _VOICE_FORMAT_BASE
+    return "\n\n".join(p for p in (soul, fmt, extra, _now_line(tz)) if p)
+
 
 # Conversation control: how the model signals the user is done so the loop can
-# return to PASSIVE (wake word required again). Detected + stripped before TTS.
+# return to PASSIVE (wake word required again). One protocol — the
+# [[CONVERSATION:...]] markers taught in voice_mode_instruction(); this section
+# covers the farewell case. Markers are detected + stripped before TTS.
 _END_INSTRUCTION = (
-    "Ending the conversation: end only when the user clearly signals they're "
-    "finished — a goodbye ('bye', 'goodnight', 'see you'), declining further help "
-    "('no thanks', \"no, that's good, thanks\", \"I'm good\", 'we're good'), or "
-    "'that's all'/'stop'/'go to sleep'. To end, give a short, warm farewell of a "
-    "few words and NOTHING else, then put [[END]] as the very last characters. "
-    "IMPORTANT: if your reply is itself a goodbye, you MUST include [[END]]. "
-    "Otherwise, just answer naturally and stop. Do NOT habitually tack on 'is "
-    "there anything else?', 'want to know more?', or similar filler — only ask a "
+    "Ending the conversation: when the user clearly signals they're finished — "
+    "a goodbye ('bye', 'goodnight', 'see you'), declining further help ('no "
+    "thanks', \"no, that's good, thanks\", \"I'm good\", 'we're good'), or "
+    "'that's all'/'stop'/'go to sleep' — reply with a short, warm farewell of a "
+    "few words and NOTHING else, then append [[CONVERSATION:closed:user_closed]] "
+    "as the very last characters. IMPORTANT: if your reply is itself a goodbye, "
+    "you MUST append that closed marker. Do NOT habitually tack on 'is there "
+    "anything else?', 'want to know more?', or similar filler — only ask a "
     "follow-up question when you genuinely need it to help (e.g. to clarify an "
-    "ambiguous request). When you can't tell whether they're done, simply finish "
-    "your reply normally — no farewell, no [[END]]; the mic stays open, so you "
-    "never need to prompt them to keep talking."
+    "ambiguous request). The mic is controlled by the conversation markers "
+    "described below, so you never need to prompt the user to keep talking."
 )
-# Matches [[END]] / [END] (case-insensitive). Stripped from the spoken reply.
+# Legacy alias: [[END]] / [END] (case-insensitive) still parses as a close and
+# is stripped from the spoken reply, but the prompt no longer teaches it.
 _END_RE = re.compile(r"\s*\[\[?\s*end\s*\]\]?\s*", re.IGNORECASE)
 
 # --- Deterministic backstops (the model handles nuance; these guarantee the
 # clear cases and never fire on a turn the user meant to continue) -----------
 
-# Any request/question word → never a sign-off.
+# Any request/question word → never a sign-off. Shared with voice_modes (the
+# pre-LLM local-action guard) — one list, so the two layers can't drift.
 _REQUEST_CUE = re.compile(
     r"\b(tell|what|whats|how|why|when|where|who|which|show|give|explain|"
-    r"recommend|suggest|find|search|list|define|describe|help)\b"
+    r"recommend|suggest|find|search|list|define|describe|help|can you|could you)\b"
 )
-# Short command / closer phrases (matched after stripping filler words).
-_CLEAR_SIGNOFFS = frozenset(
-    {
-        "goodbye", "bye", "bye bye", "good night", "goodnight",
-        "stop", "stop listening", "go to sleep", "go to bed", "go away",
-        "dismissed", "that is all", "thats all", "that is it", "thats it",
-        "im done", "i am done", "were done", "we are done", "nothing else",
-    }
+# A sign-off must contain one of these ANCHORS (matched on _norm()ed text) …
+_SIGNOFF_ANCHOR = re.compile(
+    r"\b("
+    r"goodbye|bye bye|bye|good night|goodnight|see you|see ya|im off|"
+    r"stop listening|stop|go to sleep|go to bed|go away|dismissed|"
+    r"thats all|that is all|thats it|that is it|thats everything|"
+    r"that is everything|im done|i am done|were done|we are done|"
+    r"were finished|we are finished|nothing else|im all set|i am all set|"
+    r"were good|we are good|im good|i am good"
+    r")\b"
 )
-# Farewell / "we're finished" phrasing anywhere in the utterance.
-_USER_FAREWELL = re.compile(
-    r"\b(goodbye|good ?night|see you|see ya|were good|we are good|were done|"
-    r"we are done|were finished|im off|that(s| is) (all|it|everything))\b"
-)
-# "no … <specific done-phrase>" — a decline of further help. Uses specific
-# phrases (never bare 'good') so "no, that's a good idea" is NOT a sign-off.
+# … or be a decline of further help: a leading no + a specific closer phrase.
+_DECLINE_LEAD = re.compile(r"^(no|nope|nah)\b")
 _DECLINE_CLOSER = re.compile(
-    r"^(no|nope|nah)\b.*\b(thanks|thank you|cheers|im good|im fine|im done|"
-    r"im all set|im set|all good|all set|all done|good thanks|fine thanks|"
-    r"great thanks|were good|were done|thats all|thats it|thats fine|"
-    r"thats everything|nothing else)\b"
+    r"\b(thanks|thank you|cheers|im good|im fine|im done|im all set|im set|"
+    r"all good|all set|all done|were good|were done|thats all|thats it|"
+    r"thats fine|thats everything|nothing else)\b"
 )
-_SIGNOFF_LEAD = re.compile(
-    r"^(no|nope|nah|yeah|yep|yes|ok|okay|alright|right|well|so|um|uh|cool|great|"
-    r"thanks|thank you|cheers|jarvis)\s+"
+# Phrases removed before the residue check (closers that legally accompany an
+# anchor without changing its meaning). Longest-first so 'thank you' wins.
+_SIGNOFF_REMOVABLE = re.compile(
+    r"\b(thank you|thanks|cheers|im good|im fine|all good|all set|all done|"
+    r"thats good|thats fine|thats great|thats everything|no worries|"
+    r"no|nope|nah|yeah|yep|yes)\b"
 )
-_SIGNOFF_TRAIL = re.compile(
-    r"\s+(please|thanks|thank you|cheers|now|then|mate|jarvis|ok|okay|here)$"
+# Single filler words allowed to remain around an anchor. ANY other residue
+# word means the user said something substantive — never close on it.
+_SIGNOFF_FILLER = frozenset(
+    "ok okay alright right well so um uh cool great perfect brilliant lovely "
+    "nice good fine please now then there mate jarvis hey oh ah and for a an "
+    "the that thats is it really very much indeed anyway all bye".split()
 )
 # Jarvis's OWN reply is a goodbye → end even if it forgot the [[END]] marker.
+# Anchor + residue on the FINAL sentence only: the backstop fires when that
+# sentence IS a farewell, not merely contains a farewell word ('The song is
+# Bye Bye Bye by NSYNC' must not hang up).
 _REPLY_FAREWELL = re.compile(
-    r"\b(goodbye|good ?night|see you|see ya|sleep well|take care|farewell|"
-    r"talk soon|bye)\b",
-    re.IGNORECASE,
+    r"\b(goodbye|bye bye|bye|good night|goodnight|night night|sleep well|"
+    r"sweet dreams|take care|farewell|talk soon|see you|see ya|catch you)\b"
+)
+_REPLY_FAREWELL_FILLER = frozenset(
+    "ok okay then for now soon later tonight tomorrow and have a good great "
+    "lovely one day evening night sir mate all too enjoy rest well".split()
 )
 _REPLY_CONTINUE = re.compile(
     r"\?|anything else|let me know|give me a shout|what else|tell me|how about|"
     r"shall i|would you like|need anything",
     re.IGNORECASE,
 )
+_BRACKETED = re.compile(r"\[[^\]]*\]")  # TTS tags, [[END]], voice markers
+_SENTENCE_SPLIT = re.compile(r"[.!?]+")
 
 
 def _norm(text: str) -> str:
+    """Normalise an utterance for matching: lowercase, no apostrophes or
+    punctuation, collapsed whitespace. The single copy — voice_modes imports it."""
     t = text.lower().replace("'", "")
     t = re.sub(r"[^\w\s]", " ", t)
     return re.sub(r"\s+", " ", t).strip()
 
 
+def _only_filler_remains(text: str, remove: re.Pattern, filler: frozenset) -> bool:
+    """True when removing `remove` matches from `text` leaves only `filler`
+    words — the shared anchor+residue idiom behind every deterministic close."""
+    return all(w in filler for w in remove.sub(" ", text).split())
+
+
 def _is_clear_signoff(text: str) -> bool:
-    """True only for an unambiguous goodbye / decline of further help."""
+    """True only for an unambiguous goodbye / decline of further help.
+
+    Anchor + residue: the utterance must contain a closer anchor (a farewell,
+    a done-phrase, or no + a decline closer), AND once the anchor and closer
+    phrases are removed, everything left must be filler. Any substantive
+    residue ('no, CANCEL IT, thanks') means the turn continues — this backstop
+    must never fire on a turn the user meant to continue; unusual sign-offs
+    fall through to the model's marker layer instead.
+    """
     base = _norm(text)
-    if _REQUEST_CUE.search(base):
+    if not base or _REQUEST_CUE.search(base):
         return False
-    if _USER_FAREWELL.search(base) or _DECLINE_CLOSER.search(base):
-        return True
-    t = base
-    while True:
-        stripped = _SIGNOFF_TRAIL.sub("", _SIGNOFF_LEAD.sub("", t))
-        if stripped == t:
-            break
-        t = stripped
-    return t in _CLEAR_SIGNOFFS
+    anchored = _SIGNOFF_ANCHOR.search(base) or (
+        _DECLINE_LEAD.match(base) and _DECLINE_CLOSER.search(base)
+    )
+    if not anchored:
+        return False
+    residue = _SIGNOFF_ANCHOR.sub(" ", base)
+    return _only_filler_remains(residue, _SIGNOFF_REMOVABLE, _SIGNOFF_FILLER)
 
 
 def _is_reply_farewell(reply: str) -> bool:
-    """True if Jarvis's reply is a goodbye with no continuation cue."""
-    return bool(_REPLY_FAREWELL.search(reply)) and not _REPLY_CONTINUE.search(reply)
+    """True if Jarvis's reply ENDS on a pure goodbye with no continuation cue."""
+    if _REPLY_CONTINUE.search(reply or ""):
+        return False
+    text = _BRACKETED.sub(" ", reply or "")
+    sentences = [n for s in _SENTENCE_SPLIT.split(text) if (n := _norm(s))]
+    if not sentences:
+        return False
+    last = sentences[-1]
+    if not _REPLY_FAREWELL.search(last):
+        return False
+    residue = _REPLY_FAREWELL.sub(" ", last)
+    return all(w in _REPLY_FAREWELL_FILLER for w in residue.split())
 
 
 # --- Streaming: sentence segmentation + steering reuse ----------------------
