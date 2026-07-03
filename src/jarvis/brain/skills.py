@@ -30,7 +30,9 @@ from jarvis.tools.base import Tool, ToolRegistry
 _NAME_OK = re.compile(r"[^a-zA-Z0-9_-]")
 _SKILL_FORMAT = (
     "Follow the recipe to fulfil the user's request. Use the provided tools as the "
-    "recipe directs. Reply with the final result only — concise and spoken-friendly."
+    "recipe directs. Reply with the final result only — concise plain text, no "
+    "markdown. Your reply goes back to the assistant, who will phrase it for the "
+    "user, so report facts, not conversation."
 )
 
 
