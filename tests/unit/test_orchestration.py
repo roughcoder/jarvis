@@ -212,6 +212,64 @@ def test_worker_registry_accepts_list_profile_file(tmp_path) -> None:
     assert "token_env" not in reg.profiles()[0].public()
 
 
+def test_worker_registry_reads_token_env_from_jarvis_env_file(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env = tmp_path / ".env"
+    env.write_text("HIVE_TOKEN=secret-from-file\n")
+    path = tmp_path / "workers.json"
+    path.write_text(json.dumps([{"worker_id": "hive-worker", "display_name": "Hive", "token_env": "HIVE_TOKEN"}]))
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env))
+    monkeypatch.delenv("HIVE_TOKEN", raising=False)
+    reg = WorkerRegistry(WorkerConfig(_env_file=None), profiles_path=str(path))
+
+    assert reg.profiles()[0].token_set is True
+
+
+def test_worker_registry_probe_uses_token_from_jarvis_env_file(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env = tmp_path / ".env"
+    env.write_text("HIVE_TOKEN=secret-from-file\n")
+    path = tmp_path / "workers.json"
+    path.write_text(
+        json.dumps(
+            [
+                {
+                    "worker_id": "hive-worker",
+                    "display_name": "Hive",
+                    "base_url": "http://hive-worker:8780",
+                    "token_env": "HIVE_TOKEN",
+                }
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env))
+    monkeypatch.delenv("HIVE_TOKEN", raising=False)
+    seen_headers = []
+
+    class Response:
+        def __init__(self, data):
+            self._data = data
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self._data
+
+    def fake_get(url, *, headers=None, **_kw):  # noqa: ANN001, ANN202
+        seen_headers.append(headers or {})
+        if url.endswith("/health"):
+            return Response({"ok": True, "agent": "codex"})
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions"):
+            return Response({"sessions": []})
+        raise AssertionError(url)
+
+    reg = WorkerRegistry(WorkerConfig(_env_file=None), profiles_path=str(path), http_get=fake_get)
+
+    assert reg.profiles(probe=True)[0].status == "online"
+    assert all(headers.get("Authorization") == "Bearer secret-from-file" for headers in seen_headers)
+
+
 def test_worker_registry_advertises_supported_engines(tmp_path) -> None:
     path = tmp_path / "workers.json"
     path.write_text(
