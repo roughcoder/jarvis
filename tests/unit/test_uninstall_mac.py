@@ -38,6 +38,7 @@ def test_mac_uninstaller_dry_run_removes_services_state_and_packages() -> None:
     assert "+ /usr/bin/osascript -e tell\\ application\\ \\\"Jarvis\\\"\\ to\\ quit" in result.stdout
     assert "+ /bin/launchctl bootout gui/" in result.stdout
     assert "+ rm -rf /Users/tester/Library/LaunchAgents/com.jarvis.brain.plist" in result.stdout
+    assert "+ rm -rf /Users/tester/Library/LaunchAgents/com.jarvis.api.plist" in result.stdout
     assert "+ rm -rf /Users/tester/.jarvis" in result.stdout
     assert "+ rm -rf /Users/tester/Library/Logs/Jarvis" in result.stdout
     assert "+ rm -rf /Users/tester/Library/Preferences/dev.infinitestack.jarvis.mac.plist" in result.stdout

@@ -113,8 +113,9 @@ desktop install the same formula but enable different roles.
 Example role setup after installing the formula without the app:
 
 ```bash
-jarvis service sync brain worker intercom whatsapp
+jarvis service sync brain api worker intercom whatsapp
 jarvis service install brain
+jarvis service install api
 jarvis service install worker
 jarvis service install intercom
 jarvis service install whatsapp
@@ -127,6 +128,7 @@ formula and app:
 
 ```bash
 jarvis service install brain
+jarvis service install api
 jarvis service install worker
 jarvis service install intercom
 jarvis service start brain
@@ -153,8 +155,8 @@ jarvis fleet-status --json --no-docker
 
 The JSON intentionally contains no tokens. It includes:
 
-- `services`: launchd state for `com.jarvis.brain`, `com.jarvis.intercom`,
-  `com.jarvis.worker`.
+- `services`: launchd state for `com.jarvis.brain`, `com.jarvis.api`,
+  `com.jarvis.intercom`, and `com.jarvis.worker`.
 - `brain`: bind address, auth configured, paired devices without secrets.
 - `intercom.pairing`: whether this host can reach and pair with the configured
   brain, plus resolved identity/scope/capabilities.
@@ -268,8 +270,9 @@ Brain Mac:
 
 ```bash
 brew upgrade roughcoder/infinite-stack/jarvis
-JARVIS_ENV_FILE=~/.jarvis/.env jarvis service sync brain worker whatsapp
+JARVIS_ENV_FILE=~/.jarvis/.env jarvis service sync brain api worker whatsapp
 JARVIS_ENV_FILE=~/.jarvis/.env jarvis service restart brain
+JARVIS_ENV_FILE=~/.jarvis/.env jarvis service restart api
 sleep 8
 JARVIS_ENV_FILE=~/.jarvis/.env jarvis service restart worker
 JARVIS_ENV_FILE=~/.jarvis/.env jarvis service restart whatsapp
@@ -496,8 +499,9 @@ The installed update path should stay boring:
 ```bash
 brew update
 brew upgrade jarvis
-jarvis service sync brain worker intercom whatsapp
+jarvis service sync brain api worker intercom whatsapp
 jarvis service restart brain
+jarvis service restart api
 jarvis service restart worker
 jarvis service restart intercom
 jarvis service restart whatsapp

@@ -18,6 +18,7 @@ fleet is reachable, and provide safe local controls.
 Long-running services are owned by `launchd`:
 
 - `com.jarvis.brain`
+- `com.jarvis.api`
 - `com.jarvis.intercom`
 - `com.jarvis.worker`
 

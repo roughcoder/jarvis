@@ -13,7 +13,7 @@ Homebrew packaging, onboarding, pairing, and updates.
 
 | Machine | Roles | Package path | Supervisor |
 |---|---|---|---|
-| iMac | `brain`, `worker`, optional local `intercom`, Docker services | Homebrew + Jarvis Setup | `launchd` |
+| iMac | `brain`, `api`, `worker`, optional local `intercom`, Docker services | Homebrew + Jarvis Setup | `launchd` |
 | Mac laptop | `intercom`, `worker` | Homebrew + Jarvis Setup | `launchd` |
 | Raspberry Pi | `intercom` | Pi installer / future image | `systemd` |
 
@@ -41,12 +41,14 @@ hand:
 
 ```bash
 jarvis service install brain
+jarvis service install api
 jarvis service install worker
 jarvis service install intercom
 jarvis service start brain
+jarvis service start api
 jarvis service restart worker
 jarvis service status intercom
-jarvis service extras brain worker
+jarvis service extras brain api worker
 jarvis status --json --brain-host imac.private
 jarvis pair kitchen-pi --json
 ```
