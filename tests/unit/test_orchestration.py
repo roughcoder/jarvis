@@ -203,6 +203,15 @@ def test_worker_registry_counts_running_sessions_for_capacity() -> None:
     assert reg.profiles(probe=True)[0].current_jobs == 1
 
 
+def test_worker_registry_default_profile_uses_host_display_name(monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr("jarvis.orchestration.workers.socket.gethostname", lambda: "brain-host.local")
+    reg = WorkerRegistry(WorkerConfig(_env_file=None))
+    profile = reg.profiles()[0]
+
+    assert profile.worker_id == "local-worker"
+    assert profile.display_name == "brain-host worker"
+
+
 def test_worker_registry_accepts_list_profile_file(tmp_path) -> None:
     path = tmp_path / "workers.json"
     path.write_text(json.dumps([{"worker_id": "hive-worker", "display_name": "Hive", "token_env": "HIVE_TOKEN"}]))

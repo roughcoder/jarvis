@@ -11,7 +11,7 @@ from jarvis.config import WorkerConfig
 from jarvis.orchestration.models import OrchestrationRun
 from jarvis.orchestration.store import OrchestrationStore
 from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, FAILED_SESSION_STATUSES, SUCCESS_SESSION_STATUSES
-from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry
+from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry, local_worker_display_name
 
 TERMINAL_JOB_STATUSES = {"done", "error", "interrupted"}
 
@@ -210,7 +210,7 @@ def _profile_for_job(registry: WorkerRegistry, worker_cfg: WorkerConfig, worker_
     if not worker_id or worker_id == "local-worker":
         return WorkerProfile(
             worker_id="local-worker",
-            display_name="Local worker",
+            display_name=local_worker_display_name(),
             base_url=worker_cfg.base_url,
             token_set=bool(worker_cfg.token.get_secret_value()),
             agent=worker_cfg.agent,
