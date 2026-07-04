@@ -126,19 +126,7 @@ class HonchoV2MemoryClient:
         return result is not None
 
     def deriver_idle(self) -> bool:
-        import httpx
-
-        try:
-            with httpx.Client(timeout=10.0, headers=self._headers()) as c:
-                r = c.get(
-                    f"{self._ws_url()}/deriver/status",
-                    params={"peer_id": self._cfg.user_peer_id},
-                )
-                r.raise_for_status()
-                s = r.json()
-            return (s.get("pending_work_units", 0) + s.get("in_progress_work_units", 0)) == 0
-        except httpx.HTTPError:
-            return False
+        return True
 
     def ping(self) -> bool:
         import httpx

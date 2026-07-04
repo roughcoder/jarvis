@@ -51,14 +51,16 @@ def test_base_url_is_computed_from_host_port(monkeypatch) -> None:
 
 
 def test_memory_backend_and_sidecar_are_env_driven(monkeypatch, tmp_path) -> None:
-    _clean(monkeypatch, "MEMORY_BACKEND", "MEMORY_CONCLUSION_SIDECAR_PATH")
+    _clean(monkeypatch, "MEMORY_BACKEND", "MEMORY_CONCLUSION_SIDECAR_PATH", "MEMORY_DERIVER_IDLE_TIMEOUT_S")
     monkeypatch.setenv("MEMORY_BACKEND", "v3")
     monkeypatch.setenv("MEMORY_CONCLUSION_SIDECAR_PATH", str(tmp_path / "sidecar.json"))
+    monkeypatch.setenv("MEMORY_DERIVER_IDLE_TIMEOUT_S", "4.5")
 
     c = MemoryConfig(_env_file=None)
 
     assert c.backend == "v3"
     assert c.conclusion_sidecar_path == str(tmp_path / "sidecar.json")
+    assert c.deriver_idle_timeout_s == 4.5
 
 
 def test_worker_workspace_defaults_outside_repo() -> None:

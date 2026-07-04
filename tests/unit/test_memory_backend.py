@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -222,6 +223,33 @@ def test_v3_queue_status_parses_idle_state(tmp_path) -> None:
     assert status.in_progress_work_units == 1
     assert not status.idle
     assert status.raw["queue"] == "messages"
+
+
+def test_v3_write_turn_then_refresh_cache_round_trips_to_local_cache(tmp_path) -> None:
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = _json(request)
+        calls.append((request.method, request.url.path, payload))
+        if request.url.path.endswith("/messages"):
+            return httpx.Response(201, json=[{"id": "m1"}, {"id": "m2"}])
+        if request.url.path.endswith("/chat"):
+            return httpx.Response(200, json={"content": "Neil prefers concise updates."})
+        return httpx.Response(201, json={"id": payload.get("id", "")})
+
+    client = HonchoV3MemoryClient(_cfg(tmp_path), transport=httpx.MockTransport(handler))
+
+    asyncio.run(client.write_turn("keep it short", "Noted.", user="neil"))
+    assert asyncio.run(client.refresh_cache(user="neil"))
+
+    cache = json.loads((tmp_path / "representation-neil.json").read_text(encoding="utf-8"))
+    assert cache == {"representation": "Neil prefers concise updates."}
+    paths = [path for _, path, _ in calls]
+    message_index = next(i for i, path in enumerate(paths) if path.endswith("/messages"))
+    chat_index = next(i for i, path in enumerate(paths) if path.endswith("/chat"))
+    assert message_index < chat_index
+    chat_payload = calls[chat_index][2]
+    assert chat_payload["session_id"] == encode_honcho_id("voice:neil")
 
 
 def test_v3_boundary_errors_raise_clean_httpx_errors(tmp_path) -> None:
