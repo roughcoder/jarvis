@@ -10,6 +10,7 @@ import httpx
 
 from jarvis.config import WorkerConfig
 from jarvis.engines import engine_ids, normalize_engine_id, worker_supports_engine
+from jarvis.ids import utc_now
 from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, SESSION_RUNNING
 from jarvis.orchestration.models import WorkerProfile
 
@@ -143,6 +144,7 @@ class WorkerRegistry:
             profile.current_jobs = 0
             return profile
         profile.status = "online"
+        profile.last_seen_at = utc_now()
         profile.current_jobs = sum(1 for j in job_data if j.get("status") == SESSION_RUNNING) + sum(
             1 for s in session_data if s.get("status") in ACTIVE_SESSION_STATUSES
         )
@@ -160,6 +162,8 @@ class WorkerRegistry:
             profile.engine_supports = _engine_supports_from_mapping(data["engine_supports"])
         elif isinstance(data.get("engines"), list):
             profile.engine_supports = _engine_supports_from_rows(data["engines"])
+        if isinstance(data.get("repositories"), list):
+            profile.repositories = [dict(item) for item in data["repositories"] if isinstance(item, dict)]
         profile.system = _system_from_health(data.get("system"))
         profile.__post_init__()
         return profile

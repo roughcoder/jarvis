@@ -118,6 +118,10 @@ class Artifact:
     name: str = ""
     status: str = ""
     public: bool = True
+    summary: str = ""
+    command: str = ""
+    started_at: str = ""
+    completed_at: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Artifact:
@@ -308,9 +312,12 @@ class WorkerProfile:
     status: str = "unknown"
     agent: str = "codex"
     default_engine: str = ""
+    default_repo: str = ""
+    last_seen_at: str = ""
     supported_engines: list[str] = field(default_factory=list)
     engine_supports: dict[str, dict[str, bool]] = field(default_factory=dict)
     system: dict[str, Any] = field(default_factory=dict)
+    repositories: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.default_engine = default_engine(self.default_engine or self.agent, self.supported_engines)
@@ -318,6 +325,9 @@ class WorkerProfile:
         self.agent = self.default_engine
         if not isinstance(self.system, dict):
             self.system = {}
+        if not isinstance(self.repositories, list):
+            self.repositories = []
+        self.repositories = [dict(item) for item in self.repositories if isinstance(item, dict) and (item.get("repo") or item.get("name"))]
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> WorkerProfile:

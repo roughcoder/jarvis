@@ -156,8 +156,10 @@ def sync_run_sessions(
                 _record_sync_error(store, run.run_id, link.session_id, str(exc))
                 summary.errors.append(f"{run.run_id}:{link.session_id}: {exc}")
                 continue
-            events = event_data.get("events") or []
+            events = [event for event in event_data.get("events") or [] if isinstance(event, dict)]
             last_event_id = str(events[-1].get("event_id") or link.last_event_id) if events else link.last_event_id
+            if events:
+                _persist_session_events(store, run.run_id, link.session_id, events)
             before = link.to_dict()
             store.update_session(
                 run.run_id,
@@ -231,6 +233,40 @@ def _response_error(response: Any, status_code: int) -> str:
     if isinstance(body, dict) and body.get("error"):
         return str(body["error"])
     return getattr(response, "text", "") or f"worker request failed with HTTP {status_code}"
+
+
+def _persist_session_events(store: OrchestrationStore, run_id: str, session_id: str, events: list[dict[str, Any]]) -> None:
+    """Append newly-synced worker session events to the run's local event log.
+
+    This is what makes the run timeline (and the cockpit's session.event SSE
+    stream) durable: the worker's `/events` cursor only returns each event once,
+    so discarding events here would lose them. Dedup by event_id so overlapping
+    syncs and cockpit session writes never double-append."""
+    existing = {
+        str(event.data.get("event_id") or "")
+        for event in store.events(run_id)
+        if isinstance(event.data, dict) and event.data.get("event_id")
+    }
+    for raw in events:
+        event_id = str(raw.get("event_id") or "")
+        if event_id and event_id in existing:
+            continue
+        data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+        store.append_event(
+            run_id,
+            str(raw.get("type") or "session.event"),
+            "",
+            {
+                "session_id": session_id,
+                "event_id": event_id,
+                "turn_id": str(data.get("turn_id") or ""),
+                "message_id": str(data.get("message_id") or ""),
+                "time": str(raw.get("time") or ""),
+                "data": dict(data),
+            },
+        )
+        if event_id:
+            existing.add(event_id)
 
 
 def _record_sync_error(store: OrchestrationStore, run_id: str, job_id: str, error: str) -> None:

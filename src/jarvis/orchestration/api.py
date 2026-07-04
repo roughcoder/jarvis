@@ -33,6 +33,7 @@ from jarvis.orchestration.cockpit import (
     aggregate_sessions,
     archived_session_refs_for_store,
     artifact_summaries,
+    canonical_event_type,
     cockpit_catalog,
     cockpit_snapshot,
     make_session_ref,
@@ -55,6 +56,7 @@ from jarvis.orchestration.cockpit import (
     valid_session_ref,
     worker_headers,
     worker_profiles,
+    _cursor_worker,
 )
 from jarvis.brain.capabilities import resolve_capabilities
 from jarvis.orchestration.authority import allowed
@@ -68,6 +70,7 @@ from jarvis.orchestration.service import (
     ResumeRunError,
     StartedWork,
     WorkAlreadyOwnedError,
+    WorkerCapacityError,
     WorkerDispatchError,
 )
 from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource, WorkSource
@@ -116,6 +119,7 @@ class SseSnapshotHub:
         self.ctx = ctx
         self._subscribers: dict[int, SseSubscription] = {}
         self._snapshots: dict[str, dict[str, Any]] = {}
+        self._event_counts: dict[str, dict[str, int]] = {}
         self._lock = asyncio.Lock()
         self._next_id = 0
         self._task: asyncio.Task[None] | None = None
@@ -171,8 +175,26 @@ class SseSnapshotHub:
                     body = await asyncio.to_thread(_cockpit_snapshot, self.ctx, mode)
                     previous = self._snapshots.get(mode)
                     self._snapshots[mode] = body
+                    baselined = mode in self._event_counts
+                    if not baselined:
+                        # First tick for this mode: baseline the per-run event
+                        # counts so history is not replayed as live frames.
+                        self._event_counts[mode] = await asyncio.to_thread(self._prime_event_counts, body)
                     if previous is None or previous.get("cursor") != body.get("cursor"):
-                        await self._broadcast(mode, body)
+                        deltas = _snapshot_delta_events(previous, body)
+                        frames = (
+                            await asyncio.to_thread(self._collect_session_event_frames, mode, body) if baselined else []
+                        )
+                        if deltas is not None and frames:
+                            deltas = [*deltas, *frames]
+                        await self._broadcast(
+                            mode,
+                            {
+                                "body": body,
+                                "prev_cursor": str(previous.get("cursor") or "") if previous else "",
+                                "events": deltas,
+                            },
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -189,6 +211,66 @@ class SseSnapshotHub:
                 except Exception:
                     logger.exception("cockpit SSE heartbeat broadcast failed")
                 heartbeat_at = now + heartbeat_interval
+
+    def _prime_event_counts(self, body: dict[str, Any]) -> dict[str, int]:
+        return {
+            run_id: len(self.ctx.store.events(run_id))
+            for row in body.get("runs") or []
+            if isinstance(row, dict)
+            for run_id in [str(row.get("run_id") or "")]
+            if run_id
+        }
+
+    def _collect_session_event_frames(self, mode: str, body: dict[str, Any]) -> list[dict[str, Any]]:
+        """Newly appended store events for visible runs, projected as
+        session.event SSE frames. Counts advance per broadcast, so events that
+        land between broadcasts are delivered on the next one."""
+        counts = self._event_counts.get(mode, {})
+        cursor = str(body.get("cursor") or "")
+        occurred_at = utc_now()
+        frames: list[dict[str, Any]] = []
+        new_counts: dict[str, int] = {}
+        for row in body.get("runs") or []:
+            run_id = str(row.get("run_id") or "") if isinstance(row, dict) else ""
+            if not run_id:
+                continue
+            events = self.ctx.store.events(run_id)
+            start = counts.get(run_id, 0)
+            new_counts[run_id] = len(events)
+            if len(events) <= start:
+                continue
+            run = self.ctx.store.get(run_id)
+            worker_by_session = {link.session_id: link.worker_id for link in (run.sessions if run else [])}
+            for sequence, event in enumerate(events[start:], start=start + 1):
+                data = event.data if isinstance(event.data, dict) else {}
+                session_id = str(data.get("session_id") or "")
+                worker_id = worker_by_session.get(session_id, "")
+                if not session_id or not worker_id:
+                    continue
+                projected = project_session_event(
+                    {
+                        "event_id": data.get("event_id"),
+                        "session_id": session_id,
+                        "type": event.type,
+                        "time": data.get("time") or event.time,
+                        "data": dict(data.get("data") or {}),
+                    },
+                    worker_id=worker_id,
+                    run_id=run_id,
+                    sequence=sequence,
+                )
+                frames.append(
+                    {
+                        "cursor": cursor,
+                        "occurred_at": occurred_at,
+                        "type": "session.event",
+                        "run_id": run_id,
+                        "session_ref": projected["session_ref"],
+                        "payload": projected,
+                    }
+                )
+        self._event_counts[mode] = new_counts
+        return frames
 
     async def _active_modes(self) -> list[str]:
         async with self._lock:
@@ -274,6 +356,7 @@ def make_app(
         web.get("/v1/sessions/{session_ref}", reads.session_detail),
         web.post("/v1/work/start", writes.work_start),
         web.post("/v1/work/resume", writes.work_resume),
+        web.post("/v1/work/validate", writes.work_validate),
     ])
     return app
 
@@ -296,7 +379,8 @@ class CockpitReadHandlers:
 
     async def catalog(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
-        return web.json_response(cockpit_catalog())
+        defaults, engines = await asyncio.to_thread(_catalog_context, self.ctx.cfg)
+        return web.json_response(cockpit_catalog(start_defaults=defaults, engines=engines or None))
 
     async def snapshot(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
@@ -316,6 +400,7 @@ class CockpitReadHandlers:
                     workers_path=self.ctx.cfg.orchestration.workers_path,
                     probe=probe,
                     http_get=self.ctx.get,
+                    default_repo=self.ctx.cfg.orchestration.default_repo,
                 ),
             }
         )
@@ -331,7 +416,7 @@ class CockpitReadHandlers:
         )
         if profile is None:
             raise CockpitError("not_found", "worker not found", status=404)
-        return web.json_response(project_worker_profile(profile))
+        return web.json_response(project_worker_profile(profile, default_repo=self.ctx.cfg.orchestration.default_repo))
 
     async def runs(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
@@ -398,6 +483,7 @@ class CockpitReadHandlers:
             workers_path=self.ctx.cfg.orchestration.workers_path,
             probe=mode == "probe",
             http_get=self.ctx.get,
+            default_repo=self.ctx.cfg.orchestration.default_repo,
         )
         session_rows = await asyncio.to_thread(
             aggregate_sessions,
@@ -516,6 +602,22 @@ class CockpitWriteHandlers:
             self.ctx.idempotency.save("work/start", str(body.get("idempotency_key") or ""), body, response_body)
         return web.json_response(response_body)
 
+    async def work_validate(self, request: web.Request) -> web.Response:
+        self.ctx.require_auth(request)
+        body = await _json_body(request)
+        _reject_attachments(body)
+        command, manual_item = _command_from_body(body, start=False)
+        service = self.ctx.service(manual_item=manual_item)
+        validation = await asyncio.to_thread(service.validate_work, command, manual_item=manual_item)
+        return web.json_response(
+            {
+                "ok": True,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "validation": validation,
+            }
+        )
+
     async def work_resume(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
         body = await _json_body(request)
@@ -591,6 +693,11 @@ class SseHandlers:
     async def events(self, request: web.Request) -> web.StreamResponse:
         self.ctx.require_auth(request)
         mode = _sync_mode(request)
+        filters = {
+            key: str(request.query.get(key) or "")
+            for key in ("run_id", "session_ref", "worker_id")
+            if request.query.get(key)
+        }
         client_cursor = str(request.query.get("after") or request.headers.get("Last-Event-ID") or "")
         hub = request.app[SSE_SNAPSHOT_HUB_KEY]
         subscription = await hub.subscribe(mode)
@@ -607,12 +714,26 @@ class SseHandlers:
                 if event is None:
                     await response.write(b": heartbeat\n\n")
                     continue
-                next_cursor = event["cursor"]
-                if next_cursor != cursor:
-                    cursor = next_cursor
-                    await _write_sse(response, "snapshot", cursor, _sse_envelope(cursor, "snapshot", event))
-                else:
+                next_body = event["body"]
+                next_cursor = next_body["cursor"]
+                if next_cursor == cursor:
                     await response.write(b": heartbeat\n\n")
+                    continue
+                deltas = event.get("events")
+                if deltas and event.get("prev_cursor") == cursor:
+                    # The client is exactly one tick behind: send granular events
+                    # instead of re-sending the whole snapshot.
+                    matched = [delta for delta in deltas if _frame_matches(delta, filters)]
+                    for delta in matched:
+                        await _write_sse(response, delta["type"], next_cursor, delta)
+                    if not matched:
+                        # Everything this tick was filtered out; keep the
+                        # connection's cursor moving so the next tick can still
+                        # go granular.
+                        await response.write(b": heartbeat\n\n")
+                else:
+                    await _write_sse(response, "snapshot", next_cursor, _sse_envelope(next_cursor, "snapshot", next_body))
+                cursor = next_cursor
         except asyncio.CancelledError:
             raise
         except (ConnectionResetError, RuntimeError):
@@ -689,6 +810,86 @@ async def _write_sse(response: web.StreamResponse, event: str, cursor: str, data
 
 def _sse_envelope(cursor: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {"cursor": cursor, "occurred_at": utc_now(), "type": event_type, "payload": payload}
+
+
+_SNAPSHOT_DELTA_SPECS = (
+    ("runs", "run_id", "run.updated"),
+    ("sessions", "session_ref", "session.updated"),
+    ("workers", "worker_id", "worker.updated"),
+    ("artifacts", "artifact_id", "artifact.upserted"),
+    ("requests", "request_id", "request.updated"),
+    ("checkpoints", "checkpoint_id", "checkpoint.updated"),
+)
+
+
+def _snapshot_delta_events(previous: dict[str, Any] | None, current: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Project the difference between two snapshot ticks as granular cockpit
+    events. Returns None when a snapshot must be sent instead: no baseline, a
+    run/session/worker/checkpoint disappeared (archive/restore), or nothing
+    row-level explains the cursor change."""
+    if not previous:
+        return None
+    cursor = str(current.get("cursor") or "")
+    occurred_at = utc_now()
+    events: list[dict[str, Any]] = []
+    for key, id_key, event_type in _SNAPSHOT_DELTA_SPECS:
+        prev_rows = {str(row.get(id_key) or ""): row for row in previous.get(key) or [] if isinstance(row, dict)}
+        curr_rows = {str(row.get(id_key) or ""): row for row in current.get(key) or [] if isinstance(row, dict)}
+        removed = set(prev_rows) - set(curr_rows)
+        if removed:
+            if key == "artifacts":
+                events.extend(
+                    {"cursor": cursor, "occurred_at": occurred_at, "type": "artifact.removed", "artifact_id": artifact_id, "payload": {"artifact_id": artifact_id}}
+                    for artifact_id in sorted(removed)
+                )
+            elif key == "requests":
+                # A pending request leaving the projection means it is no longer
+                # pending; the final decision lives on the session's requests.
+                for request_id in sorted(removed):
+                    stale = prev_rows[request_id]
+                    envelope = {
+                        "cursor": cursor,
+                        "occurred_at": occurred_at,
+                        "type": "request.updated",
+                        "request_id": request_id,
+                        "payload": {"request_id": request_id, "status": "closed", "session_ref": str(stale.get("session_ref") or "")},
+                    }
+                    if stale.get("run_id"):
+                        envelope["run_id"] = str(stale.get("run_id"))
+                    events.append(envelope)
+            else:
+                return None
+        for row_id, row in curr_rows.items():
+            if _delta_row(key, prev_rows.get(row_id)) == _delta_row(key, row):
+                continue
+            envelope = {"cursor": cursor, "occurred_at": occurred_at, "type": event_type, "payload": row}
+            if id_key != "run_id" and row.get("run_id"):
+                envelope["run_id"] = str(row.get("run_id"))
+            if id_key != "session_ref" and row.get("session_ref"):
+                envelope["session_ref"] = str(row.get("session_ref"))
+            envelope[id_key] = row_id
+            events.append(envelope)
+    return events or None
+
+
+def _frame_matches(frame: dict[str, Any], filters: dict[str, str]) -> bool:
+    """Strict AND matching: a filtered stream only carries frames that
+    explicitly carry the requested id (in the envelope or its payload)."""
+    if not filters:
+        return True
+    payload = frame.get("payload") if isinstance(frame.get("payload"), dict) else {}
+    for key, value in filters.items():
+        if str(frame.get(key) or payload.get(key) or "") != value:
+            return False
+    return True
+
+
+def _delta_row(key: str, row: dict[str, Any] | None) -> dict[str, Any] | None:
+    # Worker rows carry per-refresh timestamps that the snapshot cursor already
+    # ignores; ignore them here too so workers don't emit no-op updates.
+    if row is None or key != "workers":
+        return row
+    return _cursor_worker(row)
 
 
 def _work_source(name: str, cfg: Config | None = None) -> WorkSource:
@@ -909,6 +1110,8 @@ def _has_stored_session_projection(store: OrchestrationStore, ref: SessionRef) -
 def _service_error(exc: Exception) -> CockpitError:
     if isinstance(exc, MissingAuthorityError):
         return CockpitError("forbidden", f"missing authority: {', '.join(exc.actions)}", status=403)
+    if isinstance(exc, WorkerCapacityError):
+        return CockpitError("worker_capacity_exceeded", str(exc) or "all eligible workers are at capacity", recoverable=True, status=409)
     if isinstance(exc, NoEligibleWorkerError):
         return CockpitError("worker_unavailable", str(exc) or "no eligible worker found", recoverable=True, status=409)
     if isinstance(exc, WorkAlreadyOwnedError):
@@ -1010,7 +1213,26 @@ def _cockpit_snapshot(ctx: CockpitAppContext, mode: str) -> dict[str, Any]:
         workers_path=ctx.cfg.orchestration.workers_path,
         sync_mode=mode,
         http_get=ctx.get,
+        default_repo=ctx.cfg.orchestration.default_repo,
     )
+
+
+def _catalog_context(cfg: Config) -> tuple[dict[str, Any], list[str]]:
+    registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path)
+    profiles = registry.profiles(probe=False)
+    worker = profiles[0] if profiles else None
+    engines: list[str] = []
+    for profile in profiles:
+        for engine in profile.supported_engines:
+            if engine and engine not in engines:
+                engines.append(engine)
+    defaults = {
+        "worker_id": worker.worker_id if worker else "",
+        "engine": (worker.default_engine or worker.agent) if worker else "",
+        "repo": (worker.default_repo if worker else "") or cfg.orchestration.default_repo,
+        "landing_mode": cfg.orchestration.landing_mode,
+    }
+    return defaults, engines
 
 
 def _sync_mode(request: web.Request) -> str:
@@ -1147,7 +1369,7 @@ def _project_run_event(event, sequence: int) -> dict[str, Any]:  # noqa: ANN001
         "event_id": f"{event.run_id}:{sequence}",
         "sequence": sequence,
         "run_id": event.run_id,
-        "type": event.type,
+        "type": canonical_event_type(event.type),
         "occurred_at": event.time,
         "message": public_error_message(event.message),
         "data": public_event_data(event.data),
