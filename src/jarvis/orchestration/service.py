@@ -198,8 +198,10 @@ class OrchestrationService:
     ) -> None:
         # Distinguish "nothing can do this work" from "something can, but it is
         # busy" so the cockpit can offer retry instead of reconfiguration.
+        # Probe so current_jobs reflects live worker state, matching what
+        # choose() saw — static profile rows understate load.
         required_set = set(item.capability_requirements or [])
-        for profile in registry.profiles(probe=False):
+        for profile in registry.profiles(probe=True):
             if profile.status == "offline":
                 continue
             if not required_set.issubset(set(profile.capabilities)):
@@ -276,8 +278,9 @@ class OrchestrationService:
         }
 
     def _peek_work_item(self, command: WorkCommand, required_actions: list[str]) -> tuple[WorkItem | None, str]:
-        """Read-only look at what the source would hand a start. next() only
-        lists (claiming happens at start), so this is safe to call from validate."""
+        """Read-only look at what the source would hand a start. Uses list()
+        rather than next() so validation cannot claim or advance source state
+        even if a future source gives next() side effects."""
         denied = [
             action
             for action in required_actions
@@ -287,12 +290,12 @@ class OrchestrationService:
             return None, "source not inspected: missing read authority"
         try:
             source = self.source_factory(command.source, self.cfg)
-            item = source.next(repo=self._repo(command), filters=command.filters)
+            items = source.list(repo=self._repo(command), filters=command.filters, limit=1)
         except Exception as exc:  # noqa: BLE001 - validation must report, not fail
             return None, f"source not inspected: {public_error_message(str(exc))}"
-        if item is None:
+        if not items:
             return None, "no eligible work item found in the source"
-        return item, ""
+        return items[0], ""
 
     def resume_run(self, run_ref: str = "latest", *, prompt: str = "") -> StartedWork:
         self._require(required_for_command("resume_run", "jarvis"))

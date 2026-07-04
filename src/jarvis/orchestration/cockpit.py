@@ -409,7 +409,7 @@ def project_worker_profile(profile: WorkerProfile, *, default_repo: str = "") ->
         "display_name": profile.display_name,
         "status": profile.status,
         "health": _worker_health(profile.status),
-        "last_seen_at": profile.last_seen_at or (utc_now() if profile.status == "online" else ""),
+        "last_seen_at": profile.last_seen_at,
         "capabilities": mapped_capabilities,
         "engines": engines,
         "capacity": {
