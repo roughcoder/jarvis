@@ -50,6 +50,17 @@ def test_base_url_is_computed_from_host_port(monkeypatch) -> None:
     assert c.base_url == "http://frankfurt:8123"
 
 
+def test_memory_backend_and_sidecar_are_env_driven(monkeypatch, tmp_path) -> None:
+    _clean(monkeypatch, "MEMORY_BACKEND", "MEMORY_CONCLUSION_SIDECAR_PATH")
+    monkeypatch.setenv("MEMORY_BACKEND", "v3")
+    monkeypatch.setenv("MEMORY_CONCLUSION_SIDECAR_PATH", str(tmp_path / "sidecar.json"))
+
+    c = MemoryConfig(_env_file=None)
+
+    assert c.backend == "v3"
+    assert c.conclusion_sidecar_path == str(tmp_path / "sidecar.json")
+
+
 def test_worker_workspace_defaults_outside_repo() -> None:
     assert WorkerConfig(_env_file=None).workspace == "~/.jarvis/worker"
 

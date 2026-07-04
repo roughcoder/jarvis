@@ -1,0 +1,79 @@
+"""Jarvis sidecar for Honcho v3 conclusion metadata.
+
+Honcho v3.0.11 accepts extra conclusion metadata in requests but silently drops
+it from responses. Lane 2 needs provenance (`recorded_by`, `observed_at`,
+`project_id`, and similar fields) to be durable and queryable by Jarvis, so the
+v3 client stores that envelope locally by `(workspace, conclusion_id)` and
+merges it back into interface records.
+
+Upstream issue-shaped note: remove this sidecar only after Honcho conclusion
+create/list/query/delete round-trips arbitrary metadata in the API schema.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+class ConclusionMetadataSidecar:
+    def __init__(self, path: str | Path) -> None:
+        self._path = Path(path)
+
+    def get(self, workspace: str, conclusion_id: str) -> dict[str, Any]:
+        return dict(self._read().get(workspace, {}).get(conclusion_id, {}))
+
+    def put(self, workspace: str, conclusion_id: str, metadata: dict[str, Any]) -> None:
+        data = self._read()
+        data.setdefault(workspace, {})[conclusion_id] = dict(metadata)
+        _atomic_write_json(self._path, data)
+
+    def delete(self, workspace: str, conclusion_id: str) -> None:
+        data = self._read()
+        workspace_data = data.get(workspace)
+        if not workspace_data or conclusion_id not in workspace_data:
+            return
+        workspace_data.pop(conclusion_id, None)
+        if not workspace_data:
+            data.pop(workspace, None)
+        _atomic_write_json(self._path, data)
+
+    def _read(self) -> dict[str, dict[str, dict[str, Any]]]:
+        if not self._path.exists():
+            return {}
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        return raw
+
+
+def _atomic_write_json(path: Path, data: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        tmp = Path(handle.name)
+        json.dump(data, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    try:
+        dir_fd = os.open(path.parent, os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
