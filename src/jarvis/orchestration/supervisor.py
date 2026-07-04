@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -11,7 +10,7 @@ from jarvis.config import WorkerConfig
 from jarvis.orchestration.models import OrchestrationRun
 from jarvis.orchestration.store import OrchestrationStore
 from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, FAILED_SESSION_STATUSES, SUCCESS_SESSION_STATUSES
-from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry, local_worker_display_name
+from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry, local_worker_display_name, worker_token_value
 
 TERMINAL_JOB_STATUSES = {"done", "error", "interrupted"}
 
@@ -219,7 +218,7 @@ def _profile_for_job(registry: WorkerRegistry, worker_cfg: WorkerConfig, worker_
 
 
 def _headers_for_worker(worker_cfg: WorkerConfig, profile: WorkerProfile) -> dict[str, str]:
-    token = os.environ.get(profile.token_env, "") if profile.token_env else ""
+    token = worker_token_value(profile.token_env) if profile.token_env else ""
     if not token and profile.worker_id == "local-worker":
         token = worker_cfg.token.get_secret_value()
     return {"Authorization": f"Bearer {token}"} if token else {}

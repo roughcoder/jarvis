@@ -4,7 +4,6 @@ import base64
 import hashlib
 import hmac
 import json
-import os
 import pathlib
 import re
 import time
@@ -35,7 +34,7 @@ from jarvis.orchestration.redaction import redact as _redact
 from jarvis.orchestration.reports import build_run_report
 from jarvis.orchestration.store import OrchestrationStore
 from jarvis.orchestration.supervisor import SyncSummary, sync_run_jobs, sync_run_sessions
-from jarvis.orchestration.workers import WorkerRegistry
+from jarvis.orchestration.workers import WorkerRegistry, worker_token_value
 from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES
 
 API_VERSION = "v1"
@@ -939,7 +938,7 @@ def paged(items: list[dict[str, Any]], *, after: str = "", limit: int = 100) -> 
 
 
 def worker_headers(worker_cfg: WorkerConfig, profile: WorkerProfile) -> dict[str, str]:
-    token = os.environ.get(profile.token_env, "") if profile.token_env else ""
+    token = worker_token_value(profile.token_env) if profile.token_env else ""
     if not token and profile.worker_id == "local-worker":
         token = worker_cfg.token.get_secret_value()
     return {"Authorization": f"Bearer {token}"} if token else {}

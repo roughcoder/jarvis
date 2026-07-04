@@ -223,7 +223,7 @@ def test_worker_registry_accepts_list_profile_file(tmp_path) -> None:
 
 def test_worker_registry_reads_token_env_from_jarvis_env_file(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     env = tmp_path / ".env"
-    env.write_text("HIVE_TOKEN=secret-from-file\n")
+    env.write_text("HIVE_TOKEN=secret-from-file # worker registry token\n")
     path = tmp_path / "workers.json"
     path.write_text(json.dumps([{"worker_id": "hive-worker", "display_name": "Hive", "token_env": "HIVE_TOKEN"}]))
     monkeypatch.setenv("JARVIS_ENV_FILE", str(env))
@@ -235,7 +235,7 @@ def test_worker_registry_reads_token_env_from_jarvis_env_file(tmp_path, monkeypa
 
 def test_worker_registry_probe_uses_token_from_jarvis_env_file(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     env = tmp_path / ".env"
-    env.write_text("HIVE_TOKEN=secret-from-file\n")
+    env.write_text("HIVE_TOKEN=secret-from-file # worker registry token\n")
     path = tmp_path / "workers.json"
     path.write_text(
         json.dumps(
@@ -1286,6 +1286,54 @@ def test_start_worker_session_links_run_graph(tmp_path) -> None:
     assert calls[1][1]["turn_id"] == f"turn_{envelope.dispatch_id}"
     assert calls[1][1]["idempotency_key"] == f"{run.run_id}:{envelope.dispatch_id}:turn"
     assert store.get(run.run_id).sessions[0].session_id == "sess_123"  # type: ignore[union-attr]
+
+
+def test_start_worker_session_uses_token_from_jarvis_env_file(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env = tmp_path / ".env"
+    env.write_text("HIVE_WORKER_TOKEN=session-token # remote worker\n")
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env))
+    monkeypatch.delenv("HIVE_WORKER_TOKEN", raising=False)
+    envelope = build_execution_envelope(
+        run_id="run_1",
+        command=WorkCommand("start_next_work", source="github", start=True),
+        items=[_item()],
+        worker_id="hive-worker",
+    )
+    profile = WorkerProfile(
+        worker_id="hive-worker",
+        display_name="Hive",
+        base_url="http://hive-worker:8780",
+        token_env="HIVE_WORKER_TOKEN",
+    )
+    seen_headers = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, body: dict) -> None:
+            self._body = body
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return self._body
+
+    def fake_post(url, **kwargs):  # noqa: ANN001
+        seen_headers.append(kwargs["headers"])
+        if url.endswith("/sessions"):
+            return Response({"ok": True, "session": {"session_id": "sess_123", "status": "created", "provider": "codex", "engine": "codex"}})
+        return Response({"ok": True, "turn_id": "turn_123", "session": {"session_id": "sess_123", "status": "running", "provider": "codex", "engine": "codex"}})
+
+    start_worker_session(
+        envelope,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1, token="local-token"),
+        worker=profile,
+        post=fake_post,
+    )
+
+    assert seen_headers
+    assert all(headers == {"Authorization": "Bearer session-token"} for headers in seen_headers)
 
 
 def test_start_worker_session_reuses_dispatch_idempotency_key_on_retry(tmp_path) -> None:
@@ -2454,6 +2502,46 @@ def test_start_worker_job_uses_selected_worker_endpoint_and_token_env(monkeypatc
     assert seen["json"]["args"]["execution_envelope"]["session_name"] == "jarvis-1-fix-the-worker"
     assert seen["json"]["args"]["execution_envelope"]["resume_session"] is False
     assert seen["json"]["args"]["execution_envelope"]["landing"]["mode"] == "draft_pr"
+
+
+def test_start_worker_job_uses_token_env_from_jarvis_env_file(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env = tmp_path / ".env"
+    env.write_text("HIVE_WORKER_TOKEN=job-token # remote worker\n")
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env))
+    monkeypatch.delenv("HIVE_WORKER_TOKEN", raising=False)
+    envelope = build_execution_envelope(
+        run_id="run_1",
+        command=WorkCommand("start_next_work", source="github", start=True),
+        items=[_item()],
+        worker_id="hive-worker",
+    )
+    profile = WorkerProfile(
+        worker_id="hive-worker",
+        display_name="Hive",
+        base_url="http://hive-worker:8780",
+        token_env="HIVE_WORKER_TOKEN",
+    )
+    seen = {}
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {"ok": True, "job_id": "job456", "status": "running"}
+
+    def fake_post(_url, **kwargs):  # noqa: ANN001
+        seen["headers"] = kwargs["headers"]
+        return Response()
+
+    start_worker_job(
+        envelope,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1, token="local-token"),
+        worker=profile,
+        post=fake_post,
+    )
+
+    assert seen["headers"] == {"Authorization": "Bearer job-token"}
 
 
 def test_start_worker_job_sends_resume_cwd_and_session(monkeypatch) -> None:  # noqa: ANN001
