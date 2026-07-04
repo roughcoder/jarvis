@@ -59,6 +59,10 @@ NOT_SIGNOFFS = [
     "stop the music",
     "can you stop the music please",
     "go to sleep after you set the alarm",
+    # pronoun stop-commands target playback/an action, not the conversation
+    "stop it",
+    "stop that",
+    "stop it please",
 ]
 
 

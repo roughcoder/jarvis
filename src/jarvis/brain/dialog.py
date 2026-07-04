@@ -174,10 +174,12 @@ _SIGNOFF_REMOVABLE = re.compile(
 )
 # Single filler words allowed to remain around an anchor. ANY other residue
 # word means the user said something substantive — never close on it.
+# Pronouns are deliberately NOT filler: 'stop it' / 'stop that' target what
+# Jarvis is doing (music, an action), not the conversation.
 _SIGNOFF_FILLER = frozenset(
     "ok okay alright right well so um uh cool great perfect brilliant lovely "
     "nice good fine please now then there mate jarvis hey oh ah and for a an "
-    "the that thats is it really very much indeed anyway all bye can could "
+    "the thats is really very much indeed anyway all bye can could "
     "would you".split()
 )
 # Jarvis's OWN reply is a goodbye → end even if it forgot the [[END]] marker.

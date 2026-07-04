@@ -13,6 +13,11 @@ def test_is_silent_recognises_sentinel_and_empty() -> None:
     assert is_silent("   ", "NO_REPLY")
     assert is_silent("NO_REPLY", "NO_REPLY")
     assert is_silent("no_reply", "NO_REPLY")  # case-insensitive
+    # The spoken format rules forbid special characters, so the model may drop
+    # the underscore — every rendering must stay silent, never be spoken aloud.
+    assert is_silent("NO REPLY", "NO_REPLY")
+    assert is_silent("No reply.", "NO_REPLY")
+    assert is_silent("no-reply", "NO_REPLY")
     assert not is_silent("Your 3pm moved to 4pm.", "NO_REPLY")
 
 
