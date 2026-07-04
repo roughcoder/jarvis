@@ -63,6 +63,14 @@ from jarvis.brain.capabilities import resolve_capabilities
 from jarvis.orchestration.authority import allowed
 from jarvis.orchestration.intent import parse_work_command
 from jarvis.orchestration.models import WorkCommand, WorkItem
+from jarvis.orchestration.oauth import (
+    OAuthTokenValidator,
+    OAuthValidationError,
+    auth_mode,
+    oauth_is_configured,
+    oauth_metadata,
+    required_scopes,
+)
 from jarvis.orchestration.service import (
     MissingAuthorityError,
     MissingWorkRepoError,
@@ -98,10 +106,47 @@ class CockpitAppContext:
     idempotency_locks: dict[str, asyncio.Lock]
     idempotency_lock_refs: dict[str, int]
     source_factory: Callable[[str, Any], WorkSource]
+    oauth_validator: OAuthTokenValidator | None = None
 
     def require_auth(self, request: web.Request) -> None:
-        token = self.cfg.orchestration.api_token.get_secret_value()
-        if token and not hmac.compare_digest(request.headers.get("Authorization", ""), f"Bearer {token}"):
+        orchestration = self.cfg.orchestration
+        mode = auth_mode(str(orchestration.auth_mode))
+        header = request.headers.get("Authorization", "")
+        token = orchestration.api_token.get_secret_value()
+        if mode in {"legacy", "hybrid"} and token and hmac.compare_digest(header, f"Bearer {token}"):
+            request["auth"] = {
+                "mode": "legacy",
+                "subject": "legacy-token",
+                "jarvis_user": "",
+                "scopes": [],
+            }
+            return
+
+        if mode in {"oauth", "hybrid"} and self.oauth_validator is not None:
+            prefix = "Bearer "
+            if header.startswith(prefix):
+                try:
+                    principal = self.oauth_validator.validate(header[len(prefix) :])
+                except OAuthValidationError as exc:
+                    raise CockpitError("unauthorized", "unauthorized", status=401) from exc
+                request["auth"] = {
+                    "mode": "oauth",
+                    "subject": principal.subject,
+                    "jarvis_user": principal.jarvis_user,
+                    "scopes": sorted(principal.scopes),
+                }
+                return
+
+        if not token and (mode == "legacy" or (mode == "hybrid" and self.oauth_validator is None)):
+            request["auth"] = {
+                "mode": "none",
+                "subject": "",
+                "jarvis_user": "",
+                "scopes": [],
+            }
+            return
+
+        if token or self.oauth_validator is not None or mode == "oauth":
             raise CockpitError("unauthorized", "unauthorized", status=401)
 
     def service(self, *, manual_item: WorkItem | None = None) -> OrchestrationService:
@@ -331,6 +376,19 @@ def make_app(
     http_post: HttpPost | None = None,
     source_factory: Callable[[str, Any], WorkSource] | None = None,
 ) -> web.Application:
+    orchestration = cfg.orchestration
+    validator = (
+        OAuthTokenValidator(
+            issuer=str(orchestration.oauth_issuer),
+            audience=str(orchestration.oauth_audience),
+            jwks_url=str(orchestration.oauth_jwks_url),
+            scopes=required_scopes(str(orchestration.oauth_required_scopes)),
+            jarvis_user_claim=str(orchestration.oauth_jarvis_user_claim),
+            http_get=http_get or httpx.get,
+        )
+        if auth_mode(str(orchestration.auth_mode)) in {"oauth", "hybrid"} and oauth_is_configured(orchestration)
+        else None
+    )
     ctx = CockpitAppContext(
         cfg=cfg,
         get=http_get or httpx.get,
@@ -340,6 +398,7 @@ def make_app(
         idempotency_locks={},
         idempotency_lock_refs={},
         source_factory=source_factory or _work_source,
+        oauth_validator=validator,
     )
     _rebuild_session_ref_index_from_store(ctx.store)
     app = web.Application(middlewares=[_cors_middleware, _error_middleware])
@@ -351,6 +410,7 @@ def make_app(
     app[SSE_SNAPSHOT_HUB_KEY] = hub
     app.cleanup_ctx.append(_sse_snapshot_hub_context)
     app.add_routes([
+        web.get("/v1/auth/metadata", reads.auth_metadata),
         web.get("/v1/health", reads.health),
         web.get("/v1/cockpit/catalog", reads.catalog),
         web.get("/v1/cockpit/snapshot", reads.snapshot),
@@ -382,6 +442,9 @@ def make_app(
 class CockpitReadHandlers:
     def __init__(self, ctx: CockpitAppContext) -> None:
         self.ctx = ctx
+
+    async def auth_metadata(self, _request: web.Request) -> web.Response:
+        return web.json_response(oauth_metadata(self.ctx.cfg.orchestration))
 
     async def health(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
@@ -1655,7 +1718,10 @@ def _worker_error_code(message: str) -> str:
 
 async def serve(cfg: Config) -> int:
     bind = cfg.orchestration.api_bind_host or cfg.orchestration.api_host
-    token_set = bool(cfg.orchestration.api_token.get_secret_value())
+    token_set = bool(cfg.orchestration.api_token.get_secret_value()) or (
+        auth_mode(str(cfg.orchestration.auth_mode)) in {"oauth", "hybrid"}
+        and oauth_is_configured(cfg.orchestration)
+    )
     if insecure_bind(bind, token_set, cfg.orchestration.api_allow_insecure):
         print(
             f"\n✗ Refusing to start: cockpit API is bound to {bind!r} with no "
