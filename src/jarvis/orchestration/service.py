@@ -9,6 +9,7 @@ from jarvis.orchestration import executor
 from jarvis.orchestration.authority import allowed
 from jarvis.orchestration.models import ExecutionEnvelope, LandingPolicy, WorkCommand, WorkItem, WorkerSessionLink
 from jarvis.orchestration.policy import required_for_command, required_for_worker_dispatch
+from jarvis.orchestration.redaction import public_error_message, redact as _redact_text
 from jarvis.orchestration.sources import WorkSource
 from jarvis.orchestration.store import ActiveWorkerSessionError, ActiveWorkItemError, OrchestrationStore
 from jarvis.orchestration.supervisor import sync_run_sessions
@@ -35,6 +36,10 @@ class WorkAlreadyOwnedError(RuntimeError):
 
 class NoEligibleWorkerError(RuntimeError):
     pass
+
+
+class WorkerCapacityError(NoEligibleWorkerError):
+    """A worker matches the capability/engine requirements but has no free slots."""
 
 
 class WorkerDispatchError(RuntimeError):
@@ -114,32 +119,7 @@ class OrchestrationService:
             store.set_phase(run.run_id, "needs_human", "Work item has no repo/default repo; cannot start a coding worker")
             raise MissingWorkRepoError(item, run.run_id)
         registry = WorkerRegistry(self.cfg.worker, profiles_path=self.cfg.orchestration.workers_path)
-        target_engine = normalize_engine_id(_first_engine(command.target_engine_id))
-        requested_engines = _requested_engines(command)
-        if command.target_worker_id:
-            worker = registry.get(command.target_worker_id, probe=True)
-        elif command.engine_strategy == "ensemble" and requested_engines:
-            worker = registry.choose(item.capability_requirements, engines=requested_engines, slots=len(requested_engines))
-        elif command.engine_strategy == "ensemble":
-            worker = _choose_ensemble_worker(registry, item.capability_requirements, requested_engines)
-        elif target_engine:
-            worker = registry.choose(item.capability_requirements, engine=target_engine)
-        else:
-            worker = registry.choose(item.capability_requirements)
-        engine = target_engine or (worker.default_engine if worker else "") or (worker.agent if worker else "")
-        engines = _target_engines(command, worker, fallback_engine=engine) if worker is not None else []
-        required_slots = len(engines) if command.engine_strategy == "ensemble" else 1
-        if worker is None or not _worker_is_eligible(
-            worker,
-            item.capability_requirements,
-            engine=target_engine if command.engine_strategy != "ensemble" else "",
-            required_slots=required_slots,
-        ):
-            raise NoEligibleWorkerError("No eligible worker found.")
-        if any(not worker_supports_engine(worker.supported_engines, target) for target in engines):
-            raise NoEligibleWorkerError("No eligible worker found.")
-        if command.engine_strategy == "ensemble" and worker.current_jobs + len(engines) > worker.max_concurrent_jobs:
-            raise NoEligibleWorkerError("No eligible worker found.")
+        worker, engine, engines = self._select_worker_and_engines(command, item, registry)
 
         try:
             envelope = executor.create_run_and_envelope(
@@ -172,6 +152,147 @@ class OrchestrationService:
             raise WorkerDispatchError(envelope.run_id, exc) from exc
 
         return StartedWork(item=item, worker=worker, envelope=envelope, session=session, sessions=sessions)
+
+    def _select_worker_and_engines(
+        self,
+        command: WorkCommand,
+        item: WorkItem,
+        registry: WorkerRegistry,
+    ) -> tuple[WorkerProfile, str, list[str]]:
+        target_engine = normalize_engine_id(_first_engine(command.target_engine_id))
+        requested_engines = _requested_engines(command)
+        if command.target_worker_id:
+            worker = registry.get(command.target_worker_id, probe=True)
+        elif command.engine_strategy == "ensemble" and requested_engines:
+            worker = registry.choose(item.capability_requirements, engines=requested_engines, slots=len(requested_engines))
+        elif command.engine_strategy == "ensemble":
+            worker = _choose_ensemble_worker(registry, item.capability_requirements, requested_engines)
+        elif target_engine:
+            worker = registry.choose(item.capability_requirements, engine=target_engine)
+        else:
+            worker = registry.choose(item.capability_requirements)
+        engine = target_engine or (worker.default_engine if worker else "") or (worker.agent if worker else "")
+        engines = _target_engines(command, worker, fallback_engine=engine) if worker is not None else []
+        required_slots = len(engines) if command.engine_strategy == "ensemble" else 1
+        if worker is None or not _worker_is_eligible(
+            worker,
+            item.capability_requirements,
+            engine=target_engine if command.engine_strategy != "ensemble" else "",
+            required_slots=required_slots,
+        ):
+            if worker is not None and _capacity_is_only_blocker(worker, item, target_engine, required_slots):
+                raise WorkerCapacityError("All eligible workers are at capacity.")
+            self._raise_no_worker(registry, item, requested_engines or ([target_engine] if target_engine else []), required_slots)
+        if any(not worker_supports_engine(worker.supported_engines, target) for target in engines):
+            raise NoEligibleWorkerError("No eligible worker found.")
+        if command.engine_strategy == "ensemble" and worker.current_jobs + len(engines) > worker.max_concurrent_jobs:
+            raise WorkerCapacityError("All eligible workers are at capacity.")
+        return worker, engine, engines
+
+    def _raise_no_worker(
+        self,
+        registry: WorkerRegistry,
+        item: WorkItem,
+        engines: list[str],
+        required_slots: int,
+    ) -> None:
+        # Distinguish "nothing can do this work" from "something can, but it is
+        # busy" so the cockpit can offer retry instead of reconfiguration.
+        required_set = set(item.capability_requirements or [])
+        for profile in registry.profiles(probe=False):
+            if profile.status == "offline":
+                continue
+            if not required_set.issubset(set(profile.capabilities)):
+                continue
+            if any(not worker_supports_engine(profile.supported_engines, target) for target in engines if target):
+                continue
+            if profile.current_jobs + max(1, required_slots) > profile.max_concurrent_jobs:
+                raise WorkerCapacityError("All eligible workers are at capacity.")
+        raise NoEligibleWorkerError("No eligible worker found.")
+
+    def validate_work(self, command: WorkCommand, *, manual_item: WorkItem | None = None) -> dict[str, Any]:
+        """Dry-run a start intent: resolve repo/worker/engine and report anything
+        missing. Never writes to the store, claims work, or dispatches a session."""
+        required = list(required_for_command(command.operation, command.source))
+        dispatch_actions = required_for_worker_dispatch(self.cfg.orchestration.landing_mode)
+        if command.engine_strategy == "ensemble":
+            dispatch_actions = [*dispatch_actions, WORKER_SESSION_STOP]
+        missing_authority: list[str] = []
+        for action in [*required, *dispatch_actions]:
+            if action in missing_authority:
+                continue
+            if not allowed(action, self.capabilities, public_write_mode=self.cfg.orchestration.landing_mode):
+                missing_authority.append(action)
+        item = manual_item or WorkItem(source=command.source, id="validate", title="validate")
+        notes = []
+        reasons = []
+        work_item: dict[str, Any] | None = None
+        if command.source not in {"manual", ""} and manual_item is None:
+            peeked, note = self._peek_work_item(command, required)
+            if peeked is not None:
+                item = peeked
+                work_item = {
+                    "source": peeked.source,
+                    "id": peeked.id,
+                    "title": _redact_text(peeked.title),
+                    "repo": peeked.repo,
+                    "kind": peeked.kind,
+                }
+            if note:
+                notes.append(note)
+                if note == "no eligible work item found in the source":
+                    reasons.append(note)
+        repo = item.repo or self._repo(command)
+        missing = [] if repo else ["repo"]
+        worker_id = ""
+        engine = ""
+        engines: list[str] = []
+        registry = WorkerRegistry(self.cfg.worker, profiles_path=self.cfg.orchestration.workers_path)
+        try:
+            worker, engine, engines = self._select_worker_and_engines(command, item, registry)
+            worker_id = worker.worker_id
+        except NoEligibleWorkerError as exc:
+            reasons.append(str(exc) or "No eligible worker found.")
+        if missing_authority:
+            reasons.append(f"missing authority: {', '.join(missing_authority)}")
+        if missing:
+            reasons.append("work item has no repo/default repo; cannot start a coding worker")
+        no_source_item = "no eligible work item found in the source" in reasons
+        return {
+            "can_start": not missing and not missing_authority and bool(worker_id) and not no_source_item,
+            "source": command.source,
+            "operation": command.operation,
+            "repo": repo,
+            "worker_id": worker_id,
+            "engine": engine,
+            "engines": engines,
+            "engine_strategy": command.engine_strategy,
+            "landing_mode": self.cfg.orchestration.landing_mode,
+            "work_item": work_item,
+            "missing": missing,
+            "missing_authority": missing_authority,
+            "reasons": reasons,
+            "notes": notes,
+        }
+
+    def _peek_work_item(self, command: WorkCommand, required_actions: list[str]) -> tuple[WorkItem | None, str]:
+        """Read-only look at what the source would hand a start. next() only
+        lists (claiming happens at start), so this is safe to call from validate."""
+        denied = [
+            action
+            for action in required_actions
+            if not allowed(action, self.capabilities, public_write_mode=self.cfg.orchestration.landing_mode)
+        ]
+        if denied:
+            return None, "source not inspected: missing read authority"
+        try:
+            source = self.source_factory(command.source, self.cfg)
+            item = source.next(repo=self._repo(command), filters=command.filters)
+        except Exception as exc:  # noqa: BLE001 - validation must report, not fail
+            return None, f"source not inspected: {public_error_message(str(exc))}"
+        if item is None:
+            return None, "no eligible work item found in the source"
+        return item, ""
 
     def resume_run(self, run_ref: str = "latest", *, prompt: str = "") -> StartedWork:
         self._require(required_for_command("resume_run", "jarvis"))
@@ -266,6 +387,16 @@ class OrchestrationService:
 
     def _repo(self, command: WorkCommand) -> str:
         return str(command.filters.get("repo") or self.cfg.orchestration.default_repo)
+
+
+def _capacity_is_only_blocker(worker: WorkerProfile, item: WorkItem, engine: str, required_slots: int) -> bool:
+    if worker.status == "offline":
+        return False
+    if engine and not worker_supports_engine(worker.supported_engines, engine):
+        return False
+    if not set(item.capability_requirements or []).issubset(set(worker.capabilities)):
+        return False
+    return worker.current_jobs + max(1, required_slots) > worker.max_concurrent_jobs
 
 
 def _worker_is_eligible(

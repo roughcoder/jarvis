@@ -86,6 +86,36 @@ PRIVATE_PUBLIC_KEY_PATTERNS = (
     "secret",
     "token",
 )
+LANDING_MODES = ["branch_only", "draft_pr", "ready_pr", "confirm_before_pr"]
+WORK_SOURCES = ["manual", "github", "linear"]
+ENGINE_STRATEGIES = ["single", "parallel"]
+START_REQUIRED_FIELDS = {
+    "manual": ["phrase or work_item.title", "repo (unless a default repo is configured)"],
+    "github": ["repo (unless a default repo is configured)"],
+    "linear": [],
+}
+# Worker/provider event names normalized to the canonical cockpit vocabulary
+# before they reach clients. Keep this table in sync with docs/COCKPIT_API.md.
+SESSION_EVENT_TYPE_ALIASES = {
+    "provider.thread.ready": "provider.session.ready",
+}
+PHASE_STATE_REASONS = {
+    "created": "Run created; no worker session dispatched yet",
+    "claimed": "Work item claimed",
+    "provisioned": "Worker session provisioned",
+    "running": "Worker sessions active",
+    "verifying": "Verification in progress",
+    "landing": "Landing changes",
+    "handoff": "Waiting for operator handoff",
+    "blocked": "Run is blocked",
+    "stalled": "Run has stalled",
+    "needs_human": "Waiting for a human decision",
+    "completed": "All worker sessions completed",
+    "done": "Run completed",
+    "failed": "Run failed",
+    "cancelled": "Run cancelled",
+}
+BLOCKED_PHASES = {"blocked", "stalled", "needs_human"}
 PUBLIC_EVENT_DATA_KEYS = {
     "branch",
     "checkpoint_id",
@@ -207,14 +237,42 @@ def _session_ref_digest(raw: bytes) -> str:
     return base64.urlsafe_b64encode(digest[:SESSION_REF_SIGNATURE_BYTES]).decode("ascii").rstrip("=")
 
 
-def cockpit_catalog() -> dict[str, Any]:
+CATALOG_ENGINE_LABELS = {
+    "codex": ("Codex", "OpenAI Codex provider session"),
+    "claude": ("Claude", "Claude provider session"),
+}
+
+
+def cockpit_catalog(*, start_defaults: dict[str, Any] | None = None, engines: list[str] | None = None) -> dict[str, Any]:
+    defaults = {
+        "source": "manual",
+        "worker_id": "",
+        "repo": "",
+        "engine": "",
+        "engine_strategy": "single",
+        "landing_mode": "",
+        **{key: value for key, value in (start_defaults or {}).items() if value},
+    }
+    engine_ids = list(engines) if engines else list(CATALOG_ENGINE_LABELS)
+    engine_rows = [
+        _engine_catalog(
+            engine,
+            *CATALOG_ENGINE_LABELS.get(engine, (engine.capitalize(), f"{engine.capitalize()} provider session")),
+        )
+        for engine in engine_ids
+    ]
     return {
         "api_version": API_VERSION,
         "schema_version": SCHEMA_VERSION,
-        "engines": [
-            _engine_catalog("codex", "Codex", "OpenAI Codex provider session"),
-            _engine_catalog("claude", "Claude", "Claude provider session"),
-        ],
+        "engines": engine_rows,
+        "start_options": {
+            "sources": list(WORK_SOURCES),
+            "engines": engine_ids,
+            "engine_strategies": list(ENGINE_STRATEGIES),
+            "landing_modes": list(LANDING_MODES),
+            "required_fields": {key: list(value) for key, value in START_REQUIRED_FIELDS.items()},
+            "defaults": defaults,
+        },
         "capabilities": [
             {"capability": "code.edit", "display_name": "Edit code", "maps_to": [WORKER_SESSION_CREATE, WORKER_SESSION_TURN]},
             {"capability": "shell.run", "display_name": "Run shell commands", "maps_to": [WORKER_JOB_START]},
@@ -237,6 +295,7 @@ def cockpit_snapshot(
     workers_path: str,
     sync_mode: str = "none",
     http_get: Any = httpx.get,
+    default_repo: str = "",
 ) -> dict[str, Any]:
     sync = sync_state(store=store, worker_cfg=worker_cfg, workers_path=workers_path, sync_mode=sync_mode, http_get=http_get)
     all_runs = store.list_runs()
@@ -244,7 +303,13 @@ def cockpit_snapshot(
     archived_session_refs = archived_session_refs_for_store(store, all_runs)
     runs = [run for run in all_runs if not run.archived_at]
     include_worker_state = sync["mode"] in {"fast", "probe"}
-    workers = worker_profiles(worker_cfg=worker_cfg, workers_path=workers_path, probe=sync["mode"] == "probe", http_get=http_get)
+    workers = worker_profiles(
+        worker_cfg=worker_cfg,
+        workers_path=workers_path,
+        probe=sync["mode"] == "probe",
+        http_get=http_get,
+        default_repo=default_repo,
+    )
     worker_by_id = {worker["worker_id"]: worker for worker in workers}
     sessions = aggregate_sessions(
         runs=runs,
@@ -279,6 +344,8 @@ def cockpit_snapshot(
                 "sessions": session_rows,
                 "workers": [_cursor_worker(worker) for worker in workers],
                 "artifacts": artifacts,
+                "requests": requests,
+                "checkpoints": checkpoints,
             }
         ),
         "generated_at": utc_now(),
@@ -287,6 +354,8 @@ def cockpit_snapshot(
         "sessions": session_rows,
         "workers": workers,
         "artifacts": artifacts,
+        "requests": requests,
+        "checkpoints": checkpoints,
     }
 
 
@@ -318,12 +387,13 @@ def worker_profiles(
     workers_path: str,
     probe: bool = False,
     http_get: Any = httpx.get,
+    default_repo: str = "",
 ) -> list[dict[str, Any]]:
     registry = WorkerRegistry(worker_cfg, profiles_path=workers_path, http_get=http_get)
-    return [project_worker_profile(profile) for profile in registry.profiles(probe=probe)]
+    return [project_worker_profile(profile, default_repo=default_repo) for profile in registry.profiles(probe=probe)]
 
 
-def project_worker_profile(profile: WorkerProfile) -> dict[str, Any]:
+def project_worker_profile(profile: WorkerProfile, *, default_repo: str = "") -> dict[str, Any]:
     engines = [
         _engine_row(
             engine,
@@ -339,7 +409,7 @@ def project_worker_profile(profile: WorkerProfile) -> dict[str, Any]:
         "display_name": profile.display_name,
         "status": profile.status,
         "health": _worker_health(profile.status),
-        "last_seen_at": utc_now() if profile.status == "online" else "",
+        "last_seen_at": profile.last_seen_at or (utc_now() if profile.status == "online" else ""),
         "capabilities": mapped_capabilities,
         "engines": engines,
         "capacity": {
@@ -348,9 +418,36 @@ def project_worker_profile(profile: WorkerProfile) -> dict[str, Any]:
             "queued_sessions": 0,
         },
         "system": project_worker_system(profile.system),
-        "repositories": [],
+        "repositories": _repository_rows(profile.repositories, profile.default_repo or default_repo),
         "public_metadata": {},
     }
+
+
+def _repository_rows(raw_rows: list[dict[str, Any]], default_repo: str) -> list[dict[str, Any]]:
+    rows = []
+    for raw in raw_rows or []:
+        repo = str(raw.get("repo") or raw.get("name") or "")
+        if not repo:
+            continue
+        status = str(raw.get("status") or "ready")
+        rows.append(
+            {
+                "repo": repo,
+                "status": status,
+                "default_branch": str(raw.get("default_branch") or ""),
+                "is_default": _same_repo(repo, default_repo),
+                "can_start_work": status == "ready",
+            }
+        )
+    return rows
+
+
+def _same_repo(repo: str, default_repo: str) -> bool:
+    # The configured default may be "org/name" while workers publish the bare
+    # checkout directory name; match on the trailing name in that case.
+    if not repo or not default_repo:
+        return False
+    return repo == default_repo or repo.rsplit("/", 1)[-1] == default_repo.rsplit("/", 1)[-1]
 
 
 def project_worker_system(system: Any) -> dict[str, Any]:
@@ -554,6 +651,17 @@ def run_summary(
     run_artifacts = [artifact for artifact in artifacts if artifact.get("run_id") == run.run_id]
     repo = _run_repo(run)
     branch = next((session.branch for session in visible_sessions if session.branch), "")
+    pending_input = sum(1 for request in run_requests if request.get("kind") == "input")
+    pending_approval = sum(1 for request in run_requests if request.get("kind") == "approval")
+    reason = _redact(run.terminal_reason)
+    state_reason = reason or PHASE_STATE_REASONS.get(run.phase, "")
+    waiting_on = []
+    if pending_approval:
+        waiting_on.append("approval")
+    if pending_input:
+        waiting_on.append("input")
+    if run.phase == "needs_human":
+        waiting_on.append("human")
     return {
         "authority": "jarvis",
         "supported_controls": RUN_SUPPORTED_CONTROLS,
@@ -566,15 +674,19 @@ def run_summary(
         "branch": branch,
         "session_count": len(visible_sessions),
         "active_session_count": sum(1 for session in visible_sessions if session.status in ACTIVE_SESSION_STATUSES),
-        "pending_input_count": sum(1 for request in run_requests if request.get("kind") == "input"),
-        "pending_approval_count": sum(1 for request in run_requests if request.get("kind") == "approval"),
+        "pending_input_count": pending_input,
+        "pending_approval_count": pending_approval,
         "artifact_count": len(run_artifacts),
         "primary_artifact_ids": [artifact["artifact_id"] for artifact in run_artifacts if artifact.get("is_primary")],
         "latest_activity_at": run.updated_at,
         "latest_cursor": _run_cursor(run),
         "created_at": run.created_at,
         "updated_at": run.updated_at,
-        "terminal_reason": _redact(run.terminal_reason) or None,
+        "terminal_reason": reason or None,
+        "state_reason": state_reason or None,
+        "blocked_reason": state_reason if run.phase in BLOCKED_PHASES else None,
+        "waiting_on": waiting_on,
+        "last_error": reason if run.phase == "failed" else None,
         "archived_at": run.archived_at or None,
     }
 
@@ -624,6 +736,13 @@ def session_summary(
     checkpoints = checkpoints or []
     ref = str(session["session_ref"])
     session_requests = [request for request in requests if request.get("session_ref") == ref]
+    pending_input = sum(1 for request in session_requests if request.get("kind") == "input")
+    pending_approval = sum(1 for request in session_requests if request.get("kind") == "approval")
+    waiting_on = []
+    if pending_approval:
+        waiting_on.append("approval")
+    if pending_input:
+        waiting_on.append("input")
     return {
         "authority": "jarvis",
         "supported_controls": _session_supported_controls(session),
@@ -639,13 +758,19 @@ def session_summary(
         "branch": session.get("branch", ""),
         "cwd_label": cwd_label(str(session.get("cwd") or "")),
         "latest_event_cursor": session.get("latest_event_cursor", ""),
-        "pending_input_count": sum(1 for request in session_requests if request.get("kind") == "input"),
-        "pending_approval_count": sum(1 for request in session_requests if request.get("kind") == "approval"),
+        "pending_input_count": pending_input,
+        "pending_approval_count": pending_approval,
+        "waiting_on": waiting_on,
         "checkpoint_count": sum(1 for checkpoint in checkpoints if checkpoint.get("session_ref") == ref),
         "created_at": session.get("created_at", ""),
         "updated_at": session.get("updated_at", ""),
         "archived_at": session.get("archived_at") or None,
     }
+
+
+def canonical_event_type(value: Any) -> str:
+    text = str(value or "")
+    return SESSION_EVENT_TYPE_ALIASES.get(text, text)
 
 
 def project_session_event(raw: dict[str, Any], *, worker_id: str, run_id: str = "", sequence: int = 0) -> dict[str, Any]:
@@ -657,7 +782,7 @@ def project_session_event(raw: dict[str, Any], *, worker_id: str, run_id: str = 
         "sequence": sequence,
         "session_ref": make_session_ref(worker_id, session_id),
         "run_id": run_id or str(data.get("run_id") or ""),
-        "type": str(raw.get("type") or ""),
+        "type": canonical_event_type(raw.get("type")),
         "occurred_at": str(raw.get("time") or raw.get("occurred_at") or ""),
         "turn_id": turn_id,
         "message_id": _message_id(raw, data, turn_id),
@@ -766,7 +891,7 @@ def project_artifact(artifact: Artifact, run: OrchestrationRun) -> dict[str, Any
     kind = _artifact_kind(artifact.type)
     public_url = _public_url(artifact.url)
     title = _redact(artifact.name) or public_url or _redact(artifact.id) or kind
-    return {
+    row = {
         "artifact_id": artifact.id or artifact_id(run.run_id, kind, artifact.url or artifact.name),
         "run_id": run.run_id,
         "session_ref": "",
@@ -777,7 +902,7 @@ def project_artifact(artifact: Artifact, run: OrchestrationRun) -> dict[str, Any
         "visibility": "public-safe",
         "title": title,
         "status": artifact.status,
-        "summary": "",
+        "summary": _redact(artifact.summary),
         "url": public_url,
         "branch": "",
         "commit_sha": "",
@@ -785,6 +910,11 @@ def project_artifact(artifact: Artifact, run: OrchestrationRun) -> dict[str, Any
         "updated_at": run.updated_at,
         "metadata": {},
     }
+    if kind == "verification":
+        row["command"] = _redact(artifact.command)
+        row["started_at"] = artifact.started_at
+        row["completed_at"] = artifact.completed_at
+    return row
 
 
 def paged(items: list[dict[str, Any]], *, after: str = "", limit: int = 100) -> dict[str, Any]:
@@ -794,7 +924,7 @@ def paged(items: list[dict[str, Any]], *, after: str = "", limit: int = 100) -> 
                 items = items[idx + 1 :]
                 break
         else:
-            raise CockpitError("validation_failed", "unknown pagination cursor", recoverable=True, status=400)
+            raise CockpitError("stale_cursor", "unknown pagination cursor; clear the cursor and refetch from the first page", recoverable=True, status=400)
     page_limit = max(1, min(int(limit or 100), MAX_PAGE_LIMIT))
     page = items[:page_limit]
     cursor = ""

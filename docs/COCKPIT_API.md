@@ -98,6 +98,7 @@ GET /v1/sessions/{session_ref}/checkpoints
 ```text
 POST /v1/work/start
 POST /v1/work/resume
+POST /v1/work/validate
 ```
 
 ### Session Controls
@@ -181,13 +182,41 @@ It is not current operational state.
   ],
   "work_sources": ["manual", "github", "linear"],
   "engine_strategies": ["single", "parallel"],
-  "request_kinds": ["approval", "input"]
+  "request_kinds": ["approval", "input"],
+  "start_options": {
+    "sources": ["manual", "github", "linear"],
+    "engines": ["codex", "claude"],
+    "engine_strategies": ["single", "parallel"],
+    "landing_modes": ["branch_only", "draft_pr", "ready_pr", "confirm_before_pr"],
+    "required_fields": {
+      "manual": ["phrase or work_item.title", "repo (unless a default repo is configured)"],
+      "github": ["repo (unless a default repo is configured)"],
+      "linear": []
+    },
+    "defaults": {
+      "source": "manual",
+      "worker_id": "macbook-worker",
+      "repo": "roughcoder/jarvis",
+      "engine": "codex",
+      "engine_strategy": "single",
+      "landing_mode": "draft_pr"
+    }
+  }
 }
 ```
 
 The cockpit may display friendly public terms, but Jarvis maps them to internal
-policy and engine names. Catalog engine rows are stable option labels only;
-current worker-specific engine capabilities come from `WorkerProfile.engines`.
+policy and engine names. Catalog engine rows are option labels drawn from the
+engines the configured workers support (falling back to the built-in engine
+list when no workers are configured); current worker-specific engine
+capabilities still come from `WorkerProfile.engines`.
+
+`start_options` is Jarvis-owned wizard data for the start-work form: available
+sources, engines, strategies, landing modes, the fields each source requires,
+and the server-side defaults (default worker, default engine, the configured
+`ORCHESTRATION_DEFAULT_REPO`, and the active landing mode). Cockpits must read
+defaults from here instead of shipping their own (for example a cockpit-local
+`JARVIS_DEFAULT_REPO`). Empty-string defaults mean "no default configured".
 
 ## Snapshot
 
@@ -210,9 +239,15 @@ worker selectors, and artifact links without a pile of follow-up calls.
   "runs": [],
   "sessions": [],
   "workers": [],
-  "artifacts": []
+  "artifacts": [],
+  "requests": [],
+  "checkpoints": []
 }
 ```
+
+`requests` and `checkpoints` carry the pending Request objects and checkpoint
+summaries aggregated from workers. They are populated in `fast`/`probe` sync
+modes and empty (`[]`) in `none` mode, which stays store-only.
 
 Snapshot rows are summaries. Timelines, logs, report bodies, checkpoint detail,
 and large provider payloads stay behind lazy detail endpoints.
@@ -255,14 +290,31 @@ names.
   },
   "repositories": [
     {
-      "repo": "roughcoder/jarvis",
+      "repo": "jarvis",
       "status": "ready",
-      "default_branch": "main"
+      "default_branch": "main",
+      "is_default": true,
+      "can_start_work": true
     }
   ],
   "public_metadata": {}
 }
 ```
+
+`repositories` is the Jarvis-owned repo registry for this worker. Rows come
+from the worker profile (`workers.json`) and, on probe, from the worker's
+authorised `/health` response (the worker publishes the git checkouts under its
+configured repo root with each repo's default branch). `is_default` marks the
+repo matching the worker profile's own `default_repo` when set, otherwise
+`ORCHESTRATION_DEFAULT_REPO` (an `org/name` default matches a bare checkout
+name on the trailing segment). `can_start_work` is true when the repo's status
+is `ready`. Workers that publish nothing return `[]` — the cockpit should then
+fall back to `start_options.defaults.repo` or a manual repo field.
+
+`last_seen_at` is stamped when a probe of the worker last succeeded; without a
+probe in the current request it may be empty even for a worker recorded as
+online. `capacity.queued_sessions` is always `0` today: workers dispatch
+sessions immediately and have no queue.
 
 Workers may publish the source data as an `engine_supports` mapping:
 
@@ -308,8 +360,8 @@ Run summaries appear in snapshots and run lists.
   "run_id": "run_123",
   "title": "Build worker sessions",
   "objective": "Expose live worker sessions",
-  "status": "running",
-  "phase": "implementing",
+  "status": "active",
+  "phase": "running",
   "repo": "roughcoder/jarvis",
   "branch": "jarvis/foo",
   "session_count": 2,
@@ -323,9 +375,33 @@ Run summaries appear in snapshots and run lists.
   "created_at": "2026-07-01T11:00:00Z",
   "updated_at": "2026-07-01T12:00:00Z",
   "terminal_reason": null,
+  "state_reason": "Worker sessions active",
+  "blocked_reason": null,
+  "waiting_on": [],
+  "last_error": null,
   "archived_at": null
 }
 ```
+
+Run lifecycle reason fields explain what a run is doing without scraping
+events:
+
+- `state_reason` — human-readable reason for the current state: the recorded
+  terminal/blocking reason when one exists, otherwise a stable phrase derived
+  from `phase`. `null` only for unknown phases with no recorded reason.
+- `blocked_reason` — set only while `phase` is `blocked`, `stalled`, or
+  `needs_human`; explains what stopped progress.
+- `waiting_on` — list drawn from `approval`, `input`, and `human`; empty when
+  nothing is waiting on the operator.
+- `last_error` — set only when `phase` is `failed`; the redacted failure
+  reason.
+
+Live contract values: `run.status` is `active` for any non-archived run that
+has not reached a terminal phase (the phase, not the status, carries lifecycle
+detail). Public string fields that have no value are empty strings (`""`), not
+omitted keys — for example artifact `summary`, `url`, and `commit_sha`, and
+session-event `turn_id` / `message_id` on events with no turn context. Clients
+must treat empty strings as "not available", not as errors.
 
 `GET /v1/runs/{run_id}` returns a public-safe run detail projection. It extends
 `RunSummary` with projected `work_items`, `sessions`, and `artifacts`; it must
@@ -354,6 +430,7 @@ Session summaries appear in snapshots and session lists.
   "latest_event_cursor": "evt_123",
   "pending_input_count": 0,
   "pending_approval_count": 1,
+  "waiting_on": ["approval"],
   "checkpoint_count": 2,
   "created_at": "2026-07-01T11:00:00Z",
   "updated_at": "2026-07-01T12:00:00Z",
@@ -458,6 +535,17 @@ session.interrupted
 session.stopped
 ```
 
+Providers sometimes emit their own spellings for canonical events. Jarvis
+normalizes known aliases before exposing events to the cockpit, so clients only
+ever see the canonical name:
+
+| Provider alias | Canonical type |
+|---|---|
+| `provider.thread.ready` | `provider.session.ready` |
+
+Unknown event types pass through unchanged; clients should render unrecognized
+types generically rather than failing.
+
 ## Artifacts
 
 Artifacts are public-safe summaries for branches, pull requests, reports,
@@ -499,7 +587,9 @@ status_comment
 provider_evidence
 ```
 
-Verification artifacts use first-class fields:
+Verification artifacts add first-class fields (`command`, `started_at`,
+`completed_at`) on top of the base shape; `summary` is populated for any
+artifact kind that records one:
 
 ```json
 {
@@ -541,9 +631,9 @@ Response:
 ```
 
 If `after` does not match a cursor/id in the current page source, Jarvis returns
-`400 validation_failed` instead of silently restarting pagination from the
-beginning. Clients should clear the cursor and refetch from the first page when
-they receive that error.
+`400 stale_cursor` (recoverable) instead of silently restarting pagination from
+the beginning. Clients should clear the cursor and refetch from the first page
+when they receive that error.
 
 ## Writes
 
@@ -562,8 +652,53 @@ Every write accepts an idempotency key and public metadata:
 work, creates or claims a run, chooses worker and engine, dispatches sessions,
 and validates authority.
 
+The start/resume reconciliation packet always includes the created run and the
+dispatched session summary — including `session.session_ref` — so the cockpit
+can promote an optimistic draft to the real session immediately instead of
+waiting for polling reconciliation.
+
 `POST /v1/work/resume` is a high-level resume intent. Jarvis chooses the best
 resumable session for the selected run.
+
+`POST /v1/work/validate` is a read-only dry run of a start intent. It accepts
+the same body as `/v1/work/start` (phrase/command, `source`, `repo`,
+`worker_id`, `engine`, `engine_strategy`, `work_item`) but never creates a run,
+claims work, or dispatches a session — including the `needs_human` run that a
+failed start records. Use it to power start-wizard validation.
+
+```json
+{
+  "ok": true,
+  "api_version": "v1",
+  "schema_version": 1,
+  "validation": {
+    "can_start": false,
+    "source": "manual",
+    "operation": "start_next_work",
+    "repo": "",
+    "worker_id": "macbook-worker",
+    "engine": "codex",
+    "engines": ["codex"],
+    "engine_strategy": "single",
+    "landing_mode": "draft_pr",
+    "work_item": null,
+    "missing": ["repo"],
+    "missing_authority": [],
+    "reasons": ["work item has no repo/default repo; cannot start a coding worker"],
+    "notes": []
+  }
+}
+```
+
+`worker_id`/`engine`/`engines` report the selection Jarvis would make;
+`missing` lists absent required fields, `missing_authority` lists denied
+capability actions, and `reasons` is the human-readable roll-up. For github and
+linear sources, Jarvis peeks at the source read-only (`next()` lists without
+claiming) and reports the candidate as `work_item`
+(`{source, id, title, repo, kind}`); if the source has no eligible item,
+`can_start` is false with a matching reason. When read authority is missing or
+the source is unreachable, the peek is skipped and `notes` says why. The exact
+item can still change between validate and start.
 
 `POST /v1/sessions/{session_ref}/turns` appends a prompt to one exact session. T3
 uses this for the thread composer once the operator is already inside a session.
@@ -653,6 +788,12 @@ stale_cursor
 internal_error
 ```
 
+`worker_capacity_exceeded` (409, recoverable) means a worker matches the
+capability and engine requirements but has no free session slots — retry later
+or stop something. `worker_unavailable` means nothing configured can do the
+work at all. `stale_cursor` (400, recoverable) is returned for unknown
+pagination cursors; clear the cursor and refetch from the first page.
+
 ## SSE Event Stream
 
 `GET /v1/cockpit/events` is the cockpit-level update stream, not a raw internal
@@ -714,13 +855,45 @@ request.updated
 checkpoint.updated
 ```
 
-Future filters may be added without changing the base stream:
+Delivery model: a connected client that is exactly one refresh tick behind
+receives granular events diffed from the previous snapshot projection; each
+carries the new snapshot `cursor` and the full public row as `payload`
+(`artifact.removed` carries just the `artifact_id`). Any client whose cursor is
+missing, stale, or more than one tick behind gets a full `snapshot` event
+instead — snapshot fallback is always correct, granular events are an
+optimization. Run/session creation appears as the first `.updated` event for
+that id; terminal transitions appear as `.updated` events whose payload carries
+the terminal `phase`/`status`/`terminal_reason`. Archive operations (a run,
+session, or checkpoint disappearing from the projection) always force a
+snapshot event.
+
+`session.event` frames stream the per-turn worker events (turn/assistant/tool/
+approval frames) that the sync loop persists to the run's local event log. The
+payload is the canonical SessionEvent projection. Frames are emitted on the
+same refresh tick cadence, so streamed `assistant.delta` text arrives in
+per-tick batches rather than token-by-token. In `none` sync mode, new events
+only appear when something else (a cockpit write, a CLI sync) lands them in the
+store; use `fast` for live streaming.
+
+`request.updated` fires when a pending request appears or changes; when a
+request stops being pending, Jarvis emits `request.updated` with payload
+`{"request_id": ..., "status": "closed", "session_ref": ...}` — fetch the
+session's requests for the final decision. `checkpoint.updated` fires when a
+checkpoint appears or changes. Both require `fast`/`probe` sync mode, since
+`none`-mode snapshots do not poll workers.
+
+Stream filters are supported and combine with AND semantics:
 
 ```text
 ?run_id=...
 ?session_ref=...
 ?worker_id=...
 ```
+
+Filters apply to granular events only: frames that do not explicitly carry the
+requested id (in the envelope or payload) are dropped, and a tick whose frames
+are all filtered out degrades to a heartbeat. Snapshot events are always the
+full projection; filtering clients should ignore rows they do not care about.
 
 ## Deferred From v1
 
@@ -747,6 +920,69 @@ view.
 
 Future API changes should be appended here with date, schema version, compatible
 or breaking status, and migration notes.
+
+### 2026-07-04 - v1 Completeness round (compatible, one error-code change)
+
+Closes the remaining gaps between the documented contract and the
+implementation. `schema_version` stays 1.
+
+- The orchestration sync loop now persists newly-fetched worker session events
+  to the run's local event log (deduped by event id), making run timelines
+  durable and enabling live streaming.
+- `/v1/cockpit/events` now emits `session.event` frames (per-turn worker events
+  batched per refresh tick), `request.updated` (including a `status: "closed"`
+  frame when a request stops being pending), and `checkpoint.updated`. These
+  need `fast`/`probe` sync mode.
+- Snapshot responses now include `requests` and `checkpoints` arrays (populated
+  in `fast`/`probe` mode, `[]` in `none` mode).
+- SSE stream filters `?run_id=`, `?session_ref=`, `?worker_id=` are implemented
+  with AND semantics over granular events.
+- Unknown pagination cursors now return `stale_cursor` instead of
+  `validation_failed` (same 400 status, still recoverable) — update clients
+  that switch on the code.
+- Capacity-only worker selection failures now return
+  `worker_capacity_exceeded` (409) instead of `worker_unavailable`.
+- `/v1/work/validate` now peeks github/linear sources read-only and reports the
+  candidate `work_item`.
+- Verification artifacts project first-class `command`/`started_at`/
+  `completed_at`, and artifact `summary` is populated when recorded.
+- Worker `last_seen_at` is stamped at probe success rather than synthesized;
+  `capacity.queued_sessions` documented as always `0` (workers have no queue).
+- Worker profiles may declare their own `default_repo`, which wins over the
+  global default for `is_default` marking and catalog defaults.
+- Catalog engine rows and `start_options.engines` are derived from the engines
+  configured workers actually support.
+
+### 2026-07-04 - v1 Cockpit feedback round (compatible)
+
+Additive changes from the first external cockpit integration. No breaking
+changes; `schema_version` stays 1.
+
+- Documented live contract values: `run.status` is `active` for non-terminal
+  runs, and empty public strings (`summary`, `url`, `commit_sha`, event
+  `turn_id`/`message_id`) are valid "not available" values.
+- Documented that `/v1/work/start` and `/v1/work/resume` reconciliation packets
+  include `session.session_ref` for immediate draft promotion (already true in
+  the implementation).
+- Added `POST /v1/work/validate`: a read-only dry run of a start intent that
+  reports selected repo/worker/engine, missing fields, and missing authority
+  without creating a run.
+- Added `start_options` to `/v1/cockpit/catalog`: sources, engines, strategies,
+  landing modes, per-source required fields, and server-owned defaults
+  (default worker/repo/engine/landing mode) so cockpits stop hardcoding their
+  own defaults.
+- Populated `WorkerProfile.repositories` from worker profiles and the worker's
+  authorised `/health` response (repo name, default branch, readiness), with
+  `is_default` marking the configured default repo and `can_start_work`.
+- Added run lifecycle reason fields (`state_reason`, `blocked_reason`,
+  `waiting_on`, `last_error`) and session `waiting_on`.
+- Normalized provider event-type aliases before exposure
+  (`provider.thread.ready` → `provider.session.ready`) and documented the alias
+  table.
+- Upgraded `/v1/cockpit/events`: clients one tick behind now receive granular
+  `run.updated` / `session.updated` / `worker.updated` / `artifact.upserted` /
+  `artifact.removed` events diffed from the snapshot projection, with snapshot
+  fallback for stale cursors and archive transitions.
 
 ### 2026-07-01 - v1 Implementation Start
 

@@ -859,7 +859,8 @@ def test_cockpit_run_events_and_artifact_pagination(tmp_path, monkeypatch) -> No
         assert "cwd" not in json.dumps(event_page)
         assert events["has_more"] is True
         assert unknown_cursor.status_code == 400
-        assert unknown_cursor.json()["error"]["code"] == "validation_failed"
+        assert unknown_cursor.json()["error"]["code"] == "stale_cursor"
+        assert unknown_cursor.json()["error"]["recoverable"] is True
         kinds = {item["kind"] for item in artifacts["items"]}
         report = [item for item in all_artifacts["items"] if item["kind"] == "report"][0]
         assert {"branch", "pull_request"}.issubset(kinds)
@@ -922,11 +923,13 @@ def test_cockpit_sse_emits_snapshot_when_projection_cursor_changes(tmp_path, mon
         async with client.stream("GET", f"{base}/v1/cockpit/events", params={"after": current}) as response:
             async for chunk in response.aiter_text():
                 seen += chunk
-                if "event: snapshot" in seen:
+                if "event: run.updated" in seen:
                     break
         await task
 
-        assert "event: snapshot" in seen
+        # A client exactly one tick behind receives granular events, not a snapshot.
+        assert "event: run.updated" in seen
+        assert "event: snapshot" not in seen
         assert '"occurred_at":' in seen
         assert f'"cursor": "{current}"' not in seen
         assert '"phase": "verifying"' in seen
@@ -981,9 +984,9 @@ def test_cockpit_sse_preserves_requested_sync_mode(tmp_path, monkeypatch) -> Non
                     break
         await task
 
-        assert "event: snapshot" in seen
-        assert '"mode": "fast"' in seen
-        assert '"status": "fresh"' in seen
+        # Granular updates only reach the stream because the hub kept polling in
+        # the requested fast sync mode.
+        assert "event: run.updated" in seen or "event: session.updated" in seen
         assert '"pending_approval_count": 1' in seen
 
     import asyncio
@@ -1040,7 +1043,7 @@ def test_cockpit_sse_hub_fans_out_one_refresh_to_multiple_subscribers(tmp_path, 
             second_event = await asyncio.wait_for(second.queue.get(), timeout=2)
             assert first_event is not None
             assert second_event is not None
-            assert first_event["cursor"] == second_event["cursor"]
+            assert first_event["body"]["cursor"] == second_event["body"]["cursor"]
             assert request_calls["count"] == 2
         finally:
             await hub.stop()
@@ -1081,7 +1084,8 @@ def test_cockpit_sse_hub_survives_snapshot_refresh_exception(tmp_path, monkeypat
         try:
             subscription = await hub.subscribe("none")
             event = await asyncio.wait_for(subscription.queue.get(), timeout=1)
-            assert event == {"cursor": "evt_recovered"}
+            assert event is not None
+            assert event["body"] == {"cursor": "evt_recovered"}
             assert calls["count"] >= 3
         finally:
             await hub.stop()
@@ -2322,3 +2326,465 @@ def test_cockpit_work_resume_maps_active_session_error(tmp_path, monkeypatch) ->
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+
+def test_cockpit_catalog_exposes_start_options_and_defaults(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        return (await client.get(f"{base}/v1/cockpit/catalog")).json()
+
+    import asyncio
+
+    body = asyncio.run(_with_server(cfg, calls, http_get=_fake_get("")))
+    options = body["start_options"]
+
+    assert options["sources"] == ["manual", "github", "linear"]
+    assert options["engine_strategies"] == ["single", "parallel"]
+    assert options["landing_modes"] == ["branch_only", "draft_pr", "ready_pr", "confirm_before_pr"]
+    assert "repo (unless a default repo is configured)" in options["required_fields"]["manual"]
+    assert options["defaults"]["worker_id"] == "macbook-worker"
+    assert options["defaults"]["engine"] == "codex"
+    assert options["defaults"]["landing_mode"] == "branch_only"
+    assert options["defaults"]["source"] == "manual"
+
+
+def test_cockpit_worker_repositories_projection_marks_default_repo() -> None:
+    from jarvis.orchestration.cockpit import project_worker_profile
+
+    profile = WorkerProfile(
+        worker_id="macbook-worker",
+        display_name="MacBook Pro",
+        repositories=[
+            {"repo": "jarvis", "default_branch": "main", "status": "ready"},
+            {"repo": "polymarket", "default_branch": "develop", "status": "cloning"},
+            {"name": "legacy-name-key"},
+            {"no_repo": True},
+        ],
+    )
+
+    rows = project_worker_profile(profile, default_repo="roughcoder/jarvis")["repositories"]
+
+    assert rows == [
+        {"repo": "jarvis", "status": "ready", "default_branch": "main", "is_default": True, "can_start_work": True},
+        {"repo": "polymarket", "status": "cloning", "default_branch": "develop", "is_default": False, "can_start_work": False},
+        {"repo": "legacy-name-key", "status": "ready", "default_branch": "", "is_default": False, "can_start_work": True},
+    ]
+
+
+def test_cockpit_workers_probe_surfaces_health_published_repositories(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+
+    def get(url: str, **kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/health"):
+            return Response(
+                {
+                    "ok": True,
+                    "agent": "codex",
+                    "supported_engines": ["codex", "claude"],
+                    "repositories": [{"repo": "jarvis", "default_branch": "main", "status": "ready"}],
+                }
+            )
+        return _fake_get("")(url, **kwargs)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        return (await client.get(f"{base}/v1/workers", params={"probe": "true"})).json()
+
+    import asyncio
+
+    body = asyncio.run(_with_server(cfg, calls, http_get=get))
+    worker = body["workers"][0]
+
+    assert worker["repositories"] == [
+        {"repo": "jarvis", "status": "ready", "default_branch": "main", "is_default": False, "can_start_work": True}
+    ]
+
+
+def test_cockpit_work_validate_reports_selection_without_creating_a_run(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    caps = "worker.job.start,worker.session.create,worker.session.turn,forge.github.branch.push"
+    cfg = _cfg(tmp_path, monkeypatch, caps=caps)
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        response = await client.post(
+            f"{base}/v1/work/validate",
+            json={"source": "manual", "repo": "roughcoder/jarvis", "phrase": "Build a cockpit smoke", "worker_id": "macbook-worker", "engine": "codex"},
+        )
+        assert response.status_code == 200
+        return response.json()
+
+    import asyncio
+
+    body = asyncio.run(_with_server(cfg, calls, http_get=_fake_get("")))
+    validation = body["validation"]
+
+    assert body["ok"] is True
+    assert validation["can_start"] is True
+    assert validation["worker_id"] == "macbook-worker"
+    assert validation["engine"] == "codex"
+    assert validation["repo"] == "roughcoder/jarvis"
+    assert validation["missing"] == []
+    assert validation["missing_authority"] == []
+    assert OrchestrationStore(cfg.orchestration.workspace).list_runs() == []
+
+
+def test_cockpit_work_validate_flags_missing_repo_without_side_effects(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    caps = "worker.job.start,worker.session.create,worker.session.turn,forge.github.branch.push"
+    cfg = _cfg(tmp_path, monkeypatch, caps=caps)
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        response = await client.post(f"{base}/v1/work/validate", json={"source": "manual", "phrase": "Start work without repo"})
+        assert response.status_code == 200
+        return response.json()
+
+    import asyncio
+
+    validation = asyncio.run(_with_server(cfg, calls, http_get=_fake_get("")))["validation"]
+
+    assert validation["can_start"] is False
+    assert validation["missing"] == ["repo"]
+    assert any("no repo/default repo" in reason for reason in validation["reasons"])
+    # Unlike /v1/work/start, validation must not create a needs_human run.
+    assert OrchestrationStore(cfg.orchestration.workspace).list_runs() == []
+
+
+def test_cockpit_work_validate_reports_missing_authority(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="worker.job.start")
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        response = await client.post(f"{base}/v1/work/validate", json={"source": "manual", "repo": "roughcoder/jarvis", "phrase": "x"})
+        assert response.status_code == 200
+        return response.json()
+
+    import asyncio
+
+    validation = asyncio.run(_with_server(cfg, calls, http_get=_fake_get("")))["validation"]
+
+    assert validation["can_start"] is False
+    assert "worker.session.create" in validation["missing_authority"]
+    assert "forge.github.branch.push" in validation["missing_authority"]
+
+
+def test_cockpit_run_summary_lifecycle_reason_fields(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.cockpit import run_summary
+    from jarvis.orchestration.models import OrchestrationRun
+
+    failed = OrchestrationRun(run_id="run_f", objective="Fail", phase="failed", terminal_reason="Worker dispatch failed: boom")
+    blocked = OrchestrationRun(run_id="run_b", objective="Blocked", phase="needs_human", terminal_reason="Work item has no repo")
+    running = OrchestrationRun(run_id="run_r", objective="Run", phase="running")
+
+    failed_row = run_summary(failed)
+    blocked_row = run_summary(blocked)
+    running_row = run_summary(running)
+
+    assert failed_row["last_error"] == "Worker dispatch failed: boom"
+    assert failed_row["state_reason"] == "Worker dispatch failed: boom"
+    assert failed_row["blocked_reason"] is None
+    assert blocked_row["blocked_reason"] == "Work item has no repo"
+    assert blocked_row["waiting_on"] == ["human"]
+    assert blocked_row["last_error"] is None
+    assert running_row["state_reason"] == "Worker sessions active"
+    assert running_row["blocked_reason"] is None
+    assert running_row["waiting_on"] == []
+
+
+def test_cockpit_session_event_type_aliases_are_normalized() -> None:
+    from jarvis.orchestration.cockpit import canonical_event_type, project_session_event
+
+    event = project_session_event(
+        {"event_id": "ev_1", "session_id": "sess_1", "type": "provider.thread.ready", "time": "2026-07-01T11:00:00Z", "data": {}},
+        worker_id="macbook-worker",
+        run_id="run_1",
+        sequence=1,
+    )
+
+    assert event["type"] == "provider.session.ready"
+    assert canonical_event_type("assistant.delta") == "assistant.delta"
+    assert canonical_event_type("") == ""
+
+
+def test_cockpit_sse_snapshot_delta_events(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.api import _snapshot_delta_events
+
+    previous = {
+        "cursor": "evt_a",
+        "runs": [{"run_id": "run_1", "status": "active", "phase": "running"}],
+        "sessions": [{"session_ref": "sessref_x", "run_id": "run_1", "status": "running"}],
+        "workers": [{"worker_id": "w1", "status": "online", "last_seen_at": "old"}],
+        "artifacts": [{"artifact_id": "artifact_1", "run_id": "run_1"}],
+    }
+    current = {
+        "cursor": "evt_b",
+        "runs": [{"run_id": "run_1", "status": "active", "phase": "verifying"}],
+        "sessions": [{"session_ref": "sessref_x", "run_id": "run_1", "status": "running"}],
+        "workers": [{"worker_id": "w1", "status": "online", "last_seen_at": "new"}],
+        "artifacts": [{"artifact_id": "artifact_2", "run_id": "run_1"}],
+    }
+
+    events = _snapshot_delta_events(previous, current)
+
+    assert events is not None
+    types = sorted(event["type"] for event in events)
+    assert types == ["artifact.removed", "artifact.upserted", "run.updated"]
+    run_event = next(event for event in events if event["type"] == "run.updated")
+    assert run_event["run_id"] == "run_1"
+    assert run_event["cursor"] == "evt_b"
+    assert run_event["payload"]["phase"] == "verifying"
+
+    # No baseline or a disappearing run/session forces a snapshot instead.
+    assert _snapshot_delta_events(None, current) is None
+    assert _snapshot_delta_events(current, {"cursor": "evt_c", "runs": [], "sessions": [], "workers": [], "artifacts": []}) is None
+
+
+def test_supervisor_sync_persists_session_events_once(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.supervisor import sync_run_sessions
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    item = WorkItem(source="manual", id="manual_sync", title="Sync events", repo="roughcoder/jarvis")
+    run = store.create_run("Sync events", work_items=[item])
+    store.link_session(run.run_id, WorkerSessionLink(worker_id="macbook-worker", session_id="sess_123", status="running"))
+
+    def get(url: str, **kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions/sess_123"):
+            return Response({"session_id": "sess_123", "status": "running", "provider": "codex", "engine": "codex"})
+        if url.endswith("/sessions/sess_123/events"):
+            return Response(
+                {
+                    "events": [
+                        {"event_id": "ev_1", "session_id": "sess_123", "type": "turn.started", "time": "t1", "data": {"turn_id": "turn_1"}},
+                        {"event_id": "ev_2", "session_id": "sess_123", "type": "assistant.delta", "time": "t2", "data": {"turn_id": "turn_1", "delta": "hi"}},
+                    ]
+                }
+            )
+        raise AssertionError(url)
+
+    sync_run_sessions(store, worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, run_id=run.run_id, get=get)
+    sync_run_sessions(store, worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, run_id=run.run_id, get=get)
+
+    persisted = [event for event in store.events(run.run_id) if isinstance(event.data, dict) and event.data.get("event_id")]
+    assert [event.data["event_id"] for event in persisted] == ["ev_1", "ev_2"]
+    assert persisted[1].type == "assistant.delta"
+    assert persisted[1].data["data"]["delta"] == "hi"
+
+
+def test_cockpit_snapshot_fast_includes_requests_and_checkpoints(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _store, run_id = _seed_run(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        return (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+
+    import asyncio
+
+    body = asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+    assert {request["request_id"] for request in body["requests"]} == {"req_approval", "req_input"}
+    assert body["checkpoints"][0]["checkpoint_id"] == "ckpt_1"
+    # Store-only snapshots stay worker-free: the arrays exist but are empty.
+    empty = asyncio.run(_with_server(cfg, lambda base, client: client.get(f"{base}/v1/cockpit/snapshot"), http_get=_fake_get(run_id)))
+    assert empty.json()["requests"] == []
+    assert empty.json()["checkpoints"] == []
+
+
+def test_cockpit_sse_delta_events_cover_requests_and_checkpoints(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.api import _snapshot_delta_events
+
+    base = {"cursor": "evt_a", "runs": [], "sessions": [], "workers": [], "artifacts": []}
+    previous = {
+        **base,
+        "requests": [{"request_id": "req_1", "session_ref": "sessref_x", "run_id": "run_1", "kind": "approval", "status": "pending"}],
+        "checkpoints": [{"checkpoint_id": "ckpt_1", "session_ref": "sessref_x", "run_id": "run_1"}],
+    }
+    current = {
+        **base,
+        "cursor": "evt_b",
+        "requests": [{"request_id": "req_2", "session_ref": "sessref_x", "run_id": "run_1", "kind": "input", "status": "pending"}],
+        "checkpoints": [{"checkpoint_id": "ckpt_1", "session_ref": "sessref_x", "run_id": "run_1"}],
+    }
+
+    events = _snapshot_delta_events(previous, current)
+
+    assert events is not None
+    by_type = {}
+    for event in events:
+        by_type.setdefault(event["type"], []).append(event)
+    closed = [event for event in by_type["request.updated"] if event["payload"].get("status") == "closed"]
+    opened = [event for event in by_type["request.updated"] if event["payload"].get("status") == "pending"]
+    assert closed[0]["request_id"] == "req_1"
+    assert closed[0]["payload"]["session_ref"] == "sessref_x"
+    assert opened[0]["request_id"] == "req_2"
+    assert opened[0]["session_ref"] == "sessref_x"
+
+    # A checkpoint disappearing (restore/cleanup) forces a snapshot instead.
+    gone = {**current, "cursor": "evt_c", "checkpoints": []}
+    assert _snapshot_delta_events(current, gone) is None
+
+
+def test_cockpit_sse_hub_emits_session_event_frames_from_store(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    store, run_id = _seed_run(cfg)
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: Response({}),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=store,
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+    hub = SseSnapshotHub(ctx)
+    body = {"cursor": "evt_tick", "runs": [{"run_id": run_id}]}
+    hub._event_counts["none"] = hub._prime_event_counts(body)  # noqa: SLF001
+
+    store.append_event(
+        run_id,
+        "assistant.delta",
+        "",
+        {"session_id": "sess_123", "event_id": "ev_live", "turn_id": "turn_9", "message_id": "", "time": "t9", "data": {"turn_id": "turn_9", "delta": "hello"}},
+    )
+    frames = hub._collect_session_event_frames("none", body)  # noqa: SLF001
+
+    assert len(frames) == 1
+    frame = frames[0]
+    assert frame["type"] == "session.event"
+    assert frame["run_id"] == run_id
+    assert frame["session_ref"].startswith("sessref_")
+    assert frame["payload"]["type"] == "assistant.delta"
+    assert frame["payload"]["event_id"] == "ev_live"
+    assert frame["payload"]["data"]["delta"] == "hello"
+    # Counts advanced: a second collect with no new events emits nothing.
+    assert hub._collect_session_event_frames("none", body) == []  # noqa: SLF001
+
+
+def test_cockpit_sse_frame_filters_match_envelope_or_payload() -> None:
+    from jarvis.orchestration.api import _frame_matches
+
+    run_frame = {"type": "run.updated", "run_id": "run_1", "payload": {"run_id": "run_1"}}
+    session_frame = {"type": "session.updated", "run_id": "run_1", "session_ref": "sessref_x", "payload": {"worker_id": "w1", "session_ref": "sessref_x"}}
+
+    assert _frame_matches(run_frame, {}) is True
+    assert _frame_matches(run_frame, {"run_id": "run_1"}) is True
+    assert _frame_matches(run_frame, {"run_id": "run_2"}) is False
+    assert _frame_matches(session_frame, {"worker_id": "w1"}) is True
+    assert _frame_matches(session_frame, {"session_ref": "sessref_x", "run_id": "run_1"}) is True
+    # Frames that do not carry the filtered id are dropped, not passed through.
+    assert _frame_matches(run_frame, {"worker_id": "w1"}) is False
+
+
+def test_cockpit_work_start_maps_capacity_to_worker_capacity_exceeded(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    caps = "worker.job.start,worker.session.create,worker.session.turn,forge.github.branch.push"
+    cfg = _cfg(tmp_path, monkeypatch, caps=caps)
+    workers_path = Path(cfg.orchestration.workers_path)
+    data = json.loads(workers_path.read_text())
+    data["workers"][0]["current_jobs"] = 4  # max_concurrent_jobs is 4 -> no free slot
+    workers_path.write_text(json.dumps(data))
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(
+            f"{base}/v1/work/start",
+            json={"idempotency_key": "capacity_1", "source": "manual", "repo": "roughcoder/jarvis", "phrase": "start"},
+        )
+        body = response.json()
+
+        assert response.status_code == 409
+        assert body["error"]["code"] == "worker_capacity_exceeded"
+        assert body["error"]["recoverable"] is True
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get("")))
+
+
+def test_cockpit_work_validate_peeks_source_work_item(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    caps = "work.github.issues.read,worker.job.start,worker.session.create,worker.session.turn,forge.github.branch.push"
+    cfg = _cfg(tmp_path, monkeypatch, caps=caps)
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+
+    class FakeSource:
+        def __init__(self, item):  # noqa: ANN001
+            self.item = item
+
+        def list(self, *, repo: str = "", filters=None, limit: int = 10):  # noqa: ANN001
+            return [self.item] if self.item else []
+
+        def next(self, *, repo: str = "", filters=None):  # noqa: ANN001
+            return self.item
+
+    issue = WorkItem(source="github", id="#12", title="Fix flaky wake word test", repo="roughcoder/jarvis")
+
+    import asyncio
+
+    async def run_case(source) -> dict[str, Any]:  # noqa: ANN001
+        runner = web.AppRunner(make_app(cfg, http_get=_fake_get(""), source_factory=lambda name, _cfg=None: source))
+        await runner.setup()
+        site = web.TCPSite(runner, "localhost", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]  # type: ignore[union-attr, attr-defined]  # noqa: SLF001
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(f"http://localhost:{port}/v1/work/validate", json={"source": "github", "phrase": "next work"})
+                return response.json()
+        finally:
+            await runner.cleanup()
+
+    found = asyncio.run(run_case(FakeSource(issue)))
+    empty = asyncio.run(run_case(FakeSource(None)))
+
+    assert found["validation"]["can_start"] is True
+    assert found["validation"]["work_item"] == {"source": "github", "id": "#12", "title": "Fix flaky wake word test", "repo": "roughcoder/jarvis", "kind": "issue"}
+    assert found["validation"]["repo"] == "roughcoder/jarvis"
+    assert empty["validation"]["can_start"] is False
+    assert "no eligible work item found in the source" in empty["validation"]["reasons"]
+    assert OrchestrationStore(cfg.orchestration.workspace).list_runs() == []
+
+
+def test_cockpit_verification_artifacts_project_first_class_fields() -> None:
+    from jarvis.orchestration.cockpit import project_artifact
+    from jarvis.orchestration.models import OrchestrationRun
+
+    run = OrchestrationRun(run_id="run_v", objective="Verify")
+    artifact = Artifact(
+        type="verification",
+        id="verify_1",
+        status="passed",
+        summary="187 passed",
+        command="pytest -q",
+        started_at="2026-07-04T11:55:00Z",
+        completed_at="2026-07-04T12:00:00Z",
+    )
+
+    row = project_artifact(artifact, run)
+
+    assert row["kind"] == "verification"
+    assert row["summary"] == "187 passed"
+    assert row["command"] == "pytest -q"
+    assert row["started_at"] == "2026-07-04T11:55:00Z"
+    assert row["completed_at"] == "2026-07-04T12:00:00Z"
+    # Non-verification artifacts keep the base shape.
+    assert "command" not in project_artifact(Artifact(type="branch", name="jarvis/foo"), run)
+
+
+def test_cockpit_worker_last_seen_and_per_worker_default_repo(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.cockpit import project_worker_profile
+    from jarvis.orchestration.workers import WorkerRegistry
+
+    profile = WorkerProfile(
+        worker_id="macbook-worker",
+        display_name="MacBook Pro",
+        default_repo="polymarket",
+        repositories=[{"repo": "jarvis"}, {"repo": "polymarket"}],
+    )
+    rows = project_worker_profile(profile, default_repo="roughcoder/jarvis")["repositories"]
+    assert [(row["repo"], row["is_default"]) for row in rows] == [("jarvis", False), ("polymarket", True)]
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path, http_get=_fake_get(""))
+    probed = registry.profiles(probe=True)[0]
+    assert probed.status == "online"
+    assert probed.last_seen_at  # stamped at probe time, not synthesized at projection
+    assert project_worker_profile(probed)["last_seen_at"] == probed.last_seen_at

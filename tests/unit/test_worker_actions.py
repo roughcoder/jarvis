@@ -167,6 +167,30 @@ def test_resolve_repo_and_list_repos(tmp_path) -> None:
     assert list_repos("") == []
 
 
+def test_repo_inventory_reports_name_default_branch_and_readiness(tmp_path) -> None:
+    import subprocess
+
+    from jarvis.worker.actions import repo_inventory
+
+    root = tmp_path / "dev"
+    (root / "polymarket").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root / "polymarket", check=True)
+    origin_head = root / "polymarket" / ".git" / "refs" / "remotes" / "origin"
+    origin_head.mkdir(parents=True)
+    (origin_head / "HEAD").write_text("ref: refs/remotes/origin/develop\n")
+    (root / "jarvis").mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root / "jarvis", check=True)
+    (root / "not-a-repo").mkdir()
+
+    rows = repo_inventory(str(root))
+
+    assert rows == [
+        {"repo": "jarvis", "default_branch": "main", "status": "ready"},  # falls back to .git/HEAD
+        {"repo": "polymarket", "default_branch": "develop", "status": "ready"},  # origin/HEAD wins
+    ]
+    assert repo_inventory("") == []
+
+
 def test_slugify_makes_readable_handles() -> None:
     from jarvis.worker.jobs import slugify
 

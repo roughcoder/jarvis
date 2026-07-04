@@ -45,6 +45,7 @@ from jarvis.worker.actions import (
     gui_doctor,
     list_repos,
     prepare_worktree,
+    repo_inventory,
     resolve_repo,
     run_applescript,
     run_exec,
@@ -641,6 +642,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         }
         if authorised(request):
             body["system"] = system_info_cached()
+            body["repositories"] = repo_inventory(cfg.repo_root)
         return web.json_response(body)
 
     app = web.Application()

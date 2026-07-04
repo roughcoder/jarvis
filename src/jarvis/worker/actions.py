@@ -174,6 +174,28 @@ def list_repos(repo_root: str) -> list[str]:
     return sorted(d.name for d in root.iterdir() if (d / ".git").exists())
 
 
+def repo_inventory(repo_root: str) -> list[dict[str, str]]:
+    """Public-safe repo rows for the health contract: bare name, default branch,
+    and readiness. Filesystem-only (no subprocess) so health stays cheap."""
+    rows: list[dict[str, str]] = []
+    for name in list_repos(repo_root):
+        git_dir = pathlib.Path(repo_root).expanduser() / name / ".git"
+        rows.append({"repo": name, "default_branch": _default_branch(git_dir), "status": "ready"})
+    return rows
+
+
+def _default_branch(git_dir: pathlib.Path) -> str:
+    # origin/HEAD is the clone-time default; fall back to the checked-out branch.
+    for ref in (git_dir / "refs" / "remotes" / "origin" / "HEAD", git_dir / "HEAD"):
+        try:
+            text = ref.read_text().strip()
+        except OSError:
+            continue
+        if text.startswith("ref:"):
+            return text.rsplit("/", 1)[-1]
+    return ""
+
+
 def resolve_repo(repo: str, repo_root: str) -> str | None:
     """Turn a repo reference into an absolute path: an existing absolute path as
     given, or a bare name resolved under the repo root. None if not found."""
