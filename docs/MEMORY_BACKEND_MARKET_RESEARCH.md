@@ -5,6 +5,10 @@ Date: 2026-06-30
 This note compares hosted and self-hostable agent-memory systems as candidates
 for Jarvis before moving from local Honcho to a hosted memory provider.
 
+Decision update, 2026-07-04: Jarvis is sticking with Honcho. This document is
+now historical market due diligence and fallback context. The active design is
+`docs/HONCHO_MEMORY_MODEL.md`.
+
 ## Jarvis Requirements
 
 Jarvis is a local-first voice assistant with a strict hot/cold path split.
@@ -285,20 +289,21 @@ Verdict: useful substrate, not a primary memory system.
 | Supermemory | container/metadata/document graph | Good for project context and search. |
 | LangMem | custom store namespace | Full control, full burden. |
 
-## Recommended POC
+## Fallback Validation
 
-Run a three-way POC before selecting hosted Honcho:
+Honcho is selected. If hosted Honcho later fails on pricing, security, export,
+reliability, or project-memory behavior, validate fallbacks in this order:
 
 1. Honcho Hosted v3
 2. Zep Cloud
 3. Mem0 Platform
 
-Keep Cognee as a possible project/document layer if the chosen primary memory
-backend is weak on uploaded specs and findings.
+Keep Cognee as a possible project/document layer if Honcho is weak on uploaded
+specs and findings.
 
-## POC Acceptance Tests
+## Validation Tests
 
-Each candidate must pass the same tests:
+Honcho and any fallback candidate must pass the same tests:
 
 1. Write a voice turn without delaying the assistant response.
 2. Refresh local cached memory on the cold path.
@@ -316,10 +321,10 @@ Each candidate must pass the same tests:
 
 ## Current Recommendation
 
-Use Honcho Hosted v3 as the baseline because it matches Jarvis's ontology best.
-Do not commit until Zep and Mem0 have been tested against the same fixtures.
+Use Honcho Hosted v3 as the selected backend because it matches Jarvis's
+ontology best. Keep Zep and Mem0 as fallback references only.
 
-If Honcho v3 passes the POC and pricing/security/export posture is acceptable,
-it should be the primary hosted migration. If Honcho fails on hosted maturity or
-export controls, Zep is the next best serious backend. If Zep feels too heavy,
-Mem0 is the pragmatic fallback.
+Implementation should follow `docs/HONCHO_MEMORY_MODEL.md`: one workspace per
+deployment/environment, people and projects as peers, sessions as
+thread/import scopes, and messages attributed to the entity Honcho should learn
+about.
