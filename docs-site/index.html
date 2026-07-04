@@ -96,7 +96,7 @@
           <article>
             <p class="step">03</p>
             <h3>Install services</h3>
-            <code>jarvis service sync brain worker intercom</code>
+            <code>jarvis service sync brain api worker intercom</code>
           </article>
           <article>
             <p class="step">04</p>
@@ -195,9 +195,9 @@
         <div class="terminal">
           <span>brew update</span>
           <span>brew upgrade jarvis</span>
-          <span>jarvis service sync brain worker intercom</span>
-          <span>jarvis bringup --json --role brain --role worker --role intercom --hardware --brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence</span>
-          <span>jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence --expect-role brain --expect-role worker --expect-role intercom --expect-current-release --min-files 4 --output ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json</span>
+          <span>jarvis service sync brain api worker intercom</span>
+          <span>jarvis bringup --json --role brain --role api --role worker --role intercom --hardware --brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence</span>
+          <span>jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence --expect-role brain --expect-role api --expect-role worker --expect-role intercom --expect-current-release --min-files 4 --output ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json</span>
           <span>brew upgrade --cask jarvis-app</span>
           <span>sudo jarvis-pi update</span>
         </div>

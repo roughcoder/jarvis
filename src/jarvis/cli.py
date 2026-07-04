@@ -1780,7 +1780,7 @@ def _cmd_bringup(args: argparse.Namespace) -> int:
     if args.brain_port:
         cfg.intercom.brain_port = int(args.brain_port)
 
-    roles = args.roles or ["brain", "intercom", "worker"]
+    roles = args.roles or ["brain", "api", "intercom", "worker"]
     data = collect_bringup_evidence(
         roles,
         include_hardware=args.hardware,
@@ -2228,6 +2228,8 @@ def _cmd_whatsapp_auth(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from jarvis.deploy import ROLES
+
     parser = argparse.ArgumentParser(
         prog="jarvis", description="Jarvis voice assistant"
     )
@@ -2543,7 +2545,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="roles",
         action="append",
         default=None,
-        choices=["brain", "intercom", "worker", "whatsapp"],
+        choices=ROLES,
         help="Role to check; repeat for multiple roles (default: all roles)",
     )
     p_bringup.add_argument(
@@ -2598,7 +2600,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="expected_roles",
         action="append",
         default=None,
-        choices=["brain", "intercom", "worker", "whatsapp"],
+        choices=ROLES,
         help="Require at least one evidence file containing this role; repeatable",
     )
     p_bringup_summary.add_argument(
@@ -2671,7 +2673,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_service.add_argument(
         "roles",
         nargs="+",
-        choices=["brain", "intercom", "worker", "whatsapp"],
+        choices=ROLES,
         help="Role(s). Control actions accept exactly one role.",
     )
     p_service.add_argument(
@@ -2776,7 +2778,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="roles",
         action="append",
         default=[],
-        choices=["brain", "intercom", "worker", "whatsapp"],
+        choices=ROLES,
         help="Role to validate; repeatable",
     )
     p_setup.add_argument("--json", action="store_true", help="Accepted for app symmetry")

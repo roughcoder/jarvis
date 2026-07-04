@@ -25,6 +25,7 @@ from jarvis.protocol.messages import Hello, Reject, Welcome, decode, encode
 
 SERVICE_LABELS = {
     "brain": "com.jarvis.brain",
+    "api": "com.jarvis.api",
     "intercom": "com.jarvis.intercom",
     "worker": "com.jarvis.worker",
     "whatsapp": "com.jarvis.whatsapp",

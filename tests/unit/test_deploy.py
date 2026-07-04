@@ -23,7 +23,8 @@ from jarvis.deploy import (
 
 
 def test_role_extras_are_ordered_and_deduplicated() -> None:
-    assert role_extras({"worker", "intercom", "whatsapp"}) == [
+    assert role_extras({"api", "worker", "intercom", "whatsapp"}) == [
+        "cockpit",
         "stt",
         "vad",
         "wake",
@@ -50,7 +51,7 @@ def test_uv_sync_args_for_roles_are_packaged_install_safe() -> None:
         "--extra",
         "browser",
     ]
-    assert role_extras({"brain", "worker"}) == [
+    assert role_extras({"brain", "api", "worker"}) == [
         "gateway",
         "tts",
         "stt",
@@ -58,6 +59,7 @@ def test_uv_sync_args_for_roles_are_packaged_install_safe() -> None:
         "wake",
         "memory",
         "mcp",
+        "cockpit",
         "worker",
         "browser",
     ]
@@ -135,6 +137,19 @@ def test_render_launchd_service_supports_whatsapp() -> None:
 
     assert "com.jarvis.whatsapp" in text
     assert "<string>whatsapp</string>" in text
+    assert "<string>/Users/example/.jarvis/.env</string>" in text
+
+
+def test_render_launchd_service_supports_cockpit_api() -> None:
+    text = render_service(
+        "api",
+        platform_name="launchd",
+        jarvis_bin="/opt/homebrew/bin/jarvis",
+        workdir="/Users/example/.jarvis",
+    )
+
+    assert "com.jarvis.api" in text
+    assert "<string>api</string>" in text
     assert "<string>/Users/example/.jarvis/.env</string>" in text
 
 

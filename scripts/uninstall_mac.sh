@@ -100,7 +100,7 @@ echo "Quitting Jarvis app"
 run_may_fail /usr/bin/osascript -e 'tell application "Jarvis" to quit'
 
 uid="$(id -u)"
-for role in brain intercom worker; do
+for role in brain api intercom worker; do
   plist="$HOME/Library/LaunchAgents/com.jarvis.$role.plist"
   echo "Stopping $role service"
   run_may_fail /bin/launchctl bootout "gui/$uid" "$plist"

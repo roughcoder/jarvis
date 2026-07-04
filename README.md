@@ -145,10 +145,10 @@ curl -fsSL https://raw.githubusercontent.com/roughcoder/jarvis/main/scripts/unin
 Physical bring-up evidence:
 
 ```bash
-jarvis bringup --json --role brain --role worker --role intercom --hardware \
+jarvis bringup --json --role brain --role api --role worker --role intercom --hardware \
   --brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence
 jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence \
-  --expect-role brain --expect-role worker --expect-role intercom \
+  --expect-role brain --expect-role api --expect-role worker --expect-role intercom \
   --expect-current-release --min-files 4 \
   --output ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json
 ```

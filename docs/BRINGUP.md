@@ -27,7 +27,7 @@ single summary gate:
 
 ```bash
 jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence \
-  --expect-role brain --expect-role worker --expect-role intercom \
+  --expect-role brain --expect-role api --expect-role worker --expect-role intercom \
   --expect-current-release --min-files 4 \
   --output ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json
 ```
@@ -104,10 +104,10 @@ on the private network.
 5. **Collect iMac evidence and summarize**
 
    ```bash
-   jarvis bringup --json --role brain --role worker --role intercom --hardware \
+   jarvis bringup --json --role brain --role api --role worker --role intercom --hardware \
      --brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence
    jarvis bringup-summary ~/Desktop/jarvis-bringup-evidence \
-     --expect-role brain --expect-role worker --expect-role intercom \
+     --expect-role brain --expect-role api --expect-role worker --expect-role intercom \
      --expect-current-release --min-files 4 \
      --output ~/Desktop/jarvis-bringup-evidence/jarvis-fleet-summary.json
    ```
@@ -119,7 +119,7 @@ on the private network.
    ```bash
    brew update
    brew upgrade jarvis
-   jarvis service sync brain worker intercom
+   jarvis service sync brain api worker intercom
    brew upgrade --cask jarvis-app
    ```
 
@@ -162,12 +162,13 @@ Use Jarvis Setup:
 Proof:
 
 ```bash
-jarvis bringup --json --role brain --role worker --role intercom --hardware \
+jarvis bringup --json --role brain --role api --role worker --role intercom --hardware \
   --brain-host imac.private --output ~/Desktop/jarvis-bringup-evidence
 jarvis --version
 brew list --formula --versions jarvis
 brew list --cask --versions jarvis-app
 jarvis service status brain
+jarvis service status api
 jarvis service status worker
 jarvis service status intercom
 jarvis fleet-status --json
