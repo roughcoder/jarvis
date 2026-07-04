@@ -295,7 +295,20 @@ class RegistryStore:
             self._projects = {}
             self._contacts = {}
             return
-        data = json.loads(self.path.read_text(encoding="utf-8"))
+        raw = self.path.read_text(encoding="utf-8")
+        if not raw.strip():
+            # A provisioned-but-empty file (e.g. `touch`) is a valid empty registry.
+            self._projects = {}
+            self._contacts = {}
+            return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            # Fail loudly rather than starting empty: a later save would
+            # overwrite the damaged system of record.
+            raise RegistryError(f"registry file {self.path} is not valid JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise RegistryError(f"registry file {self.path} must contain a JSON object")
         self._projects = {
             item["id"]: ProjectEntry.from_dict(item) for item in data.get("projects", ())
         }

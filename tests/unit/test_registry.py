@@ -269,3 +269,19 @@ def test_atomic_persistence_round_trip(tmp_path) -> None:
     assert loaded.get_contact("klaus").peer_id == "contact:klaus"
     assert not list(tmp_path.glob("*.tmp"))
     json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_load_tolerates_empty_file_and_rejects_corruption(tmp_path) -> None:
+    path = tmp_path / "registry.json"
+
+    path.write_text("", encoding="utf-8")
+    store = RegistryStore(path)
+    assert store.list_projects("neil") == []
+
+    path.write_text('{"projects": [', encoding="utf-8")
+    with pytest.raises(RegistryError, match="not valid JSON"):
+        RegistryStore(path)
+
+    path.write_text("[]", encoding="utf-8")
+    with pytest.raises(RegistryError, match="JSON object"):
+        RegistryStore(path)
