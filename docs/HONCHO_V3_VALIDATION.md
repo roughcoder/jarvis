@@ -29,18 +29,21 @@ Dev-only compose lives at:
 deploy/honcho-v3/docker-compose.v3.yml
 ```
 
-Default command, for an already-running host LiteLLM gateway on port 4000:
+Default command — fully isolated: its own LiteLLM gateway, containers, DB,
+volumes, and network (`jarvis-honcho-v3`); the prod v2 stack and its spend
+logs are never touched, and `validate.py` can assert routing against the
+`jarvis-litellm-v3` container logs:
 
 ```bash
-docker compose --env-file .env -f deploy/honcho-v3/docker-compose.v3.yml up -d
+docker compose --env-file .env -f deploy/honcho-v3/docker-compose.v3.yml --profile gateway up -d
 ```
 
-Isolated validation command, using the repo LiteLLM config with separate
-containers, DB, and volumes:
+Opt-in alternative, reusing an already-running host LiteLLM gateway on
+port 4000 (validate.py then skips its container-log routing assertion):
 
 ```bash
-HONCHO_V3_LITELLM_BASE_URL=http://litellm-v3:4000/v1 \
-  docker compose --env-file .env -f deploy/honcho-v3/docker-compose.v3.yml --profile gateway up -d
+HONCHO_V3_LITELLM_BASE_URL=http://host.docker.internal:4000/v1 \
+  docker compose --env-file .env -f deploy/honcho-v3/docker-compose.v3.yml up -d
 ```
 
 Run validation:
@@ -61,9 +64,9 @@ Use LiteLLM route names, not provider-native model ids:
 
 - `HONCHO_V3_LITELLM_CHAT_MODEL=honcho-llm`
 - `HONCHO_V3_LITELLM_EMBED_MODEL=embed`
-- `HONCHO_V3_LITELLM_BASE_URL=http://host.docker.internal:4000/v1` for an
-  existing host gateway, or `http://litellm-v3:4000/v1` for the isolated
-  compose profile.
+- `HONCHO_V3_LITELLM_BASE_URL` defaults to `http://litellm-v3:4000/v1` (the
+  isolated compose profile); set it to `http://host.docker.internal:4000/v1`
+  to reuse an existing host gateway instead.
 - `HONCHO_V3_LITELLM_KEY` optional. If unset, compose falls back to the
   existing `HONCHO_LLM_KEY`, then `sk-honcho-memory`.
 

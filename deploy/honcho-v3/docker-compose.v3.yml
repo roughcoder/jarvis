@@ -1,11 +1,13 @@
 # Dev-only Honcho v3 validation stack.
 #
-# Default: point Honcho at an already-running LiteLLM gateway on the host:
-#   docker compose --env-file .env -f deploy/honcho-v3/docker-compose.v3.yml up -d
+# Default: fully isolated — its own LiteLLM gateway (repo config, separate
+# containers/volumes/network from the v2 memory stack). The prod gateway and
+# its spend logs are never touched:
+#   docker compose --env-file .env -f deploy/honcho-v3/docker-compose.v3.yml --profile gateway up -d
 #
-# Isolated validation gateway, using the repo's LiteLLM config but separate
-# containers/volumes from the v2 memory stack:
-#   HONCHO_V3_LITELLM_BASE_URL=http://litellm-v3:4000/v1 docker compose --env-file .env -f deploy/honcho-v3/docker-compose.v3.yml --profile gateway up -d
+# Opt-in: reuse an already-running LiteLLM gateway on the host instead
+# (validate.py then cannot assert routing via the litellm-v3 container logs):
+#   HONCHO_V3_LITELLM_BASE_URL=http://host.docker.internal:4000/v1 docker compose --env-file .env -f deploy/honcho-v3/docker-compose.v3.yml up -d
 #
 # Down:
 #   docker compose --env-file .env -f deploy/honcho-v3/docker-compose.v3.yml --profile gateway down
@@ -22,7 +24,7 @@ x-honcho-v3-env: &honcho-v3-env
   EMBEDDING_VECTOR_DIMENSIONS: "1536"
   EMBEDDING_MODEL_CONFIG__TRANSPORT: openai
   EMBEDDING_MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_EMBED_MODEL:-embed}
-  EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://host.docker.internal:4000/v1}
+  EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm-v3:4000/v1}
   LLM_OPENAI_API_KEY: ${HONCHO_V3_LITELLM_KEY:-${HONCHO_LLM_KEY:-sk-honcho-memory}}
 
   # v3's OpenAI-compatible runtime is configured per caller. The model names
@@ -35,32 +37,32 @@ x-honcho-v3-env: &honcho-v3-env
   DERIVER_FLUSH_ENABLED: "true"
   DERIVER_MODEL_CONFIG__TRANSPORT: openai
   DERIVER_MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
-  DERIVER_MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://host.docker.internal:4000/v1}
+  DERIVER_MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm-v3:4000/v1}
   DERIVER_MODEL_CONFIG__STRUCTURED_OUTPUT_MODE: json_object
   DERIVER_MODEL_CONFIG__MAX_OUTPUT_TOKENS: "4096"
 
   DIALECTIC_LEVELS__minimal__MODEL_CONFIG__TRANSPORT: openai
   DIALECTIC_LEVELS__minimal__MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
-  DIALECTIC_LEVELS__minimal__MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://host.docker.internal:4000/v1}
+  DIALECTIC_LEVELS__minimal__MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm-v3:4000/v1}
   DIALECTIC_LEVELS__low__MODEL_CONFIG__TRANSPORT: openai
   DIALECTIC_LEVELS__low__MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
-  DIALECTIC_LEVELS__low__MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://host.docker.internal:4000/v1}
+  DIALECTIC_LEVELS__low__MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm-v3:4000/v1}
   DIALECTIC_LEVELS__medium__MODEL_CONFIG__TRANSPORT: openai
   DIALECTIC_LEVELS__medium__MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
-  DIALECTIC_LEVELS__medium__MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://host.docker.internal:4000/v1}
+  DIALECTIC_LEVELS__medium__MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm-v3:4000/v1}
   DIALECTIC_LEVELS__high__MODEL_CONFIG__TRANSPORT: openai
   DIALECTIC_LEVELS__high__MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
-  DIALECTIC_LEVELS__high__MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://host.docker.internal:4000/v1}
+  DIALECTIC_LEVELS__high__MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm-v3:4000/v1}
   DIALECTIC_LEVELS__max__MODEL_CONFIG__TRANSPORT: openai
   DIALECTIC_LEVELS__max__MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
-  DIALECTIC_LEVELS__max__MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://host.docker.internal:4000/v1}
+  DIALECTIC_LEVELS__max__MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm-v3:4000/v1}
 
   SUMMARY_ENABLED: "true"
   SUMMARY_MESSAGES_PER_SHORT_SUMMARY: "10"
   SUMMARY_MESSAGES_PER_LONG_SUMMARY: "20"
   SUMMARY_MODEL_CONFIG__TRANSPORT: openai
   SUMMARY_MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
-  SUMMARY_MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://host.docker.internal:4000/v1}
+  SUMMARY_MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm-v3:4000/v1}
 
   DREAM_ENABLED: "true"
   DREAM_DOCUMENT_THRESHOLD: "1"
@@ -68,10 +70,10 @@ x-honcho-v3-env: &honcho-v3-env
   DREAM_MIN_HOURS_BETWEEN_DREAMS: "1"
   DREAM_DEDUCTION_MODEL_CONFIG__TRANSPORT: openai
   DREAM_DEDUCTION_MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
-  DREAM_DEDUCTION_MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://host.docker.internal:4000/v1}
+  DREAM_DEDUCTION_MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm-v3:4000/v1}
   DREAM_INDUCTION_MODEL_CONFIG__TRANSPORT: openai
   DREAM_INDUCTION_MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
-  DREAM_INDUCTION_MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://host.docker.internal:4000/v1}
+  DREAM_INDUCTION_MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm-v3:4000/v1}
 
 services:
   honcho-v3-db:
@@ -163,3 +165,7 @@ services:
 volumes:
   honcho-v3-pgdata:
   honcho-v3-redis-data:
+
+networks:
+  default:
+    name: jarvis-honcho-v3
