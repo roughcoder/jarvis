@@ -189,6 +189,7 @@ def test_private_state_paths_resolve_relative_to_jarvis_env_file(monkeypatch, tm
     assert c.brain.streaming_stt_enabled is True  # on by default (latency)
     assert c.capabilities.profiles_dir == str(env_dir / "jarvis-workspace/profiles")
     assert c.capabilities.users_dir == str(env_dir / "jarvis-workspace/users")
+    assert c.registry.path == str(env_dir / "jarvis-workspace/registry/registry.json")
     assert c.orchestration.workspace == str(env_dir / "jarvis-workspace/orchestration")
     assert c.orchestration.workers_path == str(
         env_dir / "jarvis-workspace/orchestration/workers.json"
@@ -214,4 +215,5 @@ def test_resolved_never_leaks_secrets() -> None:
     assert r["tts.api_key"] in {"<set>", "<unset>"}
     assert r["accounts.house_email_binding"] == "house-email"
     assert r["accounts.house_calendar_binding"] == "house-calendar"
+    assert r["registry.path"]
     assert "****" in r["database.url"]
