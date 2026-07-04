@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import socket
 from collections.abc import Callable
 from typing import Any
 
@@ -77,7 +78,7 @@ class WorkerRegistry:
     def _default_profile(self) -> WorkerProfile:
         return WorkerProfile(
             worker_id="local-worker",
-            display_name="Local worker",
+            display_name=local_worker_display_name(),
             capabilities=["git", "python", "uv", "codex", "shell"],
             base_url=self.worker_cfg.base_url,
             token_set=bool(self.worker_cfg.token.get_secret_value()),
@@ -207,6 +208,11 @@ class WorkerRegistry:
                 values[key] = value
         self._dotenv_cache = values
         return values
+
+
+def local_worker_display_name() -> str:
+    hostname = socket.gethostname().split(".", 1)[0].strip()
+    return f"{hostname} worker" if hostname else "Local worker"
 
 
 def _required_engines(engines: list[str]) -> list[str]:
