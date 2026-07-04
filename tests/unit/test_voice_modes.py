@@ -112,6 +112,43 @@ def test_hard_exit_is_pre_llm_and_returns_default_mode() -> None:
     assert sess._gateway.calls == 0
 
 
+def test_polite_hard_exit_is_pre_llm_and_returns_default_mode() -> None:
+    sess = _session(STAY_MODE)
+    result = TurnResult()
+
+    async def go() -> list[bytes]:
+        return [chunk async for chunk in sess.respond("could you go to sleep please", None, result)]
+
+    chunks = asyncio.run(go())
+    sess.finalize("could you go to sleep please", result)
+
+    assert chunks == [b"Okay, going to sleep."]
+    assert result.voice_mode == DEFAULT_MODE
+    assert result.ended is True
+    assert result.continue_listening is False
+    assert sess._gateway.calls == 0
+
+
+def test_polite_stay_mode_activation_is_pre_llm() -> None:
+    sess = _session()
+    result = TurnResult()
+
+    async def go() -> list[bytes]:
+        return [chunk async for chunk in sess.respond("could you stay with me please", None, result)]
+
+    chunks = asyncio.run(go())
+
+    assert chunks == [b"Okay, I'll stay with you."]
+    assert result.voice_mode == STAY_MODE
+    assert result.continue_listening is True
+    assert result.ended is False
+    assert sess._gateway.calls == 0
+
+
+def test_hard_exit_with_substantive_residue_goes_to_model() -> None:
+    assert local_voice_action("can you stop the music please", STAY_MODE) is None
+
+
 def test_default_mode_closes_without_explicit_open_marker() -> None:
     sess = _session(DEFAULT_MODE)
     result = TurnResult(raw="It's seven o'clock.")

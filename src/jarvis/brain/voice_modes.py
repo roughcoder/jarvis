@@ -10,7 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
-from jarvis.brain.dialog import _norm, _only_filler_remains, _REQUEST_CUE
+from jarvis.brain.conversation_policy import (
+    REQUEST_CUE_RE,
+    normalize_utterance,
+    only_filler_remains,
+)
 
 
 DEFAULT_MODE = "default"
@@ -174,8 +178,8 @@ def parse_voice_control(text: str) -> VoiceControl:
 
 def local_voice_action(user_text: str, active_mode: str = DEFAULT_MODE) -> LocalVoiceAction | None:
     """Return a pre-LLM action for unambiguous voice control, else None."""
-    text = _norm(user_text)
-    if not text or _REQUEST_CUE.search(text):
+    text = normalize_utterance(user_text)
+    if not text:
         return None
     if _EXIT_STAY.search(text):
         if not _is_pure_voice_control(text, _EXIT_STAY):
@@ -212,8 +216,8 @@ def local_voice_action(user_text: str, active_mode: str = DEFAULT_MODE) -> Local
 
 
 def should_soft_close_default(user_text: str) -> bool:
-    text = _norm(user_text)
-    return bool(text and not _REQUEST_CUE.search(text) and _SOFT_CLOSE.match(text))
+    text = normalize_utterance(user_text)
+    return bool(text and not REQUEST_CUE_RE.search(text) and _SOFT_CLOSE.match(text))
 
 
 def tool_names(tool_messages: list) -> set[str]:
@@ -271,7 +275,7 @@ def assistant_requests_followup(reply: str) -> bool:
 
 
 def user_expects_followup(user_text: str) -> bool:
-    text = _norm(user_text)
+    text = normalize_utterance(user_text)
     return bool(text and _EXPLORATORY_USER.search(text))
 
 
@@ -536,8 +540,22 @@ def voice_mode_instruction(mode: str) -> str:
 
 # Deliberately SMALLER than dialog's sign-off filler: a local action bypasses
 # the LLM entirely (canned reply), so only unmistakable padding is ignored.
-_LOCAL_CONTROL_FILLER = frozenset({"hey", "jarvis", "please", "ok", "okay", "and", "then"})
+_LOCAL_CONTROL_FILLER = frozenset(
+    {
+        "hey",
+        "jarvis",
+        "please",
+        "ok",
+        "okay",
+        "and",
+        "then",
+        "can",
+        "could",
+        "would",
+        "you",
+    }
+)
 
 
 def _is_pure_voice_control(text: str, pattern: re.Pattern[str]) -> bool:
-    return _only_filler_remains(text, pattern, _LOCAL_CONTROL_FILLER)
+    return only_filler_remains(text, pattern, _LOCAL_CONTROL_FILLER)

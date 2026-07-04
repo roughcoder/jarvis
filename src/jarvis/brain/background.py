@@ -48,6 +48,7 @@ class Job:
     device_id: str = ""
     status: str = "running"  # running | done | error
     result: str = ""
+    error_kind: str = ""
 
 
 class BackgroundRunner:
@@ -105,17 +106,19 @@ class BackgroundRunner:
         # the log, never to TTS.
         except asyncio.TimeoutError:
             job.status = "error"
+            job.error_kind = "timeout"
             job.result = (
                 f"I had to stop “{_short(job.task)}” — it was taking longer than "
                 "I allow. Say the word if you'd like me to try again."
             )
         except Exception as exc:  # noqa: BLE001 - background work must never crash the brain
             job.status = "error"
+            job.error_kind = exc.__class__.__name__
             job.result = (
                 f"I couldn't finish “{_short(job.task)}” — something went wrong "
                 "partway through. I can have another go if you like."
             )
-            print(f"  [background] job #{job.id} failed: {exc}")
+            print(f"  [background] job #{job.id} failed ({job.error_kind}): {exc}")
         await self._deliver(job)
 
     async def _deliver(self, job: Job) -> None:
