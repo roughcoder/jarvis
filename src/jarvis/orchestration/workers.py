@@ -29,6 +29,7 @@ class WorkerRegistry:
         self.worker_cfg = worker_cfg
         self.profiles_path = pathlib.Path(profiles_path).expanduser() if profiles_path else None
         self._http_get = http_get or httpx.get
+        self._dotenv_cache: dict[str, str] | None = None
 
     def profiles(self, *, probe: bool = False) -> list[WorkerProfile]:
         profiles = self._load_profiles()
@@ -114,7 +115,7 @@ class WorkerRegistry:
         for item in items:
             try:
                 profile = WorkerProfile.from_dict(item)
-                if profile.token_env and os.environ.get(profile.token_env):
+                if profile.token_env and self._token_env_value(profile.token_env):
                     profile.token_set = True
                 profiles.append(profile)
             except (TypeError, KeyError):
@@ -126,7 +127,7 @@ class WorkerRegistry:
             profile.status = "unknown"
             return profile
         headers = {}
-        token = os.environ.get(profile.token_env, "") if profile.token_env else ""
+        token = self._token_env_value(profile.token_env) if profile.token_env else ""
         if not token and profile.worker_id == "local-worker":
             token = self.worker_cfg.token.get_secret_value()
         profile.token_set = bool(token)
@@ -176,6 +177,36 @@ class WorkerRegistry:
         except Exception:  # noqa: BLE001 - older workers may not expose sessions yet
             return []
         return [dict(item) for item in data if isinstance(item, dict)]
+
+    def _token_env_value(self, name: str) -> str:
+        if not name:
+            return ""
+        value = os.environ.get(name, "")
+        if value:
+            return value
+        return self._dotenv_values().get(name, "")
+
+    def _dotenv_values(self) -> dict[str, str]:
+        if self._dotenv_cache is not None:
+            return self._dotenv_cache
+        path = pathlib.Path(os.environ.get("JARVIS_ENV_FILE") or ".env").expanduser()
+        values: dict[str, str] = {}
+        try:
+            lines = path.read_text().splitlines()
+        except OSError:
+            self._dotenv_cache = values
+            return values
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key:
+                values[key] = value
+        self._dotenv_cache = values
+        return values
 
 
 def _required_engines(engines: list[str]) -> list[str]:
