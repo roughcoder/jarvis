@@ -32,7 +32,11 @@ def decode_honcho_id(honcho_id: str) -> str:
         return honcho_id
     token = honcho_id[len(_PREFIX) :]
     padded = token + ("=" * (-len(token) % 4))
-    return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    try:
+        return base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        # Prefixed but not ours (we only decode ids we encoded); pass through.
+        return honcho_id
 
 
 def assert_honcho_safe(honcho_id: str) -> str:

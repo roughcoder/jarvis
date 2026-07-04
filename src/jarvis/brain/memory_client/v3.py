@@ -32,6 +32,18 @@ from jarvis.config import MemoryConfig
 
 
 _SESSION_ID = "voice"
+# Shape proven end-to-end by deploy/honcho-v3/validate.py (step 1). Verify
+# against the dev stack before cutover whether workspace-level env defaults
+# make this redundant; sending it explicitly is safe either way.
+_SESSION_CONFIGURATION = {
+    "summary": {
+        "enabled": True,
+        "messages_per_short_summary": 10,
+        "messages_per_long_summary": 20,
+    },
+    "reasoning": {"enabled": True},
+    "dream": {"enabled": True},
+}
 _MEMORY_QUERY = (
     "Summarise everything important you know about the user — their name, "
     "preferences, and any facts or ongoing context — in a few concise sentences. "
@@ -44,6 +56,7 @@ class HonchoV3MemoryClient:
         self._cfg = cfg
         self._ws = cfg.workspace_id
         self._encoded_ws = encode_honcho_id(cfg.workspace_id)
+        self._ensured_workspace = False
         self._ensured_peers: set[str] = set()
         self._ensured_sessions: set[str] = set()
         self._last_refresh: dict[str, float] = {}
@@ -129,10 +142,13 @@ class HonchoV3MemoryClient:
         return filtered
 
     def _ensure_workspace(self, client: httpx.Client) -> None:
+        if self._ensured_workspace:
+            return
         client.post(
             self._url("/v3/workspaces"),
             json={"id": self._encoded_ws, "metadata": {"jarvis_id": self._ws}},
         ).raise_for_status()
+        self._ensured_workspace = True
 
     def _ensure_peer(self, client: httpx.Client, peer_id: str, *, observe_me: bool | None = None) -> None:
         if peer_id in self._ensured_peers and observe_me is None:
@@ -168,6 +184,10 @@ class HonchoV3MemoryClient:
         payload: dict[str, Any] = {
             "id": self._encoded_session(session_id),
             "metadata": {"jarvis_id": session_id, **(metadata or {})},
+            # Session-scoped reasoning features, matching the shape proven by
+            # deploy/honcho-v3/validate.py — without this block a v3 cutover
+            # could write turns that never produce conclusions or summaries.
+            "configuration": _SESSION_CONFIGURATION,
         }
         if encoded_peers:
             payload["peers"] = encoded_peers
