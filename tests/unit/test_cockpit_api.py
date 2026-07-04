@@ -61,10 +61,19 @@ async def _with_server(cfg: Config, fn: Callable[[str, httpx.AsyncClient], Any],
         await runner.cleanup()
 
 
-def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, caps: str = "", token: str = "", cors_origins: str = "") -> Config:
+def _cfg(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    caps: str = "",
+    token: str = "",
+    cors_origins: str = "",
+    identity: str = "house",
+) -> Config:
     env = tmp_path / ".env"
     workspace = tmp_path / "orchestration"
     workers_path = workspace / "workers.json"
+    registry_path = tmp_path / "registry.json"
     env.write_text(
         "\n".join(
             [
@@ -73,6 +82,8 @@ def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, caps: str = "", tok
                 "ORCHESTRATION_LANDING_MODE=branch_only",
                 f"ORCHESTRATION_API_TOKEN={token}",
                 f"ORCHESTRATION_API_CORS_ORIGINS={cors_origins}",
+                f"REGISTRY_PATH={registry_path}",
+                f"CAPS_IDENTITY={identity}",
                 f"CAPS_DEFAULT_CAPABILITIES={caps}",
                 "WORKER_HOST=worker.test",
                 "WORKER_PORT=8780",
@@ -127,6 +138,67 @@ def _set_worker_status(cfg: Config, status: str) -> None:
     data = json.loads(workers_path.read_text())
     data["workers"][0]["status"] = status
     workers_path.write_text(json.dumps(data))
+
+
+def _seed_project_registry(cfg: Config) -> None:
+    path = Path(cfg.registry.path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "projects": [
+                    {
+                        "id": "house-story",
+                        "name": "House Story",
+                        "aliases": ["story project"],
+                        "owner": "jules",
+                        "members": ["jules"],
+                        "visibility": "household",
+                        "status": "active",
+                        "repos": [{"name": "runtime", "remote": "roughcoder/jarvis", "default": True}],
+                        "links": {"jira": "", "urls": ["https://example.test/story"]},
+                        "files_root": "projects/house-story/files",
+                    },
+                    {
+                        "id": "neil-shared",
+                        "name": "Neil Shared",
+                        "aliases": ["shared project"],
+                        "owner": "alice",
+                        "members": ["alice", "neil"],
+                        "visibility": "shared",
+                        "status": "active",
+                        "repos": [{"name": "notes", "remote": "roughcoder/notes"}],
+                        "links": {"jira": "SHARED", "urls": []},
+                        "files_root": "projects/neil-shared/files",
+                    },
+                    {
+                        "id": "alice-private",
+                        "name": "Alice Private",
+                        "owner": "alice",
+                        "members": ["alice"],
+                        "visibility": "private",
+                        "status": "active",
+                        "repos": [],
+                        "links": {"jira": "", "urls": []},
+                        "files_root": "projects/alice-private/files",
+                    },
+                    {
+                        "id": "old-project",
+                        "name": "Old Project",
+                        "owner": "neil",
+                        "members": ["neil"],
+                        "visibility": "private",
+                        "status": "archived",
+                        "repos": [],
+                        "links": {"jira": "", "urls": []},
+                        "files_root": "projects/old-project/files",
+                    },
+                ],
+                "contacts": [],
+            }
+        )
+    )
 
 
 def _seed_run(cfg: Config) -> tuple[OrchestrationStore, str]:
@@ -1180,6 +1252,130 @@ def test_cockpit_auth_and_bad_session_ref_errors(tmp_path, monkeypatch) -> None:
         assert unauthorized.json()["error"]["code"] == "unauthorized"
         assert bad_ref.status_code == 404
         assert bad_ref.json()["error"]["code"] == "not_found"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_projects_list_is_membership_filtered(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/projects")
+        body = response.json()
+
+        assert response.status_code == 200
+        assert body["api_version"] == "v1"
+        assert [project["id"] for project in body["projects"]] == ["house-story", "neil-shared"]
+        assert "alice-private" not in {project["id"] for project in body["projects"]}
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_project_detail_404s_when_not_visible(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        visible = await client.get(f"{base}/v1/projects/neil-shared")
+        hidden = await client.get(f"{base}/v1/projects/alice-private")
+        missing = await client.get(f"{base}/v1/projects/not-real")
+
+        assert visible.status_code == 200
+        project = visible.json()["project"]
+        assert project == {
+            "id": "neil-shared",
+            "name": "Neil Shared",
+            "peer_id": "project:neil-shared",
+            "aliases": ["shared project"],
+            "owner": "alice",
+            "members": ["alice", "neil"],
+            "visibility": "shared",
+            "status": "active",
+            "repos": [{"name": "notes", "remote": "roughcoder/notes"}],
+            "links": {"jira": "SHARED", "urls": []},
+            "files_root": "projects/neil-shared/files",
+        }
+        assert hidden.status_code == 404
+        assert hidden.json()["error"]["code"] == "not_found"
+        assert missing.status_code == 404
+        assert missing.json()["error"]["code"] == "not_found"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_projects_empty_registry_returns_empty_list(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        listing = await client.get(f"{base}/v1/projects")
+        detail = await client.get(f"{base}/v1/projects/anything")
+
+        assert listing.status_code == 200
+        assert listing.json()["projects"] == []
+        assert detail.status_code == 404
+        assert detail.json()["error"]["code"] == "not_found"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_projects_archived_filtering(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        default = await client.get(f"{base}/v1/projects")
+        included = await client.get(f"{base}/v1/projects?include_archived=true")
+        detail = await client.get(f"{base}/v1/projects/old-project")
+
+        assert "old-project" not in {project["id"] for project in default.json()["projects"]}
+        assert "old-project" in {project["id"] for project in included.json()["projects"]}
+        assert detail.status_code == 200
+        assert detail.json()["project"]["status"] == "archived"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_projects_require_api_auth(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, token="secret", identity="neil")
+    _seed_project_registry(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        listing = await client.get(f"{base}/v1/projects")
+        detail = await client.get(f"{base}/v1/projects/neil-shared")
+
+        assert listing.status_code == 401
+        assert listing.json()["error"]["code"] == "unauthorized"
+        assert detail.status_code == 401
+        assert detail.json()["error"]["code"] == "unauthorized"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_projects_without_requester_identity_are_empty(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _seed_project_registry(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        listing = await client.get(f"{base}/v1/projects")
+        detail = await client.get(f"{base}/v1/projects/house-story")
+
+        assert listing.status_code == 200
+        assert listing.json()["projects"] == []
+        assert detail.status_code == 404
+        assert detail.json()["error"]["code"] == "not_found"
 
     import asyncio
 

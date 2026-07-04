@@ -81,6 +81,77 @@ remote worker URLs or tokens. Put secrets in env vars and reference them from
 profiles with `token_env`; tokens can come from the process environment or the
 configured `JARVIS_ENV_FILE`.
 
+### Projects
+
+```text
+GET /v1/projects
+GET /v1/projects/{id}
+```
+
+Projects are read from the Jarvis registry, not Honcho. The cockpit never talks
+to Honcho directly. List and detail reads are filtered by the authenticated
+requester's configured Jarvis identity; without an identity the list is empty.
+Projects outside the requester visibility set are indistinguishable from
+missing projects: they are omitted from the list and return `404 not_found` on
+detail.
+
+`GET /v1/projects` excludes archived projects by default. Add
+`?include_archived=true` to include them.
+
+Project rows use the registry entry shape:
+
+```json
+{
+  "id": "jarvis",
+  "name": "Jarvis",
+  "peer_id": "project:jarvis",
+  "aliases": ["the jarvis project", "jarvis"],
+  "owner": "neil",
+  "members": ["neil"],
+  "visibility": "household",
+  "status": "active",
+  "repos": [
+    {"name": "runtime", "remote": "roughcoder/jarvis", "default": true}
+  ],
+  "links": {"jira": "JARV", "urls": []},
+  "files_root": "jarvis-workspace/projects/jarvis/files"
+}
+```
+
+List response:
+
+```json
+{
+  "api_version": "v1",
+  "schema_version": 1,
+  "projects": []
+}
+```
+
+Detail response:
+
+```json
+{
+  "api_version": "v1",
+  "schema_version": 1,
+  "project": {
+    "id": "jarvis",
+    "name": "Jarvis",
+    "peer_id": "project:jarvis",
+    "aliases": ["the jarvis project", "jarvis"],
+    "owner": "neil",
+    "members": ["neil"],
+    "visibility": "household",
+    "status": "active",
+    "repos": [
+      {"name": "runtime", "remote": "roughcoder/jarvis", "default": true}
+    ],
+    "links": {"jira": "JARV", "urls": []},
+    "files_root": "jarvis-workspace/projects/jarvis/files"
+  }
+}
+```
+
 ### Runs
 
 ```text
