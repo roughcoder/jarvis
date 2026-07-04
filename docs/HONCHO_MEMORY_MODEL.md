@@ -429,7 +429,8 @@ POST /v3/workspaces/jarvis-home/conclusions
   "metadata": {
     "recorded_by": "neil",
     "source": "spoken",
-    "channel": "voice"
+    "channel": "voice",
+    "observed_at": "2026-07-04"
   }
 }
 ```
@@ -484,6 +485,7 @@ Honcho keeps extracted text, not the original. Jarvis owns the file vault.
 | `channel` | `voice`, `whatsapp`, `text`, `file`, `background` | Source tracking. |
 | `device_id` | `mac`, `kitchen-pi` | Device-specific debugging/context. |
 | `recorded_by` | `neil` | Attribution for declared facts. |
+| `observed_at` | ISO date | When the fact was true/observed — REQUIRED on every explicit conclusion from day one, so retrieval can surface age and consolidation can revisit stale facts. |
 | `source_url` | URL | Research/external provenance. |
 | `content_hash` | `sha256:...` | Deduplication and migration. |
 | `original_path` | path under `jarvis-workspace` | File vault linkage. |
@@ -528,8 +530,16 @@ Three mechanisms, each doing one job:
 2. **The capability gate bounds queries (read side, enforced).** A small
    explicit matrix: a requester may query (a) their own peer, (b) `target=`
    views they themselves own, (c) contact peers they own or that are shared
-   with them, (d) project peers where they are a member. The Cockpit API
-   applies the same matrix. Deny by default.
+   with them, (d) project peers where they are a member, and (e) — the
+   guardian rule — a guardian-tier principal may query a minor principal's
+   peer ("what's been on Alice's mind?"). Guardianship is recorded in the
+   identity layer's trust tiers and lapses when the child's tier is
+   upgraded; it is a read right only. The Cockpit API applies the same
+   matrix. Deny by default.
+
+Minors are otherwise full principals: identical curation and query powers
+(remember/forget, contacts, projects). Only device/tool gating differs by
+trust tier, as it already does.
 3. **The write-routing rule bounds shared peers (curation side, policy).**
    Personal facts go on personal peers; only genuinely shared facts go on
    shared entity peers. A shared peer's representation is readable by all its
@@ -548,6 +558,14 @@ nothing; the gate and the registry do.
 - **Retract a document/import**: delete its dedicated session and the
   conclusions filtered to it (messages themselves are not deletable —
   session-per-document exists precisely for this).
+- **Facts age**: "Klaus is off Fridays" is true until it isn't. Honcho's
+  reasoning reconciles contradictions when new information arrives, but
+  nothing revisits stale declared facts on its own. Mitigations: every
+  explicit conclusion carries `observed_at` (mandatory, see metadata) so
+  retrieval and the answering prompt can weigh age ("as of last March, …"),
+  and the periodic dream/consolidation pass is pointed at old declared
+  facts as review candidates. Do not silently expire facts — surface age,
+  let contradiction or the owner retire them.
 - **Open risk to test at implementation**: whether the dreamer can re-derive
   a deleted conclusion from still-existing source messages. If so, deletions
   of *derived* facts need a guard (e.g. a correcting explicit conclusion
@@ -617,8 +635,16 @@ Contacts are not routinely cached — contact reads go through the memory tool.
 - Upstream ships a continuous Alembic chain, so in-place DB upgrade is
   supported — but this model changes the ontology anyway. Plan: **start
   `jarvis-home` fresh on v3**; keep the v2 volume as `jarvis-dev` history.
-  Nothing in the current single-user `voice` session is worth a data
-  migration.
+  Nothing in the current single-user `voice` session transcript is worth a
+  data migration — **but the authoritative profile-file facts are**.
+- **Seed the declared rail at cutover.** The two-rail collapse means the
+  current authoritative rail (the `users/<name>.md` profile facts written by
+  `remember`) must be imported as explicit conclusions on the matching
+  principal peers (`level=explicit`, `recorded_by` = the user,
+  `source: profile-migration`, `observed_at` = the fact's original date
+  where known, else the migration date). Verify the seed with a
+  count/read-back before retiring the files; without this step the facts
+  users deliberately saved are exactly the ones lost.
 - v3 renamed API routes, so the raw-`/v2` `memory_client` breaks against a v3
   server regardless. The v2-SDK/v3-server mismatch that forced raw REST now
   inverts: on v3 the official SDK is usable. Either way, the swap happens
@@ -693,7 +719,8 @@ Forget what I told you about ...
 7. Cockpit routes (`/v1/projects*`) + orchestrator threads/connector.
 8. MCP server lane (`jarvis mcp-serve`): per-principal tokens over the same
    gate and tools.
-9. Cutover: fresh `jarvis-home` on v3; retire the v2 stack.
+9. Cutover: fresh `jarvis-home` on v3; seed profile-file facts as explicit
+   conclusions (verified by read-back); retire the v2 stack.
 
 ## Implementation Implications
 
