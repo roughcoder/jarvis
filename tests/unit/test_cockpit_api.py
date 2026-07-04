@@ -2177,6 +2177,11 @@ def test_cockpit_work_start_manual_dispatches_worker_session(tmp_path, monkeypat
         assert body["run"]["repo"] == "roughcoder/jarvis"
         assert body["session"]["session_ref"].startswith("sessref_")
         assert len(post_calls) == 2
+        # The synchronous first-turn events from dispatch land in the run log.
+        store = OrchestrationStore(cfg.orchestration.workspace)
+        run_id = body["run"]["run_id"]
+        persisted_ids = [e.data.get("event_id") for e in store.events(run_id) if isinstance(e.data, dict) and e.data.get("event_id")]
+        assert persisted_ids == ["ev_turn"]
 
     import asyncio
 
@@ -2343,6 +2348,7 @@ def test_cockpit_catalog_exposes_start_options_and_defaults(tmp_path, monkeypatc
     assert options["engine_strategies"] == ["single", "parallel"]
     assert options["landing_modes"] == ["branch_only", "draft_pr", "ready_pr", "confirm_before_pr"]
     assert "repo (unless a default repo is configured)" in options["required_fields"]["manual"]
+    assert options["required_fields"]["linear"] == ["repo (unless a default repo is configured)"]
     assert options["defaults"]["worker_id"] == "macbook-worker"
     assert options["defaults"]["engine"] == "codex"
     assert options["defaults"]["landing_mode"] == "branch_only"
@@ -2656,7 +2662,13 @@ def test_cockpit_sse_hub_emits_session_event_frames_from_store(tmp_path, monkeyp
     assert frame["payload"]["type"] == "assistant.delta"
     assert frame["payload"]["event_id"] == "ev_live"
     assert frame["payload"]["data"]["delta"] == "hello"
+    assert frame["worker_id"] == "macbook-worker"  # so ?worker_id= filters apply
     # Counts advanced: a second collect with no new events emits nothing.
+    assert hub._collect_session_event_frames("none", body) == []  # noqa: SLF001
+
+    # Internal bookkeeping records that mention a session (no worker event_id)
+    # must not be streamed as per-turn timeline entries.
+    store.append_event(run_id, "session_updated", "sync bookkeeping", {"session_id": "sess_123"})
     assert hub._collect_session_event_frames("none", body) == []  # noqa: SLF001
 
 
@@ -2876,3 +2888,52 @@ def test_cockpit_worker_last_seen_at_is_empty_without_probe(tmp_path, monkeypatc
     # The static profile says online, but nothing has actually seen the worker.
     assert rows[0]["status"] == "online"
     assert rows[0]["last_seen_at"] == ""
+
+
+def test_cockpit_snapshot_hides_requests_for_archived_sessions(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    store, run_id = _seed_run(cfg)
+    store.archive_session(run_id, "sess_123", worker_id="macbook-worker")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        return (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+
+    import asyncio
+
+    body = asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+    # The worker still reports pending requests for sess_123, but the session
+    # is archived locally so they must not leak into the snapshot.
+    assert body["requests"] == []
+    assert all(session["session_id"] != "sess_123" for session in body["sessions"])
+
+
+def test_cockpit_work_validate_reports_already_owned_items(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    caps = "worker.job.start,worker.session.create,worker.session.turn,forge.github.branch.push"
+    cfg = _cfg(tmp_path, monkeypatch, caps=caps)
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    owned = WorkItem(source="manual", id="manual_owned", title="Already running", repo="roughcoder/jarvis")
+    run = store.create_run("Already running", work_items=[owned])
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        response = await client.post(
+            f"{base}/v1/work/validate",
+            json={
+                "source": "manual",
+                "repo": "roughcoder/jarvis",
+                "work_item": {"id": "manual_owned", "title": "Already running", "repo": "roughcoder/jarvis"},
+            },
+        )
+        assert response.status_code == 200
+        return response.json()
+
+    import asyncio
+
+    validation = asyncio.run(_with_server(cfg, calls, http_get=_fake_get("")))["validation"]
+
+    assert validation["can_start"] is False
+    assert validation["owned_by_run_id"] == run.run_id
+    assert any("already owned" in reason for reason in validation["reasons"])
+    # Validation stayed read-only: the owning run is still the only one.
+    assert [existing.run_id for existing in store.list_runs()] == [run.run_id]

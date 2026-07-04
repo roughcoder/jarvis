@@ -92,7 +92,7 @@ ENGINE_STRATEGIES = ["single", "parallel"]
 START_REQUIRED_FIELDS = {
     "manual": ["phrase or work_item.title", "repo (unless a default repo is configured)"],
     "github": ["repo (unless a default repo is configured)"],
-    "linear": [],
+    "linear": ["repo (unless a default repo is configured)"],
 }
 # Worker/provider event names normalized to the canonical cockpit vocabulary
 # before they reach clients. Keep this table in sync with docs/COCKPIT_API.md.
@@ -322,6 +322,10 @@ def cockpit_snapshot(
         archived_session_refs=archived_session_refs,
     )
     requests = aggregate_requests(worker_cfg=worker_cfg, workers_path=workers_path, http_get=http_get) if include_worker_state else []
+    # Workers keep reporting pending requests for locally-archived runs and
+    # sessions; keep the top-level array consistent with the visible rows: a
+    # request is shown only while its session is.
+    requests = [request for request in requests if str(request.get("session_ref") or "") in sessions]
     checkpoints = (
         aggregate_checkpoints(runs=runs, sessions=sessions, worker_cfg=worker_cfg, workers_path=workers_path, http_get=http_get)
         if include_worker_state
