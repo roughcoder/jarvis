@@ -159,7 +159,7 @@ def sync_run_sessions(
             events = [event for event in event_data.get("events") or [] if isinstance(event, dict)]
             last_event_id = str(events[-1].get("event_id") or link.last_event_id) if events else link.last_event_id
             if events:
-                _persist_session_events(store, run.run_id, link.session_id, events)
+                persist_session_events(store, run.run_id, link.session_id, events)
             before = link.to_dict()
             store.update_session(
                 run.run_id,
@@ -235,13 +235,13 @@ def _response_error(response: Any, status_code: int) -> str:
     return getattr(response, "text", "") or f"worker request failed with HTTP {status_code}"
 
 
-def _persist_session_events(store: OrchestrationStore, run_id: str, session_id: str, events: list[dict[str, Any]]) -> None:
-    """Append newly-synced worker session events to the run's local event log.
+def persist_session_events(store: OrchestrationStore, run_id: str, session_id: str, events: list[dict[str, Any]]) -> None:
+    """Append worker session events to the run's local event log.
 
     This is what makes the run timeline (and the cockpit's session.event SSE
     stream) durable: the worker's `/events` cursor only returns each event once,
     so discarding events here would lose them. Dedup by event_id so overlapping
-    syncs and cockpit session writes never double-append."""
+    syncs, dispatch responses, and cockpit session writes never double-append."""
     existing = {
         str(event.data.get("event_id") or "")
         for event in store.events(run_id)

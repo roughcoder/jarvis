@@ -12,6 +12,7 @@ from jarvis.config import WorkerConfig
 from jarvis.orchestration.envelope import build_execution_envelope
 from jarvis.orchestration.models import ExecutionEnvelope, WorkCommand, WorkItem, WorkerJobLink, WorkerSessionLink
 from jarvis.orchestration.store import OrchestrationStore
+from jarvis.orchestration.supervisor import persist_session_events
 from jarvis.orchestration.workers import WorkerProfile
 from jarvis.worker_session_contract import SESSION_RUNNING, SESSION_STOPPED
 
@@ -208,6 +209,12 @@ def start_worker_session(
     )
     if store is not None:
         store.link_session(envelope.run_id, link)
+        # The sync loop only fetches events after link.last_event_id, so the
+        # synchronous first-turn events returned here would otherwise never
+        # reach the durable run timeline.
+        dispatch_events = [event for event in events if isinstance(event, dict)]
+        if dispatch_events:
+            persist_session_events(store, envelope.run_id, link.session_id, dispatch_events)
     return link
 
 

@@ -246,6 +246,14 @@ class OrchestrationService:
                     reasons.append(note)
         repo = item.repo or self._repo(command)
         missing = [] if repo else ["repo"]
+        owned_by = ""
+        if manual_item is not None or work_item is not None:
+            # Read-only mirror of the ownership check /v1/work/start enforces,
+            # so the wizard cannot green-light a guaranteed duplicate start.
+            owner = OrchestrationStore(self.cfg.orchestration.workspace).active_primary_owner(item)
+            if owner is not None:
+                owned_by = owner.run_id
+                reasons.append(f"work item {item.source}:{item.id} is already owned by run {owner.run_id}")
         worker_id = ""
         engine = ""
         engines: list[str] = []
@@ -261,7 +269,8 @@ class OrchestrationService:
             reasons.append("work item has no repo/default repo; cannot start a coding worker")
         no_source_item = "no eligible work item found in the source" in reasons
         return {
-            "can_start": not missing and not missing_authority and bool(worker_id) and not no_source_item,
+            "can_start": not missing and not missing_authority and bool(worker_id) and not no_source_item and not owned_by,
+            "owned_by_run_id": owned_by or None,
             "source": command.source,
             "operation": command.operation,
             "repo": repo,

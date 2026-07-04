@@ -254,7 +254,11 @@ class SseSnapshotHub:
                 data = event.data if isinstance(event.data, dict) else {}
                 session_id = str(data.get("session_id") or "")
                 worker_id = worker_by_session.get(session_id, "")
-                if not session_id or not worker_id:
+                # Only worker-originated SessionEvents carry an event_id;
+                # internal store records (dispatch/sync bookkeeping) that
+                # happen to mention a session are not per-turn timeline
+                # entries and must not be streamed as such.
+                if not session_id or not worker_id or not str(data.get("event_id") or ""):
                     continue
                 projected = project_session_event(
                     {
@@ -275,6 +279,7 @@ class SseSnapshotHub:
                         "type": "session.event",
                         "run_id": run_id,
                         "session_ref": projected["session_ref"],
+                        "worker_id": worker_id,
                         "payload": projected,
                     }
                 )

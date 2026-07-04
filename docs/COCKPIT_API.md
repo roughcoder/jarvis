@@ -191,7 +191,7 @@ It is not current operational state.
     "required_fields": {
       "manual": ["phrase or work_item.title", "repo (unless a default repo is configured)"],
       "github": ["repo (unless a default repo is configured)"],
-      "linear": []
+      "linear": ["repo (unless a default repo is configured)"]
     },
     "defaults": {
       "source": "manual",
@@ -247,7 +247,9 @@ worker selectors, and artifact links without a pile of follow-up calls.
 
 `requests` and `checkpoints` carry the pending Request objects and checkpoint
 summaries aggregated from workers. They are populated in `fast`/`probe` sync
-modes and empty (`[]`) in `none` mode, which stays store-only.
+modes and empty (`[]`) in `none` mode, which stays store-only. A request is
+listed only while its session is visible: requests belonging to archived runs
+or sessions are filtered out even if the worker still reports them.
 
 Snapshot rows are summaries. Timelines, logs, report bodies, checkpoint detail,
 and large provider payloads stay behind lazy detail endpoints.
@@ -682,6 +684,7 @@ failed start records. Use it to power start-wizard validation.
     "engine_strategy": "single",
     "landing_mode": "draft_pr",
     "work_item": null,
+    "owned_by_run_id": null,
     "missing": ["repo"],
     "missing_authority": [],
     "reasons": ["work item has no repo/default repo; cannot start a coding worker"],
@@ -698,7 +701,9 @@ claiming) and reports the candidate as `work_item`
 (`{source, id, title, repo, kind}`); if the source has no eligible item,
 `can_start` is false with a matching reason. When read authority is missing or
 the source is unreachable, the peek is skipped and `notes` says why. The exact
-item can still change between validate and start.
+item can still change between validate and start. When the resolved item is
+already attached to an active run, `owned_by_run_id` names it and `can_start`
+is false — the same ownership rule start enforces with `WorkAlreadyOwnedError`.
 
 `POST /v1/sessions/{session_ref}/turns` appends a prompt to one exact session. T3
 uses this for the thread composer once the operator is already inside a session.
@@ -868,12 +873,16 @@ session, or checkpoint disappearing from the projection) always force a
 snapshot event.
 
 `session.event` frames stream the per-turn worker events (turn/assistant/tool/
-approval frames) that the sync loop persists to the run's local event log. The
-payload is the canonical SessionEvent projection. Frames are emitted on the
-same refresh tick cadence, so streamed `assistant.delta` text arrives in
-per-tick batches rather than token-by-token. In `none` sync mode, new events
-only appear when something else (a cockpit write, a CLI sync) lands them in the
-store; use `fast` for live streaming.
+approval frames) that dispatch responses and the sync loop persist to the run's
+local event log. Only worker-originated SessionEvents (records carrying a
+worker `event_id`) are streamed — internal orchestration bookkeeping never
+appears as timeline entries. The payload is the canonical SessionEvent
+projection, and the frame envelope carries `run_id`, `session_ref`, and
+`worker_id` so stream filters apply. Frames are emitted on the same refresh
+tick cadence, so streamed `assistant.delta` text arrives in per-tick batches
+rather than token-by-token. In `none` sync mode, new events only appear when
+something else (a cockpit write, a CLI sync) lands them in the store; use
+`fast` for live streaming.
 
 `request.updated` fires when a pending request appears or changes; when a
 request stops being pending, Jarvis emits `request.updated` with payload
@@ -920,6 +929,34 @@ view.
 
 Future API changes should be appended here with date, schema version, compatible
 or breaking status, and migration notes.
+
+### 2026-07-04 - v1 PR review hardening (compatible)
+
+Fixes from PR #55 review (human + Codex):
+
+- SSE event-count baselines prime at subscribe time and are dropped when a
+  mode loses its last subscriber, so the first live `session.event` after
+  connecting is never absorbed into the baseline and idle periods are not
+  replayed.
+- Capacity-only selection failures classify from probed worker state, so a
+  worker that is full only per live probe data returns
+  `worker_capacity_exceeded`, not `worker_unavailable`.
+- `last_seen_at` is only ever probe-stamped; unprobed workers report `""`
+  even when their static profile says online.
+- Validation peeks sources via `list(limit=1)` instead of `next()` so a
+  future source with a side-effecting `next()` cannot be advanced.
+- Dispatch responses persist their synchronous first-turn events to the run
+  event log, so providers that answer immediately still get durable timelines
+  and `session.event` frames.
+- Only worker-originated SessionEvents (with an `event_id`) stream as
+  `session.event`; internal store bookkeeping is excluded. Frames carry
+  `worker_id` so `?worker_id=` filters apply to them.
+- `/v1/work/validate` mirrors the start ownership check read-only and reports
+  `owned_by_run_id` when the item is already attached to an active run.
+- Snapshot `requests` are filtered to visible sessions, so archived
+  runs/sessions no longer leak pending requests.
+- `start_options.required_fields.linear` lists the repo requirement, matching
+  what a Linear start actually needs to dispatch.
 
 ### 2026-07-04 - v1 Completeness round (compatible, one error-code change)
 
