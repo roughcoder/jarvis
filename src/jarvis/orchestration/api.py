@@ -154,12 +154,21 @@ class SseSnapshotHub:
     async def unsubscribe(self, subscription: SseSubscription) -> None:
         async with self._lock:
             self._subscribers.pop(subscription.subscription_id, None)
+            if not any(existing.mode == subscription.mode for existing in self._subscribers.values()):
+                # Nobody is listening: drop the event baseline so a future
+                # subscriber doesn't get the idle period replayed as frames.
+                self._event_counts.pop(subscription.mode, None)
 
     async def _snapshot(self, mode: str) -> dict[str, Any]:
         cached = self._snapshots.get(mode)
-        if cached is not None:
-            return cached
-        body = await asyncio.to_thread(_cockpit_snapshot, self.ctx, mode)
+        body = cached if cached is not None else await asyncio.to_thread(_cockpit_snapshot, self.ctx, mode)
+        if mode not in self._event_counts:
+            # Baseline per-run event counts at subscribe time so events that
+            # land between now and the first refresh tick are emitted, not
+            # silently absorbed into the first baseline.
+            counts = await asyncio.to_thread(self._prime_event_counts, body)
+            async with self._lock:
+                self._event_counts.setdefault(mode, counts)
         async with self._lock:
             return self._snapshots.setdefault(mode, body)
 

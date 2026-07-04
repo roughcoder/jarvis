@@ -2788,3 +2788,91 @@ def test_cockpit_worker_last_seen_and_per_worker_default_repo(tmp_path, monkeypa
     assert probed.status == "online"
     assert probed.last_seen_at  # stamped at probe time, not synthesized at projection
     assert project_worker_profile(probed)["last_seen_at"] == probed.last_seen_at
+
+
+def test_cockpit_sse_first_tick_delivers_session_event_after_subscribe(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    cfg.orchestration.sse_refresh_interval_s = 0.05
+    store, run_id = _seed_run(cfg)
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: Response({}),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=store,
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+
+    async def run_hub() -> dict[str, Any]:
+        import asyncio
+
+        hub = SseSnapshotHub(ctx)
+        await hub.start()
+        try:
+            subscription = await hub.subscribe("none")
+            # An event lands between subscribe and the first refresh tick.
+            store.append_event(
+                run_id,
+                "assistant.message",
+                "",
+                {"session_id": "sess_123", "event_id": "ev_first", "turn_id": "turn_1", "message_id": "msg_1", "time": "t1", "data": {"text": "done"}},
+            )
+            run = store.get(run_id)
+            assert run is not None
+            run.phase = "verifying"
+            store.save(run)
+            return await asyncio.wait_for(subscription.queue.get(), timeout=2)
+        finally:
+            await hub.stop()
+
+    import asyncio
+
+    event = asyncio.run(run_hub())
+
+    assert event is not None
+    frames = [frame for frame in event["events"] or [] if frame["type"] == "session.event"]
+    assert len(frames) == 1
+    assert frames[0]["payload"]["event_id"] == "ev_first"
+    assert frames[0]["payload"]["type"] == "assistant.message"
+
+
+def test_cockpit_work_start_capacity_uses_probed_worker_state(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    caps = "worker.job.start,worker.session.create,worker.session.turn,forge.github.branch.push"
+    cfg = _cfg(tmp_path, monkeypatch, caps=caps)
+    # The static profile claims free slots; only the live probe reveals a full worker.
+    workers_path = Path(cfg.orchestration.workers_path)
+    data = json.loads(workers_path.read_text())
+    assert data["workers"][0]["current_jobs"] == 1
+
+    def probe(_self, profile):  # noqa: ANN001
+        profile.status = "online"
+        profile.current_jobs = profile.max_concurrent_jobs
+        return profile
+
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", probe)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(
+            f"{base}/v1/work/start",
+            json={"idempotency_key": "probed_capacity", "source": "manual", "repo": "roughcoder/jarvis", "phrase": "start"},
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "worker_capacity_exceeded"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get("")))
+
+
+def test_cockpit_worker_last_seen_at_is_empty_without_probe(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.cockpit import worker_profiles
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    rows = worker_profiles(worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, probe=False)
+
+    # The static profile says online, but nothing has actually seen the worker.
+    assert rows[0]["status"] == "online"
+    assert rows[0]["last_seen_at"] == ""
