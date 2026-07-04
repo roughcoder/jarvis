@@ -292,6 +292,14 @@ class AccountConfig(_Base):
     house_calendar_binding: str = "house-calendar"
 
 
+class RegistryConfig(_Base):
+    """Jarvis-owned local entity registry for projects and contacts."""
+
+    model_config = SettingsConfigDict(env_prefix="REGISTRY_", env_file=".env", extra="ignore")
+
+    path: str = "jarvis-workspace/registry/registry.json"
+
+
 class ToolsConfig(_Base):
     """Tool layer (Phase 3 §6). Provider keys live brain-side only."""
 
@@ -780,6 +788,7 @@ class Config:
         self.trace = TraceConfig(**source)
         self.capabilities = CapabilityConfig(**source)
         self.accounts = AccountConfig(**source)
+        self.registry = RegistryConfig(**source)
         self.tools = ToolsConfig(**source)
         self.brain = BrainConfig(**source)
         self.intercom = IntercomConfig(**source)
@@ -804,6 +813,7 @@ class Config:
             self.capabilities.profiles_dir, base_dir
         )
         self.capabilities.users_dir = _resolve_state_path(self.capabilities.users_dir, base_dir)
+        self.registry.path = _resolve_state_path(self.registry.path, base_dir)
         self.orchestration.workspace = _resolve_state_path(
             self.orchestration.workspace, base_dir
         )
@@ -872,6 +882,7 @@ class Config:
             "accounts.audit_path": self.accounts.audit_path,
             "accounts.house_email_binding": self.accounts.house_email_binding,
             "accounts.house_calendar_binding": self.accounts.house_calendar_binding,
+            "registry.path": self.registry.path,
             "tools.files_root": self.tools.files_root,
             "tools.websearch_provider": self.tools.websearch_provider,
             "tools.websearch_api_key": mask(self.tools.websearch_api_key),
