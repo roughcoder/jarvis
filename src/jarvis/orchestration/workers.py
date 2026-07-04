@@ -8,6 +8,7 @@ from collections.abc import Callable
 from typing import Any
 
 import httpx
+from dotenv import dotenv_values
 
 from jarvis.config import WorkerConfig
 from jarvis.engines import engine_ids, normalize_engine_id, worker_supports_engine
@@ -30,7 +31,6 @@ class WorkerRegistry:
         self.worker_cfg = worker_cfg
         self.profiles_path = pathlib.Path(profiles_path).expanduser() if profiles_path else None
         self._http_get = http_get or httpx.get
-        self._dotenv_cache: dict[str, str] | None = None
 
     def profiles(self, *, probe: bool = False) -> list[WorkerProfile]:
         profiles = self._load_profiles()
@@ -180,39 +180,27 @@ class WorkerRegistry:
         return [dict(item) for item in data if isinstance(item, dict)]
 
     def _token_env_value(self, name: str) -> str:
-        if not name:
-            return ""
-        value = os.environ.get(name, "")
-        if value:
-            return value
-        return self._dotenv_values().get(name, "")
-
-    def _dotenv_values(self) -> dict[str, str]:
-        if self._dotenv_cache is not None:
-            return self._dotenv_cache
-        path = pathlib.Path(os.environ.get("JARVIS_ENV_FILE") or ".env").expanduser()
-        values: dict[str, str] = {}
-        try:
-            lines = path.read_text().splitlines()
-        except OSError:
-            self._dotenv_cache = values
-            return values
-        for raw in lines:
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            if key:
-                values[key] = value
-        self._dotenv_cache = values
-        return values
+        return worker_token_value(name)
 
 
 def local_worker_display_name() -> str:
     hostname = socket.gethostname().split(".", 1)[0].strip()
     return f"{hostname} worker" if hostname else "Local worker"
+
+
+def worker_token_value(name: str) -> str:
+    if not name:
+        return ""
+    value = os.environ.get(name, "")
+    if value:
+        return value
+    parsed = dotenv_values(_jarvis_env_path())
+    raw = parsed.get(name)
+    return raw or ""
+
+
+def _jarvis_env_path() -> pathlib.Path:
+    return pathlib.Path(os.environ.get("JARVIS_ENV_FILE") or ".env").expanduser()
 
 
 def _required_engines(engines: list[str]) -> list[str]:

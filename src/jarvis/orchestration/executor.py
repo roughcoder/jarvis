@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import replace
 from collections.abc import Callable
 from typing import Any
@@ -13,7 +12,7 @@ from jarvis.orchestration.envelope import build_execution_envelope
 from jarvis.orchestration.models import ExecutionEnvelope, WorkCommand, WorkItem, WorkerJobLink, WorkerSessionLink
 from jarvis.orchestration.store import OrchestrationStore
 from jarvis.orchestration.supervisor import persist_session_events
-from jarvis.orchestration.workers import WorkerProfile
+from jarvis.orchestration.workers import WorkerProfile, worker_token_value
 from jarvis.worker_session_contract import SESSION_RUNNING, SESSION_STOPPED
 
 
@@ -35,7 +34,7 @@ def start_worker_job(
     else:
         raise RuntimeError(f"worker {worker.worker_id} has no base_url; refusing to route to local worker")
     headers = {}
-    token = os.environ.get(worker.token_env, "") if worker and worker.token_env else ""
+    token = worker_token_value(worker.token_env) if worker and worker.token_env else ""
     if not token and (worker is None or worker.worker_id == "local-worker"):
         token = worker_cfg.token.get_secret_value()
     if token:
@@ -459,7 +458,7 @@ def _worker_endpoint(worker_cfg: WorkerConfig, worker: WorkerProfile | None) -> 
         base_url = worker_cfg.base_url
     else:
         raise RuntimeError(f"worker {worker.worker_id} has no base_url; refusing to route to local worker")
-    token = os.environ.get(worker.token_env, "") if worker and worker.token_env else ""
+    token = worker_token_value(worker.token_env) if worker and worker.token_env else ""
     if not token and (worker is None or worker.worker_id == "local-worker"):
         token = worker_cfg.token.get_secret_value()
     headers = {"Authorization": f"Bearer {token}"} if token else {}

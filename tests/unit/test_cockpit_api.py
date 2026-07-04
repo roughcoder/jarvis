@@ -15,7 +15,7 @@ pytest.importorskip("httpx")
 import httpx  # noqa: E402
 from aiohttp import web  # noqa: E402
 
-from jarvis.config import Config  # noqa: E402
+from jarvis.config import Config, WorkerConfig  # noqa: E402
 import jarvis.orchestration.api as cockpit_api_module  # noqa: E402
 from jarvis.orchestration.api import CockpitAppContext, IdempotencyStore, SseSnapshotHub, _command_from_body, _idempotency_scope, make_app, serve  # noqa: E402
 from jarvis.orchestration.cockpit import make_session_ref  # noqa: E402
@@ -2782,17 +2782,22 @@ def test_cockpit_verification_artifacts_project_first_class_fields() -> None:
 
 
 def test_cockpit_worker_last_seen_and_per_worker_default_repo(tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    from jarvis.orchestration.cockpit import project_worker_profile
+    from jarvis.orchestration.cockpit import project_worker_profile, worker_headers
     from jarvis.orchestration.workers import WorkerRegistry
 
+    env = tmp_path / ".env"
+    env.write_text("MACBOOK_WORKER_TOKEN=cockpit-token # remote worker\n")
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env))
     profile = WorkerProfile(
         worker_id="macbook-worker",
         display_name="MacBook Pro",
+        token_env="MACBOOK_WORKER_TOKEN",
         default_repo="polymarket",
         repositories=[{"repo": "jarvis"}, {"repo": "polymarket"}],
     )
     rows = project_worker_profile(profile, default_repo="roughcoder/jarvis")["repositories"]
     assert [(row["repo"], row["is_default"]) for row in rows] == [("jarvis", False), ("polymarket", True)]
+    assert worker_headers(WorkerConfig(_env_file=None), profile) == {"Authorization": "Bearer cockpit-token"}
 
     cfg = _cfg(tmp_path, monkeypatch)
     registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path, http_get=_fake_get(""))
