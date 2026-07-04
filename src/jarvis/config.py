@@ -75,6 +75,7 @@ class MemoryConfig(_Base):
 
     model_config = SettingsConfigDict(env_prefix="MEMORY_", env_file=".env", extra="ignore")
 
+    backend: str = "v2"  # v2 stays default until the Honcho v3 cutover.
     host: str = "localhost"
     port: int = 8000
     api_key: SecretStr = SecretStr("")  # shared secret on the Honcho server
@@ -83,6 +84,7 @@ class MemoryConfig(_Base):
     assistant_peer_id: str = "jarvis"
     # Hot path reads a LOCAL cache (spec §3.2), never the live reasoning endpoint.
     cache_path: str = ".cache/representation.json"
+    conclusion_sidecar_path: str = "jarvis-workspace/memory/conclusions-v3-sidecar.json"
     write_timeout_s: float = 30.0
     # The turn is always WRITTEN to Honcho (facts captured immediately), but the
     # expensive dialectic cache refresh is debounced to at most once per this
@@ -808,6 +810,10 @@ class Config:
         self._resolve_private_state_paths(state_base)
 
     def _resolve_private_state_paths(self, base_dir: Path) -> None:
+        self.memory.cache_path = _resolve_state_path(self.memory.cache_path, base_dir)
+        self.memory.conclusion_sidecar_path = _resolve_state_path(
+            self.memory.conclusion_sidecar_path, base_dir
+        )
         self.trace.path = _resolve_state_path(self.trace.path, base_dir)
         self.capabilities.profiles_dir = _resolve_state_path(
             self.capabilities.profiles_dir, base_dir
@@ -837,12 +843,14 @@ class Config:
             "gateway.fast_model": self.gateway.fast_model,
             "gateway.voice_model": self.gateway.voice_model or self.gateway.fast_model,
             "gateway.strong_model": self.gateway.strong_model,
+            "memory.backend": self.memory.backend,
             "memory.base_url": self.memory.base_url,
             "memory.api_key": mask(self.memory.api_key),
             "memory.workspace_id": self.memory.workspace_id,
             "memory.user_peer_id": self.memory.user_peer_id,
             "memory.assistant_peer_id": self.memory.assistant_peer_id,
             "memory.cache_path": self.memory.cache_path,
+            "memory.conclusion_sidecar_path": self.memory.conclusion_sidecar_path,
             "database.host": self.database.host,
             "database.port": self.database.port,
             "database.url": self.database.url_masked,
