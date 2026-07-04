@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import pathlib
+import re
 import time
 from collections.abc import Awaitable, Callable
 
@@ -29,14 +30,23 @@ _HEARTBEAT_PROMPT = (
     "anything. Work through the checklist below. If there is something genuinely "
     "worth telling them right now, say it in one or two natural spoken sentences. "
     "If there is nothing worth interrupting them for, reply with exactly {sentinel} "
-    "and nothing else. When in doubt, stay silent ({sentinel})."
+    "and nothing else — exactly as written, overriding any formatting rules above. "
+    "When in doubt, stay silent ({sentinel})."
 )
+
+_SENTINEL_SEP = re.compile(r"[\s_-]+")
 
 
 def is_silent(text: str, sentinel: str) -> bool:
-    """True when the heartbeat produced nothing worth saying (empty or the sentinel)."""
+    """True when the heartbeat produced nothing worth saying (empty or the
+    sentinel). Separator-insensitive: the spoken format rules forbid special
+    characters, so a model may render NO_REPLY as 'NO REPLY' or 'No reply' —
+    all of those must stay silent, never be broadcast aloud."""
     t = (text or "").strip()
-    return (not t) or (sentinel.upper() in t.upper())
+    if not t:
+        return True
+    norm = _SENTINEL_SEP.sub(" ", t.upper())
+    return _SENTINEL_SEP.sub(" ", sentinel.upper()) in norm
 
 
 def make_heartbeat_think(cfg: Config) -> Callable[[], Awaitable[str]]:
