@@ -11,6 +11,7 @@ from typing import Any, Callable
 import httpx
 from aiohttp import web
 
+from jarvis.brain.registry import ProjectEntry, RegistryStore
 from jarvis.capabilities import (
     WORKER_SESSION_APPROVE,
     WORKER_SESSION_INPUT,
@@ -78,6 +79,7 @@ from jarvis.orchestration.store import OrchestrationStore
 from jarvis.orchestration.supervisor import final_session_phase
 from jarvis.orchestration.workers import WorkerRegistry
 from jarvis.system_info import system_info_cached
+from jarvis.users import HOUSE
 
 HttpGet = Callable[..., Any]
 HttpPost = Callable[..., Any]
@@ -353,6 +355,8 @@ def make_app(
         web.get("/v1/cockpit/catalog", reads.catalog),
         web.get("/v1/cockpit/snapshot", reads.snapshot),
         web.get("/v1/cockpit/events", sse.events),
+        web.get("/v1/projects", reads.projects),
+        web.get("/v1/projects/{project_id}", reads.project_detail),
         web.get("/v1/workers", reads.workers),
         web.get("/v1/workers/{worker_id}", reads.worker_detail),
         web.get("/v1/runs", reads.runs),
@@ -431,6 +435,41 @@ class CockpitReadHandlers:
         if profile is None:
             raise CockpitError("not_found", "worker not found", status=404)
         return web.json_response(project_worker_profile(profile, default_repo=self.ctx.cfg.orchestration.default_repo))
+
+    async def projects(self, request: web.Request) -> web.Response:
+        self.ctx.require_auth(request)
+        requester_id = _cockpit_requester_id(self.ctx.cfg)
+        include_archived = _include_archived(request)
+        projects = (
+            await asyncio.to_thread(_visible_projects, self.ctx.cfg, requester_id, include_archived=include_archived)
+            if requester_id
+            else []
+        )
+        return web.json_response(
+            {
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "projects": [project.as_dict() for project in projects],
+            }
+        )
+
+    async def project_detail(self, request: web.Request) -> web.Response:
+        self.ctx.require_auth(request)
+        requester_id = _cockpit_requester_id(self.ctx.cfg)
+        project = (
+            await asyncio.to_thread(_visible_project_or_404, self.ctx.cfg, request.match_info["project_id"], requester_id)
+            if requester_id
+            else None
+        )
+        if project is None:
+            raise CockpitError("not_found", "project not found", status=404)
+        return web.json_response(
+            {
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "project": project.as_dict(),
+            }
+        )
 
     async def runs(self, request: web.Request) -> web.Response:
         self.ctx.require_auth(request)
@@ -1247,6 +1286,30 @@ def _catalog_context(cfg: Config) -> tuple[dict[str, Any], list[str]]:
         "landing_mode": cfg.orchestration.landing_mode,
     }
     return defaults, engines
+
+
+def _registry_store(cfg: Config) -> RegistryStore:
+    return RegistryStore(cfg.registry.path)
+
+
+def _cockpit_requester_id(cfg: Config) -> str:
+    identity = cfg.capabilities.identity.strip()
+    return "" if identity == HOUSE else identity
+
+
+def _visible_projects(cfg: Config, requester_id: str, *, include_archived: bool) -> list[ProjectEntry]:
+    return _registry_store(cfg).list_projects(requester_id, include_archived=include_archived)
+
+
+def _visible_project_or_404(cfg: Config, project_id: str, requester_id: str) -> ProjectEntry | None:
+    return _registry_store(cfg).get_visible_project(project_id, requester_id)
+
+
+def _include_archived(request: web.Request) -> bool:
+    value = request.query.get("include_archived")
+    if value is not None and value not in {"true", "false", "1", "0"}:
+        raise CockpitError("validation_failed", "include_archived must be true or false", recoverable=True, status=400)
+    return value in {"true", "1"}
 
 
 def _sync_mode(request: web.Request) -> str:
