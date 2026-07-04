@@ -10,6 +10,12 @@ from __future__ import annotations
 
 import re
 
+from jarvis.brain.conversation_policy import (
+    REQUEST_CUE_RE,
+    normalize_utterance,
+    only_filler_remains,
+)
+
 
 def _date_label(dt) -> str:  # noqa: ANN001
     return dt.strftime("%A, %-d %B %Y")
@@ -136,12 +142,11 @@ _END_RE = re.compile(r"\s*\[\[?\s*end\s*\]\]?\s*", re.IGNORECASE)
 # --- Deterministic backstops (the model handles nuance; these guarantee the
 # clear cases and never fire on a turn the user meant to continue) -----------
 
-# Any request/question word → never a sign-off. Shared with voice_modes (the
-# pre-LLM local-action guard) — one list, so the two layers can't drift.
-_REQUEST_CUE = re.compile(
-    r"\b(tell|what|whats|how|why|when|where|who|which|show|give|explain|"
-    r"recommend|suggest|find|search|list|define|describe|help|can you|could you)\b"
-)
+# Back-compat aliases for direct unit coverage of the low-level policy helpers.
+_REQUEST_CUE = REQUEST_CUE_RE
+_norm = normalize_utterance
+_only_filler_remains = only_filler_remains
+
 # A sign-off must contain one of these ANCHORS (matched on _norm()ed text) …
 _SIGNOFF_ANCHOR = re.compile(
     r"\b("
@@ -172,7 +177,8 @@ _SIGNOFF_REMOVABLE = re.compile(
 _SIGNOFF_FILLER = frozenset(
     "ok okay alright right well so um uh cool great perfect brilliant lovely "
     "nice good fine please now then there mate jarvis hey oh ah and for a an "
-    "the that thats is it really very much indeed anyway all bye".split()
+    "the that thats is it really very much indeed anyway all bye can could "
+    "would you".split()
 )
 # Jarvis's OWN reply is a goodbye → end even if it forgot the [[END]] marker.
 # Anchor + residue on the FINAL sentence only: the backstop fires when that
@@ -195,20 +201,6 @@ _BRACKETED = re.compile(r"\[[^\]]*\]")  # TTS tags, [[END]], voice markers
 _SENTENCE_SPLIT = re.compile(r"[.!?]+")
 
 
-def _norm(text: str) -> str:
-    """Normalise an utterance for matching: lowercase, no apostrophes or
-    punctuation, collapsed whitespace. The single copy — voice_modes imports it."""
-    t = text.lower().replace("'", "")
-    t = re.sub(r"[^\w\s]", " ", t)
-    return re.sub(r"\s+", " ", t).strip()
-
-
-def _only_filler_remains(text: str, remove: re.Pattern, filler: frozenset) -> bool:
-    """True when removing `remove` matches from `text` leaves only `filler`
-    words — the shared anchor+residue idiom behind every deterministic close."""
-    return all(w in filler for w in remove.sub(" ", text).split())
-
-
 def _is_clear_signoff(text: str) -> bool:
     """True only for an unambiguous goodbye / decline of further help.
 
@@ -220,7 +212,7 @@ def _is_clear_signoff(text: str) -> bool:
     fall through to the model's marker layer instead.
     """
     base = _norm(text)
-    if not base or _REQUEST_CUE.search(base):
+    if not base:
         return False
     anchored = _SIGNOFF_ANCHOR.search(base) or (
         _DECLINE_LEAD.match(base) and _DECLINE_CLOSER.search(base)

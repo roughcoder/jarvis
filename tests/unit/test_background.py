@@ -146,6 +146,7 @@ def test_failing_job_notifies_friendly_message_not_crash() -> None:
     assert "couldn't finish" in notes[0]
     # The raw exception is logged, never spoken to the user.
     assert "kaboom" not in notes[0]
+    assert runner._jobs[1].error_kind == "RuntimeError"
 
 
 def test_timeout_job_notifies_and_recovers() -> None:
@@ -159,6 +160,7 @@ def test_timeout_job_notifies_and_recovers() -> None:
     asyncio.run(go())
     assert len(notes) == 1
     assert "taking longer" in notes[0]
+    assert runner._jobs[1].error_kind == "timeout"
 
 
 # --- BrainSession.run_task (headless agentic execution) --------------------

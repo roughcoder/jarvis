@@ -34,6 +34,8 @@ CLEAR_SIGNOFFS = [
     "I'm good, thanks",         # END-instruction decline example
     "no worries, bye",
     "right then, that's all, thanks very much",
+    "can you stop listening please",
+    "could you go to sleep now",
 ]
 
 NOT_SIGNOFFS = [
@@ -55,6 +57,7 @@ NOT_SIGNOFFS = [
     "see you at the station at 5, is that ok",
     "I'm good at chess",
     "stop the music",
+    "can you stop the music please",
     "go to sleep after you set the alarm",
 ]
 
