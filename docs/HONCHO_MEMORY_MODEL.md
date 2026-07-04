@@ -116,6 +116,29 @@ This lane subsumes the previous two-rail design: the authoritative
 separate personal file. One backend, two write modes: derived vs declared.
 Curation writes are capability-gated (the successor of `profile.write`).
 
+### Curation durability (never silently lossy, never blocking)
+
+Lane 1 is best-effort — losing one turn's transcript to an outage is a
+shrug. Lane 2 is not: a declared fact must be either delivered or reported,
+and the guarantee must not slow the turn.
+
+- **In-turn, a Lane 2 write is only a local outbox append** (fsync'd
+  journal — microseconds). "Noted" is honest the moment the fact exists
+  durably on disk. No network call ever blocks the reply.
+- **A background flusher delivers** outbox entries to Honcho (normally
+  within milliseconds of the reply) with retry. Every entry carries an
+  idempotency key (`content_hash`-based) so a retry after an ambiguous
+  timeout cannot double-write.
+- **Failure is proactive, not silent**: if the flusher exhausts retries, the
+  proactive lane tells the user ("I couldn't save the last two things to
+  memory — Honcho has been down since 3pm"). Delivered-or-reported, always.
+- **Read-your-writes**: while entries are pending, the memory tool appends a
+  plain "pending, not yet saved: …" line from the outbox (including pending
+  forgets). No deep merging — the gap is normally milliseconds and only
+  visible during an outage.
+- Uploads already follow the pattern: the original lands in the Jarvis file
+  vault (local, durable) first; only the Honcho ingestion step is queued.
+
 ## People
 
 ### Principals
@@ -585,8 +608,9 @@ wake -> capture -> STT -> read local cached memory -> LLM -> stream TTS
 Cold path (after the reply, fire-and-forget):
 
 ```text
-write turn messages to Honcho (Lane 1)
-apply any curation writes (Lane 2)
+write turn messages to Honcho (Lane 1, best-effort)
+flush the Lane 2 outbox (delivered-or-reported; the in-turn step was only
+  the local journal append)
 wait for deriver idle for the affected peers (bounded — refresh anyway after N seconds)
 refresh local caches for the speaking principal and the active project
 record timing/failure as best effort
