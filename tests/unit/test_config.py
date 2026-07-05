@@ -50,17 +50,31 @@ def test_base_url_is_computed_from_host_port(monkeypatch) -> None:
     assert c.base_url == "http://frankfurt:8123"
 
 
-def test_memory_backend_and_sidecar_are_env_driven(monkeypatch, tmp_path) -> None:
-    _clean(monkeypatch, "MEMORY_BACKEND", "MEMORY_CONCLUSION_SIDECAR_PATH", "MEMORY_DERIVER_IDLE_TIMEOUT_S")
+def test_memory_backend_sidecar_and_curation_outbox_are_env_driven(monkeypatch, tmp_path) -> None:
+    _clean(
+        monkeypatch,
+        "MEMORY_BACKEND",
+        "MEMORY_CONCLUSION_SIDECAR_PATH",
+        "MEMORY_DERIVER_IDLE_TIMEOUT_S",
+        "MEMORY_CURATION_OUTBOX_PATH",
+        "MEMORY_CURATION_OUTBOX_MAX_RETRIES",
+        "MEMORY_TOOL_TIMEOUT_S",
+    )
     monkeypatch.setenv("MEMORY_BACKEND", "v3")
     monkeypatch.setenv("MEMORY_CONCLUSION_SIDECAR_PATH", str(tmp_path / "sidecar.json"))
     monkeypatch.setenv("MEMORY_DERIVER_IDLE_TIMEOUT_S", "4.5")
+    monkeypatch.setenv("MEMORY_CURATION_OUTBOX_PATH", str(tmp_path / "outbox.jsonl"))
+    monkeypatch.setenv("MEMORY_CURATION_OUTBOX_MAX_RETRIES", "5")
+    monkeypatch.setenv("MEMORY_TOOL_TIMEOUT_S", "1.5")
 
     c = MemoryConfig(_env_file=None)
 
     assert c.backend == "v3"
     assert c.conclusion_sidecar_path == str(tmp_path / "sidecar.json")
     assert c.deriver_idle_timeout_s == 4.5
+    assert c.curation_outbox_path == str(tmp_path / "outbox.jsonl")
+    assert c.curation_outbox_max_retries == 5
+    assert c.tool_timeout_s == 1.5
 
 
 def test_worker_workspace_defaults_outside_repo() -> None:

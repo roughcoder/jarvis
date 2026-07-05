@@ -26,6 +26,9 @@ from jarvis.brain.gateway_client import GatewayClient
 from jarvis.brain.heartbeat import HeartbeatScheduler, make_heartbeat_think
 from jarvis.brain.identity import HOUSE, IdentityResolver, load_users
 from jarvis.brain.memory_client import MemoryClient
+from jarvis.brain.memory_outbox import CurationOutbox
+from jarvis.brain.memory_tools import make_memory_tools
+from jarvis.brain.registry import RegistryStore
 from jarvis.brain.proactive import proactive_frames
 from jarvis.brain.scheduler import Ring, Scheduler, in_quiet_hours
 from jarvis.brain.session import BrainSession, TurnResult
@@ -179,6 +182,7 @@ class BrainServer:
         )
         users = load_users(cfg.capabilities.users_dir)  # dict name -> User
         self._users = users  # for outbound (WhatsApp) routing
+        self._register_memory_tools(users)
         # MCP servers are connected at startup (async, off the hot path); OAuth
         # servers connect per principal (house + each user) so credentials isolate.
         self._mcp = MCPBridge(cfg.mcp, principals=list(users))
@@ -211,7 +215,33 @@ class BrainServer:
             for tool in make_alarm_tools(self._scheduler, cfg):
                 self._registry.register(tool)
 
+    def _register_memory_tools(self, users: dict) -> None:
+        outbox = CurationOutbox(
+            self._cfg.memory.curation_outbox_path,
+            max_retries=self._cfg.memory.curation_outbox_max_retries,
+            backoff_initial_s=self._cfg.memory.curation_outbox_backoff_initial_s,
+            backoff_max_s=self._cfg.memory.curation_outbox_backoff_max_s,
+        )
+        store = RegistryStore(self._cfg.registry.path)
+        for tool in make_memory_tools(
+            self._cfg.memory,
+            memory=self._memory,
+            outbox=outbox,
+            registry=store,
+            users=users,
+        ):
+            self._registry.register(tool)
+
     def _make_session(self, ctx: RequestContext) -> BrainSession:
+        async def notify_memory_failure(text: str) -> None:
+            await self._notify(
+                text,
+                device_id=ctx.device_id,
+                identity=ctx.identity,
+                kind="notification",
+                open_mic=True,
+            )
+
         session = BrainSession(
             self._cfg,
             ctx,
@@ -221,6 +251,7 @@ class BrainServer:
             tracer=self._tracer,
             registry=self._registry,
             memory_user=ctx.memory_peer,
+            memory_notify=notify_memory_failure,
             relevance=self._relevance,
         )
         session.load_soul()  # personality is authoritative for ALL sessions (incl. background)

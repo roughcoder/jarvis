@@ -85,6 +85,11 @@ class MemoryConfig(_Base):
     # Hot path reads a LOCAL cache (spec §3.2), never the live reasoning endpoint.
     cache_path: str = ".cache/representation.json"
     conclusion_sidecar_path: str = "jarvis-workspace/memory/conclusions-v3-sidecar.json"
+    curation_outbox_path: str = "jarvis-workspace/memory/curation-outbox.jsonl"
+    curation_outbox_max_retries: int = 3
+    curation_outbox_backoff_initial_s: float = 0.25
+    curation_outbox_backoff_max_s: float = 2.0
+    tool_timeout_s: float = 5.0
     write_timeout_s: float = 30.0
     # The turn is always WRITTEN to Honcho (facts captured immediately), but the
     # expensive dialectic cache refresh is debounced to at most once per this
@@ -817,6 +822,9 @@ class Config:
         self.memory.conclusion_sidecar_path = _resolve_state_path(
             self.memory.conclusion_sidecar_path, base_dir
         )
+        self.memory.curation_outbox_path = _resolve_state_path(
+            self.memory.curation_outbox_path, base_dir
+        )
         self.trace.path = _resolve_state_path(self.trace.path, base_dir)
         self.capabilities.profiles_dir = _resolve_state_path(
             self.capabilities.profiles_dir, base_dir
@@ -855,6 +863,11 @@ class Config:
             "memory.cache_path": self.memory.cache_path,
             "memory.conclusion_sidecar_path": self.memory.conclusion_sidecar_path,
             "memory.deriver_idle_timeout_s": self.memory.deriver_idle_timeout_s,
+            "memory.curation_outbox_path": self.memory.curation_outbox_path,
+            "memory.curation_outbox_max_retries": self.memory.curation_outbox_max_retries,
+            "memory.curation_outbox_backoff_initial_s": self.memory.curation_outbox_backoff_initial_s,
+            "memory.curation_outbox_backoff_max_s": self.memory.curation_outbox_backoff_max_s,
+            "memory.tool_timeout_s": self.memory.tool_timeout_s,
             "database.host": self.database.host,
             "database.port": self.database.port,
             "database.url": self.database.url_masked,

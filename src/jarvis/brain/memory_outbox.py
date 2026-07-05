@@ -1,0 +1,308 @@
+"""Durable Lane 2 curation outbox.
+
+In-turn curation writes append one fsync'd JSONL event. Delivery to the memory
+backend happens later through `flush()`, with idempotency by content hash.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
+
+from jarvis.brain.memory_client import MemoryBackend
+
+
+OutboxOperation = Literal["create_conclusion", "delete_conclusion"]
+OutboxStatus = Literal["pending", "delivered", "failed", "cancelled"]
+
+
+@dataclass(frozen=True)
+class OutboxEntry:
+    id: str
+    operation: OutboxOperation
+    status: OutboxStatus
+    observed_id: str
+    content: str = ""
+    observer_id: str = ""
+    conclusion_id: str = ""
+    metadata: dict[str, Any] | None = None
+    attempts: int = 0
+    content_hash: str = ""
+    error: str = ""
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+
+class CurationOutbox:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        max_retries: int = 3,
+        backoff_initial_s: float = 0.25,
+        backoff_max_s: float = 2.0,
+    ) -> None:
+        self.path = Path(path).expanduser()
+        self.max_retries = max(1, max_retries)
+        self.backoff_initial_s = max(0.0, backoff_initial_s)
+        self.backoff_max_s = max(self.backoff_initial_s, backoff_max_s)
+
+    def enqueue_create(
+        self,
+        *,
+        observed_id: str,
+        content: str,
+        observer_id: str,
+        metadata: dict[str, Any],
+    ) -> OutboxEntry:
+        metadata = dict(metadata)
+        content_hash = metadata.get("content_hash") or conclusion_content_hash(
+            observed_id=observed_id,
+            content=content,
+            observer_id=observer_id,
+            metadata=metadata,
+        )
+        metadata["content_hash"] = content_hash
+        now = time.time()
+        entry = OutboxEntry(
+            id=str(uuid.uuid4()),
+            operation="create_conclusion",
+            status="pending",
+            observed_id=observed_id,
+            content=content,
+            observer_id=observer_id,
+            metadata=metadata,
+            content_hash=content_hash,
+            created_at=now,
+            updated_at=now,
+        )
+        self._append_event({"event": "queued", **_entry_to_json(entry)})
+        return entry
+
+    def enqueue_delete(
+        self,
+        *,
+        conclusion_id: str,
+        observed_id: str = "",
+        content: str = "",
+        observer_id: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> OutboxEntry:
+        now = time.time()
+        entry = OutboxEntry(
+            id=str(uuid.uuid4()),
+            operation="delete_conclusion",
+            status="pending",
+            observed_id=observed_id,
+            content=content,
+            observer_id=observer_id,
+            conclusion_id=conclusion_id,
+            metadata=dict(metadata or {}),
+            content_hash=f"delete:{conclusion_id}",
+            created_at=now,
+            updated_at=now,
+        )
+        self._append_event({"event": "queued", **_entry_to_json(entry)})
+        return entry
+
+    def cancel_pending(self, *, observed_id: str, content: str) -> list[OutboxEntry]:
+        """Append cancellation records for pending creates matching the visible pending line."""
+        normalized = content.strip()
+        if not normalized:
+            return []
+        matches = [
+            entry
+            for entry in self.pending_entries(observed_id=observed_id)
+            if entry.operation == "create_conclusion" and entry.content.strip() == normalized
+        ]
+        now = time.time()
+        for entry in matches:
+            updated = _replace_entry(entry, status="cancelled", updated_at=now, error="")
+            self._append_event({"event": "cancelled", **_entry_to_json(updated)})
+        return matches
+
+    async def flush(self, backend: MemoryBackend, *, notify=None) -> dict[str, int]:  # noqa: ANN001
+        return await asyncio.to_thread(self.flush_sync, backend, notify=notify)
+
+    def flush_sync(self, backend: MemoryBackend, *, notify=None) -> dict[str, int]:  # noqa: ANN001
+        delivered = 0
+        failed = 0
+        for entry in self.pending_entries():
+            current = entry
+            while current.attempts < self.max_retries:
+                try:
+                    self._deliver_one(backend, current)
+                except Exception as exc:  # noqa: BLE001 - persisted and retried/reported.
+                    current = self._record_attempt(current, exc)
+                    if current.attempts >= self.max_retries:
+                        self._mark_failed(current, exc)
+                        failed += 1
+                        if notify is not None:
+                            notify("I couldn't save a declared memory item to memory.")
+                        break
+                    delay = min(
+                        self.backoff_max_s,
+                        self.backoff_initial_s * (2 ** max(0, current.attempts - 1)),
+                    )
+                    if delay:
+                        time.sleep(delay)
+                    continue
+                self._mark_delivered(current)
+                delivered += 1
+                break
+        return {"delivered": delivered, "failed": failed}
+
+    def pending_entries(self, *, observed_id: str | None = None) -> list[OutboxEntry]:
+        entries = [
+            entry for entry in self._current_entries().values()
+            if entry.status == "pending"
+        ]
+        if observed_id:
+            entries = [entry for entry in entries if entry.observed_id == observed_id]
+        return sorted(entries, key=lambda entry: entry.created_at)
+
+    def pending_lines(self, *, observed_id: str | None = None) -> list[str]:
+        lines: list[str] = []
+        for entry in self.pending_entries(observed_id=observed_id):
+            if entry.operation == "delete_conclusion":
+                detail = entry.content or entry.conclusion_id
+                lines.append(f"pending, not yet saved: forget {detail}")
+            else:
+                lines.append(f"pending, not yet saved: {entry.content}")
+        return lines
+
+    def append_pending_lines(self, text: str, *, observed_id: str | None = None) -> str:
+        lines = self.pending_lines(observed_id=observed_id)
+        if not lines:
+            return text
+        return "\n".join(part for part in (text.strip(), *lines) if part)
+
+    def _deliver_one(self, backend: MemoryBackend, entry: OutboxEntry) -> None:
+        if entry.operation == "delete_conclusion":
+            backend.delete_conclusion(entry.conclusion_id)
+            return
+        existing = backend.list_conclusions(
+            observed_id=entry.observed_id,
+            level="explicit",
+            metadata={"content_hash": entry.content_hash},
+        )
+        if existing:
+            return
+        backend.create_conclusion(
+            observed_id=entry.observed_id,
+            observer_id=entry.observer_id or None,
+            content=entry.content,
+            metadata=dict(entry.metadata or {}),
+        )
+
+    def _record_attempt(self, entry: OutboxEntry, exc: Exception) -> OutboxEntry:
+        updated = _replace_entry(
+            entry,
+            attempts=entry.attempts + 1,
+            error=str(exc),
+            updated_at=time.time(),
+        )
+        self._append_event({"event": "attempt", **_entry_to_json(updated)})
+        return updated
+
+    def _mark_delivered(self, entry: OutboxEntry) -> None:
+        updated = _replace_entry(entry, status="delivered", updated_at=time.time(), error="")
+        self._append_event({"event": "delivered", **_entry_to_json(updated)})
+
+    def _mark_failed(self, entry: OutboxEntry, exc: Exception) -> None:
+        updated = _replace_entry(entry, status="failed", error=str(exc), updated_at=time.time())
+        self._append_event({"event": "failed", **_entry_to_json(updated)})
+
+    def _current_entries(self) -> dict[str, OutboxEntry]:
+        current: dict[str, OutboxEntry] = {}
+        if not self.path.exists():
+            return current
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            raw = json.loads(line)
+            entry = _entry_from_json(raw)
+            current[entry.id] = entry
+        return current
+
+    def _append_event(self, event: dict[str, Any]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            dir_fd = os.open(self.path.parent, os.O_DIRECTORY)
+        except OSError:
+            return
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+
+def conclusion_content_hash(
+    *,
+    observed_id: str,
+    content: str,
+    observer_id: str,
+    metadata: dict[str, Any],
+) -> str:
+    payload = {
+        "observed_id": observed_id,
+        "content": content,
+        "observer_id": observer_id,
+        "metadata": {k: v for k, v in sorted(metadata.items()) if k != "content_hash"},
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _entry_to_json(entry: OutboxEntry) -> dict[str, Any]:
+    return {
+        "id": entry.id,
+        "operation": entry.operation,
+        "status": entry.status,
+        "observed_id": entry.observed_id,
+        "content": entry.content,
+        "observer_id": entry.observer_id,
+        "conclusion_id": entry.conclusion_id,
+        "metadata": dict(entry.metadata or {}),
+        "attempts": entry.attempts,
+        "content_hash": entry.content_hash,
+        "error": entry.error,
+        "created_at": entry.created_at,
+        "updated_at": entry.updated_at,
+    }
+
+
+def _entry_from_json(raw: dict[str, Any]) -> OutboxEntry:
+    return OutboxEntry(
+        id=str(raw.get("id", "")),
+        operation=str(raw.get("operation", "create_conclusion")),  # type: ignore[arg-type]
+        status=str(raw.get("status", "pending")),  # type: ignore[arg-type]
+        observed_id=str(raw.get("observed_id", "")),
+        content=str(raw.get("content", "")),
+        observer_id=str(raw.get("observer_id", "")),
+        conclusion_id=str(raw.get("conclusion_id", "")),
+        metadata=dict(raw.get("metadata") or {}),
+        attempts=int(raw.get("attempts", 0)),
+        content_hash=str(raw.get("content_hash", "")),
+        error=str(raw.get("error", "")),
+        created_at=float(raw.get("created_at", 0.0)),
+        updated_at=float(raw.get("updated_at", 0.0)),
+    )
+
+
+def _replace_entry(entry: OutboxEntry, **changes: Any) -> OutboxEntry:
+    data = _entry_to_json(entry)
+    data.update(changes)
+    return _entry_from_json(data)

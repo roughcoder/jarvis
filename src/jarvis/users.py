@@ -36,6 +36,8 @@ class User:
     household_visibility: str = ""
     scope: str = "personal"
     honcho_peer: str = ""
+    trust_tier: str = ""
+    guardians: tuple[str, ...] = ()
 
     @property
     def peer(self) -> str:
@@ -63,6 +65,8 @@ def parse_user(name: str, text: str) -> User:
         household_visibility=str(fm.get("household_visibility") or ""),
         scope=str(fm.get("scope") or "personal"),
         honcho_peer=str(fm.get("honcho_peer") or ""),
+        trust_tier=str(fm.get("trust_tier") or ""),
+        guardians=tuple(as_list(fm.get("guardians"))),
     )
 
 

@@ -11,13 +11,17 @@ import pytest
 from jarvis.brain.capabilities import (
     CapabilityError,
     build_request_context,
+    can_query_memory_peer,
+    can_write_memory_peer,
     parse_profile_capabilities,
     require,
     resolve_capabilities,
 )
 from jarvis.brain.context import RequestContext
+from jarvis.brain.registry import ContactEntry, ProjectEntry, RegistryStore
 from jarvis.brain.server import BrainServer
 from jarvis.config import CapabilityConfig
+from jarvis.users import User
 
 
 def _ctx(*caps: str) -> RequestContext:
@@ -126,3 +130,102 @@ def test_live_hardware_filters_intercom_caps() -> None:
 
     without_hardware = BrainServer._with_live_hardware(ctx, set())
     assert without_hardware.capabilities == frozenset({"web.search"})
+
+
+# --- memory access matrix -------------------------------------------------
+
+
+def _personal(identity: str, peer: str | None = None) -> RequestContext:
+    return RequestContext(
+        "dev",
+        identity,
+        "personal",
+        frozenset({"memory.query", "memory.curate"}),
+        peer=peer or identity,
+    )
+
+
+def _memory_registry(tmp_path) -> RegistryStore:  # noqa: ANN001
+    store = RegistryStore(tmp_path / "registry.json")
+    store.save_contact(
+        ContactEntry(
+            id="klaus",
+            display_name="Klaus",
+            owner="neil",
+            visibility="shared",
+            members=("neil", "jules"),
+        )
+    )
+    store.save_contact(
+        ContactEntry(
+            id="private",
+            display_name="Private",
+            owner="neil",
+            visibility="private",
+            members=("neil",),
+        )
+    )
+    store.save_project(
+        ProjectEntry(
+            id="jarvis",
+            name="Jarvis",
+            owner="neil",
+            visibility="shared",
+            members=("neil", "jules"),
+        )
+    )
+    store.save_project(
+        ProjectEntry(
+            id="private",
+            name="Private",
+            owner="neil",
+            visibility="private",
+            members=("neil",),
+        )
+    )
+    return store
+
+
+def test_memory_access_matrix_allows_own_contacts_projects_and_guardian(tmp_path) -> None:
+    registry = _memory_registry(tmp_path)
+    users = {
+        "neil": User("neil", trust_tier="guardian"),
+        "alice": User("alice", trust_tier="minor", guardians=("neil",)),
+        "jules": User("jules", trust_tier="adult"),
+    }
+
+    assert can_query_memory_peer(_personal("neil"), "neil", registry=registry, users=users).allowed
+    assert can_query_memory_peer(_personal("jules"), "contact:klaus", registry=registry, users=users).allowed
+    assert can_query_memory_peer(_personal("jules"), "project:jarvis", registry=registry, users=users).allowed
+    assert can_query_memory_peer(_personal("neil"), "alice", registry=registry, users=users).allowed
+
+
+def test_memory_access_matrix_denies_by_default_and_unowned_target_views(tmp_path) -> None:
+    registry = _memory_registry(tmp_path)
+    users = {
+        "neil": User("neil", trust_tier="guardian"),
+        "alice": User("alice", trust_tier="minor", guardians=("neil",)),
+        "jules": User("jules", trust_tier="adult"),
+    }
+
+    assert not can_query_memory_peer(_ctx(), "neil", registry=registry, users=users).allowed
+    assert not can_query_memory_peer(_personal("jules"), "contact:private", registry=registry, users=users).allowed
+    assert not can_query_memory_peer(_personal("jules"), "project:private", registry=registry, users=users).allowed
+    assert not can_query_memory_peer(_personal("jules"), "alice", registry=registry, users=users).allowed
+    assert not can_query_memory_peer(
+        _personal("neil"),
+        "project:jarvis",
+        registry=registry,
+        users=users,
+        target="jules",
+    ).allowed
+
+
+def test_memory_write_matrix_excludes_guardian_read_right(tmp_path) -> None:
+    registry = _memory_registry(tmp_path)
+    neil = _personal("neil")
+
+    assert can_write_memory_peer(neil, "neil", registry=registry).allowed
+    assert can_write_memory_peer(neil, "contact:klaus", registry=registry).allowed
+    assert can_write_memory_peer(neil, "project:jarvis", registry=registry).allowed
+    assert not can_write_memory_peer(neil, "alice", registry=registry).allowed
