@@ -18,6 +18,7 @@ import pytest
 
 from jarvis.brain.context import RequestContext
 from jarvis.brain.memory_client import MemoryClient, QueueStatus, UnsupportedMemoryOperation, cache_key
+from jarvis.brain.memory_outbox import CurationOutbox
 from jarvis.brain.memory_client.v3 import HonchoV3MemoryClient
 from jarvis.brain.session import BrainSession
 from jarvis.config import MemoryConfig
@@ -107,6 +108,7 @@ class _ColdMemory:
         self.error = error
         self.refresh_errors = dict(refresh_errors or {})
         self.calls: list[tuple] = []
+        self.created: list[dict] = []
 
     def read_cached_representation(self, user=None):  # noqa: ANN001
         return ""
@@ -127,6 +129,14 @@ class _ColdMemory:
         if user in self.refresh_errors:
             raise self.refresh_errors[user]
         return True
+
+    def list_conclusions(self, **kwargs):  # noqa: ANN001, ANN202
+        self.calls.append(("list_conclusions", kwargs.get("observed_id"), kwargs.get("metadata")))
+        return []
+
+    def create_conclusion(self, **kwargs):  # noqa: ANN001, ANN202
+        self.calls.append(("create_conclusion", kwargs.get("observed_id"), kwargs.get("content")))
+        self.created.append(kwargs)
 
 
 class _Trace:
@@ -153,10 +163,19 @@ class _Tracer:
         self.emitted.append(trace)
 
 
-def _brain_with_memory(memory: _ColdMemory, *, timeout_s: float = 0.05, tracer=None) -> BrainSession:  # noqa: ANN001
+def _brain_with_memory(
+    memory: _ColdMemory,
+    tmp_path: pathlib.Path,
+    *,
+    timeout_s: float = 0.05,
+    tracer=None,  # noqa: ANN001
+) -> BrainSession:
     cfg = load_config()
     cfg.memory.deriver_idle_timeout_s = timeout_s
     cfg.memory.refresh_interval_s = 30.0
+    cfg.memory.curation_outbox_path = str(tmp_path / "outbox.jsonl")
+    cfg.memory.curation_outbox_backoff_initial_s = 0
+    cfg.memory.curation_outbox_backoff_max_s = 0
     ctx = RequestContext("dev", "house", "house", frozenset(), channel="voice")
     return BrainSession(
         cfg,
@@ -169,9 +188,9 @@ def _brain_with_memory(memory: _ColdMemory, *, timeout_s: float = 0.05, tracer=N
     )
 
 
-def test_cold_path_waits_for_idle_before_refreshing_requested_peers() -> None:
+def test_cold_path_waits_for_idle_before_refreshing_requested_peers(tmp_path) -> None:
     memory = _ColdMemory([QueueStatus()])
-    session = _brain_with_memory(memory)
+    session = _brain_with_memory(memory, tmp_path)
 
     asyncio.run(session._cold_path("hello", "there", refresh_peers=("project:jarvis",)))
 
@@ -183,9 +202,31 @@ def test_cold_path_waits_for_idle_before_refreshing_requested_peers() -> None:
     ]
 
 
-def test_deriver_idle_wait_honours_bound_and_refreshes_on_busy_timeout() -> None:
+def test_cold_path_flushes_curation_outbox_before_deriver_wait(tmp_path) -> None:
+    memory = _ColdMemory([QueueStatus()])
+    session = _brain_with_memory(memory, tmp_path)
+    outbox = CurationOutbox(tmp_path / "outbox.jsonl")
+    entry = outbox.enqueue_create(
+        observed_id="contact:klaus",
+        observer_id="neil",
+        content="Klaus is off Fridays.",
+        metadata={"observed_at": "2026-07-04"},
+    )
+
+    asyncio.run(session._cold_path("hello", "there"))
+
+    assert memory.calls[:4] == [
+        ("write_turn", None, "hello", "there"),
+        ("list_conclusions", "contact:klaus", {"content_hash": entry.content_hash}),
+        ("create_conclusion", "contact:klaus", "Klaus is off Fridays."),
+        ("queue_status",),
+    ]
+    assert [row["content"] for row in memory.created] == ["Klaus is off Fridays."]
+
+
+def test_deriver_idle_wait_honours_bound_and_refreshes_on_busy_timeout(tmp_path) -> None:
     memory = _ColdMemory([QueueStatus(pending_work_units=1)])
-    session = _brain_with_memory(memory, timeout_s=0.03)
+    session = _brain_with_memory(memory, tmp_path, timeout_s=0.03)
 
     t0 = time.perf_counter()
     asyncio.run(session._cold_path("hello", "there"))
@@ -194,9 +235,9 @@ def test_deriver_idle_wait_honours_bound_and_refreshes_on_busy_timeout() -> None
     assert ("refresh_cache", None, 30.0) in memory.calls
 
 
-def test_deriver_idle_wait_errors_do_not_block_refresh() -> None:
+def test_deriver_idle_wait_errors_do_not_block_refresh(tmp_path) -> None:
     memory = _ColdMemory(error=RuntimeError("queue down"))
-    session = _brain_with_memory(memory)
+    session = _brain_with_memory(memory, tmp_path)
 
     asyncio.run(session._cold_path("hello", "there"))
 
@@ -207,9 +248,9 @@ def test_deriver_idle_wait_errors_do_not_block_refresh() -> None:
     ]
 
 
-def test_deriver_idle_wait_unsupported_queue_status_is_immediate_and_refreshes() -> None:
+def test_deriver_idle_wait_unsupported_queue_status_is_immediate_and_refreshes(tmp_path) -> None:
     memory = _ColdMemory(error=UnsupportedMemoryOperation("queue status unsupported"))
-    session = _brain_with_memory(memory, timeout_s=5.0)
+    session = _brain_with_memory(memory, tmp_path, timeout_s=5.0)
 
     t0 = time.perf_counter()
     asyncio.run(session._cold_path("hello", "there"))
@@ -222,10 +263,10 @@ def test_deriver_idle_wait_unsupported_queue_status_is_immediate_and_refreshes()
     ]
 
 
-def test_cold_path_continues_refreshing_peers_after_one_peer_fails() -> None:
+def test_cold_path_continues_refreshing_peers_after_one_peer_fails(tmp_path) -> None:
     memory = _ColdMemory(refresh_errors={"project:jarvis": RuntimeError("refresh failed")})
     tracer = _Tracer()
-    session = _brain_with_memory(memory, tracer=tracer)
+    session = _brain_with_memory(memory, tmp_path, tracer=tracer)
     principal = session._memory_peer()
 
     asyncio.run(

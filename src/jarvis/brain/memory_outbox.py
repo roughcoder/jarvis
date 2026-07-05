@@ -20,7 +20,7 @@ from jarvis.brain.memory_client import MemoryBackend
 
 
 OutboxOperation = Literal["create_conclusion", "delete_conclusion"]
-OutboxStatus = Literal["pending", "delivered", "failed"]
+OutboxStatus = Literal["pending", "delivered", "failed", "cancelled"]
 
 
 @dataclass(frozen=True)
@@ -112,6 +112,22 @@ class CurationOutbox:
         self._append_event({"event": "queued", **_entry_to_json(entry)})
         return entry
 
+    def cancel_pending(self, *, observed_id: str, content: str) -> list[OutboxEntry]:
+        """Append cancellation records for pending creates matching the visible pending line."""
+        normalized = content.strip()
+        if not normalized:
+            return []
+        matches = [
+            entry
+            for entry in self.pending_entries(observed_id=observed_id)
+            if entry.operation == "create_conclusion" and entry.content.strip() == normalized
+        ]
+        now = time.time()
+        for entry in matches:
+            updated = _replace_entry(entry, status="cancelled", updated_at=now, error="")
+            self._append_event({"event": "cancelled", **_entry_to_json(updated)})
+        return matches
+
     async def flush(self, backend: MemoryBackend, *, notify=None) -> dict[str, int]:  # noqa: ANN001
         return await asyncio.to_thread(self.flush_sync, backend, notify=notify)
 
@@ -128,6 +144,8 @@ class CurationOutbox:
                     if current.attempts >= self.max_retries:
                         self._mark_failed(current, exc)
                         failed += 1
+                        if notify is not None:
+                            notify("I couldn't save a declared memory item to memory.")
                         break
                     delay = min(
                         self.backoff_max_s,
@@ -139,14 +157,12 @@ class CurationOutbox:
                 self._mark_delivered(current)
                 delivered += 1
                 break
-        if failed and notify is not None:
-            notify(f"I couldn't save the last {failed} thing{'s' if failed != 1 else ''} to memory.")
         return {"delivered": delivered, "failed": failed}
 
     def pending_entries(self, *, observed_id: str | None = None) -> list[OutboxEntry]:
         entries = [
             entry for entry in self._current_entries().values()
-            if entry.status in {"pending", "failed"}
+            if entry.status == "pending"
         ]
         if observed_id:
             entries = [entry for entry in entries if entry.observed_id == observed_id]

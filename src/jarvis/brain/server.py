@@ -233,6 +233,15 @@ class BrainServer:
             self._registry.register(tool)
 
     def _make_session(self, ctx: RequestContext) -> BrainSession:
+        async def notify_memory_failure(text: str) -> None:
+            await self._notify(
+                text,
+                device_id=ctx.device_id,
+                identity=ctx.identity,
+                kind="notification",
+                open_mic=True,
+            )
+
         session = BrainSession(
             self._cfg,
             ctx,
@@ -242,6 +251,7 @@ class BrainServer:
             tracer=self._tracer,
             registry=self._registry,
             memory_user=ctx.memory_peer,
+            memory_notify=notify_memory_failure,
             relevance=self._relevance,
         )
         session.load_soul()  # personality is authoritative for ALL sessions (incl. background)

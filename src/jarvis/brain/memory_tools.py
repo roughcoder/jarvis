@@ -153,6 +153,18 @@ def make_memory_tools(
         decision = can_write_memory_peer(ctx, peer_id, registry=registry)
         if not decision.allowed:
             return f"error: {decision.reason}"
+        cancelled = outbox.cancel_pending(observed_id=peer_id, content=query)
+        if cancelled:
+            if replacement:
+                metadata = _base_metadata(ctx, args)
+                outbox.enqueue_create(
+                    observed_id=peer_id,
+                    observer_id=ctx.memory_peer,
+                    content=replacement,
+                    metadata=metadata,
+                )
+                return "Noted - replaced pending memory."
+            return "Noted - cancelled pending memory."
         confirmed = bool(args.get("confirm"))
         ids = [str(item).strip() for item in args.get("conclusion_ids", []) if str(item).strip()]
         if not confirmed:

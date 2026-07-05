@@ -66,6 +66,7 @@ class FakeMemory:
     def __init__(self) -> None:
         self.created: list[dict[str, Any]] = []
         self.deleted: list[str] = []
+        self.fail_create = False
         self.fail_after_create = False
         self.representations: dict[str, str] = {}
         self.query_matches: list[ConclusionRecord] = []
@@ -82,6 +83,8 @@ class FakeMemory:
         session_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> ConclusionRecord:
+        if self.fail_create:
+            raise TimeoutError("memory down")
         record = {
             "observed_id": observed_id,
             "content": content,
@@ -166,6 +169,55 @@ def test_outbox_append_flush_retry_and_idempotency(tmp_path) -> None:
     assert backend.created[0]["metadata"]["content_hash"] == entry.content_hash
     events = [json.loads(line)["event"] for line in (tmp_path / "outbox.jsonl").read_text().splitlines()]
     assert events == ["queued", "attempt", "delivered"]
+
+
+def test_outbox_retry_exhaustion_notifies_once_per_failed_entry(tmp_path) -> None:
+    backend = FakeMemory()
+    backend.fail_create = True
+    outbox = CurationOutbox(tmp_path / "outbox.jsonl", max_retries=2, backoff_initial_s=0)
+    outbox.enqueue_create(
+        observed_id="contact:klaus",
+        observer_id="neil",
+        content="Klaus is off Fridays.",
+        metadata={"observed_at": "2026-07-04"},
+    )
+    outbox.enqueue_create(
+        observed_id="project:jarvis",
+        observer_id="neil",
+        content="Decision: use Honcho.",
+        metadata={"observed_at": "2026-07-04"},
+    )
+    notifications: list[str] = []
+
+    first = outbox.flush_sync(backend, notify=notifications.append)
+    second = outbox.flush_sync(backend, notify=notifications.append)
+
+    assert first == {"delivered": 0, "failed": 2}
+    assert second == {"delivered": 0, "failed": 0}
+    assert len(notifications) == 2
+
+
+def test_outbox_cancellation_suppresses_pending_lines_and_delivery(tmp_path) -> None:
+    backend = FakeMemory()
+    outbox = CurationOutbox(tmp_path / "outbox.jsonl")
+    outbox.enqueue_create(
+        observed_id="contact:klaus",
+        observer_id="neil",
+        content="Klaus is off Fridays.",
+        metadata={"observed_at": "2026-07-04"},
+    )
+
+    cancelled = outbox.cancel_pending(
+        observed_id="contact:klaus",
+        content="Klaus is off Fridays.",
+    )
+    result = outbox.flush_sync(backend)
+
+    assert len(cancelled) == 1
+    assert outbox.pending_entries() == []
+    assert outbox.pending_lines(observed_id="contact:klaus") == []
+    assert result == {"delivered": 0, "failed": 0}
+    assert backend.created == []
 
 
 def test_outbox_pending_read_your_writes_lines_include_forgets(tmp_path) -> None:
@@ -301,6 +353,79 @@ def test_forget_and_correct_confirmation_roundtrip(tmp_path) -> None:
     assert done.startswith("Noted")
     pending = outbox.pending_entries()
     assert [entry.operation for entry in pending] == ["delete_conclusion", "create_conclusion"]
+
+
+def test_forget_pending_memory_cancels_outbox_entry_before_flush(tmp_path) -> None:
+    backend = FakeMemory()
+    cfg = _memory_cfg(tmp_path)
+    outbox = CurationOutbox(cfg.curation_outbox_path)
+    outbox.enqueue_create(
+        observed_id="contact:klaus",
+        observer_id="neil",
+        content="Klaus is off Fridays.",
+        metadata={"observed_at": "2026-07-04"},
+    )
+    tool = {
+        tool.name: tool
+        for tool in make_memory_tools(
+            cfg,
+            memory=backend,
+            outbox=outbox,
+            registry=_registry(tmp_path),
+        )
+    }["forget_memory"]
+
+    result = asyncio.run(
+        tool.handler(
+            _ctx("memory.curate"),
+            {"target": "Klaus", "query": "Klaus is off Fridays."},
+        )
+    )
+    flushed = outbox.flush_sync(backend)
+
+    assert result == "Noted - cancelled pending memory."
+    assert outbox.pending_lines(observed_id="contact:klaus") == []
+    assert flushed == {"delivered": 0, "failed": 0}
+    assert backend.created == []
+
+
+def test_correct_pending_memory_replaces_outbox_entry_before_flush(tmp_path) -> None:
+    backend = FakeMemory()
+    cfg = _memory_cfg(tmp_path)
+    outbox = CurationOutbox(cfg.curation_outbox_path)
+    outbox.enqueue_create(
+        observed_id="contact:klaus",
+        observer_id="neil",
+        content="Klaus works Fridays.",
+        metadata={"observed_at": "2026-07-04"},
+    )
+    tool = {
+        tool.name: tool
+        for tool in make_memory_tools(
+            cfg,
+            memory=backend,
+            outbox=outbox,
+            registry=_registry(tmp_path),
+        )
+    }["correct_memory"]
+
+    result = asyncio.run(
+        tool.handler(
+            _ctx("memory.curate"),
+            {
+                "target": "Klaus",
+                "query": "Klaus works Fridays.",
+                "replacement": "Klaus is off Fridays.",
+            },
+        )
+    )
+    pending = outbox.pending_entries(observed_id="contact:klaus")
+    flushed = outbox.flush_sync(backend)
+
+    assert result == "Noted - replaced pending memory."
+    assert [entry.content for entry in pending] == ["Klaus is off Fridays."]
+    assert flushed == {"delivered": 1, "failed": 0}
+    assert [row["content"] for row in backend.created] == ["Klaus is off Fridays."]
 
 
 def test_memory_search_degrades_to_cache_and_pending_lines_when_backend_dead(tmp_path) -> None:

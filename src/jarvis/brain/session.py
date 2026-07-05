@@ -19,7 +19,7 @@ import json
 import pathlib
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
@@ -257,6 +257,7 @@ class BrainSession:
         tracer: Tracer,
         registry: ToolRegistry,
         memory_user: str | None = None,
+        memory_notify: Callable[[str], Awaitable[None]] | None = None,
         relevance=None,  # noqa: ANN001 - optional EmbeddingRelevance (else keyword prefilter)
     ) -> None:
         self._cfg = cfg
@@ -269,6 +270,7 @@ class BrainSession:
         self._gateway = gateway
         self._tts = tts
         self._memory = memory
+        self._memory_notify = memory_notify
         self._tracer = tracer
         self._registry = registry
         self._soul = ""  # personality (SOUL.md), loaded at start
@@ -628,13 +630,15 @@ class BrainSession:
         peer_id = self._memory_user or self._ctx.memory_peer
         if not peer_id:
             return memory
-        outbox = CurationOutbox(
+        return self._curation_outbox().append_pending_lines(memory, observed_id=peer_id)
+
+    def _curation_outbox(self) -> CurationOutbox:
+        return CurationOutbox(
             self._cfg.memory.curation_outbox_path,
             max_retries=self._cfg.memory.curation_outbox_max_retries,
             backoff_initial_s=self._cfg.memory.curation_outbox_backoff_initial_s,
             backoff_max_s=self._cfg.memory.curation_outbox_backoff_max_s,
         )
-        return outbox.append_pending_lines(memory, observed_id=peer_id)
 
     def _saved_facts(self) -> str:
         """The speaker's curated facts (local file read, like the memory cache — never a
@@ -1215,6 +1219,7 @@ class BrainSession:
             await self._memory.write_turn(user_text, assistant_text, user=self._memory_user)
             if trace is not None:
                 trace.event("memory_write_done", peers=[principal])
+            await self._flush_curation_outbox(trace)
             await self._wait_for_deriver_idle(peers, trace)
             refreshed_principal = await self._memory.refresh_cache(
                 min_interval_s=self._cfg.memory.refresh_interval_s, user=self._memory_user
@@ -1253,6 +1258,31 @@ class BrainSession:
                 )
                 trace.stage("memory", (time.perf_counter() - t0) * 1000, failed=True)
                 self._tracer.emit(trace)
+
+    async def _flush_curation_outbox(self, trace) -> None:  # noqa: ANN001
+        notifications: list[str] = []
+        if trace is not None:
+            trace.event("curation_outbox_flush_start")
+        try:
+            result = await self._curation_outbox().flush(self._memory, notify=notifications.append)
+        except Exception as exc:  # noqa: BLE001 - curation delivery is best-effort cold path work.
+            print(f"  [memory] curation outbox flush skipped: {exc}")
+            if trace is not None:
+                trace.event("curation_outbox_flush_failed", error=type(exc).__name__)
+            return
+        if trace is not None:
+            trace.event("curation_outbox_flush_done", **result)
+        for message in notifications:
+            await self._notify_memory_failure(message)
+
+    async def _notify_memory_failure(self, message: str) -> None:
+        if self._memory_notify is None:
+            print(f"  [memory] {message}")
+            return
+        try:
+            await self._memory_notify(message)
+        except Exception as exc:  # noqa: BLE001 - proactive failure reporting must not break memory.
+            print(f"  [memory] proactive notification failed: {exc}")
 
     async def _tts_source(self, text: str, trace=None) -> AsyncIterator[bytes]:  # noqa: ANN001
         """Wrap the TTS stream to capture its timing (time-to-first-audio, total
