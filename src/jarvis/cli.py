@@ -31,6 +31,75 @@ def _cmd_config(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_memory_migrate(args: argparse.Namespace) -> int:
+    from jarvis.brain.memory_client import MemoryClient
+    from jarvis.migration.profile_facts import (
+        WorkspaceSafetyError,
+        default_as_of,
+        load_profile_fact_seeds,
+        print_dry_run,
+        seed_profile_facts,
+        validate_workspace_target,
+        verify_profile_fact_seed,
+    )
+
+    cfg = load_config()
+    workspace = args.workspace or cfg.memory_migration.workspace_id
+    users_dir = args.users_dir or cfg.capabilities.users_dir
+    seeds = load_profile_fact_seeds(users_dir, as_of=args.as_of or default_as_of())
+
+    if args.dry_run:
+        print(
+            f"DRY RUN: would seed {len(seeds)} profile facts into workspace "
+            f"{workspace!r} from {users_dir}"
+        )
+        print_dry_run(seeds)
+        return 0
+
+    try:
+        validate_workspace_target(
+            workspace,
+            explicit_workspace=args.workspace is not None,
+            acknowledgement=args.i_understand_this_writes_to,
+        )
+    except WorkspaceSafetyError as exc:
+        print(f"memory-migrate safety error: {exc}", file=sys.stderr)
+        return 2
+
+    memory_cfg = cfg.memory.model_copy(update={"backend": "v3", "workspace_id": workspace})
+    backend = MemoryClient(memory_cfg)
+
+    if args.verify:
+        summary = verify_profile_fact_seed(backend, seeds, workspace=workspace)
+        return _print_memory_migration_verification(summary)
+
+    seed_summary = seed_profile_facts(backend, seeds, workspace=workspace)
+    print(
+        f"Seeded workspace {workspace!r}: "
+        f"{seed_summary.created} created, {seed_summary.skipped} already present, "
+        f"{seed_summary.expected} expected."
+    )
+    verify_summary = verify_profile_fact_seed(backend, seeds, workspace=workspace)
+    return _print_memory_migration_verification(verify_summary)
+
+
+def _print_memory_migration_verification(summary) -> int:  # noqa: ANN001
+    if summary.ok:
+        print(
+            f"Verification PASS for workspace {summary.workspace!r}: "
+            f"{summary.expected} profile facts present with matching content."
+        )
+        return 0
+    print(
+        f"Verification FAIL for workspace {summary.workspace!r}: "
+        f"{len(summary.discrepancies)} discrepancies.",
+        file=sys.stderr,
+    )
+    for discrepancy in summary.discrepancies:
+        print(f"  - {discrepancy}", file=sys.stderr)
+    return 1
+
+
 def _cmd_ping_gateway(args: argparse.Namespace) -> int:
     """Step 1 gate: prove fast + strong routes return completions, and that
     switching model is a parameter (same code path, different route name)."""
@@ -2342,6 +2411,47 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_config = sub.add_parser("config", help="Print resolved configuration (dry-run)")
     p_config.set_defaults(func=_cmd_config)
+
+    p_memory_migrate = sub.add_parser(
+        "memory-migrate",
+        help="Seed users/*.md profile facts into Honcho v3 explicit conclusions",
+    )
+    p_memory_migrate.add_argument(
+        "--users-dir",
+        default="",
+        help="Directory containing users/<name>.md profile files (default: CAPS_USERS_DIR)",
+    )
+    p_memory_migrate.add_argument(
+        "--workspace",
+        default="",
+        help=(
+            "Target Honcho v3 workspace. Defaults to MEMORY_MIGRATION_WORKSPACE_ID "
+            "and must be explicitly acknowledged for non-dev targets."
+        ),
+    )
+    p_memory_migrate.add_argument(
+        "--as-of",
+        default=None,
+        help="ISO date to store as observed_at for facts with no recorded date.",
+    )
+    p_memory_migrate.add_argument(
+        "--i-understand-this-writes-to",
+        default="",
+        metavar="WORKSPACE",
+        help="Required exact workspace acknowledgement for non-dev targets.",
+    )
+    memory_migrate_mode = p_memory_migrate.add_mutually_exclusive_group()
+    memory_migrate_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the conclusions that would be written without contacting Honcho.",
+    )
+    memory_migrate_mode.add_argument(
+        "--verify",
+        action="store_true",
+        help="Read back and verify an already-seeded workspace without writing.",
+    )
+    p_memory_migrate.set_defaults(func=_cmd_memory_migrate)
 
     p_ping = sub.add_parser(
         "ping-gateway", help="Step 1 gate: test fast + strong routes"
