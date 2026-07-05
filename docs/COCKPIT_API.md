@@ -104,6 +104,9 @@ configured `JARVIS_ENV_FILE`.
 GET /v1/projects
 GET /v1/projects/{id}
 GET /v1/projects/{id}/memory
+GET /v1/projects/{id}/threads
+POST /v1/projects/{id}/threads
+POST /v1/projects/{id}/threads/{tid}/turns
 ```
 
 Projects are read from the Jarvis registry, not Honcho. The cockpit never talks
@@ -197,6 +200,75 @@ filtered by `project_id`. The API reads through the configured Jarvis memory
 backend and registry only. If the memory backend is unavailable or does not
 support live representation/conclusion reads, the response still succeeds with
 an empty or cached representation and any conclusions that were available.
+
+#### Orchestrator Threads
+
+An orchestrator thread is a long-lived Cockpit project chat backed by a Honcho
+session named:
+
+```text
+project:<project-id>:orchestrator:<thread-id>
+```
+
+Thread list/open/post routes use the same authenticated requester derivation and
+project membership gate as project reads. Invisible projects are returned as
+`404 not_found`; the Cockpit cannot distinguish a missing project from a project
+outside the caller's visibility set.
+
+`GET /v1/projects/{id}/threads` returns Jarvis's local thread index for the
+project:
+
+```json
+{
+  "api_version": "v1",
+  "schema_version": 1,
+  "project_id": "jarvis",
+  "threads": [
+    {
+      "thread_id": "thread_...",
+      "project_id": "jarvis",
+      "session_id": "project:jarvis:orchestrator:thread_...",
+      "title": "Planning",
+      "created_at": "2026-07-05T09:00:00+00:00",
+      "updated_at": "2026-07-05T09:00:00+00:00",
+      "created_by": "neil"
+    }
+  ]
+}
+```
+
+`POST /v1/projects/{id}/threads` creates the Honcho session through Jarvis's
+memory backend and sets session membership before any messages are written. The
+session includes the project peer, the requester peer, and `jarvis`.
+
+`POST /v1/projects/{id}/threads/{tid}/turns` accepts:
+
+```json
+{"text": "What should we build next?"}
+```
+
+and returns `text/event-stream` frames:
+
+```text
+event: thread.turn.started
+event: thread.reply
+event: thread.turn.done
+```
+
+The turn is driven by the shared `BrainSession.respond_text` core under the
+requester's capabilities with the active project set. Context is assembled live
+at turn start from the registry entry, live/cached project representation,
+recent `finding`/`decision` conclusions, and the recent thread transcript.
+
+Lane 1 thread persistence writes the human message as the requester peer and the
+reply as `jarvis` to the named session. Shared project memory updates remain
+Lane 2 only: the orchestrator must call the existing curation tools such as
+`add_finding` or `record_decision`; it does not silently auto-curate project
+memory from every reply.
+
+Current limitation: background job completion report-backs are not yet appended
+to the thread automatically. They can still run through the existing tool layer;
+thread follow-up delivery is a later connector enhancement.
 
 ### Runs
 
