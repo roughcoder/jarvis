@@ -29,6 +29,7 @@ from jarvis.brain.identity import HOUSE, IdentityResolver, load_users
 from jarvis.brain.memory_client import MemoryClient
 from jarvis.brain.memory_outbox import CurationOutbox
 from jarvis.brain.memory_tools import make_memory_tools
+from jarvis.brain.project_tools import make_project_tools
 from jarvis.brain.registry import RegistryStore
 from jarvis.brain.session import BrainSession, TurnResult
 from jarvis.brain.skills import register_skills
@@ -78,6 +79,7 @@ class TurnLoop:
         self._tts = tts  # kept for the wake acknowledgement ("speak" mode)
         self._tracer = tracer
         self._gateway = gateway  # kept so run() can aclose it
+        self._memory = memory
         self._sr = cfg.audio.sample_rate
         # Per-request identity/capability envelope (Phase 3 §4) — single-principal
         # in 3a. The think/speak core is shared with the brain server.
@@ -87,17 +89,17 @@ class TurnLoop:
             memory=memory,
         )
         users = load_users(cfg.capabilities.users_dir)
+        self._store = ContextStore(self._make_session)
         self._register_memory_tools(memory, users)
+        self._register_project_tools(memory)
         # MCP servers connect at startup (off the hot path); OAuth servers connect
         # per principal (house + each user) so credentials isolate. See run().
         self._mcp = MCPBridge(cfg.mcp, principals=list(users))
         # Identity-aware like the brain server (§5): resolve the speaker per turn and
         # route to that principal's session (own history + memory peer). With no
         # users/ configured this stays house-only (single principal, base cache).
-        self._memory = memory
         self._relevance = build_relevance(cfg, gateway)  # embedding scorer or None
         self._resolver = IdentityResolver(users)
-        self._store = ContextStore(self._make_session)
         self._asserted = "" if cfg.capabilities.identity == "house" else cfg.capabilities.identity
         self._base_asserted = self._asserted
         self._voice_mode = DEFAULT_MODE
@@ -120,10 +122,21 @@ class TurnLoop:
         ):
             self._registry.register(tool)
 
+    def _register_project_tools(self, memory: MemoryClient) -> None:
+        store = RegistryStore(self._cfg.registry.path)
+        for tool in make_project_tools(
+            self._cfg.memory,
+            memory=memory,
+            registry=store,
+            contexts=self._store,
+        ):
+            self._registry.register(tool)
+
     def _make_session(self, ctx: RequestContext) -> BrainSession:
         return BrainSession(
             self._cfg, ctx, gateway=self._gateway, tts=self._tts, memory=self._memory,
             tracer=self._tracer, registry=self._registry, memory_user=ctx.memory_peer,
+            active_project_getter=lambda: self._store.active_project(ctx),
             relevance=self._relevance,
         )
 

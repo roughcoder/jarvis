@@ -22,6 +22,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
+from typing import Any
 
 from jarvis.runtime import RequestContext
 from jarvis.brain.dialog import (
@@ -109,6 +110,13 @@ _MEMORY_TOOL_GUIDANCE = (
     "If memory includes a contradiction or retraction, treat it as authoritative over "
     "any derived restatement of the withdrawn fact. "
     "Use the legacy `remember` tool only for structured facts about the current user."
+)
+
+_PROJECT_TOOL_GUIDANCE = (
+    "Project switching: when the user says to open, switch to, or move to a "
+    "project, call `switch_project`. When they say to close the project, call "
+    "`close_project`. If a project switch tool says confirmation is required, "
+    "ask the user which project they meant rather than guessing."
 )
 
 _BROWSER_GUIDANCE = (
@@ -260,6 +268,7 @@ class BrainSession:
         registry: ToolRegistry,
         memory_user: str | None = None,
         memory_notify: Callable[[str], Awaitable[None]] | None = None,
+        active_project_getter: Callable[[], Any | None] | None = None,
         relevance=None,  # noqa: ANN001 - optional EmbeddingRelevance (else keyword prefilter)
     ) -> None:
         self._cfg = cfg
@@ -273,6 +282,7 @@ class BrainSession:
         self._tts = tts
         self._memory = memory
         self._memory_notify = memory_notify
+        self._active_project_getter = active_project_getter
         self._tracer = tracer
         self._registry = registry
         self._soul = ""  # personality (SOUL.md), loaded at start
@@ -359,9 +369,16 @@ class BrainSession:
                 return
 
         model = self._initial_model(user_text)
-        memory = self._memory.read_cached_representation(self._memory_user)
+        memory, project_memory, active_project = self._read_ambient_memory()
         messages = [
-            {"role": "system", "content": self._system_prompt(memory)},
+            {
+                "role": "system",
+                "content": self._system_prompt(
+                    memory,
+                    project_memory=project_memory,
+                    active_project=active_project,
+                ),
+            },
             *self._history,  # shared context: the conversation so far
             {"role": "user", "content": user_text},
         ]
@@ -454,7 +471,11 @@ class BrainSession:
         if result.ended or self._ctx.channel != "voice":
             self._sticky_servers.clear()
         if result.reply:
-            self._fire_cold_path(user_text, result.reply)
+            self._fire_cold_path(
+                user_text,
+                result.reply,
+                self._active_project_refresh_peers(),
+            )
 
     async def respond_text(self, user_text: str, trace, result: TurnResult) -> str:  # noqa: ANN001
         """Text-only turn: the SAME think core as respond() but it returns the reply
@@ -462,9 +483,16 @@ class BrainSession:
         loop, so tools work in text mode — the harness can drive the browser, etc.
         Call finalize() afterwards for end-detection + memory, exactly like respond()."""
         model = self._initial_model(user_text)
-        memory = self._memory.read_cached_representation(self._memory_user) if self._memory else ""
+        memory, project_memory, active_project = self._read_ambient_memory()
         messages = [
-            {"role": "system", "content": self._system_prompt(memory)},
+            {
+                "role": "system",
+                "content": self._system_prompt(
+                    memory,
+                    project_memory=project_memory,
+                    active_project=active_project,
+                ),
+            },
             *self._history,
             {"role": "user", "content": user_text},
         ]
@@ -489,8 +517,13 @@ class BrainSession:
         conversation history — its own ephemeral message list. Same `ctx` as the
         asker, so it runs with their capabilities and never more. Uses the strong
         model (off the hot path, quality over latency)."""
-        memory = self._memory.read_cached_representation(self._memory_user) if self._memory else ""
-        system_prompt = self._system_prompt(memory, include_voice_controls=False)
+        memory, project_memory, active_project = self._read_ambient_memory()
+        system_prompt = self._system_prompt(
+            memory,
+            include_voice_controls=False,
+            project_memory=project_memory,
+            active_project=active_project,
+        )
         messages = [
             {"role": "system", "content": f"{system_prompt}\n\n{_BACKGROUND_FRAMING}"},
             {"role": "user", "content": task},
@@ -537,9 +570,21 @@ class BrainSession:
         final = await gateway.complete_with_tools(messages, model=model, tools=None)
         return self._clean_reply(final.content or "")
 
-    def _system_prompt(self, memory: str, *, include_voice_controls: bool = True) -> str:
+    def _system_prompt(
+        self,
+        memory: str,
+        *,
+        include_voice_controls: bool = True,
+        project_memory: str = "",
+        active_project: Any | None = None,
+    ) -> str:
         """Soul (who Jarvis is) + format + memory (what he knows about you)."""
         memory = self._with_pending_memory_lines(memory)
+        if active_project is not None:
+            project_memory = self._with_pending_memory_lines(
+                project_memory,
+                peer_id=getattr(active_project, "peer_id", ""),
+            )
         parts = []
         if self._soul:
             parts.append(self._soul)
@@ -572,6 +617,8 @@ class BrainSession:
             parts.append(_PROFILE_GUIDANCE)
         if self._ctx.can("memory.query") or self._ctx.can("memory.curate"):
             parts.append(_MEMORY_TOOL_GUIDANCE)
+        if self._ctx.can("project.switch"):
+            parts.append(_PROJECT_TOOL_GUIDANCE)
         if self._ctx.can("worker.browser"):
             parts.append(_BROWSER_GUIDANCE)
         if self._ctx.can("worker.gui"):
@@ -620,6 +667,15 @@ class BrainSession:
                 "What you already know about the user (use it naturally only if "
                 f"relevant; do not recite it):\n{memory}"
             )
+        if active_project is not None:
+            project_name = getattr(active_project, "name", "the active project")
+            project_peer = getattr(active_project, "peer_id", "")
+            context = project_memory.strip() or "No cached project memory yet."
+            parts.append(
+                f"Active project context for {project_name} ({project_peer}). "
+                "This is shared project memory, not the user's personal memory "
+                f"and not Jarvis's personality:\n{context}"
+            )
         # Volatile parts last, so the stable prefix above stays cacheable: the
         # mode instruction changes when the voice mode flips, and the now-line
         # changes each minute (it also lets Jarvis answer time/date instantly).
@@ -628,11 +684,36 @@ class BrainSession:
         parts.append(_now_line(self._cfg.persona.timezone))
         return "\n\n".join(parts)
 
-    def _with_pending_memory_lines(self, memory: str) -> str:
-        peer_id = self._memory_user or self._ctx.memory_peer
+    def _with_pending_memory_lines(self, memory: str, *, peer_id: str | None = None) -> str:
+        peer_id = peer_id or self._memory_user or self._ctx.memory_peer
         if not peer_id:
             return memory
         return self._curation_outbox().append_pending_lines(memory, observed_id=peer_id)
+
+    def _read_ambient_memory(self) -> tuple[str, str, Any | None]:
+        active_project = self._active_project()
+        if self._memory is None:
+            return "", "", active_project
+        personal = self._memory.read_cached_representation(self._memory_user)
+        if active_project is None:
+            return personal, "", None
+        project_peer = getattr(active_project, "peer_id", "")
+        project_memory = (
+            self._memory.read_cached_representation(project_peer) if project_peer else ""
+        )
+        return personal, project_memory, active_project
+
+    def _active_project(self) -> Any | None:
+        if self._active_project_getter is None:
+            return None
+        return self._active_project_getter()
+
+    def _active_project_refresh_peers(self) -> tuple[str, ...]:
+        active_project = self._active_project()
+        if active_project is None:
+            return ()
+        peer_id = getattr(active_project, "peer_id", "")
+        return (peer_id,) if peer_id else ()
 
     def _curation_outbox(self) -> CurationOutbox:
         return CurationOutbox(
@@ -1138,7 +1219,6 @@ class BrainSession:
         self,
         user_text: str,
         assistant_text: str,
-        *,
         refresh_peers: Iterable[str] = (),
     ) -> None:
         """Detached background task — never awaited on the hot path."""
