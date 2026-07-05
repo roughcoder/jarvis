@@ -536,8 +536,9 @@ class HonchoV3MemoryClient:
         filters: dict[str, Any] = {}
         if observed_id:
             filters["observed"] = self._encoded_peer(observed_id)
-        if observer_id:
-            filters["observer"] = self._encoded_peer(observer_id)
+        semantic_observer_id = observer_id or observed_id
+        if semantic_observer_id:
+            filters["observer"] = self._encoded_peer(semantic_observer_id)
         if session_id:
             filters["session_id"] = self._encoded_session(session_id)
         if level:
@@ -550,8 +551,8 @@ class HonchoV3MemoryClient:
         with self._client() as client:
             response = client.post(self._url(self._ws_path("/conclusions/query")), json=payload)
             response.raise_for_status()
-            data = response.json() or {}
-        items = data.get("items", data if isinstance(data, list) else [])
+            data = response.json()
+        items = self._conclusion_items_from_response(data)
         records = [self._decode_conclusion(item) for item in items]
         return self._filter_conclusions(
             records,
