@@ -125,9 +125,6 @@ class HonchoV2MemoryClient:
         result = await asyncio.to_thread(self._refresh_cache_sync, min_interval_s, user)
         return result is not None
 
-    def deriver_idle(self) -> bool:
-        return True
-
     def ping(self) -> bool:
         import httpx
 

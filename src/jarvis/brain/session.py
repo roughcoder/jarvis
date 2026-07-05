@@ -1194,10 +1194,19 @@ class BrainSession:
                 min_interval_s=self._cfg.memory.refresh_interval_s, user=self._memory_user
             )
             refreshed_peers: list[str] = [principal] if refreshed_principal else []
+            failed_refresh_peers: list[dict[str, str]] = []
             for peer in refresh_peers:
                 if peer == principal:
                     continue
-                if await self._memory.refresh_cache(min_interval_s=0.0, user=peer):
+                try:
+                    refreshed = await self._memory.refresh_cache(min_interval_s=0.0, user=peer)
+                except Exception as exc:  # noqa: BLE001 - secondary peer refresh is best-effort
+                    failed_refresh_peers.append({"peer": peer, "error": type(exc).__name__})
+                    if trace is not None:
+                        trace.event("memory_refresh_peer_failed", peer=peer, error=type(exc).__name__)
+                    print(f"  [memory] refresh skipped for {peer}: {exc}")
+                    continue
+                if refreshed:
                     refreshed_peers.append(peer)
             ms = (time.perf_counter() - t0) * 1000
             if trace is not None:
@@ -1206,6 +1215,7 @@ class BrainSession:
                     ms,
                     peers=list(peers),
                     refreshed_peers=refreshed_peers,
+                    failed_refresh_peers=failed_refresh_peers,
                 )
                 self._tracer.emit(trace)
         except Exception as exc:  # noqa: BLE001 - memory must never break a turn

@@ -6,6 +6,11 @@ it from responses. Lane 2 needs provenance (`recorded_by`, `observed_at`,
 v3 client stores that envelope locally by `(workspace, conclusion_id)` and
 merges it back into interface records.
 
+Growth is bounded opportunistically: unfiltered workspace conclusion lists
+reconcile the sidecar against Honcho's current ids and drop rows for conclusions
+that the server has deleted or superseded. Filtered lists and queries do not
+prune because they only see a subset.
+
 Upstream issue-shaped note: remove this sidecar only after Honcho conclusion
 create/list/query/delete round-trips arbitrary metadata in the API schema.
 """
@@ -38,6 +43,20 @@ class ConclusionMetadataSidecar:
             return
         workspace_data.pop(conclusion_id, None)
         if not workspace_data:
+            data.pop(workspace, None)
+        _atomic_write_json(self._path, data)
+
+    def reconcile(self, workspace: str, existing_ids: set[str]) -> None:
+        data = self._read()
+        workspace_data = data.get(workspace)
+        if not workspace_data:
+            return
+        pruned = {cid: meta for cid, meta in workspace_data.items() if cid in existing_ids}
+        if pruned == workspace_data:
+            return
+        if pruned:
+            data[workspace] = pruned
+        else:
             data.pop(workspace, None)
         _atomic_write_json(self._path, data)
 
