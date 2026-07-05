@@ -96,7 +96,7 @@ missing projects: they are omitted from the list and return `404 not_found` on
 detail.
 
 `GET /v1/projects` excludes archived projects by default. Add
-`?include_archived=true` to include them.
+`?include_archived=true` or `?include_archived=1` to include them.
 
 Project rows use the registry entry shape:
 
