@@ -27,6 +27,23 @@ Responses that describe stable cockpit schemas include:
 `api_version` is the HTTP API namespace. `schema_version` is the response shape
 contract used by the cockpit UI.
 
+## Authentication
+
+Jarvis cockpit auth V1 is auth-only. `ORCHESTRATION_AUTH_MODE` can be `legacy`,
+`oauth`, or `hybrid`; OAuth mode validates bearer JWTs locally from cached JWKS.
+`ORCHESTRATION_OAUTH_REQUIRED_SCOPES` is enforced globally for all OAuth
+requests by design. There is no per-route scope matrix in V1.
+
+`/v1/auth/metadata` exposes only public resource-server metadata and is returned
+with `Cache-Control: no-store`. It does not disclose whether a legacy static
+token is configured.
+
+The optional `ORCHESTRATION_OAUTH_JARVIS_USER_CLAIM` value is propagated only for
+audit/introspection in V1. Future code that consumes `jarvis_user` for memory
+ownership, authorization, or user routing must bind it to `sub` or another
+IdP-controlled claim. Do not trust an unverified user-editable custom claim as a
+Jarvis user identity.
+
 ## Stable Identifiers
 
 `run_id` is the Jarvis orchestration run id.

@@ -766,6 +766,15 @@ class OrchestrationConfig(_Base):
     api_token: SecretStr = SecretStr("")
     api_allow_insecure: bool = False
     api_cors_origins: str = ""
+    auth_mode: str = "hybrid"
+    oauth_issuer: str = ""
+    oauth_audience: str = ""
+    oauth_jwks_url: str = ""
+    oauth_required_scopes: str = ""
+    oauth_jarvis_user_claim: str = "jarvis_user"
+    oauth_default_alg: str = "RS256"
+    oauth_jwks_ttl_s: float = 300.0
+    oauth_jwks_min_refresh_s: float = 30.0
     sse_refresh_interval_s: float = 1.0
     sse_heartbeat_interval_s: float = 15.0
 

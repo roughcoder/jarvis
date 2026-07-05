@@ -477,6 +477,7 @@ browser = [
 ]
 cockpit = [
     { name = "aiohttp" },
+    { name = "pyjwt", extra = ["crypto"] },
 ]
 gateway = [
     { name = "openai" },
@@ -533,6 +534,7 @@ requires-dist = [
     { name = "pvporcupine", marker = "extra == 'wake'", specifier = ">=3.0" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pydantic-settings", specifier = ">=2.3" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'cockpit'", specifier = ">=2.8" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "silero-vad", marker = "extra == 'vad'", specifier = ">=5.1" },
     { name = "sounddevice", marker = "extra == 'stt'", specifier = ">=0.4.7" },

@@ -63,6 +63,14 @@ from jarvis.brain.capabilities import resolve_capabilities
 from jarvis.orchestration.authority import allowed
 from jarvis.orchestration.intent import parse_work_command
 from jarvis.orchestration.models import WorkCommand, WorkItem
+from jarvis.orchestration.oauth import (
+    OAuthTokenValidator,
+    OAuthValidationError,
+    auth_mode,
+    oauth_is_configured,
+    oauth_metadata,
+    required_scopes,
+)
 from jarvis.orchestration.service import (
     MissingAuthorityError,
     MissingWorkRepoError,
@@ -98,10 +106,55 @@ class CockpitAppContext:
     idempotency_locks: dict[str, asyncio.Lock]
     idempotency_lock_refs: dict[str, int]
     source_factory: Callable[[str, Any], WorkSource]
+    oauth_validator: OAuthTokenValidator | None = None
 
-    def require_auth(self, request: web.Request) -> None:
-        token = self.cfg.orchestration.api_token.get_secret_value()
-        if token and not hmac.compare_digest(request.headers.get("Authorization", ""), f"Bearer {token}"):
+    async def require_auth(self, request: web.Request) -> None:
+        orchestration = self.cfg.orchestration
+        mode = auth_mode(str(orchestration.auth_mode))
+        header = request.headers.get("Authorization", "")
+        token = orchestration.api_token.get_secret_value()
+        if mode in {"legacy", "hybrid"} and token and hmac.compare_digest(header, f"Bearer {token}"):
+            # AUTH-ONLY V1: this propagation is for audit/introspection. Scopes
+            # are enforced globally by validator config, and future consumers
+            # of jarvis_user must bind it to sub or another IdP-controlled
+            # claim before using it for authorization or memory ownership.
+            request["auth"] = {
+                "mode": "legacy",
+                "subject": "legacy-token",
+                "jarvis_user": "",
+                "scopes": [],
+            }
+            return
+
+        if mode in {"oauth", "hybrid"} and self.oauth_validator is not None:
+            prefix = "Bearer "
+            if header.startswith(prefix):
+                try:
+                    principal = await asyncio.to_thread(self.oauth_validator.validate, header[len(prefix) :])
+                except OAuthValidationError as exc:
+                    raise CockpitError("unauthorized", "unauthorized", status=401) from exc
+                # AUTH-ONLY V1: this propagation is for audit/introspection.
+                # Route-level scopes are intentionally not wired yet; global
+                # scopes come from ORCHESTRATION_OAUTH_REQUIRED_SCOPES.
+                request["auth"] = {
+                    "mode": "oauth",
+                    "subject": principal.subject,
+                    "jarvis_user": principal.jarvis_user,
+                    "scopes": sorted(principal.scopes),
+                }
+                return
+
+        if not token and (mode == "legacy" or (mode == "hybrid" and self.oauth_validator is None)):
+            # AUTH-ONLY V1: unauthenticated dev mode carries no usable identity.
+            request["auth"] = {
+                "mode": "none",
+                "subject": "",
+                "jarvis_user": "",
+                "scopes": [],
+            }
+            return
+
+        if token or self.oauth_validator is not None or mode == "oauth":
             raise CockpitError("unauthorized", "unauthorized", status=401)
 
     def service(self, *, manual_item: WorkItem | None = None) -> OrchestrationService:
@@ -331,6 +384,22 @@ def make_app(
     http_post: HttpPost | None = None,
     source_factory: Callable[[str, Any], WorkSource] | None = None,
 ) -> web.Application:
+    orchestration = cfg.orchestration
+    validator = (
+        OAuthTokenValidator(
+            issuer=str(orchestration.oauth_issuer),
+            audience=str(orchestration.oauth_audience),
+            jwks_url=str(orchestration.oauth_jwks_url),
+            scopes=required_scopes(str(orchestration.oauth_required_scopes)),
+            jarvis_user_claim=str(orchestration.oauth_jarvis_user_claim),
+            default_alg=str(orchestration.oauth_default_alg),
+            jwks_ttl_s=float(orchestration.oauth_jwks_ttl_s),
+            jwks_min_refresh_s=float(orchestration.oauth_jwks_min_refresh_s),
+            http_get=http_get or httpx.get,
+        )
+        if auth_mode(str(orchestration.auth_mode)) in {"oauth", "hybrid"} and oauth_is_configured(orchestration)
+        else None
+    )
     ctx = CockpitAppContext(
         cfg=cfg,
         get=http_get or httpx.get,
@@ -340,6 +409,7 @@ def make_app(
         idempotency_locks={},
         idempotency_lock_refs={},
         source_factory=source_factory or _work_source,
+        oauth_validator=validator,
     )
     _rebuild_session_ref_index_from_store(ctx.store)
     app = web.Application(middlewares=[_cors_middleware, _error_middleware])
@@ -351,6 +421,7 @@ def make_app(
     app[SSE_SNAPSHOT_HUB_KEY] = hub
     app.cleanup_ctx.append(_sse_snapshot_hub_context)
     app.add_routes([
+        web.get("/v1/auth/metadata", reads.auth_metadata),
         web.get("/v1/health", reads.health),
         web.get("/v1/cockpit/catalog", reads.catalog),
         web.get("/v1/cockpit/snapshot", reads.snapshot),
@@ -383,8 +454,11 @@ class CockpitReadHandlers:
     def __init__(self, ctx: CockpitAppContext) -> None:
         self.ctx = ctx
 
+    async def auth_metadata(self, _request: web.Request) -> web.Response:
+        return web.json_response(oauth_metadata(self.ctx.cfg.orchestration), headers={"Cache-Control": "no-store"})
+
     async def health(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         system = await asyncio.to_thread(system_info_cached)
         return web.json_response(
             {
@@ -396,17 +470,17 @@ class CockpitReadHandlers:
         )
 
     async def catalog(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         defaults, engines = await asyncio.to_thread(_catalog_context, self.ctx.cfg)
         return web.json_response(cockpit_catalog(start_defaults=defaults, engines=engines or None))
 
     async def snapshot(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         mode = _sync_mode(request)
         return web.json_response(await asyncio.to_thread(_cockpit_snapshot, self.ctx, mode))
 
     async def workers(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         probe = _worker_probe(request)
         return web.json_response(
             {
@@ -424,7 +498,7 @@ class CockpitReadHandlers:
         )
 
     async def worker_detail(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         worker_id = request.match_info["worker_id"]
         probe = _worker_probe(request)
         profile = await asyncio.to_thread(
@@ -437,7 +511,7 @@ class CockpitReadHandlers:
         return web.json_response(project_worker_profile(profile, default_repo=self.ctx.cfg.orchestration.default_repo))
 
     async def projects(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         requester_id = _cockpit_requester_id(self.ctx.cfg)
         include_archived = _include_archived(request)
         projects = (
@@ -454,7 +528,7 @@ class CockpitReadHandlers:
         )
 
     async def project_detail(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         requester_id = _cockpit_requester_id(self.ctx.cfg)
         project = (
             await asyncio.to_thread(_visible_project_or_404, self.ctx.cfg, request.match_info["project_id"], requester_id)
@@ -472,7 +546,7 @@ class CockpitReadHandlers:
         )
 
     async def runs(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         mode = str(request.query.get("sync") or "none")
         if mode in {"fast", "probe"}:
             await asyncio.to_thread(
@@ -498,7 +572,7 @@ class CockpitReadHandlers:
         return web.json_response({"runs": [run_summary(run, requests=requests, artifacts=artifacts) for run in run_items]})
 
     async def run_detail(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         run = await asyncio.to_thread(_run_or_404, self.ctx.store, request.match_info["run_id"])
         requests = await asyncio.to_thread(
             aggregate_requests,
@@ -511,21 +585,21 @@ class CockpitReadHandlers:
         return web.json_response({"run": detail, "summary": run_summary(run, requests=requests, artifacts=artifacts)})
 
     async def run_events(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         run = await asyncio.to_thread(_run_or_404, self.ctx.store, request.match_info["run_id"])
         raw_events = await asyncio.to_thread(self.ctx.store.events, run.run_id)
         events = [_project_run_event(event, idx + 1) for idx, event in enumerate(raw_events)]
         return web.json_response(paged(events, after=str(request.query.get("after") or ""), limit=_limit(request)))
 
     async def run_artifacts(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         run = await asyncio.to_thread(_run_or_404, self.ctx.store, request.match_info["run_id"])
         report_artifact = await asyncio.to_thread(run_report_artifact, self.ctx.store, run.run_id)
         items = [*artifact_summaries([run], include_archived=True), report_artifact]
         return web.json_response(paged(items, after=str(request.query.get("after") or ""), limit=_limit(request)))
 
     async def sessions(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         mode = _sync_mode(request)
         include_worker_state = mode in {"fast", "probe"}
         all_runs = await asyncio.to_thread(self.ctx.store.list_runs)
@@ -570,7 +644,7 @@ class CockpitReadHandlers:
         return web.json_response({"sessions": [session_summary(row, requests=requests, checkpoints=checkpoints) for row in session_rows.values()]})
 
     async def session_detail(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
         raw: dict[str, Any] = {}
         has_stored_projection = await asyncio.to_thread(_has_stored_session_projection, self.ctx.store, ref)
@@ -593,7 +667,7 @@ class CockpitReadHandlers:
         return web.json_response({"session": session_summary(row, requests=requests, checkpoints=checkpoints), "raw": _public_session_detail(raw)})
 
     async def session_events(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
         run_id = await asyncio.to_thread(_session_run_id_from_store, self.ctx.store, ref)
         raw = await asyncio.to_thread(
@@ -611,7 +685,7 @@ class CockpitReadHandlers:
         return web.json_response(paged(events, after=str(request.query.get("after") or ""), limit=_limit(request)))
 
     async def session_requests(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
         run_id = await asyncio.to_thread(_session_run_id_from_store, self.ctx.store, ref)
         requests = [
@@ -621,7 +695,7 @@ class CockpitReadHandlers:
         return web.json_response({"requests": requests})
 
     async def session_checkpoints(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
         run_id = await asyncio.to_thread(_session_run_id_from_store, self.ctx.store, ref)
         checkpoints = await asyncio.to_thread(_worker_session_checkpoints, self.ctx.cfg, ref, run_id=run_id, get=self.ctx.get)
@@ -633,7 +707,7 @@ class CockpitWriteHandlers:
         self.ctx = ctx
 
     async def work_start(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         body = await _json_body(request)
         _reject_attachments(body)
         async with _idempotency_scope(self.ctx, "work/start", str(body.get("idempotency_key") or "")):
@@ -656,7 +730,7 @@ class CockpitWriteHandlers:
         return web.json_response(response_body)
 
     async def work_validate(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         body = await _json_body(request)
         _reject_attachments(body)
         command, manual_item = _command_from_body(body, start=False)
@@ -672,7 +746,7 @@ class CockpitWriteHandlers:
         )
 
     async def work_resume(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         body = await _json_body(request)
         async with _idempotency_scope(self.ctx, "work/resume", str(body.get("idempotency_key") or "")):
             cached = self.ctx.idempotency.get("work/resume", str(body.get("idempotency_key") or ""), body)
@@ -688,7 +762,7 @@ class CockpitWriteHandlers:
         return web.json_response(response_body)
 
     async def run_archive(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         body = await _json_body(request)
         run_id = request.match_info["run_id"]
         scope = f"runs/{run_id}/archive"
@@ -703,7 +777,7 @@ class CockpitWriteHandlers:
         return web.json_response(response_body)
 
     async def session_archive(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         body = await _json_body(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
         scope = f"sessions/{ref.worker_id}/{ref.session_id}/archive"
@@ -718,7 +792,7 @@ class CockpitWriteHandlers:
         return web.json_response(response_body)
 
     async def session_write(self, request: web.Request) -> web.Response:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
         action = request.match_info.get("action", "restore_checkpoint")
         body = await _json_body(request)
@@ -744,7 +818,7 @@ class SseHandlers:
         self.ctx = ctx
 
     async def events(self, request: web.Request) -> web.StreamResponse:
-        self.ctx.require_auth(request)
+        await self.ctx.require_auth(request)
         mode = _sync_mode(request)
         filters = {
             key: str(request.query.get(key) or "")
@@ -1655,7 +1729,10 @@ def _worker_error_code(message: str) -> str:
 
 async def serve(cfg: Config) -> int:
     bind = cfg.orchestration.api_bind_host or cfg.orchestration.api_host
-    token_set = bool(cfg.orchestration.api_token.get_secret_value())
+    token_set = bool(cfg.orchestration.api_token.get_secret_value()) or (
+        auth_mode(str(cfg.orchestration.auth_mode)) in {"oauth", "hybrid"}
+        and oauth_is_configured(cfg.orchestration)
+    )
     if insecure_bind(bind, token_set, cfg.orchestration.api_allow_insecure):
         print(
             f"\n✗ Refusing to start: cockpit API is bound to {bind!r} with no "
