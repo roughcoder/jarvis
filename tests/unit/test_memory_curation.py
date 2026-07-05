@@ -125,6 +125,10 @@ class FakeMemory:
         ]
         if observed_id:
             rows = [row for row in rows if row.observed_id == observed_id]
+        if observer_id:
+            rows = [row for row in rows if row.observer_id == observer_id]
+        if level:
+            rows = [row for row in rows if row.level == level]
         if metadata:
             rows = [
                 row for row in rows
@@ -218,6 +222,46 @@ def test_outbox_cancellation_suppresses_pending_lines_and_delivery(tmp_path) -> 
     assert outbox.pending_lines(observed_id="contact:klaus") == []
     assert result == {"delivered": 0, "failed": 0}
     assert backend.created == []
+
+
+def test_outbox_cancel_pending_matches_semantic_forget_query(tmp_path) -> None:
+    outbox = CurationOutbox(tmp_path / "outbox.jsonl")
+    outbox.enqueue_create(
+        observed_id="contact:klaus",
+        observer_id="neil",
+        content="Klaus is off Fridays.",
+        metadata={"observed_at": "2026-07-04"},
+    )
+
+    cancelled = outbox.cancel_pending(observed_id="contact:klaus", content="Fridays")
+
+    assert len(cancelled) == 1
+    assert outbox.pending_entries() == []
+
+
+def test_outbox_pending_entries_uses_compacted_state_for_delivered_history(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    path = tmp_path / "outbox.jsonl"
+    backend = FakeMemory()
+    outbox = CurationOutbox(path)
+    for index in range(25):
+        outbox.enqueue_create(
+            observed_id="contact:klaus",
+            observer_id="neil",
+            content=f"Klaus fact {index}.",
+            metadata={"observed_at": "2026-07-04"},
+        )
+        assert outbox.flush_sync(backend) == {"delivered": 1, "failed": 0}
+
+    original_read_text = Path.read_text
+
+    def guarded_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == path:
+            raise AssertionError("pending lookup reparsed delivered journal")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+
+    assert CurationOutbox(path).pending_entries() == []
 
 
 def test_outbox_pending_read_your_writes_lines_include_forgets(tmp_path) -> None:
@@ -378,7 +422,7 @@ def test_forget_pending_memory_cancels_outbox_entry_before_flush(tmp_path) -> No
     result = asyncio.run(
         tool.handler(
             _ctx("memory.curate"),
-            {"target": "Klaus", "query": "Klaus is off Fridays."},
+            {"target": "Klaus", "query": "Fridays"},
         )
     )
     flushed = outbox.flush_sync(backend)

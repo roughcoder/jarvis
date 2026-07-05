@@ -13,6 +13,7 @@ from urllib.parse import quote
 import httpx
 
 from jarvis.brain.memory_client.encoding import (
+    assert_honcho_safe,
     cache_key,
     decode_honcho_id,
     encode_honcho_id,
@@ -32,6 +33,7 @@ from jarvis.config import MemoryConfig
 
 
 _SESSION_ID = "voice"
+_CONCLUSION_LEVELS = {"explicit", "deductive", "inductive", "contradiction"}
 # Shape proven end-to-end by deploy/honcho-v3/validate.py (step 1). Verify
 # against the dev stack before cutover whether workspace-level env defaults
 # make this redundant; sending it explicitly is safe either way.
@@ -55,7 +57,7 @@ class HonchoV3MemoryClient:
     def __init__(self, cfg: MemoryConfig, *, transport: httpx.BaseTransport | None = None) -> None:
         self._cfg = cfg
         self._ws = cfg.workspace_id
-        self._encoded_ws = encode_honcho_id(cfg.workspace_id)
+        self._encoded_ws = assert_honcho_safe(encode_honcho_id(cfg.workspace_id))
         self._ensured_workspace = False
         self._ensured_peers: set[str] = set()
         self._ensured_sessions: set[str] = set()
@@ -97,24 +99,118 @@ class HonchoV3MemoryClient:
         return base.with_name(f"{base.stem}-{cache_key(peer)}{base.suffix}")
 
     def _encoded_peer(self, peer_id: str) -> str:
-        return encode_honcho_id(peer_id)
+        return assert_honcho_safe(encode_honcho_id(peer_id))
 
     def _encoded_session(self, session_id: str) -> str:
-        return encode_honcho_id(session_id)
+        return assert_honcho_safe(encode_honcho_id(session_id))
 
     def _decode_conclusion(self, item: dict[str, Any]) -> ConclusionRecord:
         cid = str(item.get("id", ""))
         metadata = dict(item.get("metadata") or {})
-        metadata.update(self._sidecar.get(self._ws, cid))
+        observer_id = decode_honcho_id(str(item.get("observer_id", item.get("observer", ""))))
+        observed_id = decode_honcho_id(str(item.get("observed_id", item.get("observed", ""))))
+        sidecar_metadata = self._sidecar.get(self._ws, cid)
+        if not sidecar_metadata and cid:
+            sidecar_metadata = self._sidecar.materialize_pending(
+                self._ws,
+                cid,
+                observer_id=observer_id,
+                observed_id=observed_id,
+                content=str(item.get("content", "")),
+            )
+        metadata.update(sidecar_metadata)
         return ConclusionRecord(
             id=cid,
             content=str(item.get("content", "")),
-            observer_id=decode_honcho_id(str(item.get("observer_id", item.get("observer", "")))),
-            observed_id=decode_honcho_id(str(item.get("observed_id", item.get("observed", "")))),
+            observer_id=observer_id,
+            observed_id=observed_id,
             level=str(item.get("level") or metadata.get("level") or "explicit"),  # type: ignore[arg-type]
             session_id=decode_honcho_id(str(item["session_id"])) if item.get("session_id") else None,
             metadata=metadata,
         )
+
+    def _normalise_conclusion_metadata(self, metadata: dict[str, Any] | None) -> dict[str, Any]:
+        normalised = dict(metadata or {})
+        level = str(normalised.get("level") or "explicit")
+        if level not in _CONCLUSION_LEVELS:
+            raise ValueError(f"unsupported conclusion level: {level!r}")
+        if level == "explicit" and not normalised.get("observed_at"):
+            raise ValueError("explicit conclusions require metadata['observed_at']")
+        normalised["level"] = level
+        return normalised
+
+    def _conclusion_items_from_response(self, data: Any) -> list[dict[str, Any]]:
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
+            items = data.get("items", data.get("conclusions", []))
+            if isinstance(items, list):
+                return [item for item in items if isinstance(item, dict)]
+        return []
+
+    def _next_conclusion_cursor(self, data: Any) -> tuple[Any | None, bool]:
+        if not isinstance(data, dict):
+            return None, True
+        pagination = data.get("pagination") if isinstance(data.get("pagination"), dict) else {}
+        cursor = (
+            data.get("next_cursor")
+            or data.get("next_page_token")
+            or data.get("next")
+            or pagination.get("next_cursor")
+            or pagination.get("next_page_token")
+            or pagination.get("next")
+        )
+        has_more = bool(data.get("has_more") or data.get("has_next") or pagination.get("has_more"))
+        return cursor, not has_more or cursor is not None
+
+    def _list_conclusion_items(
+        self,
+        client: httpx.Client,
+        payload: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        items: list[dict[str, Any]] = []
+        next_cursor: Any | None = None
+        known_complete = True
+        while True:
+            page_payload = dict(payload)
+            if next_cursor is not None:
+                page_payload["cursor"] = next_cursor
+            response = client.post(self._url(self._ws_path("/conclusions/list")), json=page_payload)
+            response.raise_for_status()
+            data = response.json() or {}
+            items.extend(self._conclusion_items_from_response(data))
+            next_cursor, page_complete = self._next_conclusion_cursor(data)
+            known_complete = known_complete and page_complete
+            if next_cursor is None:
+                return items, known_complete
+
+    def _find_exact_conclusion(
+        self,
+        client: httpx.Client,
+        *,
+        observer_id: str,
+        observed_id: str,
+        content: str,
+        level: ConclusionLevel,
+    ) -> ConclusionRecord | None:
+        payload = {
+            "filters": {
+                "observer_id": self._encoded_peer(observer_id),
+                "observed_id": self._encoded_peer(observed_id),
+                "level": level,
+            }
+        }
+        items, _known_complete = self._list_conclusion_items(client, payload)
+        records = [self._decode_conclusion(item) for item in items]
+        for record in records:
+            if (
+                record.observer_id == observer_id
+                and record.observed_id == observed_id
+                and record.content == content
+                and record.level == level
+            ):
+                return record
+        return None
 
     def _filter_conclusions(
         self,
@@ -348,11 +444,14 @@ class HonchoV3MemoryClient:
     ) -> ConclusionRecord:
         observer = observer_id or self._cfg.assistant_peer_id
         metadata = dict(metadata or {})
-        metadata.setdefault("level", "explicit")
+        metadata = self._normalise_conclusion_metadata(metadata)
+        level = metadata["level"]
         conclusion = {
             "observer_id": self._encoded_peer(observer),
             "observed_id": self._encoded_peer(observed_id),
             "content": content,
+            "level": level,
+            "metadata": metadata,
         }
         if session_id:
             conclusion["session_id"] = self._encoded_session(session_id)
@@ -360,6 +459,25 @@ class HonchoV3MemoryClient:
             self._ensure_workspace(client)
             self._ensure_peer(client, observer, observe_me=False if observer == self._cfg.assistant_peer_id else True)
             self._ensure_peer(client, observed_id)
+            content_hash = str(metadata.get("content_hash", ""))
+            self._sidecar.put_pending(
+                self._ws,
+                content_hash,
+                observer_id=observer,
+                observed_id=observed_id,
+                content=content,
+                metadata=metadata,
+            )
+            if content_hash:
+                existing = self._find_exact_conclusion(
+                    client,
+                    observer_id=observer,
+                    observed_id=observed_id,
+                    content=content,
+                    level=level,  # type: ignore[arg-type]
+                )
+                if existing is not None:
+                    return existing
             response = client.post(
                 self._url(self._ws_path("/conclusions")),
                 json={"conclusions": [conclusion]},
@@ -391,13 +509,10 @@ class HonchoV3MemoryClient:
             filters["level"] = level
         payload = {"filters": filters} if filters else {}
         with self._client() as client:
-            response = client.post(self._url(self._ws_path("/conclusions/list")), json=payload)
-            response.raise_for_status()
-            data = response.json() or {}
-        items = data.get("items", data if isinstance(data, list) else [])
-        if not filters:
-            self._sidecar.reconcile(self._ws, {str(item.get("id", "")) for item in items if item.get("id")})
+            items, known_complete = self._list_conclusion_items(client, payload)
         records = [self._decode_conclusion(item) for item in items]
+        if not filters and known_complete and items:
+            self._sidecar.reconcile(self._ws, {str(item.get("id", "")) for item in items if item.get("id")})
         return self._filter_conclusions(
             records,
             observed_id=observed_id,

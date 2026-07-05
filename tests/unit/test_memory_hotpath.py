@@ -206,7 +206,7 @@ def test_cold_path_flushes_curation_outbox_before_deriver_wait(tmp_path) -> None
     memory = _ColdMemory([QueueStatus()])
     session = _brain_with_memory(memory, tmp_path)
     outbox = CurationOutbox(tmp_path / "outbox.jsonl")
-    entry = outbox.enqueue_create(
+    outbox.enqueue_create(
         observed_id="contact:klaus",
         observer_id="neil",
         content="Klaus is off Fridays.",
@@ -217,7 +217,7 @@ def test_cold_path_flushes_curation_outbox_before_deriver_wait(tmp_path) -> None
 
     assert memory.calls[:4] == [
         ("write_turn", None, "hello", "there"),
-        ("list_conclusions", "contact:klaus", {"content_hash": entry.content_hash}),
+        ("list_conclusions", "contact:klaus", None),
         ("create_conclusion", "contact:klaus", "Klaus is off Fridays."),
         ("queue_status",),
     ]

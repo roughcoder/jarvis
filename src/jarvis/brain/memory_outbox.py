@@ -53,6 +53,8 @@ class CurationOutbox:
         self.max_retries = max(1, max_retries)
         self.backoff_initial_s = max(0.0, backoff_initial_s)
         self.backoff_max_s = max(self.backoff_initial_s, backoff_max_s)
+        self._entries: dict[str, OutboxEntry] | None = None
+        self._journal_size: int | None = None
 
     def enqueue_create(
         self,
@@ -120,7 +122,7 @@ class CurationOutbox:
         matches = [
             entry
             for entry in self.pending_entries(observed_id=observed_id)
-            if entry.operation == "create_conclusion" and entry.content.strip() == normalized
+            if entry.operation == "create_conclusion" and _cancel_matches(entry, normalized)
         ]
         now = time.time()
         for entry in matches:
@@ -191,9 +193,13 @@ class CurationOutbox:
         existing = backend.list_conclusions(
             observed_id=entry.observed_id,
             level="explicit",
-            metadata={"content_hash": entry.content_hash},
         )
-        if existing:
+        if any(
+            record.content == entry.content
+            and record.observed_id == entry.observed_id
+            and (not entry.observer_id or record.observer_id == entry.observer_id)
+            for record in existing
+        ):
             return
         backend.create_conclusion(
             observed_id=entry.observed_id,
@@ -221,19 +227,12 @@ class CurationOutbox:
         self._append_event({"event": "failed", **_entry_to_json(updated)})
 
     def _current_entries(self) -> dict[str, OutboxEntry]:
-        current: dict[str, OutboxEntry] = {}
-        if not self.path.exists():
-            return current
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            raw = json.loads(line)
-            entry = _entry_from_json(raw)
-            current[entry.id] = entry
-        return current
+        self._load_entries()
+        return dict(self._entries or {})
 
     def _append_event(self, event: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._load_entries()
         payload = json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(payload)
@@ -247,6 +246,64 @@ class CurationOutbox:
             os.fsync(dir_fd)
         finally:
             os.close(dir_fd)
+        self._apply_event(event)
+        self._journal_size = self.path.stat().st_size
+        self._write_state()
+
+    @property
+    def _state_path(self) -> Path:
+        return self.path.with_name(f"{self.path.name}.pending.json")
+
+    def _load_entries(self) -> None:
+        journal_size = self.path.stat().st_size if self.path.exists() else 0
+        if self._entries is not None and self._journal_size == journal_size:
+            return
+        loaded = self._load_state(journal_size)
+        if loaded is not None:
+            self._entries = loaded
+            self._journal_size = journal_size
+            return
+        self._entries = {}
+        if self.path.exists():
+            for line in self.path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                self._apply_event(json.loads(line))
+        self._journal_size = journal_size
+        self._write_state()
+
+    def _load_state(self, journal_size: int) -> dict[str, OutboxEntry] | None:
+        if not self._state_path.exists():
+            return None
+        try:
+            raw = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return None
+        if int(raw.get("journal_size", -1)) != journal_size:
+            return None
+        entries = raw.get("entries")
+        if not isinstance(entries, list):
+            return None
+        return {entry.id: entry for entry in (_entry_from_json(item) for item in entries) if entry.status == "pending"}
+
+    def _write_state(self) -> None:
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "journal_size": self._journal_size or 0,
+            "entries": [_entry_to_json(entry) for entry in (self._entries or {}).values()],
+        }
+        tmp = self._state_path.with_name(f".{self._state_path.name}.tmp")
+        tmp.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+        os.replace(tmp, self._state_path)
+
+    def _apply_event(self, raw: dict[str, Any]) -> None:
+        if self._entries is None:
+            self._entries = {}
+        entry = _entry_from_json(raw)
+        if entry.status == "pending":
+            self._entries[entry.id] = entry
+        else:
+            self._entries.pop(entry.id, None)
 
 
 def conclusion_content_hash(
@@ -300,6 +357,18 @@ def _entry_from_json(raw: dict[str, Any]) -> OutboxEntry:
         created_at=float(raw.get("created_at", 0.0)),
         updated_at=float(raw.get("updated_at", 0.0)),
     )
+
+
+def _cancel_matches(entry: OutboxEntry, query: str) -> bool:
+    if query == entry.content_hash or query == str((entry.metadata or {}).get("content_hash", "")):
+        return True
+    entry_text = " ".join(entry.content.split())
+    query_text = " ".join(query.split())
+    if not entry_text or not query_text:
+        return False
+    entry_folded = entry_text.casefold()
+    query_folded = query_text.casefold()
+    return entry_folded == query_folded or query_folded in entry_folded or entry_folded in query_folded
 
 
 def _replace_entry(entry: OutboxEntry, **changes: Any) -> OutboxEntry:
