@@ -156,6 +156,122 @@ def test_v3_conclusion_crud_round_trips_sidecar_metadata(tmp_path) -> None:
     assert sidecar == {}
 
 
+def test_v3_create_conclusion_requires_observed_at_before_network(tmp_path) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    client = HonchoV3MemoryClient(_cfg(tmp_path), transport=httpx.MockTransport(handler))
+
+    with pytest.raises(ValueError, match="observed_at"):
+        client.create_conclusion(
+            observed_id="contact:klaus",
+            observer_id="neil",
+            content="Klaus does not work Fridays.",
+            metadata={"recorded_by": "neil"},
+        )
+
+    assert calls == 0
+
+
+def test_v3_create_conclusion_sends_level_and_metadata(tmp_path) -> None:
+    conclusion_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/conclusions/list"):
+            return httpx.Response(200, json={"items": []})
+        if request.url.path.endswith("/conclusions") and request.method == "POST":
+            payload = _json(request)["conclusions"][0]
+            conclusion_payloads.append(payload)
+            return httpx.Response(
+                201,
+                json=[
+                    {
+                        "id": "c1",
+                        "content": payload["content"],
+                        "observer_id": payload["observer_id"],
+                        "observed_id": payload["observed_id"],
+                        "level": payload["level"],
+                    }
+                ],
+            )
+        return httpx.Response(201, json={"id": _json(request).get("id", "")})
+
+    client = HonchoV3MemoryClient(_cfg(tmp_path), transport=httpx.MockTransport(handler))
+    client.create_conclusion(
+        observed_id="contact:klaus",
+        observer_id="neil",
+        content="Klaus does not work Fridays.",
+        metadata={"recorded_by": "neil", "observed_at": "2026-07-04"},
+    )
+
+    assert conclusion_payloads == [
+        {
+            "observer_id": "neil",
+            "observed_id": encode_honcho_id("contact:klaus"),
+            "content": "Klaus does not work Fridays.",
+            "level": "explicit",
+            "metadata": {
+                "recorded_by": "neil",
+                "observed_at": "2026-07-04",
+                "level": "explicit",
+            },
+        }
+    ]
+
+
+def test_v3_create_conclusion_retry_after_lost_response_dedupes_from_server_list(tmp_path) -> None:
+    server_rows: list[dict[str, Any]] = []
+    post_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_count
+        if request.url.path.endswith("/conclusions/list"):
+            return httpx.Response(200, json={"items": list(server_rows)})
+        if request.url.path.endswith("/conclusions") and request.method == "POST":
+            post_count += 1
+            payload = _json(request)["conclusions"][0]
+            server_rows.append(
+                {
+                    "id": "c1",
+                    "content": payload["content"],
+                    "observer_id": payload["observer_id"],
+                    "observed_id": payload["observed_id"],
+                    "level": payload["level"],
+                }
+            )
+            raise httpx.ReadError("response lost after commit", request=request)
+        return httpx.Response(201, json={"id": _json(request).get("id", "")})
+
+    client = HonchoV3MemoryClient(_cfg(tmp_path), transport=httpx.MockTransport(handler))
+    metadata = {
+        "recorded_by": "neil",
+        "observed_at": "2026-07-04",
+        "content_hash": "sha256:abc",
+    }
+
+    with pytest.raises(httpx.ReadError):
+        client.create_conclusion(
+            observed_id="contact:klaus",
+            observer_id="neil",
+            content="Klaus does not work Fridays.",
+            metadata=metadata,
+        )
+    retry = client.create_conclusion(
+        observed_id="contact:klaus",
+        observer_id="neil",
+        content="Klaus does not work Fridays.",
+        metadata=metadata,
+    )
+
+    assert post_count == 1
+    assert retry.id == "c1"
+    assert retry.metadata["content_hash"] == "sha256:abc"
+
+
 def test_v3_query_conclusions_filters_sidecar_metadata(tmp_path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/conclusions"):
@@ -194,7 +310,7 @@ def test_v3_query_conclusions_filters_sidecar_metadata(tmp_path) -> None:
         observed_id="project:jarvis",
         observer_id="neil",
         content="Decision: use Honcho v3.",
-        metadata={"project_id": "jarvis", "artifact_type": "decision"},
+        metadata={"project_id": "jarvis", "artifact_type": "decision", "observed_at": "2026-07-04"},
     )
 
     assert client.query_conclusions(
@@ -287,6 +403,84 @@ def test_v3_filtered_list_does_not_reconcile_sidecar_subset(tmp_path) -> None:
 
     assert client.list_conclusions(observed_id="project:jarvis")
     assert json.loads(sidecar_path.read_text(encoding="utf-8")) == original_sidecar
+
+
+def test_v3_empty_unfiltered_list_does_not_reconcile_sidecar(tmp_path) -> None:
+    sidecar_path = tmp_path / "sidecar.json"
+    original_sidecar = {
+        "jarvis-dev": {
+            "orphaned": {"recorded_by": "neil"},
+        }
+    }
+    sidecar_path.write_text(json.dumps(original_sidecar), encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/conclusions/list")
+        return httpx.Response(200, json={"items": []})
+
+    client = HonchoV3MemoryClient(_cfg(tmp_path), transport=httpx.MockTransport(handler))
+
+    assert client.list_conclusions() == []
+    assert json.loads(sidecar_path.read_text(encoding="utf-8")) == original_sidecar
+
+
+def test_v3_unfiltered_list_reconciles_after_draining_pages(tmp_path) -> None:
+    sidecar_path = tmp_path / "sidecar.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "jarvis-dev": {
+                    "c1": {"recorded_by": "neil"},
+                    "c2": {"recorded_by": "neil"},
+                    "orphaned": {"recorded_by": "neil"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    pages = [
+        {
+            "items": [
+                {
+                    "id": "c1",
+                    "content": "one",
+                    "observer_id": "neil",
+                    "observed_id": encode_honcho_id("project:jarvis"),
+                    "level": "explicit",
+                }
+            ],
+            "next_cursor": "page-2",
+            "has_more": True,
+        },
+        {
+            "items": [
+                {
+                    "id": "c2",
+                    "content": "two",
+                    "observer_id": "neil",
+                    "observed_id": encode_honcho_id("project:jarvis"),
+                    "level": "explicit",
+                }
+            ],
+            "has_more": False,
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = _json(request)
+        if payload.get("cursor") == "page-2":
+            return httpx.Response(200, json=pages[1])
+        return httpx.Response(200, json=pages[0])
+
+    client = HonchoV3MemoryClient(_cfg(tmp_path), transport=httpx.MockTransport(handler))
+
+    assert [record.id for record in client.list_conclusions()] == ["c1", "c2"]
+    assert json.loads(sidecar_path.read_text(encoding="utf-8")) == {
+        "jarvis-dev": {
+            "c1": {"recorded_by": "neil"},
+            "c2": {"recorded_by": "neil"},
+        }
+    }
 
 
 def test_v3_queue_status_parses_idle_state(tmp_path) -> None:

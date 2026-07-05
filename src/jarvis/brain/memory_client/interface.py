@@ -117,6 +117,9 @@ class MemoryBackend(Protocol):
         content: str,
         observer_id: str | None = None,
         session_id: str | None = None,
+        # Explicit conclusions must include metadata["observed_at"]. The v3
+        # boundary defaults metadata["level"] to "explicit" and sends it to
+        # Honcho so level filtering remains server-visible.
         metadata: dict[str, Any] | None = None,
     ) -> ConclusionRecord: ...
 
