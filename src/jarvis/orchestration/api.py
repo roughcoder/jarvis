@@ -22,6 +22,7 @@ from jarvis.capabilities import (
     WORKER_SESSION_TURN,
 )
 from jarvis.config import Config, insecure_bind
+from jarvis.connectors.cockpit import CockpitConnector, CockpitThread
 from jarvis.ids import new_id, utc_now
 from jarvis.orchestration.cockpit import (
     API_VERSION,
@@ -429,6 +430,7 @@ def make_app(
         web.get("/v1/cockpit/snapshot", reads.snapshot),
         web.get("/v1/cockpit/events", sse.events),
         web.get("/v1/projects", reads.projects),
+        web.get("/v1/projects/{project_id}/threads", reads.project_threads),
         web.get("/v1/projects/{project_id}/memory", reads.project_memory),
         web.get("/v1/projects/{project_id}", reads.project_detail),
         web.get("/v1/workers", reads.workers),
@@ -446,6 +448,8 @@ def make_app(
         web.post("/v1/sessions/{session_ref}/checkpoints/restore", writes.session_write, name="restore_checkpoint"),
         web.post("/v1/sessions/{session_ref}/{action:turns|input|approval|interrupt|stop}", writes.session_write),
         web.get("/v1/sessions/{session_ref}", reads.session_detail),
+        web.post("/v1/projects/{project_id}/threads", writes.project_thread_open),
+        web.post("/v1/projects/{project_id}/threads/{thread_id}/turns", writes.project_thread_turn),
         web.post("/v1/work/start", writes.work_start),
         web.post("/v1/work/resume", writes.work_resume),
         web.post("/v1/work/validate", writes.work_validate),
@@ -571,6 +575,28 @@ class CockpitReadHandlers:
                 "peer_id": project.peer_id,
                 "representation": representation,
                 "conclusions": conclusions,
+            }
+        )
+
+    async def project_threads(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        registry = await asyncio.to_thread(_registry_store, self.ctx.cfg)
+        requester = _cockpit_requester_context(request, self.ctx.cfg)
+        project = (
+            await asyncio.to_thread(_visible_project_or_404, registry, request.match_info["project_id"], requester)
+            if requester is not None
+            else None
+        )
+        if project is None:
+            raise CockpitError("not_found", "project not found", status=404)
+        connector = _cockpit_connector(self.ctx)
+        threads = await asyncio.to_thread(connector.list_threads, project)
+        return web.json_response(
+            {
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "project_id": project.id,
+                "threads": [_thread_projection(thread) for thread in threads],
             }
         )
 
@@ -734,6 +760,126 @@ class CockpitReadHandlers:
 class CockpitWriteHandlers:
     def __init__(self, ctx: CockpitAppContext) -> None:
         self.ctx = ctx
+
+    async def project_thread_open(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        body = await _json_body(request)
+        registry = await asyncio.to_thread(_registry_store, self.ctx.cfg)
+        requester = _cockpit_requester_context(request, self.ctx.cfg)
+        project = (
+            await asyncio.to_thread(_visible_project_or_404, registry, request.match_info["project_id"], requester)
+            if requester is not None
+            else None
+        )
+        if project is None or requester is None:
+            raise CockpitError("not_found", "project not found", status=404)
+        try:
+            thread = await _cockpit_connector(self.ctx).open_thread(
+                project,
+                requester,
+                title=str(body.get("title") or ""),
+            )
+        except UnsupportedMemoryOperation as exc:
+            raise CockpitError("memory_unavailable", str(exc), recoverable=True, status=503) from exc
+        except (TimeoutError, OSError, RuntimeError) as exc:
+            raise CockpitError("memory_unavailable", public_error_message(str(exc)), recoverable=True, status=503) from exc
+        return web.json_response(
+            {
+                "ok": True,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "project_id": project.id,
+                "thread": _thread_projection(thread),
+            }
+        )
+
+    async def project_thread_turn(self, request: web.Request) -> web.StreamResponse:
+        await self.ctx.require_auth(request)
+        body = await _json_body(request)
+        _reject_attachments(body)
+        text = str(body.get("text") or body.get("message") or body.get("prompt") or "").strip()
+        if not text:
+            raise CockpitError("validation_failed", "turn text is required", recoverable=True, status=400)
+        registry = await asyncio.to_thread(_registry_store, self.ctx.cfg)
+        requester = _cockpit_requester_context(request, self.ctx.cfg)
+        project = (
+            await asyncio.to_thread(_visible_project_or_404, registry, request.match_info["project_id"], requester)
+            if requester is not None
+            else None
+        )
+        if project is None or requester is None:
+            raise CockpitError("not_found", "project not found", status=404)
+        connector = _cockpit_connector(self.ctx)
+        thread = await asyncio.to_thread(connector.index.get, project.id, request.match_info["thread_id"])
+        if thread is None:
+            raise CockpitError("not_found", "thread not found", status=404)
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
+        _apply_cors_headers(request, response)
+        await response.prepare(request)
+        cursor = new_id("threadturn")
+        await _write_sse(
+            response,
+            "thread.turn.started",
+            cursor,
+            _sse_envelope(
+                cursor,
+                "thread.turn.started",
+                {"project_id": project.id, "thread_id": thread.thread_id},
+            ),
+        )
+        try:
+            reply, updated = await connector.turn(project, thread, requester, text)
+        except (UnsupportedMemoryOperation, TimeoutError, OSError, RuntimeError) as exc:
+            await _write_sse(
+                response,
+                "thread.turn.error",
+                cursor,
+                _sse_envelope(
+                    cursor,
+                    "thread.turn.error",
+                    {
+                        "project_id": project.id,
+                        "thread_id": thread.thread_id,
+                        "error": {
+                            "code": "memory_unavailable",
+                            "message": public_error_message(str(exc)),
+                            "recoverable": True,
+                        },
+                    },
+                ),
+            )
+            await response.write_eof()
+            return response
+        except Exception as exc:  # noqa: BLE001 - preserve SSE contract after prepare.
+            await _write_sse(
+                response,
+                "thread.turn.error",
+                cursor,
+                _sse_envelope(
+                    cursor,
+                    "thread.turn.error",
+                    {
+                        "project_id": project.id,
+                        "thread_id": thread.thread_id,
+                        "error": {
+                            "code": "internal_error",
+                            "message": public_error_message(str(exc)),
+                            "recoverable": False,
+                        },
+                    },
+                ),
+            )
+            await response.write_eof()
+            return response
+        payload = {
+            "project_id": project.id,
+            "thread": _thread_projection(updated),
+            "reply": reply,
+        }
+        await _write_sse(response, "thread.reply", cursor, _sse_envelope(cursor, "thread.reply", payload))
+        await _write_sse(response, "thread.turn.done", cursor, _sse_envelope(cursor, "thread.turn.done", payload))
+        await response.write_eof()
+        return response
 
     async def work_start(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -1526,6 +1672,22 @@ def _project_memory_conclusion(conclusion: ConclusionRecord) -> dict[str, str]:
         "artifact_type": str(metadata.get("artifact_type") or ""),
         "recorded_by": str(metadata.get("recorded_by") or ""),
         "observed_at": str(metadata.get("observed_at") or ""),
+    }
+
+
+def _cockpit_connector(ctx: CockpitAppContext) -> CockpitConnector:
+    return CockpitConnector(ctx.cfg)
+
+
+def _thread_projection(thread: CockpitThread) -> dict[str, Any]:
+    return {
+        "thread_id": thread.thread_id,
+        "project_id": thread.project_id,
+        "session_id": thread.session_id,
+        "title": thread.title,
+        "created_at": thread.created_at,
+        "updated_at": thread.updated_at,
+        "created_by": thread.created_by,
     }
 
 

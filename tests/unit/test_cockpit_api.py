@@ -18,7 +18,8 @@ import httpx  # noqa: E402
 from aiohttp import web  # noqa: E402
 
 from jarvis.brain.capabilities import RequestContext, can_query_memory_peer  # noqa: E402
-from jarvis.brain.memory_client import ConclusionRecord, RepresentationRecord  # noqa: E402
+from jarvis.brain.memory_client import ConclusionRecord, MemoryMessage, RepresentationRecord, SessionPeer  # noqa: E402
+from jarvis.connectors.cockpit import CockpitConnector, CockpitThread, orchestrator_session_id  # noqa: E402
 from jarvis.config import Config, WorkerConfig  # noqa: E402
 import jarvis.orchestration.api as cockpit_api_module  # noqa: E402
 from jarvis.orchestration.api import CockpitAppContext, IdempotencyStore, SseSnapshotHub, _command_from_body, _idempotency_scope, make_app, serve  # noqa: E402
@@ -69,6 +70,11 @@ class FakeProjectMemory:
         self.cached_reads: list[str] = []
         self.live_reads: list[str] = []
         self.conclusion_filters: list[dict[str, Any]] = []
+        self.sessions: list[dict[str, Any]] = []
+        self.messages: list[dict[str, Any]] = []
+        self.created_conclusions: list[dict[str, Any]] = []
+        self.create_session_error: Exception | None = None
+        self.create_messages_error: Exception | None = None
 
     def read_cached_representation(self, user: str | None = None) -> str:
         self.cached_reads.append(user or "")
@@ -95,6 +101,136 @@ class FakeProjectMemory:
         for key, value in metadata.items():
             rows = [row for row in rows if row.metadata.get(key) == value]
         return rows
+
+    def create_session(
+        self,
+        session_id: str,
+        *,
+        peers: list[SessionPeer] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if self.create_session_error is not None:
+            raise self.create_session_error
+        row = {
+            "session_id": session_id,
+            "peers": [peer.peer_id for peer in peers or []],
+            "peer_configs": {
+                peer.peer_id: {
+                    "observe_me": peer.observe_me,
+                    "observe_others": peer.observe_others,
+                }
+                for peer in peers or []
+            },
+            "metadata": dict(metadata or {}),
+            "messages_at_create": len(self.messages),
+        }
+        self.sessions.append(row)
+        return row
+
+    def create_messages(self, session_id: str, messages: list[MemoryMessage]) -> list[dict[str, Any]]:
+        if self.create_messages_error is not None:
+            raise self.create_messages_error
+        rows = [
+            {
+                "session_id": session_id,
+                "peer_id": message.peer_id,
+                "content": message.content,
+                "metadata": dict(message.metadata),
+            }
+            for message in messages
+        ]
+        self.messages.extend(rows)
+        return rows
+
+    async def write_turn(self, user_text: str, assistant_text: str, *, user: str | None = None) -> None:
+        self.messages.append(
+            {
+                "session_id": f"default:{user or ''}",
+                "peer_id": user or "",
+                "content": user_text,
+                "metadata": {"assistant": assistant_text},
+            }
+        )
+
+    async def refresh_cache(self, min_interval_s: float = 0.0, *, user: str | None = None) -> bool:
+        return False
+
+    def create_conclusion(
+        self,
+        *,
+        observed_id: str,
+        content: str,
+        observer_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> ConclusionRecord:
+        row = {
+            "observed_id": observed_id,
+            "content": content,
+            "observer_id": observer_id or "jarvis",
+            "session_id": session_id,
+            "metadata": dict(metadata or {}),
+        }
+        self.created_conclusions.append(row)
+        return ConclusionRecord(
+            id=f"cc{len(self.created_conclusions)}",
+            observed_id=observed_id,
+            observer_id=row["observer_id"],
+            content=content,
+            session_id=session_id,
+            metadata=row["metadata"],
+        )
+
+    def queue_status(self) -> Any:
+        return type("QueueStatus", (), {"idle": True})()
+
+
+class _Fn:
+    def __init__(self, name: str, arguments: str) -> None:
+        self.name = name
+        self.arguments = arguments
+
+
+class _Call:
+    def __init__(self, cid: str, name: str, arguments: str) -> None:
+        self.id = cid
+        self.function = _Fn(name, arguments)
+
+
+class _Msg:
+    def __init__(self, content: str = "", tool_calls: list[_Call] | None = None) -> None:
+        self.content = content
+        self.tool_calls = tool_calls
+
+
+class FakeGateway:
+    def __init__(self, scripted: list[_Msg | str]) -> None:
+        self.scripted = scripted
+        self.calls = 0
+        self.messages: list[list[dict[str, Any]]] = []
+        self.tools: list[list[dict[str, Any]] | None] = []
+
+    async def complete(self, messages: list[dict[str, Any]], *, model: str | None = None) -> str:
+        self.messages.append(messages)
+        item = self.scripted[self.calls]
+        self.calls += 1
+        return item if isinstance(item, str) else item.content
+
+    async def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        usage_out: dict[str, Any] | None = None,
+    ) -> _Msg:
+        self.messages.append(messages)
+        self.tools.append(tools)
+        item = self.scripted[self.calls]
+        self.calls += 1
+        if isinstance(item, str):
+            return _Msg(content=item)
+        return item
 
 
 async def _with_server(cfg: Config, fn: Callable[[str, httpx.AsyncClient], Any], *, http_get=None, http_post=None) -> Any:  # noqa: ANN001
@@ -127,6 +263,7 @@ def _cfg(
     oauth_default_alg: str = "RS256",
     oauth_jwks_ttl_s: str = "300",
     oauth_jwks_min_refresh_s: str = "30",
+    memory_backend: str = "v2",
 ) -> Config:
     env = tmp_path / ".env"
     workspace = tmp_path / "orchestration"
@@ -154,6 +291,9 @@ def _cfg(
                 f"ORCHESTRATION_OAUTH_JWKS_MIN_REFRESH_S={oauth_jwks_min_refresh_s}",
                 f"CAPS_DEFAULT_CAPABILITIES={caps}",
                 f"CAPS_USERS_DIR={users_path}",
+                f"MEMORY_BACKEND={memory_backend}",
+                f"MEMORY_CACHE_PATH={tmp_path / 'memory-cache.json'}",
+                f"MEMORY_CURATION_OUTBOX_PATH={tmp_path / 'curation-outbox.jsonl'}",
                 "WORKER_HOST=worker.test",
                 "WORKER_PORT=8780",
                 "WORKER_SUPPORTED_ENGINES=codex,claude",
@@ -302,6 +442,23 @@ def _conclusion(
             "observed_at": observed_at,
         },
     )
+
+
+def _sse_events(text: str) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for block in text.strip().split("\n\n"):
+        data = ""
+        event = ""
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                event = line[len("event: ") :]
+            elif line.startswith("data: "):
+                data = line[len("data: ") :]
+        if data:
+            item = json.loads(data)
+            item["_event"] = event
+            events.append(item)
+    return events
 
 
 def _oauth_fixture(*, kid: str = "test-key", include_alg: bool = True) -> tuple[dict[str, Any], Callable[..., Response]]:
@@ -1599,6 +1756,172 @@ def test_cockpit_project_memory_degrades_when_backend_is_v2_or_dead(tmp_path, mo
         assert body["peer_id"] == "project:neil-shared"
         assert body["representation"] == ""
         assert body["conclusions"] == []
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_threads_open_and_list_are_membership_filtered(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    connector = CockpitConnector(cfg, memory=memory, gateway=FakeGateway(["unused"]), tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Kickoff"})
+        listed = await client.get(f"{base}/v1/projects/neil-shared/threads")
+        hidden_list = await client.get(f"{base}/v1/projects/alice-private/threads")
+        hidden_open = await client.post(f"{base}/v1/projects/alice-private/threads", json={})
+        hidden_post = await client.post(f"{base}/v1/projects/alice-private/threads/thread_1/turns", json={"text": "hi"})
+
+        assert opened.status_code == 200
+        thread = opened.json()["thread"]
+        assert thread["project_id"] == "neil-shared"
+        assert thread["session_id"] == orchestrator_session_id("neil-shared", thread["thread_id"])
+        assert listed.status_code == 200
+        assert [item["thread_id"] for item in listed.json()["threads"]] == [thread["thread_id"]]
+        assert hidden_list.status_code == 404
+        assert hidden_open.status_code == 404
+        assert hidden_post.status_code == 404
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    assert len(memory.sessions) == 1
+    assert memory.sessions[0]["messages_at_create"] == 0
+    assert memory.sessions[0]["peers"] == ["project:neil-shared", "neil", "jarvis"]
+    assert memory.sessions[0]["metadata"]["kind"] == "cockpit_orchestrator"
+    assert memory.messages == []
+
+
+def test_cockpit_thread_turn_streams_reply_and_writes_lane1_attribution(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory(cached="cached shared context", live="live shared context")
+    gateway = FakeGateway(["The route should stream over SSE."])
+    connector = CockpitConnector(cfg, memory=memory, gateway=gateway, tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Plan"})
+        thread = opened.json()["thread"]
+        response = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "What should we build first?"},
+        )
+        events = _sse_events(response.text)
+        reply_events = [event for event in events if event["_event"] == "thread.reply"]
+        done_events = [event for event in events if event["_event"] == "thread.turn.done"]
+
+        assert response.status_code == 200
+        assert response.headers["Content-Type"].startswith("text/event-stream")
+        assert reply_events[0]["payload"]["reply"] == "The route should stream over SSE."
+        assert done_events
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    assert [message["peer_id"] for message in memory.messages] == ["neil", "jarvis"]
+    assert memory.messages[0]["content"] == "What should we build first?"
+    assert memory.messages[1]["content"] == "The route should stream over SSE."
+    assert memory.messages[0]["session_id"].startswith("project:neil-shared:orchestrator:")
+    system_prompt = gateway.messages[0][0]["content"]
+    assert "Project registry entry" in system_prompt
+    assert "Live project representation:\nlive shared context" in system_prompt
+
+
+def test_cockpit_thread_turn_records_decision_only_through_lane2_tool(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        identity="neil",
+        caps="memory.curate",
+        memory_backend="v3",
+    )
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    gateway = FakeGateway(
+        [
+            _Msg(
+                tool_calls=[
+                    _Call(
+                        "call_1",
+                        "record_decision",
+                        json.dumps({"project": "Neil Shared", "content": "Use SSE for thread replies."}),
+                    )
+                ]
+            ),
+            _Msg(content="Queued that decision."),
+        ]
+    )
+    connector = CockpitConnector(cfg, memory=memory, gateway=gateway, tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={})
+        thread = opened.json()["thread"]
+        response = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "Record the SSE decision."},
+        )
+        events = _sse_events(response.text)
+
+        assert response.status_code == 200
+        assert any(event["_event"] == "thread.reply" for event in events)
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    assert len(memory.created_conclusions) == 1
+    conclusion = memory.created_conclusions[0]
+    assert conclusion["observed_id"] == "project:neil-shared"
+    assert conclusion["content"] == "Decision: Use SSE for thread replies."
+    assert conclusion["metadata"]["artifact_type"] == "decision"
+    assert conclusion["metadata"]["project_id"] == "neil-shared"
+    assert conclusion["metadata"]["channel"] == "cockpit"
+    assert [message["peer_id"] for message in memory.messages] == ["neil", "jarvis"]
+
+
+def test_cockpit_thread_backend_gaps_degrade_without_500(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    memory.create_session_error = cockpit_api_module.UnsupportedMemoryOperation("v2 unsupported")
+    connector = CockpitConnector(cfg, memory=memory, gateway=FakeGateway(["reply"]), tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        open_failed = await client.post(f"{base}/v1/projects/neil-shared/threads", json={})
+        assert open_failed.status_code == 503
+        assert open_failed.json()["error"]["code"] == "memory_unavailable"
+
+        thread = connector.index.save(
+            CockpitThread(
+                thread_id="thread_existing",
+                project_id="neil-shared",
+                session_id=orchestrator_session_id("neil-shared", "thread_existing"),
+                title="Existing",
+                created_at="2026-07-05T09:00:00+00:00",
+                updated_at="2026-07-05T09:00:00+00:00",
+                created_by="neil",
+            )
+        )
+        memory.create_session_error = None
+        memory.create_messages_error = cockpit_api_module.UnsupportedMemoryOperation("v2 unsupported")
+        turn_failed = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}/turns",
+            json={"text": "hi"},
+        )
+        events = _sse_events(turn_failed.text)
+
+        assert turn_failed.status_code == 200
+        assert events[-1]["_event"] == "thread.turn.error"
+        assert events[-1]["payload"]["error"]["code"] == "memory_unavailable"
 
     import asyncio
 
