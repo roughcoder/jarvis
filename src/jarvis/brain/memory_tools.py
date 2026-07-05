@@ -8,7 +8,13 @@ from typing import Any
 
 from jarvis.brain.capabilities import can_query_memory_peer, can_write_memory_peer
 from jarvis.brain.memory_client import ConclusionRecord, MemoryBackend
-from jarvis.brain.memory_outbox import ActiveRetraction, CurationOutbox, RetractionIndex, retraction_index_path
+from jarvis.brain.memory_outbox import (
+    ActiveRetraction,
+    CurationOutbox,
+    RetractionIndex,
+    memory_text_matches,
+    retraction_index_path,
+)
 from jarvis.brain.registry import RegistryStore
 from jarvis.config import MemoryConfig
 from jarvis.runtime import RequestContext
@@ -134,11 +140,10 @@ def make_memory_tools(
             "artifact_type": artifact_type,
             "status": status,
         }
-        prefix = "Decision: " if artifact_type == "decision" and not content.lower().startswith("decision:") else ""
         entry = outbox.enqueue_create(
             observed_id=resolution.entry.peer_id,
             observer_id=ctx.memory_peer,
-            content=f"{prefix}{content}",
+            content=content,
             metadata=metadata,
         )
         return f"Noted - queued {artifact_type} for {resolution.entry.name} ({entry.content_hash})."
@@ -190,12 +195,7 @@ def make_memory_tools(
             return _confirmation_text(matches, replacement=bool(replacement))
         if not ids:
             return "error: confirmation requires conclusion_ids."
-        matches = await asyncio.to_thread(
-            memory.query_conclusions,
-            query,
-            observed_id=peer_id,
-            limit=max(20, len(ids)),
-        )
+        matches = await asyncio.to_thread(memory.list_conclusions, observed_id=peer_id)
         selected, missing = _selected_conclusions(matches, ids)
         if missing:
             return "error: selected memories were not found; search again before confirming."
@@ -431,11 +431,7 @@ def _replacement_reasserts_conclusion(replacement: str, conclusion: ConclusionRe
 
 
 def _text_matches(left: str, right: str) -> bool:
-    left_text = " ".join(left.split()).casefold()
-    right_text = " ".join(right.split()).casefold()
-    if not left_text or not right_text:
-        return False
-    return left_text == right_text or left_text in right_text or right_text in left_text
+    return memory_text_matches(left, right)
 
 
 def _memory_tool_result(text: str, *, retractions: list[ActiveRetraction] | None = None) -> str:

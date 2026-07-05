@@ -77,6 +77,7 @@ class FakeMemory:
         self.fail_after_create = False
         self.representations: dict[str, str] = {}
         self.query_matches: list[ConclusionRecord] = []
+        self.list_matches: list[ConclusionRecord] = []
 
     def read_cached_representation(self, user: str | None = None) -> str:
         return self.representations.get(user or "neil", "")
@@ -132,6 +133,7 @@ class FakeMemory:
             )
             for i, row in enumerate(self.created, start=1)
         ]
+        rows.extend(self.list_matches or self.query_matches)
         if observed_id:
             rows = [row for row in rows if row.observed_id == observed_id]
         if observer_id:
@@ -246,6 +248,79 @@ def test_outbox_cancel_pending_matches_semantic_forget_query(tmp_path) -> None:
 
     assert len(cancelled) == 1
     assert outbox.pending_entries() == []
+
+
+def test_retraction_short_claim_does_not_clear_unrelated_substring(tmp_path) -> None:
+    index = RetractionIndex(tmp_path / "retractions.json")
+    index.record(
+        observed_id="contact:klaus",
+        metadata={
+            "recorded_by": "neil",
+            "observed_at": "2026-07-04",
+            "retracted_conclusion_id": "c1",
+            "retracted_conclusion_level": "deductive",
+            "retracted_content": "Fridays",
+            "retraction_reason": "user_forget_request",
+        },
+    )
+
+    cleared = index.clear_for_assertion(observed_id="contact:klaus", content="Jules likes Fridays.")
+
+    assert cleared == []
+    assert [row.retracted_content for row in index.active(observed_id="contact:klaus")] == ["Fridays"]
+
+
+def test_retraction_substantial_restatement_still_clears(tmp_path) -> None:
+    index = RetractionIndex(tmp_path / "retractions.json")
+    index.record(
+        observed_id="contact:klaus",
+        metadata={
+            "recorded_by": "neil",
+            "observed_at": "2026-07-04",
+            "retracted_conclusion_id": "c1",
+            "retracted_conclusion_level": "deductive",
+            "retracted_content": "Klaus keeps a vintage Leica camera in the study.",
+            "retraction_reason": "user_forget_request",
+        },
+    )
+
+    cleared = index.clear_for_assertion(
+        observed_id="contact:klaus",
+        content="Klaus keeps a vintage Leica camera in the study, not in the office.",
+    )
+
+    assert [row.retracted_conclusion_id for row in cleared] == ["c1"]
+    assert index.active(observed_id="contact:klaus") == []
+
+
+def test_retraction_index_active_reuses_unchanged_read_cache(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    path = tmp_path / "retractions.json"
+    index = RetractionIndex(path)
+    index.record(
+        observed_id="contact:klaus",
+        metadata={
+            "recorded_by": "neil",
+            "observed_at": "2026-07-04",
+            "retracted_conclusion_id": "c1",
+            "retracted_conclusion_level": "deductive",
+            "retracted_content": "Klaus works Fridays.",
+            "retraction_reason": "user_forget_request",
+        },
+    )
+    original_read_text = Path.read_text
+    reads = 0
+
+    def counted_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        nonlocal reads
+        if self == path:
+            reads += 1
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read_text)
+
+    assert len(index.active(observed_id="contact:klaus")) == 1
+    assert len(index.active(observed_id="contact:klaus")) == 1
+    assert reads == 0
 
 
 def test_outbox_pending_entries_uses_compacted_state_for_delivered_history(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -383,7 +458,7 @@ def test_project_finding_and_decision_payload_shape(tmp_path) -> None:
     assert entries[0].metadata["project_id"] == "jarvis"
     assert entries[0].metadata["artifact_type"] == "finding"
     assert entries[0].metadata["status"] == "open"
-    assert entries[1].content == "Decision: Use Honcho v3."
+    assert entries[1].content == "Use Honcho v3."
     assert entries[1].metadata["artifact_type"] == "decision"
     assert entries[1].metadata["status"] == "accepted"
 
@@ -485,6 +560,49 @@ def test_forget_confirmation_query_sends_self_scoped_semantic_filters(tmp_path) 
             "top_k": 5,
         }
     ]
+
+
+def test_forget_confirm_uses_id_stable_lookup_not_second_semantic_query(tmp_path) -> None:
+    backend = FakeMemory()
+    chosen = ConclusionRecord(
+        id="c1",
+        content="Klaus works Fridays.",
+        observer_id="contact:klaus",
+        observed_id="contact:klaus",
+        level="explicit",
+    )
+    backend.query_matches = [chosen]
+    backend.list_matches = [chosen]
+    cfg = _memory_cfg(tmp_path)
+    outbox = CurationOutbox(cfg.curation_outbox_path)
+    tool = {
+        tool.name: tool
+        for tool in make_memory_tools(
+            cfg,
+            memory=backend,
+            outbox=outbox,
+            registry=_registry(tmp_path),
+        )
+    }["forget_memory"]
+    ctx = _ctx("memory.curate")
+
+    ask = asyncio.run(tool.handler(ctx, {"target": "Klaus", "query": "Fridays"}))
+    backend.query_matches = []
+    done = asyncio.run(
+        tool.handler(
+            ctx,
+            {
+                "target": "Klaus",
+                "query": "Fridays",
+                "confirm": True,
+                "conclusion_ids": ["c1"],
+            },
+        )
+    )
+
+    assert "c1: Klaus works Fridays." in ask
+    assert done == "Forgotten."
+    assert [entry.conclusion_id for entry in outbox.pending_entries(observed_id="contact:klaus")] == ["c1"]
 
 
 def test_forget_derived_conclusion_queues_contradiction_retraction(tmp_path) -> None:
