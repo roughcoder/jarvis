@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from jarvis.brain import project_management as project_management_module
 from jarvis.brain.project_management import ProjectOperationError, ProjectOperationService, upload_session_id
 from jarvis.brain.registry import RegistryStore
 from jarvis.config import Config
@@ -17,8 +18,11 @@ class FakeMemory:
     def __init__(self) -> None:
         self.uploads: list[dict[str, Any]] = []
         self.deleted_sessions: list[str] = []
+        self.fail_upload: Exception | None = None
 
     def upload_file(self, session_id: str, *, peer_id: str, path: Path, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        if self.fail_upload is not None:
+            raise self.fail_upload
         assert path.exists()
         row = {"session_id": session_id, "peer_id": peer_id, "path": str(path), "metadata": dict(metadata or {})}
         self.uploads.append(row)
@@ -27,6 +31,12 @@ class FakeMemory:
     def delete_session(self, session_id: str) -> None:
         self.deleted_sessions.append(session_id)
 
+    def query_conclusions(self, query: str, **kwargs: Any) -> list[Any]:
+        return []
+
+    def list_conclusions(self, **kwargs: Any) -> list[Any]:
+        return []
+
 
 def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
     env = tmp_path / ".env"
@@ -34,8 +44,13 @@ def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
         "\n".join(
             [
                 f"REGISTRY_PATH={tmp_path / 'jarvis-workspace' / 'registry' / 'registry.json'}",
+                f"REGISTRY_FILES_VAULT_ROOT={tmp_path / 'jarvis-workspace'}",
+                f"REGISTRY_UPLOAD_STAGING_ROOT={tmp_path / 'jarvis-workspace' / 'uploads' / 'staging'}",
+                f"REGISTRY_UPLOAD_MANIFEST_PATH={tmp_path / 'jarvis-workspace' / 'registry' / 'upload-manifest.json'}",
                 f"MEMORY_CACHE_PATH={tmp_path / 'cache.json'}",
                 f"MEMORY_CURATION_OUTBOX_PATH={tmp_path / 'outbox.jsonl'}",
+                "MEMORY_BACKEND=v3",
+                "BRAIN_PEER_TOKEN=peer-token",
             ]
         ),
         encoding="utf-8",
@@ -71,8 +86,8 @@ def _seed(store: RegistryStore) -> None:
     store.load()
 
 
-def _ctx(identity: str) -> RequestContext:
-    return RequestContext("dev", identity, "personal", frozenset(), channel="cockpit", peer=identity)
+def _ctx(identity: str, caps: frozenset[str] = frozenset()) -> RequestContext:
+    return RequestContext("dev", identity, "personal", caps, channel="cockpit", peer=identity)
 
 
 def _service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ProjectOperationService, RegistryStore, FakeMemory]:
@@ -124,6 +139,16 @@ def test_project_role_gate_and_transactional_update(tmp_path, monkeypatch) -> No
             )
         )
     assert store.get_project("jarvis").as_dict() == before
+
+
+def test_archived_project_cannot_be_unarchived_by_member_update(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    service, store, _memory = _service(tmp_path, monkeypatch)
+    asyncio.run(service.execute(_ctx("neil"), "project.archive", {"project_id": "jarvis", "archived": True}))
+
+    with pytest.raises(ProjectOperationError, match="unarchived through the owner route"):
+        asyncio.run(service.execute(_ctx("jules"), "project.update", {"project_id": "jarvis", "status": "active"}))
+
+    assert store.get_project("jarvis").status == "archived"
 
 
 def test_project_create_owner_and_admin_ops(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -179,6 +204,11 @@ def test_upload_writes_vault_first_then_ingests_and_retracts_session(tmp_path, m
     assert metadata["original_path"] == str(original)
     assert metadata["agent"] == "claude-code"
 
+    listed = asyncio.run(service.execute(_ctx("jules"), "project.file.list", {"project_id": "jarvis"}))
+    assert listed["files"][0]["doc_id"] == result["doc_id"]
+    assert listed["files"][0]["original_path"] == str(original)
+    assert listed["files"][0]["ingestion"]["queued"] is True
+
     retracted = asyncio.run(
         service.execute(
             _ctx("jules"),
@@ -188,3 +218,132 @@ def test_upload_writes_vault_first_then_ingests_and_retracts_session(tmp_path, m
     )
     assert retracted["retracted"] is True
     assert memory.deleted_sessions == [result["session_id"]]
+    assert original.exists()
+    assert asyncio.run(service.execute(_ctx("jules"), "project.file.list", {"project_id": "jarvis"}))["files"] == []
+    retracted_files = asyncio.run(
+        service.execute(_ctx("jules"), "project.file.list", {"project_id": "jarvis", "include_retracted": True})
+    )["files"]
+    assert retracted_files[0]["retracted"] is True
+    assert retracted_files[0]["doc_id"] == result["doc_id"]
+
+
+def test_upload_ingestion_failure_returns_recoverable_result_with_vault_metadata(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    service, _store, memory = _service(tmp_path, monkeypatch)
+    memory.fail_upload = TimeoutError("honcho timed out")
+
+    result = asyncio.run(
+        service.execute(
+            _ctx("jules"),
+            "project.file.upload",
+            {"project_id": "jarvis", "filename": "Spec.md", "content_text": "# Spec"},
+        )
+    )
+
+    assert Path(result["original_path"]).exists()
+    assert result["doc_id"]
+    assert result["content_hash"].startswith("sha256:")
+    assert result["ingestion"] == {"queued": False, "error": "honcho timed out", "recoverable": True}
+    assert result["file"]["ingestion"] == result["ingestion"]
+
+
+def test_upload_rejects_path_outside_staging_root(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    service, _store, _memory = _service(tmp_path, monkeypatch)
+    outside = tmp_path / "secret.env"
+    outside.write_text("TOKEN=secret", encoding="utf-8")
+
+    with pytest.raises(ProjectOperationError, match="upload staging root"):
+        asyncio.run(service.execute(_ctx("jules"), "project.file.upload", {"project_id": "jarvis", "source_path": str(outside)}))
+
+
+def test_upload_accepts_path_inside_staging_root(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    service, _store, memory = _service(tmp_path, monkeypatch)
+    staging = Path(service.cfg.registry.upload_staging_root)
+    staging.mkdir(parents=True)
+    source = staging / "spec.md"
+    source.write_text("# staged", encoding="utf-8")
+
+    result = asyncio.run(service.execute(_ctx("jules"), "project.file.upload", {"project_id": "jarvis", "source_path": str(source)}))
+
+    assert Path(result["original_path"]).read_text(encoding="utf-8") == "# staged"
+    assert memory.uploads[0]["path"] == result["original_path"]
+
+
+def test_upload_rejects_file_and_private_urls(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    service, _store, _memory = _service(tmp_path, monkeypatch)
+
+    with pytest.raises(ProjectOperationError, match="http or https"):
+        asyncio.run(service.execute(_ctx("jules"), "project.file.upload", {"project_id": "jarvis", "source_url": "file:///etc/passwd"}))
+
+    with pytest.raises(ProjectOperationError, match="host is not allowed"):
+        asyncio.run(service.execute(_ctx("jules"), "project.file.upload", {"project_id": "jarvis", "source_url": "http://127.0.0.1/x"}))
+
+
+def test_upload_rejects_oversize_url_response(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    service, _store, _memory = _service(tmp_path, monkeypatch)
+    service.cfg.registry.max_upload_bytes = 5
+
+    class Response:
+        headers: dict[str, str] = {}
+
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, *args):  # noqa: ANN002, ANN204
+            return False
+
+        def read(self, _size: int) -> bytes:
+            return b"abcdef"
+
+    class Opener:
+        def open(self, _request, timeout: int):  # noqa: ANN001, ARG002, ANN201
+            return Response()
+
+    monkeypatch.setattr(
+        project_management_module.socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [(None, None, None, None, ("93.184.216.34", 80))],
+    )
+    monkeypatch.setattr(project_management_module.urllib.request, "build_opener", lambda *_args: Opener())
+
+    with pytest.raises(ProjectOperationError, match="exceeds max size"):
+        asyncio.run(
+            service.execute(
+                _ctx("jules"),
+                "project.file.upload",
+                {"project_id": "jarvis", "source_url": "https://example.com/large.md"},
+            )
+        )
+
+
+def test_files_root_is_relative_and_confined(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    service, store, _memory = _service(tmp_path, monkeypatch)
+
+    with pytest.raises(ProjectOperationError, match="relative path"):
+        asyncio.run(service.execute(_ctx("jules"), "project.update", {"project_id": "jarvis", "files_root": "/tmp/out"}))
+    with pytest.raises(ProjectOperationError, match="relative path"):
+        asyncio.run(service.execute(_ctx("jules"), "project.update", {"project_id": "jarvis", "files_root": "../out"}))
+
+    result = asyncio.run(
+        service.execute(_ctx("jules"), "project.update", {"project_id": "jarvis", "files_root": "projects/jarvis/docs"})
+    )
+    assert result["project"]["files_root"] == "projects/jarvis/docs"
+    upload = asyncio.run(
+        service.execute(_ctx("jules"), "project.file.upload", {"project_id": "jarvis", "filename": "a.txt", "content_text": "ok"})
+    )
+    assert Path(upload["original_path"]).resolve().is_relative_to(Path(service.cfg.registry.files_vault_root).resolve())
+    assert store.get_project("jarvis").files_root == "projects/jarvis/docs"
+
+
+def test_project_memory_forget_is_member_gated(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    service, _store, _memory = _service(tmp_path, monkeypatch)
+
+    with pytest.raises(ProjectOperationError) as hidden:
+        asyncio.run(
+            service.execute(
+                _ctx("alice", frozenset({"memory.curate"})),
+                "project.memory.forget",
+                {"project_id": "jarvis", "query": "old fact"},
+            )
+        )
+
+    assert hidden.value.status == 404

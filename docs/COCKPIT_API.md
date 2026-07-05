@@ -102,8 +102,23 @@ configured `JARVIS_ENV_FILE`.
 
 ```text
 GET /v1/projects
+POST /v1/projects
 GET /v1/projects/{id}
+PATCH /v1/projects/{id}
+PATCH /v1/projects/{id}/visibility
+POST /v1/projects/{id}/members
+DELETE /v1/projects/{id}/members/{member_id}
+POST /v1/projects/{id}/archive
+POST /v1/projects/{id}/unarchive
+DELETE /v1/projects/{id}
 GET /v1/projects/{id}/memory
+POST /v1/projects/{id}/findings
+POST /v1/projects/{id}/decisions
+POST /v1/projects/{id}/memory/forget
+POST /v1/projects/{id}/memory/correct
+GET /v1/projects/{id}/files
+POST /v1/projects/{id}/files
+DELETE /v1/projects/{id}/files/{doc_id}
 GET /v1/projects/{id}/threads
 POST /v1/projects/{id}/threads
 POST /v1/projects/{id}/threads/{tid}/turns
@@ -114,7 +129,9 @@ to Honcho directly. List and detail reads are filtered by the authenticated
 requester's configured Jarvis identity; without an identity the list is empty.
 Projects outside the requester visibility set are indistinguishable from
 missing projects: they are omitted from the list and return `404 not_found` on
-detail and memory reads.
+detail, memory, file, and write routes. Project writes are forwarded to the
+brain over the protocol; the API process does not write the registry or call
+Honcho for project curation/upload actions.
 
 `GET /v1/projects` excludes archived projects by default. Add
 `?include_archived=true` or `?include_archived=1` to include them.
@@ -135,7 +152,7 @@ Project rows use the registry entry shape:
     {"name": "runtime", "remote": "roughcoder/jarvis", "default": true}
   ],
   "links": {"jira": "JARV", "urls": []},
-  "files_root": "jarvis-workspace/projects/jarvis/files"
+  "files_root": "projects/jarvis/files"
 }
 ```
 
@@ -168,7 +185,7 @@ Detail response:
       {"name": "runtime", "remote": "roughcoder/jarvis", "default": true}
     ],
     "links": {"jira": "JARV", "urls": []},
-    "files_root": "jarvis-workspace/projects/jarvis/files"
+    "files_root": "projects/jarvis/files"
   }
 }
 ```
@@ -200,6 +217,154 @@ filtered by `project_id`. The API reads through the configured Jarvis memory
 backend and registry only. If the memory backend is unavailable or does not
 support live representation/conclusion reads, the response still succeeds with
 an empty or cached representation and any conclusions that were available.
+
+#### Project Management
+
+Project entry writes use one brain-owned operation path and the shared
+member/owner access matrix.
+
+Member-gated routes:
+
+```text
+POST /v1/projects
+PATCH /v1/projects/{id}
+POST /v1/projects/{id}/findings
+POST /v1/projects/{id}/decisions
+POST /v1/projects/{id}/memory/forget
+POST /v1/projects/{id}/memory/correct
+GET /v1/projects/{id}/files
+POST /v1/projects/{id}/files
+DELETE /v1/projects/{id}/files/{doc_id}
+```
+
+Owner-only routes:
+
+```text
+PATCH /v1/projects/{id}/visibility
+POST /v1/projects/{id}/members
+DELETE /v1/projects/{id}/members/{member_id}
+POST /v1/projects/{id}/archive
+POST /v1/projects/{id}/unarchive
+DELETE /v1/projects/{id}
+```
+
+`POST /v1/projects` creates a project owned by the authenticated Jarvis
+principal. `PATCH /v1/projects/{id}` accepts only member-editable fields:
+`name`, `aliases`, `status`, `links`, `files_root`, and `repos`. Owner-only
+fields in this body are rejected; visibility, members, archive/unarchive, and
+delete use their explicit routes. Member status edits are limited to
+`active` <-> `paused`; an archived project must be unarchived through the
+owner-only route.
+
+`files_root` is stored as a relative project-vault path. Absolute paths and
+`..` traversal are rejected; uploads always resolve below
+`REGISTRY_FILES_VAULT_ROOT`.
+
+Create/update response:
+
+```json
+{
+  "ok": true,
+  "api_version": "v1",
+  "schema_version": 1,
+  "project": {
+    "id": "jarvis",
+    "name": "Jarvis",
+    "peer_id": "project:jarvis",
+    "aliases": [],
+    "owner": "neil",
+    "members": ["neil"],
+    "visibility": "household",
+    "status": "active",
+    "repos": [],
+    "links": {"jira": "", "urls": []},
+    "files_root": "projects/jarvis/files"
+  }
+}
+```
+
+`POST /v1/projects/{id}/findings` and `/decisions` enqueue Lane 2 curation with
+project provenance. `POST /memory/forget` and `/memory/correct` also route
+through the brain and are member-gated. They follow the two-step memory tool
+shape: first call with `query`, then confirm with `confirm: true` and
+`conclusion_ids`.
+
+File uploads use true multipart:
+
+```text
+POST /v1/projects/{id}/files
+Content-Type: multipart/form-data
+
+file=<binary file part>
+title=Architecture Spec
+artifact_type=spec
+```
+
+The Cockpit app raises aiohttp's request body limit from the default 1 MiB to
+match `REGISTRY_MAX_UPLOAD_BYTES` plus multipart overhead. The brain still
+enforces the authoritative max upload size before vault write/ingestion.
+
+Upload response includes the durable vault metadata and ingestion state:
+
+```json
+{
+  "ok": true,
+  "api_version": "v1",
+  "schema_version": 1,
+  "project_id": "jarvis",
+  "doc_id": "architecture-spec-93c4...",
+  "session_id": "project:jarvis:uploads:architecture-spec-93c4...",
+  "content_hash": "sha256:...",
+  "original_path": ".../jarvis-workspace/projects/jarvis/files/architecture-spec-93c4.md",
+  "metadata": {
+    "project_id": "jarvis",
+    "artifact_type": "spec",
+    "title": "Architecture Spec",
+    "uploaded_by": "neil",
+    "source": "file",
+    "channel": "cockpit",
+    "content_hash": "sha256:...",
+    "original_path": "...",
+    "mime_type": "text/markdown",
+    "observed_at": "2026-07-05T09:00:00+00:00"
+  },
+  "ingestion": {"queued": true, "response": {}},
+  "file": {
+    "doc_id": "architecture-spec-93c4...",
+    "title": "Architecture Spec",
+    "session_id": "project:jarvis:uploads:architecture-spec-93c4...",
+    "original_path": "...",
+    "content_hash": "sha256:...",
+    "artifact_type": "spec",
+    "uploaded_by": "neil",
+    "observed_at": "2026-07-05T09:00:00+00:00",
+    "retracted": false,
+    "ingestion": {"queued": true, "response": {}}
+  }
+}
+```
+
+If Honcho ingestion fails after the vault write, the response still includes
+`doc_id`, `original_path`, and `content_hash` with
+`ingestion: {"queued": false, "recoverable": true, "error": "..."}` so clients
+can reconcile or retry without losing the durable original.
+
+`GET /v1/projects/{id}/files` returns non-retracted manifest entries by
+default. Add `?include_retracted=true` to include retracted entries.
+
+```json
+{
+  "ok": true,
+  "api_version": "v1",
+  "schema_version": 1,
+  "project_id": "jarvis",
+  "files": []
+}
+```
+
+`DELETE /v1/projects/{id}/files/{doc_id}` deletes the dedicated upload session
+from Honcho and marks the manifest entry retracted. The vault original is kept
+for audit/recovery and hidden from default file lists.
 
 #### Orchestrator Threads
 

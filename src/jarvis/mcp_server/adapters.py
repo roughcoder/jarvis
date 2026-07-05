@@ -266,45 +266,43 @@ class JarvisMCPService:
         self,
         ctx: RequestContext,
         *,
+        project_id: str,
         query: str,
-        target: str = "",
         confirm: bool = False,
         conclusion_ids: list[str] | None = None,
     ) -> dict[str, str]:
-        result = await self._execute_memory_tool(
+        result = await self._brain_project_write(
             ctx,
-            "forget_memory",
+            "project.memory.forget",
             {
+                "project_id": project_id,
                 "query": query,
-                "target": target,
                 "confirm": confirm,
                 "conclusion_ids": conclusion_ids or [],
                 "source": "mcp",
                 "channel": "mcp",
             },
         )
-        if result.startswith("error:"):
-            raise MCPAccessError(result)
-        return {"result": result}
+        return {"result": str(result.get("result") or "")}
 
     async def correct(
         self,
         ctx: RequestContext,
         *,
+        project_id: str,
         query: str,
         replacement: str,
-        target: str = "",
         confirm: bool = False,
         conclusion_ids: list[str] | None = None,
         observed_at: str = "",
     ) -> dict[str, str]:
-        result = await self._execute_memory_tool(
+        result = await self._brain_project_write(
             ctx,
-            "correct_memory",
+            "project.memory.correct",
             {
+                "project_id": project_id,
                 "query": query,
                 "replacement": replacement,
-                "target": target,
                 "confirm": confirm,
                 "conclusion_ids": conclusion_ids or [],
                 "observed_at": observed_at,
@@ -312,9 +310,7 @@ class JarvisMCPService:
                 "channel": "mcp",
             },
         )
-        if result.startswith("error:"):
-            raise MCPAccessError(result)
-        return {"result": result}
+        return {"result": str(result.get("result") or "")}
 
     async def open_thread(
         self,
@@ -383,6 +379,19 @@ class JarvisMCPService:
             ctx,
             "project.file.retract",
             {"project_id": project_id, "doc_id": doc_id},
+        )
+
+    async def project_list_files(
+        self,
+        ctx: RequestContext,
+        *,
+        project_id: str,
+        include_retracted: bool = False,
+    ) -> dict[str, Any]:
+        return await self._brain_project_write(
+            ctx,
+            "project.file.list",
+            {"project_id": project_id, "include_retracted": include_retracted},
         )
 
     async def _record_project_artifact(

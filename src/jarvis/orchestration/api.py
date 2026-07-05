@@ -14,7 +14,6 @@ from aiohttp import web
 
 from jarvis.brain.memory_client import ConclusionRecord, MemoryClient, UnsupportedMemoryOperation
 from jarvis.brain.memory_outbox import CurationOutbox
-from jarvis.brain.memory_tools import make_memory_tools
 from jarvis.brain.project_management import BrainProjectClient, ProjectOperationError
 from jarvis.brain.registry import ProjectEntry, RegistryStore
 from jarvis.capabilities import (
@@ -101,7 +100,6 @@ from jarvis.orchestration.store import OrchestrationStore
 from jarvis.orchestration.supervisor import final_session_phase
 from jarvis.orchestration.workers import WorkerRegistry
 from jarvis.system_info import system_info_cached
-from jarvis.runtime import CapabilityError, ToolRegistry
 from jarvis.users import HOUSE
 
 HttpGet = Callable[..., Any]
@@ -427,7 +425,10 @@ def make_app(
         oauth_validator=validator,
     )
     _rebuild_session_ref_index_from_store(ctx.store)
-    app = web.Application(middlewares=[_cors_middleware, _error_middleware])
+    app = web.Application(
+        middlewares=[_cors_middleware, _error_middleware],
+        client_max_size=max(1024 * 1024, int(cfg.registry.max_upload_bytes) + 1024 * 1024),
+    )
     app[CONFIG_KEY] = cfg
     reads = CockpitReadHandlers(ctx)
     writes = CockpitWriteHandlers(ctx)
@@ -444,6 +445,7 @@ def make_app(
         web.get("/v1/projects", reads.projects),
         web.post("/v1/projects", writes.project_create),
         web.get("/v1/projects/{project_id}/threads", reads.project_threads),
+        web.get("/v1/projects/{project_id}/files", reads.project_files),
         web.get("/v1/projects/{project_id}/memory", reads.project_memory),
         web.get("/v1/projects/{project_id}", reads.project_detail),
         web.get("/v1/workers", reads.workers),
@@ -603,6 +605,21 @@ class CockpitReadHandlers:
                 "conclusions": conclusions,
             }
         )
+
+    async def project_files(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        result = await _project_brain_write(
+            self.ctx,
+            requester,
+            "project.file.list",
+            {
+                "project_id": request.match_info["project_id"],
+                "include_retracted": str(request.query.get("include_retracted") or "").lower()
+                in {"1", "true", "yes"},
+            },
+        )
+        return _project_write_response(result)
 
     async def project_threads(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -916,33 +933,25 @@ class CockpitWriteHandlers:
         )
 
     async def project_memory_forget(self, request: web.Request) -> web.Response:
-        return await self._project_memory_tool(request, tool_name="forget_memory")
+        return await self._project_memory_op(request, op="project.memory.forget")
 
     async def project_memory_correct(self, request: web.Request) -> web.Response:
-        return await self._project_memory_tool(request, tool_name="correct_memory")
+        return await self._project_memory_op(request, op="project.memory.correct")
 
-    async def _project_memory_tool(self, request: web.Request, *, tool_name: str) -> web.Response:
+    async def _project_memory_op(self, request: web.Request, *, op: str) -> web.Response:
         await self.ctx.require_auth(request)
         requester = _requester_or_404(request, self.ctx.cfg)
         body = await _json_body(request)
-        project = await _project_for_member_route(self.ctx, request, requester)
-        result = await _execute_project_memory_tool(
-            self.ctx.cfg,
+        body["project_id"] = request.match_info["project_id"]
+        body["channel"] = "cockpit"
+        body["source"] = "cockpit"
+        result = await _project_brain_write(
+            self.ctx,
             requester,
-            tool_name,
-            {**body, "target": project.peer_id, "channel": "cockpit", "source": "cockpit"},
+            op,
+            body,
         )
-        if result.startswith("error:"):
-            raise CockpitError("validation_failed", result.removeprefix("error:").strip(), status=400, recoverable=True)
-        return web.json_response(
-            {
-                "ok": True,
-                "api_version": API_VERSION,
-                "schema_version": SCHEMA_VERSION,
-                "project_id": project.id,
-                "result": result,
-            }
-        )
+        return _project_write_response(result)
 
     async def project_file_upload(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -1882,29 +1891,6 @@ def _curation_outbox(cfg: Config) -> CurationOutbox:
         backoff_initial_s=cfg.memory.curation_outbox_backoff_initial_s,
         backoff_max_s=cfg.memory.curation_outbox_backoff_max_s,
     )
-
-
-async def _execute_project_memory_tool(
-    cfg: Config,
-    requester: RequestContext,
-    tool_name: str,
-    args: dict[str, Any],
-) -> str:
-    tools = ToolRegistry()
-    registry = RegistryStore(cfg.registry.path)
-    users = load_users(cfg.capabilities.users_dir)
-    for tool in make_memory_tools(
-        cfg.memory,
-        memory=MemoryClient(cfg.memory),
-        outbox=_curation_outbox(cfg),
-        registry=registry,
-        users=users,
-    ):
-        tools.register(tool)
-    try:
-        return await tools.execute(requester, tool_name, args, timeout_s=cfg.tools.timeout_s)
-    except CapabilityError as exc:
-        raise CockpitError("forbidden", str(exc), status=403) from exc
 
 
 async def _multipart_upload_payload(request: web.Request) -> dict[str, Any]:

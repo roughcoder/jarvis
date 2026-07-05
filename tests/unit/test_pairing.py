@@ -22,6 +22,20 @@ def test_shared_token_accepts_any_device() -> None:
     assert authorise_device(brain, "room-pi", "wrong") == (False, "")
 
 
+def test_peer_token_accepts_trusted_boundary_peer() -> None:
+    brain = _brain(pairing_token="intercom", peer_token="peer")
+    assert authorise_device(brain, "cockpit-api", "peer") == (True, "")
+    assert authorise_device(brain, "cockpit-api", "intercom") == (True, "")
+    assert authorise_device(brain, "cockpit-api", "wrong") == (False, "")
+
+
+def test_peer_token_disables_open_dev_mode() -> None:
+    brain = _brain(peer_token="peer")
+    assert authorise_device(brain, "cockpit-api", "peer") == (True, "")
+    assert authorise_device(brain, "anything", "") == (False, "")
+    assert authorise_device(brain, "anything", "wrong") == (False, "")
+
+
 def test_per_device_token_is_bound_and_pins_identity() -> None:
     brain = _brain(
         devices=[

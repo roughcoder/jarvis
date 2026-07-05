@@ -128,6 +128,9 @@ ProjectOperationName = Literal[
     "project.delete",
     "project.file.upload",
     "project.file.retract",
+    "project.file.list",
+    "project.memory.forget",
+    "project.memory.correct",
 ]
 
 

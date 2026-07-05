@@ -217,6 +217,11 @@ def test_private_state_paths_resolve_relative_to_jarvis_env_file(monkeypatch, tm
     assert c.capabilities.profiles_dir == str(env_dir / "jarvis-workspace/profiles")
     assert c.capabilities.users_dir == str(env_dir / "jarvis-workspace/users")
     assert c.registry.path == str(env_dir / "jarvis-workspace/registry/registry.json")
+    assert c.registry.files_vault_root == str(env_dir / "jarvis-workspace")
+    assert c.registry.upload_staging_root == str(env_dir / "jarvis-workspace/uploads/staging")
+    assert c.registry.upload_manifest_path == str(
+        env_dir / "jarvis-workspace/registry/upload-manifest.json"
+    )
     assert c.orchestration.workspace == str(env_dir / "jarvis-workspace/orchestration")
     assert c.orchestration.workers_path == str(
         env_dir / "jarvis-workspace/orchestration/workers.json"
@@ -243,6 +248,8 @@ def test_resolved_never_leaks_secrets() -> None:
     assert r["accounts.house_email_binding"] == "house-email"
     assert r["accounts.house_calendar_binding"] == "house-calendar"
     assert r["registry.path"]
+    assert r["registry.files_vault_root"]
+    assert r["brain.peer_token"] in {"<set>", "<unset>"}
     assert "****" in r["database.url"]
 
 

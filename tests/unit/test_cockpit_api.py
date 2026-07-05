@@ -207,6 +207,10 @@ class FakeProjectBrainClient:
                 "metadata": {"channel": payload.get("channel")},
                 "ingestion": {"queued": True},
             }
+        if op == "project.file.list":
+            return {"project_id": payload["project_id"], "files": [{"doc_id": "upload-123"}]}
+        if op in {"project.memory.forget", "project.memory.correct"}:
+            return {"project_id": payload["project_id"], "result": "Forgotten." if op.endswith("forget") else "Corrected."}
         return {
             "project": {
                 "id": payload.get("project_id") or payload.get("id") or "new-project",
@@ -1783,6 +1787,66 @@ def test_cockpit_project_file_upload_uses_multipart_and_brain(tmp_path, monkeypa
     assert base64.b64decode(payload["content_base64"]) == b"# Spec"
     assert payload["title"] == "Spec"
     assert payload["channel"] == "cockpit"
+
+
+def test_cockpit_project_files_list_uses_brain_manifest_op(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    brain = FakeProjectBrainClient()
+    monkeypatch.setattr(cockpit_api_module, "_project_brain_client", lambda _ctx: brain)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        files = await client.get(f"{base}/v1/projects/neil-shared/files?include_retracted=true")
+
+        assert files.status_code == 200
+        assert files.json()["files"] == [{"doc_id": "upload-123"}]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    assert brain.calls[0]["op"] == "project.file.list"
+    assert brain.calls[0]["payload"] == {"project_id": "neil-shared", "include_retracted": True}
+
+
+def test_cockpit_forget_correct_forward_to_brain_memory_ops(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    brain = FakeProjectBrainClient()
+    monkeypatch.setattr(cockpit_api_module, "_project_brain_client", lambda _ctx: brain)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        forget = await client.post(
+            f"{base}/v1/projects/neil-shared/memory/forget",
+            json={"query": "old fact", "confirm": True, "conclusion_ids": ["c1"]},
+        )
+        correct = await client.post(
+            f"{base}/v1/projects/neil-shared/memory/correct",
+            json={"query": "wrong fact", "replacement": "right fact", "confirm": True, "conclusion_ids": ["c2"]},
+        )
+
+        assert forget.status_code == 200
+        assert forget.json()["result"] == "Forgotten."
+        assert correct.status_code == 200
+        assert correct.json()["result"] == "Corrected."
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    assert [call["op"] for call in brain.calls] == ["project.memory.forget", "project.memory.correct"]
+    assert brain.calls[0]["payload"]["project_id"] == "neil-shared"
+    assert brain.calls[0]["payload"]["channel"] == "cockpit"
+    assert brain.calls[1]["payload"]["source"] == "cockpit"
+
+
+def test_cockpit_app_client_max_size_tracks_upload_limit(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    cfg.registry.max_upload_bytes = 3 * 1024 * 1024
+
+    app = make_app(cfg)
+
+    assert app._client_max_size == 4 * 1024 * 1024  # noqa: SLF001
 
 
 def test_cockpit_project_memory_returns_representation_and_conclusions(tmp_path, monkeypatch) -> None:  # noqa: ANN001

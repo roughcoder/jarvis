@@ -191,33 +191,33 @@ def build_mcp(runtime: MCPServerRuntime):  # noqa: ANN201
 
     @mcp.tool(name="forget")
     async def forget(
+        project_id: str,
         query: str,
-        target: str = "",
         confirm: bool = False,
         conclusion_ids: list[str] | None = None,
     ) -> dict[str, str]:
         return await runtime.service.forget(
             runtime.requester(),
+            project_id=project_id,
             query=query,
-            target=target,
             confirm=confirm,
             conclusion_ids=conclusion_ids or [],
         )
 
     @mcp.tool(name="correct")
     async def correct(
+        project_id: str,
         query: str,
         replacement: str,
-        target: str = "",
         confirm: bool = False,
         conclusion_ids: list[str] | None = None,
         observed_at: str = "",
     ) -> dict[str, str]:
         return await runtime.service.correct(
             runtime.requester(),
+            project_id=project_id,
             query=query,
             replacement=replacement,
-            target=target,
             confirm=confirm,
             conclusion_ids=conclusion_ids or [],
             observed_at=observed_at,
@@ -269,6 +269,14 @@ def build_mcp(runtime: MCPServerRuntime):  # noqa: ANN201
             runtime.requester(),
             project_id=project_id,
             doc_id=doc_id,
+        )
+
+    @mcp.tool(name="project_list_files")
+    async def project_list_files(project_id: str, include_retracted: bool = False) -> dict[str, Any]:
+        return await runtime.service.project_list_files(
+            runtime.requester(),
+            project_id=project_id,
+            include_retracted=include_retracted,
         )
 
     return mcp

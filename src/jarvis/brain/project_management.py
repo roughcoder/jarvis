@@ -9,8 +9,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import ipaddress
+import json
 import mimetypes
+import os
 import re
+import socket
+import tempfile
+import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import replace
@@ -25,7 +32,10 @@ from jarvis.brain.capabilities import (
     can_create_project,
     can_edit_project,
 )
+from jarvis.brain.identity import load_users
 from jarvis.brain.memory_client import MemoryBackend, UnsupportedMemoryOperation
+from jarvis.brain.memory_outbox import CurationOutbox
+from jarvis.brain.memory_tools import make_memory_tools
 from jarvis.brain.registry import ProjectEntry, ProjectLinks, RegistryConflict, RegistryError, RegistryStore, RepoEntry
 from jarvis.config import Config
 from jarvis.ids import utc_now
@@ -38,11 +48,13 @@ from jarvis.protocol.messages import (
     decode,
     encode,
 )
+from jarvis.runtime import CapabilityError, ToolRegistry
 
 MEMBER_UPDATE_FIELDS = {"name", "aliases", "status", "links", "files_root", "repos"}
 OWNER_ONLY_FIELDS = {"owner", "members", "visibility"}
 PROJECT_STATUSES = {"active", "paused", "archived"}
 PROJECT_VISIBILITIES = {"household", "private", "shared"}
+_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 
 
 class ProjectOperationError(RuntimeError):
@@ -83,9 +95,17 @@ class ProjectOperationService:
         self._lock = lock or asyncio.Lock()
 
     async def execute(self, ctx: RequestContext, op: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if op in {"project.file.upload", "project.file.retract"}:
+        if op == "project.file.upload":
+            return await self._execute_file_upload(ctx, payload)
+        if op == "project.file.retract":
+            return await self._execute_file_retract(ctx, payload)
+        if op == "project.file.list":
             async with self._lock:
-                return await self._execute_file(ctx, op, payload)
+                return self._execute_file_list(ctx, payload)
+        if op in {"project.memory.forget", "project.memory.correct"}:
+            async with self._lock:
+                project = self._member_project(ctx, payload)
+            return await self._execute_memory(ctx, op, payload, project)
         async with self._lock:
             try:
                 return self._execute_registry(ctx, op, payload)
@@ -137,23 +157,21 @@ class ProjectOperationService:
 
         raise ProjectOperationError("validation_failed", f"unsupported project operation: {op}", status=400)
 
-    async def _execute_file(self, ctx: RequestContext, op: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _member_project(self, ctx: RequestContext, payload: dict[str, Any]) -> ProjectEntry:
         project = self.registry.get_project(_project_id(payload))
         if project is None:
             raise ProjectOperationError("not_found", "project not found", status=404)
         _require_member(ctx, project)
-        if op == "project.file.retract":
-            doc_id = _doc_id(str(payload.get("doc_id") or ""))
-            if not doc_id:
-                raise ProjectOperationError("validation_failed", "doc_id is required", status=400, recoverable=True)
-            session_id = upload_session_id(project.id, doc_id)
-            try:
-                await asyncio.to_thread(self.memory.delete_session, session_id)
-            except UnsupportedMemoryOperation as exc:
-                raise ProjectOperationError("memory_unavailable", str(exc), status=503, recoverable=True) from exc
-            return {"project_id": project.id, "doc_id": doc_id, "session_id": session_id, "retracted": True}
+        return project
 
-        upload = await asyncio.to_thread(self._materialize_upload, ctx, project, payload)
+    async def _execute_file_upload(self, ctx: RequestContext, payload: dict[str, Any]) -> dict[str, Any]:
+        async with self._lock:
+            project = self._member_project(ctx, payload)
+        filename, data = await asyncio.to_thread(_upload_bytes, self.cfg, payload)
+        async with self._lock:
+            project = self._member_project(ctx, payload)
+            upload = self._materialize_upload(ctx, project, payload, filename, data)
+
         ingestion: dict[str, Any] = {"queued": False}
         try:
             raw = await asyncio.to_thread(
@@ -166,15 +184,95 @@ class ProjectOperationService:
             ingestion = {"queued": True, "response": raw}
         except UnsupportedMemoryOperation as exc:
             ingestion = {"queued": False, "error": str(exc), "recoverable": True}
-        return {"project_id": project.id, **upload, "ingestion": ingestion}
+        except Exception as exc:  # noqa: BLE001 - vault write succeeded; report recoverable ingestion failure.
+            ingestion = {"queued": False, "error": str(exc), "recoverable": True}
+        async with self._lock:
+            file_entry = self._update_manifest_ingestion(project.id, upload["doc_id"], ingestion)
+        return {"project_id": project.id, **upload, "ingestion": ingestion, "file": file_entry}
+
+    async def _execute_file_retract(self, ctx: RequestContext, payload: dict[str, Any]) -> dict[str, Any]:
+        async with self._lock:
+            project = self._member_project(ctx, payload)
+            doc_id = _doc_id(str(payload.get("doc_id") or ""))
+            if not doc_id:
+                raise ProjectOperationError("validation_failed", "doc_id is required", status=400, recoverable=True)
+            existing = self._manifest_entry(project.id, doc_id)
+            session_id = str(existing.get("session_id") or upload_session_id(project.id, doc_id))
+        try:
+            await asyncio.to_thread(self.memory.delete_session, session_id)
+        except UnsupportedMemoryOperation as exc:
+            raise ProjectOperationError("memory_unavailable", str(exc), status=503, recoverable=True) from exc
+        async with self._lock:
+            file_entry = self._mark_manifest_retracted(project.id, doc_id)
+        return {
+            "project_id": project.id,
+            "doc_id": doc_id,
+            "session_id": session_id,
+            "retracted": True,
+            "file": file_entry,
+        }
+
+    def _execute_file_list(self, ctx: RequestContext, payload: dict[str, Any]) -> dict[str, Any]:
+        project = self._member_project(ctx, payload)
+        include_retracted = bool(payload.get("include_retracted", False))
+        files = [
+            entry
+            for entry in _manifest_entries(self.cfg, project.id)
+            if include_retracted or not entry.get("retracted")
+        ]
+        return {"project_id": project.id, "files": files}
+
+    async def _execute_memory(
+        self,
+        ctx: RequestContext,
+        op: str,
+        payload: dict[str, Any],
+        project: ProjectEntry,
+    ) -> dict[str, Any]:
+        tool_name = "forget_memory" if op == "project.memory.forget" else "correct_memory"
+        outbox = CurationOutbox(
+            self.cfg.memory.curation_outbox_path,
+            max_retries=self.cfg.memory.curation_outbox_max_retries,
+            backoff_initial_s=self.cfg.memory.curation_outbox_backoff_initial_s,
+            backoff_max_s=self.cfg.memory.curation_outbox_backoff_max_s,
+        )
+        tools = ToolRegistry()
+        users = load_users(self.cfg.capabilities.users_dir)
+        for tool in make_memory_tools(
+            self.cfg.memory,
+            memory=self.memory,
+            outbox=outbox,
+            registry=self.registry,
+            users=users,
+        ):
+            tools.register(tool)
+        args = {
+            **payload,
+            "target": project.peer_id,
+            "source": str(payload.get("source") or ctx.channel or "brain"),
+            "channel": str(payload.get("channel") or ctx.channel or "brain"),
+        }
+        try:
+            result = await tools.execute(ctx, tool_name, args, timeout_s=self.cfg.tools.timeout_s)
+        except CapabilityError as exc:
+            raise ProjectOperationError("forbidden", str(exc), status=403) from exc
+        if result.startswith("error:"):
+            raise ProjectOperationError(
+                "validation_failed",
+                result.removeprefix("error:").strip(),
+                status=400,
+                recoverable=True,
+            )
+        return {"project_id": project.id, "result": result}
 
     def _materialize_upload(
         self,
         ctx: RequestContext,
         project: ProjectEntry,
         payload: dict[str, Any],
+        filename: str,
+        data: bytes,
     ) -> dict[str, Any]:
-        filename, data = _upload_bytes(payload)
         content_hash = "sha256:" + hashlib.sha256(data).hexdigest()
         doc_id = _doc_id(str(payload.get("doc_id") or "")) or _doc_id(f"{Path(filename).stem}-{content_hash[-12:]}")
         root = _files_root(self.cfg, project)
@@ -201,6 +299,24 @@ class ProjectOperationService:
         if agent:
             metadata["agent"] = agent
         session_id = upload_session_id(project.id, doc_id)
+        manifest_entry = {
+            "doc_id": doc_id,
+            "title": title,
+            "session_id": session_id,
+            "original_path": str(original_path),
+            "content_hash": content_hash,
+            "artifact_type": artifact_type,
+            "uploaded_by": ctx.memory_peer,
+            "observed_at": metadata["observed_at"],
+            "mime_type": metadata["mime_type"],
+            "channel": metadata["channel"],
+            "retracted": False,
+            "retracted_at": "",
+            "ingestion": {"queued": False},
+        }
+        if agent:
+            manifest_entry["agent"] = agent
+        _upsert_manifest_entry(self.cfg, project.id, manifest_entry)
         return {
             "doc_id": doc_id,
             "session_id": session_id,
@@ -209,6 +325,44 @@ class ProjectOperationService:
             "metadata": metadata,
         }
 
+    def _manifest_entry(self, project_id: str, doc_id: str) -> dict[str, Any]:
+        for entry in _manifest_entries(self.cfg, project_id):
+            if entry.get("doc_id") == doc_id:
+                return entry
+        return {}
+
+    def _update_manifest_ingestion(
+        self,
+        project_id: str,
+        doc_id: str,
+        ingestion: dict[str, Any],
+    ) -> dict[str, Any]:
+        entry = self._manifest_entry(project_id, doc_id)
+        if not entry:
+            return {}
+        entry["ingestion"] = ingestion
+        _upsert_manifest_entry(self.cfg, project_id, entry)
+        return entry
+
+    def _mark_manifest_retracted(self, project_id: str, doc_id: str) -> dict[str, Any]:
+        entry = self._manifest_entry(project_id, doc_id)
+        if not entry:
+            entry = {
+                "doc_id": doc_id,
+                "title": doc_id,
+                "session_id": upload_session_id(project_id, doc_id),
+                "original_path": "",
+                "content_hash": "",
+                "artifact_type": "",
+                "uploaded_by": "",
+                "observed_at": "",
+                "ingestion": {},
+            }
+        entry["retracted"] = True
+        entry["retracted_at"] = utc_now()
+        _upsert_manifest_entry(self.cfg, project_id, entry)
+        return entry
+
 
 class BrainProjectClient:
     def __init__(self, cfg: Config) -> None:
@@ -216,6 +370,14 @@ class BrainProjectClient:
 
     async def execute(self, ctx: RequestContext, op: str, payload: dict[str, Any]) -> dict[str, Any]:
         request_id = "projop-" + uuid.uuid4().hex[:12]
+        peer_token = self.cfg.brain.peer_token.get_secret_value()
+        if not peer_token:
+            raise ProjectOperationError(
+                "unauthorized",
+                "BRAIN_PEER_TOKEN is not configured for project operations",
+                status=503,
+                recoverable=True,
+            )
         async with websockets.connect(
             self.cfg.intercom.brain_url,
             open_timeout=self.cfg.intercom.websocket_open_timeout_s,
@@ -228,7 +390,7 @@ class BrainProjectClient:
                 encode(
                     Hello(
                         device_id=self.cfg.capabilities.device_id,
-                        token=self.cfg.intercom.token.get_secret_value(),
+                        token=peer_token,
                         identity=ctx.identity,
                         channel=ctx.channel or "cockpit",
                     )
@@ -249,9 +411,7 @@ class BrainProjectClient:
                     )
                 )
             )
-            raw = decode(await asyncio.wait_for(ws.recv(), self.cfg.tools.timeout_s + 10.0))
-        if not isinstance(raw, ProjectOperationResponse) or raw.request_id != request_id:
-            raise ProjectOperationError("protocol_error", "unexpected brain response", status=502)
+            raw = await self._read_response(ws, request_id)
         if not raw.ok:
             err = raw.error or {}
             raise ProjectOperationError(
@@ -261,6 +421,20 @@ class BrainProjectClient:
                 recoverable=bool(err.get("recoverable", False)),
             )
         return raw.result
+
+    async def _read_response(self, ws, request_id: str) -> ProjectOperationResponse:  # noqa: ANN001
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.cfg.tools.timeout_s + 10.0
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise ProjectOperationError("protocol_error", "timed out waiting for brain project response", status=502)
+            frame = await asyncio.wait_for(ws.recv(), remaining)
+            if isinstance(frame, bytes):
+                continue
+            raw = decode(frame)
+            if isinstance(raw, ProjectOperationResponse) and raw.request_id == request_id:
+                return raw
 
 
 def request_context_to_dict(ctx: RequestContext) -> dict[str, Any]:
@@ -304,7 +478,7 @@ def _project_from_create_payload(ctx: RequestContext, payload: dict[str, Any]) -
         status=str(payload.get("status") or "active"),
         repos=_repos(payload.get("repos", ())),
         links=_links(payload.get("links")),
-        files_root=str(payload.get("files_root") or f"projects/{project_id}/files").strip(),
+        files_root=_validate_files_root(payload.get("files_root"), project_id),
     )
 
 
@@ -324,11 +498,13 @@ def _updated_project(project: ProjectEntry, payload: dict[str, Any]) -> ProjectE
         status = str(payload["status"] or "").strip()
         if status not in {"active", "paused"}:
             raise RegistryError("project status edits may only set active or paused")
+        if project.status == "archived":
+            raise RegistryError("archived projects must be unarchived through the owner route")
         changes["status"] = status
     if "links" in payload:
         changes["links"] = _links(payload["links"])
     if "files_root" in payload:
-        changes["files_root"] = str(payload["files_root"] or "").strip()
+        changes["files_root"] = _validate_files_root(payload["files_root"], project.id)
     if "repos" in payload:
         changes["repos"] = _repos(payload["repos"])
     return replace(project, **changes)
@@ -379,21 +555,29 @@ def _strings(value: Any) -> tuple[str, ...]:
     return tuple(str(item).strip() for item in (value or ()) if str(item).strip())
 
 
-def _upload_bytes(payload: dict[str, Any]) -> tuple[str, bytes]:
+def _upload_bytes(cfg: Config, payload: dict[str, Any]) -> tuple[str, bytes]:
     filename = str(payload.get("filename") or payload.get("path") or "upload.txt").split("/")[-1] or "upload.txt"
+    max_bytes = max(1, int(cfg.registry.max_upload_bytes))
     if "content_text" in payload:
-        return filename, str(payload.get("content_text") or "").encode("utf-8")
+        data = str(payload.get("content_text") or "").encode("utf-8")
+        _ensure_upload_size(data, max_bytes)
+        return filename, data
     if "content_base64" in payload:
-        return filename, base64.b64decode(str(payload.get("content_base64") or ""), validate=True)
+        raw = str(payload.get("content_base64") or "")
+        if len(raw) > ((max_bytes + 2) // 3) * 4 + 4:
+            raise ProjectOperationError("validation_failed", "upload exceeds max size", status=413, recoverable=True)
+        data = base64.b64decode(raw, validate=True)
+        _ensure_upload_size(data, max_bytes)
+        return filename, data
     source_path = str(payload.get("source_path") or "").strip()
     if source_path:
-        path = Path(source_path).expanduser()
+        path = _confined_source_path(cfg, source_path)
+        if path.stat().st_size > max_bytes:
+            raise ProjectOperationError("validation_failed", "upload exceeds max size", status=413, recoverable=True)
         return path.name, path.read_bytes()
     source_url = str(payload.get("source_url") or "").strip()
     if source_url:
-        with urllib.request.urlopen(source_url, timeout=30) as response:  # noqa: S310 - explicit user-provided upload source.
-            data = response.read(25 * 1024 * 1024)
-        return filename or Path(source_url).name or "upload", data
+        return filename or Path(urllib.parse.urlparse(source_url).path).name or "upload", _read_url_upload(cfg, source_url)
     raise ProjectOperationError("validation_failed", "upload content, path, or URL is required", status=400, recoverable=True)
 
 
@@ -404,11 +588,181 @@ def _doc_id(value: str) -> str:
 
 
 def _files_root(cfg: Config, project: ProjectEntry) -> Path:
-    raw = project.files_root or f"projects/{project.id}/files"
-    path = Path(raw).expanduser()
-    if path.is_absolute():
-        return path
-    registry_root = Path(cfg.registry.path).expanduser().parent.parent
-    if path.parts and path.parts[0] == registry_root.name:
-        return registry_root.parent / path
-    return registry_root / path
+    raw = _validate_files_root(project.files_root, project.id)
+    base = Path(cfg.registry.files_vault_root).expanduser().resolve(strict=False)
+    path = (base / raw).resolve(strict=False)
+    try:
+        path.relative_to(base)
+    except ValueError as exc:
+        raise ProjectOperationError("validation_failed", "files_root escapes vault root", status=400, recoverable=True) from exc
+    return path
+
+
+def _validate_files_root(value: Any, project_id: str) -> str:
+    raw = str(value or f"projects/{project_id}/files").strip()
+    path = Path(raw)
+    if path.is_absolute() or ".." in path.parts:
+        raise RegistryError("files_root must be a relative path inside the project vault")
+    return path.as_posix()
+
+
+def _ensure_upload_size(data: bytes, max_bytes: int) -> None:
+    if len(data) > max_bytes:
+        raise ProjectOperationError("validation_failed", "upload exceeds max size", status=413, recoverable=True)
+
+
+def _confined_source_path(cfg: Config, source_path: str) -> Path:
+    root = Path(cfg.registry.upload_staging_root).expanduser().resolve(strict=False)
+    path = Path(source_path).expanduser().resolve(strict=True)
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ProjectOperationError(
+            "validation_failed",
+            "source_path must be inside the configured upload staging root",
+            status=400,
+            recoverable=True,
+        ) from exc
+    return path
+
+
+def _read_url_upload(cfg: Config, source_url: str) -> bytes:
+    max_bytes = max(1, int(cfg.registry.max_upload_bytes))
+    url = source_url
+    opener = urllib.request.build_opener(_NoRedirectHandler)
+    for _ in range(max(0, int(cfg.registry.upload_url_max_redirects)) + 1):
+        _validate_upload_url(url)
+        request = urllib.request.Request(url, headers={"User-Agent": "jarvis-project-upload/1.0"})
+        try:
+            with opener.open(request, timeout=30) as response:  # noqa: S310 - URL validated before open.
+                length = response.headers.get("Content-Length")
+                if length and int(length) > max_bytes:
+                    raise ProjectOperationError(
+                        "validation_failed",
+                        "upload exceeds max size",
+                        status=413,
+                        recoverable=True,
+                    )
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    remaining = max_bytes + 1 - total
+                    if remaining <= 0:
+                        raise ProjectOperationError(
+                            "validation_failed",
+                            "upload exceeds max size",
+                            status=413,
+                            recoverable=True,
+                        )
+                    chunk = response.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ProjectOperationError(
+                            "validation_failed",
+                            "upload exceeds max size",
+                            status=413,
+                            recoverable=True,
+                        )
+                return b"".join(chunks)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in _REDIRECT_STATUSES:
+                raise ProjectOperationError(
+                    "validation_failed",
+                    f"upload URL failed with HTTP {exc.code}",
+                    status=400,
+                    recoverable=True,
+                ) from exc
+            location = exc.headers.get("Location")
+            if not location:
+                raise ProjectOperationError("validation_failed", "upload URL redirect missing location", status=400) from exc
+            url = urllib.parse.urljoin(url, location)
+    raise ProjectOperationError("validation_failed", "upload URL redirected too many times", status=400, recoverable=True)
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+def _validate_upload_url(url: str) -> None:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ProjectOperationError("validation_failed", "upload URL must use http or https", status=400, recoverable=True)
+    if not parsed.hostname:
+        raise ProjectOperationError("validation_failed", "upload URL host is required", status=400, recoverable=True)
+    try:
+        infos = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ProjectOperationError("validation_failed", "upload URL host could not be resolved", status=400, recoverable=True) from exc
+    for info in infos:
+        address = info[4][0]
+        ip = ipaddress.ip_address(address)
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        ):
+            raise ProjectOperationError("validation_failed", "upload URL host is not allowed", status=400, recoverable=True)
+
+
+def _manifest_path(cfg: Config) -> Path:
+    return Path(cfg.registry.upload_manifest_path).expanduser()
+
+
+def _load_manifest(cfg: Config) -> dict[str, Any]:
+    path = _manifest_path(cfg)
+    if not path.exists():
+        return {"version": 1, "projects": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ProjectOperationError("validation_failed", f"invalid upload manifest: {path}", status=500) from exc
+    if not isinstance(data, dict):
+        return {"version": 1, "projects": {}}
+    data.setdefault("version", 1)
+    data.setdefault("projects", {})
+    return data
+
+
+def _save_manifest(cfg: Config, data: dict[str, Any]) -> None:
+    path = _manifest_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def _manifest_entries(cfg: Config, project_id: str) -> list[dict[str, Any]]:
+    data = _load_manifest(cfg)
+    projects = data.get("projects") if isinstance(data.get("projects"), dict) else {}
+    entries = projects.get(project_id) if isinstance(projects.get(project_id), list) else []
+    return [dict(entry) for entry in entries if isinstance(entry, dict)]
+
+
+def _upsert_manifest_entry(cfg: Config, project_id: str, entry: dict[str, Any]) -> None:
+    data = _load_manifest(cfg)
+    projects = data.setdefault("projects", {})
+    entries = [dict(item) for item in projects.get(project_id, []) if isinstance(item, dict)]
+    doc_id = str(entry.get("doc_id") or "")
+    updated = False
+    for index, existing in enumerate(entries):
+        if existing.get("doc_id") == doc_id:
+            entries[index] = dict(entry)
+            updated = True
+            break
+    if not updated:
+        entries.append(dict(entry))
+    projects[project_id] = sorted(entries, key=lambda item: str(item.get("observed_at") or ""))
+    _save_manifest(cfg, data)

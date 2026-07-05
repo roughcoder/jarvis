@@ -8,10 +8,13 @@ runs end to end through the real server. Two devices resolve to two principals.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 import websockets
 
+from jarvis.brain.project_management import BrainProjectClient, ProjectOperationService, request_context_to_dict
+from jarvis.brain.registry import RegistryStore
 from jarvis.brain.server import BrainServer, BufferedAudioTurn
 from jarvis.brain.tracing import TurnTrace
 from jarvis.config import BrainConfig, CapabilityConfig, MCPConfig, load_config
@@ -19,6 +22,9 @@ from jarvis.protocol.messages import (
     AudioStart,
     BinaryAudio,
     Hello,
+    Proactive,
+    ProjectOperationRequest,
+    ProjectOperationResponse,
     ReplyEnd,
     ReplyText,
     TextIn,
@@ -239,6 +245,128 @@ def test_audio_buffer_accepts_final_frame_at_local_capture_limit() -> None:
     )
     assert too_much is False
     assert "t1" not in conn["audio_buffers"]
+
+
+class _FakeProjectWs:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send(self, payload: str) -> None:
+        self.sent.append(payload)
+
+
+class _FakeProjectMemory:
+    def upload_file(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
+        return {"ok": True}
+
+    def delete_session(self, _session_id: str) -> None:
+        return None
+
+
+def _project_cfg(tmp_path, *, peer_token: str = "peer", pairing_token: str = "intercom"):  # noqa: ANN001, ANN201
+    c = load_config()
+    c.brain = BrainConfig(_env_file=None, pairing_token=pairing_token, peer_token=peer_token)
+    c.registry.path = str(tmp_path / "registry.json")
+    c.registry.files_vault_root = str(tmp_path / "jarvis-workspace")
+    c.registry.upload_manifest_path = str(tmp_path / "manifest.json")
+    c.registry.upload_staging_root = str(tmp_path / "staging")
+    return c
+
+
+def _seed_project(path) -> RegistryStore:  # noqa: ANN001
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        """
+{"version":1,"contacts":[],"projects":[{"id":"jarvis","name":"Jarvis","owner":"neil","members":["neil","jules"],"visibility":"shared","status":"active","repos":[],"links":{"jira":"","urls":[]},"files_root":"projects/jarvis/files"}]}
+""".strip(),
+        encoding="utf-8",
+    )
+    store = RegistryStore(path)
+    store.load()
+    return store
+
+
+def test_project_operation_rejects_forwarded_requester_on_intercom_connection(tmp_path) -> None:
+    c = _project_cfg(tmp_path)
+    server = object.__new__(BrainServer)
+    server._project_ops = ProjectOperationService(c, registry=_seed_project(Path(c.registry.path)), memory=_FakeProjectMemory())  # noqa: SLF001
+    ws = _FakeProjectWs()
+    forged = RequestContext("dev", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    msg = ProjectOperationRequest(
+        request_id="r1",
+        op="project.visibility.set",
+        requester=request_context_to_dict(forged),
+        payload={"project_id": "jarvis", "visibility": "private"},
+    )
+
+    asyncio.run(server._handle_project_operation(ws, msg, trusted_peer=False))  # noqa: SLF001
+
+    response = decode(ws.sent[0])
+    assert isinstance(response, ProjectOperationResponse)
+    assert response.ok is False
+    assert response.error["code"] == "unauthorized"
+
+
+def test_project_operation_on_peer_connection_still_enforces_role_gate(tmp_path) -> None:
+    c = _project_cfg(tmp_path)
+    server = object.__new__(BrainServer)
+    server._project_ops = ProjectOperationService(c, registry=_seed_project(Path(c.registry.path)), memory=_FakeProjectMemory())  # noqa: SLF001
+    member_ws = _FakeProjectWs()
+    owner_ws = _FakeProjectWs()
+    member = RequestContext("dev", "jules", "personal", frozenset(), channel="cockpit", peer="jules")
+    owner = RequestContext("dev", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+
+    asyncio.run(
+        server._handle_project_operation(  # noqa: SLF001
+            member_ws,
+            ProjectOperationRequest(
+                request_id="r1",
+                op="project.visibility.set",
+                requester=request_context_to_dict(member),
+                payload={"project_id": "jarvis", "visibility": "private"},
+            ),
+            trusted_peer=True,
+        )
+    )
+    asyncio.run(
+        server._handle_project_operation(  # noqa: SLF001
+            owner_ws,
+            ProjectOperationRequest(
+                request_id="r2",
+                op="project.visibility.set",
+                requester=request_context_to_dict(owner),
+                payload={"project_id": "jarvis", "visibility": "private"},
+            ),
+            trusted_peer=True,
+        )
+    )
+
+    denied = decode(member_ws.sent[0])
+    allowed = decode(owner_ws.sent[0])
+    assert denied.ok is False
+    assert denied.error["status"] == 403
+    assert allowed.ok is True
+    assert allowed.result["project"]["visibility"] == "private"
+
+
+def test_project_client_ignores_interleaved_proactive_frames(tmp_path) -> None:
+    c = _project_cfg(tmp_path)
+    client = BrainProjectClient(c)
+
+    class Ws:
+        def __init__(self) -> None:
+            self.frames = [
+                encode(Proactive(text="heartbeat")),
+                encode(ProjectOperationResponse(request_id="wanted", ok=True, result={"project": {"id": "jarvis"}})),
+            ]
+
+        async def recv(self) -> str:
+            return self.frames.pop(0)
+
+    result = asyncio.run(client._read_response(Ws(), "wanted"))  # noqa: SLF001
+
+    assert result.ok is True
+    assert result.result["project"]["id"] == "jarvis"
 
 
 class _TurnTracer:

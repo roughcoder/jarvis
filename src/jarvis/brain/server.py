@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import hmac
+import logging
 import time
 import uuid
 
@@ -89,6 +91,8 @@ from jarvis.tools.selection import build_relevance
 
 import re
 
+logger = logging.getLogger(__name__)
+
 # Only consulted while an alarm is actually ringing, so it can be liberal — any of
 # these silences it.
 _ALARM_ACK = re.compile(
@@ -161,12 +165,15 @@ def authorise_device(brain, device_id: str, token: str) -> tuple[bool, str]:  # 
             if d.device_id and device_id != d.device_id:
                 return (False, "")  # token bound to a different device
             return (True, d.identity)
+    peer = brain.peer_token.get_secret_value()
+    if peer and hmac.compare_digest(token, peer):
+        return (True, "")
     shared = brain.pairing_token.get_secret_value()
-    if shared and token == shared:
+    if shared and hmac.compare_digest(token, shared):
         return (True, "")
     # Open only when NOTHING is configured (dev/local). If any token (shared or
     # per-device) is set, an unmatched token is rejected.
-    if not shared and not brain.devices:
+    if not shared and not peer and not brain.devices:
         return (True, "")
     return (False, "")
 
@@ -285,7 +292,7 @@ class BrainServer:
     async def serve(self) -> None:
         host, port = self._cfg.brain.host, self._cfg.brain.port
         b = self._cfg.brain
-        has_token = bool(b.pairing_token.get_secret_value()) or bool(b.devices)
+        has_token = bool(b.pairing_token.get_secret_value()) or bool(b.devices) or bool(b.peer_token.get_secret_value())
         if insecure_bind(host, has_token, b.allow_insecure):  # don't expose unauth access on a LAN
             print(
                 f"\n✗ Refusing to start: brain is bound to {host!r} (non-loopback) with no "
@@ -496,6 +503,10 @@ class BrainServer:
     def _authorise(self, hello: Hello) -> tuple[bool, str]:
         return authorise_device(self._cfg.brain, hello.device_id, hello.token)
 
+    def _is_peer_connection(self, hello: Hello) -> bool:
+        peer = self._cfg.brain.peer_token.get_secret_value()
+        return bool(peer) and hmac.compare_digest(hello.token, peer)
+
     def _resolve(
         self,
         device_id: str,
@@ -551,6 +562,7 @@ class BrainServer:
             "base_asserted": first.identity,
             "device_default": device_default or HOUSE,
             "hardware": hardware,
+            "trusted_peer": self._is_peer_connection(first),
             "voice_mode": "default",
             "waiters": {},
             "audio_buffers": {},
@@ -573,8 +585,9 @@ class BrainServer:
             f"identity={base.identity} hardware={hw} audio={REPLY_AUDIO_BINARY_V1}"
         )
 
-        self._connections.add(ws)  # eligible for proactive heartbeat push
-        self._device_conns.setdefault(device_id, set()).add(ws)  # for device-routed alarms
+        if not conn["trusted_peer"]:
+            self._connections.add(ws)  # eligible for proactive heartbeat push
+            self._device_conns.setdefault(device_id, set()).add(ws)  # for device-routed alarms
         self._conn_meta[ws] = conn
         turn: asyncio.Task | None = None
         try:
@@ -620,7 +633,7 @@ class BrainServer:
                     if fut is not None and not fut.done():
                         fut.set_result(msg)
                 elif isinstance(msg, ProjectOperationRequest):
-                    await self._handle_project_operation(ws, msg)
+                    await self._handle_project_operation(ws, msg, trusted_peer=bool(conn.get("trusted_peer")))
                 elif isinstance(msg, BargeIn):
                     turn = await self._cancel(turn)
                     with contextlib.suppress(Exception):
@@ -639,8 +652,20 @@ class BrainServer:
                     self._device_conns.pop(device_id, None)
             await self._cancel(turn)
 
-    async def _handle_project_operation(self, ws, msg: ProjectOperationRequest) -> None:  # noqa: ANN001
+    async def _handle_project_operation(
+        self,
+        ws,
+        msg: ProjectOperationRequest,
+        *,
+        trusted_peer: bool = False,
+    ) -> None:  # noqa: ANN001
         try:
+            if not trusted_peer:
+                raise ProjectOperationError(
+                    "unauthorized",
+                    "project operations require a trusted brain peer",
+                    status=401,
+                )
             ctx = request_context_from_dict(msg.requester)
             result = await self._project_ops.execute(ctx, msg.op, msg.payload)
             response = ProjectOperationResponse(request_id=msg.request_id, ok=True, result=result)
@@ -650,13 +675,14 @@ class BrainServer:
                 ok=False,
                 error=exc.body(),
             )
-        except Exception as exc:  # noqa: BLE001 - keep boundary responses structured.
+        except Exception:  # noqa: BLE001 - keep boundary responses structured.
+            logger.exception("brain project operation failed")
             response = ProjectOperationResponse(
                 request_id=msg.request_id,
                 ok=False,
                 error={
                     "code": "internal_error",
-                    "message": str(exc) or "project operation failed",
+                    "message": "project operation failed",
                     "status": 500,
                     "recoverable": False,
                 },
