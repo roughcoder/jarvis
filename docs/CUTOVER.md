@@ -13,6 +13,16 @@ permission to retire the v2 stack.
 - The migration command never deletes profile files and never retires v2.
 - Non-dev workspace writes require both `--workspace` and an exact
   `--i-understand-this-writes-to <workspace>` acknowledgement.
+- **The provenance envelope lives in the local sidecar, not on the server.**
+  Honcho v3.0.11 silently drops conclusion metadata, so `recorded_by`,
+  `source`, `observed_at`, and `content_hash` for every migrated fact are held
+  only in the sidecar file at `MEMORY_CONCLUSION_SIDECAR_PATH` (default
+  `jarvis-workspace/memory/conclusions-v3-sidecar.json`). This file is
+  load-bearing, durable state: the read-back gate matches on it, and losing it
+  after the seed silently strips provenance from every migrated fact. Keep
+  `MEMORY_CONCLUSION_SIDECAR_PATH` fixed for the whole cutover (seed, verify,
+  and production runtime must all point at the same path), and back the file up
+  immediately after the seed.
 
 ## Reversible Preparation
 
@@ -71,6 +81,12 @@ workspace.
    - `source=profile-migration`
    - `observed_at=<as-of date>`
    - `content_hash=sha256:...`
+
+   All of the above except the content itself is stored only in the local
+   sidecar (see Safety Boundary). **Immediately after the seed, back up the
+   sidecar file** (`MEMORY_CONCLUSION_SIDECAR_PATH`) before running the
+   read-back gate — the gate depends on it, and it is the only copy of the
+   migration provenance.
 
 3. Run the read-back gate again without writing:
 
