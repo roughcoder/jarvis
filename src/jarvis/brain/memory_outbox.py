@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -65,6 +66,8 @@ class RetractionIndex:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser()
+        self._data: dict[str, Any] | None = None
+        self._file_state: tuple[int, int] | None = None
 
     def record(self, *, observed_id: str, metadata: dict[str, Any]) -> ActiveRetraction | None:
         retracted_content = str(metadata.get("retracted_content") or "").strip()
@@ -96,6 +99,7 @@ class RetractionIndex:
         }
         peer_rows[key] = row
         _atomic_write_json(self.path, data)
+        self._cache_data(data)
         return _retraction_from_json(row)
 
     def clear_for_assertion(self, *, observed_id: str, content: str) -> list[ActiveRetraction]:
@@ -121,6 +125,7 @@ class RetractionIndex:
         if not data.get("peers"):
             data.pop("peers", None)
         _atomic_write_json(self.path, data)
+        self._cache_data(data)
         return removed
 
     def active(self, *, observed_id: str) -> list[ActiveRetraction]:
@@ -137,18 +142,36 @@ class RetractionIndex:
         return sorted(records, key=lambda row: (row.observed_at, row.created_at, row.retracted_content))
 
     def _read(self) -> dict[str, Any]:
-        if not self.path.exists():
+        file_state = self._current_file_state()
+        if self._data is not None and self._file_state == file_state:
+            return self._data
+        if file_state == (0, 0):
+            self._data = {"peers": {}}
+            self._file_state = file_state
             return {"peers": {}}
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
-            return {"peers": {}}
+            raw = {"peers": {}}
         if not isinstance(raw, dict):
-            return {"peers": {}}
+            raw = {"peers": {}}
         peers = raw.get("peers")
         if not isinstance(peers, dict):
             raw["peers"] = {}
+        self._data = raw
+        self._file_state = file_state
         return raw
+
+    def _current_file_state(self) -> tuple[int, int]:
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return (0, 0)
+        return (stat.st_size, stat.st_mtime_ns)
+
+    def _cache_data(self, data: dict[str, Any]) -> None:
+        self._data = data
+        self._file_state = self._current_file_state()
 
 
 def retraction_index_path(curation_outbox_path: str | Path) -> Path:
@@ -504,12 +527,34 @@ def _cancel_matches(entry: OutboxEntry, query: str) -> bool:
     return entry_folded == query_folded or query_folded in entry_folded or entry_folded in query_folded
 
 
-def _text_matches(left: str, right: str) -> bool:
-    left_text = " ".join(left.split()).casefold()
-    right_text = " ".join(right.split()).casefold()
+_MIN_CONTAINMENT_CHARS = 24
+_MIN_CONTAINMENT_TOKENS = 4
+_PUNCTUATION_RE = re.compile(r"[^\w\s]+", re.UNICODE)
+
+
+def memory_text_matches(left: str, right: str) -> bool:
+    """Match exact normalized claims, or substantial contained restatements."""
+    left_text = _normalise_claim_text(left)
+    right_text = _normalise_claim_text(right)
     if not left_text or not right_text:
         return False
-    return left_text == right_text or left_text in right_text or right_text in left_text
+    if left_text == right_text:
+        return True
+    shorter, longer = sorted((left_text, right_text), key=len)
+    if len(shorter) < _MIN_CONTAINMENT_CHARS:
+        return False
+    if len(shorter.split()) < _MIN_CONTAINMENT_TOKENS:
+        return False
+    return shorter in longer
+
+
+def _text_matches(left: str, right: str) -> bool:
+    return memory_text_matches(left, right)
+
+
+def _normalise_claim_text(value: str) -> str:
+    without_punctuation = _PUNCTUATION_RE.sub(" ", value.casefold())
+    return " ".join(without_punctuation.split())
 
 
 def _replace_entry(entry: OutboxEntry, **changes: Any) -> OutboxEntry:

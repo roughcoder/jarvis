@@ -79,7 +79,15 @@ class MemoryBackend(Protocol):
     # `user` is the historical keyword; callers may pass any cached peer id.
     def read_cached_representation(self, user: str | None = None) -> str: ...
 
-    async def write_turn(self, user_text: str, assistant_text: str, *, user: str | None = None) -> None: ...
+    async def write_turn(
+        self,
+        user_text: str,
+        assistant_text: str,
+        *,
+        user: str | None = None,
+        channel: str = "voice",
+        device_id: str | None = None,
+    ) -> None: ...
 
     # `user` is the historical keyword; callers may pass any cached peer id.
     async def refresh_cache(self, min_interval_s: float = 0.0, *, user: str | None = None) -> bool: ...

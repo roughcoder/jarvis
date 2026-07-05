@@ -605,7 +605,7 @@ def test_v3_write_turn_then_refresh_cache_round_trips_to_local_cache(tmp_path) -
 
     client = HonchoV3MemoryClient(_cfg(tmp_path), transport=httpx.MockTransport(handler))
 
-    asyncio.run(client.write_turn("keep it short", "Noted.", user="neil"))
+    asyncio.run(client.write_turn("keep it short", "Noted.", user="neil", channel="text", device_id="mac-mini"))
     assert asyncio.run(client.refresh_cache(user="neil"))
 
     cache = json.loads((tmp_path / "representation-neil.json").read_text(encoding="utf-8"))
@@ -614,6 +614,9 @@ def test_v3_write_turn_then_refresh_cache_round_trips_to_local_cache(tmp_path) -
     message_index = next(i for i, path in enumerate(paths) if path.endswith("/messages"))
     chat_index = next(i for i, path in enumerate(paths) if path.endswith("/chat"))
     assert message_index < chat_index
+    message_payload = calls[message_index][2]
+    assert message_payload["messages"][0]["metadata"] == {"channel": "text", "device_id": "mac-mini"}
+    assert message_payload["messages"][1]["metadata"] == {"channel": "text", "device_id": "mac-mini"}
     chat_payload = calls[chat_index][2]
     assert chat_payload["session_id"] == encode_honcho_id("voice:neil")
 

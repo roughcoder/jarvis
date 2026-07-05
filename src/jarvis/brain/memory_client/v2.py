@@ -31,6 +31,13 @@ _MEMORY_QUERY = (
 )
 
 
+def _turn_metadata(*, channel: str, device_id: str | None) -> dict[str, str]:
+    metadata = {"channel": (channel or "voice").strip() or "voice"}
+    if device_id:
+        metadata["device_id"] = device_id
+    return metadata
+
+
 class UnsupportedMemoryOperation(NotImplementedError):
     """Raised when the active backend cannot provide a v3-only memory surface."""
 
@@ -82,17 +89,25 @@ class HonchoV2MemoryClient:
         except (json.JSONDecodeError, OSError):
             return ""
 
-    def _write_turn_sync(self, user_text: str, assistant_text: str, user: str | None = None) -> None:
+    def _write_turn_sync(
+        self,
+        user_text: str,
+        assistant_text: str,
+        user: str | None = None,
+        channel: str = "voice",
+        device_id: str | None = None,
+    ) -> None:
         import httpx
 
+        metadata = _turn_metadata(channel=channel, device_id=device_id)
         with httpx.Client(timeout=self._cfg.write_timeout_s, headers=self._headers()) as c:
             self._ensure(c, user)
             r = c.post(
                 f"{self._ws_url()}/sessions/{self._session_id(user)}/messages/",
                 json={
                     "messages": [
-                        {"content": user_text, "peer_id": self._peer(user)},
-                        {"content": assistant_text, "peer_id": self._cfg.assistant_peer_id},
+                        {"content": user_text, "peer_id": self._peer(user), "metadata": metadata},
+                        {"content": assistant_text, "peer_id": self._cfg.assistant_peer_id, "metadata": metadata},
                     ]
                 },
             )
@@ -118,8 +133,16 @@ class HonchoV2MemoryClient:
         self._last_refresh[self._peer(user)] = time.monotonic()
         return text
 
-    async def write_turn(self, user_text: str, assistant_text: str, *, user: str | None = None) -> None:
-        await asyncio.to_thread(self._write_turn_sync, user_text, assistant_text, user)
+    async def write_turn(
+        self,
+        user_text: str,
+        assistant_text: str,
+        *,
+        user: str | None = None,
+        channel: str = "voice",
+        device_id: str | None = None,
+    ) -> None:
+        await asyncio.to_thread(self._write_turn_sync, user_text, assistant_text, user, channel, device_id)
 
     async def refresh_cache(self, min_interval_s: float = 0.0, *, user: str | None = None) -> bool:
         result = await asyncio.to_thread(self._refresh_cache_sync, min_interval_s, user)
