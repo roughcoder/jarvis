@@ -244,3 +244,39 @@ def test_resolved_never_leaks_secrets() -> None:
     assert r["accounts.house_calendar_binding"] == "house-calendar"
     assert r["registry.path"]
     assert "****" in r["database.url"]
+
+
+def test_resolved_includes_orchestration_oauth_fields(monkeypatch) -> None:
+    _clean(
+        monkeypatch,
+        "ORCHESTRATION_AUTH_MODE",
+        "ORCHESTRATION_OAUTH_ISSUER",
+        "ORCHESTRATION_OAUTH_AUDIENCE",
+        "ORCHESTRATION_OAUTH_JWKS_URL",
+        "ORCHESTRATION_OAUTH_REQUIRED_SCOPES",
+        "ORCHESTRATION_OAUTH_JARVIS_USER_CLAIM",
+        "ORCHESTRATION_OAUTH_DEFAULT_ALG",
+        "ORCHESTRATION_OAUTH_JWKS_TTL_S",
+        "ORCHESTRATION_OAUTH_JWKS_MIN_REFRESH_S",
+    )
+    monkeypatch.setenv("ORCHESTRATION_AUTH_MODE", "oauth")
+    monkeypatch.setenv("ORCHESTRATION_OAUTH_ISSUER", "https://issuer.example")
+    monkeypatch.setenv("ORCHESTRATION_OAUTH_AUDIENCE", "jarvis-cockpit")
+    monkeypatch.setenv("ORCHESTRATION_OAUTH_JWKS_URL", "https://issuer.example/jwks")
+    monkeypatch.setenv("ORCHESTRATION_OAUTH_REQUIRED_SCOPES", "jarvis:read,jarvis:write")
+    monkeypatch.setenv("ORCHESTRATION_OAUTH_JARVIS_USER_CLAIM", "sub")
+    monkeypatch.setenv("ORCHESTRATION_OAUTH_DEFAULT_ALG", "ES256")
+    monkeypatch.setenv("ORCHESTRATION_OAUTH_JWKS_TTL_S", "120")
+    monkeypatch.setenv("ORCHESTRATION_OAUTH_JWKS_MIN_REFRESH_S", "10")
+
+    r = Config().resolved()
+
+    assert r["orchestration.auth_mode"] == "oauth"
+    assert r["orchestration.oauth_issuer"] == "https://issuer.example"
+    assert r["orchestration.oauth_audience"] == "jarvis-cockpit"
+    assert r["orchestration.oauth_jwks_url"] == "https://issuer.example/jwks"
+    assert r["orchestration.oauth_required_scopes"] == "jarvis:read,jarvis:write"
+    assert r["orchestration.oauth_jarvis_user_claim"] == "sub"
+    assert r["orchestration.oauth_default_alg"] == "ES256"
+    assert r["orchestration.oauth_jwks_ttl_s"] == 120.0
+    assert r["orchestration.oauth_jwks_min_refresh_s"] == 10.0

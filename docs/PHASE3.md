@@ -154,6 +154,12 @@ Deliberately small. OpenClaw is a menu to shop from, not a kit to clone.
 gate** — the `RequestContext`→capability check from §4 stands in front of all of
 them, present from 3a (§12) before the first tool that touches an account or the
 filesystem. A tool with no granted capability does not run, single-principal or not.
+Memory-related grants follow the same rule: `memory.query` exposes the
+memory-search tool, `memory.curate` exposes declared memory curation tools when
+the configured memory backend supports conclusions, and `profile.write` permits
+local profile/user edits. Grant them via `CAPS_DEFAULT_CAPABILITIES` only for a
+single-user/default setup, or prefer `profiles/<device>.md` and `users/<name>.md`
+front-matter for scoped devices and principals.
 
 **Atomic tools (hand-built, few):**
 

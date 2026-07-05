@@ -114,7 +114,10 @@ Declared conclusions are:
 This lane subsumes the previous two-rail design: the authoritative
 `remember`/`forget` rail becomes explicit conclusions in Honcho instead of a
 separate personal file. One backend, two write modes: derived vs declared.
-Curation writes are capability-gated (the successor of `profile.write`).
+Curation writes are capability-gated by `memory.curate` (the successor memory
+write lane to profile-file edits). Live memory searches are gated by
+`memory.query`; local profile/user file edits remain gated separately by
+`profile.write`. All three grants are explicit and deny-by-default.
 
 ### Curation durability (never silently lossy, never blocking)
 

@@ -10,7 +10,7 @@ from jarvis.brain.memory_outbox import CurationOutbox
 from jarvis.brain.memory_tools import make_memory_tools
 from jarvis.brain.registry import ContactEntry, ProjectEntry, RegistryStore
 from jarvis.config import MemoryConfig
-from jarvis.runtime import RequestContext
+from jarvis.runtime import RequestContext, ToolRegistry
 
 
 def _ctx(*caps: str, identity: str = "neil", peer: str = "neil") -> RequestContext:
@@ -25,15 +25,18 @@ def _ctx(*caps: str, identity: str = "neil", peer: str = "neil") -> RequestConte
 
 
 def _memory_cfg(tmp_path: Path, **over: Any) -> MemoryConfig:
+    values = {
+        "backend": "v3",
+        "cache_path": str(tmp_path / "cache.json"),
+        "curation_outbox_path": str(tmp_path / "outbox.jsonl"),
+        "tool_timeout_s": 0.05,
+        "curation_outbox_backoff_initial_s": 0,
+        "curation_outbox_backoff_max_s": 0,
+    }
+    values.update(over)
     return MemoryConfig(
         _env_file=None,
-        backend="v3",
-        cache_path=str(tmp_path / "cache.json"),
-        curation_outbox_path=str(tmp_path / "outbox.jsonl"),
-        tool_timeout_s=0.05,
-        curation_outbox_backoff_initial_s=0,
-        curation_outbox_backoff_max_s=0,
-        **over,
+        **values,
     )
 
 
@@ -234,6 +237,50 @@ def test_outbox_pending_read_your_writes_lines_include_forgets(tmp_path) -> None
 
     assert "pending, not yet saved: Klaus is off Fridays." in text
     assert "pending, not yet saved: forget old address" in text
+
+
+def test_memory_capabilities_make_tools_available_on_v3(tmp_path) -> None:
+    cfg = _memory_cfg(tmp_path)
+    registry = ToolRegistry()
+    for tool in make_memory_tools(
+        cfg,
+        memory=FakeMemory(),
+        outbox=CurationOutbox(cfg.curation_outbox_path),
+        registry=_registry(tmp_path),
+    ):
+        registry.register(tool)
+
+    available = {
+        tool.name
+        for tool in registry.available_for(_ctx("memory.query", "memory.curate"))
+    }
+
+    assert {
+        "memory_search",
+        "remember_contact",
+        "forget_memory",
+        "correct_memory",
+        "add_finding",
+        "record_decision",
+    } <= available
+
+
+def test_v2_backend_omits_curation_write_tools_and_enqueues_nothing(tmp_path) -> None:
+    cfg = _memory_cfg(tmp_path, backend="v2")
+    outbox = CurationOutbox(cfg.curation_outbox_path)
+
+    tools = {
+        tool.name: tool
+        for tool in make_memory_tools(
+            cfg,
+            memory=FakeMemory(),
+            outbox=outbox,
+            registry=_registry(tmp_path),
+        )
+    }
+
+    assert set(tools) == {"memory_search"}
+    assert outbox.pending_entries() == []
 
 
 def test_curation_tool_queues_contact_conclusion_with_observed_at(tmp_path) -> None:

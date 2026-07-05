@@ -148,6 +148,29 @@ def test_contact_identifier_dedupes_and_resolves_exactly(tmp_path) -> None:
     assert exc_info.value.conflicting_entry_id == "klaus"
 
 
+def test_contact_identifier_load_conflict_is_sanitized_with_structured_ids(tmp_path) -> None:
+    path = tmp_path / "registry.json"
+    first = _contact().as_dict()
+    second = _contact(
+        id="klaus-duplicate",
+        display_name="Klaus Duplicate",
+        identifiers=ContactIdentifiers(phones=("+15550100",)),
+    ).as_dict()
+    path.write_text(json.dumps({"version": 1, "contacts": [first, second]}), encoding="utf-8")
+
+    with pytest.raises(
+        RegistryConflict,
+        match="identifier already belongs to another contact",
+    ) as exc_info:
+        RegistryStore(path)
+
+    message = str(exc_info.value)
+    assert "+15550100" not in message
+    assert "klaus" not in message
+    assert exc_info.value.conflicting_entry_id == "klaus"
+    assert exc_info.value.conflicting_entry_ids == ("klaus", "klaus-duplicate")
+
+
 def test_contact_name_resolution_fuzzy_and_visibility_filtered(tmp_path) -> None:
     store = RegistryStore(tmp_path / "registry.json")
     store.save_contact(_contact(visibility="shared", members=("neil", "jules")))

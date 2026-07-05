@@ -991,7 +991,25 @@ class Config:
             "orchestration.landing_mode": self.orchestration.landing_mode,
             "orchestration.api_host": self.orchestration.api_host,
             "orchestration.api_port": self.orchestration.api_port,
+            "orchestration.api_bind_host": self.orchestration.api_bind_host or "<auto>",
             "orchestration.api_token": mask(self.orchestration.api_token),
+            "orchestration.api_allow_insecure": self.orchestration.api_allow_insecure,
+            "orchestration.api_cors_origins": self.orchestration.api_cors_origins or "<none>",
+            "orchestration.auth_mode": self.orchestration.auth_mode,
+            "orchestration.oauth_issuer": self.orchestration.oauth_issuer or "<unset>",
+            "orchestration.oauth_audience": self.orchestration.oauth_audience or "<unset>",
+            "orchestration.oauth_jwks_url": self.orchestration.oauth_jwks_url or "<unset>",
+            "orchestration.oauth_required_scopes": (
+                self.orchestration.oauth_required_scopes or "<none>"
+            ),
+            "orchestration.oauth_jarvis_user_claim": self.orchestration.oauth_jarvis_user_claim,
+            "orchestration.oauth_default_alg": self.orchestration.oauth_default_alg,
+            "orchestration.oauth_jwks_ttl_s": self.orchestration.oauth_jwks_ttl_s,
+            "orchestration.oauth_jwks_min_refresh_s": (
+                self.orchestration.oauth_jwks_min_refresh_s
+            ),
+            "orchestration.sse_refresh_interval_s": self.orchestration.sse_refresh_interval_s,
+            "orchestration.sse_heartbeat_interval_s": self.orchestration.sse_heartbeat_interval_s,
             "linear.api_key": mask(self.linear.api_key),
         }
 
