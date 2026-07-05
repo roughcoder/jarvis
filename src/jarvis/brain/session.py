@@ -1334,7 +1334,13 @@ class BrainSession:
                     kind="memory",
                 )
                 trace.event("memory_write_start", peers=[principal])
-            await self._memory.write_turn(user_text, assistant_text, user=self._memory_user)
+            await self._memory.write_turn(
+                user_text,
+                assistant_text,
+                user=self._memory_user,
+                channel=self._ctx.channel,
+                device_id=self._ctx.device_id or None,
+            )
             if trace is not None:
                 trace.event("memory_write_done", peers=[principal])
             await self._flush_curation_outbox(trace)
