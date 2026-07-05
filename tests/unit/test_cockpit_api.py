@@ -86,6 +86,7 @@ def _cfg(
     workspace = tmp_path / "orchestration"
     workers_path = workspace / "workers.json"
     registry_path = tmp_path / "registry.json"
+    users_path = tmp_path / "users"
     env.write_text(
         "\n".join(
             [
@@ -106,6 +107,7 @@ def _cfg(
                 f"ORCHESTRATION_OAUTH_JWKS_TTL_S={oauth_jwks_ttl_s}",
                 f"ORCHESTRATION_OAUTH_JWKS_MIN_REFRESH_S={oauth_jwks_min_refresh_s}",
                 f"CAPS_DEFAULT_CAPABILITIES={caps}",
+                f"CAPS_USERS_DIR={users_path}",
                 "WORKER_HOST=worker.test",
                 "WORKER_PORT=8780",
                 "WORKER_SUPPORTED_ENGINES=codex,claude",
@@ -220,6 +222,16 @@ def _seed_project_registry(cfg: Config) -> None:
             }
         )
     )
+
+
+def _seed_user_profiles(cfg: Config, *names: str) -> None:
+    users_dir = Path(cfg.capabilities.users_dir)
+    users_dir.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        users_dir.joinpath(f"{name}.md").write_text(
+            f"---\nscope: personal\nhoncho_peer: {name}\n---\n\n# {name.title()}\n",
+            encoding="utf-8",
+        )
 
 
 def _oauth_fixture(*, kid: str = "test-key", include_alg: bool = True) -> tuple[dict[str, Any], Callable[..., Response]]:
@@ -1419,6 +1431,7 @@ def test_cockpit_oauth_projects_use_subject_not_process_identity_or_jarvis_user(
         oauth_required_scopes="jarvis:read",
     )
     _seed_project_registry(cfg)
+    _seed_user_profiles(cfg, "jules", "neil")
     token = fixture["sign"](subject="jules", jarvis_user="neil", scope="jarvis:read")
 
     async def calls(base: str, client: httpx.AsyncClient) -> None:
@@ -1430,6 +1443,41 @@ def test_cockpit_oauth_projects_use_subject_not_process_identity_or_jarvis_user(
         assert listing.status_code == 200
         assert [project["id"] for project in listing.json()["projects"]] == ["house-story"]
         assert process_visible.status_code == 404
+        assert private.status_code == 404
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=jwks_get))
+
+
+def test_cockpit_oauth_household_principal_without_projects_sees_household_projects(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        identity="neil",
+        auth_mode="oauth",
+        oauth_issuer="https://cockpit.example",
+        oauth_audience="jarvis-brain",
+        oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+        oauth_required_scopes="jarvis:read",
+    )
+    _seed_project_registry(cfg)
+    _seed_user_profiles(cfg, "riley")
+    token = fixture["sign"](subject="riley", jarvis_user="neil", scope="jarvis:read")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        headers = {"Authorization": f"Bearer {token}"}
+        listing = await client.get(f"{base}/v1/projects", headers=headers)
+        household = await client.get(f"{base}/v1/projects/house-story", headers=headers)
+        shared = await client.get(f"{base}/v1/projects/neil-shared", headers=headers)
+        private = await client.get(f"{base}/v1/projects/alice-private", headers=headers)
+
+        assert listing.status_code == 200
+        assert [project["id"] for project in listing.json()["projects"]] == ["house-story"]
+        assert household.status_code == 200
+        assert household.json()["project"]["id"] == "house-story"
+        assert shared.status_code == 404
         assert private.status_code == 404
 
     import asyncio
@@ -1450,6 +1498,7 @@ def test_cockpit_oauth_unmapped_subject_gets_no_project_visibility(tmp_path, mon
         oauth_required_scopes="jarvis:read",
     )
     _seed_project_registry(cfg)
+    _seed_user_profiles(cfg, "neil")
     token = fixture["sign"](subject="idp-user-123", jarvis_user="neil", scope="jarvis:read")
 
     async def calls(base: str, client: httpx.AsyncClient) -> None:
@@ -1470,21 +1519,32 @@ def test_cockpit_project_access_matches_voice_memory_matrix(tmp_path, monkeypatc
     cfg = _cfg(tmp_path, monkeypatch)
     _seed_project_registry(cfg)
     registry = cockpit_api_module._registry_store(cfg)  # noqa: SLF001
-    requester = RequestContext(
-        "dev",
-        "jules",
-        "personal",
-        frozenset({"memory.query"}),
-        channel="cockpit",
-        peer="jules",
+    requesters = (
+        RequestContext(
+            "dev",
+            "jules",
+            "personal",
+            frozenset({"memory.query"}),
+            channel="cockpit",
+            peer="jules",
+        ),
+        RequestContext(
+            "dev",
+            "riley",
+            "personal",
+            frozenset({"memory.query"}),
+            channel="cockpit",
+            peer="riley",
+        ),
     )
 
-    for project_id in ("house-story", "neil-shared", "alice-private"):
-        project = registry.get_project(project_id)
-        assert project is not None
-        api_allowed = cockpit_api_module._project_access_allowed(registry, requester, project)  # noqa: SLF001
-        voice_allowed = can_query_memory_peer(requester, project.peer_id, registry=registry).allowed
-        assert api_allowed == voice_allowed
+    for requester in requesters:
+        for project_id in ("house-story", "neil-shared", "alice-private"):
+            project = registry.get_project(project_id)
+            assert project is not None
+            api_allowed = cockpit_api_module._project_access_allowed(registry, requester, project)  # noqa: SLF001
+            voice_allowed = can_query_memory_peer(requester, project.peer_id, registry=registry).allowed
+            assert api_allowed == voice_allowed
 
 
 def test_cockpit_projects_empty_registry_returns_empty_list(tmp_path, monkeypatch) -> None:  # noqa: ANN001
