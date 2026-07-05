@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import threading
 import time
@@ -21,6 +22,7 @@ import jarvis.orchestration.api as cockpit_api_module  # noqa: E402
 from jarvis.orchestration.api import CockpitAppContext, IdempotencyStore, SseSnapshotHub, _command_from_body, _idempotency_scope, make_app, serve  # noqa: E402
 from jarvis.orchestration.cockpit import make_session_ref  # noqa: E402
 from jarvis.orchestration.models import Artifact, ExecutionEnvelope, WorkItem, WorkerProfile, WorkerSessionLink  # noqa: E402
+from jarvis.orchestration.oauth import OAuthTokenValidator, OAuthValidationError  # noqa: E402
 from jarvis.orchestration.service import StartedWork  # noqa: E402
 from jarvis.orchestration.store import OrchestrationStore  # noqa: E402
 
@@ -270,6 +272,28 @@ def _oauth_fixture(*, kid: str = "test-key", include_alg: bool = True) -> tuple[
         return Response({})
 
     return {"sign": sign, "calls": calls, "jwks": jwks}, jwks_get
+
+
+def _oauth_validator(http_get: Callable[..., Response], *, jwks_min_refresh_s: float = 30.0, jwks_ttl_s: float = 300.0) -> OAuthTokenValidator:
+    return OAuthTokenValidator(
+        issuer="https://cockpit.example",
+        audience="jarvis-brain",
+        jwks_url="https://cockpit.example/api/auth/jwks",
+        scopes=("jarvis:read",),
+        jarvis_user_claim="jarvis_user",
+        default_alg="RS256",
+        jwks_ttl_s=jwks_ttl_s,
+        jwks_min_refresh_s=jwks_min_refresh_s,
+        http_get=http_get,
+    )
+
+
+def _unsigned_jwt_with_kid(kid: str) -> str:
+    def encode(data: dict[str, Any]) -> str:
+        raw = json.dumps(data, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    return f"{encode({'alg': 'RS256', 'kid': kid})}.{encode({})}.{encode({'sig': 'invalid'})}"
 
 
 def _seed_run(cfg: Config) -> tuple[OrchestrationStore, str]:
@@ -1579,6 +1603,69 @@ def test_cockpit_oauth_throttles_unknown_kid_jwks_refreshes(tmp_path, monkeypatc
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=jwks_get))
+
+
+def test_cockpit_oauth_bounds_negative_kid_cache() -> None:
+    fixture, jwks_get = _oauth_fixture()
+    validator = _oauth_validator(jwks_get)
+    validator.validate(fixture["sign"]())
+
+    for idx in range(validator._NEG_KID_MAX + 100):  # noqa: SLF001
+        with pytest.raises(OAuthValidationError):
+            validator.validate(_unsigned_jwt_with_kid(f"random-kid-{idx}"))
+
+    assert len(validator._negative_kids) <= validator._NEG_KID_MAX  # noqa: SLF001
+    assert fixture["calls"]["jwks"] == 2
+
+
+def test_cockpit_oauth_failed_unknown_kid_refresh_is_throttled_and_nonblocking() -> None:
+    fixture, jwks_get = _oauth_fixture()
+    failing = False
+    fail_calls = {"jwks": 0}
+    fetch_started = threading.Event()
+    release_fetch = threading.Event()
+
+    def slow_failing_get(url: str, **kwargs: Any) -> Response:
+        if not failing:
+            return jwks_get(url, **kwargs)
+        fail_calls["jwks"] += 1
+        fetch_started.set()
+        release_fetch.wait(timeout=2)
+        raise RuntimeError("jwks endpoint down")
+
+    validator = _oauth_validator(slow_failing_get)
+    valid_token = fixture["sign"]()
+    validator.validate(valid_token)
+    failing = True
+
+    errors: list[Exception] = []
+
+    def validate_unknown() -> None:
+        try:
+            validator.validate(_unsigned_jwt_with_kid("unknown-during-outage"))
+        except OAuthValidationError as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=validate_unknown)
+    thread.start()
+    assert fetch_started.wait(timeout=1)
+
+    started_at = time.perf_counter()
+    principal = validator.validate(valid_token)
+    elapsed = time.perf_counter() - started_at
+
+    release_fetch.set()
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert errors
+    assert principal.subject == "user_123"
+    assert elapsed < 0.5
+
+    for idx in range(5):
+        with pytest.raises(OAuthValidationError):
+            validator.validate(_unsigned_jwt_with_kid(f"unknown-after-outage-{idx}"))
+
+    assert fail_calls["jwks"] == 1
 
 
 def test_cockpit_oauth_refetches_jwks_after_ttl(tmp_path, monkeypatch) -> None:  # noqa: ANN001
