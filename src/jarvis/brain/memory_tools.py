@@ -190,7 +190,7 @@ def make_memory_tools(
             return "Noted - queued correction."
         return "Noted - queued forget."
 
-    return [
+    tools = [
         Tool(
             name="memory_search",
             description=(
@@ -210,6 +210,10 @@ def make_memory_tools(
             announce=True,
             timeout_s=cfg.tool_timeout_s + 1.0,
         ),
+    ]
+    if cfg.backend != "v3":
+        return tools
+    tools.extend([
         Tool(
             name="remember_contact",
             description=(
@@ -302,7 +306,8 @@ def make_memory_tools(
             required_capability=CURATE_CAPABILITY,
             handler=record_decision,
         ),
-    ]
+    ])
+    return tools
 
 
 def _base_metadata(ctx: RequestContext, args: dict[str, Any]) -> dict[str, Any]:

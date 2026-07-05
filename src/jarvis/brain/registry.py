@@ -49,9 +49,11 @@ class RegistryConflict(RegistryError):
         message: str,
         *,
         conflicting_entry_id: str | None = None,
+        conflicting_entry_ids: tuple[str, ...] = (),
     ) -> None:
         super().__init__(message)
         self.conflicting_entry_id = conflicting_entry_id
+        self.conflicting_entry_ids = conflicting_entry_ids
 
 
 @dataclass(frozen=True)
@@ -506,7 +508,9 @@ class RegistryStore:
                 other = seen.setdefault(key, contact.id)
                 if other != contact.id:
                     raise RegistryConflict(
-                        f"identifier {key!r} belongs to both {other!r} and {contact.id!r}"
+                        "identifier already belongs to another contact",
+                        conflicting_entry_id=other,
+                        conflicting_entry_ids=(other, contact.id),
                     )
 
     def _assert_contact_identifiers_available(self, entry: ContactEntry) -> None:
@@ -554,6 +558,8 @@ def resolve_repo(project: ProjectEntry, repo_name: str | None = None) -> RepoRes
     if defaults:
         return RepoResolution(status="matched", repo=defaults[0], reason="default repo")
     if len(repos) == 1:
+        # The explicit -> default -> ask ladder collapses the ask step when there
+        # is only one speakable repo; asking would add no disambiguating signal.
         return RepoResolution(status="matched", repo=repos[0], reason="only repo")
     return RepoResolution(
         status="ambiguous",
