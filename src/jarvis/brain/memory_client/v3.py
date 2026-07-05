@@ -395,6 +395,8 @@ class HonchoV3MemoryClient:
             response.raise_for_status()
             data = response.json() or {}
         items = data.get("items", data if isinstance(data, list) else [])
+        if not filters:
+            self._sidecar.reconcile(self._ws, {str(item.get("id", "")) for item in items if item.get("id")})
         records = [self._decode_conclusion(item) for item in items]
         return self._filter_conclusions(
             records,
@@ -524,12 +526,6 @@ class HonchoV3MemoryClient:
             in_progress_work_units=int(data.get("in_progress_work_units", 0)),
             raw=dict(data),
         )
-
-    def deriver_idle(self) -> bool:
-        try:
-            return self.queue_status().idle
-        except httpx.HTTPError:
-            return False
 
     def ping(self) -> bool:
         try:

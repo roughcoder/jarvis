@@ -209,6 +209,86 @@ def test_v3_query_conclusions_filters_sidecar_metadata(tmp_path) -> None:
     )
 
 
+def test_v3_unfiltered_list_reconciles_sidecar_orphans(tmp_path) -> None:
+    sidecar_path = tmp_path / "sidecar.json"
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                "jarvis-dev": {
+                    "c1": {"recorded_by": "neil"},
+                    "orphaned": {"recorded_by": "neil"},
+                },
+                "other-workspace": {
+                    "keep": {"recorded_by": "neil"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/conclusions/list")
+        assert _json(request) == {}
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "id": "c1",
+                        "content": "Decision: use Honcho v3.",
+                        "observer_id": "neil",
+                        "observed_id": encode_honcho_id("project:jarvis"),
+                        "level": "explicit",
+                    }
+                ]
+            },
+        )
+
+    client = HonchoV3MemoryClient(_cfg(tmp_path), transport=httpx.MockTransport(handler))
+
+    listed = client.list_conclusions()
+
+    assert listed[0].metadata == {"recorded_by": "neil"}
+    assert json.loads(sidecar_path.read_text(encoding="utf-8")) == {
+        "jarvis-dev": {"c1": {"recorded_by": "neil"}},
+        "other-workspace": {"keep": {"recorded_by": "neil"}},
+    }
+
+
+def test_v3_filtered_list_does_not_reconcile_sidecar_subset(tmp_path) -> None:
+    sidecar_path = tmp_path / "sidecar.json"
+    original_sidecar = {
+        "jarvis-dev": {
+            "c1": {"recorded_by": "neil"},
+            "not-in-filter": {"recorded_by": "neil"},
+        }
+    }
+    sidecar_path.write_text(json.dumps(original_sidecar), encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/conclusions/list")
+        assert _json(request) == {"filters": {"observed_id": encode_honcho_id("project:jarvis")}}
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "id": "c1",
+                        "content": "Decision: use Honcho v3.",
+                        "observer_id": "neil",
+                        "observed_id": encode_honcho_id("project:jarvis"),
+                        "level": "explicit",
+                    }
+                ]
+            },
+        )
+
+    client = HonchoV3MemoryClient(_cfg(tmp_path), transport=httpx.MockTransport(handler))
+
+    assert client.list_conclusions(observed_id="project:jarvis")
+    assert json.loads(sidecar_path.read_text(encoding="utf-8")) == original_sidecar
+
+
 def test_v3_queue_status_parses_idle_state(tmp_path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path.endswith("/queue/status")
