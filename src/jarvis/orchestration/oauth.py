@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 import jwt
 from jwt import PyJWK
@@ -49,7 +52,6 @@ def oauth_metadata(orchestration: Any) -> dict[str, Any]:
         "jwks_url": str(orchestration.oauth_jwks_url).strip(),
         "required_scopes": list(required_scopes(str(orchestration.oauth_required_scopes))),
         "jarvis_user_claim": str(orchestration.oauth_jarvis_user_claim).strip() or "jarvis_user",
-        "legacy_token_available": bool(orchestration.api_token.get_secret_value()),
     }
 
 
@@ -62,15 +64,27 @@ class OAuthTokenValidator:
         jwks_url: str,
         scopes: tuple[str, ...],
         jarvis_user_claim: str,
+        default_alg: str,
+        jwks_ttl_s: float,
+        jwks_min_refresh_s: float,
         http_get: HttpGet,
     ) -> None:
         self.issuer = issuer.strip()
         self.audience = audience.strip()
         self.jwks_url = jwks_url.strip()
+        _require_secure_url("OAuth issuer", self.issuer)
+        _require_secure_url("OAuth JWKS URL", self.jwks_url)
         self.scopes = scopes
         self.jarvis_user_claim = jarvis_user_claim.strip() or "jarvis_user"
+        self.default_alg = default_alg.strip() or "RS256"
+        self.jwks_ttl_s = max(0.0, float(jwks_ttl_s))
+        self.jwks_min_refresh_s = max(0.0, float(jwks_min_refresh_s))
         self._http_get = http_get
+        self._lock = threading.Lock()
         self._jwks: dict[str, Any] | None = None
+        self._jwks_loaded_at = 0.0
+        self._last_unknown_refresh_at = 0.0
+        self._negative_kids: dict[str, float] = {}
 
     def validate(self, token: str) -> OAuthPrincipal:
         if not token:
@@ -87,13 +101,14 @@ class OAuthTokenValidator:
 
         try:
             signing_key = PyJWK.from_dict(key).key
-            algorithms = [str(key.get("alg") or header.get("alg") or "RS256")]
+            algorithms = [str(key.get("alg") or self.default_alg)]
             claims = jwt.decode(
                 token,
                 signing_key,
                 algorithms=algorithms,
                 issuer=self.issuer,
                 audience=self.audience,
+                leeway=30,
                 options={"require": ["exp", "iss", "sub"]},
             )
         except Exception as exc:  # noqa: BLE001 - surface all JWT failures as unauthorized.
@@ -107,6 +122,8 @@ class OAuthTokenValidator:
         if missing:
             raise OAuthValidationError("missing required scope")
         jarvis_user = str(claims.get(self.jarvis_user_claim) or "")
+        if not jarvis_user:
+            raise OAuthValidationError("missing jarvis user")
         return OAuthPrincipal(
             subject=subject,
             jarvis_user=jarvis_user,
@@ -122,7 +139,36 @@ class OAuthTokenValidator:
         return header if isinstance(header, dict) else {}
 
     def _key_for_kid(self, kid: str, *, refresh: bool) -> dict[str, Any] | None:
-        jwks = self._load_jwks(refresh=refresh)
+        now = time.monotonic()
+        with self._lock:
+            missed_at = self._negative_kids.get(kid)
+            if missed_at is not None and now - missed_at < self.jwks_min_refresh_s:
+                return None
+
+            jwks = self._load_jwks_locked(refresh=False, now=now)
+            key = self._find_key(jwks, kid)
+            if key is not None:
+                self._negative_kids.pop(kid, None)
+                return key
+
+            if not refresh:
+                return None
+
+            if now - self._last_unknown_refresh_at < self.jwks_min_refresh_s:
+                self._negative_kids[kid] = now
+                return None
+
+            jwks = self._load_jwks_locked(refresh=True, now=now)
+            self._last_unknown_refresh_at = time.monotonic()
+            key = self._find_key(jwks, kid)
+            if key is not None:
+                self._negative_kids.pop(kid, None)
+                return key
+
+            self._negative_kids[kid] = now
+            return None
+
+    def _find_key(self, jwks: dict[str, Any], kid: str) -> dict[str, Any] | None:
         keys = jwks.get("keys")
         if not isinstance(keys, list):
             raise OAuthValidationError("invalid jwks")
@@ -131,8 +177,9 @@ class OAuthTokenValidator:
                 return key
         return None
 
-    def _load_jwks(self, *, refresh: bool = False) -> dict[str, Any]:
-        if self._jwks is not None and not refresh:
+    def _load_jwks_locked(self, *, refresh: bool, now: float) -> dict[str, Any]:
+        cache_fresh = self._jwks is not None and (self.jwks_ttl_s <= 0.0 or now - self._jwks_loaded_at < self.jwks_ttl_s)
+        if cache_fresh and not refresh:
             return self._jwks
         try:
             response = self._http_get(self.jwks_url, timeout=5)
@@ -145,7 +192,17 @@ class OAuthTokenValidator:
             raise OAuthValidationError("invalid jwks")
         # Round-trip through JSON to detach any response-owned objects.
         self._jwks = json.loads(json.dumps(data))
+        self._jwks_loaded_at = time.monotonic()
         return self._jwks
+
+
+def _require_secure_url(label: str, value: str) -> None:
+    parsed = urlparse(value)
+    if parsed.scheme == "https":
+        return
+    if parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1"}:
+        return
+    raise ValueError(f"{label} must use https:// outside localhost development")
 
 
 def _claim_scopes(claims: dict[str, Any]) -> set[str]:

@@ -75,6 +75,9 @@ def _cfg(
     oauth_audience: str = "",
     oauth_jwks_url: str = "",
     oauth_required_scopes: str = "",
+    oauth_default_alg: str = "RS256",
+    oauth_jwks_ttl_s: str = "300",
+    oauth_jwks_min_refresh_s: str = "30",
 ) -> Config:
     env = tmp_path / ".env"
     workspace = tmp_path / "orchestration"
@@ -96,6 +99,9 @@ def _cfg(
                 f"ORCHESTRATION_OAUTH_JWKS_URL={oauth_jwks_url}",
                 f"ORCHESTRATION_OAUTH_REQUIRED_SCOPES={oauth_required_scopes}",
                 "ORCHESTRATION_OAUTH_JARVIS_USER_CLAIM=jarvis_user",
+                f"ORCHESTRATION_OAUTH_DEFAULT_ALG={oauth_default_alg}",
+                f"ORCHESTRATION_OAUTH_JWKS_TTL_S={oauth_jwks_ttl_s}",
+                f"ORCHESTRATION_OAUTH_JWKS_MIN_REFRESH_S={oauth_jwks_min_refresh_s}",
                 f"CAPS_DEFAULT_CAPABILITIES={caps}",
                 "WORKER_HOST=worker.test",
                 "WORKER_PORT=8780",
@@ -213,7 +219,7 @@ def _seed_project_registry(cfg: Config) -> None:
     )
 
 
-def _oauth_fixture(*, kid: str = "test-key") -> tuple[dict[str, Any], Callable[..., Response]]:
+def _oauth_fixture(*, kid: str = "test-key", include_alg: bool = True) -> tuple[dict[str, Any], Callable[..., Response]]:
     jwt = pytest.importorskip("jwt")
     cryptography_rsa = pytest.importorskip("cryptography.hazmat.primitives.asymmetric.rsa")
     cryptography_serialization = pytest.importorskip("cryptography.hazmat.primitives.serialization")
@@ -225,7 +231,9 @@ def _oauth_fixture(*, kid: str = "test-key") -> tuple[dict[str, Any], Callable[.
         encryption_algorithm=cryptography_serialization.NoEncryption(),
     )
     public_jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(private_key.public_key()))
-    public_jwk.update({"kid": kid, "alg": "RS256", "use": "sig"})
+    public_jwk.update({"kid": kid, "use": "sig"})
+    if include_alg:
+        public_jwk["alg"] = "RS256"
     jwks = {"keys": [public_jwk]}
 
     def sign(
@@ -237,6 +245,8 @@ def _oauth_fixture(*, kid: str = "test-key") -> tuple[dict[str, Any], Callable[.
         scope: str = "jarvis:read jarvis:operate",
         expires_delta: timedelta = timedelta(minutes=5),
         token_kid: str = kid,
+        algorithm: str = "RS256",
+        signing_key: Any = private_pem,
     ) -> str:
         now = datetime.now(UTC)
         claims = {
@@ -248,13 +258,14 @@ def _oauth_fixture(*, kid: str = "test-key") -> tuple[dict[str, Any], Callable[.
             "iat": now,
             "jarvis_user": jarvis_user,
         }
-        return jwt.encode(claims, private_pem, algorithm="RS256", headers={"kid": token_kid})
+        return jwt.encode(claims, signing_key, algorithm=algorithm, headers={"kid": token_kid})
 
-    calls = {"jwks": 0}
+    calls: dict[str, Any] = {"jwks": 0, "threads": []}
 
     def jwks_get(url: str, **_kwargs: Any) -> Response:
         if url == "https://cockpit.example/api/auth/jwks":
             calls["jwks"] += 1
+            calls["threads"].append(threading.get_ident())
             return Response(jwks)
         return Response({})
 
@@ -1466,8 +1477,8 @@ def test_cockpit_auth_metadata_is_public_and_secret_free(tmp_path, monkeypatch) 
             "jwks_url": "https://cockpit.example/api/auth/jwks",
             "required_scopes": ["jarvis:read", "jarvis:operate"],
             "jarvis_user_claim": "jarvis_user",
-            "legacy_token_available": True,
         }
+        assert response.headers["Cache-Control"] == "no-store"
         assert "secret" not in response.text
 
     import asyncio
@@ -1489,6 +1500,7 @@ def test_cockpit_oauth_jwt_allows_health_and_snapshot(tmp_path, monkeypatch) -> 
     token = fixture["sign"]()
 
     async def calls(base: str, client: httpx.AsyncClient) -> None:
+        event_loop_thread = threading.get_ident()
         headers = {"Authorization": f"Bearer {token}"}
         health = await client.get(f"{base}/v1/health", headers=headers)
         snapshot = await client.get(f"{base}/v1/cockpit/snapshot", headers=headers)
@@ -1497,6 +1509,8 @@ def test_cockpit_oauth_jwt_allows_health_and_snapshot(tmp_path, monkeypatch) -> 
         assert snapshot.status_code == 200
         assert snapshot.json()["api_version"]
         assert fixture["calls"]["jwks"] == 1
+        assert fixture["calls"]["threads"]
+        assert all(thread_id != event_loop_thread for thread_id in fixture["calls"]["threads"])
 
     import asyncio
 
@@ -1518,7 +1532,8 @@ def test_cockpit_oauth_rejects_bad_jwt_claims(tmp_path, monkeypatch) -> None:  #
         fixture["sign"](issuer="https://evil.example"),
         fixture["sign"](audience="other-brain"),
         fixture["sign"](scope="jarvis:read"),
-        fixture["sign"](expires_delta=timedelta(seconds=-1)),
+        fixture["sign"](expires_delta=timedelta(minutes=-2)),
+        fixture["sign"](jarvis_user=""),
         "not-a-jwt",
     ]
 
@@ -1533,7 +1548,7 @@ def test_cockpit_oauth_rejects_bad_jwt_claims(tmp_path, monkeypatch) -> None:  #
     asyncio.run(_with_server(cfg, calls, http_get=jwks_get))
 
 
-def test_cockpit_oauth_refreshes_jwks_for_unknown_kid(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+def test_cockpit_oauth_throttles_unknown_kid_jwks_refreshes(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     fixture, jwks_get = _oauth_fixture()
     cfg = _cfg(
         tmp_path,
@@ -1543,19 +1558,104 @@ def test_cockpit_oauth_refreshes_jwks_for_unknown_kid(tmp_path, monkeypatch) -> 
         oauth_audience="jarvis-brain",
         oauth_jwks_url="https://cockpit.example/api/auth/jwks",
         oauth_required_scopes="jarvis:read",
+        oauth_jwks_min_refresh_s="30",
     )
-    token = fixture["sign"](token_kid="rotated-key")
+    valid_token = fixture["sign"]()
+    unknown_tokens = [fixture["sign"](token_kid=f"rotated-key-{idx}") for idx in range(8)]
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        valid = await client.get(f"{base}/v1/health", headers={"Authorization": f"Bearer {valid_token}"})
+        assert valid.status_code == 200
+
+        for token in unknown_tokens:
+            response = await client.get(f"{base}/v1/health", headers={"Authorization": f"Bearer {token}"})
+            assert response.status_code == 401
+            assert response.json()["error"]["code"] == "unauthorized"
+
+        # One initial JWKS load for the valid token plus one allowed unknown-kid
+        # refresh. The rest are served from cache and rejected.
+        assert fixture["calls"]["jwks"] == 2
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=jwks_get))
+
+
+def test_cockpit_oauth_refetches_jwks_after_ttl(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        auth_mode="oauth",
+        oauth_issuer="https://cockpit.example",
+        oauth_audience="jarvis-brain",
+        oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+        oauth_required_scopes="jarvis:read",
+        oauth_jwks_ttl_s="0.001",
+    )
+    token = fixture["sign"]()
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        first = await client.get(f"{base}/v1/health", headers={"Authorization": f"Bearer {token}"})
+        await asyncio.sleep(0.01)
+        second = await client.get(f"{base}/v1/health", headers={"Authorization": f"Bearer {token}"})
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert fixture["calls"]["jwks"] == 2
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=jwks_get))
+
+
+def test_cockpit_oauth_rejects_header_algorithm_confusion(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    fixture, jwks_get = _oauth_fixture(include_alg=False)
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        auth_mode="oauth",
+        oauth_issuer="https://cockpit.example",
+        oauth_audience="jarvis-brain",
+        oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+        oauth_required_scopes="jarvis:read",
+    )
+    token = fixture["sign"](algorithm="HS256", signing_key="attacker-secret-value-with-enough-bytes")
 
     async def calls(base: str, client: httpx.AsyncClient) -> None:
         response = await client.get(f"{base}/v1/health", headers={"Authorization": f"Bearer {token}"})
 
         assert response.status_code == 401
         assert response.json()["error"]["code"] == "unauthorized"
-        assert fixture["calls"]["jwks"] == 2
 
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=jwks_get))
+
+
+def test_cockpit_oauth_requires_secure_issuer_and_jwks_urls(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    insecure_cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        auth_mode="oauth",
+        oauth_issuer="http://issuer.example",
+        oauth_audience="jarvis-brain",
+        oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+        oauth_required_scopes="jarvis:read",
+    )
+    with pytest.raises(ValueError, match="OAuth issuer must use https://"):
+        make_app(insecure_cfg)
+
+    localhost_cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        auth_mode="oauth",
+        oauth_issuer="http://localhost:41760",
+        oauth_audience="jarvis-brain",
+        oauth_jwks_url="http://127.0.0.1:41760/api/auth/jwks",
+        oauth_required_scopes="jarvis:read",
+    )
+    make_app(localhost_cfg)
 
 
 def test_cockpit_hybrid_accepts_legacy_token_while_oauth_is_configured(tmp_path, monkeypatch) -> None:  # noqa: ANN001
