@@ -133,7 +133,10 @@ def test_contact_identifier_dedupes_and_resolves_exactly(tmp_path) -> None:
     assert resolved is not None
     assert resolved.id == "klaus"
 
-    with pytest.raises(RegistryConflict, match="already belongs"):
+    with pytest.raises(
+        RegistryConflict,
+        match="identifier already belongs to another contact",
+    ) as exc_info:
         store.save_contact(
             _contact(
                 id="klaus-duplicate",
@@ -141,6 +144,8 @@ def test_contact_identifier_dedupes_and_resolves_exactly(tmp_path) -> None:
                 identifiers=ContactIdentifiers(phones=("+15550100",)),
             )
         )
+    assert "klaus" not in str(exc_info.value)
+    assert exc_info.value.conflicting_entry_id == "klaus"
 
 
 def test_contact_name_resolution_fuzzy_and_visibility_filtered(tmp_path) -> None:
@@ -199,6 +204,54 @@ def test_visibility_semantics_for_project_and_contact_lists(tmp_path) -> None:
     }
     assert store.list_projects("") == []
     assert store.list_contacts("") == []
+
+
+def test_membership_grants_private_visibility_to_lists_details_and_resolvers(tmp_path) -> None:
+    store = RegistryStore(tmp_path / "registry.json")
+    store.save_project(
+        _project(
+            id="private-project",
+            name="Private Project",
+            aliases=("secret workspace",),
+            owner="alice",
+            members=("alice", "neil"),
+            visibility="private",
+            repos=(RepoEntry("notes", "roughcoder/private-notes", default=True),),
+        )
+    )
+    store.save_contact(
+        _contact(
+            id="private-contact",
+            display_name="Private Contact",
+            aliases=("private colleague",),
+            owner="alice",
+            members=("alice", "neil"),
+            visibility="private",
+            identifiers=ContactIdentifiers(emails=("private@example.test",)),
+        )
+    )
+
+    assert [project.id for project in store.list_projects("neil")] == ["private-project"]
+    assert store.get_visible_project("private-project", "neil").id == "private-project"
+    assert store.resolve_project("secret workspace", "neil").entry.id == "private-project"
+    assert store.resolve_project_repo("private-project", "neil").repo.name == "notes"
+
+    assert [contact.id for contact in store.list_contacts("neil")] == ["private-contact"]
+    assert store.get_visible_contact("private-contact", "neil").id == "private-contact"
+    assert store.resolve_contact("private colleague", "neil").entry.id == "private-contact"
+    assert (
+        store.resolve_contact_identifier("email", "PRIVATE@example.test", "neil").id
+        == "private-contact"
+    )
+
+    assert store.list_projects("jules") == []
+    assert store.get_visible_project("private-project", "jules") is None
+    assert store.resolve_project("secret workspace", "jules").status == "not_found"
+    assert store.resolve_project_repo("private-project", "jules").status == "not_found"
+    assert store.list_contacts("jules") == []
+    assert store.get_visible_contact("private-contact", "jules") is None
+    assert store.resolve_contact("private colleague", "jules").status == "not_found"
+    assert store.resolve_contact_identifier("email", "private@example.test", "jules") is None
 
 
 def test_repo_resolution_precedence_and_ambiguity() -> None:

@@ -2,7 +2,8 @@
 
 The registry is local state, deliberately separate from Honcho: Honcho stores
 reasoned memory for peers, while this file stores identity, access metadata,
-and external pointers for those peers.
+and external pointers for those peers. Explicit membership always grants
+visibility; the visibility tier controls the default audience.
 """
 
 from __future__ import annotations
@@ -30,6 +31,11 @@ _CONTACT_STATUSES = {"active", "merged"}
 _CREATED_FROM = {"curated", "auto_created_channel_sender"}
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
+# Tune conservatively: these thresholds absorb STT noise without guessing ties.
+_ENTITY_MATCH_THRESHOLD = 0.68
+_REPO_MATCH_THRESHOLD = 0.70
+_AMBIGUITY_MARGIN = 0.03
+
 
 class RegistryError(ValueError):
     """Base error for invalid registry operations."""
@@ -37,6 +43,15 @@ class RegistryError(ValueError):
 
 class RegistryConflict(RegistryError):
     """Raised when a registry entry conflicts with an existing entry."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        conflicting_entry_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.conflicting_entry_id = conflicting_entry_id
 
 
 @dataclass(frozen=True)
@@ -282,7 +297,11 @@ class RepoResolution:
 
 
 class RegistryStore:
-    """JSON-backed single-writer registry store."""
+    """JSON-backed single-writer registry store.
+
+    The brain is the only writer. Atomic writes keep the file internally
+    consistent, but concurrent RegistryStore instances would be last-writer-wins.
+    """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser()
@@ -498,8 +517,10 @@ class RegistryStore:
                 continue
             overlap = set(entry.identifiers.keys) & set(contact.identifiers.keys)
             if overlap:
-                key = sorted(overlap)[0]
-                raise RegistryConflict(f"identifier {key!r} already belongs to {contact.id!r}")
+                raise RegistryConflict(
+                    "identifier already belongs to another contact",
+                    conflicting_entry_id=contact.id,
+                )
 
 
 def is_visible_to(entry: ProjectEntry | ContactEntry, requester_id: str) -> bool:
@@ -510,9 +531,7 @@ def is_visible_to(entry: ProjectEntry | ContactEntry, requester_id: str) -> bool
         return True
     if requester == entry.owner:
         return True
-    if entry.visibility == "shared":
-        return requester in entry.members
-    return False
+    return requester in entry.members
 
 
 def resolve_repo(project: ProjectEntry, repo_name: str | None = None) -> RepoResolution:
@@ -549,9 +568,9 @@ def _resolve_named_repo(query: str, repos: tuple[RepoEntry, ...]) -> RepoResolut
         key=lambda item: item[0],
         reverse=True,
     )
-    if not ranked or ranked[0][0] < 0.70:
+    if not ranked or ranked[0][0] < _REPO_MATCH_THRESHOLD:
         return RepoResolution(status="not_found", speakable_names=tuple(repo.name for repo in repos))
-    if len(ranked) > 1 and ranked[0][0] - ranked[1][0] <= 0.03:
+    if len(ranked) > 1 and ranked[0][0] - ranked[1][0] <= _AMBIGUITY_MARGIN:
         return RepoResolution(
             status="ambiguous",
             speakable_names=tuple(repo.name for _, repo in ranked[:3]),
@@ -568,13 +587,13 @@ def _resolve_entity(
     ranked: list[tuple[float, ProjectEntry | ContactEntry]] = []
     for entry in entries:
         score = max(_phrase_score(query, name) for name in _entity_names(entry))
-        if score >= 0.68:
+        if score >= _ENTITY_MATCH_THRESHOLD:
             ranked.append((score, entry))
     ranked.sort(key=lambda item: item[0], reverse=True)
     if not ranked:
         return EntityResolution(status="not_found")
     top_score = ranked[0][0]
-    near = tuple(entry for score, entry in ranked if top_score - score <= 0.03)
+    near = tuple(entry for score, entry in ranked if top_score - score <= _AMBIGUITY_MARGIN)
     if len(near) > 1:
         return EntityResolution(
             status="ambiguous",
