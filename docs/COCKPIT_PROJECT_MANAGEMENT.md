@@ -21,10 +21,11 @@ Read + converse, membership-filtered by the authenticated caller:
 | `GET /v1/projects/{id}/memory` | Cached representation + recent findings/decisions. |
 | `GET`/`POST /v1/projects/{id}/threads` | List / open orchestrator threads. |
 | `POST /v1/projects/{id}/threads/{tid}/turns` | Send a turn (reply streams over SSE). |
-| MCP tools | `project_list`, `project_get`, `memory_search`, `record_finding`, `record_decision`, `remember`, `open_thread`, `send_turn`. (`upload_file` is a stub.) |
+| MCP tools | `project_list`, `project_get`, project write tools, `memory_search`, `record_finding`, `record_decision`, `remember`, `forget`, `correct`, `open_thread`, `send_turn`, `upload_file`. |
 
-Missing, and specified here: **registry-entry writes** (create/edit the entry,
-repos, members, visibility, status) and **file upload**.
+This feature now also includes **registry-entry writes** (create/edit the entry,
+repos, members, visibility, status) and **file upload** through the same
+brain-owned write path described below.
 
 ## Locked decisions
 
@@ -154,12 +155,11 @@ Mirror the REST operations for external agents, forwarding to the same brain op:
 MCP writes carry `recorded_by`, `channel: mcp`, and an `agent` tag, as
 established for the MCP server lane.
 
-## File upload (specified; deferred build)
+## File upload
 
-Not built. `upload_file` is a stub and there is no REST upload route. Documented
-here so it lands with this work rather than as an afterthought. Uploading a
-document (e.g. a spec) is **project content**: **member-gated, per-action,
-routed through the brain** (which owns the file vault and is the single writer).
+Uploading a document (e.g. a spec) is **project content**: **member-gated,
+per-action, routed through the brain** (which owns the file vault and is the
+single writer).
 
 Flow:
 

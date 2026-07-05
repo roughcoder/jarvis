@@ -56,6 +56,82 @@ def build_mcp(runtime: MCPServerRuntime):  # noqa: ANN201
     async def project_get(project_id: str) -> dict[str, Any]:
         return await runtime.service.project_get(runtime.requester(), project_id=project_id)
 
+    @mcp.tool(name="project_create")
+    async def project_create(
+        id: str,
+        name: str,
+        aliases: list[str] | None = None,
+        visibility: str = "household",
+        status: str = "active",
+        files_root: str = "",
+        repos: list[dict[str, Any]] | None = None,
+        links: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return await runtime.service.project_create(
+            runtime.requester(),
+            id=id,
+            name=name,
+            aliases=aliases or [],
+            visibility=visibility,
+            status=status,
+            files_root=files_root,
+            repos=repos or [],
+            links=links or {},
+        )
+
+    @mcp.tool(name="project_update")
+    async def project_update(
+        project_id: str,
+        name: str = "",
+        aliases: list[str] | None = None,
+        status: str = "",
+        files_root: str = "",
+        repos: list[dict[str, Any]] | None = None,
+        links: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        if name:
+            fields["name"] = name
+        if aliases is not None:
+            fields["aliases"] = aliases
+        if status:
+            fields["status"] = status
+        if files_root:
+            fields["files_root"] = files_root
+        if repos is not None:
+            fields["repos"] = repos
+        if links is not None:
+            fields["links"] = links
+        return await runtime.service.project_update(runtime.requester(), project_id=project_id, **fields)
+
+    @mcp.tool(name="project_set_repos")
+    async def project_set_repos(project_id: str, repos: list[dict[str, Any]]) -> dict[str, Any]:
+        return await runtime.service.project_set_repos(runtime.requester(), project_id=project_id, repos=repos)
+
+    @mcp.tool(name="project_set_visibility")
+    async def project_set_visibility(project_id: str, visibility: str) -> dict[str, Any]:
+        return await runtime.service.project_set_visibility(
+            runtime.requester(),
+            project_id=project_id,
+            visibility=visibility,
+        )
+
+    @mcp.tool(name="project_set_members")
+    async def project_set_members(project_id: str, members: list[str]) -> dict[str, Any]:
+        return await runtime.service.project_set_members(runtime.requester(), project_id=project_id, members=members)
+
+    @mcp.tool(name="project_archive")
+    async def project_archive(project_id: str, archived: bool = True) -> dict[str, Any]:
+        return await runtime.service.project_archive(
+            runtime.requester(),
+            project_id=project_id,
+            archived=archived,
+        )
+
+    @mcp.tool(name="project_delete")
+    async def project_delete(project_id: str) -> dict[str, Any]:
+        return await runtime.service.project_delete(runtime.requester(), project_id=project_id)
+
     @mcp.tool(name="memory_search")
     async def memory_search(search_query: str, target: str = "") -> dict[str, str]:
         return await runtime.service.memory_search(
@@ -113,6 +189,40 @@ def build_mcp(runtime: MCPServerRuntime):  # noqa: ANN201
             observed_at=observed_at,
         )
 
+    @mcp.tool(name="forget")
+    async def forget(
+        query: str,
+        target: str = "",
+        confirm: bool = False,
+        conclusion_ids: list[str] | None = None,
+    ) -> dict[str, str]:
+        return await runtime.service.forget(
+            runtime.requester(),
+            query=query,
+            target=target,
+            confirm=confirm,
+            conclusion_ids=conclusion_ids or [],
+        )
+
+    @mcp.tool(name="correct")
+    async def correct(
+        query: str,
+        replacement: str,
+        target: str = "",
+        confirm: bool = False,
+        conclusion_ids: list[str] | None = None,
+        observed_at: str = "",
+    ) -> dict[str, str]:
+        return await runtime.service.correct(
+            runtime.requester(),
+            query=query,
+            replacement=replacement,
+            target=target,
+            confirm=confirm,
+            conclusion_ids=conclusion_ids or [],
+            observed_at=observed_at,
+        )
+
     @mcp.tool(name="open_thread")
     async def open_thread(project_id: str, title: str = "") -> dict[str, Any]:
         return await runtime.service.open_thread(
@@ -134,15 +244,31 @@ def build_mcp(runtime: MCPServerRuntime):  # noqa: ANN201
     async def upload_file(
         project_id: str = "",
         path: str = "",
-        content_base64: str = "",
+        url: str = "",
+        content: str = "",
+        filename: str = "",
+        title: str = "",
+        artifact_type: str = "spec",
         agent: str = "",
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         return await runtime.service.upload_file(
             runtime.requester(),
             project_id=project_id,
             path=path,
-            content_base64=content_base64,
+            url=url,
+            content=content,
+            filename=filename,
+            title=title,
+            artifact_type=artifact_type,
             agent=agent,
+        )
+
+    @mcp.tool(name="retract_file")
+    async def retract_file(project_id: str, doc_id: str) -> dict[str, Any]:
+        return await runtime.service.retract_file(
+            runtime.requester(),
+            project_id=project_id,
+            doc_id=doc_id,
         )
 
     return mcp

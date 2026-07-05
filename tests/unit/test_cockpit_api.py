@@ -19,6 +19,7 @@ from aiohttp import web  # noqa: E402
 
 from jarvis.brain.capabilities import RequestContext, can_query_memory_peer  # noqa: E402
 from jarvis.brain.memory_client import ConclusionRecord, MemoryMessage, RepresentationRecord, SessionPeer  # noqa: E402
+from jarvis.brain.memory_outbox import CurationOutbox  # noqa: E402
 from jarvis.connectors.cockpit import CockpitConnector, CockpitThread, orchestrator_session_id  # noqa: E402
 from jarvis.config import Config, WorkerConfig  # noqa: E402
 import jarvis.orchestration.api as cockpit_api_module  # noqa: E402
@@ -183,6 +184,44 @@ class FakeProjectMemory:
 
     def queue_status(self) -> Any:
         return type("QueueStatus", (), {"idle": True})()
+
+
+class FakeProjectBrainClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def execute(self, requester: RequestContext, op: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append({"identity": requester.identity, "op": op, "payload": dict(payload)})
+        if payload.get("project_id") == "alice-private" and requester.identity != "alice":
+            raise cockpit_api_module.ProjectOperationError("not_found", "project not found", status=404)
+        if op in {"project.visibility.set", "project.members.set", "project.archive", "project.delete"} and requester.identity != "alice":
+            raise cockpit_api_module.ProjectOperationError("forbidden", "project owner required", status=403)
+        if op == "project.delete":
+            return {"deleted": True, "project_id": payload["project_id"]}
+        if op == "project.file.upload":
+            return {
+                "project_id": payload["project_id"],
+                "doc_id": "upload-123",
+                "session_id": "project:neil-shared:uploads:upload-123",
+                "original_path": "/tmp/upload.md",
+                "metadata": {"channel": payload.get("channel")},
+                "ingestion": {"queued": True},
+            }
+        return {
+            "project": {
+                "id": payload.get("project_id") or payload.get("id") or "new-project",
+                "name": payload.get("name") or "Updated Project",
+                "peer_id": "project:updated",
+                "aliases": payload.get("aliases") or [],
+                "owner": "alice",
+                "members": payload.get("members") or ["alice", "neil"],
+                "visibility": payload.get("visibility") or "shared",
+                "status": "active",
+                "repos": payload.get("repos") or [],
+                "links": payload.get("links") or {"jira": "", "urls": []},
+                "files_root": payload.get("files_root") or "projects/updated/files",
+            }
+        }
 
 
 class _Fn:
@@ -1651,6 +1690,99 @@ def test_cockpit_project_detail_404s_when_not_visible(tmp_path, monkeypatch) -> 
     import asyncio
 
     asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_project_writes_forward_to_brain_without_direct_registry_write(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    brain = FakeProjectBrainClient()
+    monkeypatch.setattr(cockpit_api_module, "_project_brain_client", lambda _ctx: brain)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        create = await client.post(f"{base}/v1/projects", json={"id": "new-project", "name": "New Project"})
+        update = await client.patch(f"{base}/v1/projects/neil-shared", json={"name": "Renamed"})
+        visibility = await client.patch(f"{base}/v1/projects/neil-shared/visibility", json={"visibility": "private"})
+        hidden = await client.patch(f"{base}/v1/projects/alice-private", json={"name": "Nope"})
+
+        assert create.status_code == 200
+        assert update.status_code == 200
+        assert update.json()["project"]["name"] == "Renamed"
+        assert visibility.status_code == 403
+        assert hidden.status_code == 404
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    assert [call["op"] for call in brain.calls] == [
+        "project.create",
+        "project.update",
+        "project.visibility.set",
+        "project.update",
+    ]
+    assert brain.calls[1]["payload"] == {"name": "Renamed", "project_id": "neil-shared"}
+    assert cockpit_api_module._registry_store(cfg).get_project("neil-shared").name == "Neil Shared"  # noqa: SLF001
+
+
+def test_cockpit_project_memory_routes_are_member_gated_and_attributed(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        finding = await client.post(
+            f"{base}/v1/projects/neil-shared/findings",
+            json={"content": "The notes repo owns project notes.", "observed_at": "2026-07-05"},
+        )
+        hidden = await client.post(
+            f"{base}/v1/projects/alice-private/findings",
+            json={"content": "No access."},
+        )
+
+        assert finding.status_code == 200
+        assert finding.json()["content_hash"].startswith("sha256:")
+        assert hidden.status_code == 404
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    entry = CurationOutbox(cfg.memory.curation_outbox_path).pending_entries()[0]
+    assert entry.observed_id == "project:neil-shared"
+    assert entry.content == "The notes repo owns project notes."
+    assert entry.metadata["project_id"] == "neil-shared"
+    assert entry.metadata["artifact_type"] == "finding"
+    assert entry.metadata["recorded_by"] == "neil"
+    assert entry.metadata["channel"] == "cockpit"
+    assert entry.metadata["observed_at"] == "2026-07-05"
+
+
+def test_cockpit_project_file_upload_uses_multipart_and_brain(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    brain = FakeProjectBrainClient()
+    monkeypatch.setattr(cockpit_api_module, "_project_brain_client", lambda _ctx: brain)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        upload = await client.post(
+            f"{base}/v1/projects/neil-shared/files",
+            files={"file": ("spec.md", b"# Spec", "text/markdown")},
+            data={"title": "Spec", "artifact_type": "spec"},
+        )
+
+        assert upload.status_code == 200
+        assert upload.json()["doc_id"] == "upload-123"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    assert brain.calls[0]["op"] == "project.file.upload"
+    payload = brain.calls[0]["payload"]
+    assert payload["project_id"] == "neil-shared"
+    assert payload["filename"] == "spec.md"
+    assert base64.b64decode(payload["content_base64"]) == b"# Spec"
+    assert payload["title"] == "Spec"
+    assert payload["channel"] == "cockpit"
 
 
 def test_cockpit_project_memory_returns_representation_and_conclusions(tmp_path, monkeypatch) -> None:  # noqa: ANN001

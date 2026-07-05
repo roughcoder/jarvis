@@ -118,6 +118,29 @@ class DeviceResponse(BaseModel):
     error: str = ""
 
 
+ProjectOperationName = Literal[
+    "project.create",
+    "project.update",
+    "project.repos.set",
+    "project.members.set",
+    "project.visibility.set",
+    "project.archive",
+    "project.delete",
+    "project.file.upload",
+    "project.file.retract",
+]
+
+
+class ProjectOperationRequest(BaseModel):
+    """Up: authenticated boundary peers ask the brain to perform project writes."""
+
+    type: Literal["project_operation_request"] = "project_operation_request"
+    request_id: str
+    op: ProjectOperationName
+    requester: dict[str, Any] = Field(default_factory=dict)
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
 # --- down: brain -> intercom -----------------------------------------------
 
 
@@ -195,10 +218,21 @@ class DeviceRequest(BaseModel):
     args: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProjectOperationResponse(BaseModel):
+    """Down: structured response for a project write/upload operation."""
+
+    type: Literal["project_operation_response"] = "project_operation_response"
+    request_id: str
+    ok: bool
+    result: dict[str, Any] = Field(default_factory=dict)
+    error: dict[str, Any] = Field(default_factory=dict)
+
+
 Message = Union[
     Hello, AudioStart, AudioEnd, BargeIn, ConversationIdle, TextIn, Identify, DeviceResponse,
+    ProjectOperationRequest,
     Welcome, Reject, ReplyText, ReplyEnd, Cancel, Proactive, WhoAreYou,
-    Transcript, DeviceRequest,
+    Transcript, DeviceRequest, ProjectOperationResponse,
 ]
 _ADAPTER: TypeAdapter = TypeAdapter(Annotated[Message, Field(discriminator="type")])
 

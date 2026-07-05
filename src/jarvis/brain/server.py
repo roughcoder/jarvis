@@ -28,6 +28,11 @@ from jarvis.brain.identity import HOUSE, IdentityResolver, load_users
 from jarvis.brain.memory_client import MemoryClient
 from jarvis.brain.memory_outbox import CurationOutbox
 from jarvis.brain.memory_tools import make_memory_tools
+from jarvis.brain.project_management import (
+    ProjectOperationError,
+    ProjectOperationService,
+    request_context_from_dict,
+)
 from jarvis.brain.project_tools import make_project_tools
 from jarvis.brain.registry import RegistryStore
 from jarvis.brain.proactive import proactive_frames
@@ -57,6 +62,8 @@ from jarvis.protocol.messages import (
     Hello,
     Identify,
     Proactive,
+    ProjectOperationRequest,
+    ProjectOperationResponse,
     Reject,
     REPLY_AUDIO_BINARY_V1,
     ReplyEnd,
@@ -176,6 +183,13 @@ class BrainServer:
         self._gateway = GatewayClient(cfg.gateway)
         self._tts = InworldTTS(cfg.tts)
         self._memory = MemoryClient(cfg.memory)
+        self._registry_store = RegistryStore(cfg.registry.path)
+        self._project_ops = ProjectOperationService(
+            cfg,
+            registry=self._registry_store,
+            memory=self._memory,
+            lock=asyncio.Lock(),
+        )
         self._registry = build_registry(
             cfg.tools, worker=cfg.worker, remote=cfg.remote, google=cfg.google,
             accounts=cfg.accounts, browser=cfg.browser, capabilities=cfg.capabilities,
@@ -224,22 +238,20 @@ class BrainServer:
             backoff_initial_s=self._cfg.memory.curation_outbox_backoff_initial_s,
             backoff_max_s=self._cfg.memory.curation_outbox_backoff_max_s,
         )
-        store = RegistryStore(self._cfg.registry.path)
         for tool in make_memory_tools(
             self._cfg.memory,
             memory=self._memory,
             outbox=outbox,
-            registry=store,
+            registry=self._registry_store,
             users=users,
         ):
             self._registry.register(tool)
 
     def _register_project_tools(self) -> None:
-        store = RegistryStore(self._cfg.registry.path)
         for tool in make_project_tools(
             self._cfg.memory,
             memory=self._memory,
-            registry=store,
+            registry=self._registry_store,
             contexts=self._contexts,
         ):
             self._registry.register(tool)
@@ -607,6 +619,8 @@ class BrainServer:
                     fut = conn["waiters"].pop(msg.request_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result(msg)
+                elif isinstance(msg, ProjectOperationRequest):
+                    await self._handle_project_operation(ws, msg)
                 elif isinstance(msg, BargeIn):
                     turn = await self._cancel(turn)
                     with contextlib.suppress(Exception):
@@ -624,6 +638,30 @@ class BrainServer:
                 if not conns:
                     self._device_conns.pop(device_id, None)
             await self._cancel(turn)
+
+    async def _handle_project_operation(self, ws, msg: ProjectOperationRequest) -> None:  # noqa: ANN001
+        try:
+            ctx = request_context_from_dict(msg.requester)
+            result = await self._project_ops.execute(ctx, msg.op, msg.payload)
+            response = ProjectOperationResponse(request_id=msg.request_id, ok=True, result=result)
+        except ProjectOperationError as exc:
+            response = ProjectOperationResponse(
+                request_id=msg.request_id,
+                ok=False,
+                error=exc.body(),
+            )
+        except Exception as exc:  # noqa: BLE001 - keep boundary responses structured.
+            response = ProjectOperationResponse(
+                request_id=msg.request_id,
+                ok=False,
+                error={
+                    "code": "internal_error",
+                    "message": str(exc) or "project operation failed",
+                    "status": 500,
+                    "recoverable": False,
+                },
+            )
+        await ws.send(encode(response))
 
     @staticmethod
     def _start_audio_buffer(conn: dict, msg: AudioStart) -> bool:

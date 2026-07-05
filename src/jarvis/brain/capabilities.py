@@ -29,7 +29,11 @@ __all__ = [
     "build_request_context",
     "context_for_resolution",
     "MemoryAccessDecision",
+    "ProjectAccessDecision",
     "parse_profile_capabilities",
+    "can_create_project",
+    "can_edit_project",
+    "can_admin_project",
     "can_query_memory_peer",
     "can_write_memory_peer",
     "require",
@@ -39,6 +43,12 @@ __all__ = [
 
 @dataclass(frozen=True)
 class MemoryAccessDecision:
+    allowed: bool
+    reason: str
+
+
+@dataclass(frozen=True)
+class ProjectAccessDecision:
     allowed: bool
     reason: str
 
@@ -171,10 +181,42 @@ def can_write_memory_peer(
     return MemoryAccessDecision(False, "memory write denied")
 
 
+def can_create_project(ctx: RequestContext) -> ProjectAccessDecision:
+    """Any authenticated personal principal may create a project."""
+    if _requester_peer(ctx):
+        return ProjectAccessDecision(True, "authenticated principal")
+    return ProjectAccessDecision(False, "missing requester")
+
+
+def can_edit_project(ctx: RequestContext, project) -> ProjectAccessDecision:  # noqa: ANN001
+    """Member write gate for project content, repos, memory, and uploads."""
+    if not _requester_peer(ctx):
+        return ProjectAccessDecision(False, "missing requester")
+    if _is_project_member(ctx, project):
+        return ProjectAccessDecision(True, "project member")
+    return ProjectAccessDecision(False, "project member required")
+
+
+def can_admin_project(ctx: RequestContext, project) -> ProjectAccessDecision:  # noqa: ANN001
+    """Owner-only gate for visibility, membership, archive, and delete."""
+    if not _requester_peer(ctx):
+        return ProjectAccessDecision(False, "missing requester")
+    if getattr(project, "owner", "") == ctx.identity:
+        return ProjectAccessDecision(True, "project owner")
+    return ProjectAccessDecision(False, "project owner required")
+
+
 def _requester_peer(ctx: RequestContext) -> str:
     if ctx.scope != "personal" or not ctx.identity or ctx.identity == "house":
         return ""
     return ctx.memory_peer
+
+
+def _is_project_member(ctx: RequestContext, project) -> bool:  # noqa: ANN001
+    requester = ctx.identity
+    if not requester:
+        return False
+    return requester == getattr(project, "owner", "") or requester in set(getattr(project, "members", ()))
 
 
 def _guardian_can_read(ctx: RequestContext, peer_id: str, users: dict[str, User]) -> bool:

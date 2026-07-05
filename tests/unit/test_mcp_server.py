@@ -92,6 +92,26 @@ class FakeGateway:
         return _Msg(self.reply)
 
 
+class FakeProjectClient:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    async def execute(self, ctx, op: str, payload: dict[str, Any]) -> dict[str, Any]:  # noqa: ANN001
+        self.calls.append({"identity": ctx.identity, "op": op, "payload": dict(payload)})
+        if op == "project.file.upload":
+            return {
+                "project_id": payload["project_id"],
+                "doc_id": "spec-123",
+                "session_id": "project:jarvis:uploads:spec-123",
+                "original_path": "/tmp/spec.md",
+                "metadata": {"channel": payload.get("channel")},
+                "ingestion": {"queued": True},
+            }
+        if op == "project.file.retract":
+            return {"project_id": payload["project_id"], "doc_id": payload["doc_id"], "retracted": True}
+        return {"project": {"id": payload.get("project_id") or payload.get("id"), "name": payload.get("name", "Project")}}
+
+
 def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
     env = tmp_path / ".env"
     env.write_text(
@@ -277,14 +297,61 @@ def test_record_finding_carries_mcp_audit_metadata(tmp_path, monkeypatch) -> Non
     assert entry.metadata["observed_at"] == "2026-07-05"
 
 
-def test_upload_file_is_clear_not_available_stub(tmp_path, monkeypatch) -> None:
+def test_upload_file_relays_to_brain_without_base64_tool_arg(tmp_path, monkeypatch) -> None:
     cfg = _cfg(tmp_path, monkeypatch)
-    service = JarvisMCPService(cfg, memory=FakeMemory())
+    project_client = FakeProjectClient()
+    service = JarvisMCPService(cfg, memory=FakeMemory(), project_client=project_client)
     ctx = service.context_for_principal("neil")
 
-    body = asyncio.run(service.upload_file(ctx, project_id="jarvis", path="note.md"))
+    body = asyncio.run(
+        service.upload_file(
+            ctx,
+            project_id="jarvis",
+            content="# Spec",
+            filename="spec.md",
+            agent="claude-code",
+        )
+    )
 
-    assert "not yet available" in body["error"]
+    assert body["doc_id"] == "spec-123"
+    assert project_client.calls == [
+        {
+            "identity": "neil",
+            "op": "project.file.upload",
+            "payload": {
+                "project_id": "jarvis",
+                "artifact_type": "spec",
+                "title": "",
+                "agent": "claude-code",
+                "channel": "mcp",
+                "content_text": "# Spec",
+                "filename": "spec.md",
+            },
+        }
+    ]
+
+
+def test_mcp_project_writes_relay_to_brain(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    project_client = FakeProjectClient()
+    service = JarvisMCPService(cfg, memory=FakeMemory(), project_client=project_client)
+    ctx = service.context_for_principal("neil")
+
+    asyncio.run(service.project_create(ctx, id="new-project", name="New Project"))
+    asyncio.run(service.project_update(ctx, project_id="jarvis", name="Renamed"))
+    asyncio.run(service.project_set_visibility(ctx, project_id="jarvis", visibility="private"))
+    asyncio.run(service.project_set_members(ctx, project_id="jarvis", members=["neil", "viewer"]))
+    asyncio.run(service.project_archive(ctx, project_id="jarvis", archived=True))
+    asyncio.run(service.project_delete(ctx, project_id="jarvis"))
+
+    assert [call["op"] for call in project_client.calls] == [
+        "project.create",
+        "project.update",
+        "project.visibility.set",
+        "project.members.set",
+        "project.archive",
+        "project.delete",
+    ]
 
 
 def test_send_turn_context_caps_host_device_tool_ceiling(tmp_path, monkeypatch) -> None:
