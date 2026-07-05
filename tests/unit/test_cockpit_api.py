@@ -17,6 +17,7 @@ pytest.importorskip("httpx")
 import httpx  # noqa: E402
 from aiohttp import web  # noqa: E402
 
+from jarvis.brain.capabilities import RequestContext, can_query_memory_peer  # noqa: E402
 from jarvis.config import Config, WorkerConfig  # noqa: E402
 import jarvis.orchestration.api as cockpit_api_module  # noqa: E402
 from jarvis.orchestration.api import CockpitAppContext, IdempotencyStore, SseSnapshotHub, _command_from_body, _idempotency_scope, make_app, serve  # noqa: E402
@@ -1403,6 +1404,87 @@ def test_cockpit_project_detail_404s_when_not_visible(tmp_path, monkeypatch) -> 
     import asyncio
 
     asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_oauth_projects_use_subject_not_process_identity_or_jarvis_user(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        identity="neil",
+        auth_mode="oauth",
+        oauth_issuer="https://cockpit.example",
+        oauth_audience="jarvis-brain",
+        oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+        oauth_required_scopes="jarvis:read",
+    )
+    _seed_project_registry(cfg)
+    token = fixture["sign"](subject="jules", jarvis_user="neil", scope="jarvis:read")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        headers = {"Authorization": f"Bearer {token}"}
+        listing = await client.get(f"{base}/v1/projects", headers=headers)
+        process_visible = await client.get(f"{base}/v1/projects/neil-shared", headers=headers)
+        private = await client.get(f"{base}/v1/projects/alice-private", headers=headers)
+
+        assert listing.status_code == 200
+        assert [project["id"] for project in listing.json()["projects"]] == ["house-story"]
+        assert process_visible.status_code == 404
+        assert private.status_code == 404
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=jwks_get))
+
+
+def test_cockpit_oauth_unmapped_subject_gets_no_project_visibility(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        identity="neil",
+        auth_mode="oauth",
+        oauth_issuer="https://cockpit.example",
+        oauth_audience="jarvis-brain",
+        oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+        oauth_required_scopes="jarvis:read",
+    )
+    _seed_project_registry(cfg)
+    token = fixture["sign"](subject="idp-user-123", jarvis_user="neil", scope="jarvis:read")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        headers = {"Authorization": f"Bearer {token}"}
+        listing = await client.get(f"{base}/v1/projects", headers=headers)
+        detail = await client.get(f"{base}/v1/projects/house-story", headers=headers)
+
+        assert listing.status_code == 200
+        assert listing.json()["projects"] == []
+        assert detail.status_code == 404
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=jwks_get))
+
+
+def test_cockpit_project_access_matches_voice_memory_matrix(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _seed_project_registry(cfg)
+    registry = cockpit_api_module._registry_store(cfg)  # noqa: SLF001
+    requester = RequestContext(
+        "dev",
+        "jules",
+        "personal",
+        frozenset({"memory.query"}),
+        channel="cockpit",
+        peer="jules",
+    )
+
+    for project_id in ("house-story", "neil-shared", "alice-private"):
+        project = registry.get_project(project_id)
+        assert project is not None
+        api_allowed = cockpit_api_module._project_access_allowed(registry, requester, project)  # noqa: SLF001
+        voice_allowed = can_query_memory_peer(requester, project.peer_id, registry=registry).allowed
+        assert api_allowed == voice_allowed
 
 
 def test_cockpit_projects_empty_registry_returns_empty_list(tmp_path, monkeypatch) -> None:  # noqa: ANN001

@@ -59,7 +59,7 @@ from jarvis.orchestration.cockpit import (
     worker_profiles,
     _cursor_worker,
 )
-from jarvis.brain.capabilities import resolve_capabilities
+from jarvis.brain.capabilities import RequestContext, can_query_memory_peer, resolve_capabilities
 from jarvis.orchestration.authority import allowed
 from jarvis.orchestration.intent import parse_work_command
 from jarvis.orchestration.models import WorkCommand, WorkItem
@@ -512,11 +512,12 @@ class CockpitReadHandlers:
 
     async def projects(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
-        requester_id = _cockpit_requester_id(self.ctx.cfg)
+        registry = await asyncio.to_thread(_registry_store, self.ctx.cfg)
+        requester = _cockpit_requester_context(request, self.ctx.cfg, registry)
         include_archived = _include_archived(request)
         projects = (
-            await asyncio.to_thread(_visible_projects, self.ctx.cfg, requester_id, include_archived=include_archived)
-            if requester_id
+            await asyncio.to_thread(_visible_projects, registry, requester, include_archived=include_archived)
+            if requester is not None
             else []
         )
         return web.json_response(
@@ -529,10 +530,11 @@ class CockpitReadHandlers:
 
     async def project_detail(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
-        requester_id = _cockpit_requester_id(self.ctx.cfg)
+        registry = await asyncio.to_thread(_registry_store, self.ctx.cfg)
+        requester = _cockpit_requester_context(request, self.ctx.cfg, registry)
         project = (
-            await asyncio.to_thread(_visible_project_or_404, self.ctx.cfg, request.match_info["project_id"], requester_id)
-            if requester_id
+            await asyncio.to_thread(_visible_project_or_404, registry, request.match_info["project_id"], requester)
+            if requester is not None
             else None
         )
         if project is None:
@@ -1366,17 +1368,85 @@ def _registry_store(cfg: Config) -> RegistryStore:
     return RegistryStore(cfg.registry.path)
 
 
-def _cockpit_requester_id(cfg: Config) -> str:
+def _legacy_cockpit_requester_id(cfg: Config) -> str:
     identity = cfg.capabilities.identity.strip()
     return "" if identity == HOUSE else identity
 
 
-def _visible_projects(cfg: Config, requester_id: str, *, include_archived: bool) -> list[ProjectEntry]:
-    return _registry_store(cfg).list_projects(requester_id, include_archived=include_archived)
+def _cockpit_requester_context(
+    request: web.Request,
+    cfg: Config,
+    registry: RegistryStore,
+) -> RequestContext | None:
+    auth = request.get("auth", {})
+    auth_mode_value = str(auth.get("mode") or "")
+    if auth_mode_value == "oauth":
+        # OAuth route authorization is anchored on the IdP-guaranteed subject.
+        # `jarvis_user` is audit metadata until it is explicitly bound to `sub`.
+        identity = str(auth.get("subject") or "").strip()
+        if identity not in _registry_principal_ids(registry):
+            return None
+    elif auth_mode_value in {"legacy", "none"}:
+        identity = _legacy_cockpit_requester_id(cfg)
+    else:
+        identity = ""
+    if not identity:
+        return None
+    return RequestContext(
+        device_id=cfg.capabilities.device_id,
+        identity=identity,
+        scope="personal",
+        capabilities=frozenset(resolve_capabilities(cfg.capabilities)),
+        channel="cockpit",
+        peer=identity,
+    )
 
 
-def _visible_project_or_404(cfg: Config, project_id: str, requester_id: str) -> ProjectEntry | None:
-    return _registry_store(cfg).get_visible_project(project_id, requester_id)
+def _registry_principal_ids(registry: RegistryStore) -> set[str]:
+    principals: set[str] = set()
+    for project in _registry_projects(registry):
+        principals.add(project.owner)
+        principals.update(project.members)
+    principals.discard("")
+    return principals
+
+
+def _registry_projects(registry: RegistryStore) -> list[ProjectEntry]:
+    return list(registry._projects.values())  # noqa: SLF001
+
+
+def _visible_projects(
+    registry: RegistryStore,
+    requester: RequestContext,
+    *,
+    include_archived: bool,
+) -> list[ProjectEntry]:
+    projects = [
+        project
+        for project in _registry_projects(registry)
+        if (include_archived or project.status != "archived")
+        and _project_access_allowed(registry, requester, project)
+    ]
+    return sorted(projects, key=lambda project: project.name.lower())
+
+
+def _visible_project_or_404(
+    registry: RegistryStore,
+    project_id: str,
+    requester: RequestContext,
+) -> ProjectEntry | None:
+    project = registry.get_project(project_id)
+    if project is None or not _project_access_allowed(registry, requester, project):
+        return None
+    return project
+
+
+def _project_access_allowed(
+    registry: RegistryStore,
+    requester: RequestContext,
+    project: ProjectEntry,
+) -> bool:
+    return can_query_memory_peer(requester, project.peer_id, registry=registry).allowed
 
 
 def _include_archived(request: web.Request) -> bool:
