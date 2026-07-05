@@ -19,7 +19,7 @@ import json
 import pathlib
 import time
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
@@ -37,7 +37,7 @@ from jarvis.brain.dialog import (
     _now_line,
 )
 from jarvis.brain.gateway_client import GatewayClient, LLMAttribution
-from jarvis.brain.memory_client import MemoryClient
+from jarvis.brain.memory_client import MemoryClient, UnsupportedMemoryOperation
 from jarvis.brain.soul import read_soul
 from jarvis.users import format_facts, read_facts
 from jarvis.brain.tracing import Tracer
@@ -1102,35 +1102,121 @@ class BrainSession:
             trimmed.pop(0)
         self._history = trimmed
 
-    def _fire_cold_path(self, user_text: str, assistant_text: str) -> None:
+    def _fire_cold_path(
+        self,
+        user_text: str,
+        assistant_text: str,
+        *,
+        refresh_peers: Iterable[str] = (),
+    ) -> None:
         """Detached background task — never awaited on the hot path."""
-        task = asyncio.create_task(self._cold_path(user_text, assistant_text))
+        task = asyncio.create_task(self._cold_path(user_text, assistant_text, refresh_peers=tuple(refresh_peers)))
         self._cold_tasks.add(task)
         task.add_done_callback(self._cold_tasks.discard)
 
-    async def _cold_path(self, user_text: str, assistant_text: str) -> None:
-        # Write the turn to Honcho (deriver reasons in the background), then
-        # refresh the local representation cache for the next turn. Resilient:
-        # if memory is unreachable, the turn is unaffected.
+    def _memory_peer(self) -> str:
+        return self._memory_user or self._cfg.memory.user_peer_id
+
+    async def _wait_for_deriver_idle(self, peers: tuple[str, ...], trace) -> bool:  # noqa: ANN001
+        timeout_s = max(0.0, float(self._cfg.memory.deriver_idle_timeout_s))
+        if timeout_s <= 0:
+            if trace is not None:
+                trace.event("deriver_wait_disabled", peers=list(peers))
+            return False
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        polls = 0
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                if trace is not None:
+                    trace.event("deriver_wait_timeout", peers=list(peers), polls=polls)
+                return False
+            try:
+                status = await asyncio.wait_for(
+                    asyncio.to_thread(self._memory.queue_status),
+                    timeout=remaining,
+                )
+            except UnsupportedMemoryOperation:
+                if trace is not None:
+                    trace.event("deriver_wait_unavailable", peers=list(peers))
+                return True
+            except (asyncio.TimeoutError, TimeoutError):
+                if trace is not None:
+                    trace.event("deriver_wait_timeout", peers=list(peers), polls=polls)
+                return False
+            except Exception as exc:  # noqa: BLE001 - memory diagnostics must stay best-effort
+                if trace is not None:
+                    trace.event(
+                        "deriver_wait_failed",
+                        peers=list(peers),
+                        error=type(exc).__name__,
+                    )
+                print(f"  [memory] deriver-idle wait skipped: {exc}")
+                return False
+
+            polls += 1
+            if status.idle:
+                if trace is not None:
+                    trace.event("deriver_idle", peers=list(peers), polls=polls)
+                return True
+            await asyncio.sleep(min(0.25, max(0.0, deadline - loop.time())))
+
+    async def _cold_path(
+        self,
+        user_text: str,
+        assistant_text: str,
+        *,
+        refresh_peers: tuple[str, ...] = (),
+    ) -> None:
+        # Lane 1 write happens first. Cache refresh waits briefly for the deriver
+        # to catch up, then refreshes anyway; all of it is detached from the turn.
         t0 = time.perf_counter()
+        trace = None
         try:
-            await self._memory.write_turn(user_text, assistant_text, user=self._memory_user)
-            refreshed = await self._memory.refresh_cache(
-                min_interval_s=self._cfg.memory.refresh_interval_s, user=self._memory_user
-            )
-            if refreshed:
-                ms = (time.perf_counter() - t0) * 1000
-                mt = self._tracer.turn(
+            principal = self._memory_peer()
+            peers = tuple(dict.fromkeys((principal, *refresh_peers)))
+            if self._tracer is not None:
+                trace = self._tracer.turn(
                     room=self._cfg.gateway.room,
                     speaker=self._ctx.identity,
                     channel=self._ctx.channel,
                     device_id=self._ctx.device_id,
                     kind="memory",
                 )
-                mt.stage("memory", ms)
-                self._tracer.emit(mt)
+                trace.event("memory_write_start", peers=[principal])
+            await self._memory.write_turn(user_text, assistant_text, user=self._memory_user)
+            if trace is not None:
+                trace.event("memory_write_done", peers=[principal])
+            await self._wait_for_deriver_idle(peers, trace)
+            refreshed_principal = await self._memory.refresh_cache(
+                min_interval_s=self._cfg.memory.refresh_interval_s, user=self._memory_user
+            )
+            refreshed_peers: list[str] = [principal] if refreshed_principal else []
+            for peer in refresh_peers:
+                if peer == principal:
+                    continue
+                if await self._memory.refresh_cache(min_interval_s=0.0, user=peer):
+                    refreshed_peers.append(peer)
+            ms = (time.perf_counter() - t0) * 1000
+            if trace is not None:
+                trace.stage(
+                    "memory",
+                    ms,
+                    peers=list(peers),
+                    refreshed_peers=refreshed_peers,
+                )
+                self._tracer.emit(trace)
         except Exception as exc:  # noqa: BLE001 - memory must never break a turn
             print(f"  [memory] cold-path skipped: {exc}")
+            if trace is not None:
+                trace.event(
+                    "memory_cold_path_failed",
+                    error=type(exc).__name__,
+                )
+                trace.stage("memory", (time.perf_counter() - t0) * 1000, failed=True)
+                self._tracer.emit(trace)
 
     async def _tts_source(self, text: str, trace=None) -> AsyncIterator[bytes]:  # noqa: ANN001
         """Wrap the TTS stream to capture its timing (time-to-first-audio, total
@@ -1156,4 +1242,3 @@ class BrainSession:
                     voice=self._cfg.tts.voice,
                     provider=self._cfg.tts.provider,
                 )
-

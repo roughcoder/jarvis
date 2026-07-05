@@ -46,5 +46,12 @@ def assert_honcho_safe(honcho_id: str) -> str:
 
 
 def cache_key(peer_id: str) -> str:
-    """Filesystem-safe peer key while preserving old filenames for simple peers."""
-    return peer_id if _HONCHO_ID_RE.match(peer_id) else encode_honcho_id(peer_id)
+    """Readable filesystem-safe peer key for local representation caches.
+
+    Cache filenames are local operator artifacts, not Honcho boundary ids. Keep
+    simple peer ids byte-compatible while mapping semantic separators such as
+    `project:jarvis` to `project-jarvis` instead of base64.
+    """
+    key = re.sub(r"[^a-zA-Z0-9_-]+", "-", peer_id).strip("-")
+    key = re.sub(r"-{2,}", "-", key)
+    return key or "peer"

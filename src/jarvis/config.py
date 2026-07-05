@@ -90,6 +90,9 @@ class MemoryConfig(_Base):
     # expensive dialectic cache refresh is debounced to at most once per this
     # interval — avoids a ~9s reasoning call every single turn.
     refresh_interval_s: float = 30.0
+    # Cold path waits briefly for Honcho's deriver queue to go idle before
+    # refreshing local caches, then refreshes anyway on timeout.
+    deriver_idle_timeout_s: float = 3.0
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -851,6 +854,7 @@ class Config:
             "memory.assistant_peer_id": self.memory.assistant_peer_id,
             "memory.cache_path": self.memory.cache_path,
             "memory.conclusion_sidecar_path": self.memory.conclusion_sidecar_path,
+            "memory.deriver_idle_timeout_s": self.memory.deriver_idle_timeout_s,
             "database.host": self.database.host,
             "database.port": self.database.port,
             "database.url": self.database.url_masked,
