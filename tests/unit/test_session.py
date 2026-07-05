@@ -159,6 +159,23 @@ def test_system_prompt_tells_voice_to_ground_relative_dates() -> None:
     assert "remembered weekday or dated commitments" in prompt
 
 
+def test_system_prompt_tells_memory_caps_to_honor_retractions() -> None:
+    sess = BrainSession(
+        load_config(),
+        RequestContext("dev", "neil", "personal", frozenset({"memory.query"}), channel="voice"),
+        gateway=None,
+        tts=None,
+        memory=None,
+        tracer=None,
+        registry=None,
+    )
+
+    prompt = sess._system_prompt("")
+
+    assert "contradiction or retraction" in prompt
+    assert "authoritative over any derived restatement" in prompt
+
+
 def test_initial_model_is_channel_aware() -> None:
     cfg = load_config()
     fast, voice, strong = (

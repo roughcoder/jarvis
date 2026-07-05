@@ -17,6 +17,11 @@ from jarvis.users import User
 
 QUERY_CAPABILITY = "memory.query"
 CURATE_CAPABILITY = "memory.curate"
+DERIVED_CONCLUSION_LEVELS = {"deductive", "inductive"}
+MEMORY_RETRACTION_INSTRUCTION = (
+    "Memory note: contradiction or retraction conclusions are authoritative; "
+    "do not present a retracted fact as current."
+)
 
 
 def make_memory_tools(
@@ -60,11 +65,12 @@ def make_memory_tools(
                 )
                 if answer.strip():
                     text = answer.strip()
-            return outbox.append_pending_lines(text or "No memory found.", observed_id=peer_id)
+            text = outbox.append_pending_lines(text or "No memory found.", observed_id=peer_id)
+            return _memory_tool_result(text)
         except Exception as exc:  # noqa: BLE001 - memory tool degrades, never breaks a turn.
             fallback = cached or "No cached memory found."
             fallback = outbox.append_pending_lines(fallback, observed_id=peer_id)
-            return f"{fallback}\nmemory is unreachable: {exc}"
+            return _memory_tool_result(f"{fallback}\nmemory is unreachable: {exc}")
 
     async def remember_contact(ctx: RequestContext, args: dict[str, Any]) -> str:
         contact_name = (args.get("contact") or args.get("person") or args.get("name") or "").strip()
@@ -163,8 +169,8 @@ def make_memory_tools(
                     content=replacement,
                     metadata=metadata,
                 )
-                return "Noted - replaced pending memory."
-            return "Noted - cancelled pending memory."
+                return "Corrected."
+            return "Forgotten."
         confirmed = bool(args.get("confirm"))
         ids = [str(item).strip() for item in args.get("conclusion_ids", []) if str(item).strip()]
         if not confirmed:
@@ -177,8 +183,25 @@ def make_memory_tools(
             return _confirmation_text(matches, replacement=bool(replacement))
         if not ids:
             return "error: confirmation requires conclusion_ids."
+        matches = await asyncio.to_thread(
+            memory.query_conclusions,
+            query,
+            observed_id=peer_id,
+            limit=max(20, len(ids)),
+        )
+        selected, missing = _selected_conclusions(matches, ids)
+        if missing:
+            return "error: selected memories were not found; search again before confirming."
         for conclusion_id in ids:
             outbox.enqueue_delete(conclusion_id=conclusion_id, observed_id=peer_id, content=query)
+        for conclusion in selected:
+            if conclusion.level in DERIVED_CONCLUSION_LEVELS:
+                outbox.enqueue_create(
+                    observed_id=peer_id,
+                    observer_id=ctx.memory_peer,
+                    content=_retraction_content(conclusion),
+                    metadata=_retraction_metadata(ctx, args, conclusion),
+                )
         if replacement:
             metadata = _base_metadata(ctx, args)
             outbox.enqueue_create(
@@ -187,8 +210,8 @@ def make_memory_tools(
                 content=replacement,
                 metadata=metadata,
             )
-            return "Noted - queued correction."
-        return "Noted - queued forget."
+            return "Corrected."
+        return "Forgotten."
 
     tools = [
         Tool(
@@ -319,6 +342,28 @@ def _base_metadata(ctx: RequestContext, args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _retraction_metadata(
+    ctx: RequestContext,
+    args: dict[str, Any],
+    conclusion: ConclusionRecord,
+) -> dict[str, Any]:
+    return {
+        **_base_metadata(ctx, {**args, "source": "forget"}),
+        "level": "contradiction",
+        "retracted_conclusion_id": conclusion.id,
+        "retracted_conclusion_level": conclusion.level,
+        "retracted_content": conclusion.content,
+        "retraction_reason": "user_forget_request",
+    }
+
+
+def _retraction_content(conclusion: ConclusionRecord) -> str:
+    return (
+        "Retraction: the user withdrew this memory and does not want it retained "
+        f"as current: {conclusion.content}"
+    )
+
+
 def _observed_at(args: dict[str, Any]) -> str:
     value = (args.get("observed_at") or "").strip()
     return value or datetime.now(UTC).date().isoformat()
@@ -351,5 +396,19 @@ def _confirmation_text(matches: list[ConclusionRecord], *, replacement: bool) ->
     action = "correct" if replacement else "forget"
     lines = [f"confirmation required: choose conclusion_ids to {action}."]
     for match in matches:
-        lines.append(f"- {match.id}: {match.content}")
+        lines.append(f"- {match.id}: {match.content} (level: {match.level})")
     return "\n".join(lines)
+
+
+def _selected_conclusions(
+    matches: list[ConclusionRecord],
+    ids: list[str],
+) -> tuple[list[ConclusionRecord], list[str]]:
+    by_id = {match.id: match for match in matches}
+    selected = [by_id[conclusion_id] for conclusion_id in ids if conclusion_id in by_id]
+    missing = [conclusion_id for conclusion_id in ids if conclusion_id not in by_id]
+    return selected, missing
+
+
+def _memory_tool_result(text: str) -> str:
+    return "\n".join(part for part in (MEMORY_RETRACTION_INSTRUCTION, text.strip()) if part)

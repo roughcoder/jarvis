@@ -106,6 +106,8 @@ _MEMORY_TOOL_GUIDANCE = (
     "Lane 2 tools: `remember_contact`, `add_finding`, and `record_decision`. For "
     "forgetting or correcting memory, use `forget_memory` or `correct_memory`; if a "
     "tool says confirmation is required, ask the user to choose before continuing. "
+    "If memory includes a contradiction or retraction, treat it as authoritative over "
+    "any derived restatement of the withdrawn fact. "
     "Use the legacy `remember` tool only for structured facts about the current user."
 )
 
