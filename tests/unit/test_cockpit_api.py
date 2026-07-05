@@ -1880,7 +1880,7 @@ def test_cockpit_thread_turn_records_decision_only_through_lane2_tool(tmp_path, 
     assert len(memory.created_conclusions) == 1
     conclusion = memory.created_conclusions[0]
     assert conclusion["observed_id"] == "project:neil-shared"
-    assert conclusion["content"] == "Decision: Use SSE for thread replies."
+    assert conclusion["content"] == "Use SSE for thread replies."
     assert conclusion["metadata"]["artifact_type"] == "decision"
     assert conclusion["metadata"]["project_id"] == "neil-shared"
     assert conclusion["metadata"]["channel"] == "cockpit"
