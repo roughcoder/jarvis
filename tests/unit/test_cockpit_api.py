@@ -18,6 +18,7 @@ import httpx  # noqa: E402
 from aiohttp import web  # noqa: E402
 
 from jarvis.brain.capabilities import RequestContext, can_query_memory_peer  # noqa: E402
+from jarvis.brain.memory_client import ConclusionRecord, RepresentationRecord  # noqa: E402
 from jarvis.config import Config, WorkerConfig  # noqa: E402
 import jarvis.orchestration.api as cockpit_api_module  # noqa: E402
 from jarvis.orchestration.api import CockpitAppContext, IdempotencyStore, SseSnapshotHub, _command_from_body, _idempotency_scope, make_app, serve  # noqa: E402
@@ -49,6 +50,51 @@ class TextResponse:
 
     def json(self) -> dict[str, Any]:
         raise ValueError("not json")
+
+
+class FakeProjectMemory:
+    def __init__(
+        self,
+        *,
+        cached: str = "",
+        live: str = "",
+        live_error: Exception | None = None,
+        conclusion_error: Exception | None = None,
+    ) -> None:
+        self.cached = cached
+        self.live = live
+        self.live_error = live_error
+        self.conclusion_error = conclusion_error
+        self.conclusions: list[ConclusionRecord] = []
+        self.cached_reads: list[str] = []
+        self.live_reads: list[str] = []
+        self.conclusion_filters: list[dict[str, Any]] = []
+
+    def read_cached_representation(self, user: str | None = None) -> str:
+        self.cached_reads.append(user or "")
+        return self.cached
+
+    def read_representation(self, peer_id: str) -> RepresentationRecord:
+        self.live_reads.append(peer_id)
+        if self.live_error is not None:
+            raise self.live_error
+        return RepresentationRecord(peer_id=peer_id, representation=self.live)
+
+    def list_conclusions(self, **kwargs: Any) -> list[ConclusionRecord]:
+        self.conclusion_filters.append(kwargs)
+        if self.conclusion_error is not None:
+            raise self.conclusion_error
+        rows = list(self.conclusions)
+        observed_id = kwargs.get("observed_id")
+        level = kwargs.get("level")
+        metadata = kwargs.get("metadata") or {}
+        if observed_id:
+            rows = [row for row in rows if row.observed_id == observed_id]
+        if level:
+            rows = [row for row in rows if row.level == level]
+        for key, value in metadata.items():
+            rows = [row for row in rows if row.metadata.get(key) == value]
+        return rows
 
 
 async def _with_server(cfg: Config, fn: Callable[[str, httpx.AsyncClient], Any], *, http_get=None, http_post=None) -> Any:  # noqa: ANN001
@@ -232,6 +278,30 @@ def _seed_user_profiles(cfg: Config, *names: str) -> None:
             f"---\nscope: personal\nhoncho_peer: {name}\n---\n\n# {name.title()}\n",
             encoding="utf-8",
         )
+
+
+def _conclusion(
+    cid: str,
+    *,
+    project_id: str,
+    artifact_type: str,
+    content: str,
+    observed_at: str,
+    recorded_by: str = "neil",
+    observed_id: str | None = None,
+) -> ConclusionRecord:
+    return ConclusionRecord(
+        id=cid,
+        content=content,
+        observer_id="jarvis",
+        observed_id=observed_id or f"project:{project_id}",
+        metadata={
+            "project_id": project_id,
+            "artifact_type": artifact_type,
+            "recorded_by": recorded_by,
+            "observed_at": observed_at,
+        },
+    )
 
 
 def _oauth_fixture(*, kid: str = "test-key", include_alg: bool = True) -> tuple[dict[str, Any], Callable[..., Response]]:
@@ -1390,10 +1460,14 @@ def test_cockpit_project_detail_404s_when_not_visible(tmp_path, monkeypatch) -> 
 
     async def calls(base: str, client: httpx.AsyncClient) -> None:
         visible = await client.get(f"{base}/v1/projects/neil-shared")
+        visible_memory = await client.get(f"{base}/v1/projects/neil-shared/memory")
         hidden = await client.get(f"{base}/v1/projects/alice-private")
+        hidden_memory = await client.get(f"{base}/v1/projects/alice-private/memory")
         missing = await client.get(f"{base}/v1/projects/not-real")
+        missing_memory = await client.get(f"{base}/v1/projects/not-real/memory")
 
         assert visible.status_code == 200
+        assert visible_memory.status_code == 200
         project = visible.json()["project"]
         assert project == {
             "id": "neil-shared",
@@ -1410,8 +1484,121 @@ def test_cockpit_project_detail_404s_when_not_visible(tmp_path, monkeypatch) -> 
         }
         assert hidden.status_code == 404
         assert hidden.json()["error"]["code"] == "not_found"
+        assert hidden_memory.status_code == 404
+        assert hidden_memory.json()["error"]["code"] == "not_found"
         assert missing.status_code == 404
         assert missing.json()["error"]["code"] == "not_found"
+        assert missing_memory.status_code == 404
+        assert missing_memory.json()["error"]["code"] == "not_found"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_project_memory_returns_representation_and_conclusions(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory(cached="cached shared context", live="live shared context")
+    memory.conclusions = [
+        _conclusion(
+            "c1",
+            project_id="neil-shared",
+            artifact_type="finding",
+            content="Finding: the notes repo owns the cockpit notes.",
+            observed_at="2026-07-04T10:00:00Z",
+        ),
+        _conclusion(
+            "c2",
+            project_id="neil-shared",
+            artifact_type="decision",
+            content="Decision: keep project memory behind the Jarvis API.",
+            observed_at="2026-07-05T09:00:00Z",
+            recorded_by="alice",
+        ),
+        _conclusion(
+            "c3",
+            project_id="neil-shared",
+            artifact_type="note",
+            content="Note: hidden from the findings/decisions surface.",
+            observed_at="2026-07-06T09:00:00Z",
+        ),
+        _conclusion(
+            "c4",
+            project_id="other",
+            artifact_type="decision",
+            content="Decision: belongs to another project.",
+            observed_at="2026-07-07T09:00:00Z",
+        ),
+    ]
+    monkeypatch.setattr(cockpit_api_module, "MemoryClient", lambda _cfg: memory)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/projects/neil-shared/memory")
+        body = response.json()
+
+        assert response.status_code == 200
+        assert body == {
+            "api_version": "v1",
+            "schema_version": 1,
+            "project_id": "neil-shared",
+            "peer_id": "project:neil-shared",
+            "representation": "live shared context",
+            "conclusions": [
+                {
+                    "id": "c2",
+                    "content": "Decision: keep project memory behind the Jarvis API.",
+                    "artifact_type": "decision",
+                    "recorded_by": "alice",
+                    "observed_at": "2026-07-05T09:00:00Z",
+                },
+                {
+                    "id": "c1",
+                    "content": "Finding: the notes repo owns the cockpit notes.",
+                    "artifact_type": "finding",
+                    "recorded_by": "neil",
+                    "observed_at": "2026-07-04T10:00:00Z",
+                },
+            ],
+        }
+        assert memory.cached_reads == ["project:neil-shared"]
+        assert memory.live_reads == ["project:neil-shared"]
+        assert memory.conclusion_filters == [
+            {
+                "observed_id": "project:neil-shared",
+                "level": "explicit",
+                "metadata": {"project_id": "neil-shared", "artifact_type": "finding"},
+            },
+            {
+                "observed_id": "project:neil-shared",
+                "level": "explicit",
+                "metadata": {"project_id": "neil-shared", "artifact_type": "decision"},
+            },
+        ]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_project_memory_degrades_when_backend_is_v2_or_dead(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory(
+        live_error=cockpit_api_module.UnsupportedMemoryOperation("v2 unsupported"),
+        conclusion_error=RuntimeError("memory down"),
+    )
+    monkeypatch.setattr(cockpit_api_module, "MemoryClient", lambda _cfg: memory)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/projects/neil-shared/memory")
+        body = response.json()
+
+        assert response.status_code == 200
+        assert body["project_id"] == "neil-shared"
+        assert body["peer_id"] == "project:neil-shared"
+        assert body["representation"] == ""
+        assert body["conclusions"] == []
 
     import asyncio
 
@@ -1438,12 +1625,16 @@ def test_cockpit_oauth_projects_use_subject_not_process_identity_or_jarvis_user(
         headers = {"Authorization": f"Bearer {token}"}
         listing = await client.get(f"{base}/v1/projects", headers=headers)
         process_visible = await client.get(f"{base}/v1/projects/neil-shared", headers=headers)
+        process_visible_memory = await client.get(f"{base}/v1/projects/neil-shared/memory", headers=headers)
         private = await client.get(f"{base}/v1/projects/alice-private", headers=headers)
+        private_memory = await client.get(f"{base}/v1/projects/alice-private/memory", headers=headers)
 
         assert listing.status_code == 200
         assert [project["id"] for project in listing.json()["projects"]] == ["house-story"]
         assert process_visible.status_code == 404
+        assert process_visible_memory.status_code == 404
         assert private.status_code == 404
+        assert private_memory.status_code == 404
 
     import asyncio
 
@@ -1470,14 +1661,18 @@ def test_cockpit_oauth_household_principal_without_projects_sees_household_proje
         headers = {"Authorization": f"Bearer {token}"}
         listing = await client.get(f"{base}/v1/projects", headers=headers)
         household = await client.get(f"{base}/v1/projects/house-story", headers=headers)
+        household_memory = await client.get(f"{base}/v1/projects/house-story/memory", headers=headers)
         shared = await client.get(f"{base}/v1/projects/neil-shared", headers=headers)
+        shared_memory = await client.get(f"{base}/v1/projects/neil-shared/memory", headers=headers)
         private = await client.get(f"{base}/v1/projects/alice-private", headers=headers)
 
         assert listing.status_code == 200
         assert [project["id"] for project in listing.json()["projects"]] == ["house-story"]
         assert household.status_code == 200
         assert household.json()["project"]["id"] == "house-story"
+        assert household_memory.status_code == 200
         assert shared.status_code == 404
+        assert shared_memory.status_code == 404
         assert private.status_code == 404
 
     import asyncio
@@ -1505,10 +1700,12 @@ def test_cockpit_oauth_unmapped_subject_gets_no_project_visibility(tmp_path, mon
         headers = {"Authorization": f"Bearer {token}"}
         listing = await client.get(f"{base}/v1/projects", headers=headers)
         detail = await client.get(f"{base}/v1/projects/house-story", headers=headers)
+        memory = await client.get(f"{base}/v1/projects/house-story/memory", headers=headers)
 
         assert listing.status_code == 200
         assert listing.json()["projects"] == []
         assert detail.status_code == 404
+        assert memory.status_code == 404
 
     import asyncio
 
@@ -1590,11 +1787,14 @@ def test_cockpit_projects_require_api_auth(tmp_path, monkeypatch) -> None:  # no
     async def calls(base: str, client: httpx.AsyncClient) -> None:
         listing = await client.get(f"{base}/v1/projects")
         detail = await client.get(f"{base}/v1/projects/neil-shared")
+        memory = await client.get(f"{base}/v1/projects/neil-shared/memory")
 
         assert listing.status_code == 401
         assert listing.json()["error"]["code"] == "unauthorized"
         assert detail.status_code == 401
         assert detail.json()["error"]["code"] == "unauthorized"
+        assert memory.status_code == 401
+        assert memory.json()["error"]["code"] == "unauthorized"
 
     import asyncio
 
@@ -1608,11 +1808,14 @@ def test_cockpit_projects_without_requester_identity_are_empty(tmp_path, monkeyp
     async def calls(base: str, client: httpx.AsyncClient) -> None:
         listing = await client.get(f"{base}/v1/projects")
         detail = await client.get(f"{base}/v1/projects/house-story")
+        memory = await client.get(f"{base}/v1/projects/house-story/memory")
 
         assert listing.status_code == 200
         assert listing.json()["projects"] == []
         assert detail.status_code == 404
         assert detail.json()["error"]["code"] == "not_found"
+        assert memory.status_code == 404
+        assert memory.json()["error"]["code"] == "not_found"
 
     import asyncio
 

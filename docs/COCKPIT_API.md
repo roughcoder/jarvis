@@ -103,6 +103,7 @@ configured `JARVIS_ENV_FILE`.
 ```text
 GET /v1/projects
 GET /v1/projects/{id}
+GET /v1/projects/{id}/memory
 ```
 
 Projects are read from the Jarvis registry, not Honcho. The cockpit never talks
@@ -110,7 +111,7 @@ to Honcho directly. List and detail reads are filtered by the authenticated
 requester's configured Jarvis identity; without an identity the list is empty.
 Projects outside the requester visibility set are indistinguishable from
 missing projects: they are omitted from the list and return `404 not_found` on
-detail.
+detail and memory reads.
 
 `GET /v1/projects` excludes archived projects by default. Add
 `?include_archived=true` or `?include_archived=1` to include them.
@@ -168,6 +169,34 @@ Detail response:
   }
 }
 ```
+
+Memory response:
+
+```json
+{
+  "api_version": "v1",
+  "schema_version": 1,
+  "project_id": "jarvis",
+  "peer_id": "project:jarvis",
+  "representation": "Project memory summary...",
+  "conclusions": [
+    {
+      "id": "conclusion-1",
+      "content": "Decision: project memory reads stay behind the Jarvis API.",
+      "artifact_type": "decision",
+      "recorded_by": "neil",
+      "observed_at": "2026-07-05T09:00:00Z"
+    }
+  ]
+}
+```
+
+`GET /v1/projects/{id}/memory` returns the project peer's available
+representation plus recent explicit `finding` and `decision` conclusions
+filtered by `project_id`. The API reads through the configured Jarvis memory
+backend and registry only. If the memory backend is unavailable or does not
+support live representation/conclusion reads, the response still succeeds with
+an empty or cached representation and any conclusions that were available.
 
 ### Runs
 

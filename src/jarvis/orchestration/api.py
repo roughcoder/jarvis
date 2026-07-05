@@ -11,6 +11,7 @@ from typing import Any, Callable
 import httpx
 from aiohttp import web
 
+from jarvis.brain.memory_client import ConclusionRecord, MemoryClient, UnsupportedMemoryOperation
 from jarvis.brain.registry import ProjectEntry, RegistryStore
 from jarvis.capabilities import (
     WORKER_SESSION_APPROVE,
@@ -428,6 +429,7 @@ def make_app(
         web.get("/v1/cockpit/snapshot", reads.snapshot),
         web.get("/v1/cockpit/events", sse.events),
         web.get("/v1/projects", reads.projects),
+        web.get("/v1/projects/{project_id}/memory", reads.project_memory),
         web.get("/v1/projects/{project_id}", reads.project_detail),
         web.get("/v1/workers", reads.workers),
         web.get("/v1/workers/{worker_id}", reads.worker_detail),
@@ -545,6 +547,30 @@ class CockpitReadHandlers:
                 "api_version": API_VERSION,
                 "schema_version": SCHEMA_VERSION,
                 "project": project.as_dict(),
+            }
+        )
+
+    async def project_memory(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        registry = await asyncio.to_thread(_registry_store, self.ctx.cfg)
+        requester = _cockpit_requester_context(request, self.ctx.cfg)
+        project = (
+            await asyncio.to_thread(_visible_project_or_404, registry, request.match_info["project_id"], requester)
+            if requester is not None
+            else None
+        )
+        if project is None:
+            raise CockpitError("not_found", "project not found", status=404)
+        memory = MemoryClient(self.ctx.cfg.memory)
+        representation, conclusions = await asyncio.to_thread(_project_memory, memory, project)
+        return web.json_response(
+            {
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "project_id": project.id,
+                "peer_id": project.peer_id,
+                "representation": representation,
+                "conclusions": conclusions,
             }
         )
 
@@ -1442,6 +1468,65 @@ def _project_access_allowed(
     project: ProjectEntry,
 ) -> bool:
     return can_query_memory_peer(requester, project.peer_id, registry=registry).allowed
+
+
+def _project_memory(memory: Any, project: ProjectEntry) -> tuple[str, list[dict[str, str]]]:
+    representation = _project_representation(memory, project.peer_id)
+    conclusions = _project_memory_conclusions(memory, project)
+    return representation, conclusions
+
+
+def _project_representation(memory: Any, peer_id: str) -> str:
+    representation = ""
+    try:
+        representation = str(memory.read_cached_representation(peer_id) or "")
+    except Exception as exc:  # pragma: no cover - defensive best-effort boundary
+        logger.debug("project memory cache read failed for %s: %s", peer_id, exc)
+    try:
+        live = memory.read_representation(peer_id)
+    except (UnsupportedMemoryOperation, TimeoutError, OSError, RuntimeError) as exc:
+        logger.debug("project memory live representation unavailable for %s: %s", peer_id, exc)
+    except Exception as exc:  # pragma: no cover - defensive best-effort boundary
+        logger.debug("project memory live representation failed for %s: %s", peer_id, exc)
+    else:
+        representation = str(live.representation or representation)
+    return representation
+
+
+def _project_memory_conclusions(memory: Any, project: ProjectEntry) -> list[dict[str, str]]:
+    rows: list[ConclusionRecord] = []
+    for artifact_type in ("finding", "decision"):
+        try:
+            rows.extend(
+                memory.list_conclusions(
+                    observed_id=project.peer_id,
+                    level="explicit",
+                    metadata={"project_id": project.id, "artifact_type": artifact_type},
+                )
+            )
+        except (UnsupportedMemoryOperation, TimeoutError, OSError, RuntimeError) as exc:
+            logger.debug("project memory conclusions unavailable for %s: %s", project.peer_id, exc)
+            continue
+        except Exception as exc:  # pragma: no cover - defensive best-effort boundary
+            logger.debug("project memory conclusions failed for %s: %s", project.peer_id, exc)
+            continue
+    rows.sort(key=_conclusion_sort_key, reverse=True)
+    return [_project_memory_conclusion(row) for row in rows[:20]]
+
+
+def _conclusion_sort_key(conclusion: ConclusionRecord) -> tuple[str, str]:
+    return (str(conclusion.metadata.get("observed_at") or ""), conclusion.id)
+
+
+def _project_memory_conclusion(conclusion: ConclusionRecord) -> dict[str, str]:
+    metadata = conclusion.metadata
+    return {
+        "id": conclusion.id,
+        "content": conclusion.content,
+        "artifact_type": str(metadata.get("artifact_type") or ""),
+        "recorded_by": str(metadata.get("recorded_by") or ""),
+        "observed_at": str(metadata.get("observed_at") or ""),
+    }
 
 
 def _include_archived(request: web.Request) -> bool:
