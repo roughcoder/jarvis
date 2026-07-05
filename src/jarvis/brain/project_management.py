@@ -9,17 +9,20 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import http.client
 import ipaddress
 import json
+import logging
 import mimetypes
 import os
 import re
 import socket
+import ssl
 import tempfile
-import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -55,6 +58,7 @@ OWNER_ONLY_FIELDS = {"owner", "members", "visibility"}
 PROJECT_STATUSES = {"active", "paused", "archived"}
 PROJECT_VISIBILITIES = {"household", "private", "shared"}
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+logger = logging.getLogger(__name__)
 
 
 class ProjectOperationError(RuntimeError):
@@ -182,10 +186,12 @@ class ProjectOperationService:
                 metadata=upload["metadata"],
             )
             ingestion = {"queued": True, "response": raw}
-        except UnsupportedMemoryOperation as exc:
-            ingestion = {"queued": False, "error": str(exc), "recoverable": True}
-        except Exception as exc:  # noqa: BLE001 - vault write succeeded; report recoverable ingestion failure.
-            ingestion = {"queued": False, "error": str(exc), "recoverable": True}
+        except UnsupportedMemoryOperation:
+            logger.warning("project file ingestion is unsupported", exc_info=True)
+            ingestion = _ingestion_failed()
+        except Exception:  # noqa: BLE001 - vault write succeeded; report recoverable ingestion failure.
+            logger.warning("project file ingestion failed", exc_info=True)
+            ingestion = _ingestion_failed()
         async with self._lock:
             file_entry = self._update_manifest_ingestion(project.id, upload["doc_id"], ingestion)
         return {"project_id": project.id, **upload, "ingestion": ingestion, "file": file_entry}
@@ -465,6 +471,15 @@ def upload_session_id(project_id: str, doc_id: str) -> str:
     return f"project:{project_id}:uploads:{doc_id}"
 
 
+def _ingestion_failed() -> dict[str, Any]:
+    return {
+        "queued": False,
+        "code": "ingestion_failed",
+        "error": "file ingestion failed",
+        "recoverable": True,
+    }
+
+
 def _project_from_create_payload(ctx: RequestContext, payload: dict[str, Any]) -> ProjectEntry:
     project_id = _project_id(payload)
     members = _strings(payload.get("members", ()))
@@ -626,89 +641,163 @@ def _confined_source_path(cfg: Config, source_path: str) -> Path:
     return path
 
 
+@dataclass(frozen=True)
+class _ResolvedUploadURL:
+    url: str
+    parsed: urllib.parse.ParseResult
+    address: str
+    port: int
+
+
 def _read_url_upload(cfg: Config, source_url: str) -> bytes:
     max_bytes = max(1, int(cfg.registry.max_upload_bytes))
     url = source_url
-    opener = urllib.request.build_opener(_NoRedirectHandler)
     for _ in range(max(0, int(cfg.registry.upload_url_max_redirects)) + 1):
-        _validate_upload_url(url)
-        request = urllib.request.Request(url, headers={"User-Agent": "jarvis-project-upload/1.0"})
+        resolved = _resolve_upload_url(url)
+        _reject_dns_rebind(resolved)
+        response = _open_pinned_upload_url(resolved)
         try:
-            with opener.open(request, timeout=30) as response:  # noqa: S310 - URL validated before open.
-                length = response.headers.get("Content-Length")
-                if length and int(length) > max_bytes:
+            if response.status in _REDIRECT_STATUSES:
+                location = response.getheader("Location")
+                if not location:
+                    raise ProjectOperationError("validation_failed", "upload URL redirect missing location", status=400)
+                url = urllib.parse.urljoin(url, location)
+                continue
+            if response.status >= 400:
+                raise ProjectOperationError(
+                    "validation_failed",
+                    f"upload URL failed with HTTP {response.status}",
+                    status=400,
+                    recoverable=True,
+                )
+            length = response.getheader("Content-Length")
+            if length and int(length) > max_bytes:
+                raise ProjectOperationError(
+                    "validation_failed",
+                    "upload exceeds max size",
+                    status=413,
+                    recoverable=True,
+                )
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                remaining = max_bytes + 1 - total
+                if remaining <= 0:
                     raise ProjectOperationError(
                         "validation_failed",
                         "upload exceeds max size",
                         status=413,
                         recoverable=True,
                     )
-                chunks: list[bytes] = []
-                total = 0
-                while True:
-                    remaining = max_bytes + 1 - total
-                    if remaining <= 0:
-                        raise ProjectOperationError(
-                            "validation_failed",
-                            "upload exceeds max size",
-                            status=413,
-                            recoverable=True,
-                        )
-                    chunk = response.read(min(65536, remaining))
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    total += len(chunk)
-                    if total > max_bytes:
-                        raise ProjectOperationError(
-                            "validation_failed",
-                            "upload exceeds max size",
-                            status=413,
-                            recoverable=True,
-                        )
-                return b"".join(chunks)
-        except urllib.error.HTTPError as exc:
-            if exc.code not in _REDIRECT_STATUSES:
-                raise ProjectOperationError(
-                    "validation_failed",
-                    f"upload URL failed with HTTP {exc.code}",
-                    status=400,
-                    recoverable=True,
-                ) from exc
-            location = exc.headers.get("Location")
-            if not location:
-                raise ProjectOperationError("validation_failed", "upload URL redirect missing location", status=400) from exc
-            url = urllib.parse.urljoin(url, location)
+                chunk = response.read(min(65536, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ProjectOperationError(
+                        "validation_failed",
+                        "upload exceeds max size",
+                        status=413,
+                        recoverable=True,
+                    )
+            return b"".join(chunks)
+        finally:
+            response.close()
     raise ProjectOperationError("validation_failed", "upload URL redirected too many times", status=400, recoverable=True)
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
-        return None
-
-
-def _validate_upload_url(url: str) -> None:
+def _resolve_upload_url(url: str) -> _ResolvedUploadURL:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         raise ProjectOperationError("validation_failed", "upload URL must use http or https", status=400, recoverable=True)
     if not parsed.hostname:
         raise ProjectOperationError("validation_failed", "upload URL host is required", status=400, recoverable=True)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
-        infos = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+        infos = socket.getaddrinfo(parsed.hostname, port, type=socket.SOCK_STREAM)
     except OSError as exc:
         raise ProjectOperationError("validation_failed", "upload URL host could not be resolved", status=400, recoverable=True) from exc
     for info in infos:
         address = info[4][0]
-        ip = ipaddress.ip_address(address)
-        if (
-            ip.is_private
-            or ip.is_loopback
-            or ip.is_link_local
-            or ip.is_multicast
-            or ip.is_reserved
-            or ip.is_unspecified
-        ):
-            raise ProjectOperationError("validation_failed", "upload URL host is not allowed", status=400, recoverable=True)
+        if not _blocked_upload_address(address):
+            return _ResolvedUploadURL(url=url, parsed=parsed, address=address, port=port)
+    raise ProjectOperationError("validation_failed", "upload URL host is not allowed", status=400, recoverable=True)
+
+
+def _reject_dns_rebind(resolved: _ResolvedUploadURL) -> None:
+    try:
+        infos = socket.getaddrinfo(resolved.parsed.hostname, resolved.port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ProjectOperationError("validation_failed", "upload URL host could not be resolved", status=400, recoverable=True) from exc
+    if any(_blocked_upload_address(info[4][0]) for info in infos):
+        raise ProjectOperationError("validation_failed", "upload URL host is not allowed", status=400, recoverable=True)
+
+
+def _blocked_upload_address(address: str) -> bool:
+    ip = ipaddress.ip_address(address)
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
+def _open_pinned_upload_url(resolved: _ResolvedUploadURL) -> http.client.HTTPResponse:
+    connection_cls: type[http.client.HTTPConnection]
+    if resolved.parsed.scheme == "https":
+        connection_cls = _PinnedHTTPSConnection
+    else:
+        connection_cls = _PinnedHTTPConnection
+    conn = connection_cls(
+        resolved.address,
+        resolved.port,
+        timeout=30,
+        original_host=resolved.parsed.hostname or "",
+    )
+    path = urllib.parse.urlunparse(
+        ("", "", resolved.parsed.path or "/", resolved.parsed.params, resolved.parsed.query, "")
+    )
+    conn.request(
+        "GET",
+        path,
+        headers={
+            "Host": _host_header(resolved.parsed),
+            "User-Agent": "jarvis-project-upload/1.0",
+        },
+    )
+    return conn.getresponse()
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host: str, port: int, *, timeout: float, original_host: str) -> None:
+        super().__init__(host, port=port, timeout=timeout)
+        self._original_host = original_host
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, port: int, *, timeout: float, original_host: str) -> None:
+        super().__init__(host, port=port, timeout=timeout, context=ssl.create_default_context())
+        self._original_host = original_host
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection((self.host, self.port), self.timeout, self.source_address)
+        if self._tunnel_host:
+            self._tunnel()
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self._original_host)
+
+
+def _host_header(parsed: urllib.parse.ParseResult) -> str:
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    default_port = 443 if parsed.scheme == "https" else 80
+    if parsed.port and parsed.port != default_port:
+        return f"{host}:{parsed.port}"
+    return host
 
 
 def _manifest_path(cfg: Config) -> Path:

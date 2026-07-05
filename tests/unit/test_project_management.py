@@ -242,7 +242,12 @@ def test_upload_ingestion_failure_returns_recoverable_result_with_vault_metadata
     assert Path(result["original_path"]).exists()
     assert result["doc_id"]
     assert result["content_hash"].startswith("sha256:")
-    assert result["ingestion"] == {"queued": False, "error": "honcho timed out", "recoverable": True}
+    assert result["ingestion"] == {
+        "queued": False,
+        "code": "ingestion_failed",
+        "error": "file ingestion failed",
+        "recoverable": True,
+    }
     assert result["file"]["ingestion"] == result["ingestion"]
 
 
@@ -283,27 +288,24 @@ def test_upload_rejects_oversize_url_response(tmp_path, monkeypatch) -> None:  #
     service.cfg.registry.max_upload_bytes = 5
 
     class Response:
+        status = 200
         headers: dict[str, str] = {}
 
-        def __enter__(self):  # noqa: ANN204
-            return self
+        def getheader(self, name: str) -> str | None:
+            return self.headers.get(name)
 
-        def __exit__(self, *args):  # noqa: ANN002, ANN204
-            return False
+        def close(self) -> None:
+            return None
 
         def read(self, _size: int) -> bytes:
             return b"abcdef"
-
-    class Opener:
-        def open(self, _request, timeout: int):  # noqa: ANN001, ARG002, ANN201
-            return Response()
 
     monkeypatch.setattr(
         project_management_module.socket,
         "getaddrinfo",
         lambda *args, **kwargs: [(None, None, None, None, ("93.184.216.34", 80))],
     )
-    monkeypatch.setattr(project_management_module.urllib.request, "build_opener", lambda *_args: Opener())
+    monkeypatch.setattr(project_management_module, "_open_pinned_upload_url", lambda _resolved: Response())
 
     with pytest.raises(ProjectOperationError, match="exceeds max size"):
         asyncio.run(
@@ -311,6 +313,33 @@ def test_upload_rejects_oversize_url_response(tmp_path, monkeypatch) -> None:  #
                 _ctx("jules"),
                 "project.file.upload",
                 {"project_id": "jarvis", "source_url": "https://example.com/large.md"},
+            )
+        )
+
+
+def test_upload_rejects_dns_rebinding_to_private_address(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    service, _store, _memory = _service(tmp_path, monkeypatch)
+    answers = [
+        [(None, None, None, None, ("93.184.216.34", 80))],
+        [(None, None, None, None, ("169.254.169.254", 80))],
+    ]
+
+    def fake_getaddrinfo(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        return answers.pop(0)
+
+    monkeypatch.setattr(project_management_module.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(
+        project_management_module,
+        "_open_pinned_upload_url",
+        lambda _resolved: pytest.fail("rebound URL should be rejected before connect"),
+    )
+
+    with pytest.raises(ProjectOperationError, match="host is not allowed"):
+        asyncio.run(
+            service.execute(
+                _ctx("jules"),
+                "project.file.upload",
+                {"project_id": "jarvis", "source_url": "https://example.com/spec.md"},
             )
         )
 
