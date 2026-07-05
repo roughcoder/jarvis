@@ -38,6 +38,7 @@ from jarvis.brain.dialog import (
 )
 from jarvis.brain.gateway_client import GatewayClient, LLMAttribution
 from jarvis.brain.memory_client import MemoryClient, UnsupportedMemoryOperation
+from jarvis.brain.memory_outbox import CurationOutbox
 from jarvis.brain.soul import read_soul
 from jarvis.users import format_facts, read_facts
 from jarvis.brain.tracing import Tracer
@@ -96,6 +97,16 @@ _PROFILE_GUIDANCE = (
     "durable fact, call `remember` even if you think you already know it; the tool is "
     "idempotent, so re-saving is harmless. Don't save fleeting or conversational remarks. "
     "Use `forget` to remove one, `list_facts` to read back what's actually saved."
+)
+
+_MEMORY_TOOL_GUIDANCE = (
+    "Memory questions: when the user explicitly asks what you know or remember about "
+    "a person, project, or topic, call `memory_search` rather than answering from the "
+    "ambient summary alone. For durable facts about contacts or projects, use the "
+    "Lane 2 tools: `remember_contact`, `add_finding`, and `record_decision`. For "
+    "forgetting or correcting memory, use `forget_memory` or `correct_memory`; if a "
+    "tool says confirmation is required, ask the user to choose before continuing. "
+    "Use the legacy `remember` tool only for structured facts about the current user."
 )
 
 _BROWSER_GUIDANCE = (
@@ -524,6 +535,7 @@ class BrainSession:
 
     def _system_prompt(self, memory: str, *, include_voice_controls: bool = True) -> str:
         """Soul (who Jarvis is) + format + memory (what he knows about you)."""
+        memory = self._with_pending_memory_lines(memory)
         parts = []
         if self._soul:
             parts.append(self._soul)
@@ -554,6 +566,8 @@ class BrainSession:
             parts.append(_BACKGROUND_GUIDANCE)
         if self._ctx.can("profile.write"):
             parts.append(_PROFILE_GUIDANCE)
+        if self._ctx.can("memory.query") or self._ctx.can("memory.curate"):
+            parts.append(_MEMORY_TOOL_GUIDANCE)
         if self._ctx.can("worker.browser"):
             parts.append(_BROWSER_GUIDANCE)
         if self._ctx.can("worker.gui"):
@@ -609,6 +623,18 @@ class BrainSession:
             parts.append(voice_mode_instruction(self._voice_mode))
         parts.append(_now_line(self._cfg.persona.timezone))
         return "\n\n".join(parts)
+
+    def _with_pending_memory_lines(self, memory: str) -> str:
+        peer_id = self._memory_user or self._ctx.memory_peer
+        if not peer_id:
+            return memory
+        outbox = CurationOutbox(
+            self._cfg.memory.curation_outbox_path,
+            max_retries=self._cfg.memory.curation_outbox_max_retries,
+            backoff_initial_s=self._cfg.memory.curation_outbox_backoff_initial_s,
+            backoff_max_s=self._cfg.memory.curation_outbox_backoff_max_s,
+        )
+        return outbox.append_pending_lines(memory, observed_id=peer_id)
 
     def _saved_facts(self) -> str:
         """The speaker's curated facts (local file read, like the memory cache — never a

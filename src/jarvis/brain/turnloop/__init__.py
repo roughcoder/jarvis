@@ -27,6 +27,9 @@ from jarvis.brain.contexts import ContextStore
 from jarvis.brain.gateway_client import GatewayClient
 from jarvis.brain.identity import HOUSE, IdentityResolver, load_users
 from jarvis.brain.memory_client import MemoryClient
+from jarvis.brain.memory_outbox import CurationOutbox
+from jarvis.brain.memory_tools import make_memory_tools
+from jarvis.brain.registry import RegistryStore
 from jarvis.brain.session import BrainSession, TurnResult
 from jarvis.brain.skills import register_skills
 from jarvis.brain.tracing import Tracer
@@ -84,6 +87,7 @@ class TurnLoop:
             memory=memory,
         )
         users = load_users(cfg.capabilities.users_dir)
+        self._register_memory_tools(memory, users)
         # MCP servers connect at startup (off the hot path); OAuth servers connect
         # per principal (house + each user) so credentials isolate. See run().
         self._mcp = MCPBridge(cfg.mcp, principals=list(users))
@@ -98,6 +102,23 @@ class TurnLoop:
         self._base_asserted = self._asserted
         self._voice_mode = DEFAULT_MODE
         self.state = State.PASSIVE
+
+    def _register_memory_tools(self, memory: MemoryClient, users: dict) -> None:
+        outbox = CurationOutbox(
+            self._cfg.memory.curation_outbox_path,
+            max_retries=self._cfg.memory.curation_outbox_max_retries,
+            backoff_initial_s=self._cfg.memory.curation_outbox_backoff_initial_s,
+            backoff_max_s=self._cfg.memory.curation_outbox_backoff_max_s,
+        )
+        store = RegistryStore(self._cfg.registry.path)
+        for tool in make_memory_tools(
+            self._cfg.memory,
+            memory=memory,
+            outbox=outbox,
+            registry=store,
+            users=users,
+        ):
+            self._registry.register(tool)
 
     def _make_session(self, ctx: RequestContext) -> BrainSession:
         return BrainSession(
