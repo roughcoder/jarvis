@@ -50,3 +50,8 @@ ingestion flow is not in this branch.
 
 Writes from MCP force `channel: mcp`, `source: mcp`, `recorded_by` from the
 token principal, and an `agent` tag so external-agent conclusions are auditable.
+
+`send_turn` uses an additional structural tool ceiling. Even if the host device
+profile grants broad local powers, MCP-driven BrainSession turns are intersected
+with the MCP-safe memory/project allow-list and cannot expose worker, browser,
+files, web, remote, Google, or background tools.

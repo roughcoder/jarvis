@@ -7,7 +7,14 @@ capability-gated brain/tool calls out.
 
 from __future__ import annotations
 
-from jarvis.mcp_server.adapters import JarvisMCPService
 from jarvis.mcp_server.tokens import MCPTokenRecord, MCPTokenStore
 
 __all__ = ["JarvisMCPService", "MCPTokenRecord", "MCPTokenStore"]
+
+
+def __getattr__(name: str):  # noqa: ANN202
+    if name == "JarvisMCPService":
+        from jarvis.mcp_server.adapters import JarvisMCPService
+
+        return JarvisMCPService
+    raise AttributeError(name)

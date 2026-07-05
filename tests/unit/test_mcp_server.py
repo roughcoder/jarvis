@@ -10,7 +10,14 @@ import pytest
 from jarvis.brain.memory_client import RepresentationRecord
 from jarvis.brain.memory_outbox import CurationOutbox
 from jarvis.config import Config
-from jarvis.mcp_server.adapters import JarvisMCPService, MCPAccessError
+from jarvis.mcp_server.adapters import (
+    MCPAccessError,
+    MCPCockpitConnector,
+    MCP_SEND_TURN_CAPABILITIES,
+    JarvisMCPService,
+    mcp_send_turn_context,
+)
+from jarvis.mcp_server.server import MCPServerRuntime, _BearerAuthASGI
 from jarvis.mcp_server.tokens import MCPTokenStore
 
 
@@ -19,6 +26,8 @@ class FakeMemory:
         self.representations: dict[str, str] = {}
         self.reads: list[dict[str, Any]] = []
         self.chats: list[dict[str, Any]] = []
+        self.sessions: list[dict[str, Any]] = []
+        self.messages: list[dict[str, Any]] = []
 
     def read_cached_representation(self, user: str | None = None) -> str:
         return self.representations.get(user or "", "cached")
@@ -33,6 +42,54 @@ class FakeMemory:
     def dialectic_chat(self, peer_id: str, query: str, **kwargs: Any) -> str:
         self.chats.append({"peer_id": peer_id, "query": query, **kwargs})
         return f"answer for {peer_id}: {query}"
+
+    def create_session(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
+        row = {"session_id": session_id, **kwargs}
+        self.sessions.append(row)
+        return row
+
+    def create_messages(self, session_id: str, messages: list[Any]) -> list[dict[str, Any]]:
+        rows = [
+            {
+                "session_id": session_id,
+                "peer_id": message.peer_id,
+                "content": message.content,
+                "metadata": dict(message.metadata),
+            }
+            for message in messages
+        ]
+        self.messages.extend(rows)
+        return rows
+
+
+class _Fn:
+    def __init__(self, name: str, arguments: str) -> None:
+        self.name = name
+        self.arguments = arguments
+
+
+class _Msg:
+    def __init__(self, content: str = "") -> None:
+        self.content = content
+        self.tool_calls = []
+
+
+class FakeGateway:
+    def __init__(self, reply: str = "MCP reply.") -> None:
+        self.reply = reply
+        self.tools: list[list[dict[str, Any]] | None] = []
+
+    async def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        usage_out: dict[str, Any] | None = None,
+    ) -> _Msg:
+        _ = (messages, model, usage_out)
+        self.tools.append(tools)
+        return _Msg(self.reply)
 
 
 def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
@@ -62,7 +119,7 @@ def _seed_users(cfg: Config) -> None:
     users = Path(cfg.capabilities.users_dir)
     users.mkdir(parents=True, exist_ok=True)
     users.joinpath("neil.md").write_text(
-        "---\nscope: personal\nhoncho_peer: neil\ncapabilities: [memory.query, memory.curate]\n---\n# Neil\n",
+        "---\nscope: personal\nhoncho_peer: neil\ncapabilities: [memory.query, memory.curate, project.switch]\n---\n# Neil\n",
         encoding="utf-8",
     )
     users.joinpath("viewer.md").write_text(
@@ -142,7 +199,7 @@ def test_token_principal_context_inherits_user_capabilities(tmp_path, monkeypatc
     assert ctx.identity == "neil"
     assert ctx.memory_peer == "neil"
     assert ctx.channel == "mcp"
-    assert {"memory.query", "memory.curate"} <= set(ctx.capabilities)
+    assert {"memory.query", "memory.curate", "project.switch"} <= set(ctx.capabilities)
 
 
 def test_unknown_principal_is_denied_by_default(tmp_path, monkeypatch) -> None:
@@ -228,6 +285,102 @@ def test_upload_file_is_clear_not_available_stub(tmp_path, monkeypatch) -> None:
     body = asyncio.run(service.upload_file(ctx, project_id="jarvis", path="note.md"))
 
     assert "not yet available" in body["error"]
+
+
+def test_send_turn_context_caps_host_device_tool_ceiling(tmp_path, monkeypatch) -> None:
+    cfg = _cfg(tmp_path, monkeypatch)
+    cfg.capabilities.default_capabilities = (
+        "memory.query,memory.curate,project.switch,web.search,files.read,files.write,"
+        "worker.code,worker.shell,worker.browser,background.run"
+    )
+    memory = FakeMemory()
+    service = JarvisMCPService(cfg, memory=memory)
+    full_ctx = service.context_for_principal("neil")
+    assert "worker.code" in full_ctx.capabilities
+    assert "web.search" in full_ctx.capabilities
+
+    project = service.registry.get_project("jarvis")
+    connector = MCPCockpitConnector(cfg, memory=memory, gateway=FakeGateway())
+
+    session = connector._make_session(  # noqa: SLF001 - security regression probes the built registry.
+        mcp_send_turn_context(full_ctx),
+        project=project,
+        memory=memory,
+    )
+    offered = {tool.name for tool in session._registry.available_for(session._ctx)}  # noqa: SLF001
+
+    assert session._ctx.capabilities == MCP_SEND_TURN_CAPABILITIES  # noqa: SLF001
+    assert {"memory_search", "add_finding", "record_decision", "switch_project"} <= offered
+    assert {
+        "web_search",
+        "fetch_page",
+        "read_file",
+        "write_file",
+        "start_coding_job",
+        "run_shell",
+        "browser_open",
+        "run_in_background",
+    }.isdisjoint(offered)
+
+
+def test_send_turn_persists_messages_with_mcp_channel(tmp_path, monkeypatch) -> None:
+    cfg = _cfg(tmp_path, monkeypatch)
+    memory = FakeMemory()
+    gateway = FakeGateway("done")
+    connector = MCPCockpitConnector(cfg, memory=memory, gateway=gateway)
+    service = JarvisMCPService(cfg, memory=memory, cockpit=connector)
+    ctx = service.context_for_principal("neil")
+    project = service.registry.get_project("jarvis")
+    thread = asyncio.run(connector.open_thread(project, ctx, title="MCP thread"))
+
+    body = asyncio.run(
+        service.send_turn(
+            ctx,
+            project_id="jarvis",
+            thread_id=thread.thread_id,
+            text="summarise status",
+        )
+    )
+
+    assert body["reply"] == "done"
+    persisted = [message for message in memory.messages if message["session_id"] == thread.session_id]
+    assert [message["metadata"]["channel"] for message in persisted] == ["mcp", "mcp"]
+    assert [message["metadata"]["role"] for message in persisted] == ["user", "assistant"]
+
+
+def test_mcp_request_context_is_set_and_cleared_per_request(tmp_path, monkeypatch) -> None:
+    cfg = _cfg(tmp_path, monkeypatch)
+    neil_token, _ = MCPTokenStore(cfg.mcp_serve.token_store_path).add(principal="neil")
+    viewer_token, _ = MCPTokenStore(cfg.mcp_serve.token_store_path).add(principal="viewer")
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+    runtime = MCPServerRuntime(service)
+    seen: list[str] = []
+
+    async def inner(scope, receive, send):  # noqa: ANN001
+        _ = (receive, send)
+        seen.append(runtime.requester().identity)
+
+    app = _BearerAuthASGI(inner, service, cfg.mcp_serve.token_store_path)
+
+    async def call(token: str) -> None:
+        sent: list[dict[str, Any]] = []
+        await app(
+            {
+                "type": "http",
+                "headers": [(b"authorization", f"Bearer {token}".encode("ascii"))],
+            },
+            lambda: None,
+            sent.append,
+        )
+
+    async def go() -> None:
+        await asyncio.gather(call(neil_token), call(viewer_token))
+
+    asyncio.run(go())
+
+    assert sorted(seen) == ["neil", "viewer"]
+    with pytest.raises(MCPAccessError):
+        runtime.requester()
 
 
 def test_service_does_not_construct_memory_client_for_registry_reads(tmp_path, monkeypatch) -> None:

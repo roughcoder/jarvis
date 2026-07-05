@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from jarvis.brain.capabilities import (
     RequestContext,
@@ -13,16 +13,42 @@ from jarvis.brain.capabilities import (
     can_write_memory_peer,
     context_for_resolution,
 )
+from jarvis.brain.contexts import ActiveProject, ContextStore
 from jarvis.brain.identity import Resolution
+from jarvis.brain.memory_client import MemoryBackend, MemoryMessage, SessionPeer
 from jarvis.brain.memory_outbox import CurationOutbox
 from jarvis.brain.memory_tools import make_memory_tools
+from jarvis.brain.project_tools import make_project_tools
 from jarvis.brain.registry import ProjectEntry, RegistryStore
+from jarvis.brain.session import BrainSession, TurnResult
 from jarvis.config import Config
+from jarvis.connectors.cockpit import (
+    CockpitConnector,
+    CockpitMemoryView,
+    CockpitThread,
+    _drain_cold_tasks,
+    _project_context,
+)
+from jarvis.ids import utc_now
 from jarvis.runtime import CapabilityError, ToolRegistry
+from jarvis.tools import build_registry
 from jarvis.users import User, load_users
 
-if TYPE_CHECKING:
-    from jarvis.connectors.cockpit import CockpitConnector
+
+MCP_SEND_TURN_CAPABILITIES = frozenset(
+    {
+        "memory.query",
+        "memory.curate",
+        "project.switch",
+    }
+)
+"""Capabilities a BrainSession may see when driven by external MCP send_turn.
+
+The token principal still resolves normally, but the conversation tool ceiling
+is structurally limited to memory/project verbs. Host-device grants such as
+web.search, files.*, worker.*, browser, google, remote, or background.run never
+become available to an external MCP agent through send_turn.
+"""
 
 
 class MCPAccessError(PermissionError):
@@ -75,9 +101,7 @@ class JarvisMCPService:
     @property
     def cockpit(self) -> CockpitConnector:
         if self._cockpit is None:
-            from jarvis.connectors.cockpit import CockpitConnector
-
-            self._cockpit = CockpitConnector(self.cfg, memory=self.memory)
+            self._cockpit = MCPCockpitConnector(self.cfg, memory=self.memory)
         return self._cockpit
 
     def context_for_principal(self, principal: str) -> RequestContext:
@@ -209,7 +233,7 @@ class JarvisMCPService:
         thread = await asyncio.to_thread(self.cockpit.index.get, project.id, thread_id)
         if thread is None:
             raise MCPAccessError("thread not found")
-        reply, updated = await self.cockpit.turn(project, thread, ctx, text)
+        reply, updated = await self.cockpit.turn(project, thread, mcp_send_turn_context(ctx), text)
         return {"reply": reply, "thread": updated.as_dict()}
 
     async def upload_file(
@@ -333,3 +357,157 @@ def _mcp_metadata(ctx: RequestContext, *, agent: str, observed_at: str) -> dict[
         "agent": agent.strip() or "external-agent",
         "observed_at": observed_at.strip() or datetime.now(UTC).date().isoformat(),
     }
+
+
+def mcp_send_turn_context(ctx: RequestContext) -> RequestContext:
+    return replace(
+        ctx,
+        channel="mcp",
+        capabilities=frozenset(ctx.capabilities & MCP_SEND_TURN_CAPABILITIES),
+    )
+
+
+class MCPCockpitConnector(CockpitConnector):
+    async def turn(
+        self,
+        project: ProjectEntry,
+        thread: CockpitThread,
+        requester: RequestContext,
+        text: str,
+    ) -> tuple[str, CockpitThread]:
+        text = text.strip()
+        if not text:
+            raise ValueError("turn text is required")
+        project_context = _project_context(self._memory, project, thread)
+        view = CockpitMemoryView(
+            self._memory,
+            project_peer_id=project.peer_id,
+            project_context=project_context,
+        )
+        session = self._make_session(
+            requester,
+            project=project,
+            memory=view,
+        )
+        trace = self._tracer.turn(
+            room=self._cfg.gateway.room,
+            speaker=requester.identity,
+            channel="mcp",
+            device_id=requester.device_id,
+        )
+        result = TurnResult()
+        reply = await session.respond_text(text, trace, result)
+        session.finalize(text, result, trace)
+        await _drain_cold_tasks(session)
+        if self._tracer is not None:
+            self._tracer.emit(trace)
+        reply = result.reply or reply
+        await asyncio.to_thread(
+            self._persist_turn,
+            thread.session_id,
+            requester.memory_peer,
+            requester.device_id,
+            text,
+            reply,
+            "mcp",
+        )
+        updated = self._index.append_turn(
+            thread,
+            user_peer_id=requester.memory_peer,
+            user_text=text,
+            assistant_peer_id=self._cfg.memory.assistant_peer_id,
+            assistant_text=reply,
+        )
+        return reply, updated
+
+    def _make_session(
+        self,
+        requester: RequestContext,
+        *,
+        project: ProjectEntry,
+        memory: MemoryBackend,
+    ) -> BrainSession:
+        ctx = mcp_send_turn_context(requester)
+        contexts = ContextStore(lambda _ctx: None)  # type: ignore[arg-type]
+        active = ActiveProject(id=project.id, name=project.name, peer_id=project.peer_id)
+        contexts.set_active_project(ctx, active)
+        registry_store = RegistryStore(self._cfg.registry.path)
+        users = load_users(self._cfg.capabilities.users_dir)
+        tools = build_registry(
+            self._cfg.tools,
+            worker=self._cfg.worker,
+            remote=self._cfg.remote,
+            google=self._cfg.google,
+            accounts=self._cfg.accounts,
+            browser=self._cfg.browser,
+            capabilities=self._cfg.capabilities,
+            memory=memory,
+        )
+        outbox = CurationOutbox(
+            self._cfg.memory.curation_outbox_path,
+            max_retries=self._cfg.memory.curation_outbox_max_retries,
+            backoff_initial_s=self._cfg.memory.curation_outbox_backoff_initial_s,
+            backoff_max_s=self._cfg.memory.curation_outbox_backoff_max_s,
+        )
+        for tool in make_memory_tools(
+            self._cfg.memory,
+            memory=memory,
+            outbox=outbox,
+            registry=registry_store,
+            users=users,
+        ):
+            tools.register(tool)
+        for tool in make_project_tools(
+            self._cfg.memory,
+            memory=memory,
+            registry=registry_store,
+            contexts=contexts,
+        ):
+            tools.register(tool)
+        session = BrainSession(
+            self._cfg,
+            ctx,
+            gateway=self._turn_gateway(),
+            tts=self._tts,
+            memory=memory,
+            tracer=self._tracer,
+            registry=tools,
+            memory_user=ctx.memory_peer,
+            active_project_getter=lambda: active,
+        )
+        session.load_soul()
+        return session
+
+    def _persist_turn(
+        self,
+        session_id: str,
+        requester_peer_id: str,
+        device_id: str | None,
+        user_text: str,
+        assistant_text: str,
+        channel: str,
+    ) -> None:
+        self._memory.create_session(
+            session_id,
+            peers=[SessionPeer(peer_id=requester_peer_id, observe_me=True, observe_others=True)],
+        )
+        user_metadata = {"channel": channel, "role": "user", "observed_at": utc_now()}
+        assistant_metadata = {"channel": channel, "role": "assistant", "observed_at": utc_now()}
+        if device_id:
+            user_metadata["device_id"] = device_id
+            assistant_metadata["device_id"] = device_id
+        self._memory.create_messages(
+            session_id,
+            [
+                MemoryMessage(
+                    peer_id=requester_peer_id,
+                    content=user_text,
+                    metadata=user_metadata,
+                ),
+                MemoryMessage(
+                    peer_id=self._cfg.memory.assistant_peer_id,
+                    content=assistant_text,
+                    metadata=assistant_metadata,
+                ),
+            ],
+        )
