@@ -535,9 +535,9 @@ class HonchoV3MemoryClient:
     ) -> list[ConclusionRecord]:
         filters: dict[str, Any] = {}
         if observed_id:
-            filters["observed_id"] = self._encoded_peer(observed_id)
+            filters["observed"] = self._encoded_peer(observed_id)
         if observer_id:
-            filters["observer_id"] = self._encoded_peer(observer_id)
+            filters["observer"] = self._encoded_peer(observer_id)
         if session_id:
             filters["session_id"] = self._encoded_session(session_id)
         if level:

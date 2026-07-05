@@ -325,6 +325,45 @@ def test_v3_query_conclusions_filters_sidecar_metadata(tmp_path) -> None:
     )
 
 
+def test_v3_query_conclusions_uses_semantic_observer_filter_keys(tmp_path) -> None:
+    query_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/conclusions/query"):
+            query_payloads.append(_json(request))
+            return httpx.Response(200, json=[])
+        return httpx.Response(201, json={"id": _json(request).get("id", "")})
+
+    client = HonchoV3MemoryClient(_cfg(tmp_path), transport=httpx.MockTransport(handler))
+
+    assert (
+        client.query_conclusions(
+            "forget Klaus Fridays",
+            observed_id="contact:klaus",
+            observer_id="voice:neil:mac",
+            session_id="voice:neil:mac",
+            level="explicit",
+            limit=7,
+        )
+        == []
+    )
+
+    assert query_payloads == [
+        {
+            "query": "forget Klaus Fridays",
+            "filters": {
+                "observer": encode_honcho_id("voice:neil:mac"),
+                "observed": encode_honcho_id("contact:klaus"),
+                "session_id": encode_honcho_id("voice:neil:mac"),
+                "level": "explicit",
+            },
+            "top_k": 7,
+        }
+    ]
+    assert "observer_id" not in query_payloads[0]["filters"]
+    assert "observed_id" not in query_payloads[0]["filters"]
+
+
 def test_v3_unfiltered_list_reconciles_sidecar_orphans(tmp_path) -> None:
     sidecar_path = tmp_path / "sidecar.json"
     sidecar_path.write_text(
