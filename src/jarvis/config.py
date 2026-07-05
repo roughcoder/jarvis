@@ -105,6 +105,14 @@ class MemoryConfig(_Base):
         return f"http://{self.host}:{self.port}"
 
 
+class MemoryMigrationConfig(_Base):
+    """Operator tooling defaults for Honcho cutover migrations."""
+
+    model_config = SettingsConfigDict(env_prefix="MEMORY_MIGRATION_", env_file=".env", extra="ignore")
+
+    workspace_id: str = "jarvis-migration-dev"
+
+
 class DatabaseConfig(_Base):
     """Postgres + pgvector backing Honcho (spec §4). Config-driven host (§3.1)."""
 
@@ -813,6 +821,7 @@ class Config:
 
         self.gateway = GatewayConfig(**source)
         self.memory = MemoryConfig(**source)
+        self.memory_migration = MemoryMigrationConfig(**source)
         self.database = DatabaseConfig(**source)
         self.tts = TTSConfig(**source)
         self.stt = STTConfig(**source)
@@ -898,6 +907,7 @@ class Config:
             "memory.curation_outbox_backoff_initial_s": self.memory.curation_outbox_backoff_initial_s,
             "memory.curation_outbox_backoff_max_s": self.memory.curation_outbox_backoff_max_s,
             "memory.tool_timeout_s": self.memory.tool_timeout_s,
+            "memory_migration.workspace_id": self.memory_migration.workspace_id,
             "database.host": self.database.host,
             "database.port": self.database.port,
             "database.url": self.database.url_masked,
