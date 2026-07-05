@@ -12,8 +12,10 @@ from datetime import datetime
 
 from jarvis.brain.dialog import _relative_date_map
 from jarvis.brain.context import RequestContext
+from jarvis.brain.contexts import ActiveProject
 from jarvis.brain.session import BrainSession, TurnResult, _now_line
 from jarvis.config import load_config
+from jarvis.tools.base import ToolRegistry
 
 
 def _tool_turn(reply: str, job_id: str = "abc123") -> TurnResult:
@@ -71,6 +73,33 @@ def _session(channel: str = "voice", cfg=None) -> BrainSession:  # noqa: ANN001
         tracer=None,
         registry=None,
     )
+
+
+class _CachedMemory:
+    def __init__(self) -> None:
+        self.cached = {
+            "neil": "Neil likes fast answers.",
+            "project:jarvis": "Jarvis project uses cached memory only.",
+        }
+        self.reads: list[str | None] = []
+        self.refreshes: list[str | None] = []
+
+    def read_cached_representation(self, user=None):  # noqa: ANN001
+        self.reads.append(user)
+        return self.cached.get(user, "")
+
+    async def refresh_cache(self, min_interval_s=0.0, *, user=None) -> bool:  # noqa: ANN001
+        self.refreshes.append(user)
+        raise AssertionError("ambient project memory must not refresh live")
+
+
+class _PromptGateway:
+    def __init__(self) -> None:
+        self.system_prompts: list[str] = []
+
+    async def complete(self, messages, *, model):  # noqa: ANN001
+        self.system_prompts.append(messages[0]["content"])
+        return "done"
 
 
 def test_system_prompt_mentions_camera_when_available() -> None:
@@ -174,6 +203,95 @@ def test_system_prompt_tells_memory_caps_to_honor_retractions() -> None:
 
     assert "contradiction or retraction" in prompt
     assert "authoritative over any derived restatement" in prompt
+
+
+def test_ambient_prompt_includes_active_project_cached_representation(tmp_path) -> None:
+    active = ActiveProject(id="jarvis", name="Jarvis", peer_id="project:jarvis")
+    memory = _CachedMemory()
+    gateway = _PromptGateway()
+    cfg = load_config()
+    cfg.memory.curation_outbox_path = str(tmp_path / "outbox.jsonl")
+    sess = BrainSession(
+        cfg,
+        RequestContext("dev", "neil", "personal", frozenset(), channel="text", peer="neil"),
+        gateway=gateway,
+        tts=None,
+        memory=memory,
+        tracer=None,
+        registry=ToolRegistry(),
+        memory_user="neil",
+        active_project_getter=lambda: active,
+    )
+
+    asyncio.run(sess.respond_text("status", None, TurnResult()))
+
+    prompt = gateway.system_prompts[-1]
+    assert "What you already know about the user" in prompt
+    assert "Neil likes fast answers." in prompt
+    assert "Active project context for Jarvis (project:jarvis)" in prompt
+    assert "shared project memory, not the user's personal memory" in prompt
+    assert "Jarvis project uses cached memory only." in prompt
+    assert memory.reads == ["neil", "project:jarvis"]
+    assert memory.refreshes == []
+
+
+def test_ambient_prompt_excludes_project_after_close(tmp_path) -> None:
+    active: ActiveProject | None = ActiveProject(
+        id="jarvis",
+        name="Jarvis",
+        peer_id="project:jarvis",
+    )
+    memory = _CachedMemory()
+    gateway = _PromptGateway()
+    cfg = load_config()
+    cfg.memory.curation_outbox_path = str(tmp_path / "outbox.jsonl")
+    sess = BrainSession(
+        cfg,
+        RequestContext("dev", "neil", "personal", frozenset(), channel="text", peer="neil"),
+        gateway=gateway,
+        tts=None,
+        memory=memory,
+        tracer=None,
+        registry=ToolRegistry(),
+        memory_user="neil",
+        active_project_getter=lambda: active,
+    )
+
+    asyncio.run(sess.respond_text("status", None, TurnResult()))
+    active = None
+    asyncio.run(sess.respond_text("status", None, TurnResult()))
+
+    assert "Active project context" in gateway.system_prompts[0]
+    assert "Active project context" not in gateway.system_prompts[1]
+    assert memory.reads == ["neil", "project:jarvis", "neil"]
+
+
+def test_finalize_refreshes_active_project_peer_only_while_active() -> None:
+    active: ActiveProject | None = ActiveProject(
+        id="jarvis",
+        name="Jarvis",
+        peer_id="project:jarvis",
+    )
+    captured: list[tuple[str, ...]] = []
+    sess = BrainSession(
+        load_config(),
+        RequestContext("dev", "neil", "personal", frozenset(), channel="text", peer="neil"),
+        gateway=None,
+        tts=None,
+        memory=None,
+        tracer=None,
+        registry=ToolRegistry(),
+        active_project_getter=lambda: active,
+    )
+    sess._fire_cold_path = (  # type: ignore[method-assign]
+        lambda _u, _a, refresh_peers=(): captured.append(tuple(refresh_peers))
+    )
+
+    sess.finalize("hello", TurnResult(raw="there"))
+    active = None
+    sess.finalize("hello again", TurnResult(raw="there again"))
+
+    assert captured == [("project:jarvis",), ()]
 
 
 def test_initial_model_is_channel_aware() -> None:

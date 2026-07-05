@@ -28,6 +28,7 @@ from jarvis.brain.identity import HOUSE, IdentityResolver, load_users
 from jarvis.brain.memory_client import MemoryClient
 from jarvis.brain.memory_outbox import CurationOutbox
 from jarvis.brain.memory_tools import make_memory_tools
+from jarvis.brain.project_tools import make_project_tools
 from jarvis.brain.registry import RegistryStore
 from jarvis.brain.proactive import proactive_frames
 from jarvis.brain.scheduler import Ring, Scheduler, in_quiet_hours
@@ -182,7 +183,9 @@ class BrainServer:
         )
         users = load_users(cfg.capabilities.users_dir)  # dict name -> User
         self._users = users  # for outbound (WhatsApp) routing
+        self._contexts = ContextStore(self._make_session)
         self._register_memory_tools(users)
+        self._register_project_tools()
         # MCP servers are connected at startup (async, off the hot path); OAuth
         # servers connect per principal (house + each user) so credentials isolate.
         self._mcp = MCPBridge(cfg.mcp, principals=list(users))
@@ -190,7 +193,6 @@ class BrainServer:
         # Identity resolution (§5): who is speaking, per utterance.
         self._resolver = IdentityResolver(users)
         self._users_mtime = _dir_mtime(cfg.capabilities.users_dir)  # for live reload (WhatsApp pairing)
-        self._contexts = ContextStore(self._make_session)
         # Open intercom connections (for proactive heartbeat push, §3b). Also indexed by
         # device so an alarm/notification can be routed to the device that set it.
         self._connections: set = set()
@@ -232,6 +234,16 @@ class BrainServer:
         ):
             self._registry.register(tool)
 
+    def _register_project_tools(self) -> None:
+        store = RegistryStore(self._cfg.registry.path)
+        for tool in make_project_tools(
+            self._cfg.memory,
+            memory=self._memory,
+            registry=store,
+            contexts=self._contexts,
+        ):
+            self._registry.register(tool)
+
     def _make_session(self, ctx: RequestContext) -> BrainSession:
         async def notify_memory_failure(text: str) -> None:
             await self._notify(
@@ -252,6 +264,7 @@ class BrainServer:
             registry=self._registry,
             memory_user=ctx.memory_peer,
             memory_notify=notify_memory_failure,
+            active_project_getter=lambda: self._contexts.active_project(ctx),
             relevance=self._relevance,
         )
         session.load_soul()  # personality is authoritative for ALL sessions (incl. background)

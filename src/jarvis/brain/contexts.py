@@ -13,11 +13,19 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from jarvis.runtime import RequestContext
 from jarvis.brain.session import BrainSession
 
 _MAX_SESSIONS = 64
+
+
+@dataclass(frozen=True)
+class ActiveProject:
+    id: str
+    name: str
+    peer_id: str
 
 
 class ContextStore:
@@ -32,6 +40,7 @@ class ContextStore:
         self._make = make_session
         self._max_sessions = max(1, max_sessions)
         self._sessions: OrderedDict[tuple[str, str], BrainSession] = OrderedDict()
+        self._active_projects: dict[tuple[str, str], ActiveProject] = {}
         # Retired sessions with pending cold-path writes stay strongly referenced
         # until those tasks finish; otherwise context replacement can detach the
         # last turn's memory write from the resident brain's lifetime accounting.
@@ -52,6 +61,7 @@ class ContextStore:
         if session is not None:
             self._retire(session)
             self._sessions.pop(key, None)
+            self._active_projects.pop(key, None)
         if session is None or getattr(session, "_ctx", ctx) != ctx:
             session = self._make(ctx)  # _make_session loads SOUL.md
             self._sessions[key] = session
@@ -65,9 +75,19 @@ class ContextStore:
     def keys(self) -> list[tuple[str, str]]:
         return list(self._sessions)
 
+    def active_project(self, ctx: RequestContext) -> ActiveProject | None:
+        return self._active_projects.get(_key(ctx))
+
+    def set_active_project(self, ctx: RequestContext, project: ActiveProject) -> None:
+        self._active_projects[_key(ctx)] = project
+
+    def clear_active_project(self, ctx: RequestContext) -> ActiveProject | None:
+        return self._active_projects.pop(_key(ctx), None)
+
     def _evict_if_needed(self) -> None:
         while len(self._sessions) > self._max_sessions:
-            _, session = self._sessions.popitem(last=False)
+            key, session = self._sessions.popitem(last=False)
+            self._active_projects.pop(key, None)
             self._retire(session)
 
     def _retire(self, session: BrainSession) -> None:
@@ -89,3 +109,7 @@ class ContextStore:
 def _pending_cold_tasks(session: BrainSession) -> tuple[asyncio.Task, ...]:
     tasks = getattr(session, "pending_cold_tasks", ())
     return tuple(task for task in tasks if isinstance(task, asyncio.Task))
+
+
+def _key(ctx: RequestContext) -> tuple[str, str]:
+    return (ctx.device_id, ctx.identity)

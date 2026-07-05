@@ -11,7 +11,7 @@ import types
 import asyncio
 
 from jarvis.brain.context import RequestContext
-from jarvis.brain.contexts import ContextStore
+from jarvis.brain.contexts import ActiveProject, ContextStore
 from jarvis.brain.memory_client import MemoryClient
 from jarvis.config import MemoryConfig
 
@@ -74,11 +74,16 @@ def test_context_store_rebuilds_when_capabilities_change() -> None:
     )
 
     s1 = store.get(before)
+    store.set_active_project(
+        before,
+        ActiveProject(id="jarvis", name="Jarvis", peer_id="project:jarvis"),
+    )
     s2 = store.get(after)
 
     assert s1 is not s2
     assert s2._ctx.can("intercom.camera")
     assert len(store) == 1
+    assert store.active_project(after) is None
 
 
 def test_context_store_eviction_retains_pending_cold_path() -> None:
@@ -101,10 +106,15 @@ def test_context_store_eviction_retains_pending_cold_path() -> None:
         second = RequestContext("mac", "jules", "personal", frozenset(), peer="jules")
 
         old = store.get(first)
+        store.set_active_project(
+            first,
+            ActiveProject(id="jarvis", name="Jarvis", peer_id="project:jarvis"),
+        )
         store.get(second)
 
         assert len(store) == 1
         assert old in store._retired
+        assert store.active_project(first) is None
         done.set()
         await sessions[0].pending_cold_tasks[0]
         store.get(second)  # prune completed retired sessions on the next access
