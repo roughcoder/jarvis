@@ -1828,6 +1828,10 @@ def test_cockpit_thread_turn_streams_reply_and_writes_lane1_attribution(tmp_path
     assert [message["peer_id"] for message in memory.messages] == ["neil", "jarvis"]
     assert memory.messages[0]["content"] == "What should we build first?"
     assert memory.messages[1]["content"] == "The route should stream over SSE."
+    assert memory.messages[0]["metadata"]["channel"] == "cockpit"
+    assert memory.messages[0]["metadata"]["device_id"] == "local-mac"
+    assert memory.messages[1]["metadata"]["channel"] == "cockpit"
+    assert memory.messages[1]["metadata"]["device_id"] == "local-mac"
     assert memory.messages[0]["session_id"].startswith("project:neil-shared:orchestrator:")
     system_prompt = gateway.messages[0][0]["content"]
     assert "Project registry entry" in system_prompt

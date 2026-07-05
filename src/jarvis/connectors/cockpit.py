@@ -201,7 +201,15 @@ class CockpitMemoryView:
             return self._project_context
         return self._backend.read_cached_representation(user)
 
-    async def write_turn(self, _user_text: str, _assistant_text: str, *, user: str | None = None) -> None:
+    async def write_turn(
+        self,
+        _user_text: str,
+        _assistant_text: str,
+        *,
+        user: str | None = None,
+        channel: str = "voice",
+        device_id: str | None = None,
+    ) -> None:
         return None
 
     async def refresh_cache(self, min_interval_s: float = 0.0, *, user: str | None = None) -> bool:
@@ -309,6 +317,7 @@ class CockpitConnector:
             self._persist_turn,
             thread.session_id,
             requester.memory_peer,
+            requester.device_id,
             text,
             reply,
         )
@@ -398,21 +407,31 @@ class CockpitConnector:
         self,
         session_id: str,
         requester_peer_id: str,
+        device_id: str | None,
         user_text: str,
         assistant_text: str,
     ) -> None:
+        self._memory.create_session(
+            session_id,
+            peers=[SessionPeer(peer_id=requester_peer_id, observe_me=True, observe_others=True)],
+        )
+        user_metadata = {"channel": "cockpit", "role": "user", "observed_at": utc_now()}
+        assistant_metadata = {"channel": "cockpit", "role": "assistant", "observed_at": utc_now()}
+        if device_id:
+            user_metadata["device_id"] = device_id
+            assistant_metadata["device_id"] = device_id
         self._memory.create_messages(
             session_id,
             [
                 MemoryMessage(
                     peer_id=requester_peer_id,
                     content=user_text,
-                    metadata={"channel": "cockpit", "role": "user", "observed_at": utc_now()},
+                    metadata=user_metadata,
                 ),
                 MemoryMessage(
                     peer_id=self._cfg.memory.assistant_peer_id,
                     content=assistant_text,
-                    metadata={"channel": "cockpit", "role": "assistant", "observed_at": utc_now()},
+                    metadata=assistant_metadata,
                 ),
             ],
         )

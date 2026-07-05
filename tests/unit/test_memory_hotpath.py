@@ -108,13 +108,23 @@ class _ColdMemory:
         self.error = error
         self.refresh_errors = dict(refresh_errors or {})
         self.calls: list[tuple] = []
+        self.write_turn_kwargs: list[dict[str, str | None]] = []
         self.created: list[dict] = []
 
     def read_cached_representation(self, user=None):  # noqa: ANN001
         return ""
 
-    async def write_turn(self, user_text, assistant_text, *, user=None) -> None:  # noqa: ANN001
+    async def write_turn(  # noqa: ANN001
+        self,
+        user_text,
+        assistant_text,
+        *,
+        user=None,
+        channel="voice",
+        device_id=None,
+    ) -> None:
         self.calls.append(("write_turn", user, user_text, assistant_text))
+        self.write_turn_kwargs.append({"channel": channel, "device_id": device_id})
 
     def queue_status(self) -> QueueStatus:
         self.calls.append(("queue_status",))
@@ -169,6 +179,8 @@ def _brain_with_memory(
     *,
     timeout_s: float = 0.05,
     tracer=None,  # noqa: ANN001
+    channel: str = "voice",
+    device_id: str = "dev",
 ) -> BrainSession:
     cfg = load_config()
     cfg.memory.deriver_idle_timeout_s = timeout_s
@@ -176,7 +188,7 @@ def _brain_with_memory(
     cfg.memory.curation_outbox_path = str(tmp_path / "outbox.jsonl")
     cfg.memory.curation_outbox_backoff_initial_s = 0
     cfg.memory.curation_outbox_backoff_max_s = 0
-    ctx = RequestContext("dev", "house", "house", frozenset(), channel="voice")
+    ctx = RequestContext(device_id, "house", "house", frozenset(), channel=channel)
     return BrainSession(
         cfg,
         ctx,
@@ -200,6 +212,15 @@ def test_cold_path_waits_for_idle_before_refreshing_requested_peers(tmp_path) ->
         ("refresh_cache", None, 30.0),
         ("refresh_cache", "project:jarvis", 0.0),
     ]
+
+
+def test_cold_path_forwards_channel_and_device_to_memory_write(tmp_path) -> None:
+    memory = _ColdMemory([QueueStatus()])
+    session = _brain_with_memory(memory, tmp_path, channel="whatsapp", device_id="whatsapp")
+
+    asyncio.run(session._cold_path("hello", "there"))
+
+    assert memory.write_turn_kwargs == [{"channel": "whatsapp", "device_id": "whatsapp"}]
 
 
 def test_cold_path_flushes_curation_outbox_before_deriver_wait(tmp_path) -> None:
