@@ -39,7 +39,7 @@ from jarvis.brain.dialog import (
 )
 from jarvis.brain.gateway_client import GatewayClient, LLMAttribution
 from jarvis.brain.memory_client import MemoryClient, UnsupportedMemoryOperation
-from jarvis.brain.memory_outbox import CurationOutbox
+from jarvis.brain.memory_outbox import ActiveRetraction, CurationOutbox, RetractionIndex, retraction_index_path
 from jarvis.brain.soul import read_soul
 from jarvis.users import format_facts, read_facts
 from jarvis.brain.tracing import Tracer
@@ -221,6 +221,14 @@ _BACKGROUND_FRAMING = (
 )
 
 
+def _format_withdrawn_records(title: str, records: list[ActiveRetraction]) -> str:
+    lines = [f"{title}:"]
+    for record in records:
+        suffix = f" (withdrawn {record.observed_at})" if record.observed_at else ""
+        lines.append(f"- {record.retracted_content}{suffix}")
+    return "\n".join(lines)
+
+
 
 
 def _make_heartbeat(sample_rate: int) -> bytes:
@@ -369,7 +377,7 @@ class BrainSession:
                 return
 
         model = self._initial_model(user_text)
-        memory, project_memory, active_project = self._read_ambient_memory()
+        memory, project_memory, active_project, withdrawn_memory = self._read_ambient_memory()
         messages = [
             {
                 "role": "system",
@@ -377,6 +385,7 @@ class BrainSession:
                     memory,
                     project_memory=project_memory,
                     active_project=active_project,
+                    withdrawn_memory=withdrawn_memory,
                 ),
             },
             *self._history,  # shared context: the conversation so far
@@ -483,7 +492,7 @@ class BrainSession:
         loop, so tools work in text mode — the harness can drive the browser, etc.
         Call finalize() afterwards for end-detection + memory, exactly like respond()."""
         model = self._initial_model(user_text)
-        memory, project_memory, active_project = self._read_ambient_memory()
+        memory, project_memory, active_project, withdrawn_memory = self._read_ambient_memory()
         messages = [
             {
                 "role": "system",
@@ -491,6 +500,7 @@ class BrainSession:
                     memory,
                     project_memory=project_memory,
                     active_project=active_project,
+                    withdrawn_memory=withdrawn_memory,
                 ),
             },
             *self._history,
@@ -517,12 +527,13 @@ class BrainSession:
         conversation history — its own ephemeral message list. Same `ctx` as the
         asker, so it runs with their capabilities and never more. Uses the strong
         model (off the hot path, quality over latency)."""
-        memory, project_memory, active_project = self._read_ambient_memory()
+        memory, project_memory, active_project, withdrawn_memory = self._read_ambient_memory()
         system_prompt = self._system_prompt(
             memory,
             include_voice_controls=False,
             project_memory=project_memory,
             active_project=active_project,
+            withdrawn_memory=withdrawn_memory,
         )
         messages = [
             {"role": "system", "content": f"{system_prompt}\n\n{_BACKGROUND_FRAMING}"},
@@ -577,6 +588,7 @@ class BrainSession:
         include_voice_controls: bool = True,
         project_memory: str = "",
         active_project: Any | None = None,
+        withdrawn_memory: str = "",
     ) -> str:
         """Soul (who Jarvis is) + format + memory (what he knows about you)."""
         memory = self._with_pending_memory_lines(memory)
@@ -662,6 +674,12 @@ class BrainSession:
                 "Facts the user has asked you to remember (authoritative — trust these "
                 f"over anything fuzzier):\n{facts}"
             )
+        if withdrawn_memory:
+            parts.append(
+                "Withdrawn memory (authoritative — the user has retracted these "
+                "and they must NOT be treated as current):\n"
+                f"{withdrawn_memory}"
+            )
         if memory:
             parts.append(
                 "What you already know about the user (use it naturally only if "
@@ -690,18 +708,36 @@ class BrainSession:
             return memory
         return self._curation_outbox().append_pending_lines(memory, observed_id=peer_id)
 
-    def _read_ambient_memory(self) -> tuple[str, str, Any | None]:
+    def _read_ambient_memory(self) -> tuple[str, str, Any | None, str]:
         active_project = self._active_project()
+        withdrawn_memory = self._read_ambient_retractions(active_project)
         if self._memory is None:
-            return "", "", active_project
+            return "", "", active_project, withdrawn_memory
         personal = self._memory.read_cached_representation(self._memory_user)
         if active_project is None:
-            return personal, "", None
+            return personal, "", None, withdrawn_memory
         project_peer = getattr(active_project, "peer_id", "")
         project_memory = (
             self._memory.read_cached_representation(project_peer) if project_peer else ""
         )
-        return personal, project_memory, active_project
+        return personal, project_memory, active_project, withdrawn_memory
+
+    def _read_ambient_retractions(self, active_project: Any | None) -> str:
+        index = RetractionIndex(retraction_index_path(self._cfg.memory.curation_outbox_path))
+        sections: list[str] = []
+        personal_peer = self._memory_user or self._ctx.memory_peer
+        if personal_peer:
+            records = index.active(observed_id=personal_peer)
+            if records:
+                sections.append(_format_withdrawn_records("User memory withdrawals", records))
+        if active_project is not None:
+            project_peer = getattr(active_project, "peer_id", "")
+            if project_peer and project_peer != personal_peer:
+                records = index.active(observed_id=project_peer)
+                if records:
+                    project_name = getattr(active_project, "name", project_peer)
+                    sections.append(_format_withdrawn_records(f"Project memory withdrawals for {project_name}", records))
+        return "\n".join(sections)
 
     def _active_project(self) -> Any | None:
         if self._active_project_getter is None:

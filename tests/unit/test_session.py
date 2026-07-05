@@ -13,6 +13,7 @@ from datetime import datetime
 from jarvis.brain.dialog import _relative_date_map
 from jarvis.brain.context import RequestContext
 from jarvis.brain.contexts import ActiveProject
+from jarvis.brain.memory_outbox import RetractionIndex, retraction_index_path
 from jarvis.brain.session import BrainSession, TurnResult, _now_line
 from jarvis.config import load_config
 from jarvis.tools.base import ToolRegistry
@@ -231,6 +232,88 @@ def test_ambient_prompt_includes_active_project_cached_representation(tmp_path) 
     assert "Active project context for Jarvis (project:jarvis)" in prompt
     assert "shared project memory, not the user's personal memory" in prompt
     assert "Jarvis project uses cached memory only." in prompt
+    assert memory.reads == ["neil", "project:jarvis"]
+    assert memory.refreshes == []
+
+
+def test_ambient_prompt_includes_withdrawn_memory_and_clears_after_reassertion(tmp_path) -> None:
+    memory = _CachedMemory()
+    gateway = _PromptGateway()
+    cfg = load_config()
+    cfg.memory.curation_outbox_path = str(tmp_path / "outbox.jsonl")
+    index = RetractionIndex(retraction_index_path(cfg.memory.curation_outbox_path))
+    index.record(
+        observed_id="neil",
+        metadata={
+            "recorded_by": "neil",
+            "observed_at": "2026-07-05",
+            "retracted_conclusion_id": "c1",
+            "retracted_conclusion_level": "deductive",
+            "retracted_content": "Neil keeps a vintage Leica.",
+            "retraction_reason": "user_forget_request",
+        },
+    )
+    sess = BrainSession(
+        cfg,
+        RequestContext("dev", "neil", "personal", frozenset(), channel="text", peer="neil"),
+        gateway=gateway,
+        tts=None,
+        memory=memory,
+        tracer=None,
+        registry=ToolRegistry(),
+        memory_user="neil",
+    )
+
+    asyncio.run(sess.respond_text("status", None, TurnResult()))
+    index.clear_for_assertion(observed_id="neil", content="Neil keeps a vintage Leica.")
+    asyncio.run(sess.respond_text("status", None, TurnResult()))
+
+    first, second = gateway.system_prompts
+    assert "Withdrawn memory" in first
+    assert "must NOT be treated as current" in first
+    assert "Neil keeps a vintage Leica." in first
+    assert "What you already know about the user" in first
+    assert "Withdrawn memory" not in second
+    assert "Neil keeps a vintage Leica." not in second
+    assert memory.reads == ["neil", "neil"]
+    assert memory.refreshes == []
+
+
+def test_ambient_prompt_includes_active_project_withdrawals_from_local_index(tmp_path) -> None:
+    active = ActiveProject(id="jarvis", name="Jarvis", peer_id="project:jarvis")
+    memory = _CachedMemory()
+    gateway = _PromptGateway()
+    cfg = load_config()
+    cfg.memory.curation_outbox_path = str(tmp_path / "outbox.jsonl")
+    RetractionIndex(retraction_index_path(cfg.memory.curation_outbox_path)).record(
+        observed_id="project:jarvis",
+        metadata={
+            "recorded_by": "neil",
+            "observed_at": "2026-07-05",
+            "retracted_conclusion_id": "p1",
+            "retracted_conclusion_level": "inductive",
+            "retracted_content": "Jarvis uses remote memory on the hot path.",
+            "retraction_reason": "user_forget_request",
+        },
+    )
+    sess = BrainSession(
+        cfg,
+        RequestContext("dev", "neil", "personal", frozenset(), channel="text", peer="neil"),
+        gateway=gateway,
+        tts=None,
+        memory=memory,
+        tracer=None,
+        registry=ToolRegistry(),
+        memory_user="neil",
+        active_project_getter=lambda: active,
+    )
+
+    asyncio.run(sess.respond_text("status", None, TurnResult()))
+
+    prompt = gateway.system_prompts[-1]
+    assert "Project memory withdrawals for Jarvis" in prompt
+    assert "Jarvis uses remote memory on the hot path." in prompt
+    assert "Active project context for Jarvis (project:jarvis)" in prompt
     assert memory.reads == ["neil", "project:jarvis"]
     assert memory.refreshes == []
 
