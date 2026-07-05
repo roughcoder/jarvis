@@ -100,6 +100,7 @@ class FakeMemory:
             content=content,
             observer_id=record["observer_id"],
             observed_id=observed_id,
+            level=record["metadata"].get("level", "explicit"),
             metadata=record["metadata"],
         )
         if self.fail_after_create:
@@ -122,6 +123,7 @@ class FakeMemory:
                 content=row["content"],
                 observer_id=row["observer_id"],
                 observed_id=row["observed_id"],
+                level=row["metadata"].get("level", "explicit"),
                 metadata=row["metadata"],
             )
             for i, row in enumerate(self.created, start=1)
@@ -441,9 +443,157 @@ def test_forget_and_correct_confirmation_roundtrip(tmp_path) -> None:
     )
 
     assert "confirmation required" in ask and "c1: Klaus works Fridays." in ask
-    assert done.startswith("Noted")
+    assert done == "Corrected."
     pending = outbox.pending_entries()
     assert [entry.operation for entry in pending] == ["delete_conclusion", "create_conclusion"]
+
+
+def test_forget_derived_conclusion_queues_contradiction_retraction(tmp_path) -> None:
+    backend = FakeMemory()
+    backend.query_matches = [
+        ConclusionRecord(
+            id="c1",
+            content="Klaus works Fridays.",
+            observer_id="neil",
+            observed_id="contact:klaus",
+            level="deductive",
+        )
+    ]
+    cfg = _memory_cfg(tmp_path)
+    outbox = CurationOutbox(cfg.curation_outbox_path)
+    tool = {
+        tool.name: tool
+        for tool in make_memory_tools(
+            cfg,
+            memory=backend,
+            outbox=outbox,
+            registry=_registry(tmp_path),
+        )
+    }["forget_memory"]
+
+    result = asyncio.run(
+        tool.handler(
+            _ctx("memory.curate"),
+            {
+                "target": "Klaus",
+                "query": "Fridays",
+                "confirm": True,
+                "conclusion_ids": ["c1"],
+            },
+        )
+    )
+    pending = outbox.pending_entries(observed_id="contact:klaus")
+    flushed = outbox.flush_sync(backend)
+
+    assert result == "Forgotten."
+    assert [entry.operation for entry in pending] == ["delete_conclusion", "create_conclusion"]
+    retraction = pending[1]
+    assert retraction.metadata is not None
+    assert retraction.metadata["level"] == "contradiction"
+    assert retraction.metadata["source"] == "forget"
+    assert retraction.metadata["recorded_by"] == "neil"
+    assert retraction.metadata["observed_at"]
+    assert retraction.metadata["retracted_conclusion_id"] == "c1"
+    assert retraction.metadata["retracted_conclusion_level"] == "deductive"
+    assert retraction.metadata["retracted_content"] == "Klaus works Fridays."
+    assert "does not want it retained as current" in retraction.content
+    assert flushed == {"delivered": 2, "failed": 0}
+    assert backend.deleted == ["c1"]
+    assert backend.created[0]["metadata"]["level"] == "contradiction"
+
+
+def test_forget_declared_conclusion_deletes_without_retraction(tmp_path) -> None:
+    backend = FakeMemory()
+    backend.query_matches = [
+        ConclusionRecord(
+            id="c1",
+            content="Klaus works Fridays.",
+            observer_id="neil",
+            observed_id="contact:klaus",
+            level="explicit",
+        )
+    ]
+    cfg = _memory_cfg(tmp_path)
+    outbox = CurationOutbox(cfg.curation_outbox_path)
+    tool = {
+        tool.name: tool
+        for tool in make_memory_tools(
+            cfg,
+            memory=backend,
+            outbox=outbox,
+            registry=_registry(tmp_path),
+        )
+    }["forget_memory"]
+
+    result = asyncio.run(
+        tool.handler(
+            _ctx("memory.curate"),
+            {
+                "target": "Klaus",
+                "query": "Fridays",
+                "confirm": True,
+                "conclusion_ids": ["c1"],
+            },
+        )
+    )
+    pending = outbox.pending_entries(observed_id="contact:klaus")
+    flushed = outbox.flush_sync(backend)
+
+    assert result == "Forgotten."
+    assert [entry.operation for entry in pending] == ["delete_conclusion"]
+    assert flushed == {"delivered": 1, "failed": 0}
+    assert backend.deleted == ["c1"]
+    assert backend.created == []
+
+
+def test_correct_derived_conclusion_retracts_then_writes_replacement(tmp_path) -> None:
+    backend = FakeMemory()
+    backend.query_matches = [
+        ConclusionRecord(
+            id="c1",
+            content="Klaus works Fridays.",
+            observer_id="neil",
+            observed_id="contact:klaus",
+            level="inductive",
+        )
+    ]
+    cfg = _memory_cfg(tmp_path)
+    outbox = CurationOutbox(cfg.curation_outbox_path)
+    tool = {
+        tool.name: tool
+        for tool in make_memory_tools(
+            cfg,
+            memory=backend,
+            outbox=outbox,
+            registry=_registry(tmp_path),
+        )
+    }["correct_memory"]
+
+    result = asyncio.run(
+        tool.handler(
+            _ctx("memory.curate"),
+            {
+                "target": "Klaus",
+                "query": "Fridays",
+                "replacement": "Klaus is off Fridays.",
+                "confirm": True,
+                "conclusion_ids": ["c1"],
+            },
+        )
+    )
+    pending = outbox.pending_entries(observed_id="contact:klaus")
+
+    assert result == "Corrected."
+    assert [entry.operation for entry in pending] == [
+        "delete_conclusion",
+        "create_conclusion",
+        "create_conclusion",
+    ]
+    assert pending[1].metadata is not None
+    assert pending[1].metadata["level"] == "contradiction"
+    assert pending[2].content == "Klaus is off Fridays."
+    assert pending[2].metadata is not None
+    assert pending[2].metadata.get("level") is None
 
 
 def test_forget_pending_memory_cancels_outbox_entry_before_flush(tmp_path) -> None:
@@ -474,7 +624,7 @@ def test_forget_pending_memory_cancels_outbox_entry_before_flush(tmp_path) -> No
     )
     flushed = outbox.flush_sync(backend)
 
-    assert result == "Noted - cancelled pending memory."
+    assert result == "Forgotten."
     assert outbox.pending_lines(observed_id="contact:klaus") == []
     assert flushed == {"delivered": 0, "failed": 0}
     assert backend.created == []
@@ -513,7 +663,7 @@ def test_correct_pending_memory_replaces_outbox_entry_before_flush(tmp_path) -> 
     pending = outbox.pending_entries(observed_id="contact:klaus")
     flushed = outbox.flush_sync(backend)
 
-    assert result == "Noted - replaced pending memory."
+    assert result == "Corrected."
     assert [entry.content for entry in pending] == ["Klaus is off Fridays."]
     assert flushed == {"delivered": 1, "failed": 0}
     assert [row["content"] for row in backend.created] == ["Klaus is off Fridays."]
@@ -569,4 +719,5 @@ def test_memory_search_queries_live_when_backend_available(tmp_path) -> None:
         tool.handler(_ctx("memory.query"), {"target": "Klaus", "search_query": "Fridays?"})
     )
 
-    assert result == "answer: Fridays?"
+    assert "contradiction or retraction conclusions are authoritative" in result
+    assert "answer: Fridays?" in result
