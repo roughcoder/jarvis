@@ -614,6 +614,22 @@ class MCPConfig(_Base):
     oauth_redirect_port: int = 41760
 
 
+class MCPServeConfig(_Base):
+    """Jarvis-as-MCP-server lane.
+
+    External agents connect to this boundary peer with per-principal bearer
+    tokens. The server maps the token to a real user profile, builds that
+    principal's RequestContext, and then uses the shared brain/tool interfaces.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="MCP_SERVE_", env_file=".env", extra="ignore")
+
+    host: str = "localhost"
+    port: int = 8795
+    bind_host: str = ""
+    token_store_path: str = "jarvis-workspace/.mcp-server/tokens.json"
+
+
 class GoogleConfig(_Base):
     """Current email/calendar adapter (Phase 3 §6): Jarvis's OWN Gmail + Calendar
     house account, via the `gogcli` CLI. The registered tool capabilities are
@@ -815,6 +831,7 @@ class Config:
         self.worker = WorkerConfig(**source)
         self.remote = RemoteConfig(**source)
         self.mcp = MCPConfig(**source)
+        self.mcp_serve = MCPServeConfig(**source)
         self.heartbeat = HeartbeatConfig(**source)
         self.background = BackgroundConfig(**source)
         self.notify = NotifyConfig(**source)
@@ -840,6 +857,10 @@ class Config:
         )
         self.capabilities.users_dir = _resolve_state_path(self.capabilities.users_dir, base_dir)
         self.registry.path = _resolve_state_path(self.registry.path, base_dir)
+        self.mcp_serve.token_store_path = _resolve_state_path(
+            self.mcp_serve.token_store_path,
+            base_dir,
+        )
         self.orchestration.workspace = _resolve_state_path(
             self.orchestration.workspace, base_dir
         )
@@ -966,6 +987,10 @@ class Config:
                 or "<none>"
             ),
             "mcp.call_timeout_s": self.mcp.call_timeout_s,
+            "mcp_serve.host": self.mcp_serve.host,
+            "mcp_serve.port": self.mcp_serve.port,
+            "mcp_serve.bind_host": self.mcp_serve.bind_host or "<auto>",
+            "mcp_serve.token_store_path": self.mcp_serve.token_store_path,
             "heartbeat.enabled": self.heartbeat.enabled,
             "heartbeat.interval_s": self.heartbeat.interval_s,
             "background.enabled": self.background.enabled,

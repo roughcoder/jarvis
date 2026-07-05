@@ -116,6 +116,7 @@ Secrets to put in `.env` (gitignored): `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
 | `jarvis remote-setup` | one-time: create the cloud agent + environment for the (dormant) remote lane |
 | `jarvis mcp` | probe configured MCP servers: discover their tools + the capability each needs |
 | `jarvis mcp login [--server N] [--user U]` | one-time interactive OAuth for http MCP servers (browser); tokens cached per user |
+| `jarvis mcp-serve` | expose Jarvis as an MCP server for external agents with per-principal tokens |
 | `jarvis traces [-n N]` | view per-turn pipeline timings |
 
 Phase 3 (see `docs/PHASE3.md`) split the loop into a **brain server** + thin

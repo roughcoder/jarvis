@@ -1667,6 +1667,110 @@ def _cmd_mcp_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_mcp_serve(args: argparse.Namespace) -> int:
+    action = getattr(args, "mcp_serve_action", "serve")
+    if action == "add-token":
+        return _cmd_mcp_serve_add_token(args)
+    if action == "list-tokens":
+        return _cmd_mcp_serve_list_tokens(args)
+    if action == "revoke-token":
+        return _cmd_mcp_serve_revoke_token(args)
+    return _cmd_mcp_serve_run(args)
+
+
+def _cmd_mcp_serve_add_token(args: argparse.Namespace) -> int:
+    from jarvis.mcp_server.tokens import MCPTokenStore
+    from jarvis.users import load_users
+
+    cfg = load_config()
+    principal = args.principal.strip()
+    if not principal:
+        print("--principal is required.")
+        return 1
+    if principal not in load_users(cfg.capabilities.users_dir):
+        print(
+            f"Unknown principal {principal!r}. MCP tokens must map to a real "
+            f"user profile under {cfg.capabilities.users_dir}."
+        )
+        return 1
+    token, record = MCPTokenStore(cfg.mcp_serve.token_store_path).add(
+        principal=principal,
+        name=args.name,
+    )
+    print(f"Created MCP token {record.token_id} for {record.principal}.")
+    print(token)
+    return 0
+
+
+def _cmd_mcp_serve_list_tokens(args: argparse.Namespace) -> int:
+    import json
+
+    from jarvis.mcp_server.tokens import MCPTokenStore
+
+    cfg = load_config()
+    records = MCPTokenStore(cfg.mcp_serve.token_store_path).list(
+        include_revoked=args.include_revoked,
+    )
+    if args.json:
+        print(json.dumps([record.as_dict() for record in records], indent=2))
+        return 0
+    if not records:
+        print("No MCP server tokens.")
+        return 0
+    for record in records:
+        state = "revoked" if record.revoked else "active"
+        name = f" {record.name}" if record.name else ""
+        print(
+            f"{record.token_id:<28} {state:<8} {record.principal:<16} "
+            f"{record.token_prefix}...{name}"
+        )
+    return 0
+
+
+def _cmd_mcp_serve_revoke_token(args: argparse.Namespace) -> int:
+    from jarvis.mcp_server.tokens import MCPTokenError, MCPTokenStore
+
+    cfg = load_config()
+    try:
+        record = MCPTokenStore(cfg.mcp_serve.token_store_path).revoke(args.token_id)
+    except MCPTokenError as exc:
+        print(str(exc))
+        return 1
+    print(f"Revoked MCP token {record.token_id} for {record.principal}.")
+    return 0
+
+
+def _cmd_mcp_serve_run(args: argparse.Namespace) -> int:
+    from jarvis.mcp_server.adapters import MCPAccessError
+    from jarvis.mcp_server.server import run_http, run_stdio
+
+    cfg = load_config()
+    transport = args.transport
+    try:
+        if transport == "stdio":
+            token = args.token or os.environ.get("JARVIS_MCP_TOKEN", "")
+            if not token:
+                print("stdio MCP serving requires --token or JARVIS_MCP_TOKEN.")
+                return 1
+            run_stdio(cfg, token=token)
+            return 0
+        if args.host:
+            cfg.mcp_serve.host = args.host
+        if args.port:
+            cfg.mcp_serve.port = int(args.port)
+        print(f"Serving Jarvis MCP over streamable HTTP at http://{cfg.mcp_serve.host}:{cfg.mcp_serve.port}/mcp")
+        print("Every request must include Authorization: Bearer <mcp-server-token>.")
+        run_http(cfg)
+        return 0
+    except MCPAccessError as exc:
+        print(f"MCP server auth failed: {exc}")
+        return 1
+    except ImportError as exc:
+        print(f"MCP server dependencies are not installed: {exc}")
+        print("Install with: uv sync --extra mcp")
+        return 1
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     """Device lifecycle (§3): is the brain reachable, and what is THIS device allowed
     to do? Pairs like an intercom (device id + token) and prints the Welcome."""
@@ -2388,6 +2492,46 @@ def build_parser() -> argparse.ArgumentParser:
         "--user", default="", help="principal whose credentials to use (default: house)"
     )
     p_mcp.set_defaults(func=_cmd_mcp)
+
+    p_mcp_serve = sub.add_parser(
+        "mcp-serve",
+        help="Expose Jarvis brain powers as an MCP server with per-principal tokens",
+    )
+    mcp_serve_sub = p_mcp_serve.add_subparsers(dest="mcp_serve_action", required=False)
+    p_mcp_serve_run = mcp_serve_sub.add_parser("serve", help="Run the MCP server")
+    p_mcp_serve_run.add_argument(
+        "--transport",
+        choices=["http", "stdio"],
+        default="http",
+        help="http = streamable HTTP on /mcp; stdio = one token-bound principal",
+    )
+    p_mcp_serve_run.add_argument("--host", default="", help="HTTP host override")
+    p_mcp_serve_run.add_argument("--port", type=int, default=0, help="HTTP port override")
+    p_mcp_serve_run.add_argument(
+        "--token",
+        default="",
+        help="stdio token; prefer JARVIS_MCP_TOKEN to avoid shell history",
+    )
+    p_mcp_serve_add = mcp_serve_sub.add_parser("add-token", help="Create a revocable MCP bearer token")
+    p_mcp_serve_add.add_argument("--principal", required=True, help="User profile principal")
+    p_mcp_serve_add.add_argument("--name", default="", help="Operator label for this token")
+    p_mcp_serve_list = mcp_serve_sub.add_parser("list-tokens", help="List MCP server tokens")
+    p_mcp_serve_list.add_argument("--include-revoked", action="store_true")
+    p_mcp_serve_list.add_argument("--json", action="store_true")
+    p_mcp_serve_revoke = mcp_serve_sub.add_parser("revoke-token", help="Revoke an MCP server token")
+    p_mcp_serve_revoke.add_argument("token_id", help="Token id or unique prefix")
+    p_mcp_serve.set_defaults(
+        func=_cmd_mcp_serve,
+        mcp_serve_action="serve",
+        transport="http",
+        host="",
+        port=0,
+        token="",
+    )
+    p_mcp_serve_run.set_defaults(func=_cmd_mcp_serve, mcp_serve_action="serve")
+    p_mcp_serve_add.set_defaults(func=_cmd_mcp_serve, mcp_serve_action="add-token")
+    p_mcp_serve_list.set_defaults(func=_cmd_mcp_serve, mcp_serve_action="list-tokens")
+    p_mcp_serve_revoke.set_defaults(func=_cmd_mcp_serve, mcp_serve_action="revoke-token")
 
     p_jobs = sub.add_parser("jobs", help="List the worker's recent jobs + results")
     p_jobs.add_argument("-n", type=int, default=20, help="How many recent jobs")
