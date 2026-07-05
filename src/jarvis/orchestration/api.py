@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hmac
 import json
@@ -12,6 +13,8 @@ import httpx
 from aiohttp import web
 
 from jarvis.brain.memory_client import ConclusionRecord, MemoryClient, UnsupportedMemoryOperation
+from jarvis.brain.memory_outbox import CurationOutbox
+from jarvis.brain.project_management import BrainProjectClient, ProjectOperationError
 from jarvis.brain.registry import ProjectEntry, RegistryStore
 from jarvis.capabilities import (
     WORKER_SESSION_APPROVE,
@@ -61,7 +64,14 @@ from jarvis.orchestration.cockpit import (
     worker_profiles,
     _cursor_worker,
 )
-from jarvis.brain.capabilities import RequestContext, can_query_memory_peer, context_for_resolution, resolve_capabilities
+from jarvis.brain.capabilities import (
+    RequestContext,
+    can_admin_project,
+    can_edit_project,
+    can_query_memory_peer,
+    context_for_resolution,
+    resolve_capabilities,
+)
 from jarvis.brain.identity import Resolution, load_users
 from jarvis.orchestration.authority import allowed
 from jarvis.orchestration.intent import parse_work_command
@@ -415,7 +425,10 @@ def make_app(
         oauth_validator=validator,
     )
     _rebuild_session_ref_index_from_store(ctx.store)
-    app = web.Application(middlewares=[_cors_middleware, _error_middleware])
+    app = web.Application(
+        middlewares=[_cors_middleware, _error_middleware],
+        client_max_size=max(1024 * 1024, int(cfg.registry.max_upload_bytes) + 1024 * 1024),
+    )
     app[CONFIG_KEY] = cfg
     reads = CockpitReadHandlers(ctx)
     writes = CockpitWriteHandlers(ctx)
@@ -430,7 +443,9 @@ def make_app(
         web.get("/v1/cockpit/snapshot", reads.snapshot),
         web.get("/v1/cockpit/events", sse.events),
         web.get("/v1/projects", reads.projects),
+        web.post("/v1/projects", writes.project_create),
         web.get("/v1/projects/{project_id}/threads", reads.project_threads),
+        web.get("/v1/projects/{project_id}/files", reads.project_files),
         web.get("/v1/projects/{project_id}/memory", reads.project_memory),
         web.get("/v1/projects/{project_id}", reads.project_detail),
         web.get("/v1/workers", reads.workers),
@@ -448,6 +463,19 @@ def make_app(
         web.post("/v1/sessions/{session_ref}/checkpoints/restore", writes.session_write, name="restore_checkpoint"),
         web.post("/v1/sessions/{session_ref}/{action:turns|input|approval|interrupt|stop}", writes.session_write),
         web.get("/v1/sessions/{session_ref}", reads.session_detail),
+        web.patch("/v1/projects/{project_id}", writes.project_update),
+        web.patch("/v1/projects/{project_id}/visibility", writes.project_visibility),
+        web.post("/v1/projects/{project_id}/members", writes.project_member_add),
+        web.delete("/v1/projects/{project_id}/members/{member_id}", writes.project_member_remove),
+        web.post("/v1/projects/{project_id}/archive", writes.project_archive),
+        web.post("/v1/projects/{project_id}/unarchive", writes.project_unarchive),
+        web.delete("/v1/projects/{project_id}", writes.project_delete),
+        web.post("/v1/projects/{project_id}/findings", writes.project_finding),
+        web.post("/v1/projects/{project_id}/decisions", writes.project_decision),
+        web.post("/v1/projects/{project_id}/memory/forget", writes.project_memory_forget),
+        web.post("/v1/projects/{project_id}/memory/correct", writes.project_memory_correct),
+        web.post("/v1/projects/{project_id}/files", writes.project_file_upload),
+        web.delete("/v1/projects/{project_id}/files/{doc_id}", writes.project_file_retract),
         web.post("/v1/projects/{project_id}/threads", writes.project_thread_open),
         web.post("/v1/projects/{project_id}/threads/{thread_id}/turns", writes.project_thread_turn),
         web.post("/v1/work/start", writes.work_start),
@@ -577,6 +605,21 @@ class CockpitReadHandlers:
                 "conclusions": conclusions,
             }
         )
+
+    async def project_files(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        result = await _project_brain_write(
+            self.ctx,
+            requester,
+            "project.file.list",
+            {
+                "project_id": request.match_info["project_id"],
+                "include_retracted": str(request.query.get("include_retracted") or "").lower()
+                in {"1", "true", "yes"},
+            },
+        )
+        return _project_write_response(result)
 
     async def project_threads(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -760,6 +803,175 @@ class CockpitReadHandlers:
 class CockpitWriteHandlers:
     def __init__(self, ctx: CockpitAppContext) -> None:
         self.ctx = ctx
+
+    async def project_create(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_401(request, self.ctx.cfg)
+        body = await _json_body(request)
+        result = await _project_brain_write(self.ctx, requester, "project.create", body)
+        return _project_write_response(result)
+
+    async def project_update(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        body = await _json_body(request)
+        body["project_id"] = request.match_info["project_id"]
+        result = await _project_brain_write(self.ctx, requester, "project.update", body)
+        return _project_write_response(result)
+
+    async def project_visibility(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        body = await _json_body(request)
+        result = await _project_brain_write(
+            self.ctx,
+            requester,
+            "project.visibility.set",
+            {"project_id": request.match_info["project_id"], "visibility": body.get("visibility")},
+        )
+        return _project_write_response(result)
+
+    async def project_member_add(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        body = await _json_body(request)
+        project = await _project_for_owner_route(self.ctx, request, requester)
+        new_members = _members_from_body(body)
+        members = _unique_member_list([*project.members, *new_members])
+        result = await _project_brain_write(
+            self.ctx,
+            requester,
+            "project.members.set",
+            {"project_id": project.id, "members": members},
+        )
+        return _project_write_response(result)
+
+    async def project_member_remove(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        project = await _project_for_owner_route(self.ctx, request, requester)
+        member = request.match_info["member_id"]
+        members = [item for item in project.members if item != member]
+        result = await _project_brain_write(
+            self.ctx,
+            requester,
+            "project.members.set",
+            {"project_id": project.id, "members": members},
+        )
+        return _project_write_response(result)
+
+    async def project_archive(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        result = await _project_brain_write(
+            self.ctx,
+            requester,
+            "project.archive",
+            {"project_id": request.match_info["project_id"], "archived": True},
+        )
+        return _project_write_response(result)
+
+    async def project_unarchive(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        result = await _project_brain_write(
+            self.ctx,
+            requester,
+            "project.archive",
+            {"project_id": request.match_info["project_id"], "archived": False},
+        )
+        return _project_write_response(result)
+
+    async def project_delete(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        result = await _project_brain_write(
+            self.ctx,
+            requester,
+            "project.delete",
+            {"project_id": request.match_info["project_id"]},
+        )
+        return _project_write_response(result)
+
+    async def project_finding(self, request: web.Request) -> web.Response:
+        return await self._project_artifact(request, artifact_type="finding")
+
+    async def project_decision(self, request: web.Request) -> web.Response:
+        return await self._project_artifact(request, artifact_type="decision")
+
+    async def _project_artifact(self, request: web.Request, *, artifact_type: str) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        body = await _json_body(request)
+        project = await _project_for_member_route(self.ctx, request, requester)
+        content = str(body.get("content") or body.get(artifact_type) or "").strip()
+        if not content:
+            raise CockpitError("validation_failed", f"{artifact_type} content is required", status=400, recoverable=True)
+        status = str(body.get("status") or ("accepted" if artifact_type == "decision" else "open")).strip()
+        queued = _curation_outbox(self.ctx.cfg).enqueue_create(
+            observed_id=project.peer_id,
+            observer_id=requester.memory_peer,
+            content=content,
+            metadata={
+                "project_id": project.id,
+                "artifact_type": artifact_type,
+                "recorded_by": requester.memory_peer,
+                "source": "cockpit",
+                "channel": "cockpit",
+                "status": status,
+                "observed_at": str(body.get("observed_at") or utc_now()),
+            },
+        )
+        return web.json_response(
+            {
+                "ok": True,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "project_id": project.id,
+                "content_hash": queued.content_hash,
+            }
+        )
+
+    async def project_memory_forget(self, request: web.Request) -> web.Response:
+        return await self._project_memory_op(request, op="project.memory.forget")
+
+    async def project_memory_correct(self, request: web.Request) -> web.Response:
+        return await self._project_memory_op(request, op="project.memory.correct")
+
+    async def _project_memory_op(self, request: web.Request, *, op: str) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        body = await _json_body(request)
+        body["project_id"] = request.match_info["project_id"]
+        body["channel"] = "cockpit"
+        body["source"] = "cockpit"
+        result = await _project_brain_write(
+            self.ctx,
+            requester,
+            op,
+            body,
+        )
+        return _project_write_response(result)
+
+    async def project_file_upload(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        payload = await _multipart_upload_payload(request)
+        payload["project_id"] = request.match_info["project_id"]
+        payload["channel"] = "cockpit"
+        result = await _project_brain_write(self.ctx, requester, "project.file.upload", payload)
+        return _project_write_response(result)
+
+    async def project_file_retract(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        result = await _project_brain_write(
+            self.ctx,
+            requester,
+            "project.file.retract",
+            {"project_id": request.match_info["project_id"], "doc_id": request.match_info["doc_id"]},
+        )
+        return _project_write_response(result)
 
     async def project_thread_open(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -1081,7 +1293,7 @@ def _apply_cors_headers(request: web.Request, response: web.StreamResponse) -> N
         return
     response.headers["Access-Control-Allow-Origin"] = origin
     response.headers["Vary"] = _append_vary(response.headers.get("Vary", ""), "Origin")
-    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,PATCH,DELETE,OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Authorization,Content-Type,Last-Event-ID"
     response.headers["Access-Control-Expose-Headers"] = "Content-Type"
     response.headers["Access-Control-Max-Age"] = "600"
@@ -1576,6 +1788,156 @@ def _cockpit_requester_context(
         channel="cockpit",
         peer=identity,
     )
+
+
+def _requester_or_401(request: web.Request, cfg: Config) -> RequestContext:
+    requester = _cockpit_requester_context(request, cfg)
+    if requester is None:
+        raise CockpitError("unauthorized", "unauthorized", status=401)
+    return requester
+
+
+def _requester_or_404(request: web.Request, cfg: Config) -> RequestContext:
+    requester = _cockpit_requester_context(request, cfg)
+    if requester is None:
+        raise CockpitError("not_found", "project not found", status=404)
+    return requester
+
+
+async def _project_brain_write(
+    ctx: CockpitAppContext,
+    requester: RequestContext,
+    op: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return await _project_brain_client(ctx).execute(requester, op, payload)
+    except ProjectOperationError as exc:
+        raise CockpitError(
+            exc.code,
+            str(exc),
+            recoverable=exc.recoverable,
+            status=exc.status,
+        ) from exc
+    except (TimeoutError, OSError, RuntimeError) as exc:
+        raise CockpitError(
+            "brain_unavailable",
+            public_error_message(str(exc)),
+            recoverable=True,
+            status=502,
+        ) from exc
+
+
+def _project_brain_client(ctx: CockpitAppContext) -> BrainProjectClient:
+    return BrainProjectClient(ctx.cfg)
+
+
+def _project_write_response(result: dict[str, Any]) -> web.Response:
+    return web.json_response(
+        {
+            "ok": True,
+            "api_version": API_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            **result,
+        }
+    )
+
+
+async def _project_for_member_route(
+    ctx: CockpitAppContext,
+    request: web.Request,
+    requester: RequestContext,
+) -> ProjectEntry:
+    registry = await asyncio.to_thread(_registry_store, ctx.cfg)
+    project = await asyncio.to_thread(
+        _visible_project_or_404,
+        registry,
+        request.match_info["project_id"],
+        requester,
+    )
+    if project is None:
+        raise CockpitError("not_found", "project not found", status=404)
+    decision = can_edit_project(requester, project)
+    if not decision.allowed:
+        raise CockpitError("not_found", "project not found", status=404)
+    return project
+
+
+async def _project_for_owner_route(
+    ctx: CockpitAppContext,
+    request: web.Request,
+    requester: RequestContext,
+) -> ProjectEntry:
+    registry = await asyncio.to_thread(_registry_store, ctx.cfg)
+    project = await asyncio.to_thread(
+        _visible_project_or_404,
+        registry,
+        request.match_info["project_id"],
+        requester,
+    )
+    if project is None:
+        raise CockpitError("not_found", "project not found", status=404)
+    if not can_edit_project(requester, project).allowed:
+        raise CockpitError("not_found", "project not found", status=404)
+    if not can_admin_project(requester, project).allowed:
+        raise CockpitError("forbidden", "project owner required", status=403)
+    return project
+
+
+def _curation_outbox(cfg: Config) -> CurationOutbox:
+    return CurationOutbox(
+        cfg.memory.curation_outbox_path,
+        max_retries=cfg.memory.curation_outbox_max_retries,
+        backoff_initial_s=cfg.memory.curation_outbox_backoff_initial_s,
+        backoff_max_s=cfg.memory.curation_outbox_backoff_max_s,
+    )
+
+
+async def _multipart_upload_payload(request: web.Request) -> dict[str, Any]:
+    if not request.content_type.startswith("multipart/"):
+        raise CockpitError("validation_failed", "file upload must be multipart/form-data", status=400, recoverable=True)
+    reader = await request.multipart()
+    payload: dict[str, Any] = {}
+    file_seen = False
+    async for part in reader:
+        if part.name == "file":
+            data = await part.read(decode=False)
+            if not data:
+                raise CockpitError("validation_failed", "uploaded file is empty", status=400, recoverable=True)
+            payload["filename"] = part.filename or "upload"
+            payload["content_base64"] = base64.b64encode(data).decode("ascii")
+            payload["mime_type"] = part.headers.get("Content-Type", "")
+            file_seen = True
+            continue
+        if part.name:
+            payload[part.name] = await part.text()
+    if not file_seen:
+        raise CockpitError("validation_failed", "multipart upload requires a file part", status=400, recoverable=True)
+    return payload
+
+
+def _members_from_body(body: dict[str, Any]) -> list[str]:
+    if "members" in body:
+        value = body["members"]
+        if not isinstance(value, list):
+            raise CockpitError("validation_failed", "members must be an array", status=400, recoverable=True)
+        return [str(item).strip() for item in value if str(item).strip()]
+    member = str(body.get("member") or body.get("member_id") or body.get("identity") or "").strip()
+    if not member:
+        raise CockpitError("validation_failed", "member is required", status=400, recoverable=True)
+    return [member]
+
+
+def _unique_member_list(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = value.strip()
+        key = item.lower()
+        if item and key not in seen:
+            out.append(item)
+            seen.add(key)
+    return out
 
 
 def _registry_projects(registry: RegistryStore) -> list[ProjectEntry]:

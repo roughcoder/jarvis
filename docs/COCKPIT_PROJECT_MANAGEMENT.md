@@ -21,10 +21,11 @@ Read + converse, membership-filtered by the authenticated caller:
 | `GET /v1/projects/{id}/memory` | Cached representation + recent findings/decisions. |
 | `GET`/`POST /v1/projects/{id}/threads` | List / open orchestrator threads. |
 | `POST /v1/projects/{id}/threads/{tid}/turns` | Send a turn (reply streams over SSE). |
-| MCP tools | `project_list`, `project_get`, `memory_search`, `record_finding`, `record_decision`, `remember`, `open_thread`, `send_turn`. (`upload_file` is a stub.) |
+| MCP tools | `project_list`, `project_get`, project write tools, `memory_search`, `record_finding`, `record_decision`, `remember`, `forget`, `correct`, `open_thread`, `send_turn`, `upload_file`. |
 
-Missing, and specified here: **registry-entry writes** (create/edit the entry,
-repos, members, visibility, status) and **file upload**.
+This feature now also includes **registry-entry writes** (create/edit the entry,
+repos, members, visibility, status) and **file upload** through the same
+brain-owned write path described below.
 
 ## Locked decisions
 
@@ -149,17 +150,16 @@ Mirror the REST operations for external agents, forwarding to the same brain op:
 | `project_set_repos` | Registry repos write. |
 | `project_set_visibility` / `project_set_members` / `project_archive` / `project_delete` | Owner-gated registry writes. |
 | `record_finding` / `record_decision` / `forget` / `correct` | Lane 2 (record/* exist; add forget/correct). |
-| `upload_file` | File vault + Honcho ingestion (see below; currently a stub). |
+| `project_list_files` / `upload_file` / `retract_file` | File manifest + vault + Honcho ingestion (see below). |
 
 MCP writes carry `recorded_by`, `channel: mcp`, and an `agent` tag, as
 established for the MCP server lane.
 
-## File upload (specified; deferred build)
+## File upload
 
-Not built. `upload_file` is a stub and there is no REST upload route. Documented
-here so it lands with this work rather than as an afterthought. Uploading a
-document (e.g. a spec) is **project content**: **member-gated, per-action,
-routed through the brain** (which owns the file vault and is the single writer).
+Uploading a document (e.g. a spec) is **project content**: **member-gated,
+per-action, routed through the brain** (which owns the file vault and is the
+single writer).
 
 Flow:
 
@@ -174,9 +174,15 @@ Flow:
    pattern (vault write is synchronous and durable; ingestion is queued).
 3. **Provenance:** `artifact_type: spec` (or `note`/`meeting`), `title`,
    `uploaded_by`, `source: file`, `content_hash`, `original_path` under the vault.
-4. **Retraction is surgical:** each document gets its own session, so removing a
+4. **Manifest:** the brain records each upload in a durable project file
+   manifest (`doc_id`, `title`, `session_id`, `original_path`, `content_hash`,
+   `artifact_type`, `uploaded_by`, `observed_at`) so Cockpit and MCP can list
+   project documents.
+5. **Retraction is surgical:** each document gets its own session, so removing a
    document = delete that one upload session (messages are not individually
-   deletable in Honcho; session-per-document exists precisely for this).
+   deletable in Honcho; session-per-document exists precisely for this). The
+   vault original is retained for audit/recovery; the manifest entry is marked
+   retracted and hidden from default file lists.
 
 Transport wrinkle (decide at build): **REST uses true multipart**
 (`POST /v1/projects/{id}/files`) — the natural fit for Cockpit drag-and-drop.
@@ -192,7 +198,7 @@ identically.
   and requester derivation (OAuth `sub` → `users/` principal → gate), the Lane 2
   curation path, and the cockpit connector pattern. New: the registry-write
   protocol message + brain handler, the REST write routes, the MCP write tools,
-  the write capabilities in the gate, and (deferred) the file vault + Honcho
+  the write capabilities in the gate, and the file vault + manifest + Honcho
   ingestion.
 - Boundary rules hold: the Cockpit/MCP never touch Honcho or the registry storage
   directly; everything over the network boundary from env config; the brain is

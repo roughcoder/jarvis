@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import hmac
+import logging
 import time
 import uuid
 
@@ -28,6 +30,11 @@ from jarvis.brain.identity import HOUSE, IdentityResolver, load_users
 from jarvis.brain.memory_client import MemoryClient
 from jarvis.brain.memory_outbox import CurationOutbox
 from jarvis.brain.memory_tools import make_memory_tools
+from jarvis.brain.project_management import (
+    ProjectOperationError,
+    ProjectOperationService,
+    request_context_from_dict,
+)
 from jarvis.brain.project_tools import make_project_tools
 from jarvis.brain.registry import RegistryStore
 from jarvis.brain.proactive import proactive_frames
@@ -57,6 +64,8 @@ from jarvis.protocol.messages import (
     Hello,
     Identify,
     Proactive,
+    ProjectOperationRequest,
+    ProjectOperationResponse,
     Reject,
     REPLY_AUDIO_BINARY_V1,
     ReplyEnd,
@@ -81,6 +90,8 @@ from jarvis.tools.selection import build_relevance
 
 
 import re
+
+logger = logging.getLogger(__name__)
 
 # Only consulted while an alarm is actually ringing, so it can be liberal — any of
 # these silences it.
@@ -154,12 +165,15 @@ def authorise_device(brain, device_id: str, token: str) -> tuple[bool, str]:  # 
             if d.device_id and device_id != d.device_id:
                 return (False, "")  # token bound to a different device
             return (True, d.identity)
+    peer = brain.peer_token.get_secret_value()
+    if peer and hmac.compare_digest(token, peer):
+        return (True, "")
     shared = brain.pairing_token.get_secret_value()
-    if shared and token == shared:
+    if shared and hmac.compare_digest(token, shared):
         return (True, "")
     # Open only when NOTHING is configured (dev/local). If any token (shared or
     # per-device) is set, an unmatched token is rejected.
-    if not shared and not brain.devices:
+    if not shared and not peer and not brain.devices:
         return (True, "")
     return (False, "")
 
@@ -176,6 +190,13 @@ class BrainServer:
         self._gateway = GatewayClient(cfg.gateway)
         self._tts = InworldTTS(cfg.tts)
         self._memory = MemoryClient(cfg.memory)
+        self._registry_store = RegistryStore(cfg.registry.path)
+        self._project_ops = ProjectOperationService(
+            cfg,
+            registry=self._registry_store,
+            memory=self._memory,
+            lock=asyncio.Lock(),
+        )
         self._registry = build_registry(
             cfg.tools, worker=cfg.worker, remote=cfg.remote, google=cfg.google,
             accounts=cfg.accounts, browser=cfg.browser, capabilities=cfg.capabilities,
@@ -224,22 +245,20 @@ class BrainServer:
             backoff_initial_s=self._cfg.memory.curation_outbox_backoff_initial_s,
             backoff_max_s=self._cfg.memory.curation_outbox_backoff_max_s,
         )
-        store = RegistryStore(self._cfg.registry.path)
         for tool in make_memory_tools(
             self._cfg.memory,
             memory=self._memory,
             outbox=outbox,
-            registry=store,
+            registry=self._registry_store,
             users=users,
         ):
             self._registry.register(tool)
 
     def _register_project_tools(self) -> None:
-        store = RegistryStore(self._cfg.registry.path)
         for tool in make_project_tools(
             self._cfg.memory,
             memory=self._memory,
-            registry=store,
+            registry=self._registry_store,
             contexts=self._contexts,
         ):
             self._registry.register(tool)
@@ -273,7 +292,7 @@ class BrainServer:
     async def serve(self) -> None:
         host, port = self._cfg.brain.host, self._cfg.brain.port
         b = self._cfg.brain
-        has_token = bool(b.pairing_token.get_secret_value()) or bool(b.devices)
+        has_token = bool(b.pairing_token.get_secret_value()) or bool(b.devices) or bool(b.peer_token.get_secret_value())
         if insecure_bind(host, has_token, b.allow_insecure):  # don't expose unauth access on a LAN
             print(
                 f"\n✗ Refusing to start: brain is bound to {host!r} (non-loopback) with no "
@@ -484,6 +503,10 @@ class BrainServer:
     def _authorise(self, hello: Hello) -> tuple[bool, str]:
         return authorise_device(self._cfg.brain, hello.device_id, hello.token)
 
+    def _is_peer_connection(self, hello: Hello) -> bool:
+        peer = self._cfg.brain.peer_token.get_secret_value()
+        return bool(peer) and hmac.compare_digest(hello.token, peer)
+
     def _resolve(
         self,
         device_id: str,
@@ -539,6 +562,7 @@ class BrainServer:
             "base_asserted": first.identity,
             "device_default": device_default or HOUSE,
             "hardware": hardware,
+            "trusted_peer": self._is_peer_connection(first),
             "voice_mode": "default",
             "waiters": {},
             "audio_buffers": {},
@@ -561,8 +585,9 @@ class BrainServer:
             f"identity={base.identity} hardware={hw} audio={REPLY_AUDIO_BINARY_V1}"
         )
 
-        self._connections.add(ws)  # eligible for proactive heartbeat push
-        self._device_conns.setdefault(device_id, set()).add(ws)  # for device-routed alarms
+        if not conn["trusted_peer"]:
+            self._connections.add(ws)  # eligible for proactive heartbeat push
+            self._device_conns.setdefault(device_id, set()).add(ws)  # for device-routed alarms
         self._conn_meta[ws] = conn
         turn: asyncio.Task | None = None
         try:
@@ -607,6 +632,8 @@ class BrainServer:
                     fut = conn["waiters"].pop(msg.request_id, None)
                     if fut is not None and not fut.done():
                         fut.set_result(msg)
+                elif isinstance(msg, ProjectOperationRequest):
+                    await self._handle_project_operation(ws, msg, trusted_peer=bool(conn.get("trusted_peer")))
                 elif isinstance(msg, BargeIn):
                     turn = await self._cancel(turn)
                     with contextlib.suppress(Exception):
@@ -624,6 +651,43 @@ class BrainServer:
                 if not conns:
                     self._device_conns.pop(device_id, None)
             await self._cancel(turn)
+
+    async def _handle_project_operation(
+        self,
+        ws,
+        msg: ProjectOperationRequest,
+        *,
+        trusted_peer: bool = False,
+    ) -> None:  # noqa: ANN001
+        try:
+            if not trusted_peer:
+                raise ProjectOperationError(
+                    "unauthorized",
+                    "project operations require a trusted brain peer",
+                    status=401,
+                )
+            ctx = request_context_from_dict(msg.requester)
+            result = await self._project_ops.execute(ctx, msg.op, msg.payload)
+            response = ProjectOperationResponse(request_id=msg.request_id, ok=True, result=result)
+        except ProjectOperationError as exc:
+            response = ProjectOperationResponse(
+                request_id=msg.request_id,
+                ok=False,
+                error=exc.body(),
+            )
+        except Exception:  # noqa: BLE001 - keep boundary responses structured.
+            logger.exception("brain project operation failed")
+            response = ProjectOperationResponse(
+                request_id=msg.request_id,
+                ok=False,
+                error={
+                    "code": "internal_error",
+                    "message": "project operation failed",
+                    "status": 500,
+                    "recoverable": False,
+                },
+            )
+        await ws.send(encode(response))
 
     @staticmethod
     def _start_audio_buffer(conn: dict, msg: AudioStart) -> bool:

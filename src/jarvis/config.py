@@ -316,6 +316,11 @@ class RegistryConfig(_Base):
     model_config = SettingsConfigDict(env_prefix="REGISTRY_", env_file=".env", extra="ignore")
 
     path: str = "jarvis-workspace/registry/registry.json"
+    files_vault_root: str = "jarvis-workspace"
+    upload_staging_root: str = "jarvis-workspace/uploads/staging"
+    upload_manifest_path: str = "jarvis-workspace/registry/upload-manifest.json"
+    max_upload_bytes: int = 25 * 1024 * 1024
+    upload_url_max_redirects: int = 3
 
 
 class ToolsConfig(_Base):
@@ -377,6 +382,10 @@ class BrainConfig(_Base):
     port: int = 8700
     # Shared pairing secret. Empty => accept any device (dev/local only).
     pairing_token: SecretStr = SecretStr("")
+    # Trusted boundary peers (Cockpit API / MCP server) use this distinct token
+    # when forwarding an already-authenticated requester identity. Ordinary
+    # intercom pairing tokens are never allowed to supply forwarded requesters.
+    peer_token: SecretStr = SecretStr("")
     # Per-device pairing (Phase 3d): a JSON array of DeviceAuth so each device has
     # its own token (a token is bound to its device_id, so a leaked Pi token can't
     # impersonate your Mac). The shared pairing_token above stays a fallback.
@@ -866,6 +875,18 @@ class Config:
         )
         self.capabilities.users_dir = _resolve_state_path(self.capabilities.users_dir, base_dir)
         self.registry.path = _resolve_state_path(self.registry.path, base_dir)
+        self.registry.files_vault_root = _resolve_state_path(
+            self.registry.files_vault_root,
+            base_dir,
+        )
+        self.registry.upload_staging_root = _resolve_state_path(
+            self.registry.upload_staging_root,
+            base_dir,
+        )
+        self.registry.upload_manifest_path = _resolve_state_path(
+            self.registry.upload_manifest_path,
+            base_dir,
+        )
         self.mcp_serve.token_store_path = _resolve_state_path(
             self.mcp_serve.token_store_path,
             base_dir,
@@ -948,6 +969,11 @@ class Config:
             "accounts.house_email_binding": self.accounts.house_email_binding,
             "accounts.house_calendar_binding": self.accounts.house_calendar_binding,
             "registry.path": self.registry.path,
+            "registry.files_vault_root": self.registry.files_vault_root,
+            "registry.upload_staging_root": self.registry.upload_staging_root,
+            "registry.upload_manifest_path": self.registry.upload_manifest_path,
+            "registry.max_upload_bytes": self.registry.max_upload_bytes,
+            "registry.upload_url_max_redirects": self.registry.upload_url_max_redirects,
             "tools.files_root": self.tools.files_root,
             "tools.websearch_provider": self.tools.websearch_provider,
             "tools.websearch_api_key": mask(self.tools.websearch_api_key),
@@ -957,6 +983,7 @@ class Config:
             "brain.host": self.brain.host,
             "brain.port": self.brain.port,
             "brain.pairing_token": mask(self.brain.pairing_token),
+            "brain.peer_token": mask(self.brain.peer_token),
             "brain.websocket_max_size": self.brain.websocket_max_size,
             "brain.websocket_ping_interval_s": self.brain.websocket_ping_interval_s,
             "brain.websocket_ping_timeout_s": self.brain.websocket_ping_timeout_s,

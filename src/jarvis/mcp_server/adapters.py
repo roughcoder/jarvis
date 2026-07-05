@@ -18,6 +18,7 @@ from jarvis.brain.identity import Resolution
 from jarvis.brain.memory_client import MemoryBackend, MemoryMessage, SessionPeer
 from jarvis.brain.memory_outbox import CurationOutbox
 from jarvis.brain.memory_tools import make_memory_tools
+from jarvis.brain.project_management import BrainProjectClient, ProjectOperationError
 from jarvis.brain.project_tools import make_project_tools
 from jarvis.brain.registry import ProjectEntry, RegistryStore
 from jarvis.brain.session import BrainSession, TurnResult
@@ -70,12 +71,14 @@ class JarvisMCPService:
         memory: Any | None = None,
         registry: RegistryStore | None = None,
         cockpit: "CockpitConnector | None" = None,
+        project_client: BrainProjectClient | None = None,
         users: dict[str, User] | None = None,
     ) -> None:
         self.cfg = cfg
         self._memory = memory
         self._registry = registry
         self._cockpit = cockpit
+        self._project_client = project_client
         self._users = users
 
     @property
@@ -124,6 +127,59 @@ class JarvisMCPService:
         if project is None:
             raise MCPAccessError("project not found or not visible")
         return {"project": project.as_dict()}
+
+    async def project_create(self, ctx: RequestContext, **payload: Any) -> dict[str, Any]:
+        return await self._brain_project_write(ctx, "project.create", payload)
+
+    async def project_update(self, ctx: RequestContext, *, project_id: str, **fields: Any) -> dict[str, Any]:
+        return await self._brain_project_write(ctx, "project.update", {"project_id": project_id, **fields})
+
+    async def project_set_repos(
+        self,
+        ctx: RequestContext,
+        *,
+        project_id: str,
+        repos: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return await self._brain_project_write(ctx, "project.repos.set", {"project_id": project_id, "repos": repos})
+
+    async def project_set_visibility(
+        self,
+        ctx: RequestContext,
+        *,
+        project_id: str,
+        visibility: str,
+    ) -> dict[str, Any]:
+        return await self._brain_project_write(
+            ctx,
+            "project.visibility.set",
+            {"project_id": project_id, "visibility": visibility},
+        )
+
+    async def project_set_members(
+        self,
+        ctx: RequestContext,
+        *,
+        project_id: str,
+        members: list[str],
+    ) -> dict[str, Any]:
+        return await self._brain_project_write(ctx, "project.members.set", {"project_id": project_id, "members": members})
+
+    async def project_archive(
+        self,
+        ctx: RequestContext,
+        *,
+        project_id: str,
+        archived: bool = True,
+    ) -> dict[str, Any]:
+        return await self._brain_project_write(
+            ctx,
+            "project.archive",
+            {"project_id": project_id, "archived": archived},
+        )
+
+    async def project_delete(self, ctx: RequestContext, *, project_id: str) -> dict[str, Any]:
+        return await self._brain_project_write(ctx, "project.delete", {"project_id": project_id})
 
     async def memory_search(
         self,
@@ -206,6 +262,56 @@ class JarvisMCPService:
         )
         return {"result": f"Noted - queued memory ({entry.content_hash})."}
 
+    async def forget(
+        self,
+        ctx: RequestContext,
+        *,
+        project_id: str,
+        query: str,
+        confirm: bool = False,
+        conclusion_ids: list[str] | None = None,
+    ) -> dict[str, str]:
+        result = await self._brain_project_write(
+            ctx,
+            "project.memory.forget",
+            {
+                "project_id": project_id,
+                "query": query,
+                "confirm": confirm,
+                "conclusion_ids": conclusion_ids or [],
+                "source": "mcp",
+                "channel": "mcp",
+            },
+        )
+        return {"result": str(result.get("result") or "")}
+
+    async def correct(
+        self,
+        ctx: RequestContext,
+        *,
+        project_id: str,
+        query: str,
+        replacement: str,
+        confirm: bool = False,
+        conclusion_ids: list[str] | None = None,
+        observed_at: str = "",
+    ) -> dict[str, str]:
+        result = await self._brain_project_write(
+            ctx,
+            "project.memory.correct",
+            {
+                "project_id": project_id,
+                "query": query,
+                "replacement": replacement,
+                "confirm": confirm,
+                "conclusion_ids": conclusion_ids or [],
+                "observed_at": observed_at,
+                "source": "mcp",
+                "channel": "mcp",
+            },
+        )
+        return {"result": str(result.get("result") or "")}
+
     async def open_thread(
         self,
         ctx: RequestContext,
@@ -238,20 +344,55 @@ class JarvisMCPService:
 
     async def upload_file(
         self,
-        _ctx: RequestContext,
+        ctx: RequestContext,
         *,
         project_id: str = "",
         path: str = "",
-        content_base64: str = "",
+        url: str = "",
+        content: str = "",
+        filename: str = "",
+        title: str = "",
+        artifact_type: str = "spec",
         agent: str = "",
-    ) -> dict[str, str]:
-        _ = (project_id, path, content_base64, agent)
-        return {
-            "error": (
-                "upload_file is not yet available: the file-vault ingestion flow "
-                "has not landed in this branch."
-            )
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "project_id": project_id,
+            "artifact_type": artifact_type,
+            "title": title,
+            "agent": agent,
+            "channel": "mcp",
         }
+        if content:
+            payload["content_text"] = content
+            payload["filename"] = filename or "upload.md"
+        elif path:
+            payload["source_path"] = path
+        elif url:
+            payload["source_url"] = url
+            payload["filename"] = filename or "upload"
+        else:
+            raise ValueError("upload_file requires content, path, or url")
+        return await self._brain_project_write(ctx, "project.file.upload", payload)
+
+    async def retract_file(self, ctx: RequestContext, *, project_id: str, doc_id: str) -> dict[str, Any]:
+        return await self._brain_project_write(
+            ctx,
+            "project.file.retract",
+            {"project_id": project_id, "doc_id": doc_id},
+        )
+
+    async def project_list_files(
+        self,
+        ctx: RequestContext,
+        *,
+        project_id: str,
+        include_retracted: bool = False,
+    ) -> dict[str, Any]:
+        return await self._brain_project_write(
+            ctx,
+            "project.file.list",
+            {"project_id": project_id, "include_retracted": include_retracted},
+        )
 
     async def _record_project_artifact(
         self,
@@ -330,6 +471,18 @@ class JarvisMCPService:
             backoff_initial_s=self.cfg.memory.curation_outbox_backoff_initial_s,
             backoff_max_s=self.cfg.memory.curation_outbox_backoff_max_s,
         )
+
+    async def _brain_project_write(self, ctx: RequestContext, op: str, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return await self.project_client.execute(ctx, op, payload)
+        except ProjectOperationError as exc:
+            raise MCPAccessError(str(exc)) from exc
+
+    @property
+    def project_client(self) -> BrainProjectClient:
+        if self._project_client is None:
+            self._project_client = BrainProjectClient(self.cfg)
+        return self._project_client
 
     def _resolve_peer(self, target: str, ctx: RequestContext) -> str:
         value = target.strip()
