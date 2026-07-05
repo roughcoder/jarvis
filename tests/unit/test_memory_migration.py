@@ -3,12 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from jarvis.brain.memory_client import ConclusionRecord
 from jarvis.cli import main
 from jarvis.migration.profile_facts import (
     EXPLICIT_LEVEL,
+    is_dev_workspace,
     load_profile_fact_seeds,
     seed_profile_facts,
+    validate_workspace_target,
     verify_profile_fact_seed,
 )
 
@@ -131,6 +135,71 @@ def test_profile_fact_verify_fails_when_fact_is_missing(tmp_path: Path) -> None:
     assert "missing 'email: neil@example.test'" in summary.discrepancies[0]
 
 
+def test_profile_fact_verify_fails_on_duplicate_migrated_fact(tmp_path: Path) -> None:
+    users_dir = _write_profile(tmp_path)
+    seeds = load_profile_fact_seeds(users_dir, as_of="2026-07-05")
+    first = _record_from_seed(seeds[0], "c1")
+    duplicate = _record_from_seed(seeds[0], "c2")
+
+    summary = verify_profile_fact_seed(
+        FakeBackend([first, duplicate]),
+        seeds,
+        workspace="jarvis-migration-dev",
+    )
+
+    assert not summary.ok
+    assert "neil: duplicate 'email: neil@example.test' (2 matches)" in summary.discrepancies
+
+
+def test_profile_fact_verify_fails_on_unexpected_migrated_fact(tmp_path: Path) -> None:
+    users_dir = _write_profile(tmp_path)
+    seeds = load_profile_fact_seeds(users_dir, as_of="2026-07-05")
+    expected = _record_from_seed(seeds[0], "c1")
+    unexpected = ConclusionRecord(
+        id="c2",
+        content="phone: 555-0100",
+        observer_id="neil",
+        observed_id="neil",
+        level=EXPLICIT_LEVEL,
+        metadata={
+            "level": EXPLICIT_LEVEL,
+            "recorded_by": "neil",
+            "source": "profile-migration",
+            "observed_at": "2026-07-05",
+            "content_hash": "sha256:unexpected",
+        },
+    )
+
+    summary = verify_profile_fact_seed(
+        FakeBackend([expected, unexpected]),
+        seeds,
+        workspace="jarvis-migration-dev",
+    )
+
+    assert not summary.ok
+    assert "neil: unexpected migrated conclusion 'phone: 555-0100'" in summary.discrepancies
+
+
+@pytest.mark.parametrize(
+    "workspace",
+    ["jarvis-latest", "jarvis-fastest"],
+)
+def test_workspace_guard_rejects_substring_dev_markers(workspace: str) -> None:
+    assert not is_dev_workspace(workspace)
+
+    with pytest.raises(ValueError, match="require --i-understand-this-writes-to"):
+        validate_workspace_target(workspace, explicit_workspace=True)
+
+
+@pytest.mark.parametrize(
+    "workspace",
+    ["jarvis-dev", "jarvis-migration-dryrun"],
+)
+def test_workspace_guard_allows_tokenized_dev_workspaces(workspace: str) -> None:
+    assert is_dev_workspace(workspace)
+    validate_workspace_target(workspace, explicit_workspace=True)
+
+
 def test_memory_migrate_dry_run_does_not_build_backend(tmp_path: Path, monkeypatch, capsys) -> None:  # noqa: ANN001
     users_dir = _write_profile(tmp_path)
     monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / "missing.env"))
@@ -159,7 +228,7 @@ def test_memory_migrate_dry_run_does_not_build_backend(tmp_path: Path, monkeypat
     assert "email: neil@example.test" in out
 
 
-def test_memory_migrate_blocks_non_dev_workspace_without_ack(tmp_path: Path, monkeypatch) -> None:  # noqa: ANN001
+def test_memory_migrate_blocks_non_dev_workspace_without_ack(tmp_path: Path, monkeypatch, capsys) -> None:  # noqa: ANN001
     users_dir = _write_profile(tmp_path)
     monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / "missing.env"))
 
@@ -181,6 +250,106 @@ def test_memory_migrate_blocks_non_dev_workspace_without_ack(tmp_path: Path, mon
     )
 
     assert status == 2
+    assert "require --i-understand-this-writes-to 'jarvis-home'" in capsys.readouterr().err
+
+
+def test_memory_migrate_blocks_non_dev_env_default_without_explicit_workspace(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,  # noqa: ANN001
+) -> None:
+    users_dir = _write_profile(tmp_path)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / "missing.env"))
+    monkeypatch.setenv("MEMORY_MIGRATION_WORKSPACE_ID", "jarvis-home")
+
+    def fail_backend(_cfg):  # noqa: ANN001, ANN202
+        raise AssertionError("guard should run before backend creation")
+
+    monkeypatch.setattr("jarvis.brain.memory_client.MemoryClient", fail_backend)
+
+    status = main(
+        [
+            "memory-migrate",
+            "--users-dir",
+            str(users_dir),
+            "--as-of",
+            "2026-07-05",
+        ]
+    )
+
+    assert status == 2
+    assert "require an explicit --workspace value" in capsys.readouterr().err
+
+
+def test_memory_migrate_blocks_latest_workspace_without_ack(tmp_path: Path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    users_dir = _write_profile(tmp_path)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / "missing.env"))
+
+    def fail_backend(_cfg):  # noqa: ANN001, ANN202
+        raise AssertionError("guard should run before backend creation")
+
+    monkeypatch.setattr("jarvis.brain.memory_client.MemoryClient", fail_backend)
+
+    status = main(
+        [
+            "memory-migrate",
+            "--users-dir",
+            str(users_dir),
+            "--workspace",
+            "jarvis-latest",
+            "--as-of",
+            "2026-07-05",
+        ]
+    )
+
+    assert status == 2
+    assert "require --i-understand-this-writes-to 'jarvis-latest'" in capsys.readouterr().err
+
+
+def test_memory_migrate_verify_returns_zero_on_pass(tmp_path: Path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    users_dir = _write_profile(tmp_path)
+    seeds = load_profile_fact_seeds(users_dir, as_of="2026-07-05")
+    backend = FakeBackend([_record_from_seed(seeds[0], "c1")])
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / "missing.env"))
+    monkeypatch.setattr("jarvis.brain.memory_client.MemoryClient", lambda _cfg: backend)
+
+    status = main(
+        [
+            "memory-migrate",
+            "--users-dir",
+            str(users_dir),
+            "--workspace",
+            "jarvis-migration-dev",
+            "--as-of",
+            "2026-07-05",
+            "--verify",
+        ]
+    )
+
+    assert status == 0
+    assert "Verification PASS" in capsys.readouterr().out
+
+
+def test_memory_migrate_verify_returns_one_on_fail(tmp_path: Path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    users_dir = _write_profile(tmp_path)
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(tmp_path / "missing.env"))
+    monkeypatch.setattr("jarvis.brain.memory_client.MemoryClient", lambda _cfg: FakeBackend())
+
+    status = main(
+        [
+            "memory-migrate",
+            "--users-dir",
+            str(users_dir),
+            "--workspace",
+            "jarvis-migration-dev",
+            "--as-of",
+            "2026-07-05",
+            "--verify",
+        ]
+    )
+
+    assert status == 1
+    assert "Verification FAIL" in capsys.readouterr().err
 
 
 def _write_profile(tmp_path: Path, *, honcho_peer: str = "neil") -> Path:
@@ -195,3 +364,14 @@ def _write_profile(tmp_path: Path, *, honcho_peer: str = "neil") -> Path:
         encoding="utf-8",
     )
     return users_dir
+
+
+def _record_from_seed(seed, record_id: str) -> ConclusionRecord:  # noqa: ANN001
+    return ConclusionRecord(
+        id=record_id,
+        content=seed.content,
+        observer_id=seed.peer_id,
+        observed_id=seed.peer_id,
+        level=EXPLICIT_LEVEL,
+        metadata=dict(seed.metadata),
+    )

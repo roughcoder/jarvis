@@ -59,7 +59,7 @@ def _cmd_memory_migrate(args: argparse.Namespace) -> int:
     try:
         validate_workspace_target(
             workspace,
-            explicit_workspace=args.workspace is not None,
+            explicit_workspace=bool(args.workspace),
             acknowledgement=args.i_understand_this_writes_to,
         )
     except WorkspaceSafetyError as exc:

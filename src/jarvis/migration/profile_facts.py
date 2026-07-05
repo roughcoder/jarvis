@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -16,8 +17,10 @@ DEFAULT_MIGRATION_WORKSPACE = "jarvis-migration-dev"
 PROFILE_MIGRATION_SOURCE = "profile-migration"
 EXPLICIT_LEVEL = "explicit"
 
-_DEV_WORKSPACE_MARKERS = ("dev", "stage", "staging", "test", "dryrun", "dry-run", "throwaway")
-_NON_DEV_WORKSPACE_MARKERS = ("home", "prod", "production", "live")
+_DEV_WORKSPACE_MARKERS = frozenset(
+    {"dev", "test", "testing", "stage", "staging", "local", "dryrun", "scratch", "sandbox"}
+)
+_NON_DEV_WORKSPACE_MARKERS = frozenset({"home", "prod", "production", "main", "live"})
 
 
 class WorkspaceSafetyError(ValueError):
@@ -76,9 +79,10 @@ def default_as_of() -> str:
 
 def is_dev_workspace(workspace: str) -> bool:
     value = (workspace or "").strip().lower()
-    if not value or any(marker in value for marker in _NON_DEV_WORKSPACE_MARKERS):
+    tokens = {token for token in re.split(r"[-_]+", value) if token}
+    if not tokens or tokens & _NON_DEV_WORKSPACE_MARKERS:
         return False
-    return any(marker in value for marker in _DEV_WORKSPACE_MARKERS)
+    return bool(tokens & _DEV_WORKSPACE_MARKERS)
 
 
 def validate_workspace_target(
