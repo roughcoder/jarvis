@@ -24,6 +24,20 @@ OutboxStatus = Literal["pending", "delivered", "failed", "cancelled"]
 
 
 @dataclass(frozen=True)
+class ActiveRetraction:
+    observed_id: str
+    retracted_content: str
+    retracted_conclusion_id: str
+    retracted_conclusion_level: str = ""
+    retraction_reason: str = ""
+    recorded_by: str = ""
+    observed_at: str = ""
+    metadata: dict[str, Any] | None = None
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+
+@dataclass(frozen=True)
 class OutboxEntry:
     id: str
     operation: OutboxOperation
@@ -38,6 +52,110 @@ class OutboxEntry:
     error: str = ""
     created_at: float = 0.0
     updated_at: float = 0.0
+
+
+class RetractionIndex:
+    """Durable local index of active memory retractions.
+
+    Honcho v3.0.11 does not expose Jarvis's contradiction metadata to the
+    dreamer/dialectic path, so this local file is the answer-time suppression
+    source of truth. Reads are pure local file reads and are safe on the voice
+    hot path.
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path).expanduser()
+
+    def record(self, *, observed_id: str, metadata: dict[str, Any]) -> ActiveRetraction | None:
+        retracted_content = str(metadata.get("retracted_content") or "").strip()
+        retracted_conclusion_id = str(metadata.get("retracted_conclusion_id") or "").strip()
+        if not observed_id or not retracted_content:
+            return None
+        key = retracted_conclusion_id or conclusion_content_hash(
+            observed_id=observed_id,
+            content=retracted_content,
+            observer_id=str(metadata.get("recorded_by") or ""),
+            metadata=metadata,
+        )
+        now = time.time()
+        data = self._read()
+        peers = data.setdefault("peers", {})
+        peer_rows = peers.setdefault(observed_id, {})
+        existing = peer_rows.get(key) if isinstance(peer_rows.get(key), dict) else {}
+        row = {
+            "observed_id": observed_id,
+            "retracted_content": retracted_content,
+            "retracted_conclusion_id": retracted_conclusion_id,
+            "retracted_conclusion_level": str(metadata.get("retracted_conclusion_level") or ""),
+            "retraction_reason": str(metadata.get("retraction_reason") or ""),
+            "recorded_by": str(metadata.get("recorded_by") or ""),
+            "observed_at": str(metadata.get("observed_at") or ""),
+            "metadata": dict(metadata),
+            "created_at": float(existing.get("created_at", now)),
+            "updated_at": now,
+        }
+        peer_rows[key] = row
+        _atomic_write_json(self.path, data)
+        return _retraction_from_json(row)
+
+    def clear_for_assertion(self, *, observed_id: str, content: str) -> list[ActiveRetraction]:
+        content = content.strip()
+        if not observed_id or not content:
+            return []
+        data = self._read()
+        peer_rows = data.get("peers", {}).get(observed_id)
+        if not isinstance(peer_rows, dict):
+            return []
+        removed: list[ActiveRetraction] = []
+        for key, raw in list(peer_rows.items()):
+            if not isinstance(raw, dict):
+                continue
+            record = _retraction_from_json(raw)
+            if _text_matches(record.retracted_content, content):
+                removed.append(record)
+                peer_rows.pop(key, None)
+        if not removed:
+            return []
+        if not peer_rows:
+            data.get("peers", {}).pop(observed_id, None)
+        if not data.get("peers"):
+            data.pop("peers", None)
+        _atomic_write_json(self.path, data)
+        return removed
+
+    def active(self, *, observed_id: str) -> list[ActiveRetraction]:
+        if not observed_id:
+            return []
+        peer_rows = self._read().get("peers", {}).get(observed_id)
+        if not isinstance(peer_rows, dict):
+            return []
+        records = [
+            _retraction_from_json(raw)
+            for raw in peer_rows.values()
+            if isinstance(raw, dict)
+        ]
+        return sorted(records, key=lambda row: (row.observed_at, row.created_at, row.retracted_content))
+
+    def _read(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {"peers": {}}
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {"peers": {}}
+        if not isinstance(raw, dict):
+            return {"peers": {}}
+        peers = raw.get("peers")
+        if not isinstance(peers, dict):
+            raw["peers"] = {}
+        return raw
+
+
+def retraction_index_path(curation_outbox_path: str | Path) -> Path:
+    path = Path(curation_outbox_path).expanduser()
+    if path.suffix:
+        return path.with_suffix(".retractions.json")
+    return path.with_name(f"{path.name}.retractions.json")
 
 
 class CurationOutbox:
@@ -359,6 +477,21 @@ def _entry_from_json(raw: dict[str, Any]) -> OutboxEntry:
     )
 
 
+def _retraction_from_json(raw: dict[str, Any]) -> ActiveRetraction:
+    return ActiveRetraction(
+        observed_id=str(raw.get("observed_id", "")),
+        retracted_content=str(raw.get("retracted_content", "")),
+        retracted_conclusion_id=str(raw.get("retracted_conclusion_id", "")),
+        retracted_conclusion_level=str(raw.get("retracted_conclusion_level", "")),
+        retraction_reason=str(raw.get("retraction_reason", "")),
+        recorded_by=str(raw.get("recorded_by", "")),
+        observed_at=str(raw.get("observed_at", "")),
+        metadata=dict(raw.get("metadata") or {}),
+        created_at=float(raw.get("created_at", 0.0)),
+        updated_at=float(raw.get("updated_at", 0.0)),
+    )
+
+
 def _cancel_matches(entry: OutboxEntry, query: str) -> bool:
     if query == entry.content_hash or query == str((entry.metadata or {}).get("content_hash", "")):
         return True
@@ -371,7 +504,34 @@ def _cancel_matches(entry: OutboxEntry, query: str) -> bool:
     return entry_folded == query_folded or query_folded in entry_folded or entry_folded in query_folded
 
 
+def _text_matches(left: str, right: str) -> bool:
+    left_text = " ".join(left.split()).casefold()
+    right_text = " ".join(right.split()).casefold()
+    if not left_text or not right_text:
+        return False
+    return left_text == right_text or left_text in right_text or right_text in left_text
+
+
 def _replace_entry(entry: OutboxEntry, **changes: Any) -> OutboxEntry:
     data = _entry_to_json(entry)
     data.update(changes)
     return _entry_from_json(data)
+
+
+def _atomic_write_json(path: Path, data: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    try:
+        dir_fd = os.open(path.parent, os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)

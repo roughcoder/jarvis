@@ -8,7 +8,7 @@ from typing import Any
 
 from jarvis.brain.capabilities import can_query_memory_peer, can_write_memory_peer
 from jarvis.brain.memory_client import ConclusionRecord, MemoryBackend
-from jarvis.brain.memory_outbox import CurationOutbox
+from jarvis.brain.memory_outbox import ActiveRetraction, CurationOutbox, RetractionIndex, retraction_index_path
 from jarvis.brain.registry import RegistryStore
 from jarvis.config import MemoryConfig
 from jarvis.runtime import RequestContext
@@ -19,8 +19,9 @@ QUERY_CAPABILITY = "memory.query"
 CURATE_CAPABILITY = "memory.curate"
 DERIVED_CONCLUSION_LEVELS = {"deductive", "inductive"}
 MEMORY_RETRACTION_INSTRUCTION = (
-    "Memory note: contradiction or retraction conclusions are authoritative; "
-    "do not present a retracted fact as current."
+    "Memory note: the withdrawals below are authoritative. Do not present a "
+    "withdrawn fact as current, including semantically equivalent restatements "
+    "that Honcho may have re-derived with different wording."
 )
 
 
@@ -33,6 +34,7 @@ def make_memory_tools(
     users: dict[str, User] | None = None,
 ) -> list[Tool]:
     users = users or {}
+    retractions = RetractionIndex(retraction_index_path(outbox.path))
 
     async def memory_search(ctx: RequestContext, args: dict[str, Any]) -> str:
         search_query = (args.get("search_query") or args.get("query") or "").strip()
@@ -42,6 +44,7 @@ def make_memory_tools(
         if not decision.allowed:
             return f"error: {decision.reason}"
         cached = memory.read_cached_representation(peer_id)
+        active_retractions = retractions.active(observed_id=peer_id)
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -66,11 +69,14 @@ def make_memory_tools(
                 if answer.strip():
                     text = answer.strip()
             text = outbox.append_pending_lines(text or "No memory found.", observed_id=peer_id)
-            return _memory_tool_result(text)
+            return _memory_tool_result(text, retractions=active_retractions)
         except Exception as exc:  # noqa: BLE001 - memory tool degrades, never breaks a turn.
             fallback = cached or "No cached memory found."
             fallback = outbox.append_pending_lines(fallback, observed_id=peer_id)
-            return _memory_tool_result(f"{fallback}\nmemory is unreachable: {exc}")
+            return _memory_tool_result(
+                f"{fallback}\nmemory is unreachable: {exc}",
+                retractions=active_retractions,
+            )
 
     async def remember_contact(ctx: RequestContext, args: dict[str, Any]) -> str:
         contact_name = (args.get("contact") or args.get("person") or args.get("name") or "").strip()
@@ -169,6 +175,7 @@ def make_memory_tools(
                     content=replacement,
                     metadata=metadata,
                 )
+                retractions.clear_for_assertion(observed_id=peer_id, content=replacement)
                 return "Corrected."
             return "Forgotten."
         confirmed = bool(args.get("confirm"))
@@ -195,13 +202,19 @@ def make_memory_tools(
         for conclusion_id in ids:
             outbox.enqueue_delete(conclusion_id=conclusion_id, observed_id=peer_id, content=query)
         for conclusion in selected:
-            if conclusion.level in DERIVED_CONCLUSION_LEVELS:
+            if conclusion.level in DERIVED_CONCLUSION_LEVELS and not _replacement_reasserts_conclusion(
+                replacement, conclusion
+            ):
+                metadata = _retraction_metadata(ctx, args, conclusion)
+                # Honcho v3.0.11 stores this as explicit; the local index below is
+                # the suppression source, while this queued row remains audit data.
                 outbox.enqueue_create(
                     observed_id=peer_id,
                     observer_id=ctx.memory_peer,
                     content=_retraction_content(conclusion),
-                    metadata=_retraction_metadata(ctx, args, conclusion),
+                    metadata=metadata,
                 )
+                retractions.record(observed_id=peer_id, metadata=metadata)
         if replacement:
             metadata = _base_metadata(ctx, args)
             outbox.enqueue_create(
@@ -210,6 +223,7 @@ def make_memory_tools(
                 content=replacement,
                 metadata=metadata,
             )
+            retractions.clear_for_assertion(observed_id=peer_id, content=replacement)
             return "Corrected."
         return "Forgotten."
 
@@ -410,5 +424,33 @@ def _selected_conclusions(
     return selected, missing
 
 
-def _memory_tool_result(text: str) -> str:
-    return "\n".join(part for part in (MEMORY_RETRACTION_INSTRUCTION, text.strip()) if part)
+def _replacement_reasserts_conclusion(replacement: str, conclusion: ConclusionRecord) -> bool:
+    if not replacement:
+        return False
+    return _text_matches(replacement, conclusion.content)
+
+
+def _text_matches(left: str, right: str) -> bool:
+    left_text = " ".join(left.split()).casefold()
+    right_text = " ".join(right.split()).casefold()
+    if not left_text or not right_text:
+        return False
+    return left_text == right_text or left_text in right_text or right_text in left_text
+
+
+def _memory_tool_result(text: str, *, retractions: list[ActiveRetraction] | None = None) -> str:
+    active = retractions or []
+    parts = []
+    if active:
+        parts.append(MEMORY_RETRACTION_INSTRUCTION)
+        parts.append(_retractions_tool_block(active))
+    parts.append(text.strip())
+    return "\n".join(part for part in parts if part)
+
+
+def _retractions_tool_block(retractions: list[ActiveRetraction]) -> str:
+    lines = ["The user has retracted / withdrawn these memory claims:"]
+    for item in retractions:
+        suffix = f" (withdrawn {item.observed_at})" if item.observed_at else ""
+        lines.append(f"- {item.retracted_content}{suffix}")
+    return "\n".join(lines)

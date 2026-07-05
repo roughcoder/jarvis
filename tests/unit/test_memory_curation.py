@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from jarvis.brain.memory_client import ConclusionRecord, RepresentationRecord
-from jarvis.brain.memory_outbox import CurationOutbox
+from jarvis.brain.memory_outbox import CurationOutbox, RetractionIndex, retraction_index_path
 from jarvis.brain.memory_tools import make_memory_tools
 from jarvis.brain.registry import ContactEntry, ProjectEntry, RegistryStore
 from jarvis.config import MemoryConfig
@@ -497,6 +497,10 @@ def test_forget_derived_conclusion_queues_contradiction_retraction(tmp_path) -> 
     assert retraction.metadata["retracted_conclusion_level"] == "deductive"
     assert retraction.metadata["retracted_content"] == "Klaus works Fridays."
     assert "does not want it retained as current" in retraction.content
+    active = RetractionIndex(retraction_index_path(cfg.curation_outbox_path)).active(observed_id="contact:klaus")
+    assert len(active) == 1
+    assert active[0].retracted_conclusion_id == "c1"
+    assert active[0].retracted_content == "Klaus works Fridays."
     assert flushed == {"delivered": 2, "failed": 0}
     assert backend.deleted == ["c1"]
     assert backend.created[0]["metadata"]["level"] == "contradiction"
@@ -541,6 +545,9 @@ def test_forget_declared_conclusion_deletes_without_retraction(tmp_path) -> None
 
     assert result == "Forgotten."
     assert [entry.operation for entry in pending] == ["delete_conclusion"]
+    assert RetractionIndex(retraction_index_path(cfg.curation_outbox_path)).active(
+        observed_id="contact:klaus"
+    ) == []
     assert flushed == {"delivered": 1, "failed": 0}
     assert backend.deleted == ["c1"]
     assert backend.created == []
@@ -594,6 +601,65 @@ def test_correct_derived_conclusion_retracts_then_writes_replacement(tmp_path) -
     assert pending[2].content == "Klaus is off Fridays."
     assert pending[2].metadata is not None
     assert pending[2].metadata.get("level") is None
+    active = RetractionIndex(retraction_index_path(cfg.curation_outbox_path)).active(observed_id="contact:klaus")
+    assert [row.retracted_content for row in active] == ["Klaus works Fridays."]
+
+
+def test_correct_derived_conclusion_reassertion_clears_matching_retraction(tmp_path) -> None:
+    backend = FakeMemory()
+    backend.query_matches = [
+        ConclusionRecord(
+            id="c2",
+            content="Klaus works Fridays.",
+            observer_id="neil",
+            observed_id="contact:klaus",
+            level="deductive",
+        )
+    ]
+    cfg = _memory_cfg(tmp_path)
+    index = RetractionIndex(retraction_index_path(cfg.curation_outbox_path))
+    index.record(
+        observed_id="contact:klaus",
+        metadata={
+            "recorded_by": "neil",
+            "observed_at": "2026-07-04",
+            "retracted_conclusion_id": "c1",
+            "retracted_conclusion_level": "deductive",
+            "retracted_content": "Klaus works Fridays.",
+            "retraction_reason": "user_forget_request",
+        },
+    )
+    outbox = CurationOutbox(cfg.curation_outbox_path)
+    tool = {
+        tool.name: tool
+        for tool in make_memory_tools(
+            cfg,
+            memory=backend,
+            outbox=outbox,
+            registry=_registry(tmp_path),
+        )
+    }["correct_memory"]
+
+    result = asyncio.run(
+        tool.handler(
+            _ctx("memory.curate"),
+            {
+                "target": "Klaus",
+                "query": "Fridays",
+                "replacement": "Klaus works Fridays.",
+                "confirm": True,
+                "conclusion_ids": ["c2"],
+            },
+        )
+    )
+    pending = outbox.pending_entries(observed_id="contact:klaus")
+
+    assert result == "Corrected."
+    assert [entry.operation for entry in pending] == ["delete_conclusion", "create_conclusion"]
+    assert pending[1].content == "Klaus works Fridays."
+    assert RetractionIndex(retraction_index_path(cfg.curation_outbox_path)).active(
+        observed_id="contact:klaus"
+    ) == []
 
 
 def test_forget_pending_memory_cancels_outbox_entry_before_flush(tmp_path) -> None:
@@ -719,5 +785,40 @@ def test_memory_search_queries_live_when_backend_available(tmp_path) -> None:
         tool.handler(_ctx("memory.query"), {"target": "Klaus", "search_query": "Fridays?"})
     )
 
-    assert "contradiction or retraction conclusions are authoritative" in result
+    assert "withdrawals below are authoritative" not in result
     assert "answer: Fridays?" in result
+
+
+def test_memory_search_includes_active_retractions_for_peer(tmp_path) -> None:
+    backend = FakeMemory()
+    cfg = _memory_cfg(tmp_path)
+    RetractionIndex(retraction_index_path(cfg.curation_outbox_path)).record(
+        observed_id="contact:klaus",
+        metadata={
+            "recorded_by": "neil",
+            "observed_at": "2026-07-05",
+            "retracted_conclusion_id": "c1",
+            "retracted_conclusion_level": "deductive",
+            "retracted_content": "Klaus works Fridays.",
+            "retraction_reason": "user_forget_request",
+        },
+    )
+    tool = {
+        tool.name: tool
+        for tool in make_memory_tools(
+            cfg,
+            memory=backend,
+            outbox=CurationOutbox(cfg.curation_outbox_path),
+            registry=_registry(tmp_path),
+        )
+    }["memory_search"]
+
+    result = asyncio.run(
+        tool.handler(_ctx("memory.query"), {"target": "Klaus", "search_query": "Does Klaus work Friday?"})
+    )
+
+    assert "withdrawals below are authoritative" in result
+    assert "semantically equivalent restatements" in result
+    assert "The user has retracted / withdrawn these memory claims" in result
+    assert "Klaus works Fridays." in result
+    assert "answer: Does Klaus work Friday?" in result
