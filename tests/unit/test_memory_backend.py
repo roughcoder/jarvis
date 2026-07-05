@@ -364,6 +364,59 @@ def test_v3_query_conclusions_uses_semantic_observer_filter_keys(tmp_path) -> No
     assert "observed_id" not in query_payloads[0]["filters"]
 
 
+def test_v3_query_conclusions_defaults_observer_to_observed_for_semantic_search(tmp_path) -> None:
+    query_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/conclusions/query"):
+            query_payloads.append(_json(request))
+            return httpx.Response(200, json=[])
+        return httpx.Response(201, json={"id": _json(request).get("id", "")})
+
+    client = HonchoV3MemoryClient(_cfg(tmp_path), transport=httpx.MockTransport(handler))
+
+    assert client.query_conclusions("forget Fridays", observed_id="contact:klaus", limit=5) == []
+
+    assert query_payloads == [
+        {
+            "query": "forget Fridays",
+            "filters": {
+                "observed": encode_honcho_id("contact:klaus"),
+                "observer": encode_honcho_id("contact:klaus"),
+            },
+            "top_k": 5,
+        }
+    ]
+
+
+def test_v3_query_conclusions_parses_bare_list_response(tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/conclusions/query"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "c1",
+                        "content": "Klaus works Fridays.",
+                        "observer_id": encode_honcho_id("contact:klaus"),
+                        "observed_id": encode_honcho_id("contact:klaus"),
+                        "level": "explicit",
+                    }
+                ],
+            )
+        return httpx.Response(201, json={"id": _json(request).get("id", "")})
+
+    client = HonchoV3MemoryClient(_cfg(tmp_path), transport=httpx.MockTransport(handler))
+
+    records = client.query_conclusions("Fridays", observed_id="contact:klaus", limit=5)
+
+    assert len(records) == 1
+    assert records[0].id == "c1"
+    assert records[0].content == "Klaus works Fridays."
+    assert records[0].observer_id == "contact:klaus"
+    assert records[0].observed_id == "contact:klaus"
+
+
 def test_v3_unfiltered_list_reconciles_sidecar_orphans(tmp_path) -> None:
     sidecar_path = tmp_path / "sidecar.json"
     sidecar_path.write_text(

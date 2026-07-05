@@ -5,7 +5,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from jarvis.brain.memory_client import ConclusionRecord, RepresentationRecord
+from jarvis.brain.memory_client import encode_honcho_id
+from jarvis.brain.memory_client.v3 import HonchoV3MemoryClient
 from jarvis.brain.memory_outbox import CurationOutbox, RetractionIndex, retraction_index_path
 from jarvis.brain.memory_tools import make_memory_tools
 from jarvis.brain.registry import ContactEntry, ProjectEntry, RegistryStore
@@ -446,6 +450,41 @@ def test_forget_and_correct_confirmation_roundtrip(tmp_path) -> None:
     assert done == "Corrected."
     pending = outbox.pending_entries()
     assert [entry.operation for entry in pending] == ["delete_conclusion", "create_conclusion"]
+
+
+def test_forget_confirmation_query_sends_self_scoped_semantic_filters(tmp_path) -> None:
+    query_payloads: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/conclusions/query"):
+            query_payloads.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(200, json=[])
+        return httpx.Response(201, json={"id": "ok"})
+
+    cfg = _memory_cfg(tmp_path, conclusion_sidecar_path=str(tmp_path / "sidecar.json"))
+    memory = HonchoV3MemoryClient(cfg, transport=httpx.MockTransport(handler))
+    tool = {
+        tool.name: tool
+        for tool in make_memory_tools(
+            cfg,
+            memory=memory,
+            outbox=CurationOutbox(cfg.curation_outbox_path),
+            registry=_registry(tmp_path),
+        )
+    }["forget_memory"]
+
+    asyncio.run(tool.handler(_ctx("memory.curate"), {"target": "Klaus", "query": "Fridays"}))
+
+    assert query_payloads == [
+        {
+            "query": "Fridays",
+            "filters": {
+                "observed": encode_honcho_id("contact:klaus"),
+                "observer": encode_honcho_id("contact:klaus"),
+            },
+            "top_k": 5,
+        }
+    ]
 
 
 def test_forget_derived_conclusion_queues_contradiction_retraction(tmp_path) -> None:
