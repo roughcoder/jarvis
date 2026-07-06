@@ -75,12 +75,86 @@ inside the ref.
 GET /v1/health
 ```
 
+### Discovery
+
+```text
+GET /v1/capabilities
+GET /v1/projects/{id}/permissions
+```
+
 ### Cockpit
 
 ```text
 GET /v1/cockpit/catalog
 GET /v1/cockpit/snapshot?sync=none|fast|probe
 GET /v1/cockpit/events?after=<cursor>
+```
+
+## Discovery
+
+`GET /v1/capabilities` is caller-scoped API discovery. It requires cockpit auth
+and returns only public-safe route templates, the requester's effective
+capability strings, and feature availability booleans/counts. It does not expose
+worker URLs, MCP server names or URLs, local paths, tokens, or concrete resource
+ids.
+
+Example:
+
+```json
+{
+  "api_version": "v1",
+  "schema_version": 1,
+  "principal": {
+    "identity": "neil",
+    "scope": "personal",
+    "auth_mode": "legacy"
+  },
+  "capabilities": ["worker.job.start", "worker.session.turn"],
+  "routes": [
+    {"method": "GET", "path": "/v1/capabilities"},
+    {"method": "GET", "path": "/v1/projects/{project_id}/permissions"},
+    {"method": "POST", "path": "/v1/work/start"}
+  ],
+  "features": {
+    "project_writes": {"available": true, "reason": ""},
+    "mcp": {"available": true, "serve_configured": false},
+    "worker_dispatch": {"available": true, "workers_configured": 1}
+  }
+}
+```
+
+`features.project_writes` is a wiring check for whether the API has the
+configured brain boundary credentials needed for project write forwarding. It is
+not a live brain ping. `features.mcp.available` is true only when MCP is enabled
+and at least one MCP server is configured; `serve_configured` means the Jarvis
+MCP server token store exists. `features.worker_dispatch.workers_configured` is
+the count of configured worker profiles, read without probing workers.
+
+`GET /v1/projects/{id}/permissions` returns the authenticated caller's effective
+project permissions. Non-members receive the same `404 not_found` as other
+project routes so the endpoint does not disclose private project existence.
+Archived projects still report permissions when the caller is a member and the
+project is otherwise visible.
+
+Example:
+
+```json
+{
+  "api_version": "v1",
+  "schema_version": 1,
+  "project_id": "jarvis",
+  "role": "owner",
+  "permissions": {
+    "can_update": true,
+    "can_manage_repos": true,
+    "can_create_thread": true,
+    "can_archive_thread": true,
+    "can_archive": true,
+    "can_delete": true,
+    "can_manage_members": true,
+    "can_set_visibility": true
+  }
+}
 ```
 
 ### Workers
@@ -104,6 +178,7 @@ configured `JARVIS_ENV_FILE`.
 GET /v1/projects
 POST /v1/projects
 GET /v1/projects/{id}
+GET /v1/projects/{id}/permissions
 PATCH /v1/projects/{id}
 PATCH /v1/projects/{id}/visibility
 POST /v1/projects/{id}/members
@@ -1327,17 +1402,6 @@ requested id (in the envelope or payload) are dropped, and a tick whose frames
 are all filtered out degrades to a heartbeat. Snapshot events are always the
 full projection; filtering clients should ignore rows they do not care about.
 
-## Deferred From v1
-
-`GET /v1/capabilities` is deferred. T3 v1 should use:
-
-- `/v1/cockpit/catalog` for stable option data and friendly capability labels
-- `/v1/workers` for worker capabilities and engine availability
-- write responses for authoritative allow/deny outcomes
-
-Add `/v1/capabilities` later only if T3 needs a separate policy or debugging
-view.
-
 ## Implementation Order
 
 1. `/v1/cockpit/catalog` and worker projection.
@@ -1361,6 +1425,18 @@ or breaking status, and migration notes.
   `archived_by`, and `archive_reason` to thread projections.
 - Documented member-gating for thread archive/unarchive and the `409
   thread_archived` turn rejection.
+
+### 2026-07-06 - v1 Cockpit discovery (compatible)
+
+- Added `GET /v1/capabilities` for caller-scoped route discovery, effective
+  capability strings, and public-safe feature availability blocks for project
+  writes, MCP, and worker dispatch.
+- Added `GET /v1/projects/{id}/permissions` so cockpits can render project
+  update, repo, thread, archive, delete, membership, and visibility controls
+  from the same effective member/owner gates the brain enforces.
+- Route discovery lists HTTP method and path templates only; it does not expose
+  concrete project ids, worker ids, session refs, URLs, local paths, or tokens.
+>>>>>>> 129f3a8 (feat(cockpit): expose effective capability discovery)
 
 ### 2026-07-04 - v1 PR review hardening (compatible)
 
