@@ -646,6 +646,27 @@ class MCPServeConfig(_Base):
     port: int = 8795
     bind_host: str = ""
     token_store_path: str = "jarvis-workspace/.mcp-server/tokens.json"
+    auth_mode: str = "hybrid"
+    resource_url: str = ""
+    oauth_issuer: str = ""
+    oauth_jwks_url: str = ""
+    oauth_required_scopes: str = ""
+    oauth_allow_identity_subject: str = ""
+    oauth_jwks_ttl_s: float = 300.0
+    oauth_jwks_min_refresh_s: float = 30.0
+
+    @property
+    def resolved_resource_url(self) -> str:
+        return (self.resource_url or f"http://{self.host}:{self.port}").rstrip("/")
+
+    @property
+    def resolved_oauth_allow_identity_subject(self) -> bool:
+        value = str(self.oauth_allow_identity_subject).strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off"}:
+            return False
+        return str(self.auth_mode).strip().lower() != "oauth"
 
 
 class GoogleConfig(_Base):
@@ -1029,6 +1050,20 @@ class Config:
             "mcp_serve.port": self.mcp_serve.port,
             "mcp_serve.bind_host": self.mcp_serve.bind_host or "<auto>",
             "mcp_serve.token_store_path": self.mcp_serve.token_store_path,
+            "mcp_serve.auth_mode": self.mcp_serve.auth_mode,
+            "mcp_serve.resource_url": self.mcp_serve.resolved_resource_url,
+            "mcp_serve.oauth_issuer": self.mcp_serve.oauth_issuer or "<unset>",
+            "mcp_serve.oauth_jwks_url": self.mcp_serve.oauth_jwks_url or "<unset>",
+            "mcp_serve.oauth_required_scopes": (
+                self.mcp_serve.oauth_required_scopes or "<none>"
+            ),
+            "mcp_serve.oauth_allow_identity_subject": (
+                self.mcp_serve.resolved_oauth_allow_identity_subject
+            ),
+            "mcp_serve.oauth_jwks_ttl_s": self.mcp_serve.oauth_jwks_ttl_s,
+            "mcp_serve.oauth_jwks_min_refresh_s": (
+                self.mcp_serve.oauth_jwks_min_refresh_s
+            ),
             "heartbeat.enabled": self.heartbeat.enabled,
             "heartbeat.interval_s": self.heartbeat.interval_s,
             "background.enabled": self.background.enabled,

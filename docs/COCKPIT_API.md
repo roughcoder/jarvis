@@ -136,6 +136,13 @@ config fallback responses report `stale: true`.
     "configured": true,
     "host": "localhost",
     "port": 8795,
+    "auth_mode": "hybrid",
+    "oauth": {
+      "configured": true,
+      "issuer": "https://cockpit.example",
+      "resource": "http://jarvis.local:8795",
+      "metadata_url": "http://jarvis.local:8795/.well-known/oauth-protected-resource"
+    },
     "tokens": {"active": 1, "revoked": 0},
     "codex_wired": false,
     "codex_wired_reason": "worker Codex sessions do not currently inject the Jarvis MCP serve endpoint"
@@ -144,7 +151,10 @@ config fallback responses report `stale: true`.
 ```
 
 `serve.configured` means the MCP serve token store exists. `serve.tokens` is a
-count only. `codex_wired` is reported, not enforced: today
+count only. `serve.auth_mode` reports `MCP_SERVE_AUTH_MODE`; `serve.oauth`
+reports whether the OAuth protected-resource lane is fully configured plus the
+operator-configured issuer/resource discovery URLs. These URLs are not secrets.
+`codex_wired` is reported, not enforced: today
 the worker Codex provider starts `codex app-server --stdio` and does not inject
 the Jarvis MCP serve endpoint into Codex session config, so it reports `false`.
 
@@ -1889,6 +1899,12 @@ full projection; filtering clients should ignore rows they do not care about.
 
 Future API changes should be appended here with date, schema version, compatible
 or breaking status, and migration notes.
+
+### 2026-07-06 - MCP serve OAuth status projection (compatible)
+
+- Added `serve.auth_mode` and `serve.oauth` to `GET /v1/mcp/status` so
+  cockpits can display the configured MCP serve auth lane and OAuth discovery
+  URLs without exposing token-store paths or JWKS internals.
 
 ### 2026-07-06 - Thread Archive Controls (compatible)
 

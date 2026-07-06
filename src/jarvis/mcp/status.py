@@ -14,6 +14,11 @@ from jarvis.config import Config
 from jarvis.ids import utc_now
 from jarvis.mcp.bridge import MCPBridge
 from jarvis.mcp_server.tokens import MCPTokenError, MCPTokenRecord, MCPTokenStore
+from jarvis.oauth import (
+    auth_mode,
+    oauth_endpoint_urls_are_secure,
+    protected_resource_metadata_url,
+)
 from jarvis.orchestration.redaction import public_error_message
 
 logger = logging.getLogger(__name__)
@@ -165,12 +170,34 @@ def _serve_contract(cfg: Config) -> dict[str, Any]:
         "configured": token_store_path.exists(),
         "host": cfg.mcp_serve.host,
         "port": int(cfg.mcp_serve.port),
+        "auth_mode": auth_mode(str(cfg.mcp_serve.auth_mode)),
+        "oauth": _serve_oauth_contract(cfg),
         "tokens": tokens,
         "codex_wired": codex_wired,
     }
     if reason:
         body["codex_wired_reason"] = reason
     return body
+
+
+def _serve_oauth_contract(cfg: Config) -> dict[str, Any]:
+    mode = auth_mode(str(cfg.mcp_serve.auth_mode))
+    issuer = str(cfg.mcp_serve.oauth_issuer).strip()
+    jwks_url = str(cfg.mcp_serve.oauth_jwks_url).strip()
+    resource = cfg.mcp_serve.resolved_resource_url
+    configured = bool(
+        mode in {"oauth", "hybrid"}
+        and issuer
+        and jwks_url
+        and resource
+        and oauth_endpoint_urls_are_secure(issuer=issuer, jwks_url=jwks_url)
+    )
+    return {
+        "configured": configured,
+        "issuer": issuer,
+        "resource": resource,
+        "metadata_url": protected_resource_metadata_url(resource),
+    }
 
 
 def _codex_wired() -> tuple[bool, str]:

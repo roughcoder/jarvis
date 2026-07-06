@@ -1828,7 +1828,10 @@ def _cmd_mcp_serve_run(args: argparse.Namespace) -> int:
         if args.port:
             cfg.mcp_serve.port = int(args.port)
         print(f"Serving Jarvis MCP over streamable HTTP at http://{cfg.mcp_serve.host}:{cfg.mcp_serve.port}/mcp")
-        print("Every request must include Authorization: Bearer <mcp-server-token>.")
+        print(
+            "Every request must include Authorization: Bearer <token> "
+            f"(auth_mode={cfg.mcp_serve.auth_mode})."
+        )
         run_http(cfg)
         return 0
     except MCPAccessError as exc:

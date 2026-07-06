@@ -3,18 +3,36 @@
 from __future__ import annotations
 
 import contextvars
+import asyncio
+import json
+import logging
+from importlib.util import find_spec
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
+
+import httpx
 
 from jarvis.brain.capabilities import RequestContext
 from jarvis.config import Config
 from jarvis.mcp_server.adapters import JarvisMCPService, MCPAccessError
 from jarvis.mcp_server.tokens import MCPTokenStore
+from jarvis.oauth import (
+    OAuthTokenValidator,
+    OAuthValidationError,
+    protected_resource_metadata_path,
+    protected_resource_metadata_url,
+    required_scopes,
+)
+from jarvis.users import User, load_users
 
 _REQUEST_CONTEXT: contextvars.ContextVar[RequestContext | None] = contextvars.ContextVar(
     "jarvis_mcp_request_context",
     default=None,
 )
+logger = logging.getLogger(__name__)
+_METADATA_PATH = "/.well-known/oauth-protected-resource"
+_AUTH_MODES = {"legacy", "oauth", "hybrid"}
+_MAX_BEARER_TOKEN_CHARS = 8192
 
 
 @dataclass(frozen=True)
@@ -316,36 +334,176 @@ def run_http(cfg: Config) -> None:
     service = JarvisMCPService(cfg)
     runtime = MCPServerRuntime(service=service)
     mcp = build_mcp(runtime)
-    app = _BearerAuthASGI(mcp.streamable_http_app(), service, cfg.mcp_serve.token_store_path)
+    app = _BearerAuthASGI(mcp.streamable_http_app(), service, cfg)
     bind_host = cfg.mcp_serve.bind_host or cfg.mcp_serve.host
     uvicorn.run(app, host=bind_host, port=cfg.mcp_serve.port, log_level="info")
 
 
 class _BearerAuthASGI:
-    def __init__(self, app: Any, service: JarvisMCPService, token_store_path: str) -> None:
+    def __init__(self, app: Any, service: JarvisMCPService, cfg: Config, *, http_get: Callable[..., Any] | None = None) -> None:
         self.app = app
         self.service = service
-        self.store = MCPTokenStore(token_store_path)
+        self.cfg = cfg
+        self.store = MCPTokenStore(cfg.mcp_serve.token_store_path)
+        self.mode = _strict_auth_mode(str(cfg.mcp_serve.auth_mode))
+        self.resource_url = cfg.mcp_serve.resolved_resource_url
+        self.metadata_path = protected_resource_metadata_path(self.resource_url)
+        self.metadata_url = protected_resource_metadata_url(self.resource_url)
+        self.oauth_issuer = str(cfg.mcp_serve.oauth_issuer).strip()
+        self.oauth_jwks_url = str(cfg.mcp_serve.oauth_jwks_url).strip()
+        self.oauth_scopes = required_scopes(str(cfg.mcp_serve.oauth_required_scopes))
+        self.allow_identity_subject = cfg.mcp_serve.resolved_oauth_allow_identity_subject
+        self.oauth_validator = self._build_oauth_validator(http_get or httpx.get)
+
+    def _build_oauth_validator(self, http_get: Callable[..., Any]) -> OAuthTokenValidator | None:
+        if self.mode not in {"oauth", "hybrid"}:
+            return None
+        oauth_env_present = bool(
+            self.oauth_issuer
+            or self.oauth_jwks_url
+            or str(self.cfg.mcp_serve.resource_url).strip()
+            or str(self.cfg.mcp_serve.oauth_required_scopes).strip()
+        )
+        missing = [
+            name
+            for name, value in {
+                "issuer": self.oauth_issuer,
+                "jwks_url": self.oauth_jwks_url,
+                "resource_url": self.resource_url,
+            }.items()
+            if not str(value).strip()
+        ]
+        if missing:
+            return self._disable_or_fail_oauth(f"missing {', '.join(missing)}", warn=oauth_env_present)
+        if find_spec("jwt") is None:
+            return self._disable_or_fail_oauth("PyJWT[crypto] is not installed", warn=True)
+        try:
+            return OAuthTokenValidator(
+                issuer=self.oauth_issuer,
+                audience=self.resource_url,
+                jwks_url=self.oauth_jwks_url,
+                scopes=self.oauth_scopes,
+                jarvis_user_claim="",
+                default_alg="RS256",
+                jwks_ttl_s=float(self.cfg.mcp_serve.oauth_jwks_ttl_s),
+                jwks_min_refresh_s=float(self.cfg.mcp_serve.oauth_jwks_min_refresh_s),
+                http_get=http_get,
+                require_jarvis_user=False,
+            )
+        except ValueError as exc:
+            return self._disable_or_fail_oauth(str(exc), warn=True)
+
+    def _disable_or_fail_oauth(self, reason: str, *, warn: bool) -> None:
+        if self.mode == "oauth":
+            raise MCPAccessError(f"mcp-serve OAuth is not configured: {reason}")
+        if warn:
+            logger.warning("mcp-serve OAuth disabled: %s", reason)
+        return None
 
     async def __call__(self, scope: dict[str, Any], receive: Callable[[], Awaitable[Any]], send: Callable[[Any], Awaitable[None]]) -> None:
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
-        token = _bearer_token(scope.get("headers") or [])
-        record = self.store.resolve(token)
-        if record is None:
-            await _send_plain(send, 401, "unauthorized")
+        if scope.get("path") in {_METADATA_PATH, self.metadata_path}:
+            await self._send_metadata(send)
             return
+        token = _bearer_token(scope.get("headers") or [])
         try:
-            ctx = self.service.context_for_principal(record.principal)
+            ctx = await self._context_for_token(token)
         except MCPAccessError:
             await _send_plain(send, 403, "principal is not available")
+            return
+        if ctx is None:
+            await self._send_unauthorized(send)
             return
         reset = _REQUEST_CONTEXT.set(ctx)
         try:
             await self.app(scope, receive, send)
         finally:
             _REQUEST_CONTEXT.reset(reset)
+
+    async def _context_for_token(self, token: str) -> RequestContext | None:
+        if self.mode in {"legacy", "hybrid"}:
+            record = self.store.resolve(token)
+            if record is not None:
+                return self.service.context_for_principal(record.principal)
+        if self.mode not in {"oauth", "hybrid"} or self.oauth_validator is None:
+            return None
+        if len(token) > _MAX_BEARER_TOKEN_CHARS:
+            return None
+        try:
+            principal = await asyncio.to_thread(self.oauth_validator.validate, token)
+            users = await asyncio.to_thread(load_users, self.cfg.capabilities.users_dir)
+            user = _user_for_oauth_subject(users, principal.subject, allow_identity=self.allow_identity_subject)
+            return self.service.context_for_principal(user.name)
+        except (OAuthValidationError, MCPAccessError):
+            return None
+
+    async def _send_metadata(self, send: Callable[[Any], Awaitable[None]]) -> None:
+        if not self.oauth_issuer:
+            await _send_plain(send, 404, "not found")
+            return
+        await _send_json(
+            send,
+            200,
+            {
+                "resource": self.resource_url,
+                "authorization_servers": [self.oauth_issuer],
+                "bearer_methods_supported": ["header"],
+                "resource_name": "Jarvis MCP",
+                "scopes_supported": list(self.oauth_scopes),
+            },
+        )
+
+    async def _send_unauthorized(self, send: Callable[[Any], Awaitable[None]]) -> None:
+        await _send_plain(
+            send,
+            401,
+            "unauthorized",
+            extra_headers=self._challenge_headers if self._challenge_enabled else None,
+        )
+
+    @property
+    def _challenge_enabled(self) -> bool:
+        return self.mode in {"oauth", "hybrid"} and bool(self.oauth_issuer)
+
+    @property
+    def _challenge_headers(self) -> list[tuple[bytes, bytes]]:
+        value = f'Bearer resource_metadata="{self.metadata_url}"'
+        return [(b"www-authenticate", value.encode("ascii"))]
+
+
+def _strict_auth_mode(value: str) -> str:
+    mode = value.strip().lower()
+    if mode not in _AUTH_MODES:
+        raise MCPAccessError(
+            f"invalid MCP_SERVE_AUTH_MODE {value!r}; expected legacy, oauth, or hybrid"
+        )
+    return mode
+
+
+def _user_for_oauth_subject(users: dict[str, User], subject: str, *, allow_identity: bool) -> User:
+    subject_matches: dict[str, User] = {}
+    for user in users.values():
+        if subject in user.oauth_subjects:
+            subject_matches[user.name] = user
+    if len(subject_matches) > 1:
+        logger.error("mcp-serve OAuth subject maps to multiple users subject=%s", subject)
+        raise OAuthValidationError("duplicate subject mapping")
+    if subject_matches:
+        return next(iter(subject_matches.values()))
+    if not allow_identity:
+        raise OAuthValidationError("unknown subject")
+    identity_matches: dict[str, User] = {}
+    for key, user in users.items():
+        if subject in {key, user.name}:
+            identity_matches[user.name] = user
+    if len(identity_matches) > 1:
+        logger.error("mcp-serve OAuth subject maps to multiple users subject=%s", subject)
+        raise OAuthValidationError("duplicate subject mapping")
+    if not identity_matches:
+        raise OAuthValidationError("unknown subject")
+    return next(iter(identity_matches.values()))
 
 
 def _bearer_token(headers: list[tuple[bytes, bytes]]) -> str:
@@ -358,16 +516,40 @@ def _bearer_token(headers: list[tuple[bytes, bytes]]) -> str:
     return ""
 
 
-async def _send_plain(send: Callable[[Any], Awaitable[None]], status: int, text: str) -> None:
-    body = text.encode("utf-8")
+async def _send_json(send: Callable[[Any], Awaitable[None]], status: int, data: dict[str, Any]) -> None:
+    body = json.dumps(data, separators=(",", ":")).encode("utf-8")
     await send(
         {
             "type": "http.response.start",
             "status": status,
             "headers": [
-                (b"content-type", b"text/plain; charset=utf-8"),
+                (b"content-type", b"application/json"),
                 (b"content-length", str(len(body)).encode("ascii")),
             ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
+
+
+async def _send_plain(
+    send: Callable[[Any], Awaitable[None]],
+    status: int,
+    text: str,
+    *,
+    extra_headers: list[tuple[bytes, bytes]] | None = None,
+) -> None:
+    body = text.encode("utf-8")
+    headers = [
+        (b"content-type", b"text/plain; charset=utf-8"),
+        (b"content-length", str(len(body)).encode("ascii")),
+    ]
+    if extra_headers:
+        headers.extend(extra_headers)
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status,
+            "headers": headers,
         }
     )
     await send({"type": "http.response.body", "body": body})
