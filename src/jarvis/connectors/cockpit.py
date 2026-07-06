@@ -12,7 +12,7 @@ import asyncio
 import json
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +54,9 @@ class CockpitThread:
     created_at: str
     updated_at: str
     created_by: str
+    archived_at: str = ""
+    archived_by: str = ""
+    archive_reason: str = ""
     messages: tuple[dict[str, str], ...] = ()
 
     @classmethod
@@ -66,6 +69,9 @@ class CockpitThread:
             created_at=str(data.get("created_at") or ""),
             updated_at=str(data.get("updated_at") or ""),
             created_by=str(data.get("created_by") or ""),
+            archived_at=str(data.get("archived_at") or ""),
+            archived_by=str(data.get("archived_by") or ""),
+            archive_reason=str(data.get("archive_reason") or ""),
             messages=tuple(
                 {
                     "role": str(item.get("role") or ""),
@@ -87,6 +93,9 @@ class CockpitThread:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "created_by": self.created_by,
+            "archived_at": self.archived_at,
+            "archived_by": self.archived_by,
+            "archive_reason": self.archive_reason,
         }
         if include_messages:
             data["messages"] = [dict(message) for message in self.messages]
@@ -97,9 +106,13 @@ class CockpitThreadIndex:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser()
 
-    def list(self, project_id: str) -> list[CockpitThread]:
+    def list(self, project_id: str, *, include_archived: bool = False) -> list[CockpitThread]:
         return sorted(
-            [thread for thread in self._threads().values() if thread.project_id == project_id],
+            [
+                thread
+                for thread in self._threads().values()
+                if thread.project_id == project_id and (include_archived or not thread.archived_at)
+            ],
             key=lambda thread: thread.updated_at or thread.created_at,
             reverse=True,
         )
@@ -116,6 +129,29 @@ class CockpitThreadIndex:
         threads[thread.thread_id] = thread.as_dict(include_messages=True)
         _atomic_write_json(self.path, data)
         return thread
+
+    def set_archived(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        archived: bool,
+        by: str = "",
+        reason: str = "",
+    ) -> CockpitThread | None:
+        thread = self.get(project_id, thread_id)
+        if thread is None:
+            return None
+        if archived and thread.archived_at:
+            return thread
+        archive_reason = reason.strip()[:500]
+        updated = replace(
+            thread,
+            archived_at=utc_now() if archived else "",
+            archived_by=by if archived else "",
+            archive_reason=archive_reason if archived else "",
+        )
+        return self.save(updated)
 
     def append_turn(
         self,
@@ -142,15 +178,16 @@ class CockpitThreadIndex:
                 "observed_at": observed_at,
             },
         ][-THREAD_HISTORY_LIMIT:]
+        stored = self.get(thread.project_id, thread.thread_id)
+        archive_source = stored or thread
         return self.save(
-            CockpitThread(
-                thread_id=thread.thread_id,
-                project_id=thread.project_id,
-                session_id=thread.session_id,
+            replace(
+                thread,
                 title=thread.title or _thread_title(user_text),
-                created_at=thread.created_at,
                 updated_at=observed_at,
-                created_by=thread.created_by,
+                archived_at=archive_source.archived_at,
+                archived_by=archive_source.archived_by,
+                archive_reason=archive_source.archive_reason,
                 messages=tuple(messages),
             )
         )
@@ -242,8 +279,14 @@ class CockpitConnector:
     def index(self) -> CockpitThreadIndex:
         return self._index
 
-    def list_threads(self, project: ProjectEntry) -> list[CockpitThread]:
-        return self._index.list(project.id)
+    def list_threads(self, project: ProjectEntry, *, include_archived: bool = False) -> list[CockpitThread]:
+        return self._index.list(project.id, include_archived=include_archived)
+
+    def archive_thread(self, project: ProjectEntry, thread_id: str, *, by: str = "", reason: str = "") -> CockpitThread | None:
+        return self._index.set_archived(project.id, thread_id, archived=True, by=by, reason=reason)
+
+    def unarchive_thread(self, project: ProjectEntry, thread_id: str) -> CockpitThread | None:
+        return self._index.set_archived(project.id, thread_id, archived=False)
 
     async def open_thread(
         self,

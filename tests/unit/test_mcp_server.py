@@ -10,6 +10,7 @@ import pytest
 from jarvis.brain.memory_client import RepresentationRecord
 from jarvis.brain.memory_outbox import CurationOutbox
 from jarvis.brain.project_management import ProjectOperationError
+from jarvis.brain.registry import ProjectEntry
 from jarvis.config import Config
 from jarvis.mcp_server.adapters import (
     MCPAccessError,
@@ -126,6 +127,7 @@ def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
             [
                 f"CAPS_USERS_DIR={tmp_path / 'users'}",
                 "CAPS_DEFAULT_CAPABILITIES=",
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
                 f"REGISTRY_PATH={tmp_path / 'registry.json'}",
                 "MEMORY_BACKEND=v3",
                 f"MEMORY_CACHE_PATH={tmp_path / 'cache.json'}",
@@ -466,6 +468,80 @@ def test_send_turn_persists_messages_with_mcp_channel(tmp_path, monkeypatch) -> 
     persisted = [message for message in memory.messages if message["session_id"] == thread.session_id]
     assert [message["metadata"]["channel"] for message in persisted] == ["mcp", "mcp"]
     assert [message["metadata"]["role"] for message in persisted] == ["user", "assistant"]
+
+
+def test_mcp_archive_unarchive_thread_roundtrip(tmp_path, monkeypatch) -> None:
+    cfg = _cfg(tmp_path, monkeypatch)
+    memory = FakeMemory()
+    connector = MCPCockpitConnector(cfg, memory=memory, gateway=FakeGateway())
+    service = JarvisMCPService(cfg, memory=memory, cockpit=connector)
+    ctx = service.context_for_principal("neil")
+    project = service.registry.get_project("jarvis")
+    thread = asyncio.run(connector.open_thread(project, ctx, title="MCP archive"))
+
+    archived = asyncio.run(
+        service.archive_thread(
+            ctx,
+            project_id="jarvis",
+            thread_id=thread.thread_id,
+            reason="done",
+        )
+    )
+    with pytest.raises(MCPAccessError, match="thread is archived"):
+        asyncio.run(service.send_turn(ctx, project_id="jarvis", thread_id=thread.thread_id, text="continue"))
+    unarchived = asyncio.run(service.unarchive_thread(ctx, project_id="jarvis", thread_id=thread.thread_id))
+
+    assert archived["thread"]["archived_at"]
+    assert archived["thread"]["archived_by"] == "neil"
+    assert archived["thread"]["archive_reason"] == "done"
+    assert unarchived["thread"]["archived_at"] == ""
+    assert unarchived["thread"]["archived_by"] == ""
+    assert unarchived["thread"]["archive_reason"] == ""
+
+
+def test_mcp_archive_thread_requires_project_membership(tmp_path, monkeypatch) -> None:
+    cfg = _cfg(tmp_path, monkeypatch)
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+    service.registry.create_project(
+        ProjectEntry(
+            id="household-thread",
+            name="Household Thread",
+            owner="neil",
+            members=("neil",),
+            visibility="household",
+        )
+    )
+    ctx = service.context_for_principal("viewer")
+    visible = asyncio.run(service.project_get(ctx, project_id="household-thread"))
+    assert visible["project"]["id"] == "household-thread"
+
+    with pytest.raises(MCPAccessError, match="not editable"):
+        asyncio.run(
+            service.archive_thread(
+                ctx,
+                project_id="household-thread",
+                thread_id="thread_any",
+                reason="done",
+            )
+        )
+    with pytest.raises(MCPAccessError, match="not editable"):
+        asyncio.run(service.unarchive_thread(ctx, project_id="household-thread", thread_id="thread_any"))
+
+
+def test_mcp_archive_thread_requires_visible_project(tmp_path, monkeypatch) -> None:
+    cfg = _cfg(tmp_path, monkeypatch)
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+    ctx = service.context_for_principal("viewer")
+
+    with pytest.raises(MCPAccessError, match="project not found"):
+        asyncio.run(
+            service.archive_thread(
+                ctx,
+                project_id="private",
+                thread_id="thread_missing",
+                reason="done",
+            )
+        )
 
 
 def test_mcp_request_context_is_set_and_cleared_per_request(tmp_path, monkeypatch) -> None:

@@ -122,6 +122,8 @@ DELETE /v1/projects/{id}/files/{doc_id}
 GET /v1/projects/{id}/threads
 POST /v1/projects/{id}/threads
 POST /v1/projects/{id}/threads/{tid}/turns
+POST /v1/projects/{id}/threads/{tid}/archive
+POST /v1/projects/{id}/threads/{tid}/unarchive
 ```
 
 Projects are read from the Jarvis registry, not Honcho. The cockpit never talks
@@ -375,13 +377,16 @@ session named:
 project:<project-id>:orchestrator:<thread-id>
 ```
 
-Thread list/open/post routes use the same authenticated requester derivation and
-project membership gate as project reads. Invisible projects are returned as
-`404 not_found`; the Cockpit cannot distinguish a missing project from a project
-outside the caller's visibility set.
+Thread list/open/post/archive routes use the same authenticated requester
+derivation and project membership gate as project reads and content writes.
+Invisible projects are returned as `404 not_found`; the Cockpit cannot
+distinguish a missing project from a project outside the caller's visibility
+set. Archive/unarchive is member-gated thread content work, not owner-only
+project administration.
 
 `GET /v1/projects/{id}/threads` returns Jarvis's local thread index for the
-project:
+project. Archived threads are hidden by default; pass
+`?include_archived=true` or `?include_archived=1` to include them:
 
 ```json
 {
@@ -396,7 +401,10 @@ project:
       "title": "Planning",
       "created_at": "2026-07-05T09:00:00+00:00",
       "updated_at": "2026-07-05T09:00:00+00:00",
-      "created_by": "neil"
+      "created_by": "neil",
+      "archived_at": "",
+      "archived_by": "",
+      "archive_reason": ""
     }
   ]
 }
@@ -424,6 +432,59 @@ The turn is driven by the shared `BrainSession.respond_text` core under the
 requester's capabilities with the active project set. Context is assembled live
 at turn start from the registry entry, live/cached project representation,
 recent `finding`/`decision` conclusions, and the recent thread transcript.
+Turns on archived threads are rejected before streaming starts:
+
+```json
+{
+  "error": {
+    "code": "thread_archived",
+    "message": "thread is archived",
+    "recoverable": true
+  }
+}
+```
+
+The status is `409`; callers must explicitly unarchive first.
+
+`POST /v1/projects/{id}/threads/{tid}/archive` accepts:
+
+```json
+{"reason": "superseded by release thread", "idempotency_key": "optional-key"}
+```
+
+`reason` is optional, trimmed, stored verbatim, and capped at about 500
+characters. Re-archiving an already archived thread succeeds without changing
+`archived_at`, `archived_by`, or `archive_reason`.
+
+`POST /v1/projects/{id}/threads/{tid}/unarchive` accepts:
+
+```json
+{"idempotency_key": "optional-key"}
+```
+
+It clears `archived_at`, `archived_by`, and `archive_reason`. Both archive
+routes return the same envelope as opening a thread:
+
+```json
+{
+  "ok": true,
+  "api_version": "v1",
+  "schema_version": 1,
+  "project_id": "jarvis",
+  "thread": {
+    "thread_id": "thread_...",
+    "project_id": "jarvis",
+    "session_id": "project:jarvis:orchestrator:thread_...",
+    "title": "Planning",
+    "created_at": "2026-07-05T09:00:00+00:00",
+    "updated_at": "2026-07-05T09:00:00+00:00",
+    "created_by": "neil",
+    "archived_at": "2026-07-06T10:00:00+00:00",
+    "archived_by": "neil",
+    "archive_reason": "superseded by release thread"
+  }
+}
+```
 
 Lane 1 thread persistence writes the human message as the requester peer and the
 reply as `jarvis` to the named session. Shared project memory updates remain
@@ -1291,6 +1352,15 @@ view.
 
 Future API changes should be appended here with date, schema version, compatible
 or breaking status, and migration notes.
+
+### 2026-07-06 - Thread Archive Controls (compatible)
+
+- Added `POST /v1/projects/{id}/threads/{tid}/archive` and `/unarchive`.
+  Archived threads remain addressable but are hidden from default thread lists.
+- Added `?include_archived=true|1` to thread lists and added `archived_at`,
+  `archived_by`, and `archive_reason` to thread projections.
+- Documented member-gating for thread archive/unarchive and the `409
+  thread_archived` turn rejection.
 
 ### 2026-07-04 - v1 PR review hardening (compatible)
 
