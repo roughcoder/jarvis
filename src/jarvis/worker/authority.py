@@ -100,7 +100,7 @@ class WorkerSessionAuthority:
 
     def claude_tool_denial(self, tool_name: str) -> str:
         name = str(tool_name or "").strip()
-        if self.codex_sandbox == "read-only" and _claude_tool_may_write_or_execute(name):
+        if self.codex_sandbox == "read-only" and not _claude_tool_is_read_only(name):
             return f"worker session is read-only; refusing Claude tool {name or '<unknown>'}"
         if self.codex_sandbox != "read-only" and not self.can_resolve_approval:
             return f"worker session lacks {WORKER_SESSION_APPROVE}; refusing Claude tool {name or '<unknown>'}"
@@ -121,19 +121,10 @@ def _string_list(value: Any) -> list[str]:
     return [str(item) for item in value if str(item)]
 
 
-def _claude_tool_may_write_or_execute(tool_name: str) -> bool:
+def _claude_tool_is_read_only(tool_name: str) -> bool:
     name = tool_name.strip()
     if not name:
-        return True
-    base = name.rsplit("__", 1)[-1] if name.startswith("mcp__") else name
-    return base in {
-        "Agent",
-        "Bash",
-        "Edit",
-        "ExitPlanMode",
-        "MultiEdit",
-        "NotebookEdit",
-        "Task",
-        "TodoWrite",
-        "Write",
-    }
+        return False
+    if name.startswith("mcp__"):
+        return False
+    return name in {"AskUserQuestion", "Glob", "Grep", "Read", "WebFetch", "WebSearch"}

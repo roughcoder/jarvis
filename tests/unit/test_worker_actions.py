@@ -304,6 +304,7 @@ def test_claude_state_file_is_indeterminate_without_credentials(monkeypatch, tmp
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("CLAUDE_API_KEY", raising=False)
     monkeypatch.setattr(actions.pathlib.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(actions, "_claude_sdk_auth_probe", lambda _binary: None)
 
     row = actions._claude_auth()  # noqa: SLF001
 

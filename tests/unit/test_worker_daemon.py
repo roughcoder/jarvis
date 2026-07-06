@@ -306,6 +306,12 @@ def test_worker_session_authority_maps_read_only_to_codex_read_only() -> None:
     assert authority.codex_approval_policy == "never"
     assert authority.claude_permission_mode == "plan"
     assert authority.claude_tool_denial("Bash")
+    assert authority.claude_tool_denial("mcp__github__create_issue")
+    assert authority.claude_tool_denial("FutureClaudeTool")
+    assert authority.claude_tool_denial("")
+    assert authority.claude_tool_denial("Read") == ""
+    assert authority.claude_tool_denial("Grep") == ""
+    assert authority.claude_tool_denial("AskUserQuestion") == ""
 
 
 def test_worker_session_authority_maps_branch_only_to_workspace_write() -> None:
@@ -2579,7 +2585,8 @@ def test_daemon_claude_provider_projects_sdk_events_and_reuses_stream(tmp_path, 
     assert _FakeClaudeClient.instances[0].queries == ["reply with hello", "resume and reply again"]
     assert _FakeClaudeClient.instances[0].options.kwargs["session_id"]
     assert _FakeClaudeClient.instances[0].options.kwargs["resume"] is None
-    assert _FakeClaudeClient.instances[0].options.kwargs["setting_sources"] == []
+    assert _FakeClaudeClient.instances[0].options.kwargs["system_prompt"] == {"type": "preset", "preset": "claude_code"}
+    assert _FakeClaudeClient.instances[0].options.kwargs["setting_sources"] is None
     assert _FakeClaudeClient.instances[0].response_exhausted == 2
 
 
