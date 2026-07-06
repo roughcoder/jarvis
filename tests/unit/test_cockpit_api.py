@@ -4447,6 +4447,25 @@ def test_cockpit_workers_probe_surfaces_health_published_repositories(tmp_path, 
                     "agent": "codex",
                     "supported_engines": ["codex", "claude"],
                     "repositories": [{"repo": "jarvis", "default_branch": "main", "status": "ready"}],
+                    "diagnostics": {
+                        "engines": [
+                            {
+                                "engine": "codex",
+                                "installed": True,
+                                "authenticated": True,
+                                "version": "codex 1.2.3",
+                                "detail": "/Users/neil/.codex/auth.json present",
+                            }
+                        ],
+                        "package_managers": [{"name": "uv", "available": True}],
+                        "browser": {
+                            "available": False,
+                            "nodriver_installed": True,
+                            "chrome_found": False,
+                            "detail": "/Applications/Google Chrome.app missing",
+                        },
+                        "repositories": [{"repo": "jarvis", "default_branch": "main", "status": "ready"}],
+                    },
                 }
             )
         return _fake_get("")(url, **kwargs)
@@ -4462,6 +4481,12 @@ def test_cockpit_workers_probe_surfaces_health_published_repositories(tmp_path, 
     assert worker["repositories"] == [
         {"repo": "jarvis", "status": "ready", "default_branch": "main", "is_default": False, "can_start_work": True}
     ]
+    assert worker["readiness"]["engines"][0]["installed"] is True
+    assert worker["readiness"]["engines"][0]["authenticated"] is True
+    assert worker["readiness"]["package_managers"] == [{"name": "uv", "available": True}]
+    assert worker["readiness"]["browser"]["available"] is False
+    assert "/Users/neil" not in json.dumps(worker["readiness"])
+    assert "/Applications/" not in json.dumps(worker["readiness"])
 
 
 def test_cockpit_work_validate_reports_selection_without_creating_a_run(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -4487,9 +4512,68 @@ def test_cockpit_work_validate_reports_selection_without_creating_a_run(tmp_path
     assert validation["worker_id"] == "macbook-worker"
     assert validation["engine"] == "codex"
     assert validation["repo"] == "roughcoder/jarvis"
+    assert validation["compatibility"]["repo"] == "roughcoder/jarvis"
+    assert validation["compatibility"]["selected_worker_id"] == "macbook-worker"
+    assert validation["compatibility"]["workers"] == [
+        {"worker_id": "macbook-worker", "eligible": True, "reasons": ["selected"]}
+    ]
     assert validation["missing"] == []
     assert validation["missing_authority"] == []
     assert OrchestrationStore(cfg.orchestration.workspace).list_runs() == []
+
+
+def test_cockpit_work_validate_reports_worker_repo_compatibility(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    caps = "worker.job.start,worker.session.create,worker.session.turn,forge.github.branch.push"
+    cfg = _cfg(tmp_path, monkeypatch, caps=caps)
+    workers_path = Path(cfg.orchestration.workers_path)
+    workers_path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "macbook-worker",
+                        "display_name": "MacBook Pro",
+                        "base_url": "http://worker-a.test",
+                        "capabilities": ["git", "codex"],
+                        "status": "online",
+                        "supported_engines": ["codex"],
+                        "repositories": [{"repo": "jarvis", "status": "ready", "default_branch": "main"}],
+                    },
+                    {
+                        "worker_id": "hive-worker",
+                        "display_name": "Hive",
+                        "base_url": "http://worker-b.test",
+                        "capabilities": ["git", "codex"],
+                        "status": "online",
+                        "supported_engines": ["codex"],
+                        "repositories": [{"repo": "other", "status": "ready", "default_branch": "main"}],
+                    },
+                ]
+            }
+        )
+    )
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        response = await client.post(
+            f"{base}/v1/work/validate",
+            json={"source": "manual", "repo": "roughcoder/jarvis", "phrase": "Build a cockpit smoke"},
+        )
+        assert response.status_code == 200
+        return response.json()
+
+    import asyncio
+
+    validation = asyncio.run(_with_server(cfg, calls, http_get=_fake_get("")))["validation"]
+
+    assert validation["compatibility"] == {
+        "repo": "roughcoder/jarvis",
+        "selected_worker_id": "macbook-worker",
+        "workers": [
+            {"worker_id": "macbook-worker", "eligible": True, "reasons": ["selected"]},
+            {"worker_id": "hive-worker", "eligible": False, "reasons": ["repo not checked out"]},
+        ],
+    }
 
 
 def test_cockpit_work_validate_flags_missing_repo_without_side_effects(tmp_path, monkeypatch) -> None:  # noqa: ANN001

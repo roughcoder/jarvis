@@ -318,6 +318,7 @@ class WorkerProfile:
     engine_supports: dict[str, dict[str, bool]] = field(default_factory=dict)
     system: dict[str, Any] = field(default_factory=dict)
     repositories: list[dict[str, Any]] = field(default_factory=list)
+    readiness: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.default_engine = default_engine(self.default_engine or self.agent, self.supported_engines)
@@ -328,6 +329,8 @@ class WorkerProfile:
         if not isinstance(self.repositories, list):
             self.repositories = []
         self.repositories = [dict(item) for item in self.repositories if isinstance(item, dict) and (item.get("repo") or item.get("name"))]
+        if self.readiness is not None and not isinstance(self.readiness, dict):
+            self.readiness = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> WorkerProfile:
@@ -354,5 +357,6 @@ class WorkerProfile:
             "supported_engines": self.supported_engines,
             "engine_supports": self.engine_supports,
             "system": self.system,
+            "readiness": self.readiness,
             "token_set": self.token_set,
         }

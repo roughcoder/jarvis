@@ -726,6 +726,24 @@ def test_daemon_health_returns_system_block_only_for_authorized_callers(tmp_path
     assert private_health["system"]["hostname"] == "worker-laptop"
 
 
+def test_daemon_health_reports_diagnostics_error_without_500(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    monkeypatch.setattr(
+        "jarvis.worker.server.diagnostics",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("diagnostics failed")),
+    )
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"))
+
+    async def calls(base, c):  # noqa: ANN001
+        response = await c.get(base + "/health")
+        return response.status_code, response.json()
+
+    status, health = asyncio.run(_with_server(cfg, 8848, calls))
+
+    assert status == 200
+    assert health["ok"] is True
+    assert health["diagnostics"]["error"] == "diagnostics failed"
+
+
 def test_daemon_shell_uses_expanded_default_workspace(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))

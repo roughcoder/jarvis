@@ -69,6 +69,15 @@ class StartedWork:
     sessions: list[WorkerSessionLink] = field(default_factory=list)
 
 
+@dataclass
+class WorkerSelection:
+    worker: WorkerProfile | None
+    engine: str
+    engines: list[str]
+    compatibility: dict[str, Any]
+    capacity_only: bool = False
+
+
 class OrchestrationService:
     def __init__(
         self,
@@ -159,58 +168,71 @@ class OrchestrationService:
         item: WorkItem,
         registry: WorkerRegistry,
     ) -> tuple[WorkerProfile, str, list[str]]:
-        target_engine = normalize_engine_id(_first_engine(command.target_engine_id))
-        requested_engines = _requested_engines(command)
-        if command.target_worker_id:
-            worker = registry.get(command.target_worker_id, probe=True)
-        elif command.engine_strategy == "ensemble" and requested_engines:
-            worker = registry.choose(item.capability_requirements, engines=requested_engines, slots=len(requested_engines))
-        elif command.engine_strategy == "ensemble":
-            worker = _choose_ensemble_worker(registry, item.capability_requirements, requested_engines)
-        elif target_engine:
-            worker = registry.choose(item.capability_requirements, engine=target_engine)
-        else:
-            worker = registry.choose(item.capability_requirements)
-        engine = target_engine or (worker.default_engine if worker else "") or (worker.agent if worker else "")
-        engines = _target_engines(command, worker, fallback_engine=engine) if worker is not None else []
-        required_slots = len(engines) if command.engine_strategy == "ensemble" else 1
-        if worker is None or not _worker_is_eligible(
-            worker,
-            item.capability_requirements,
-            engine=target_engine if command.engine_strategy != "ensemble" else "",
-            required_slots=required_slots,
-        ):
-            if worker is not None and _capacity_is_only_blocker(worker, item, target_engine, required_slots):
+        selection = self._explain_worker_selection(command, item, registry)
+        if selection.worker is None:
+            if selection.capacity_only:
                 raise WorkerCapacityError("All eligible workers are at capacity.")
-            self._raise_no_worker(registry, item, requested_engines or ([target_engine] if target_engine else []), required_slots)
-        if any(not worker_supports_engine(worker.supported_engines, target) for target in engines):
             raise NoEligibleWorkerError("No eligible worker found.")
-        if command.engine_strategy == "ensemble" and worker.current_jobs + len(engines) > worker.max_concurrent_jobs:
-            raise WorkerCapacityError("All eligible workers are at capacity.")
-        return worker, engine, engines
+        return selection.worker, selection.engine, selection.engines
 
-    def _raise_no_worker(
+    def _explain_worker_selection(
         self,
-        registry: WorkerRegistry,
+        command: WorkCommand,
         item: WorkItem,
-        engines: list[str],
-        required_slots: int,
-    ) -> None:
-        # Distinguish "nothing can do this work" from "something can, but it is
-        # busy" so the cockpit can offer retry instead of reconfiguration.
-        # Probe so current_jobs reflects live worker state, matching what
-        # choose() saw — static profile rows understate load.
-        required_set = set(item.capability_requirements or [])
-        for profile in registry.profiles(probe=True):
-            if profile.status == "offline":
-                continue
-            if not required_set.issubset(set(profile.capabilities)):
-                continue
-            if any(not worker_supports_engine(profile.supported_engines, target) for target in engines if target):
-                continue
-            if profile.current_jobs + max(1, required_slots) > profile.max_concurrent_jobs:
-                raise WorkerCapacityError("All eligible workers are at capacity.")
-        raise NoEligibleWorkerError("No eligible worker found.")
+        registry: WorkerRegistry,
+    ) -> WorkerSelection:
+        target_engine = normalize_engine_id(_first_engine(command.target_engine_id))
+        profiles = registry.profiles(probe=True)
+        selected: WorkerProfile | None = None
+        selected_engine = ""
+        selected_engines: list[str] = []
+        rows = []
+        capacity_only = False
+        any_eligible_except_capacity = False
+        for worker in profiles:
+            reasons, engines, required_slots = _worker_exclusion_reasons(
+                worker,
+                item,
+                command,
+                target_engine=target_engine,
+            )
+            if command.target_worker_id and worker.worker_id != command.target_worker_id:
+                reasons.append("different worker requested")
+            eligible = not reasons
+            if reasons == ["worker at capacity"]:
+                any_eligible_except_capacity = True
+            if eligible and selected is None:
+                selected = worker
+                selected_engines = engines
+                selected_engine = target_engine or (worker.default_engine or worker.agent)
+                reasons = ["selected"]
+            elif eligible:
+                reasons = ["eligible"]
+            rows.append(
+                {
+                    "worker_id": worker.worker_id,
+                    "eligible": eligible,
+                    "reasons": [_public_reason(reason) for reason in reasons],
+                }
+            )
+            if worker.current_jobs + max(1, required_slots) > worker.max_concurrent_jobs and not [
+                reason for reason in reasons if reason != "worker at capacity"
+            ]:
+                any_eligible_except_capacity = True
+        if selected is None and any_eligible_except_capacity:
+            capacity_only = True
+        compatibility = {
+            "repo": item.repo or None,
+            "workers": rows,
+            "selected_worker_id": selected.worker_id if selected else None,
+        }
+        return WorkerSelection(
+            worker=selected,
+            engine=selected_engine,
+            engines=selected_engines,
+            compatibility=compatibility,
+            capacity_only=capacity_only,
+        )
 
     def validate_work(self, command: WorkCommand, *, manual_item: WorkItem | None = None) -> dict[str, Any]:
         """Dry-run a start intent: resolve repo/worker/engine and report anything
@@ -245,6 +267,7 @@ class OrchestrationService:
                 if note == "no eligible work item found in the source":
                     reasons.append(note)
         repo = item.repo or self._repo(command)
+        item.repo = repo
         missing = [] if repo else ["repo"]
         owned_by = ""
         if manual_item is not None or work_item is not None:
@@ -258,11 +281,20 @@ class OrchestrationService:
         engine = ""
         engines: list[str] = []
         registry = WorkerRegistry(self.cfg.worker, profiles_path=self.cfg.orchestration.workers_path)
-        try:
-            worker, engine, engines = self._select_worker_and_engines(command, item, registry)
-            worker_id = worker.worker_id
-        except NoEligibleWorkerError as exc:
-            reasons.append(str(exc) or "No eligible worker found.")
+        selection = self._explain_worker_selection(command, item, registry)
+        if selection.worker is not None:
+            worker_id = selection.worker.worker_id
+            engine = selection.engine
+            engines = selection.engines
+        else:
+            reasons.append(
+                "All eligible workers are at capacity."
+                if selection.capacity_only
+                else "No eligible worker found."
+            )
+        compatibility = selection.compatibility
+        compatibility["repo"] = repo or None
+        compatibility["selected_worker_id"] = worker_id or None
         if missing_authority:
             reasons.append(f"missing authority: {', '.join(missing_authority)}")
         if missing:
@@ -280,6 +312,7 @@ class OrchestrationService:
             "engine_strategy": command.engine_strategy,
             "landing_mode": self.cfg.orchestration.landing_mode,
             "work_item": work_item,
+            "compatibility": compatibility,
             "missing": missing,
             "missing_authority": missing_authority,
             "reasons": reasons,
@@ -401,16 +434,6 @@ class OrchestrationService:
         return str(command.filters.get("repo") or self.cfg.orchestration.default_repo)
 
 
-def _capacity_is_only_blocker(worker: WorkerProfile, item: WorkItem, engine: str, required_slots: int) -> bool:
-    if worker.status == "offline":
-        return False
-    if engine and not worker_supports_engine(worker.supported_engines, engine):
-        return False
-    if not set(item.capability_requirements or []).issubset(set(worker.capabilities)):
-        return False
-    return worker.current_jobs + max(1, required_slots) > worker.max_concurrent_jobs
-
-
 def _worker_is_eligible(
     worker: WorkerProfile,
     required: list[str] | None = None,
@@ -427,24 +450,81 @@ def _worker_is_eligible(
     return set(required or []).issubset(set(worker.capabilities))
 
 
-def _choose_ensemble_worker(
-    registry: WorkerRegistry,
-    required: list[str] | None,
-    requested_engines: list[str],
-) -> WorkerProfile | None:
-    required_set = set(required or [])
-    for worker in registry.profiles(probe=True):
-        if worker.status == "offline":
+def _worker_exclusion_reasons(
+    worker: WorkerProfile,
+    item: WorkItem,
+    command: WorkCommand,
+    *,
+    target_engine: str,
+) -> tuple[list[str], list[str], int]:
+    engines = _worker_target_engines(worker, command, target_engine)
+    required_slots = len(engines) if command.engine_strategy == "ensemble" else 1
+    reasons: list[str] = []
+    if worker.status == "offline":
+        reasons.append("worker offline")
+    required_set = set(item.capability_requirements or [])
+    missing_caps = sorted(required_set - set(worker.capabilities))
+    for capability in missing_caps:
+        reasons.append(f"missing capability {capability}")
+    repo_reason = _repo_compatibility_reason(worker, item.repo)
+    if repo_reason:
+        reasons.append(repo_reason)
+    for engine in engines:
+        if not worker_supports_engine(worker.supported_engines, engine):
+            reasons.append(f"engine {engine} unsupported")
             continue
-        if not required_set.issubset(set(worker.capabilities)):
+        engine_reason = _engine_readiness_reason(worker, engine)
+        if engine_reason:
+            reasons.append(engine_reason)
+    if worker.current_jobs + max(1, required_slots) > worker.max_concurrent_jobs:
+        reasons.append("worker at capacity")
+    return reasons, engines, required_slots
+
+
+def _worker_target_engines(worker: WorkerProfile, command: WorkCommand, target_engine: str) -> list[str]:
+    fallback = normalize_engine_id(worker.default_engine or worker.agent)
+    if command.engine_strategy == "ensemble":
+        return _requested_engines(command) or _unique_engines(worker.supported_engines or [fallback])
+    return [target_engine or fallback]
+
+
+def _repo_compatibility_reason(worker: WorkerProfile, repo: str) -> str:
+    if not repo:
+        return ""
+    if worker.readiness is None and not worker.repositories:
+        return ""
+    repo_name = repo.rsplit("/", 1)[-1]
+    for row in worker.repositories:
+        candidate = str(row.get("repo") or row.get("name") or "")
+        if candidate not in {repo, repo_name}:
             continue
-        fallback = normalize_engine_id(worker.default_engine or worker.agent)
-        engines = requested_engines or _unique_engines(worker.supported_engines or [fallback])
-        if any(not worker_supports_engine(worker.supported_engines, engine) for engine in engines):
+        status = str(row.get("status") or "ready")
+        if status != "ready":
+            detail = public_error_message(str(row.get("detail") or ""))
+            return f"repo checkout broken: {detail}" if detail else "repo checkout broken"
+        return ""
+    return "repo not checked out"
+
+
+def _engine_readiness_reason(worker: WorkerProfile, engine: str) -> str:
+    readiness = worker.readiness if isinstance(worker.readiness, dict) else {}
+    rows = readiness.get("engines") if isinstance(readiness, dict) else None
+    if not isinstance(rows, list):
+        return ""
+    for row in rows:
+        if not isinstance(row, dict) or normalize_engine_id(str(row.get("engine") or "")) != engine:
             continue
-        if worker.current_jobs + max(1, len(engines)) <= worker.max_concurrent_jobs:
-            return worker
-    return None
+        if row.get("installed") is False:
+            return f"engine {engine} unavailable"
+        authenticated = row.get("authenticated")
+        if authenticated is False:
+            return f"engine {engine} unauthenticated"
+        return ""
+    return ""
+
+
+def _public_reason(reason: str) -> str:
+    return public_error_message(_redact_text(reason))
 
 
 def _session_is_active(status: str) -> bool:
@@ -464,14 +544,6 @@ def _requested_engines(command: WorkCommand) -> list[str]:
         if engine and engine not in result:
             result.append(engine)
     return result
-
-
-def _target_engines(command: WorkCommand, worker: WorkerProfile, *, fallback_engine: str) -> list[str]:
-    if command.engine_strategy != "ensemble":
-        return [fallback_engine]
-    requested = [normalize_engine_id(x) for x in str(command.target_engine_id or "").split(",") if x.strip()]
-    engines = requested or list(worker.supported_engines or [fallback_engine])
-    return _unique_engines(engines) or [fallback_engine]
 
 
 def _unique_engines(engines: list[str]) -> list[str]:

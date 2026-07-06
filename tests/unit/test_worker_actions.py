@@ -191,6 +191,69 @@ def test_repo_inventory_reports_name_default_branch_and_readiness(tmp_path) -> N
     assert repo_inventory("") == []
 
 
+def test_repo_inventory_reports_broken_checkout(tmp_path) -> None:
+    from jarvis.worker.actions import repo_inventory
+
+    root = tmp_path / "dev"
+    broken = root / "broken"
+    (broken / ".git").mkdir(parents=True)
+
+    rows = repo_inventory(str(root))
+
+    assert rows[0]["repo"] == "broken"
+    assert rows[0]["status"] == "broken"
+    assert rows[0]["detail"]
+
+
+def test_worker_diagnostics_reports_engines_packages_browser_and_uses_ttl(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    from types import SimpleNamespace
+
+    import jarvis.worker.actions as actions
+    from jarvis.worker.actions import diagnostics
+
+    actions._DIAGNOSTICS_CACHE.clear()  # noqa: SLF001
+    calls = {"run": 0}
+
+    def fake_which(name: str) -> str:
+        return f"/bin/{name}" if name in {"codex", "uv"} else ""
+
+    def fake_run_quick(argv, *, timeout_s=3.0):  # noqa: ANN001
+        calls["run"] += 1
+        if argv == ["codex", "--version"]:
+            return actions._QuickResult(0, "codex 1.2.3")  # noqa: SLF001
+        if argv == ["codex", "login", "status"]:
+            return actions._QuickResult(0, "logged in")  # noqa: SLF001
+        return actions._QuickResult(1, "missing")  # noqa: SLF001
+
+    monkeypatch.setattr(actions.shutil, "which", fake_which)
+    monkeypatch.setattr(actions, "_run_quick", fake_run_quick)
+    monkeypatch.setattr(actions, "_browser_diagnostic", lambda _cfg: {"available": True, "detail": "ready"})
+
+    first = diagnostics(
+        repo_root=str(tmp_path / "repos"),
+        engines=["codex"],
+        codex_bin="codex",
+        claude_bin="claude",
+        browser_cfg=SimpleNamespace(enabled=True, chrome_path=""),
+        ttl_s=60,
+    )
+    second = diagnostics(
+        repo_root=str(tmp_path / "repos"),
+        engines=["codex"],
+        codex_bin="codex",
+        claude_bin="claude",
+        browser_cfg=SimpleNamespace(enabled=True, chrome_path=""),
+        ttl_s=60,
+    )
+
+    assert first == second
+    assert calls["run"] == 2  # version + auth status only once
+    assert first["engines"][0]["installed"] is True
+    assert first["engines"][0]["authenticated"] is True
+    assert {"name": "uv", "available": True} in first["package_managers"]
+    assert first["browser"]["available"] is True
+
+
 def test_slugify_makes_readable_handles() -> None:
     from jarvis.worker.jobs import slugify
 

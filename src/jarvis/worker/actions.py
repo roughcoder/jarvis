@@ -10,10 +10,13 @@ import asyncio
 import os
 import pathlib
 import shutil
+import subprocess
 import time
 import uuid
+from collections.abc import Iterable
+from typing import Any
 
-from jarvis.engines import code_engine_argv
+from jarvis.engines import ENGINE_CLAUDE, ENGINE_CODEX, code_engine_argv, normalize_engine_id
 
 
 # A model-driven shell runs with ONLY these operational vars from the host env — never
@@ -22,6 +25,7 @@ from jarvis.engines import code_engine_argv
 _SAFE_ENV_KEYS = (
     "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "SHELL", "TZ",
 )
+_DIAGNOSTICS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
 def _safe_base_env() -> dict:
@@ -174,14 +178,53 @@ def list_repos(repo_root: str) -> list[str]:
     return sorted(d.name for d in root.iterdir() if (d / ".git").exists())
 
 
-def repo_inventory(repo_root: str) -> list[dict[str, str]]:
+def repo_inventory(repo_root: str, *, ttl_s: float = 0.0) -> list[dict[str, str]]:
     """Public-safe repo rows for the health contract: bare name, default branch,
-    and readiness. Filesystem-only (no subprocess) so health stays cheap."""
+    and readiness. Git subprocesses are timeout-bounded and optionally cached so
+    health can report real checkout state without becoming fragile."""
+    cache_key = f"repos:{pathlib.Path(repo_root).expanduser() if repo_root else ''}"
+    now = time.monotonic()
+    cached = _DIAGNOSTICS_CACHE.get(cache_key)
+    if ttl_s > 0 and cached is not None and cached[0] > now:
+        return list(cached[1].get("repositories", []))
     rows: list[dict[str, str]] = []
     for name in list_repos(repo_root):
-        git_dir = pathlib.Path(repo_root).expanduser() / name / ".git"
-        rows.append({"repo": name, "default_branch": _default_branch(git_dir), "status": "ready"})
+        repo_path = pathlib.Path(repo_root).expanduser() / name
+        rows.append(_repo_check(name, repo_path))
+    if ttl_s > 0:
+        _DIAGNOSTICS_CACHE[cache_key] = (now + ttl_s, {"repositories": list(rows)})
     return rows
+
+
+def _repo_check(name: str, repo_path: pathlib.Path) -> dict[str, str]:
+    git_dir = repo_path / ".git"
+    default_branch = _default_branch(git_dir)
+    if not git_dir.exists():
+        return {
+            "repo": name,
+            "default_branch": default_branch,
+            "status": "broken",
+            "detail": "missing .git directory",
+        }
+    status = _run_quick(["git", "-C", str(repo_path), "status", "--porcelain"], timeout_s=3.0)
+    if status.returncode != 0:
+        return {
+            "repo": name,
+            "default_branch": default_branch,
+            "status": "broken",
+            "detail": _short_detail(status.output or "git status failed"),
+        }
+    branch = _run_quick(["git", "-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD"], timeout_s=3.0)
+    if not default_branch:
+        default_branch = branch.output.strip() if branch.returncode == 0 and branch.output.strip() != "HEAD" else ""
+    if not default_branch:
+        return {
+            "repo": name,
+            "default_branch": "",
+            "status": "broken",
+            "detail": "default branch not resolvable",
+        }
+    return {"repo": name, "default_branch": default_branch, "status": "ready"}
 
 
 def _default_branch(git_dir: pathlib.Path) -> str:
@@ -194,6 +237,177 @@ def _default_branch(git_dir: pathlib.Path) -> str:
         if text.startswith("ref:"):
             return text.rsplit("/", 1)[-1]
     return ""
+
+
+class _QuickResult:
+    def __init__(self, returncode: int, output: str) -> None:
+        self.returncode = returncode
+        self.output = output
+
+
+def _run_quick(argv: list[str], *, timeout_s: float = 3.0) -> _QuickResult:
+    try:
+        result = subprocess.run(
+            argv,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout_s,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _QuickResult(1, str(exc))
+    return _QuickResult(result.returncode, (result.stdout + result.stderr).strip())
+
+
+def _short_detail(value: str) -> str:
+    text = str(value or "").strip().replace("\n", " ")
+    if not text:
+        return ""
+    return text[:200]
+
+
+def diagnostics(
+    *,
+    repo_root: str,
+    engines: Iterable[str],
+    codex_bin: str,
+    claude_bin: str,
+    browser_cfg: Any,
+    ttl_s: float,
+) -> dict[str, Any]:
+    """Cheap worker readiness diagnostics for health/doctor surfaces.
+
+    The result is cached because health is a probe endpoint. All subprocesses are
+    timeout-bounded and local-only; failures become status rows, never exceptions
+    for callers.
+    """
+    cache_key = "|".join(
+        [
+            "diagnostics",
+            str(pathlib.Path(repo_root).expanduser() if repo_root else ""),
+            ",".join(normalize_engine_id(e) for e in engines),
+            codex_bin,
+            claude_bin,
+            str(getattr(browser_cfg, "enabled", "")),
+            str(getattr(browser_cfg, "chrome_path", "")),
+        ]
+    )
+    now = time.monotonic()
+    cached = _DIAGNOSTICS_CACHE.get(cache_key)
+    if ttl_s > 0 and cached is not None and cached[0] > now:
+        return dict(cached[1])
+    try:
+        rows = {
+            "engines": [
+                _engine_diagnostic(engine, codex_bin=codex_bin, claude_bin=claude_bin)
+                for engine in engines
+            ],
+            "repositories": repo_inventory(repo_root, ttl_s=ttl_s),
+            "package_managers": _package_managers(),
+            "browser": _browser_diagnostic(browser_cfg),
+            "checked_at": int(time.time()),
+            "ttl_s": ttl_s,
+        }
+    except Exception as exc:  # noqa: BLE001 - diagnostics must degrade, not break health
+        rows = {"error": _short_detail(str(exc) or exc.__class__.__name__)}
+    if ttl_s > 0:
+        _DIAGNOSTICS_CACHE[cache_key] = (now + ttl_s, dict(rows))
+    return rows
+
+
+def _engine_diagnostic(engine: str, *, codex_bin: str, claude_bin: str) -> dict[str, Any]:
+    engine_id = normalize_engine_id(engine)
+    binary = codex_bin if engine_id == ENGINE_CODEX else claude_bin if engine_id == ENGINE_CLAUDE else engine_id
+    installed = bool(shutil.which(binary))
+    row: dict[str, Any] = {
+        "engine": engine_id,
+        "installed": installed,
+        "authenticated": None,
+        "version": "",
+        "detail": "",
+    }
+    if not installed:
+        row["authenticated"] = False
+        row["detail"] = "binary not found on PATH"
+        return row
+    row["version"] = _version(binary)
+    if engine_id == ENGINE_CODEX:
+        row.update(_codex_auth(binary))
+    elif engine_id == ENGINE_CLAUDE:
+        row.update(_claude_auth())
+    else:
+        row["detail"] = "auth check not defined for this engine"
+    return row
+
+
+def _version(binary: str) -> str:
+    result = _run_quick([binary, "--version"], timeout_s=3.0)
+    if result.returncode != 0:
+        return ""
+    return _short_detail(result.output.splitlines()[0] if result.output else "")
+
+
+def _codex_auth(binary: str) -> dict[str, Any]:
+    status = _run_quick([binary, "login", "status"], timeout_s=5.0)
+    if status.returncode == 0:
+        return {"authenticated": True, "detail": "codex login status succeeded"}
+    if _codex_auth_file_present():
+        return {"authenticated": True, "detail": "codex auth state present"}
+    detail = _short_detail(status.output) or "codex auth state not found"
+    return {"authenticated": False, "detail": detail}
+
+
+def _codex_auth_file_present() -> bool:
+    home = pathlib.Path.home()
+    return any(
+        path.exists()
+        for path in (
+            home / ".codex" / "auth.json",
+            home / ".codex" / "credentials.json",
+            home / ".codex" / "config.toml",
+        )
+    )
+
+
+def _claude_auth() -> dict[str, Any]:
+    if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY"):
+        return {"authenticated": True, "detail": "credential environment variable present"}
+    home = pathlib.Path.home()
+    if any(path.exists() for path in (home / ".claude.json", home / ".claude" / ".credentials.json")):
+        return {"authenticated": True, "detail": "claude credential state present"}
+    return {"authenticated": False, "detail": "claude credential state not found"}
+
+
+def _package_managers() -> list[dict[str, Any]]:
+    rows = []
+    for name in ("npm", "pnpm", "yarn", "uv", "pip"):
+        rows.append({"name": name, "available": bool(shutil.which(name))})
+    return rows
+
+
+def _browser_diagnostic(browser_cfg: Any) -> dict[str, Any]:
+    if not getattr(browser_cfg, "enabled", False):
+        return {"available": False, "detail": "browser lane disabled"}
+    try:
+        from jarvis.browser import browser_doctor
+
+        raw = browser_doctor(browser_cfg)
+    except Exception as exc:  # noqa: BLE001 - browser diagnostics are best-effort
+        return {"available": False, "detail": _short_detail(str(exc) or exc.__class__.__name__)}
+    details = []
+    if not raw.get("nodriver_installed"):
+        details.append("nodriver not installed")
+    chrome_path = str(raw.get("chrome_path") or "")
+    if not chrome_path or chrome_path == "(not found)":
+        details.append("chrome binary not found")
+    return {
+        "available": bool(raw.get("ready")),
+        "nodriver_installed": bool(raw.get("nodriver_installed")),
+        "chrome_found": bool(chrome_path and chrome_path != "(not found)"),
+        "headless": bool(raw.get("headless")),
+        "default_context": str(raw.get("default_context") or ""),
+        "detail": "; ".join(details) or "ready",
+    }
 
 
 def resolve_repo(repo: str, repo_root: str) -> str | None:

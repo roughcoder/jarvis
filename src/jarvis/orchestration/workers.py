@@ -177,6 +177,13 @@ class WorkerRegistry:
             profile.engine_supports = _engine_supports_from_rows(data["engines"])
         if isinstance(data.get("repositories"), list):
             profile.repositories = [dict(item) for item in data["repositories"] if isinstance(item, dict)]
+        if isinstance(data.get("diagnostics"), dict):
+            diagnostics = dict(data["diagnostics"])
+            profile.readiness = diagnostics
+            if isinstance(diagnostics.get("repositories"), list):
+                profile.repositories = [
+                    dict(item) for item in diagnostics["repositories"] if isinstance(item, dict)
+                ]
         profile.system = _system_from_health(data.get("system"))
         profile.__post_init__()
         return profile

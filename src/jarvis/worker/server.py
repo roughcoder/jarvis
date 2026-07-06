@@ -43,6 +43,7 @@ from jarvis.worker.actions import (
     clone_repo,
     code_argv,
     gui_doctor,
+    diagnostics,
     list_repos,
     prepare_worktree,
     repo_inventory,
@@ -642,7 +643,21 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         }
         if authorised(request):
             body["system"] = system_info_cached()
-            body["repositories"] = repo_inventory(cfg.repo_root)
+            try:
+                readiness = diagnostics(
+                    repo_root=cfg.repo_root,
+                    engines=supported_engines,
+                    codex_bin=cfg.codex_bin,
+                    claude_bin=cfg.claude_bin,
+                    browser_cfg=browser_cfg,
+                    ttl_s=cfg.diagnostics_ttl_s,
+                )
+            except Exception as exc:  # noqa: BLE001 - health must stay a liveness endpoint
+                readiness = {"error": str(exc)[:200] or exc.__class__.__name__}
+            body["diagnostics"] = readiness
+            body["repositories"] = readiness.get("repositories") if isinstance(readiness, dict) else []
+            if not isinstance(body["repositories"], list):
+                body["repositories"] = repo_inventory(cfg.repo_root, ttl_s=cfg.diagnostics_ttl_s)
         return web.json_response(body)
 
     app = web.Application()
