@@ -547,6 +547,7 @@ def test_mcp_status_uses_config_fallback_and_redacts_server_specs(tmp_path, monk
         data = response.json()
         assert data["source"] == "config"
         assert data["generated_at"] == ""
+        assert data["stale"] is True
         assert data["servers"] == [
             {
                 "name": "vault",
@@ -554,6 +555,7 @@ def test_mcp_status_uses_config_fallback_and_redacts_server_specs(tmp_path, monk
                 "connected": None,
                 "tool_count": 0,
                 "error": "",
+                "connected_at": None,
                 "required_capability": "mcp.vault",
             }
         ]
@@ -562,6 +564,7 @@ def test_mcp_status_uses_config_fallback_and_redacts_server_specs(tmp_path, monk
         assert "Authorization" not in raw
         assert "/Users/neil" not in raw
         assert "token_store_path" not in raw
+        assert data["serve"]["configured"] is False
         assert data["serve"]["tokens"] == {"active": 0, "revoked": 0}
         assert data["serve"]["codex_wired"] is False
         assert data["serve"]["codex_wired_reason"]
@@ -574,10 +577,11 @@ def test_mcp_status_and_tools_use_snapshot_with_server_filter(tmp_path, monkeypa
     store = MCPTokenStore(cfg.mcp_serve.token_store_path)
     _token, record = store.add(principal="neil", name="Codex")
     store.revoke(record.token_id)
+    generated_at = datetime.now(UTC).replace(microsecond=0).isoformat()
     mcp_status_path(cfg).write_text(
         json.dumps(
             {
-                "generated_at": "2026-07-06T10:00:00Z",
+                "generated_at": generated_at,
                 "servers": [
                     {
                         "name": "linear",
@@ -619,12 +623,15 @@ def test_mcp_status_and_tools_use_snapshot_with_server_filter(tmp_path, monkeypa
     async def calls(base: str, client: httpx.AsyncClient) -> None:
         status = (await client.get(f"{base}/v1/mcp/status")).json()
         assert status["source"] == "snapshot"
-        assert status["generated_at"] == "2026-07-06T10:00:00Z"
+        assert status["generated_at"] == generated_at
+        assert status["stale"] is False
         assert status["servers"][0]["connected"] is True
         assert status["servers"][1]["error"] == "failed at <local-path> with <redacted-token>"
+        assert status["serve"]["configured"] is True
         assert status["serve"]["tokens"] == {"active": 0, "revoked": 1}
 
         tools = (await client.get(f"{base}/v1/mcp/tools")).json()
+        assert tools["stale"] is False
         assert [tool["name"] for tool in tools["tools"]] == ["linear_search", "local_read"]
         filtered = (await client.get(f"{base}/v1/mcp/tools", params={"server": "linear"})).json()
         assert filtered["tools"] == [
@@ -635,6 +642,25 @@ def test_mcp_status_and_tools_use_snapshot_with_server_filter(tmp_path, monkeypa
                 "required_capability": "mcp.linear",
             }
         ]
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_mcp_status_marks_old_snapshot_stale(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    old_generated_at = (datetime.now(UTC) - timedelta(hours=2)).replace(microsecond=0).isoformat()
+    mcp_status_path(cfg).write_text(
+        json.dumps({"generated_at": old_generated_at, "servers": [], "tools": []}),
+        encoding="utf-8",
+    )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        status = (await client.get(f"{base}/v1/mcp/status")).json()
+        assert status["source"] == "snapshot"
+        assert status["generated_at"] == old_generated_at
+        assert status["stale"] is True
+        tools = (await client.get(f"{base}/v1/mcp/tools")).json()
+        assert tools["stale"] is True
 
     asyncio.run(_with_server(cfg, calls))
 
@@ -698,6 +724,16 @@ def test_mcp_token_errors_and_capability_gate(tmp_path, monkeypatch) -> None:  #
         missing = await client.delete(f"{base}/v1/mcp/tokens/mcptok_missing")
         assert missing.status_code == 404
         assert missing.json()["error"]["code"] == "not_found"
+
+        token_store = Path(cfg.mcp_serve.token_store_path)
+        token_store.parent.mkdir(parents=True, exist_ok=True)
+        token_store.write_text("{not json", encoding="utf-8")
+        corrupt = await client.post(
+            f"{base}/v1/mcp/tokens",
+            json={"principal": "neil", "name": "Codex"},
+        )
+        assert corrupt.status_code == 500
+        assert corrupt.json()["error"]["code"] == "internal_error"
 
     asyncio.run(_with_server(cfg, calls))
 

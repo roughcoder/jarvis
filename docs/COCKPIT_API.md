@@ -106,7 +106,10 @@ servers, spawn stdio subprocesses, or pay connect timeouts. The brain publishes 
 best-effort sidecar snapshot at
 `<ORCHESTRATION_WORKSPACE>/mcp-status.json` after bridge startup/refresh; if the
 file is absent or unreadable, the API falls back to config-only server rows with
-`connected: null` and `source: "config"`.
+`connected: null`, `connected_at: null`, `source: "config"`, and `stale: true`.
+Snapshot responses are fresh while `generated_at` is at most one hour old;
+snapshots older than one hour, missing timestamps, unparsable timestamps, and
+config fallback responses report `stale: true`.
 
 `GET /v1/mcp/status` response:
 
@@ -140,13 +143,15 @@ file is absent or unreadable, the API falls back to config-only server rows with
 }
 ```
 
-`serve.tokens` is a count only. `codex_wired` is reported, not enforced: today
+`serve.configured` means the MCP serve token store exists. `serve.tokens` is a
+count only. `codex_wired` is reported, not enforced: today
 the worker Codex provider starts `codex app-server --stdio` and does not inject
 the Jarvis MCP serve endpoint into Codex session config, so it reports `false`.
 
-`GET /v1/mcp/tools` returns the bridged tool list from the snapshot. With no
-snapshot it returns `tools: []` and `source: "config"`. `?server=<name>` filters
-the returned list exactly by server name.
+`GET /v1/mcp/tools` returns the bridged tool list from the snapshot and uses the
+same one-hour staleness rule. With no snapshot it returns `tools: []`,
+`source: "config"`, and `stale: true`. `?server=<name>` filters the returned
+list exactly by server name.
 
 ```json
 {
@@ -1591,7 +1596,7 @@ or breaking status, and migration notes.
 
 - Added `GET /v1/mcp/status` backed by the brain's cold-path MCP status sidecar,
   with config-only fallback when no snapshot exists. The API process never
-  live-probes MCP servers.
+  live-probes MCP servers. Snapshots older than one hour report `stale: true`.
 - Added `GET /v1/mcp/tools` with optional `?server=` filtering over the bridged
   tool list from the latest snapshot.
 - Added MCP serve token management routes:

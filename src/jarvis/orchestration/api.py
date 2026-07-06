@@ -453,7 +453,7 @@ def make_app(
         web.get("/v1/cockpit/events", sse.events),
         web.get("/v1/mcp/status", reads.mcp_status),
         web.get("/v1/mcp/tools", reads.mcp_tools),
-        web.get("/v1/mcp/tokens", writes.mcp_token_list),
+        web.get("/v1/mcp/tokens", reads.mcp_token_list),
         web.post("/v1/mcp/tokens", writes.mcp_token_issue),
         web.delete("/v1/mcp/tokens/{token_id}", writes.mcp_token_revoke),
         web.get("/v1/projects", reads.projects),
@@ -560,6 +560,30 @@ class CockpitReadHandlers:
         server = str(request.query.get("server") or "")
         return web.json_response(
             await asyncio.to_thread(cockpit_mcp_tools, self.ctx.cfg, server=server)
+        )
+
+    async def mcp_token_list(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        _require_capability(self.ctx.cfg, MCP_TOKENS_MANAGE_CAPABILITY)
+        include_revoked = str(request.query.get("include_revoked") or "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        try:
+            records = await asyncio.to_thread(
+                MCPTokenStore(self.ctx.cfg.mcp_serve.token_store_path).list,
+                include_revoked=include_revoked,
+            )
+        except MCPTokenError as exc:
+            raise CockpitError("internal_error", public_error_message(str(exc)), status=500) from exc
+        return web.json_response(
+            {
+                "ok": True,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "tokens": [token_record_public(record) for record in records],
+            }
         )
 
     async def workers(self, request: web.Request) -> web.Response:
@@ -1283,7 +1307,7 @@ class CockpitWriteHandlers:
                     name=name,
                 )
             except MCPTokenError as exc:
-                raise CockpitError("validation_failed", public_error_message(str(exc)), status=400) from exc
+                raise CockpitError("internal_error", public_error_message(str(exc)), status=500) from exc
             logger.info(
                 "mcp token issued token_id=%s principal=%s name=%s",
                 record.token_id,
@@ -1301,30 +1325,6 @@ class CockpitWriteHandlers:
             idempotent_body["token"] = ""
             self.ctx.idempotency.save(scope, key, body, idempotent_body)
         return web.json_response(response_body)
-
-    async def mcp_token_list(self, request: web.Request) -> web.Response:
-        await self.ctx.require_auth(request)
-        _require_capability(self.ctx.cfg, MCP_TOKENS_MANAGE_CAPABILITY)
-        include_revoked = str(request.query.get("include_revoked") or "").lower() in {
-            "1",
-            "true",
-            "yes",
-        }
-        try:
-            records = await asyncio.to_thread(
-                MCPTokenStore(self.ctx.cfg.mcp_serve.token_store_path).list,
-                include_revoked=include_revoked,
-            )
-        except MCPTokenError as exc:
-            raise CockpitError("internal_error", public_error_message(str(exc)), status=500) from exc
-        return web.json_response(
-            {
-                "ok": True,
-                "api_version": API_VERSION,
-                "schema_version": SCHEMA_VERSION,
-                "tokens": [token_record_public(record) for record in records],
-            }
-        )
 
     async def mcp_token_revoke(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 MCP_STATUS_FILENAME = "mcp-status.json"
 MCP_TOKENS_MANAGE_CAPABILITY = "mcp.tokens.manage"
+MCP_STATUS_STALE_AFTER_S = 60 * 60
 
 
 def mcp_status_path(cfg: Config) -> Path:
@@ -46,7 +48,7 @@ def cockpit_mcp_status(cfg: Config) -> dict[str, Any]:
         "enabled": bool(cfg.mcp.enabled),
         "source": source,
         "generated_at": str((snapshot or {}).get("generated_at") or ""),
-        "stale": False,
+        "stale": _snapshot_stale(snapshot),
         "servers": servers,
         "serve": serve,
     }
@@ -62,7 +64,7 @@ def cockpit_mcp_tools(cfg: Config, *, server: str = "") -> dict[str, Any]:
         "schema_version": 1,
         "source": "snapshot" if snapshot is not None else "config",
         "generated_at": str((snapshot or {}).get("generated_at") or ""),
-        "stale": False,
+        "stale": _snapshot_stale(snapshot),
         "tools": tools,
     }
 
@@ -98,6 +100,7 @@ def _config_servers(cfg: Config) -> list[dict[str, Any]]:
             "connected": None,
             "tool_count": 0,
             "error": "",
+            "connected_at": None,
             "required_capability": spec.required_capability,
         }
         for spec in cfg.mcp.servers
@@ -150,15 +153,16 @@ def _snapshot_tools(snapshot: dict[str, Any] | None) -> list[dict[str, str]]:
 
 def _serve_contract(cfg: Config) -> dict[str, Any]:
     tokens = {"active": 0, "revoked": 0}
+    token_store_path = Path(cfg.mcp_serve.token_store_path).expanduser()
     try:
-        records = MCPTokenStore(cfg.mcp_serve.token_store_path).list(include_revoked=True)
+        records = MCPTokenStore(token_store_path).list(include_revoked=True)
         tokens["active"] = sum(1 for record in records if not record.revoked)
         tokens["revoked"] = sum(1 for record in records if record.revoked)
     except MCPTokenError as exc:
         logger.warning("mcp token count failed: %s", public_error_message(str(exc)))
     codex_wired, reason = _codex_wired()
     body = {
-        "configured": bool(cfg.mcp_serve.host and cfg.mcp_serve.port),
+        "configured": token_store_path.exists(),
         "host": cfg.mcp_serve.host,
         "port": int(cfg.mcp_serve.port),
         "tokens": tokens,
@@ -174,6 +178,22 @@ def _codex_wired() -> tuple[bool, str]:
         False,
         "worker Codex sessions do not currently inject the Jarvis MCP serve endpoint",
     )
+
+
+def _snapshot_stale(snapshot: dict[str, Any] | None) -> bool:
+    if snapshot is None:
+        return True
+    generated_at = str(snapshot.get("generated_at") or "")
+    if not generated_at:
+        return True
+    try:
+        generated = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if generated.tzinfo is None:
+        generated = generated.replace(tzinfo=timezone.utc)
+    age_s = (datetime.now(timezone.utc) - generated.astimezone(timezone.utc)).total_seconds()
+    return age_s > MCP_STATUS_STALE_AFTER_S
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
