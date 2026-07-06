@@ -270,6 +270,7 @@ POST /v1/projects/{id}/archive
 POST /v1/projects/{id}/unarchive
 DELETE /v1/projects/{id}
 GET /v1/projects/{id}/memory
+GET /v1/projects/{id}/activity?limit=&cursor=&type=
 POST /v1/projects/{id}/findings
 POST /v1/projects/{id}/decisions
 POST /v1/projects/{id}/memory/forget
@@ -378,6 +379,62 @@ backend and registry only. If the memory backend is unavailable or does not
 support live representation/conclusion reads, the response still succeeds with
 an empty or cached representation and any conclusions that were available.
 
+#### Project Activity
+
+`GET /v1/projects/{id}/activity?limit=&cursor=&type=` returns the per-project
+append-only activity feed, newest first. It uses the same auth and membership
+filtering as project detail and threads: invisible projects return
+`404 not_found`. `limit` follows the standard page limit rules, `cursor` is the
+previous response's `next_cursor`, and `type` filters to one activity type.
+Unknown cursors return `400 stale_cursor`.
+
+Project activity is poll-based in v1. It is intentionally not part of
+`/v1/cockpit/events`; that SSE stream is snapshot-diff based and remains scoped
+to run/session/worker projections.
+
+Activity records are redacted before persistence:
+
+```json
+{
+  "api_version": "v1",
+  "schema_version": 1,
+  "project_id": "jarvis",
+  "activity": [
+    {
+      "id": "act_...",
+      "project_id": "jarvis",
+      "type": "file.uploaded",
+      "actor": {
+        "identity": "neil",
+        "peer": "neil",
+        "scope": "personal",
+        "device_id": "local-mac",
+        "channel": "cockpit"
+      },
+      "summary": "Uploaded file to project jarvis",
+      "data": {"project_id": "jarvis", "doc_id": "architecture-spec"},
+      "occurred_at": "2026-07-06T10:00:00+00:00"
+    }
+  ],
+  "next_cursor": ""
+}
+```
+
+Activity types:
+
+| Type | Emitted when |
+| --- | --- |
+| `project.created` | `POST /v1/projects` succeeds. |
+| `project.updated` | `PATCH /v1/projects/{id}` succeeds. |
+| `project.visibility_changed` | `PATCH /v1/projects/{id}/visibility` succeeds. |
+| `project.members_changed` | Member add/remove succeeds. |
+| `project.archived` / `project.unarchived` / `project.deleted` | Owner lifecycle writes succeed. |
+| `finding.recorded` / `decision.recorded` | Lane 2 project curation is queued. |
+| `memory.forgotten` / `memory.corrected` | Project memory curation writes succeed. |
+| `file.uploaded` / `file.retracted` | Project upload/retraction succeeds. |
+| `thread.opened` | An orchestrator thread is created. |
+| `work.dispatched` | `/v1/work/start` succeeds with a visible `project_id` linkage. |
+
 #### Project Management
 
 Project entry writes use one brain-owned operation path and the shared
@@ -439,7 +496,38 @@ Create/update response:
     "repos": [],
     "links": {"jira": "", "urls": []},
     "files_root": "projects/jarvis/files"
+  },
+  "result": {
+    "project": {
+      "id": "jarvis",
+      "name": "Jarvis",
+      "peer_id": "project:jarvis",
+      "aliases": [],
+      "owner": "neil",
+      "members": ["neil"],
+      "visibility": "household",
+      "status": "active",
+      "repos": [],
+      "links": {"jira": "", "urls": []},
+      "files_root": "projects/jarvis/files"
+    }
   }
+}
+```
+
+Visibility, member, archive, and unarchive writes return the same project
+resource shape with the updated `project` at top level and in `result`.
+
+Delete response:
+
+```json
+{
+  "ok": true,
+  "api_version": "v1",
+  "schema_version": 1,
+  "deleted": true,
+  "project_id": "jarvis",
+  "result": {"deleted": true, "project_id": "jarvis"}
 }
 ```
 
@@ -449,11 +537,37 @@ through the brain and are member-gated. They follow the two-step memory tool
 shape: first call with `query`, then confirm with `confirm: true` and
 `conclusion_ids`.
 
+Finding/decision response:
+
+```json
+{
+  "ok": true,
+  "api_version": "v1",
+  "schema_version": 1,
+  "project_id": "jarvis",
+  "content_hash": "sha256:...",
+  "result": {"project_id": "jarvis", "content_hash": "sha256:..."}
+}
+```
+
+Memory write response keeps the historical top-level `result` string:
+
+```json
+{
+  "ok": true,
+  "api_version": "v1",
+  "schema_version": 1,
+  "project_id": "jarvis",
+  "result": "Forgotten."
+}
+```
+
 File uploads use true multipart:
 
 ```text
 POST /v1/projects/{id}/files
 Content-Type: multipart/form-data
+X-Idempotency-Key: t3_upload_...
 
 file=<binary file part>
 title=Architecture Spec
@@ -500,6 +614,16 @@ Upload response includes the durable vault metadata and ingestion state:
     "observed_at": "2026-07-05T09:00:00+00:00",
     "retracted": false,
     "ingestion": {"queued": true, "response": {}}
+  },
+  "result": {
+    "project_id": "jarvis",
+    "doc_id": "architecture-spec-93c4...",
+    "session_id": "project:jarvis:uploads:architecture-spec-93c4...",
+    "content_hash": "sha256:...",
+    "original_path": "...",
+    "metadata": {},
+    "ingestion": {"queued": true, "response": {}},
+    "file": {}
   }
 }
 ```
@@ -525,6 +649,28 @@ default. Add `?include_retracted=true` to include retracted entries.
 `DELETE /v1/projects/{id}/files/{doc_id}` deletes the dedicated upload session
 from Honcho and marks the manifest entry retracted. The vault original is kept
 for audit/recovery and hidden from default file lists.
+
+File retraction response:
+
+```json
+{
+  "ok": true,
+  "api_version": "v1",
+  "schema_version": 1,
+  "project_id": "jarvis",
+  "doc_id": "architecture-spec-93c4...",
+  "session_id": "project:jarvis:uploads:architecture-spec-93c4...",
+  "retracted": true,
+  "file": {"doc_id": "architecture-spec-93c4...", "retracted": true},
+  "result": {
+    "project_id": "jarvis",
+    "doc_id": "architecture-spec-93c4...",
+    "session_id": "project:jarvis:uploads:architecture-spec-93c4...",
+    "retracted": true,
+    "file": {"doc_id": "architecture-spec-93c4...", "retracted": true}
+  }
+}
+```
 
 #### Orchestrator Threads
 
@@ -572,6 +718,38 @@ project. Archived threads are hidden by default; pass
 memory backend and sets session membership before any messages are written. The
 session includes the project peer, the requester peer, and `jarvis`.
 
+Thread open response:
+
+```json
+{
+  "ok": true,
+  "api_version": "v1",
+  "schema_version": 1,
+  "project_id": "jarvis",
+  "thread": {
+    "thread_id": "thread_...",
+    "project_id": "jarvis",
+    "session_id": "project:jarvis:orchestrator:thread_...",
+    "title": "Planning",
+    "created_at": "2026-07-05T09:00:00+00:00",
+    "updated_at": "2026-07-05T09:00:00+00:00",
+    "created_by": "neil"
+  },
+  "result": {
+    "project_id": "jarvis",
+    "thread": {
+      "thread_id": "thread_...",
+      "project_id": "jarvis",
+      "session_id": "project:jarvis:orchestrator:thread_...",
+      "title": "Planning",
+      "created_at": "2026-07-05T09:00:00+00:00",
+      "updated_at": "2026-07-05T09:00:00+00:00",
+      "created_by": "neil"
+    }
+  }
+}
+```
+
 `POST /v1/projects/{id}/threads/{tid}/turns` accepts:
 
 ```json
@@ -584,6 +762,29 @@ and returns `text/event-stream` frames:
 event: thread.turn.started
 event: thread.reply
 event: thread.turn.done
+```
+
+The `thread.reply` and `thread.turn.done` payload shape is:
+
+```json
+{
+  "cursor": "threadturn_...",
+  "occurred_at": "2026-07-06T10:00:00+00:00",
+  "type": "thread.turn.done",
+  "payload": {
+    "project_id": "jarvis",
+    "thread": {
+      "thread_id": "thread_...",
+      "project_id": "jarvis",
+      "session_id": "project:jarvis:orchestrator:thread_...",
+      "title": "Planning",
+      "created_at": "2026-07-05T09:00:00+00:00",
+      "updated_at": "2026-07-06T10:00:00+00:00",
+      "created_by": "neil"
+    },
+    "reply": "Jarvis reply text."
+  }
+}
 ```
 
 The turn is driven by the shared `BrainSession.respond_text` core under the
@@ -653,6 +854,10 @@ memory from every reply.
 Current limitation: background job completion report-backs are not yet appended
 to the thread automatically. They can still run through the existing tool layer;
 thread follow-up delivery is a later connector enhancement.
+
+Thread archive/unarchive endpoints are not exposed in cockpit API v1 yet. When
+added, they should use the same project activity types
+`thread.archived` / `thread.unarchived` and resource-write envelope.
 
 ### Runs
 
@@ -1324,7 +1529,25 @@ when they receive that error.
 
 ## Writes
 
-Every write accepts an idempotency key and public metadata:
+Cockpit write responses use named envelopes:
+
+`Reconciliation packet`: returned by orchestration writes that mutate the run or
+session projection (`/v1/work/start`, `/v1/work/resume`, run archive, session
+archive, exact-session controls). It includes the snapshot cursor plus the
+affected `run`, `session`, `events`, `requests`, and `artifacts` so clients can
+reconcile optimistic UI state immediately.
+
+`Resource write envelope`: returned by project resource writes
+(`/v1/projects*`). It includes `ok`, `api_version`, `schema_version`, the
+route-specific result fields at top level, and, where it does not conflict with
+an existing legacy field, a nested `result` object containing the same
+route-specific result. Memory forget/correct keep their historical top-level
+`result` string for compatibility.
+
+### Idempotency
+
+Every cockpit write accepts an idempotency key. JSON writes use
+`idempotency_key` in the request body:
 
 ```json
 {
@@ -1333,6 +1556,37 @@ Every write accepts an idempotency key and public metadata:
     "surface": "jarvis-cockpit"
   }
 }
+```
+
+Multipart project file uploads use `X-Idempotency-Key` because the upload body
+is `multipart/form-data`.
+
+Semantics:
+
+- Scope is per route plus key, for example `projects/{id}/files/upload` or
+  `sessions/{worker_id}/{session_id}/turns`. The same key may be reused safely
+  on a different route scope.
+- Empty or absent key disables caching.
+- Replay with the same scope, same key, and same request fingerprint returns
+  the stored response with `"idempotent": true`.
+- Conflict with the same scope/key but a different request fingerprint returns
+  `409 idempotency_conflict`.
+- Records expire after twenty-four hours (`IDEMPOTENCY_TTL_SECONDS`) and are
+  pruned lazily on save. After expiry, a reused key is treated as a new write.
+- Concurrent requests with the same scope/key serialize through an in-process
+  lock before checking or saving the record.
+
+Worked example:
+
+```text
+POST /v1/projects/jarvis/archive
+{"idempotency_key":"archive-123"} -> 200 {"ok":true,...}
+
+POST /v1/projects/jarvis/archive
+{"idempotency_key":"archive-123"} -> 200 {"ok":true,...,"idempotent":true}
+
+POST /v1/projects/jarvis/archive
+{"idempotency_key":"archive-123","reason":"different body"} -> 409 idempotency_conflict
 ```
 
 `POST /v1/work/start` is a high-level operator intent. Jarvis parses/selects
@@ -1452,7 +1706,7 @@ visibility locally.
 Checkpoint IDs are durable and stable within a session. Clients must not restore
 by page position, turn count, or rendered list index.
 
-Successful writes return a reconciliation packet:
+Successful orchestration writes return a reconciliation packet:
 
 ```json
 {
@@ -1465,10 +1719,6 @@ Successful writes return a reconciliation packet:
   "artifacts": []
 }
 ```
-
-If a write is replayed with the same `idempotency_key` and the same request
-body, Jarvis may return the stored reconciliation packet with an additional
-`"idempotent": true` field.
 
 Rejected writes return structured errors:
 
@@ -1674,6 +1924,24 @@ or breaking status, and migration notes.
   and why workers were selected or excluded.
 - Added env-driven `WORKER_DIAGNOSTICS_TTL_S` to cache worker readiness checks
   used by `/health`.
+
+### 2026-07-06 - Project Activity and Write Contracts (compatible)
+
+- Added `GET /v1/projects/{id}/activity`, a membership-filtered, poll-based
+  per-project activity feed backed by append-only JSONL under the orchestration
+  workspace. Activity logging is best-effort and cannot fail the write it
+  observes.
+- Project writes now honor idempotency across create/update, owner lifecycle
+  writes, findings/decisions, memory forget/correct, file upload/retract, and
+  thread open. Multipart upload uses `X-Idempotency-Key`.
+- Documented exact idempotency scope, replay, conflict, expiry, and concurrent
+  same-key serialization semantics.
+- Named the two write envelopes: reconciliation packet for run/session
+  projection writes and resource write envelope for project writes. Project
+  writes now consistently expose route-specific result fields and, where
+  compatible, a nested `result` object.
+- Findings/decisions now include `result: {project_id, content_hash}` while
+  preserving the previous top-level `project_id` and `content_hash` fields.
 
 ### 2026-07-04 - v1 PR review hardening (compatible)
 

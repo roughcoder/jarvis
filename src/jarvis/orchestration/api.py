@@ -83,6 +83,7 @@ from jarvis.brain.capabilities import (
 )
 from jarvis.brain.identity import Resolution, load_users
 from jarvis.orchestration.authority import allowed
+from jarvis.orchestration.activity import ProjectActivityLog
 from jarvis.orchestration.intent import parse_work_command
 from jarvis.orchestration.models import WorkCommand, WorkItem
 from jarvis.orchestration.oauth import (
@@ -464,6 +465,7 @@ def make_app(
         web.get("/v1/projects/{project_id}/files", reads.project_files),
         web.get("/v1/projects/{project_id}/memory", reads.project_memory),
         web.get("/v1/projects/{project_id}/permissions", reads.project_permissions),
+        web.get("/v1/projects/{project_id}/activity", reads.project_activity),
         web.get("/v1/projects/{project_id}", reads.project_detail),
         web.get("/v1/workers", reads.workers),
         web.get("/v1/workers/{worker_id}", reads.worker_detail),
@@ -713,6 +715,34 @@ class CockpitReadHandlers:
             }
         )
 
+    async def project_activity(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        registry = await asyncio.to_thread(_registry_store, self.ctx.cfg)
+        requester = _cockpit_requester_context(request, self.ctx.cfg)
+        project = (
+            await asyncio.to_thread(_visible_project_or_404, registry, request.match_info["project_id"], requester)
+            if requester is not None
+            else None
+        )
+        if project is None:
+            raise CockpitError("not_found", "project not found", status=404)
+        activity, next_cursor = await asyncio.to_thread(
+            _project_activity_log(self.ctx).list,
+            project.id,
+            limit=_limit(request),
+            cursor=str(request.query.get("cursor") or ""),
+            activity_type=str(request.query.get("type") or ""),
+        )
+        return web.json_response(
+            {
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "project_id": project.id,
+                "activity": activity,
+                "next_cursor": next_cursor,
+            }
+        )
+
     async def project_files(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         requester = _requester_or_404(request, self.ctx.cfg)
@@ -916,28 +946,76 @@ class CockpitWriteHandlers:
         await self.ctx.require_auth(request)
         requester = _requester_or_401(request, self.ctx.cfg)
         body = await _json_body(request)
-        result = await _project_brain_write(self.ctx, requester, "project.create", body)
-        return _project_write_response(result)
+        scope = "projects/create"
+
+        async def produce() -> dict[str, Any]:
+            result = await _project_brain_write(self.ctx, requester, "project.create", body)
+            project_id = _project_id_from_result(result, str(body.get("id") or ""))
+            if project_id:
+                await _record_project_activity(
+                    self.ctx,
+                    project_id,
+                    "project.created",
+                    requester,
+                    f"Created project {project_id}",
+                    {"project_id": project_id, "name": body.get("name", "")},
+                )
+            return _project_write_body(result)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce)
+        return web.json_response(response_body)
 
     async def project_update(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         requester = _requester_or_404(request, self.ctx.cfg)
         body = await _json_body(request)
         body["project_id"] = request.match_info["project_id"]
-        result = await _project_brain_write(self.ctx, requester, "project.update", body)
-        return _project_write_response(result)
+        scope = f"projects/{body['project_id']}/update"
+        op_payload = {key: value for key, value in body.items() if key != "idempotency_key"}
+
+        async def produce() -> dict[str, Any]:
+            result = await _project_brain_write(self.ctx, requester, "project.update", op_payload)
+            project_id = _project_id_from_result(result, body["project_id"])
+            await _record_project_activity(
+                self.ctx,
+                project_id,
+                "project.updated",
+                requester,
+                f"Updated project {project_id}",
+                {
+                    "project_id": project_id,
+                    "fields": sorted(key for key in body if key not in {"idempotency_key", "project_id"}),
+                    "changes": {key: value for key, value in body.items() if key not in {"idempotency_key", "project_id"}},
+                },
+            )
+            return _project_write_body(result)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce)
+        return web.json_response(response_body)
 
     async def project_visibility(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         requester = _requester_or_404(request, self.ctx.cfg)
         body = await _json_body(request)
-        result = await _project_brain_write(
-            self.ctx,
-            requester,
-            "project.visibility.set",
-            {"project_id": request.match_info["project_id"], "visibility": body.get("visibility")},
-        )
-        return _project_write_response(result)
+        fingerprint_body = {"project_id": request.match_info["project_id"], "visibility": body.get("visibility"), "idempotency_key": body.get("idempotency_key", "")}
+        payload = {key: value for key, value in fingerprint_body.items() if key != "idempotency_key"}
+        scope = f"projects/{payload['project_id']}/visibility"
+
+        async def produce() -> dict[str, Any]:
+            result = await _project_brain_write(self.ctx, requester, "project.visibility.set", payload)
+            project_id = _project_id_from_result(result, str(payload["project_id"]))
+            await _record_project_activity(
+                self.ctx,
+                project_id,
+                "project.visibility_changed",
+                requester,
+                f"Changed project visibility for {project_id}",
+                {"project_id": project_id, "visibility": payload.get("visibility")},
+            )
+            return _project_write_body(result)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        return web.json_response(response_body)
 
     async def project_member_add(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -946,60 +1024,103 @@ class CockpitWriteHandlers:
         project = await _project_for_owner_route(self.ctx, request, requester)
         new_members = _members_from_body(body)
         members = _unique_member_list([*project.members, *new_members])
-        result = await _project_brain_write(
-            self.ctx,
-            requester,
-            "project.members.set",
-            {"project_id": project.id, "members": members},
-        )
-        return _project_write_response(result)
+        fingerprint_body = {"project_id": project.id, "members": members, "idempotency_key": body.get("idempotency_key", "")}
+        payload = {key: value for key, value in fingerprint_body.items() if key != "idempotency_key"}
+        scope = f"projects/{project.id}/members/add"
+
+        async def produce() -> dict[str, Any]:
+            result = await _project_brain_write(self.ctx, requester, "project.members.set", payload)
+            project_id = _project_id_from_result(result, project.id)
+            await _record_project_activity(
+                self.ctx,
+                project_id,
+                "project.members_changed",
+                requester,
+                f"Changed project members for {project_id}",
+                {"project_id": project_id, "added": new_members, "members": members},
+            )
+            return _project_write_body(result)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        return web.json_response(response_body)
 
     async def project_member_remove(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         requester = _requester_or_404(request, self.ctx.cfg)
+        body = await _optional_json_body(request)
         project = await _project_for_owner_route(self.ctx, request, requester)
         member = request.match_info["member_id"]
         members = [item for item in project.members if item != member]
-        result = await _project_brain_write(
-            self.ctx,
-            requester,
-            "project.members.set",
-            {"project_id": project.id, "members": members},
-        )
-        return _project_write_response(result)
+        fingerprint_body = {"project_id": project.id, "members": members, "member_id": member, "idempotency_key": body.get("idempotency_key", "")}
+        payload = {key: value for key, value in fingerprint_body.items() if key not in {"idempotency_key", "member_id"}}
+        scope = f"projects/{project.id}/members/remove"
+
+        async def produce() -> dict[str, Any]:
+            result = await _project_brain_write(self.ctx, requester, "project.members.set", payload)
+            project_id = _project_id_from_result(result, project.id)
+            await _record_project_activity(
+                self.ctx,
+                project_id,
+                "project.members_changed",
+                requester,
+                f"Changed project members for {project_id}",
+                {"project_id": project_id, "removed": member, "members": members},
+            )
+            return _project_write_body(result)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        return web.json_response(response_body)
 
     async def project_archive(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         requester = _requester_or_404(request, self.ctx.cfg)
-        result = await _project_brain_write(
-            self.ctx,
-            requester,
-            "project.archive",
-            {"project_id": request.match_info["project_id"], "archived": True},
-        )
-        return _project_write_response(result)
+        body = await _optional_json_body(request)
+        fingerprint_body = {"project_id": request.match_info["project_id"], "archived": True, "idempotency_key": body.get("idempotency_key", "")}
+        payload = {key: value for key, value in fingerprint_body.items() if key != "idempotency_key"}
+        scope = f"projects/{payload['project_id']}/archive"
+
+        async def produce() -> dict[str, Any]:
+            result = await _project_brain_write(self.ctx, requester, "project.archive", payload)
+            project_id = _project_id_from_result(result, str(payload["project_id"]))
+            await _record_project_activity(self.ctx, project_id, "project.archived", requester, f"Archived project {project_id}", {"project_id": project_id})
+            return _project_write_body(result)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        return web.json_response(response_body)
 
     async def project_unarchive(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         requester = _requester_or_404(request, self.ctx.cfg)
-        result = await _project_brain_write(
-            self.ctx,
-            requester,
-            "project.archive",
-            {"project_id": request.match_info["project_id"], "archived": False},
-        )
-        return _project_write_response(result)
+        body = await _optional_json_body(request)
+        fingerprint_body = {"project_id": request.match_info["project_id"], "archived": False, "idempotency_key": body.get("idempotency_key", "")}
+        payload = {key: value for key, value in fingerprint_body.items() if key != "idempotency_key"}
+        scope = f"projects/{payload['project_id']}/unarchive"
+
+        async def produce() -> dict[str, Any]:
+            result = await _project_brain_write(self.ctx, requester, "project.archive", payload)
+            project_id = _project_id_from_result(result, str(payload["project_id"]))
+            await _record_project_activity(self.ctx, project_id, "project.unarchived", requester, f"Unarchived project {project_id}", {"project_id": project_id})
+            return _project_write_body(result)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        return web.json_response(response_body)
 
     async def project_delete(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         requester = _requester_or_404(request, self.ctx.cfg)
-        result = await _project_brain_write(
-            self.ctx,
-            requester,
-            "project.delete",
-            {"project_id": request.match_info["project_id"]},
-        )
-        return _project_write_response(result)
+        body = await _optional_json_body(request)
+        fingerprint_body = {"project_id": request.match_info["project_id"], "idempotency_key": body.get("idempotency_key", "")}
+        payload = {key: value for key, value in fingerprint_body.items() if key != "idempotency_key"}
+        scope = f"projects/{payload['project_id']}/delete"
+
+        async def produce() -> dict[str, Any]:
+            result = await _project_brain_write(self.ctx, requester, "project.delete", payload)
+            project_id = _project_id_from_result(result, str(payload["project_id"]))
+            await _record_project_activity(self.ctx, project_id, "project.deleted", requester, f"Deleted project {project_id}", {"project_id": project_id})
+            return _project_write_body(result)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        return web.json_response(response_body)
 
     async def project_finding(self, request: web.Request) -> web.Response:
         return await self._project_artifact(request, artifact_type="finding")
@@ -1016,29 +1137,43 @@ class CockpitWriteHandlers:
         if not content:
             raise CockpitError("validation_failed", f"{artifact_type} content is required", status=400, recoverable=True)
         status = str(body.get("status") or ("accepted" if artifact_type == "decision" else "open")).strip()
-        queued = _curation_outbox(self.ctx.cfg).enqueue_create(
-            observed_id=project.peer_id,
-            observer_id=requester.memory_peer,
-            content=content,
-            metadata={
-                "project_id": project.id,
-                "artifact_type": artifact_type,
-                "recorded_by": requester.memory_peer,
-                "source": "cockpit",
-                "channel": "cockpit",
-                "status": status,
-                "observed_at": str(body.get("observed_at") or utc_now()),
-            },
-        )
-        return web.json_response(
-            {
-                "ok": True,
-                "api_version": API_VERSION,
-                "schema_version": SCHEMA_VERSION,
-                "project_id": project.id,
-                "content_hash": queued.content_hash,
-            }
-        )
+        fingerprint_body = {
+            "project_id": project.id,
+            "content": content,
+            "status": status,
+            "observed_at": body.get("observed_at", ""),
+            "idempotency_key": body.get("idempotency_key", ""),
+        }
+        scope = f"projects/{project.id}/{artifact_type}s"
+
+        async def produce() -> dict[str, Any]:
+            queued = _curation_outbox(self.ctx.cfg).enqueue_create(
+                observed_id=project.peer_id,
+                observer_id=requester.memory_peer,
+                content=content,
+                metadata={
+                    "project_id": project.id,
+                    "artifact_type": artifact_type,
+                    "recorded_by": requester.memory_peer,
+                    "source": "cockpit",
+                    "channel": "cockpit",
+                    "status": status,
+                    "observed_at": str(body.get("observed_at") or utc_now()),
+                },
+            )
+            result = {"project_id": project.id, "content_hash": queued.content_hash}
+            await _record_project_activity(
+                self.ctx,
+                project.id,
+                f"{artifact_type}.recorded",
+                requester,
+                f"Recorded project {artifact_type}",
+                {"project_id": project.id, "content_hash": queued.content_hash, "status": status},
+            )
+            return _project_write_body(result)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        return web.json_response(response_body)
 
     async def project_memory_forget(self, request: web.Request) -> web.Response:
         return await self._project_memory_op(request, op="project.memory.forget")
@@ -1053,13 +1188,26 @@ class CockpitWriteHandlers:
         body["project_id"] = request.match_info["project_id"]
         body["channel"] = "cockpit"
         body["source"] = "cockpit"
-        result = await _project_brain_write(
-            self.ctx,
-            requester,
-            op,
-            body,
-        )
-        return _project_write_response(result)
+        project_id = str(body["project_id"])
+        scope = f"projects/{project_id}/memory/{'forget' if op.endswith('forget') else 'correct'}"
+        op_payload = {key: value for key, value in body.items() if key != "idempotency_key"}
+
+        async def produce() -> dict[str, Any]:
+            result = await _project_brain_write(self.ctx, requester, op, op_payload)
+            result_project_id = _project_id_from_result(result, project_id)
+            activity_type = "memory.forgotten" if op.endswith("forget") else "memory.corrected"
+            await _record_project_activity(
+                self.ctx,
+                result_project_id,
+                activity_type,
+                requester,
+                "Forgot project memory" if op.endswith("forget") else "Corrected project memory",
+                {"project_id": result_project_id, "conclusion_ids": body.get("conclusion_ids", [])},
+            )
+            return _project_write_body(result)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce)
+        return web.json_response(response_body)
 
     async def project_file_upload(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -1067,19 +1215,53 @@ class CockpitWriteHandlers:
         payload = await _multipart_upload_payload(request)
         payload["project_id"] = request.match_info["project_id"]
         payload["channel"] = "cockpit"
-        result = await _project_brain_write(self.ctx, requester, "project.file.upload", payload)
-        return _project_write_response(result)
+        idempotency_key = str(request.headers.get("X-Idempotency-Key") or "")
+        fingerprint_body = {**payload, "idempotency_key": idempotency_key}
+        scope = f"projects/{payload['project_id']}/files/upload"
+
+        async def produce() -> dict[str, Any]:
+            result = await _project_brain_write(self.ctx, requester, "project.file.upload", payload)
+            project_id = _project_id_from_result(result, str(payload["project_id"]))
+            await _record_project_activity(
+                self.ctx,
+                project_id,
+                "file.uploaded",
+                requester,
+                f"Uploaded file to project {project_id}",
+                {"project_id": project_id, "doc_id": result.get("doc_id", ""), "filename": payload.get("filename", "")},
+            )
+            return _project_write_body(result)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, idempotency_key, fingerprint_body, produce)
+        return web.json_response(response_body)
 
     async def project_file_retract(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         requester = _requester_or_404(request, self.ctx.cfg)
-        result = await _project_brain_write(
-            self.ctx,
-            requester,
-            "project.file.retract",
-            {"project_id": request.match_info["project_id"], "doc_id": request.match_info["doc_id"]},
-        )
-        return _project_write_response(result)
+        body = await _optional_json_body(request)
+        fingerprint_body = {
+            "project_id": request.match_info["project_id"],
+            "doc_id": request.match_info["doc_id"],
+            "idempotency_key": body.get("idempotency_key", ""),
+        }
+        payload = {key: value for key, value in fingerprint_body.items() if key != "idempotency_key"}
+        scope = f"projects/{payload['project_id']}/files/retract"
+
+        async def produce() -> dict[str, Any]:
+            result = await _project_brain_write(self.ctx, requester, "project.file.retract", payload)
+            project_id = _project_id_from_result(result, str(payload["project_id"]))
+            await _record_project_activity(
+                self.ctx,
+                project_id,
+                "file.retracted",
+                requester,
+                f"Retracted file from project {project_id}",
+                {"project_id": project_id, "doc_id": payload["doc_id"]},
+            )
+            return _project_write_body(result)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        return web.json_response(response_body)
 
     async def project_thread_open(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -1093,25 +1275,36 @@ class CockpitWriteHandlers:
         )
         if project is None or requester is None:
             raise CockpitError("not_found", "project not found", status=404)
-        try:
-            thread = await _cockpit_connector(self.ctx).open_thread(
-                project,
+        fingerprint_body = {
+            "project_id": project.id,
+            "title": str(body.get("title") or ""),
+            "idempotency_key": body.get("idempotency_key", ""),
+        }
+        scope = f"projects/{project.id}/threads/open"
+
+        async def produce() -> dict[str, Any]:
+            try:
+                thread = await _cockpit_connector(self.ctx).open_thread(
+                    project,
+                    requester,
+                    title=str(body.get("title") or ""),
+                )
+            except UnsupportedMemoryOperation as exc:
+                raise CockpitError("memory_unavailable", str(exc), recoverable=True, status=503) from exc
+            except (TimeoutError, OSError, RuntimeError) as exc:
+                raise CockpitError("memory_unavailable", public_error_message(str(exc)), recoverable=True, status=503) from exc
+            await _record_project_activity(
+                self.ctx,
+                project.id,
+                "thread.opened",
                 requester,
-                title=str(body.get("title") or ""),
+                f"Opened project thread {thread.thread_id}",
+                {"project_id": project.id, "thread_id": thread.thread_id},
             )
-        except UnsupportedMemoryOperation as exc:
-            raise CockpitError("memory_unavailable", str(exc), recoverable=True, status=503) from exc
-        except (TimeoutError, OSError, RuntimeError) as exc:
-            raise CockpitError("memory_unavailable", public_error_message(str(exc)), recoverable=True, status=503) from exc
-        return web.json_response(
-            {
-                "ok": True,
-                "api_version": API_VERSION,
-                "schema_version": SCHEMA_VERSION,
-                "project_id": project.id,
-                "thread": _thread_projection(thread),
-            }
-        )
+            return _project_write_body({"project_id": project.id, "thread": _thread_projection(thread)})
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        return web.json_response(response_body)
 
     async def project_thread_turn(self, request: web.Request) -> web.StreamResponse:
         await self.ctx.require_auth(request)
@@ -1267,6 +1460,7 @@ class CockpitWriteHandlers:
             if result is None or not isinstance(result, StartedWork):
                 raise CockpitError("not_found", "no eligible work item found", recoverable=True, status=404)
             response_body = _started_work_packet(self.ctx.store, result)
+            await _record_work_dispatched_activity(self.ctx, request, body, result)
             self.ctx.idempotency.save("work/start", str(body.get("idempotency_key") or ""), body, response_body)
         return web.json_response(response_body)
 
@@ -1532,7 +1726,7 @@ def _apply_cors_headers(request: web.Request, response: web.StreamResponse) -> N
     response.headers["Access-Control-Allow-Origin"] = origin
     response.headers["Vary"] = _append_vary(response.headers.get("Vary", ""), "Origin")
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,PATCH,DELETE,OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Authorization,Content-Type,Last-Event-ID"
+    response.headers["Access-Control-Allow-Headers"] = "Authorization,Content-Type,Last-Event-ID,X-Idempotency-Key"
     response.headers["Access-Control-Expose-Headers"] = "Content-Type"
     response.headers["Access-Control-Max-Age"] = "600"
 
@@ -1889,6 +2083,33 @@ async def _json_body(request: web.Request) -> dict[str, Any]:
     return body
 
 
+async def _optional_json_body(request: web.Request) -> dict[str, Any]:
+    if not request.can_read_body:
+        return {}
+    try:
+        return await _json_body(request)
+    except CockpitError as exc:
+        if exc.code == "validation_failed" and not (request.content_length or 0):
+            return {}
+        raise
+
+
+async def _idempotent_write_body(
+    ctx: CockpitAppContext,
+    scope: str,
+    key: str,
+    fingerprint_body: dict[str, Any],
+    producer: Callable[[], Any],
+) -> dict[str, Any]:
+    async with _idempotency_scope(ctx, scope, key):
+        cached = ctx.idempotency.get(scope, key, fingerprint_body)
+        if cached is not None:
+            return cached
+        response_body = await producer()
+        ctx.idempotency.save(scope, key, fingerprint_body, response_body)
+        return response_body
+
+
 def _reject_attachments(body: dict[str, Any]) -> None:
     attachments = body.get("attachments")
     if attachments in (None, []):
@@ -2135,14 +2356,122 @@ def _project_brain_client(ctx: CockpitAppContext) -> BrainProjectClient:
 
 
 def _project_write_response(result: dict[str, Any]) -> web.Response:
-    return web.json_response(
+    body = {
+        "ok": True,
+        "api_version": API_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        **result,
+    }
+    if "result" not in result:
+        body["result"] = result
+    return web.json_response(body)
+
+
+def _project_write_body(result: dict[str, Any]) -> dict[str, Any]:
+    body = {
+        "ok": True,
+        "api_version": API_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        **result,
+    }
+    if "result" not in result:
+        body["result"] = result
+    return body
+
+
+def _project_activity_log(ctx: CockpitAppContext) -> ProjectActivityLog:
+    return ProjectActivityLog(ctx.cfg.orchestration.workspace)
+
+
+async def _record_project_activity(
+    ctx: CockpitAppContext,
+    project_id: str,
+    activity_type: str,
+    requester: RequestContext,
+    summary: str,
+    data: dict[str, Any] | None = None,
+) -> None:
+    try:
+        await asyncio.to_thread(
+            _project_activity_log(ctx).append,
+            project_id,
+            activity_type,
+            _activity_actor(requester),
+            summary,
+            data or {},
+        )
+    except Exception as exc:  # noqa: BLE001 - activity logging is best-effort.
+        logger.warning("project activity append failed for %s: %s", project_id, exc)
+
+
+def _activity_actor(requester: RequestContext) -> dict[str, Any]:
+    return {
+        "identity": requester.identity,
+        "peer": requester.peer or requester.identity,
+        "scope": requester.scope,
+        "device_id": requester.device_id,
+        "channel": requester.channel,
+    }
+
+
+def _project_id_from_result(result: dict[str, Any], fallback: str = "") -> str:
+    project = result.get("project")
+    if isinstance(project, dict):
+        return str(project.get("id") or fallback)
+    return str(result.get("project_id") or fallback)
+
+
+async def _record_work_dispatched_activity(
+    ctx: CockpitAppContext,
+    request: web.Request,
+    body: dict[str, Any],
+    result: StartedWork,
+) -> None:
+    project_id = _work_project_id(body)
+    if not project_id:
+        return
+    requester = _cockpit_requester_context(request, ctx.cfg)
+    if requester is None:
+        return
+    try:
+        registry = await asyncio.to_thread(_registry_store, ctx.cfg)
+        project = await asyncio.to_thread(_visible_project_or_404, registry, project_id, requester)
+    except Exception as exc:  # noqa: BLE001 - work dispatch must not depend on activity lookup.
+        logger.warning("project activity work linkage lookup failed for %s: %s", project_id, exc)
+        return
+    if project is None:
+        return
+    await _record_project_activity(
+        ctx,
+        project.id,
+        "work.dispatched",
+        requester,
+        f"Dispatched work for project {project.id}",
         {
-            "ok": True,
-            "api_version": API_VERSION,
-            "schema_version": SCHEMA_VERSION,
-            **result,
-        }
+            "project_id": project.id,
+            "run_id": result.envelope.run_id,
+            "session_id": result.session.session_id,
+            "worker_id": result.worker.worker_id,
+            "work_source": result.item.source,
+            "work_id": result.item.id,
+            "title": result.item.title,
+        },
     )
+
+
+def _work_project_id(body: dict[str, Any]) -> str:
+    project_id = str(body.get("project_id") or "").strip()
+    if project_id:
+        return project_id
+    work_item = body.get("work_item")
+    if isinstance(work_item, dict):
+        return str(work_item.get("project_id") or "").strip()
+    command = body.get("command")
+    if isinstance(command, dict):
+        filters = command.get("filters")
+        if isinstance(filters, dict):
+            return str(filters.get("project_id") or "").strip()
+    return ""
 
 
 async def _project_for_member_route(

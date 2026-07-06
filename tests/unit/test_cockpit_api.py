@@ -210,6 +210,13 @@ class FakeProjectBrainClient:
                 "metadata": {"channel": payload.get("channel")},
                 "ingestion": {"queued": True},
             }
+        if op == "project.file.retract":
+            return {
+                "project_id": payload["project_id"],
+                "doc_id": payload["doc_id"],
+                "session_id": f"project:{payload['project_id']}:uploads:{payload['doc_id']}",
+                "retracted": True,
+            }
         if op == "project.file.list":
             return {"project_id": payload["project_id"], "files": [{"doc_id": "upload-123"}]}
         if op in {"project.memory.forget", "project.memory.correct"}:
@@ -2731,6 +2738,248 @@ def test_cockpit_thread_backend_gaps_degrade_without_500(tmp_path, monkeypatch) 
         assert turn_failed.status_code == 200
         assert events[-1]["_event"] == "thread.turn.error"
         assert events[-1]["payload"]["error"]["code"] == "memory_unavailable"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_project_activity_records_member_writes_and_paginates(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    brain = FakeProjectBrainClient()
+    memory = FakeProjectMemory()
+    connector = CockpitConnector(cfg, memory=memory, gateway=FakeGateway(["unused"]), tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_project_brain_client", lambda _ctx: brain)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        update = await client.patch(
+            f"{base}/v1/projects/neil-shared",
+            json={"name": "Spec at /Users/example/private and https://example.test/private"},
+        )
+        finding = await client.post(f"{base}/v1/projects/neil-shared/findings", json={"content": "Finding one."})
+        decision = await client.post(f"{base}/v1/projects/neil-shared/decisions", json={"content": "Decision one."})
+        forget = await client.post(f"{base}/v1/projects/neil-shared/memory/forget", json={"query": "old", "confirm": True})
+        correct = await client.post(f"{base}/v1/projects/neil-shared/memory/correct", json={"query": "bad", "replacement": "good", "confirm": True})
+        upload = await client.post(
+            f"{base}/v1/projects/neil-shared/files",
+            files={"file": ("spec.md", b"# Spec", "text/markdown")},
+        )
+        retract = await client.request(
+            "DELETE",
+            f"{base}/v1/projects/neil-shared/files/upload-123",
+            json={},
+        )
+        thread = await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Kickoff"})
+        hidden = await client.get(f"{base}/v1/projects/alice-private/activity")
+        first_page = (await client.get(f"{base}/v1/projects/neil-shared/activity", params={"limit": 2})).json()
+        second_page = (await client.get(f"{base}/v1/projects/neil-shared/activity", params={"cursor": first_page["next_cursor"], "limit": 10})).json()
+        filtered = (await client.get(f"{base}/v1/projects/neil-shared/activity", params={"type": "file.uploaded"})).json()
+
+        assert all(response.status_code == 200 for response in [update, finding, decision, forget, correct, upload, retract, thread])
+        assert hidden.status_code == 404
+        assert [item["type"] for item in first_page["activity"]] == ["thread.opened", "file.retracted"]
+        assert first_page["next_cursor"]
+        assert {item["type"] for item in second_page["activity"]} == {
+            "file.uploaded",
+            "memory.corrected",
+            "memory.forgotten",
+            "decision.recorded",
+            "finding.recorded",
+            "project.updated",
+        }
+        assert [item["type"] for item in filtered["activity"]] == ["file.uploaded"]
+        all_activity = first_page["activity"] + second_page["activity"]
+        assert all(item["actor"]["identity"] == "neil" for item in all_activity)
+        text = json.dumps(all_activity)
+        assert "/Users/example/private" not in text
+        assert "https://example.test/private" not in text
+        assert "<local-path>" in text
+        assert "https://example.test/private" not in text
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    activity_file = Path(cfg.orchestration.workspace) / "project-activity" / "neil-shared.jsonl"
+    assert activity_file.exists()
+    assert len(activity_file.read_text().splitlines()) == 8
+
+
+def test_cockpit_project_activity_records_owner_writes(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="alice")
+    _seed_project_registry(cfg)
+    brain = FakeProjectBrainClient()
+    monkeypatch.setattr(cockpit_api_module, "_project_brain_client", lambda _ctx: brain)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        visibility = await client.patch(f"{base}/v1/projects/neil-shared/visibility", json={"visibility": "private"})
+        add = await client.post(f"{base}/v1/projects/neil-shared/members", json={"member": "jules"})
+        remove = await client.request("DELETE", f"{base}/v1/projects/neil-shared/members/neil", json={})
+        archive = await client.post(f"{base}/v1/projects/neil-shared/archive", json={})
+        unarchive = await client.post(f"{base}/v1/projects/neil-shared/unarchive", json={})
+        delete = await client.request("DELETE", f"{base}/v1/projects/neil-shared", json={})
+        activity = (await client.get(f"{base}/v1/projects/neil-shared/activity")).json()["activity"]
+
+        assert all(response.status_code == 200 for response in [visibility, add, remove, archive, unarchive, delete])
+        assert [item["type"] for item in activity] == [
+            "project.deleted",
+            "project.unarchived",
+            "project.archived",
+            "project.members_changed",
+            "project.members_changed",
+            "project.visibility_changed",
+        ]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_project_activity_append_failure_does_not_fail_write(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    brain = FakeProjectBrainClient()
+    monkeypatch.setattr(cockpit_api_module, "_project_brain_client", lambda _ctx: brain)
+
+    def fail_append(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("jarvis.orchestration.activity.ProjectActivityLog.append", fail_append)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.patch(f"{base}/v1/projects/neil-shared", json={"name": "Still succeeds"})
+
+        assert response.status_code == 200
+        assert response.json()["project"]["name"] == "Still succeeds"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_project_idempotency_replay_conflict_and_no_key(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="alice")
+    _seed_project_registry(cfg)
+    brain = FakeProjectBrainClient()
+    monkeypatch.setattr(cockpit_api_module, "_project_brain_client", lambda _ctx: brain)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        first = await client.post(f"{base}/v1/projects", json={"id": "created-one", "name": "Created", "idempotency_key": "create-1"})
+        replay = await client.post(f"{base}/v1/projects", json={"id": "created-one", "name": "Created", "idempotency_key": "create-1"})
+        conflict = await client.post(f"{base}/v1/projects", json={"id": "created-one", "name": "Changed", "idempotency_key": "create-1"})
+        archive = await client.post(f"{base}/v1/projects/neil-shared/archive", json={"idempotency_key": "archive-1"})
+        archive_replay = await client.post(f"{base}/v1/projects/neil-shared/archive", json={"idempotency_key": "archive-1"})
+        no_key_a = await client.post(f"{base}/v1/projects", json={"id": "no-key", "name": "No Key"})
+        no_key_b = await client.post(f"{base}/v1/projects", json={"id": "no-key", "name": "No Key"})
+
+        assert first.status_code == 200
+        assert replay.status_code == 200
+        assert replay.json()["idempotent"] is True
+        assert replay.json()["project"] == first.json()["project"]
+        assert conflict.status_code == 409
+        assert conflict.json()["error"]["code"] == "idempotency_conflict"
+        assert archive.status_code == 200
+        assert archive_replay.json()["idempotent"] is True
+        assert no_key_a.status_code == 200
+        assert no_key_b.status_code == 200
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    assert [call["op"] for call in brain.calls].count("project.create") == 3
+    assert [call["op"] for call in brain.calls].count("project.archive") == 1
+
+
+def test_cockpit_file_upload_and_retract_idempotency(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    brain = FakeProjectBrainClient()
+    monkeypatch.setattr(cockpit_api_module, "_project_brain_client", lambda _ctx: brain)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        first_upload = await client.post(
+            f"{base}/v1/projects/neil-shared/files",
+            headers={"X-Idempotency-Key": "upload-1"},
+            files={"file": ("spec.md", b"# Spec", "text/markdown")},
+        )
+        upload_replay = await client.post(
+            f"{base}/v1/projects/neil-shared/files",
+            headers={"X-Idempotency-Key": "upload-1"},
+            files={"file": ("spec.md", b"# Spec", "text/markdown")},
+        )
+        upload_conflict = await client.post(
+            f"{base}/v1/projects/neil-shared/files",
+            headers={"X-Idempotency-Key": "upload-1"},
+            files={"file": ("spec.md", b"# Changed", "text/markdown")},
+        )
+        retract = await client.request(
+            "DELETE",
+            f"{base}/v1/projects/neil-shared/files/upload-123",
+            json={"idempotency_key": "retract-1"},
+        )
+        retract_replay = await client.request(
+            "DELETE",
+            f"{base}/v1/projects/neil-shared/files/upload-123",
+            json={"idempotency_key": "retract-1"},
+        )
+
+        assert first_upload.status_code == 200
+        assert upload_replay.json()["idempotent"] is True
+        assert upload_replay.json()["doc_id"] == first_upload.json()["doc_id"]
+        assert upload_conflict.status_code == 409
+        assert retract.status_code == 200
+        assert retract_replay.json()["idempotent"] is True
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    assert [call["op"] for call in brain.calls] == ["project.file.upload", "project.file.retract"]
+
+
+def test_cockpit_thread_open_idempotency(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    connector = CockpitConnector(cfg, memory=memory, gateway=FakeGateway(["unused"]), tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        first = await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Plan", "idempotency_key": "thread-1"})
+        replay = await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Plan", "idempotency_key": "thread-1"})
+        conflict = await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Changed", "idempotency_key": "thread-1"})
+
+        assert first.status_code == 200
+        assert replay.status_code == 200
+        assert replay.json()["idempotent"] is True
+        assert replay.json()["thread"] == first.json()["thread"]
+        assert conflict.status_code == 409
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    assert len(memory.sessions) == 1
+
+
+def test_cockpit_findings_decisions_use_resource_write_envelope(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        finding = (await client.post(f"{base}/v1/projects/neil-shared/findings", json={"content": "Finding."})).json()
+        decision = (await client.post(f"{base}/v1/projects/neil-shared/decisions", json={"content": "Decision."})).json()
+
+        for body in (finding, decision):
+            assert body["ok"] is True
+            assert body["api_version"] == "v1"
+            assert body["schema_version"] == 1
+            assert body["project_id"] == "neil-shared"
+            assert body["content_hash"].startswith("sha256:")
+            assert body["result"] == {"project_id": "neil-shared", "content_hash": body["content_hash"]}
 
     import asyncio
 
