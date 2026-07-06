@@ -102,14 +102,14 @@ class ClaudeProviderAdapter:
                 "provider_session_id": claude_session_id,
             },
         )
-        runtime = _runtime_for_session(
+        _runtime_for_session(
             session=session,
             sessions=sessions,
             worker_cfg=worker_cfg,
             authority=authority,
             claude_session_id=claude_session_id,
+            turn=turn,
         )
-        runtime.enqueue(turn)
         return [started]
 
     def resolve_approval(
@@ -269,6 +269,7 @@ class _ClaudeSessionRuntime:
     def stop(self) -> None:
         self._close_requested.set()
         self._schedule_client_interrupt()
+        self._resolve_pending_requests_on_shutdown("claude session stopped before request was resolved")
         self._queue.put(_StopRuntime())
         if self._thread.is_alive():
             self._thread.join(timeout=5)
@@ -290,6 +291,7 @@ class _ClaudeSessionRuntime:
             session_id=None if self.resume else self.claude_session_id,
             resume=self.claude_session_id if self.resume else None,
             cli_path=self.worker_cfg.claude_bin or None,
+            setting_sources=[],
             include_partial_messages=False,
             can_use_tool=self._can_use_tool,
             stderr=self._record_stderr,
@@ -305,7 +307,7 @@ class _ClaudeSessionRuntime:
                     return
                 await self._run_turn(client, item.turn)
         except Exception as exc:  # noqa: BLE001 - provider failures must become session events
-            turn = self._current_turn
+            turn = self._current_turn or self._pop_unstarted_turn()
             if turn is not None and not _session_cancelled(self.sessions, self.session_id):
                 self.sessions.append_event_with_status(
                     self.session_id,
@@ -327,6 +329,7 @@ class _ClaudeSessionRuntime:
                 return
             await client.set_permission_mode(self.authority.claude_permission_mode)
             await client.query(turn.prompt)
+            terminal_seen = False
             async with asyncio.timeout(timeout_s):
                 async for message in client.receive_response():
                     if _project_sdk_message(
@@ -335,7 +338,9 @@ class _ClaudeSessionRuntime:
                         turn=turn,
                         sessions=self.sessions,
                     ):
-                        return
+                        terminal_seen = True
+            if terminal_seen:
+                return
             if _session_cancelled(self.sessions, self.session_id):
                 return
             self.sessions.append_event_with_status(
@@ -504,6 +509,39 @@ class _ClaudeSessionRuntime:
             pending.response = {"request_id": pending.request_id, "decision": "denied", "message": message}
             pending.done.set()
 
+    def _resolve_pending_requests_on_shutdown(self, message: str) -> None:
+        with self._pending_lock:
+            pending_items = list(self._pending.values())
+            self._pending.clear()
+        for pending in pending_items:
+            event_type = EVENT_INPUT_RECEIVED if pending.kind == REQUEST_KIND_INPUT else EVENT_APPROVAL_RESOLVED
+            waiting_status = SESSION_WAITING_INPUT if pending.kind == REQUEST_KIND_INPUT else SESSION_WAITING_APPROVAL
+            self.sessions.append_event(
+                self.session_id,
+                event_type,
+                {
+                    "turn_id": pending.turn.turn_id,
+                    "idempotency_key": pending.turn.idempotency_key,
+                    "provider": "claude",
+                    "request_id": pending.request_id,
+                    "decision": "denied",
+                    "message": message,
+                    "provider_resolved": True,
+                },
+            )
+            pending.response = {"request_id": pending.request_id, "decision": "denied", "message": message}
+            pending.done.set()
+            _restore_running_if_waiting(self.sessions, self.session_id, waiting_status, self.has_pending_requests)
+
+    def _pop_unstarted_turn(self) -> ProviderTurn | None:
+        try:
+            while True:
+                item = self._queue.get_nowait()
+                if isinstance(item, _QueuedTurn):
+                    return item.turn
+        except queue.Empty:
+            return None
+
     def _schedule_client_interrupt(self) -> None:
         loop = self._loop
         client = self._client
@@ -539,11 +577,13 @@ def _runtime_for_session(
     worker_cfg: WorkerConfig,
     authority: WorkerSessionAuthority,
     claude_session_id: str,
+    turn: ProviderTurn,
 ) -> _ClaudeSessionRuntime:
     with _RUNTIME_LOCK:
         runtime = _RUNTIMES.get(session.session_id)
         if runtime is not None and runtime.alive:
             runtime.authority = authority
+            runtime.enqueue(turn)
             return runtime
         runtime = _ClaudeSessionRuntime(
             session=session,
@@ -553,6 +593,7 @@ def _runtime_for_session(
             claude_session_id=claude_session_id,
         )
         _RUNTIMES[session.session_id] = runtime
+        runtime.enqueue(turn)
         runtime.start()
         return runtime
 
@@ -863,10 +904,29 @@ def _updated_question_input(tool_input: dict[str, Any], response: dict[str, Any]
     if isinstance(answers, dict):
         updated["answers"] = answers
     elif isinstance(answers, list):
-        updated["answers"] = [str(item) for item in answers]
+        updated["answers"] = {"text": [str(item) for item in answers]}
     elif text:
-        updated["answer"] = text
+        updated["answers"] = {key: text for key in _question_answer_keys(tool_input)}
     return updated
+
+
+def _question_answer_keys(tool_input: dict[str, Any]) -> list[str]:
+    keys: list[str] = []
+    for input_field in ("questions", "items", "inputs"):
+        values = tool_input.get(input_field)
+        if not isinstance(values, list):
+            continue
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("id") or item.get("name") or item.get("key") or "").strip()
+            if key and key not in keys:
+                keys.append(key)
+    for input_field in ("question_id", "id", "name", "key"):
+        key = str(tool_input.get(input_field) or "").strip()
+        if key and key not in keys:
+            keys.append(key)
+    return keys or ["text"]
 
 
 def _restore_running_if_waiting(

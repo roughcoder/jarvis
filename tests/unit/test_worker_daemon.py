@@ -207,12 +207,14 @@ class _FakeClaudeContext:
 class _FakeClaudeClient:
     response_batches: list[list[list[object]]] = []
     instances: list["_FakeClaudeClient"] = []
+    connect_error: Exception | None = None
 
     def __init__(self, options):  # noqa: ANN001
         self.options = options
         self.connected = False
         self.disconnected = False
         self.interrupted = False
+        self.response_exhausted = 0
         self.permission_modes: list[str] = []
         self.queries: list[str] = []
         self.permission_results: list[object] = []
@@ -221,6 +223,8 @@ class _FakeClaudeClient:
         _FakeClaudeClient.instances.append(self)
 
     async def connect(self, prompt=None) -> None:  # noqa: ANN001
+        if _FakeClaudeClient.connect_error is not None:
+            raise _FakeClaudeClient.connect_error
         self.connected = True
         if prompt is not None:
             async for _ in prompt:
@@ -250,6 +254,7 @@ class _FakeClaudeClient:
                 self.permission_results.append(result)
                 continue
             yield item
+        self.response_exhausted += 1
 
 
 def _fake_claude_sdk() -> object:
@@ -277,6 +282,7 @@ def _fake_claude_sdk() -> object:
 def _install_fake_claude_sdk(monkeypatch, batches: list[list[list[object]]]) -> None:  # noqa: ANN001
     _FakeClaudeClient.response_batches = batches
     _FakeClaudeClient.instances = []
+    _FakeClaudeClient.connect_error = None
     monkeypatch.setattr(claude, "_SDK", _fake_claude_sdk())
     with claude._RUNTIME_LOCK:
         for runtime in list(claude._RUNTIMES.values()):
@@ -2573,6 +2579,8 @@ def test_daemon_claude_provider_projects_sdk_events_and_reuses_stream(tmp_path, 
     assert _FakeClaudeClient.instances[0].queries == ["reply with hello", "resume and reply again"]
     assert _FakeClaudeClient.instances[0].options.kwargs["session_id"]
     assert _FakeClaudeClient.instances[0].options.kwargs["resume"] is None
+    assert _FakeClaudeClient.instances[0].options.kwargs["setting_sources"] == []
+    assert _FakeClaudeClient.instances[0].response_exhausted == 2
 
 
 def test_claude_provider_resumes_after_runtime_restart(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -2617,6 +2625,39 @@ def test_claude_provider_resumes_after_runtime_restart(tmp_path, monkeypatch) ->
 
     assert _FakeClaudeClient.instances[0].options.kwargs["session_id"] is None
     assert _FakeClaudeClient.instances[0].options.kwargs["resume"] == native_id
+
+
+def test_claude_connection_failure_fails_queued_turn(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    _install_fake_claude_sdk(monkeypatch, [[[]]])
+    _FakeClaudeClient.connect_error = RuntimeError("bad claude auth")
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "claude",
+            "engine": "claude",
+            "cwd": _owned_worker_cwd(tmp_path, "claude-connect-failure"),
+            "metadata": _authority_metadata("claude"),
+        }
+    )
+
+    try:
+        claude.ClaudeProviderAdapter().start_turn(
+            session=session,
+            turn=ProviderTurn(turn_id="turn_connect_failure", prompt="hello"),
+            sessions=sessions,
+            worker_cfg=WorkerConfig(_env_file=None, workspace=str(tmp_path / "worker"), claude_bin="fake-claude", job_timeout_s=5),
+        )
+        for _ in range(100):
+            if any(event.type == "turn.failed" for event in sessions.events(session.session_id)):
+                break
+            time.sleep(0.02)
+    finally:
+        _stop_fake_claude_runtimes()
+
+    failed = [event for event in sessions.events(session.session_id) if event.type == "turn.failed"]
+    assert failed[-1].data["turn_id"] == "turn_connect_failure"
+    assert "bad claude auth" in failed[-1].data["error"]
+    assert sessions.get(session.session_id).status == "failed"  # type: ignore[union-attr]
 
 
 def test_claude_approval_request_resolves_through_adapter(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -2719,7 +2760,7 @@ def test_claude_ask_user_question_uses_input_endpoint(tmp_path, monkeypatch) -> 
         [
             [
                 [
-                    _FakePermissionAsk("AskUserQuestion", {"question": "Proceed?"}, request_id="input_1"),
+                    _FakePermissionAsk("AskUserQuestion", {"question": "Proceed?", "questions": [{"id": "choice"}]}, request_id="input_1"),
                     _FakeResultMessage(session_id=native_id),
                 ]
             ]
@@ -2763,7 +2804,7 @@ def test_claude_ask_user_question_uses_input_endpoint(tmp_path, monkeypatch) -> 
     result = _FakeClaudeClient.instances[0].permission_results[0]
     assert event.type == "input.received"
     assert isinstance(result, _FakePermissionResultAllow)
-    assert result.updated_input["answer"] == "yes"
+    assert result.updated_input["answers"] == {"choice": "yes"}
 
 
 def test_claude_interrupt_and_stop_call_live_client(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -2799,6 +2840,9 @@ def test_claude_interrupt_and_stop_call_live_client(tmp_path, monkeypatch) -> No
     assert stopped.status == "stopped"
     assert _FakeClaudeClient.instances[0].interrupted is True
     assert _FakeClaudeClient.instances[0].disconnected is True
+    resolved = [event for event in sessions.events(session.session_id) if event.type == "input.received"]
+    assert resolved[-1].data["request_id"] == "input_wait"
+    assert resolved[-1].data["decision"] == "denied"
 
 
 def test_daemon_code_dispatch_marks_nonzero_agent_exit_as_error(tmp_path) -> None:
