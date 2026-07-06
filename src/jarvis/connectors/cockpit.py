@@ -42,6 +42,7 @@ from jarvis.users import load_users
 
 
 THREAD_INDEX_FILENAME = "cockpit-threads.json"
+THREAD_TRANSCRIPTS_DIRNAME = "cockpit-thread-transcripts"
 THREAD_HISTORY_LIMIT = 24
 
 
@@ -60,7 +61,7 @@ class CockpitThread:
     messages: tuple[dict[str, str], ...] = ()
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "CockpitThread":
+    def from_dict(cls, data: dict[str, Any], *, include_messages: bool = True) -> "CockpitThread":
         return cls(
             thread_id=str(data.get("thread_id") or ""),
             project_id=str(data.get("project_id") or ""),
@@ -72,16 +73,7 @@ class CockpitThread:
             archived_at=str(data.get("archived_at") or ""),
             archived_by=str(data.get("archived_by") or ""),
             archive_reason=str(data.get("archive_reason") or ""),
-            messages=tuple(
-                {
-                    "role": str(item.get("role") or ""),
-                    "peer_id": str(item.get("peer_id") or ""),
-                    "content": str(item.get("content") or ""),
-                    "observed_at": str(item.get("observed_at") or ""),
-                }
-                for item in data.get("messages") or ()
-                if isinstance(item, dict)
-            ),
+            messages=tuple(_normalized_messages(data.get("messages") or ())) if include_messages else (),
         )
 
     def as_dict(self, *, include_messages: bool = False) -> dict[str, Any]:
@@ -105,6 +97,7 @@ class CockpitThread:
 class CockpitThreadIndex:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser()
+        self.transcripts_dir = self.path.parent / THREAD_TRANSCRIPTS_DIRNAME
 
     def list(self, project_id: str, *, include_archived: bool = False) -> list[CockpitThread]:
         return sorted(
@@ -123,12 +116,25 @@ class CockpitThreadIndex:
             return None
         return thread
 
+    def get_with_messages(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        limit: int | None = None,
+    ) -> CockpitThread | None:
+        thread = self.get(project_id, thread_id)
+        if thread is None:
+            return None
+        messages = self._thread_messages(thread, limit=limit)
+        return replace(thread, messages=tuple(messages))
+
     def save(self, thread: CockpitThread) -> CockpitThread:
         data = self._read()
         threads = data.setdefault("threads", {})
-        threads[thread.thread_id] = thread.as_dict(include_messages=True)
+        threads[thread.thread_id] = thread.as_dict(include_messages=False)
         _atomic_write_json(self.path, data)
-        return thread
+        return replace(thread, messages=())
 
     def set_archived(
         self,
@@ -163,8 +169,10 @@ class CockpitThreadIndex:
         assistant_text: str,
     ) -> CockpitThread:
         observed_at = utc_now()
+        stored = self.get(thread.project_id, thread.thread_id)
+        archive_source = stored or thread
         messages = [
-            *thread.messages,
+            *self._thread_messages(archive_source, seed_messages=thread.messages),
             {
                 "role": "user",
                 "peer_id": user_peer_id,
@@ -177,10 +185,8 @@ class CockpitThreadIndex:
                 "content": assistant_text,
                 "observed_at": observed_at,
             },
-        ][-THREAD_HISTORY_LIMIT:]
-        stored = self.get(thread.project_id, thread.thread_id)
-        archive_source = stored or thread
-        return self.save(
+        ]
+        updated = self.save(
             replace(
                 thread,
                 title=thread.title or _thread_title(user_text),
@@ -188,16 +194,66 @@ class CockpitThreadIndex:
                 archived_at=archive_source.archived_at,
                 archived_by=archive_source.archived_by,
                 archive_reason=archive_source.archive_reason,
-                messages=tuple(messages),
+                messages=(),
             )
         )
+        self._write_thread_messages(updated, messages)
+        return replace(updated, messages=tuple(messages))
 
-    def _threads(self) -> dict[str, CockpitThread]:
+    def _threads(self, *, include_messages: bool = False) -> dict[str, CockpitThread]:
         return {
-            thread_id: CockpitThread.from_dict(raw)
+            thread_id: CockpitThread.from_dict(raw, include_messages=include_messages)
             for thread_id, raw in self._read().get("threads", {}).items()
             if isinstance(raw, dict)
         }
+
+    def _thread_messages(
+        self,
+        thread: CockpitThread,
+        *,
+        limit: int | None = None,
+        seed_messages: tuple[dict[str, str], ...] = (),
+    ) -> list[dict[str, str]]:
+        messages = self._read_thread_messages(thread)
+        if not messages:
+            messages = [dict(message) for message in seed_messages] or self._legacy_thread_messages(thread.thread_id)
+        if limit is not None:
+            if limit <= 0:
+                return []
+            messages = messages[-limit:]
+        return messages
+
+    def _read_thread_messages(self, thread: CockpitThread) -> list[dict[str, str]]:
+        path = self._transcript_path(thread.project_id, thread.thread_id)
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return []
+        if not isinstance(data, dict):
+            return []
+        return _normalized_messages(data.get("messages") or ())
+
+    def _write_thread_messages(self, thread: CockpitThread, messages: list[dict[str, str]]) -> None:
+        _atomic_write_json(
+            self._transcript_path(thread.project_id, thread.thread_id),
+            {
+                "version": 1,
+                "project_id": thread.project_id,
+                "thread_id": thread.thread_id,
+                "messages": messages,
+            },
+        )
+
+    def _legacy_thread_messages(self, thread_id: str) -> list[dict[str, str]]:
+        raw = self._read().get("threads", {}).get(thread_id)
+        if not isinstance(raw, dict):
+            return []
+        return _normalized_messages(raw.get("messages") or ())
+
+    def _transcript_path(self, project_id: str, thread_id: str) -> Path:
+        return self.transcripts_dir / _safe_path_segment(project_id) / f"{_safe_path_segment(thread_id)}.json"
 
     def _read(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -211,7 +267,33 @@ class CockpitThreadIndex:
         if not isinstance(data.get("threads"), dict):
             data["threads"] = {}
         data.setdefault("version", 1)
+        if self._migrate_legacy_messages(data):
+            _atomic_write_json(self.path, data)
         return data
+
+    def _migrate_legacy_messages(self, data: dict[str, Any]) -> bool:
+        changed = False
+        threads = data.get("threads") if isinstance(data.get("threads"), dict) else {}
+        for thread_id, raw in threads.items():
+            if not isinstance(raw, dict) or "messages" not in raw:
+                continue
+            messages = _normalized_messages(raw.get("messages") or ())
+            project_id = str(raw.get("project_id") or "")
+            if messages and project_id:
+                path = self._transcript_path(project_id, str(thread_id))
+                if not path.exists():
+                    _atomic_write_json(
+                        path,
+                        {
+                            "version": 1,
+                            "project_id": project_id,
+                            "thread_id": str(thread_id),
+                            "messages": messages,
+                        },
+                    )
+            raw.pop("messages", None)
+            changed = True
+        return changed
 
 
 class CockpitMemoryView:
@@ -332,7 +414,8 @@ class CockpitConnector:
         text = text.strip()
         if not text:
             raise ValueError("turn text is required")
-        project_context = _project_context(self._memory, project, thread)
+        context_thread = self._index.get_with_messages(project.id, thread.thread_id, limit=THREAD_HISTORY_LIMIT) or thread
+        project_context = _project_context(self._memory, project, context_thread)
         view = CockpitMemoryView(
             self._memory,
             project_peer_id=project.peer_id,
@@ -589,6 +672,24 @@ def _thread_title(text: str) -> str:
     if not title:
         return "Project thread"
     return title if len(title) <= 72 else title[:71] + "..."
+
+
+def _normalized_messages(messages: Any) -> list[dict[str, str]]:
+    return [
+        {
+            "role": str(item.get("role") or ""),
+            "peer_id": str(item.get("peer_id") or ""),
+            "content": str(item.get("content") or ""),
+            "observed_at": str(item.get("observed_at") or ""),
+        }
+        for item in messages
+        if isinstance(item, dict)
+    ]
+
+
+def _safe_path_segment(value: str) -> str:
+    segment = "".join(char if char.isalnum() or char in {"-", "_", "."} else "_" for char in value)
+    return segment or "unknown"
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:

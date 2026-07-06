@@ -462,6 +462,7 @@ def make_app(
         web.get("/v1/projects", reads.projects),
         web.post("/v1/projects", writes.project_create),
         web.get("/v1/projects/{project_id}/threads", reads.project_threads),
+        web.get("/v1/projects/{project_id}/threads/{thread_id}", reads.project_thread_detail),
         web.get("/v1/projects/{project_id}/files", reads.project_files),
         web.get("/v1/projects/{project_id}/memory", reads.project_memory),
         web.get("/v1/projects/{project_id}/permissions", reads.project_permissions),
@@ -795,6 +796,23 @@ class CockpitReadHandlers:
                 "schema_version": SCHEMA_VERSION,
                 "project_id": project.id,
                 "threads": [_thread_projection(thread) for thread in threads],
+            }
+        )
+
+    async def project_thread_detail(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        project = await _project_for_member_route(self.ctx, request, requester)
+        connector = _cockpit_connector(self.ctx)
+        thread = await asyncio.to_thread(connector.index.get_with_messages, project.id, request.match_info["thread_id"])
+        if thread is None:
+            raise CockpitError("not_found", "thread not found", status=404)
+        return web.json_response(
+            {
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "project_id": project.id,
+                "thread": _thread_detail_projection(thread),
             }
         )
 
@@ -2713,6 +2731,20 @@ def _thread_projection(thread: CockpitThread) -> dict[str, Any]:
         "archived_by": thread.archived_by,
         "archive_reason": thread.archive_reason,
     }
+
+
+def _thread_detail_projection(thread: CockpitThread) -> dict[str, Any]:
+    row = _thread_projection(thread)
+    row["messages"] = [
+        {
+            "role": message.get("role", ""),
+            "peer_id": message.get("peer_id", ""),
+            "content": message.get("content", ""),
+            "observed_at": message.get("observed_at", ""),
+        }
+        for message in thread.messages
+    ]
+    return row
 
 
 def _include_archived(request: web.Request) -> bool:

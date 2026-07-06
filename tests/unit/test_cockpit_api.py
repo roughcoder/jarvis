@@ -2526,6 +2526,7 @@ def test_cockpit_threads_open_and_list_are_membership_filtered(tmp_path, monkeyp
         listed = await client.get(f"{base}/v1/projects/neil-shared/threads")
         hidden_list = await client.get(f"{base}/v1/projects/alice-private/threads")
         hidden_open = await client.post(f"{base}/v1/projects/alice-private/threads", json={})
+        hidden_detail = await client.get(f"{base}/v1/projects/alice-private/threads/thread_1")
         hidden_post = await client.post(f"{base}/v1/projects/alice-private/threads/thread_1/turns", json={"text": "hi"})
 
         assert opened.status_code == 200
@@ -2534,8 +2535,10 @@ def test_cockpit_threads_open_and_list_are_membership_filtered(tmp_path, monkeyp
         assert thread["session_id"] == orchestrator_session_id("neil-shared", thread["thread_id"])
         assert listed.status_code == 200
         assert [item["thread_id"] for item in listed.json()["threads"]] == [thread["thread_id"]]
+        assert "messages" not in listed.json()["threads"][0]
         assert hidden_list.status_code == 404
         assert hidden_open.status_code == 404
+        assert hidden_detail.status_code == 404
         assert hidden_post.status_code == 404
 
     import asyncio
@@ -2564,6 +2567,7 @@ def test_cockpit_thread_turn_streams_reply_and_writes_lane1_attribution(tmp_path
             f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
             json={"text": "What should we build first?"},
         )
+        detail = await client.get(f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}")
         events = _sse_events(response.text)
         reply_events = [event for event in events if event["_event"] == "thread.reply"]
         done_events = [event for event in events if event["_event"] == "thread.turn.done"]
@@ -2572,6 +2576,22 @@ def test_cockpit_thread_turn_streams_reply_and_writes_lane1_attribution(tmp_path
         assert response.headers["Content-Type"].startswith("text/event-stream")
         assert reply_events[0]["payload"]["reply"] == "The route should stream over SSE."
         assert done_events
+        assert detail.status_code == 200
+        messages = detail.json()["thread"]["messages"]
+        assert messages == [
+            {
+                "role": "user",
+                "peer_id": "neil",
+                "content": "What should we build first?",
+                "observed_at": messages[0]["observed_at"],
+            },
+            {
+                "role": "assistant",
+                "peer_id": "jarvis",
+                "content": "The route should stream over SSE.",
+                "observed_at": messages[1]["observed_at"],
+            },
+        ]
 
     import asyncio
 
