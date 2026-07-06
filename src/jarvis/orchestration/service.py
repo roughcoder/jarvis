@@ -196,29 +196,29 @@ class OrchestrationService:
                 command,
                 target_engine=target_engine,
             )
+            hard_reasons = [reason for reason in reasons if not _is_advisory_reason(reason)]
+            advisory_reasons = [reason for reason in reasons if _is_advisory_reason(reason)]
             if command.target_worker_id and worker.worker_id != command.target_worker_id:
-                reasons.append("different worker requested")
-            eligible = not reasons
-            if reasons == ["worker at capacity"]:
+                hard_reasons.append("different worker requested")
+            eligible = not hard_reasons
+            if hard_reasons == ["worker at capacity"]:
                 any_eligible_except_capacity = True
             if eligible and selected is None:
                 selected = worker
                 selected_engines = engines
                 selected_engine = target_engine or (worker.default_engine or worker.agent)
-                reasons = ["selected"]
+                display_reasons = ["selected", *advisory_reasons]
             elif eligible:
-                reasons = ["eligible"]
+                display_reasons = ["eligible", *advisory_reasons]
+            else:
+                display_reasons = [*hard_reasons, *advisory_reasons]
             rows.append(
                 {
                     "worker_id": worker.worker_id,
                     "eligible": eligible,
-                    "reasons": [_public_reason(reason) for reason in reasons],
+                    "reasons": [_public_reason(reason) for reason in display_reasons],
                 }
             )
-            if worker.current_jobs + max(1, required_slots) > worker.max_concurrent_jobs and not [
-                reason for reason in reasons if reason != "worker at capacity"
-            ]:
-                any_eligible_except_capacity = True
         if selected is None and any_eligible_except_capacity:
             capacity_only = True
         compatibility = {
@@ -504,6 +504,10 @@ def _repo_compatibility_reason(worker: WorkerProfile, repo: str) -> str:
             return f"repo checkout broken: {detail}" if detail else "repo checkout broken"
         return ""
     return "repo not checked out"
+
+
+def _is_advisory_reason(reason: str) -> bool:
+    return reason == "repo not checked out"
 
 
 def _engine_readiness_reason(worker: WorkerProfile, engine: str) -> str:

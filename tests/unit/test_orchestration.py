@@ -862,7 +862,73 @@ def test_orchestration_validate_compatibility_matches_selection(tmp_path, monkey
     assert engine == "codex"
     assert engines == ["codex"]
     assert validation["compatibility"]["selected_worker_id"] == worker.worker_id
-    assert validation["compatibility"]["workers"][1]["reasons"] == ["repo not checked out"]
+    assert validation["compatibility"]["workers"][1] == {
+        "worker_id": "remote-worker",
+        "eligible": True,
+        "reasons": ["eligible", "repo not checked out"],
+    }
+
+
+def test_orchestration_dispatch_allows_clone_on_demand_when_repo_missing(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    workers_path = tmp_path / "workers.json"
+    workers_path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "local-worker",
+                        "display_name": "Local",
+                        "capabilities": ["git", "codex"],
+                        "status": "online",
+                        "supported_engines": ["codex"],
+                        "repositories": [{"repo": "other", "status": "ready", "default_branch": "main"}],
+                    }
+                ]
+            }
+        )
+    )
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                f"ORCHESTRATION_WORKERS_PATH={workers_path}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+    cfg = load_config()
+
+    class Source:
+        def next(self, *, repo="", filters=None):  # noqa: ANN001, ANN201
+            return _item(id="#clone", repo="roughcoder/jarvis")
+
+    seen = {}
+
+    def fake_start(envelope, *, worker_cfg, worker=None, store=None, post=None):  # noqa: ANN001, ANN202
+        seen["worker_id"] = worker.worker_id
+        seen["repo"] = envelope.repo
+        return WorkerSessionLink(worker_id=envelope.worker_id, session_id="sess_clone", branch=envelope.branch_name)
+
+    monkeypatch.setattr("jarvis.orchestration.executor.start_worker_session", fake_start)
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={
+            "work.github.issues.read",
+            "worker.job.start",
+            "worker.session.create",
+            "worker.session.turn",
+            "forge.github.branch.push",
+        },
+        source_factory=lambda _name, _cfg=None: Source(),
+    )
+
+    result = service.next_work(WorkCommand("start_next_work", source="github", start=True), start=True)
+
+    assert isinstance(result, StartedWork)
+    assert seen == {"worker_id": "local-worker", "repo": "roughcoder/jarvis"}
 
 
 def test_orchestration_service_starts_ensemble_sessions(tmp_path, monkeypatch) -> None:  # noqa: ANN001

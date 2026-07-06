@@ -4454,7 +4454,7 @@ def test_cockpit_workers_probe_surfaces_health_published_repositories(tmp_path, 
                                 "installed": True,
                                 "authenticated": True,
                                 "version": "codex 1.2.3",
-                                "detail": "/Users/neil/.codex/auth.json present",
+                                "detail": "~/.codex/auth.json present",
                             }
                         ],
                         "package_managers": [{"name": "uv", "available": True}],
@@ -4485,6 +4485,7 @@ def test_cockpit_workers_probe_surfaces_health_published_repositories(tmp_path, 
     assert worker["readiness"]["engines"][0]["authenticated"] is True
     assert worker["readiness"]["package_managers"] == [{"name": "uv", "available": True}]
     assert worker["readiness"]["browser"]["available"] is False
+    assert "~/.codex" not in json.dumps(worker["readiness"])
     assert "/Users/neil" not in json.dumps(worker["readiness"])
     assert "/Applications/" not in json.dumps(worker["readiness"])
 
@@ -4571,7 +4572,7 @@ def test_cockpit_work_validate_reports_worker_repo_compatibility(tmp_path, monke
         "selected_worker_id": "macbook-worker",
         "workers": [
             {"worker_id": "macbook-worker", "eligible": True, "reasons": ["selected"]},
-            {"worker_id": "hive-worker", "eligible": False, "reasons": ["repo not checked out"]},
+            {"worker_id": "hive-worker", "eligible": True, "reasons": ["eligible", "repo not checked out"]},
         ],
     }
 

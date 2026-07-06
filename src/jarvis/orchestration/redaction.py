@@ -15,6 +15,7 @@ def public_url(value: str) -> str:
 def redact(value: str) -> str:
     text = str(value or "")
     text = re.sub(r"https?://[^\s)]+", lambda match: public_url(match.group(0)) or "<redacted-url>", text)
+    text = re.sub(r"~/[^\s)]+", "<local-path>", text)
     text = re.sub(r"/Users/[^\s)]+", "<local-path>", text)
     text = re.sub(r"/(?:Applications|home|workspace|workspaces|tmp|mnt|opt)/[^\s)]+", "<local-path>", text)
     text = re.sub(r"/(?:private/tmp|var/folders)/[^\s)]+", "<local-path>", text)

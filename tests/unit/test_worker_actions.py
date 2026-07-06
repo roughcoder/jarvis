@@ -254,6 +254,63 @@ def test_worker_diagnostics_reports_engines_packages_browser_and_uses_ttl(monkey
     assert first["browser"]["available"] is True
 
 
+def test_codex_auth_file_is_indeterminate_when_login_status_fails(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    import jarvis.worker.actions as actions
+
+    home = tmp_path / "home"
+    auth_dir = home / ".codex"
+    auth_dir.mkdir(parents=True)
+    (auth_dir / "auth.json").write_text("{}")
+    (auth_dir / "config.toml").write_text("model = 'x'\n")
+    monkeypatch.setattr(actions.pathlib.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(
+        actions,
+        "_run_quick",
+        lambda *_args, **_kwargs: actions._QuickResult(1, "read ~/.codex/auth.json failed"),  # noqa: SLF001
+    )
+
+    row = actions._codex_auth("codex")  # noqa: SLF001
+
+    assert row["authenticated"] is None
+    assert row["detail"] == "codex login status failed but auth file present"
+
+
+def test_codex_config_file_alone_is_not_auth_state(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    import jarvis.worker.actions as actions
+
+    home = tmp_path / "home"
+    config_dir = home / ".codex"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.toml").write_text("model = 'x'\n")
+    monkeypatch.setattr(actions.pathlib.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(
+        actions,
+        "_run_quick",
+        lambda *_args, **_kwargs: actions._QuickResult(1, "not logged in"),  # noqa: SLF001
+    )
+
+    row = actions._codex_auth("codex")  # noqa: SLF001
+
+    assert row["authenticated"] is False
+    assert row["detail"] == "not logged in"
+
+
+def test_claude_state_file_is_indeterminate_without_credentials(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    import jarvis.worker.actions as actions
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude.json").write_text("{}")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_API_KEY", raising=False)
+    monkeypatch.setattr(actions.pathlib.Path, "home", classmethod(lambda cls: home))
+
+    row = actions._claude_auth()  # noqa: SLF001
+
+    assert row["authenticated"] is None
+    assert "not cheaply determinable" in row["detail"]
+
+
 def test_slugify_makes_readable_handles() -> None:
     from jarvis.worker.jobs import slugify
 

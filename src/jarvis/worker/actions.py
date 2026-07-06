@@ -352,7 +352,7 @@ def _codex_auth(binary: str) -> dict[str, Any]:
     if status.returncode == 0:
         return {"authenticated": True, "detail": "codex login status succeeded"}
     if _codex_auth_file_present():
-        return {"authenticated": True, "detail": "codex auth state present"}
+        return {"authenticated": None, "detail": "codex login status failed but auth file present"}
     detail = _short_detail(status.output) or "codex auth state not found"
     return {"authenticated": False, "detail": detail}
 
@@ -364,7 +364,6 @@ def _codex_auth_file_present() -> bool:
         for path in (
             home / ".codex" / "auth.json",
             home / ".codex" / "credentials.json",
-            home / ".codex" / "config.toml",
         )
     )
 
@@ -373,8 +372,10 @@ def _claude_auth() -> dict[str, Any]:
     if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY"):
         return {"authenticated": True, "detail": "credential environment variable present"}
     home = pathlib.Path.home()
-    if any(path.exists() for path in (home / ".claude.json", home / ".claude" / ".credentials.json")):
+    if (home / ".claude" / ".credentials.json").exists():
         return {"authenticated": True, "detail": "claude credential state present"}
+    if (home / ".claude.json").exists():
+        return {"authenticated": None, "detail": "claude state present; credential status not cheaply determinable"}
     return {"authenticated": False, "detail": "claude credential state not found"}
 
 

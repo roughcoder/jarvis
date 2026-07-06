@@ -1377,8 +1377,8 @@ failed start records. Use it to power start-wizard validation.
         },
         {
           "worker_id": "hive-worker",
-          "eligible": false,
-          "reasons": ["repo not checked out"]
+          "eligible": true,
+          "reasons": ["eligible", "repo not checked out"]
         }
       ],
       "selected_worker_id": "macbook-worker"
@@ -1397,8 +1397,9 @@ capability actions, and `reasons` is the human-readable roll-up.
 `compatibility` explains worker↔repo selection from the same probed registry
 path used by `/v1/work/start`. `compatibility.repo` is the resolved repo, each
 worker row says whether that worker is eligible, and `reasons` explains either
-the chosen row (`selected`), an alternate eligible row (`eligible`), or why a
-worker was excluded (for example `repo not checked out`, `repo checkout broken`,
+the chosen row (`selected`), an alternate eligible row (`eligible`), advisory
+compatibility notes such as `repo not checked out` (the worker may clone on
+demand), or why a worker was excluded (for example `repo checkout broken`,
 `engine codex unavailable`, `engine codex unauthenticated`, `worker offline`,
 or `worker at capacity`). For github and linear sources, Jarvis peeks at the
 source read-only (`next()` lists without claiming) and reports the candidate as
@@ -1666,7 +1667,8 @@ or breaking status, and migration notes.
 - Changed worker repository status semantics from config-derived readiness to
   bounded git checks (`ready` or `broken` with redacted detail).
 - Added `/v1/work/validate.compatibility` so start wizards can show which
-  workers can serve the resolved repo and why workers were selected or excluded.
+  workers can serve the resolved repo, which workers may clone it on demand,
+  and why workers were selected or excluded.
 - Added env-driven `WORKER_DIAGNOSTICS_TTL_S` to cache worker readiness checks
   used by `/health`.
 

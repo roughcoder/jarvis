@@ -644,7 +644,8 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         if authorised(request):
             body["system"] = system_info_cached()
             try:
-                readiness = diagnostics(
+                readiness = await asyncio.to_thread(
+                    diagnostics,
                     repo_root=cfg.repo_root,
                     engines=supported_engines,
                     codex_bin=cfg.codex_bin,
@@ -657,7 +658,14 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             body["diagnostics"] = readiness
             body["repositories"] = readiness.get("repositories") if isinstance(readiness, dict) else []
             if not isinstance(body["repositories"], list):
-                body["repositories"] = repo_inventory(cfg.repo_root, ttl_s=cfg.diagnostics_ttl_s)
+                try:
+                    body["repositories"] = await asyncio.to_thread(
+                        repo_inventory,
+                        cfg.repo_root,
+                        ttl_s=cfg.diagnostics_ttl_s,
+                    )
+                except Exception:  # noqa: BLE001 - health must stay a liveness endpoint
+                    body["repositories"] = []
         return web.json_response(body)
 
     app = web.Application()

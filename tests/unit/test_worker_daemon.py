@@ -731,6 +731,10 @@ def test_daemon_health_reports_diagnostics_error_without_500(tmp_path, monkeypat
         "jarvis.worker.server.diagnostics",
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("diagnostics failed")),
     )
+    monkeypatch.setattr(
+        "jarvis.worker.server.repo_inventory",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("repo scan failed")),
+    )
     cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"))
 
     async def calls(base, c):  # noqa: ANN001
@@ -742,6 +746,7 @@ def test_daemon_health_reports_diagnostics_error_without_500(tmp_path, monkeypat
     assert status == 200
     assert health["ok"] is True
     assert health["diagnostics"]["error"] == "diagnostics failed"
+    assert health["repositories"] == []
 
 
 def test_daemon_shell_uses_expanded_default_workspace(tmp_path, monkeypatch) -> None:  # noqa: ANN001
