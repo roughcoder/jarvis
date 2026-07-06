@@ -426,6 +426,34 @@ def test_oauth_discovery_and_challenge_header(tmp_path, monkeypatch) -> None:
     assert expired["headers"]["www-authenticate"] == challenge
 
 
+def test_oauth_challenge_uses_rfc9728_path_metadata_url(tmp_path, monkeypatch) -> None:
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        auth_mode="hybrid",
+        resource_url="https://jarvis.example/mcp/serve",
+        oauth_issuer="https://cockpit.example",
+        oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+    )
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+    app = _BearerAuthASGI(
+        _inner_app(MCPServerRuntime(service)),
+        service,
+        cfg,
+        http_get=lambda *args, **kwargs: None,
+    )
+
+    metadata = asyncio.run(_asgi_request(app, "/.well-known/oauth-protected-resource/mcp/serve"))
+    missing = asyncio.run(_asgi_request(app, "/mcp"))
+
+    assert metadata["status"] == 200
+    assert json.loads(metadata["body"])["resource"] == "https://jarvis.example/mcp/serve"
+    assert (
+        missing["headers"]["www-authenticate"]
+        == 'Bearer resource_metadata="https://jarvis.example/.well-known/oauth-protected-resource/mcp/serve"'
+    )
+
+
 def test_oauth_discovery_404s_in_legacy_without_issuer(tmp_path, monkeypatch) -> None:
     cfg = _cfg(tmp_path, monkeypatch, auth_mode="legacy")
     service = JarvisMCPService(cfg, memory=FakeMemory())

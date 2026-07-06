@@ -5,7 +5,7 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 HttpGet = Callable[..., Any]
 
@@ -30,6 +30,34 @@ def auth_mode(value: str) -> str:
 def required_scopes(value: str) -> tuple[str, ...]:
     normalized = value.replace(",", " ")
     return tuple(scope for scope in (part.strip() for part in normalized.split()) if scope)
+
+
+def protected_resource_metadata_path(resource_url: str) -> str:
+    path = urlsplit(resource_url).path.rstrip("/")
+    if not path:
+        suffix = ""
+    elif path.startswith("/"):
+        suffix = path
+    else:
+        suffix = f"/{path}"
+    return f"/.well-known/oauth-protected-resource{suffix}"
+
+
+def protected_resource_metadata_url(resource_url: str) -> str:
+    parts = urlsplit(resource_url)
+    metadata_path = protected_resource_metadata_path(resource_url)
+    if parts.scheme and parts.netloc:
+        return urlunsplit((parts.scheme, parts.netloc, metadata_path, "", ""))
+    return metadata_path
+
+
+def oauth_endpoint_urls_are_secure(*, issuer: str, jwks_url: str) -> bool:
+    try:
+        _require_secure_url("OAuth issuer", issuer)
+        _require_secure_url("OAuth JWKS URL", jwks_url)
+    except ValueError:
+        return False
+    return True
 
 
 def oauth_is_configured(orchestration: Any) -> bool:

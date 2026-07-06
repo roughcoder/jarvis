@@ -16,7 +16,13 @@ from jarvis.brain.capabilities import RequestContext
 from jarvis.config import Config
 from jarvis.mcp_server.adapters import JarvisMCPService, MCPAccessError
 from jarvis.mcp_server.tokens import MCPTokenStore
-from jarvis.oauth import OAuthTokenValidator, OAuthValidationError, required_scopes
+from jarvis.oauth import (
+    OAuthTokenValidator,
+    OAuthValidationError,
+    protected_resource_metadata_path,
+    protected_resource_metadata_url,
+    required_scopes,
+)
 from jarvis.users import User, load_users
 
 _REQUEST_CONTEXT: contextvars.ContextVar[RequestContext | None] = contextvars.ContextVar(
@@ -341,6 +347,8 @@ class _BearerAuthASGI:
         self.store = MCPTokenStore(cfg.mcp_serve.token_store_path)
         self.mode = _strict_auth_mode(str(cfg.mcp_serve.auth_mode))
         self.resource_url = cfg.mcp_serve.resolved_resource_url
+        self.metadata_path = protected_resource_metadata_path(self.resource_url)
+        self.metadata_url = protected_resource_metadata_url(self.resource_url)
         self.oauth_issuer = str(cfg.mcp_serve.oauth_issuer).strip()
         self.oauth_jwks_url = str(cfg.mcp_serve.oauth_jwks_url).strip()
         self.oauth_scopes = required_scopes(str(cfg.mcp_serve.oauth_required_scopes))
@@ -396,7 +404,7 @@ class _BearerAuthASGI:
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
-        if scope.get("path") == _METADATA_PATH:
+        if scope.get("path") in {_METADATA_PATH, self.metadata_path}:
             await self._send_metadata(send)
             return
         token = _bearer_token(scope.get("headers") or [])
@@ -461,7 +469,7 @@ class _BearerAuthASGI:
 
     @property
     def _challenge_headers(self) -> list[tuple[bytes, bytes]]:
-        value = f'Bearer resource_metadata="{self.resource_url}{_METADATA_PATH}"'
+        value = f'Bearer resource_metadata="{self.metadata_url}"'
         return [(b"www-authenticate", value.encode("ascii"))]
 
 

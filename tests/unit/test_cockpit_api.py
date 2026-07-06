@@ -702,6 +702,29 @@ def test_mcp_status_projects_mcp_serve_oauth_config(tmp_path, monkeypatch) -> No
     asyncio.run(_with_server(cfg, calls))
 
 
+def test_mcp_status_oauth_projection_validates_runtime_urls(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        mcp_serve_auth_mode="hybrid",
+        mcp_serve_resource_url="https://jarvis.example/mcp/serve",
+        mcp_serve_oauth_issuer="http://cockpit.example",
+        mcp_serve_oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+    )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/mcp/status")
+        assert response.status_code == 200
+        assert response.json()["serve"]["oauth"] == {
+            "configured": False,
+            "issuer": "http://cockpit.example",
+            "resource": "https://jarvis.example/mcp/serve",
+            "metadata_url": "https://jarvis.example/.well-known/oauth-protected-resource/mcp/serve",
+        }
+
+    asyncio.run(_with_server(cfg, calls))
+
+
 def test_mcp_status_marks_old_snapshot_stale(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch)
     old_generated_at = (datetime.now(UTC) - timedelta(hours=2)).replace(microsecond=0).isoformat()

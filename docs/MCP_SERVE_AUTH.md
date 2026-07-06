@@ -86,6 +86,14 @@ collide with a stored static token hash.
 GET /.well-known/oauth-protected-resource
 ```
 
+When `MCP_SERVE_RESOURCE_URL` contains a path, the RFC 9728 metadata path is
+also served with the protected resource path appended after the well-known
+segment, for example:
+
+```text
+GET /.well-known/oauth-protected-resource/mcp/serve
+```
+
 Unauthenticated, `Content-Type: application/json`:
 
 ```json
@@ -114,10 +122,12 @@ Every unauthenticated or failed-auth response to the MCP endpoint returns
 `401` with the spec's discovery pointer:
 
 ```text
-WWW-Authenticate: Bearer resource_metadata="<resource-url>/.well-known/oauth-protected-resource"
+WWW-Authenticate: Bearer resource_metadata="<resource-origin>/.well-known/oauth-protected-resource[/resource-path]"
 ```
 
 This is what lets a spec client bootstrap auth with zero prior configuration.
+For a resource URL of `https://jarvis.example/mcp/serve`, the challenge points
+to `https://jarvis.example/.well-known/oauth-protected-resource/mcp/serve`.
 The static-token lane's failures return the same challenge in `hybrid`/`oauth`
 mode (the client can't tell which lane rejected it, and shouldn't).
 
@@ -229,6 +239,11 @@ that extra includes `PyJWT[crypto]` for local JWKS validation.
 Issuer and resource URLs here are operator-configured endpoints, not secrets;
 they are exempt from URL redaction the same way `serve.host`/`serve.port`
 already are. Nothing else about redaction changes.
+
+The `oauth.configured` field is true only when the OAuth lane can be built with
+the same issuer/JWKS URL security validation used by the runtime validator.
+Invalid non-localhost `http://` issuer or JWKS URLs therefore report
+`configured: false` even when values are present.
 
 ## Client flows (documentation, not code)
 
