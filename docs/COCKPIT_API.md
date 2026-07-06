@@ -548,9 +548,9 @@ POST /v1/sessions/{session_ref}/checkpoints/restore
 
 `GET /v1/capabilities` is caller-scoped API discovery. It requires cockpit auth
 and returns only public-safe route templates, the requester's effective
-capability strings, and feature availability booleans/counts. It does not expose
-worker URLs, MCP server names or URLs, local paths, tokens, or concrete resource
-ids.
+capability strings enforced by cockpit write routes, and feature availability
+booleans/counts. It does not expose worker URLs, MCP server names or URLs, local
+paths, tokens, or concrete resource ids.
 
 Example:
 
@@ -582,7 +582,8 @@ configured brain boundary credentials needed for project write forwarding. It is
 not a live brain ping. `features.mcp.available` is true only when MCP is enabled
 and at least one MCP server is configured; `serve_configured` means the Jarvis
 MCP server token store exists. `features.worker_dispatch.workers_configured` is
-the count of configured worker profiles, read without probing workers.
+the count of dispatchable worker profiles read without probing workers; a
+missing worker profile file counts the default `local-worker` fallback.
 
 `GET /v1/projects/{id}/permissions` returns the authenticated caller's effective
 project permissions. Projects outside the caller's visibility set still return
@@ -602,7 +603,7 @@ Example:
     "can_update": true,
     "can_manage_repos": true,
     "can_create_thread": true,
-    "can_archive_thread": true,
+    "can_archive_thread": false,
     "can_archive": true,
     "can_delete": true,
     "can_manage_members": true,
@@ -610,6 +611,9 @@ Example:
   }
 }
 ```
+
+`can_archive_thread` is reserved for a future thread archive route and remains
+`false` in v1 so cockpits do not render an unsupported control.
 
 ## Sync Modes
 

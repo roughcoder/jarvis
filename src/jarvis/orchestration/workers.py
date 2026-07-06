@@ -47,7 +47,14 @@ class WorkerRegistry:
         return next((p for p in profiles if p.worker_id == worker_id), None)
 
     def configured_profile_count(self) -> int:
-        """Number of explicit worker profiles configured, excluding fallback."""
+        """Profiles available for dispatch, including the default fallback.
+
+        An explicit but empty workers file means no named workers are configured.
+        A missing file preserves the existing local-worker fallback used by
+        `profiles()` and dispatch selection.
+        """
+        if self.profiles_path is None or not self.profiles_path.exists():
+            return 1
         return len(self._load_profiles())
 
     def choose(

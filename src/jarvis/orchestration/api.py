@@ -528,7 +528,7 @@ class CockpitReadHandlers:
                     "scope": requester.scope,
                     "auth_mode": str(auth.get("mode") or ""),
                 },
-                "capabilities": sorted(requester.capabilities),
+                "capabilities": _cockpit_advertised_capabilities(requester, self.ctx.cfg),
                 "routes": _route_templates(request.app),
                 "features": features,
             }
@@ -631,7 +631,7 @@ class CockpitReadHandlers:
                     "can_update": edit.allowed,
                     "can_manage_repos": edit.allowed,
                     "can_create_thread": edit.allowed,
-                    "can_archive_thread": edit.allowed,
+                    "can_archive_thread": False,
                     "can_archive": admin.allowed,
                     "can_delete": admin.allowed,
                     "can_manage_members": admin.allowed,
@@ -1898,6 +1898,11 @@ def _feature_availability(cfg: Config) -> dict[str, Any]:
             "workers_configured": workers_configured,
         },
     }
+
+
+def _cockpit_advertised_capabilities(requester: RequestContext, cfg: Config) -> list[str]:
+    enforced = resolve_capabilities(cfg.capabilities)
+    return sorted(set(requester.capabilities) & enforced)
 
 
 def _project_write_available(cfg: Config) -> tuple[bool, str]:

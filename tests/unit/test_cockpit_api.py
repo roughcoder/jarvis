@@ -471,6 +471,16 @@ def _seed_user_profiles(cfg: Config, *names: str) -> None:
         )
 
 
+def _seed_user_profile(cfg: Config, name: str, *, capabilities: list[str] | None = None) -> None:
+    users_dir = Path(cfg.capabilities.users_dir)
+    users_dir.mkdir(parents=True, exist_ok=True)
+    caps = f"\ncapabilities: {json.dumps(capabilities)}" if capabilities is not None else ""
+    users_dir.joinpath(f"{name}.md").write_text(
+        f"---\nscope: personal\nhoncho_peer: {name}{caps}\n---\n\n# {name.title()}\n",
+        encoding="utf-8",
+    )
+
+
 def _conclusion(
     cid: str,
     *,
@@ -1707,7 +1717,7 @@ def test_cockpit_capabilities_reports_oauth_principal_and_unavailable_features(t
         oauth_jwks_url="https://cockpit.example/api/auth/jwks",
         oauth_required_scopes="jarvis:read",
     )
-    _seed_user_profiles(cfg, "jules")
+    _seed_user_profile(cfg, "jules", capabilities=["worker.job.start", "worker.session.turn"])
     Path(cfg.orchestration.workers_path).write_text(json.dumps({"workers": []}))
     token = fixture["sign"](subject="jules", jarvis_user="neil", scope="jarvis:read")
 
@@ -1726,6 +1736,24 @@ def test_cockpit_capabilities_reports_oauth_principal_and_unavailable_features(t
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=jwks_get))
+
+
+def test_cockpit_capabilities_counts_default_worker_when_profiles_file_missing(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg_root = tmp_path / "default-worker"
+    cfg_root.mkdir()
+    cfg = _cfg(cfg_root, monkeypatch, token="secret", identity="neil")
+    Path(cfg.orchestration.workers_path).unlink()
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/capabilities", headers={"Authorization": "Bearer secret"})
+        body = response.json()
+
+        assert response.status_code == 200
+        assert body["features"]["worker_dispatch"] == {"available": True, "workers_configured": 1}
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
 
 
 def test_cockpit_projects_list_is_membership_filtered(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -1809,7 +1837,7 @@ def test_cockpit_project_permissions_project_effective_role(tmp_path, monkeypatc
                 "can_update": True,
                 "can_manage_repos": True,
                 "can_create_thread": True,
-                "can_archive_thread": True,
+                "can_archive_thread": False,
                 "can_archive": False,
                 "can_delete": False,
                 "can_manage_members": False,
@@ -1837,7 +1865,9 @@ def test_cockpit_project_permissions_project_effective_role(tmp_path, monkeypatc
         }
         assert archived.status_code == 200
         assert archived.json()["role"] == "owner"
-        assert all(archived.json()["permissions"].values())
+        archived_permissions = archived.json()["permissions"]
+        assert archived_permissions.pop("can_archive_thread") is False
+        assert all(archived_permissions.values())
         assert "localhost" not in text
         assert str(tmp_path) not in text
         assert "token" not in text.lower()
@@ -1860,7 +1890,9 @@ def test_cockpit_project_permissions_owner_gets_admin_actions(tmp_path, monkeypa
         assert response.status_code == 200
         assert body["role"] == "owner"
         assert body["project_id"] == "neil-shared"
-        assert all(body["permissions"].values())
+        permissions = body["permissions"]
+        assert permissions.pop("can_archive_thread") is False
+        assert all(permissions.values())
 
     import asyncio
 
