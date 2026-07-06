@@ -321,6 +321,11 @@ def _cfg(
     mcp_enabled: str = "false",
     mcp_servers: str = "[]",
     mcp_serve_token_store_path: str = "jarvis-workspace/.mcp-server/tokens.json",
+    mcp_serve_auth_mode: str = "hybrid",
+    mcp_serve_resource_url: str = "",
+    mcp_serve_oauth_issuer: str = "",
+    mcp_serve_oauth_jwks_url: str = "",
+    mcp_serve_oauth_required_scopes: str = "",
 ) -> Config:
     env = tmp_path / ".env"
     workspace = tmp_path / "orchestration"
@@ -355,6 +360,11 @@ def _cfg(
                 f"MCP_ENABLED={mcp_enabled}",
                 f"MCP_SERVERS={mcp_servers}",
                 f"MCP_SERVE_TOKEN_STORE_PATH={mcp_serve_token_store_path}",
+                f"MCP_SERVE_AUTH_MODE={mcp_serve_auth_mode}",
+                f"MCP_SERVE_RESOURCE_URL={mcp_serve_resource_url}",
+                f"MCP_SERVE_OAUTH_ISSUER={mcp_serve_oauth_issuer}",
+                f"MCP_SERVE_OAUTH_JWKS_URL={mcp_serve_oauth_jwks_url}",
+                f"MCP_SERVE_OAUTH_REQUIRED_SCOPES={mcp_serve_oauth_required_scopes}",
                 "WORKER_HOST=worker.test",
                 "WORKER_PORT=8780",
                 "WORKER_SUPPORTED_ENGINES=codex,claude",
@@ -572,6 +582,13 @@ def test_mcp_status_uses_config_fallback_and_redacts_server_specs(tmp_path, monk
         assert "/Users/neil" not in raw
         assert "token_store_path" not in raw
         assert data["serve"]["configured"] is False
+        assert data["serve"]["auth_mode"] == "hybrid"
+        assert data["serve"]["oauth"] == {
+            "configured": False,
+            "issuer": "",
+            "resource": "http://localhost:8795",
+            "metadata_url": "http://localhost:8795/.well-known/oauth-protected-resource",
+        }
         assert data["serve"]["tokens"] == {"active": 0, "revoked": 0}
         assert data["serve"]["codex_wired"] is False
         assert data["serve"]["codex_wired_reason"]
@@ -635,6 +652,7 @@ def test_mcp_status_and_tools_use_snapshot_with_server_filter(tmp_path, monkeypa
         assert status["servers"][0]["connected"] is True
         assert status["servers"][1]["error"] == "failed at <local-path> with <redacted-token>"
         assert status["serve"]["configured"] is True
+        assert status["serve"]["auth_mode"] == "hybrid"
         assert status["serve"]["tokens"] == {"active": 0, "revoked": 1}
 
         tools = (await client.get(f"{base}/v1/mcp/tools")).json()
@@ -651,6 +669,35 @@ def test_mcp_status_and_tools_use_snapshot_with_server_filter(tmp_path, monkeypa
         ]
         local_only = (await client.get(f"{base}/v1/mcp/tools", params={"server": "local"})).json()
         assert local_only["tools"][0]["description"] == "Read <local-path> with <redacted-token>"
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_mcp_status_projects_mcp_serve_oauth_config(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        mcp_serve_auth_mode="oauth",
+        mcp_serve_resource_url="https://jarvis.example",
+        mcp_serve_oauth_issuer="https://cockpit.example",
+        mcp_serve_oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+        mcp_serve_oauth_required_scopes="mcp:use",
+    )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/mcp/status")
+        assert response.status_code == 200
+        serve = response.json()["serve"]
+        assert serve["auth_mode"] == "oauth"
+        assert serve["oauth"] == {
+            "configured": True,
+            "issuer": "https://cockpit.example",
+            "resource": "https://jarvis.example",
+            "metadata_url": "https://jarvis.example/.well-known/oauth-protected-resource",
+        }
+        raw = json.dumps(serve)
+        assert "jwks" not in raw.lower()
+        assert "token_store_path" not in raw
 
     asyncio.run(_with_server(cfg, calls))
 

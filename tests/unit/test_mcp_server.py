@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
+import threading
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+import httpx
 import pytest
 
+from jarvis.brain.capabilities import RequestContext
 from jarvis.brain.memory_client import RepresentationRecord
 from jarvis.brain.memory_outbox import CurationOutbox
 from jarvis.brain.project_management import ProjectOperationError
@@ -19,8 +25,22 @@ from jarvis.mcp_server.adapters import (
     JarvisMCPService,
     mcp_send_turn_context,
 )
-from jarvis.mcp_server.server import MCPServerRuntime, _BearerAuthASGI
+from jarvis.mcp_server.server import MCPServerRuntime, _BearerAuthASGI, build_mcp
 from jarvis.mcp_server.tokens import MCPTokenStore
+
+
+class Response:
+    def __init__(self, data: dict[str, Any], status_code: int = 200) -> None:
+        self._data = data
+        self.status_code = status_code
+        self.text = json.dumps(data)
+
+    def json(self) -> dict[str, Any]:
+        return self._data
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(self.text)
 
 
 class FakeMemory:
@@ -120,7 +140,17 @@ class FakeProjectClient:
         return {"project": {"id": payload.get("project_id") or payload.get("id"), "name": payload.get("name", "Project")}}
 
 
-def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
+def _cfg(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    auth_mode: str = "hybrid",
+    resource_url: str = "",
+    oauth_issuer: str = "",
+    oauth_jwks_url: str = "",
+    oauth_required_scopes: str = "",
+) -> Config:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     env = tmp_path / ".env"
     env.write_text(
         "\n".join(
@@ -133,6 +163,13 @@ def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
                 f"MEMORY_CACHE_PATH={tmp_path / 'cache.json'}",
                 f"MEMORY_CURATION_OUTBOX_PATH={tmp_path / 'outbox.jsonl'}",
                 f"MCP_SERVE_TOKEN_STORE_PATH={tmp_path / 'tokens.json'}",
+                f"MCP_SERVE_AUTH_MODE={auth_mode}",
+                f"MCP_SERVE_RESOURCE_URL={resource_url}",
+                f"MCP_SERVE_OAUTH_ISSUER={oauth_issuer}",
+                f"MCP_SERVE_OAUTH_JWKS_URL={oauth_jwks_url}",
+                f"MCP_SERVE_OAUTH_REQUIRED_SCOPES={oauth_required_scopes}",
+                "MCP_SERVE_OAUTH_JWKS_TTL_S=300",
+                "MCP_SERVE_OAUTH_JWKS_MIN_REFRESH_S=30",
             ]
         ),
         encoding="utf-8",
@@ -148,7 +185,7 @@ def _seed_users(cfg: Config) -> None:
     users = Path(cfg.capabilities.users_dir)
     users.mkdir(parents=True, exist_ok=True)
     users.joinpath("neil.md").write_text(
-        "---\nscope: personal\nhoncho_peer: neil\ncapabilities: [memory.query, memory.curate, project.switch]\n---\n# Neil\n",
+        "---\nscope: personal\nhoncho_peer: neil\noauth_subjects: [ba_neil]\ncapabilities: [memory.query, memory.curate, project.switch]\n---\n# Neil\n",
         encoding="utf-8",
     )
     users.joinpath("viewer.md").write_text(
@@ -204,6 +241,119 @@ def _seed_registry(cfg: Config) -> None:
     )
 
 
+def _oauth_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, scopes: str = "mcp:use") -> Config:
+    return _cfg(
+        tmp_path,
+        monkeypatch,
+        auth_mode="hybrid",
+        resource_url="http://localhost:8795",
+        oauth_issuer="https://cockpit.example",
+        oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+        oauth_required_scopes=scopes,
+    )
+
+
+def _oauth_fixture(*, kid: str = "mcp-test-key") -> tuple[dict[str, Any], Callable[..., Response]]:
+    jwt = pytest.importorskip("jwt")
+    cryptography_rsa = pytest.importorskip("cryptography.hazmat.primitives.asymmetric.rsa")
+    cryptography_serialization = pytest.importorskip("cryptography.hazmat.primitives.serialization")
+
+    private_key = cryptography_rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = private_key.private_bytes(
+        encoding=cryptography_serialization.Encoding.PEM,
+        format=cryptography_serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=cryptography_serialization.NoEncryption(),
+    )
+    public_jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(private_key.public_key()))
+    public_jwk.update({"kid": kid, "use": "sig", "alg": "RS256"})
+    jwks = {"keys": [public_jwk]}
+    calls = {"jwks": 0}
+
+    def sign(
+        *,
+        issuer: str = "https://cockpit.example",
+        audience: str | list[str] = "http://localhost:8795",
+        subject: str = "ba_neil",
+        scope: str = "mcp:use",
+        expires_delta: timedelta = timedelta(minutes=5),
+        token_kid: str = kid,
+        signing_key: Any = private_pem,
+    ) -> str:
+        now = datetime.now(UTC)
+        return jwt.encode(
+            {
+                "iss": issuer,
+                "sub": subject,
+                "aud": audience,
+                "scope": scope,
+                "exp": now + expires_delta,
+                "iat": now,
+            },
+            signing_key,
+            algorithm="RS256",
+            headers={"kid": token_kid},
+        )
+
+    def jwks_get(url: str, **_kwargs: Any) -> Response:
+        if url == "https://cockpit.example/api/auth/jwks":
+            calls["jwks"] += 1
+            return Response(jwks)
+        return Response({})
+
+    return {"sign": sign, "calls": calls, "jwks": jwks}, jwks_get
+
+
+def _bad_signature_token(fixture: dict[str, Any]) -> str:
+    other, _get = _oauth_fixture(kid="mcp-test-key")
+    return other["sign"]()
+
+
+async def _asgi_request(app: Any, path: str, *, token: str = "") -> dict[str, Any]:
+    sent: list[dict[str, Any]] = []
+    headers = [(b"authorization", f"Bearer {token}".encode("ascii"))] if token else []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    await app(
+        {"type": "http", "method": "GET", "path": path, "headers": headers},
+        receive,
+        send,
+    )
+    start = next(item for item in sent if item["type"] == "http.response.start")
+    body = b"".join(item.get("body", b"") for item in sent if item["type"] == "http.response.body")
+    return {
+        "status": start["status"],
+        "headers": {name.decode("latin1"): value.decode("latin1") for name, value in start["headers"]},
+        "body": body.decode("utf-8"),
+    }
+
+
+def _inner_app(runtime: MCPServerRuntime, seen: list[RequestContext] | None = None):  # noqa: ANN202
+    async def inner(scope, receive, send):  # noqa: ANN001
+        _ = (scope, receive)
+        ctx = runtime.requester()
+        if seen is not None:
+            seen.append(ctx)
+        body = json.dumps({"identity": ctx.identity, "capabilities": sorted(ctx.capabilities)}).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
+    return inner
+
+
 def test_token_add_list_revoke_roundtrip(tmp_path) -> None:
     store = MCPTokenStore(tmp_path / "tokens.json")
     token, record = store.add(principal="neil", name="Claude Code")
@@ -233,6 +383,157 @@ def test_token_principal_context_inherits_user_capabilities(tmp_path, monkeypatc
     assert ctx.memory_peer == "neil"
     assert ctx.channel == "mcp"
     assert {"memory.query", "memory.curate", "project.switch"} <= set(ctx.capabilities)
+
+
+def test_oauth_discovery_and_challenge_header(tmp_path, monkeypatch) -> None:
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _oauth_cfg(tmp_path, monkeypatch)
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+    runtime = MCPServerRuntime(service)
+    app = _BearerAuthASGI(_inner_app(runtime), service, cfg, http_get=jwks_get)
+
+    metadata = asyncio.run(_asgi_request(app, "/.well-known/oauth-protected-resource"))
+    missing = asyncio.run(_asgi_request(app, "/mcp"))
+    invalid = asyncio.run(_asgi_request(app, "/mcp", token="not-a-jwt"))
+    expired = asyncio.run(
+        _asgi_request(
+            app,
+            "/mcp",
+            token=fixture["sign"](expires_delta=timedelta(minutes=-2)),
+        )
+    )
+
+    assert metadata["status"] == 200
+    assert json.loads(metadata["body"]) == {
+        "resource": "http://localhost:8795",
+        "authorization_servers": ["https://cockpit.example"],
+        "bearer_methods_supported": ["header"],
+        "resource_name": "Jarvis MCP",
+        "scopes_supported": ["mcp:use"],
+    }
+    challenge = 'Bearer resource_metadata="http://localhost:8795/.well-known/oauth-protected-resource"'
+    assert missing["status"] == 401
+    assert missing["headers"]["www-authenticate"] == challenge
+    assert invalid["status"] == 401
+    assert invalid["headers"]["www-authenticate"] == challenge
+    assert expired["status"] == 401
+    assert expired["headers"]["www-authenticate"] == challenge
+
+
+def test_oauth_discovery_404s_in_legacy_without_issuer(tmp_path, monkeypatch) -> None:
+    cfg = _cfg(tmp_path, monkeypatch, auth_mode="legacy")
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+    app = _BearerAuthASGI(_inner_app(MCPServerRuntime(service)), service, cfg)
+
+    response = asyncio.run(_asgi_request(app, "/.well-known/oauth-protected-resource"))
+
+    assert response["status"] == 404
+
+
+def test_oauth_validation_matrix_rejects_bad_jwts(tmp_path, monkeypatch) -> None:
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _oauth_cfg(tmp_path, monkeypatch)
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+    runtime = MCPServerRuntime(service)
+    app = _BearerAuthASGI(_inner_app(runtime), service, cfg, http_get=jwks_get)
+
+    valid = asyncio.run(_asgi_request(app, "/mcp", token=fixture["sign"]()))
+    invalid_tokens = [
+        fixture["sign"](issuer="https://evil.example"),
+        fixture["sign"](audience="jarvis-cockpit-api"),
+        fixture["sign"](scope="other:scope"),
+        fixture["sign"](expires_delta=timedelta(minutes=-2)),
+        _bad_signature_token(fixture),
+    ]
+    rejected = [asyncio.run(_asgi_request(app, "/mcp", token=token)) for token in invalid_tokens]
+
+    assert valid["status"] == 200
+    assert json.loads(valid["body"])["identity"] == "neil"
+    assert [response["status"] for response in rejected] == [401, 401, 401, 401, 401]
+
+
+def test_oauth_principal_mapping_and_capability_parity(tmp_path, monkeypatch) -> None:
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _oauth_cfg(tmp_path, monkeypatch)
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+    runtime = MCPServerRuntime(service)
+    seen: list[RequestContext] = []
+    app = _BearerAuthASGI(_inner_app(runtime, seen), service, cfg, http_get=jwks_get)
+
+    mapped = asyncio.run(_asgi_request(app, "/mcp", token=fixture["sign"](subject="ba_neil")))
+    fallback = asyncio.run(_asgi_request(app, "/mcp", token=fixture["sign"](subject="viewer")))
+    unknown = asyncio.run(_asgi_request(app, "/mcp", token=fixture["sign"](subject="missing-sub")))
+    static_token, _record = MCPTokenStore(cfg.mcp_serve.token_store_path).add(principal="neil")
+    static = asyncio.run(_asgi_request(app, "/mcp", token=static_token))
+
+    users = Path(cfg.capabilities.users_dir)
+    users.joinpath("viewer.md").write_text(
+        "---\nscope: personal\nhoncho_peer: viewer\noauth_subjects: [ba_neil]\ncapabilities: [memory.query]\n---\n# Viewer\n",
+        encoding="utf-8",
+    )
+    duplicate = asyncio.run(_asgi_request(app, "/mcp", token=fixture["sign"](subject="ba_neil")))
+
+    assert mapped["status"] == 200
+    assert fallback["status"] == 200
+    assert json.loads(fallback["body"])["identity"] == "viewer"
+    assert unknown["status"] == 401
+    assert static["status"] == 200
+    assert duplicate["status"] == 401
+    oauth_neil = next(ctx for ctx in seen if ctx.identity == "neil")
+    static_neil = service.context_for_principal("neil")
+    assert oauth_neil.capabilities == static_neil.capabilities
+    assert oauth_neil.memory_peer == static_neil.memory_peer
+    assert oauth_neil.channel == static_neil.channel == "mcp"
+
+
+def test_hybrid_ordering_degradation_and_jwks_fail_closed(tmp_path, monkeypatch, caplog) -> None:
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _oauth_cfg(tmp_path, monkeypatch)
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+    runtime = MCPServerRuntime(service)
+    static_token, _record = MCPTokenStore(cfg.mcp_serve.token_store_path).add(principal="viewer")
+    app = _BearerAuthASGI(_inner_app(runtime), service, cfg, http_get=jwks_get)
+
+    static = asyncio.run(_asgi_request(app, "/mcp", token=static_token))
+    assert static["status"] == 200
+    assert json.loads(static["body"])["identity"] == "viewer"
+    assert fixture["calls"]["jwks"] == 0
+
+    jwt_response = asyncio.run(_asgi_request(app, "/mcp", token=fixture["sign"]()))
+    garbage = asyncio.run(_asgi_request(app, "/mcp", token="garbage"))
+
+    assert jwt_response["status"] == 200
+    assert fixture["calls"]["jwks"] == 1
+    assert garbage["status"] == 401
+
+    partial_cfg = _cfg(
+        tmp_path / "partial",
+        monkeypatch,
+        auth_mode="hybrid",
+        resource_url="http://localhost:8795",
+        oauth_issuer="https://cockpit.example",
+    )
+    partial_service = JarvisMCPService(partial_cfg, memory=FakeMemory())
+    partial_token, _ = MCPTokenStore(partial_cfg.mcp_serve.token_store_path).add(principal="neil")
+    caplog.clear()
+    partial_app = _BearerAuthASGI(_inner_app(MCPServerRuntime(partial_service)), partial_service, partial_cfg, http_get=jwks_get)
+    partial_static = asyncio.run(_asgi_request(partial_app, "/mcp", token=partial_token))
+    partial_jwt = asyncio.run(_asgi_request(partial_app, "/mcp", token=fixture["sign"]()))
+
+    assert partial_static["status"] == 200
+    assert partial_jwt["status"] == 401
+    assert "OAuth disabled" in caplog.text
+
+    def failing_jwks_get(_url: str, **_kwargs: Any) -> Response:
+        raise RuntimeError("jwks down")
+
+    fail_cfg = _oauth_cfg(tmp_path / "fail", monkeypatch)
+    fail_service = JarvisMCPService(fail_cfg, memory=FakeMemory())
+    fail_static_token, _ = MCPTokenStore(fail_cfg.mcp_serve.token_store_path).add(principal="neil")
+    fail_app = _BearerAuthASGI(_inner_app(MCPServerRuntime(fail_service)), fail_service, fail_cfg, http_get=failing_jwks_get)
+
+    assert asyncio.run(_asgi_request(fail_app, "/mcp", token=fixture["sign"]()))["status"] == 401
+    assert asyncio.run(_asgi_request(fail_app, "/mcp", token=fail_static_token))["status"] == 200
 
 
 def test_unknown_principal_is_denied_by_default(tmp_path, monkeypatch) -> None:
@@ -556,7 +857,7 @@ def test_mcp_request_context_is_set_and_cleared_per_request(tmp_path, monkeypatc
         _ = (receive, send)
         seen.append(runtime.requester().identity)
 
-    app = _BearerAuthASGI(inner, service, cfg.mcp_serve.token_store_path)
+    app = _BearerAuthASGI(inner, service, cfg)
 
     async def call(token: str) -> None:
         sent: list[dict[str, Any]] = []
@@ -577,6 +878,69 @@ def test_mcp_request_context_is_set_and_cleared_per_request(tmp_path, monkeypatc
     assert sorted(seen) == ["neil", "viewer"]
     with pytest.raises(MCPAccessError):
         runtime.requester()
+
+
+def test_oauth_real_mcp_app_serves_discovery_challenge_and_tool_call(tmp_path, monkeypatch) -> None:
+    pytest.importorskip("mcp")
+    uvicorn = pytest.importorskip("uvicorn")
+    from jarvis.mcp.client import MCPClient
+
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _oauth_cfg(tmp_path, monkeypatch)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    cfg.mcp_serve.host = "127.0.0.1"
+    cfg.mcp_serve.port = port
+    cfg.mcp_serve.resource_url = f"http://127.0.0.1:{port}"
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+    runtime = MCPServerRuntime(service)
+    mcp = build_mcp(runtime)
+    app = _BearerAuthASGI(mcp.streamable_http_app(), service, cfg, http_get=jwks_get)
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    )
+    thread = threading.Thread(target=lambda: asyncio.run(server.serve()), daemon=True)
+    thread.start()
+    started_at = time.monotonic()
+    while not server.started and time.monotonic() - started_at < 5:
+        time.sleep(0.05)
+    assert server.started
+
+    token = fixture["sign"](audience=cfg.mcp_serve.resolved_resource_url)
+    try:
+        metadata = httpx.get(f"{cfg.mcp_serve.resolved_resource_url}/.well-known/oauth-protected-resource")
+        challenge = httpx.get(f"{cfg.mcp_serve.resolved_resource_url}/mcp")
+        assert metadata.status_code == 200
+        assert metadata.json()["resource"] == cfg.mcp_serve.resolved_resource_url
+        assert challenge.status_code == 401
+        assert challenge.headers["www-authenticate"] == (
+            f'Bearer resource_metadata="{cfg.mcp_serve.resolved_resource_url}/.well-known/oauth-protected-resource"'
+        )
+
+        async def call_tool() -> str:
+            from jarvis.config import MCPServerSpec
+
+            client = MCPClient(
+                MCPServerSpec(
+                    name="jarvis",
+                    transport="http",
+                    url=f"{cfg.mcp_serve.resolved_resource_url}/mcp",
+                    headers={"Authorization": f"Bearer {token}"},
+                ),
+                call_timeout_s=10.0,
+            )
+            await asyncio.wait_for(client.connect(), 20.0)
+            try:
+                return await client.call("project_list", {"include_archived": False})
+            finally:
+                await client.aclose()
+
+        out = asyncio.run(call_tool())
+        assert "Jarvis" in out
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
 
 
 def test_service_does_not_construct_memory_client_for_registry_reads(tmp_path, monkeypatch) -> None:

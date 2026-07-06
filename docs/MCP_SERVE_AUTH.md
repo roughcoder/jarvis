@@ -1,6 +1,6 @@
 # MCP Serve OAuth — spec
 
-Status: decision-locked spec for implementation. Companion to
+Status: implemented. Companion to
 `docs/COCKPIT_API.md` (MCP section) and the MCP authorization specification.
 Dated 2026-07-06.
 

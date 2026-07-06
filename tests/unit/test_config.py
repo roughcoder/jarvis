@@ -15,6 +15,7 @@ from jarvis.config import (
     IntercomConfig,
     IntercomDeviceConfig,
     LinearConfig,
+    MCPServeConfig,
     MemoryConfig,
     WorkerConfig,
 )
@@ -48,6 +49,45 @@ def test_base_url_is_computed_from_host_port(monkeypatch) -> None:
     _clean(monkeypatch, "MEMORY_HOST", "MEMORY_PORT")
     c = MemoryConfig(_env_file=None, host="frankfurt", port=8123)
     assert c.base_url == "http://frankfurt:8123"
+
+
+def test_mcp_serve_resource_url_defaults_to_host_port(monkeypatch) -> None:
+    _clean(monkeypatch, "MCP_SERVE_HOST", "MCP_SERVE_PORT", "MCP_SERVE_RESOURCE_URL")
+
+    c = MCPServeConfig(_env_file=None, host="jarvis.local", port=8795)
+
+    assert c.resource_url == ""
+    assert c.resolved_resource_url == "http://jarvis.local:8795"
+
+
+def test_resolved_includes_mcp_serve_oauth_fields(monkeypatch) -> None:
+    _clean(
+        monkeypatch,
+        "MCP_SERVE_AUTH_MODE",
+        "MCP_SERVE_RESOURCE_URL",
+        "MCP_SERVE_OAUTH_ISSUER",
+        "MCP_SERVE_OAUTH_JWKS_URL",
+        "MCP_SERVE_OAUTH_REQUIRED_SCOPES",
+        "MCP_SERVE_OAUTH_JWKS_TTL_S",
+        "MCP_SERVE_OAUTH_JWKS_MIN_REFRESH_S",
+    )
+    monkeypatch.setenv("MCP_SERVE_AUTH_MODE", "oauth")
+    monkeypatch.setenv("MCP_SERVE_RESOURCE_URL", "https://jarvis.example/mcp")
+    monkeypatch.setenv("MCP_SERVE_OAUTH_ISSUER", "https://cockpit.example")
+    monkeypatch.setenv("MCP_SERVE_OAUTH_JWKS_URL", "https://cockpit.example/api/auth/jwks")
+    monkeypatch.setenv("MCP_SERVE_OAUTH_REQUIRED_SCOPES", "mcp:use,mcp:write")
+    monkeypatch.setenv("MCP_SERVE_OAUTH_JWKS_TTL_S", "120")
+    monkeypatch.setenv("MCP_SERVE_OAUTH_JWKS_MIN_REFRESH_S", "10")
+
+    r = Config().resolved()
+
+    assert r["mcp_serve.auth_mode"] == "oauth"
+    assert r["mcp_serve.resource_url"] == "https://jarvis.example/mcp"
+    assert r["mcp_serve.oauth_issuer"] == "https://cockpit.example"
+    assert r["mcp_serve.oauth_jwks_url"] == "https://cockpit.example/api/auth/jwks"
+    assert r["mcp_serve.oauth_required_scopes"] == "mcp:use,mcp:write"
+    assert r["mcp_serve.oauth_jwks_ttl_s"] == 120.0
+    assert r["mcp_serve.oauth_jwks_min_refresh_s"] == 10.0
 
 
 def test_memory_backend_sidecar_and_curation_outbox_are_env_driven(monkeypatch, tmp_path) -> None:

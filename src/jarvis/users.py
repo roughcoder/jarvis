@@ -30,6 +30,7 @@ class User:
     devices: frozenset[str] = frozenset()
     whatsapp: frozenset[str] = frozenset()
     claims: tuple[str, ...] = ()
+    oauth_subjects: tuple[str, ...] = ()
     capabilities: frozenset[str] = frozenset()
     calendar_accounts: tuple[str, ...] = ()
     email_accounts: tuple[str, ...] = ()
@@ -59,6 +60,7 @@ def parse_user(name: str, text: str) -> User:
         devices=frozenset(as_list(fm.get("devices"))),
         whatsapp=frozenset(as_list(fm.get("whatsapp"))),
         claims=tuple(c.lower() for c in as_list(fm.get("claims"))),
+        oauth_subjects=tuple(as_list(fm.get("oauth_subjects"))),
         capabilities=frozenset(as_list(fm.get("capabilities"))),
         calendar_accounts=tuple(as_list(fm.get("calendar_accounts"))),
         email_accounts=tuple(as_list(fm.get("email_accounts"))),
