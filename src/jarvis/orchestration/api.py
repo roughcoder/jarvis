@@ -719,16 +719,26 @@ class CockpitReadHandlers:
         await self.ctx.require_auth(request)
         registry = await asyncio.to_thread(_registry_store, self.ctx.cfg)
         requester = _cockpit_requester_context(request, self.ctx.cfg)
+        route_project_id = request.match_info["project_id"]
+        registry_project = registry.get_project(route_project_id)
         project = (
-            await asyncio.to_thread(_visible_project_or_404, registry, request.match_info["project_id"], requester)
+            await asyncio.to_thread(_visible_project_or_404, registry, route_project_id, requester)
             if requester is not None
             else None
         )
         if project is None:
-            raise CockpitError("not_found", "project not found", status=404)
+            if (
+                requester is None
+                or registry_project is not None
+                or not await asyncio.to_thread(_project_activity_log(self.ctx).visible_after_delete, route_project_id, requester.identity)
+            ):
+                raise CockpitError("not_found", "project not found", status=404)
+            activity_project_id = route_project_id
+        else:
+            activity_project_id = project.id
         activity, next_cursor = await asyncio.to_thread(
             _project_activity_log(self.ctx).list,
-            project.id,
+            activity_project_id,
             limit=_limit(request),
             cursor=str(request.query.get("cursor") or ""),
             activity_type=str(request.query.get("type") or ""),
@@ -737,7 +747,7 @@ class CockpitReadHandlers:
             {
                 "api_version": API_VERSION,
                 "schema_version": SCHEMA_VERSION,
-                "project_id": project.id,
+                "project_id": activity_project_id,
                 "activity": activity,
                 "next_cursor": next_cursor,
             }
@@ -969,7 +979,7 @@ class CockpitWriteHandlers:
                 )
             return _project_write_body(result)
 
-        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce)
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def project_update(self, request: web.Request) -> web.Response:
@@ -997,7 +1007,7 @@ class CockpitWriteHandlers:
             )
             return _project_write_body(result)
 
-        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce)
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def project_visibility(self, request: web.Request) -> web.Response:
@@ -1024,7 +1034,7 @@ class CockpitWriteHandlers:
             )
             return _project_write_body(result)
 
-        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def project_member_add(self, request: web.Request) -> web.Response:
@@ -1051,7 +1061,7 @@ class CockpitWriteHandlers:
             )
             return _project_write_body(result)
 
-        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def project_member_remove(self, request: web.Request) -> web.Response:
@@ -1078,7 +1088,7 @@ class CockpitWriteHandlers:
             )
             return _project_write_body(result)
 
-        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def project_archive(self, request: web.Request) -> web.Response:
@@ -1095,7 +1105,7 @@ class CockpitWriteHandlers:
             await _record_project_activity(self.ctx, project_id, "project.archived", requester, f"Archived project {project_id}", {"project_id": project_id})
             return _project_write_body(result)
 
-        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def project_unarchive(self, request: web.Request) -> web.Response:
@@ -1112,7 +1122,7 @@ class CockpitWriteHandlers:
             await _record_project_activity(self.ctx, project_id, "project.unarchived", requester, f"Unarchived project {project_id}", {"project_id": project_id})
             return _project_write_body(result)
 
-        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def project_delete(self, request: web.Request) -> web.Response:
@@ -1124,12 +1134,25 @@ class CockpitWriteHandlers:
         scope = f"projects/{payload['project_id']}/delete"
 
         async def produce() -> dict[str, Any]:
+            visible_to: list[str] = []
+            with contextlib.suppress(Exception):
+                registry = await asyncio.to_thread(_registry_store, self.ctx.cfg)
+                project = registry.get_project(str(payload["project_id"]))
+                if project is not None:
+                    visible_to = sorted({project.owner, *project.members})
             result = await _project_brain_write(self.ctx, requester, "project.delete", payload)
             project_id = _project_id_from_result(result, str(payload["project_id"]))
-            await _record_project_activity(self.ctx, project_id, "project.deleted", requester, f"Deleted project {project_id}", {"project_id": project_id})
+            await _record_project_activity(
+                self.ctx,
+                project_id,
+                "project.deleted",
+                requester,
+                f"Deleted project {project_id}",
+                {"project_id": project_id, "visible_to": visible_to},
+            )
             return _project_write_body(result)
 
-        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def project_finding(self, request: web.Request) -> web.Response:
@@ -1176,7 +1199,7 @@ class CockpitWriteHandlers:
             )
             return _project_write_body(result)
 
-        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def project_memory_forget(self, request: web.Request) -> web.Response:
@@ -1210,7 +1233,7 @@ class CockpitWriteHandlers:
             )
             return _project_write_body(result)
 
-        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce)
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def project_file_upload(self, request: web.Request) -> web.Response:
@@ -1236,7 +1259,7 @@ class CockpitWriteHandlers:
             )
             return _project_write_body(result)
 
-        response_body = await _idempotent_write_body(self.ctx, scope, idempotency_key, fingerprint_body, produce)
+        response_body = await _idempotent_write_body(self.ctx, scope, idempotency_key, fingerprint_body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def project_file_retract(self, request: web.Request) -> web.Response:
@@ -1260,7 +1283,7 @@ class CockpitWriteHandlers:
             )
             return _project_write_body(result)
 
-        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def project_thread_open(self, request: web.Request) -> web.Response:
@@ -1299,7 +1322,7 @@ class CockpitWriteHandlers:
             )
             return _project_write_body({"project_id": project.id, "thread": _thread_projection(thread)})
 
-        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce)
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def project_thread_turn(self, request: web.Request) -> web.StreamResponse:
@@ -2096,7 +2119,11 @@ async def _idempotent_write_body(
     key: str,
     fingerprint_body: dict[str, Any],
     producer: Callable[[], Any],
+    *,
+    requester: RequestContext | None = None,
 ) -> dict[str, Any]:
+    if requester is not None:
+        scope = f"{scope}/principal/{_idempotency_principal(requester)}"
     async with _idempotency_scope(ctx, scope, key):
         cached = ctx.idempotency.get(scope, key, fingerprint_body)
         if cached is not None:
@@ -2104,6 +2131,10 @@ async def _idempotent_write_body(
         response_body = await producer()
         ctx.idempotency.save(scope, key, fingerprint_body, response_body)
         return response_body
+
+
+def _idempotency_principal(requester: RequestContext) -> str:
+    return "\0".join((requester.scope, requester.identity, requester.memory_peer, requester.channel))
 
 
 def _reject_attachments(body: dict[str, Any]) -> None:

@@ -2840,6 +2840,37 @@ def test_cockpit_project_activity_records_owner_writes(tmp_path, monkeypatch) ->
     asyncio.run(_with_server(cfg, calls))
 
 
+def test_cockpit_project_activity_remains_readable_after_delete(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="alice")
+    _seed_project_registry(cfg)
+
+    class DeletingProjectBrain(FakeProjectBrainClient):
+        async def execute(self, requester: RequestContext, op: str, payload: dict[str, Any]) -> dict[str, Any]:
+            result = await super().execute(requester, op, payload)
+            if op == "project.delete":
+                registry_path = Path(cfg.registry.path)
+                registry = json.loads(registry_path.read_text())
+                registry["projects"] = [project for project in registry["projects"] if project["id"] != payload["project_id"]]
+                registry_path.write_text(json.dumps(registry))
+            return result
+
+    monkeypatch.setattr(cockpit_api_module, "_project_brain_client", lambda _ctx: DeletingProjectBrain())
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        delete = await client.request("DELETE", f"{base}/v1/projects/neil-shared", json={})
+        detail = await client.get(f"{base}/v1/projects/neil-shared")
+        activity = await client.get(f"{base}/v1/projects/neil-shared/activity")
+
+        assert delete.status_code == 200
+        assert detail.status_code == 404
+        assert activity.status_code == 200
+        assert activity.json()["activity"][0]["type"] == "project.deleted"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
 def test_cockpit_project_activity_append_failure_does_not_fail_write(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)
@@ -2911,6 +2942,44 @@ def test_cockpit_project_idempotency_replay_conflict_and_no_key(tmp_path, monkey
     assert [call["op"] for call in brain.calls].count("project.members.set") == 1
     activity_file = Path(cfg.orchestration.workspace) / "project-activity" / "created-one.jsonl"
     assert json.loads(activity_file.read_text().splitlines()[0])["type"] == "project.created"
+
+
+def test_cockpit_project_idempotency_is_principal_scoped(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        auth_mode="oauth",
+        oauth_issuer="https://cockpit.example",
+        oauth_audience="jarvis-brain",
+        oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+        oauth_required_scopes="jarvis:read",
+    )
+    _seed_project_registry(cfg)
+    _seed_user_profiles(cfg, "alice", "neil")
+    brain = FakeProjectBrainClient()
+    monkeypatch.setattr(cockpit_api_module, "_project_brain_client", lambda _ctx: brain)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        alice = {"Authorization": f"Bearer {fixture['sign'](subject='alice', jarvis_user='alice', scope='jarvis:read')}"}
+        neil = {"Authorization": f"Bearer {fixture['sign'](subject='neil', jarvis_user='neil', scope='jarvis:read')}"}
+        body = {"idempotency_key": "delete-private"}
+
+        first = await client.request("DELETE", f"{base}/v1/projects/alice-private", headers=alice, json=body)
+        replay = await client.request("DELETE", f"{base}/v1/projects/alice-private", headers=alice, json=body)
+        cross_principal = await client.request("DELETE", f"{base}/v1/projects/alice-private", headers=neil, json=body)
+
+        assert first.status_code == 200
+        assert replay.status_code == 200
+        assert replay.json()["idempotent"] is True
+        assert cross_principal.status_code == 404
+        assert cross_principal.json()["error"]["code"] == "not_found"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=jwks_get))
+
+    assert [call["op"] for call in brain.calls].count("project.delete") == 2
 
 
 def test_cockpit_file_upload_and_retract_idempotency(tmp_path, monkeypatch) -> None:  # noqa: ANN001

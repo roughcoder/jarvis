@@ -77,6 +77,16 @@ class ProjectActivityLog:
         next_cursor = str(page[-1].get("id") or "") if len(events) > limit and page else ""
         return page, next_cursor
 
+    def visible_after_delete(self, project_id: str, identity: str) -> bool:
+        for event in reversed(self._read(project_id)):
+            if str(event.get("type") or "") != "project.deleted":
+                continue
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            visible_to = data.get("visible_to") if isinstance(data, dict) else []
+            actor = event.get("actor") if isinstance(event.get("actor"), dict) else {}
+            return identity in {str(item) for item in visible_to or []} or str(actor.get("identity") or "") == identity
+        return False
+
     def _read(self, project_id: str) -> list[dict[str, Any]]:
         path = self._path(project_id)
         if not path.exists():

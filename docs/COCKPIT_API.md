@@ -392,6 +392,11 @@ Project activity is poll-based in v1. It is intentionally not part of
 `/v1/cockpit/events`; that SSE stream is snapshot-diff based and remains scoped
 to run/session/worker projections.
 
+After a successful project delete, the live registry row may be gone before the
+client's next poll. The `project.deleted` activity carries a small visibility
+tombstone so prior owner/member clients can still read the deleted project's
+activity feed.
+
 Activity records are redacted before persistence:
 
 ```json
@@ -1568,7 +1573,9 @@ Semantics:
 
 - Scope is per route plus key, for example `projects/{id}/files/upload` or
   `sessions/{worker_id}/{session_id}/turns`. The same key may be reused safely
-  on a different route scope.
+  on a different route scope. Project-write cache scopes also include the
+  authenticated requester, so one principal cannot replay another principal's
+  stored project-write response.
 - Empty or absent key disables caching.
 - Replay with the same scope, same key, and same request fingerprint returns
   the stored response with `"idempotent": true`.
@@ -1938,8 +1945,8 @@ or breaking status, and migration notes.
   writes, findings/decisions, memory forget/correct, file upload/retract, and
   thread open. Multipart upload uses `X-Idempotency-Key`; project thread turns
   remain the explicit streaming exception.
-- Documented exact idempotency scope, replay, conflict, expiry, and concurrent
-  same-key serialization semantics.
+- Documented exact idempotency scope, replay, conflict, expiry, concurrent
+  same-key serialization, and project-write requester-binding semantics.
 - Named the two write envelopes: reconciliation packet for run/session
   projection writes and resource write envelope for project writes. Project
   writes now consistently expose route-specific result fields and, where
