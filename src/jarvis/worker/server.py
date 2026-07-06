@@ -43,9 +43,9 @@ from jarvis.worker.actions import (
     clone_repo,
     code_argv,
     gui_doctor,
+    diagnostics,
     list_repos,
     prepare_worktree,
-    repo_inventory,
     resolve_repo,
     run_applescript,
     run_exec,
@@ -167,6 +167,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
 
     browser_cfg = BrowserConfig()
     browser_holder: dict = {}
+    diagnostics_state: dict[str, Any] = {"value": None, "expires_at": 0.0, "task": None}
 
     async def browser_dispatch(action: str, args: dict) -> web.Response:
         if not browser_cfg.enabled:
@@ -642,12 +643,58 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         }
         if authorised(request):
             body["system"] = system_info_cached()
-            body["repositories"] = repo_inventory(cfg.repo_root)
+            readiness = _diagnostics_payload(supported_engines)
+            body["diagnostics"] = readiness
+            body["repositories"] = readiness.get("repositories") if isinstance(readiness, dict) else []
+            if not isinstance(body["repositories"], list):
+                body["repositories"] = []
         return web.json_response(body)
+
+    def _diagnostics_payload(supported_engines: list[str]) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        value = diagnostics_state.get("value")
+        expired = value is None or float(diagnostics_state.get("expires_at") or 0.0) <= now
+        task = diagnostics_state.get("task")
+        if expired and (task is None or task.done()):
+            diagnostics_state["task"] = loop.create_task(_refresh_diagnostics(supported_engines))
+        if isinstance(value, dict):
+            payload = dict(value)
+            if expired:
+                payload["status"] = "refreshing"
+            return payload
+        return {"status": "refreshing", "repositories": []}
+
+    async def _refresh_diagnostics(supported_engines: list[str]) -> None:
+        try:
+            value = await asyncio.to_thread(
+                diagnostics,
+                repo_root=cfg.repo_root,
+                engines=supported_engines,
+                codex_bin=cfg.codex_bin,
+                claude_bin=cfg.claude_bin,
+                browser_cfg=browser_cfg,
+                ttl_s=cfg.diagnostics_ttl_s,
+            )
+            if not isinstance(value, dict):
+                value = {"error": "invalid diagnostics payload", "repositories": []}
+        except Exception as exc:  # noqa: BLE001 - health must stay a liveness endpoint
+            value = {"error": str(exc)[:200] or exc.__class__.__name__, "repositories": []}
+        diagnostics_state["value"] = value
+        diagnostics_state["expires_at"] = asyncio.get_running_loop().time() + max(0.0, cfg.diagnostics_ttl_s)
+        diagnostics_state["task"] = None
+
+    async def _cleanup_diagnostics(_app: web.Application) -> None:
+        task = diagnostics_state.get("task")
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     app = web.Application()
     app["browser_holder"] = browser_holder  # for clean shutdown in serve()
     app["browser_cfg"] = browser_cfg
+    app.on_cleanup.append(_cleanup_diagnostics)
     app.add_routes([
         web.post("/run", run),
         web.get("/jobs/{id}", get_job),

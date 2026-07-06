@@ -943,6 +943,26 @@ names.
     "active_sessions": 1,
     "queued_sessions": 0
   },
+  "readiness": {
+    "engines": [
+      {
+        "engine": "codex",
+        "installed": true,
+        "authenticated": true,
+        "version": "codex 1.2.3",
+        "detail": "codex login status succeeded"
+      }
+    ],
+    "package_managers": [{"name": "uv", "available": true}],
+    "browser": {
+      "available": true,
+      "nodriver_installed": true,
+      "chrome_found": true,
+      "headless": false,
+      "default_context": "jarvis",
+      "detail": "ready"
+    }
+  },
   "repositories": [
     {
       "repo": "jarvis",
@@ -956,11 +976,23 @@ names.
 }
 ```
 
+`readiness` is populated only for probed responses (`?probe=true`). Static
+worker-profile responses set it to `null`. It is a public-safe projection of
+the worker's authorised `/health.diagnostics` block: engine install/auth/version
+state, package-manager availability, and browser readiness. Local filesystem
+paths, binary paths, and credential locations are redacted before exposure.
+If a worker has no cached diagnostics yet, or cached diagnostics are stale, the
+worker may return `{"status":"refreshing"}` while it refreshes the expensive
+checks in the background; clients should keep treating `/health.ok` as liveness.
+
 `repositories` is the Jarvis-owned repo registry for this worker. Rows come
 from the worker profile (`workers.json`) and, on probe, from the worker's
-authorised `/health` response (the worker publishes the git checkouts under its
-configured repo root with each repo's default branch). `is_default` marks the
-repo matching the worker profile's own `default_repo` when set, otherwise
+authorised `/health` diagnostics (the worker publishes the git checkouts under
+its configured repo root with each repo's default branch). `status` is now a
+real checkout result: `ready` means `.git` exists, `git status --porcelain`
+succeeds, and the default branch is resolvable; `broken` means at least one of
+those checks failed and `detail` may explain why. `is_default` marks the repo
+matching the worker profile's own `default_repo` when set, otherwise
 `ORCHESTRATION_DEFAULT_REPO` (an `org/name` default matches a bare checkout
 name on the trailing segment). `can_start_work` is true when the repo's status
 is `ready`. Workers that publish nothing return `[]` — the cockpit should then
@@ -1338,6 +1370,22 @@ failed start records. Use it to power start-wizard validation.
     "landing_mode": "draft_pr",
     "work_item": null,
     "owned_by_run_id": null,
+    "compatibility": {
+      "repo": null,
+      "workers": [
+        {
+          "worker_id": "macbook-worker",
+          "eligible": true,
+          "reasons": ["selected"]
+        },
+        {
+          "worker_id": "hive-worker",
+          "eligible": true,
+          "reasons": ["eligible", "repo not checked out"]
+        }
+      ],
+      "selected_worker_id": "macbook-worker"
+    },
     "missing": ["repo"],
     "missing_authority": [],
     "reasons": ["work item has no repo/default repo; cannot start a coding worker"],
@@ -1348,9 +1396,17 @@ failed start records. Use it to power start-wizard validation.
 
 `worker_id`/`engine`/`engines` report the selection Jarvis would make;
 `missing` lists absent required fields, `missing_authority` lists denied
-capability actions, and `reasons` is the human-readable roll-up. For github and
-linear sources, Jarvis peeks at the source read-only (`next()` lists without
-claiming) and reports the candidate as `work_item`
+capability actions, and `reasons` is the human-readable roll-up.
+`compatibility` explains worker↔repo selection from the same probed registry
+path used by `/v1/work/start`. `compatibility.repo` is the resolved repo, each
+worker row says whether that worker is eligible, and `reasons` explains either
+the chosen row (`selected`), an alternate eligible row (`eligible`), advisory
+compatibility notes such as `repo not checked out` (the worker may clone on
+demand), or why a worker was excluded (for example `repo checkout broken`,
+`engine codex unavailable`, `engine codex unauthenticated`, `worker offline`,
+or `worker at capacity`). For github and linear sources, Jarvis peeks at the
+source read-only (`next()` lists without claiming) and reports the candidate as
+`work_item`
 (`{source, id, title, repo, kind}`); if the source has no eligible item,
 `can_start` is false with a matching reason. When read authority is missing or
 the source is unreachable, the peek is skipped and `notes` says why. The exact
@@ -1605,6 +1661,19 @@ or breaking status, and migration notes.
 - Documented MCP response redaction guarantees, one-time plaintext token
   visibility, token-count-only status reporting, and the reported-only
   `codex_wired` field.
+
+### 2026-07-06 - Worker readiness + compatibility (compatible)
+
+- Added worker readiness diagnostics to probed `WorkerProfile` responses:
+  engine install/auth/version, package managers, browser capability, and real
+  repo checkout status.
+- Changed worker repository status semantics from config-derived readiness to
+  bounded git checks (`ready` or `broken` with redacted detail).
+- Added `/v1/work/validate.compatibility` so start wizards can show which
+  workers can serve the resolved repo, which workers may clone it on demand,
+  and why workers were selected or excluded.
+- Added env-driven `WORKER_DIAGNOSTICS_TTL_S` to cache worker readiness checks
+  used by `/health`.
 
 ### 2026-07-04 - v1 PR review hardening (compatible)
 

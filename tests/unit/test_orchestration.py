@@ -160,6 +160,24 @@ def test_worker_registry_redacts_private_connection_details(monkeypatch) -> None
                         ],
                         "checked_at": "2026-07-02T23:35:00Z",
                     },
+                    "diagnostics": {
+                        "engines": [
+                            {
+                                "engine": "codex",
+                                "installed": True,
+                                "authenticated": None,
+                                "version": "codex 1.2.3",
+                                "detail": "read ~/.codex/auth.json under /Users/example/private",
+                            }
+                        ],
+                        "repositories": [
+                            {
+                                "repo": "broken",
+                                "status": "broken",
+                                "detail": "fatal: not a git repository: /Users/example/dev/broken",
+                            }
+                        ],
+                    },
                 }
             )
         return Response({"jobs": [{"status": "running"}, {"status": "done"}]})
@@ -172,8 +190,10 @@ def test_worker_registry_redacts_private_connection_details(monkeypatch) -> None
     assert public["status"] == "online"
     assert public["capacity"]["current_jobs"] == 1
     assert public["system"]["disk"][0]["mount"] is None
+    assert public["readiness"]["repositories"][0]["detail"] == "fatal: not a git repository: <local-path>"
     assert "private-host" not in json.dumps(public)
     assert "/Users/example" not in json.dumps(public)
+    assert "~/.codex" not in json.dumps(public)
     assert "secret" not in json.dumps(public)
 
 
@@ -662,6 +682,7 @@ def test_orchestration_service_starts_next_work_through_shared_policy(tmp_path, 
             [
                 f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
                 "ORCHESTRATION_LANDING_MODE=branch_only",
+                "WORKER_SUPPORTED_ENGINES=codex,claude",
             ]
         )
     )
@@ -684,13 +705,14 @@ def test_orchestration_service_starts_next_work_through_shared_policy(tmp_path, 
         )
 
     monkeypatch.setattr(
-        "jarvis.orchestration.workers.WorkerRegistry.choose",
-        lambda _self, _required=None: WorkerProfile(
-            worker_id="local-worker",
-            display_name="Local",
+        "jarvis.orchestration.workers.WorkerRegistry._probe",
+        lambda _self, profile: WorkerProfile(
+            worker_id=profile.worker_id,
+            display_name=profile.display_name,
             capabilities=["git"],
-            base_url="http://localhost:1",
+            base_url=profile.base_url,
             status="online",
+            supported_engines=profile.supported_engines,
             max_concurrent_jobs=1,
             current_jobs=0,
         ),
@@ -800,6 +822,135 @@ def test_orchestration_service_selects_requested_engine(tmp_path, monkeypatch) -
     assert result.envelope.session_id
 
 
+def test_orchestration_validate_compatibility_matches_selection(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    workers_path = tmp_path / "workers.json"
+    workers_path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "local-worker",
+                        "display_name": "Local",
+                        "capabilities": ["git", "codex"],
+                        "status": "online",
+                        "supported_engines": ["codex"],
+                        "repositories": [{"repo": "jarvis", "status": "ready", "default_branch": "main"}],
+                    },
+                    {
+                        "worker_id": "remote-worker",
+                        "display_name": "Remote",
+                        "capabilities": ["git", "codex"],
+                        "status": "online",
+                        "supported_engines": ["codex"],
+                        "repositories": [{"repo": "other", "status": "ready", "default_branch": "main"}],
+                    },
+                ]
+            }
+        )
+    )
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                f"ORCHESTRATION_WORKERS_PATH={workers_path}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+    cfg = load_config()
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={
+            "worker.job.start",
+            "worker.session.create",
+            "worker.session.turn",
+            "forge.github.branch.push",
+        },
+        source_factory=lambda _name, _cfg=None: None,
+    )
+    command = WorkCommand("start_next_work", source="manual")
+    item = WorkItem(source="manual", id="manual", title="Manual", repo="roughcoder/jarvis")
+    registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path)
+
+    worker, engine, engines = service._select_worker_and_engines(command, item, registry)  # noqa: SLF001
+    validation = service.validate_work(command, manual_item=item)
+
+    assert worker.worker_id == "local-worker"
+    assert engine == "codex"
+    assert engines == ["codex"]
+    assert validation["compatibility"]["selected_worker_id"] == worker.worker_id
+    assert validation["compatibility"]["workers"][1] == {
+        "worker_id": "remote-worker",
+        "eligible": True,
+        "reasons": ["eligible", "repo not checked out"],
+    }
+
+
+def test_orchestration_dispatch_allows_clone_on_demand_when_repo_missing(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    workers_path = tmp_path / "workers.json"
+    workers_path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "local-worker",
+                        "display_name": "Local",
+                        "capabilities": ["git", "codex"],
+                        "status": "online",
+                        "supported_engines": ["codex"],
+                        "repositories": [{"repo": "other", "status": "ready", "default_branch": "main"}],
+                    }
+                ]
+            }
+        )
+    )
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                f"ORCHESTRATION_WORKERS_PATH={workers_path}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+    cfg = load_config()
+
+    class Source:
+        def next(self, *, repo="", filters=None):  # noqa: ANN001, ANN201
+            return _item(id="#clone", repo="roughcoder/jarvis")
+
+    seen = {}
+
+    def fake_start(envelope, *, worker_cfg, worker=None, store=None, post=None):  # noqa: ANN001, ANN202
+        seen["worker_id"] = worker.worker_id
+        seen["repo"] = envelope.repo
+        return WorkerSessionLink(worker_id=envelope.worker_id, session_id="sess_clone", branch=envelope.branch_name)
+
+    monkeypatch.setattr("jarvis.orchestration.executor.start_worker_session", fake_start)
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={
+            "work.github.issues.read",
+            "worker.job.start",
+            "worker.session.create",
+            "worker.session.turn",
+            "forge.github.branch.push",
+        },
+        source_factory=lambda _name, _cfg=None: Source(),
+    )
+
+    result = service.next_work(WorkCommand("start_next_work", source="github", start=True), start=True)
+
+    assert isinstance(result, StartedWork)
+    assert seen == {"worker_id": "local-worker", "repo": "roughcoder/jarvis"}
+
+
 def test_orchestration_service_starts_ensemble_sessions(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     env_file = tmp_path / ".env"
     env_file.write_text(
@@ -807,6 +958,7 @@ def test_orchestration_service_starts_ensemble_sessions(tmp_path, monkeypatch) -
             [
                 f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
                 "ORCHESTRATION_LANDING_MODE=branch_only",
+                "WORKER_SUPPORTED_ENGINES=codex,claude",
             ]
         )
     )
@@ -816,20 +968,6 @@ def test_orchestration_service_starts_ensemble_sessions(tmp_path, monkeypatch) -
     class Source:
         def next(self, *, repo="", filters=None):  # noqa: ANN001, ANN201
             return _item(id="#33")
-
-    def fake_choose(_self, _required=None, *, engine="", engines=None, slots=1):  # noqa: ANN001, ANN202
-        assert engine == ""
-        assert engines == ["codex", "claude"]
-        assert slots == 2
-        return WorkerProfile(
-            worker_id="local-worker",
-            display_name="Local",
-            capabilities=["git"],
-            base_url="http://localhost:1",
-            status="online",
-            supported_engines=["codex", "claude"],
-            max_concurrent_jobs=2,
-        )
 
     def fake_start_ensemble(envelope, *, engines, worker_cfg, worker=None, store=None, post=None):  # noqa: ANN001, ANN202
         assert envelope.engine_strategy == "ensemble"
@@ -843,7 +981,12 @@ def test_orchestration_service_starts_ensemble_sessions(tmp_path, monkeypatch) -
             store.link_session(envelope.run_id, link)
         return links
 
-    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry.choose", fake_choose)
+    def fake_probe(_self, profile):  # noqa: ANN001
+        profile.status = "online"
+        profile.max_concurrent_jobs = 2
+        return profile
+
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", fake_probe)
     monkeypatch.setattr("jarvis.orchestration.executor.start_worker_ensemble", fake_start_ensemble)
     service = OrchestrationService(
         cfg=cfg,
@@ -1164,13 +1307,14 @@ def test_orchestration_service_uses_default_repo_for_repo_less_item(tmp_path, mo
         return WorkerSessionLink(worker_id=envelope.worker_id, session_id="sess255", branch=envelope.branch_name)
 
     monkeypatch.setattr(
-        "jarvis.orchestration.workers.WorkerRegistry.choose",
-        lambda _self, _required=None: WorkerProfile(
-            worker_id="local-worker",
-            display_name="Local",
+        "jarvis.orchestration.workers.WorkerRegistry._probe",
+        lambda _self, profile: WorkerProfile(
+            worker_id=profile.worker_id,
+            display_name=profile.display_name,
             capabilities=["git"],
-            base_url="http://localhost:1",
+            base_url=profile.base_url,
             status="online",
+            supported_engines=profile.supported_engines,
             max_concurrent_jobs=1,
             current_jobs=0,
         ),
@@ -4315,13 +4459,14 @@ def test_cli_work_dispatch_failure_marks_run_failed(tmp_path, monkeypatch, capsy
     )
     monkeypatch.setattr(cli, "_work_source", lambda _name, _cfg=None: Source())
     monkeypatch.setattr(
-        "jarvis.orchestration.workers.WorkerRegistry.choose",
-        lambda _self, _required=None: WorkerProfile(
-            worker_id="local-worker",
-            display_name="Local",
+        "jarvis.orchestration.workers.WorkerRegistry._probe",
+        lambda _self, profile: WorkerProfile(
+            worker_id=profile.worker_id,
+            display_name=profile.display_name,
             capabilities=["git"],
-            base_url="http://localhost:1",
+            base_url=profile.base_url,
             status="online",
+            supported_engines=profile.supported_engines,
             max_concurrent_jobs=1,
             current_jobs=0,
         ),

@@ -415,6 +415,7 @@ def project_worker_profile(profile: WorkerProfile, *, default_repo: str = "") ->
         "last_seen_at": profile.last_seen_at,
         "capabilities": mapped_capabilities,
         "engines": engines,
+        "readiness": _worker_readiness(profile.readiness),
         "capacity": {
             "max_sessions": profile.max_concurrent_jobs,
             "active_sessions": profile.current_jobs,
@@ -433,16 +434,64 @@ def _repository_rows(raw_rows: list[dict[str, Any]], default_repo: str) -> list[
         if not repo:
             continue
         status = str(raw.get("status") or "ready")
-        rows.append(
+        row = {
+            "repo": repo,
+            "status": status,
+            "default_branch": str(raw.get("default_branch") or ""),
+            "is_default": _same_repo(repo, default_repo),
+            "can_start_work": status == "ready",
+        }
+        detail = public_error_message(str(raw.get("detail") or ""))
+        if detail:
+            row["detail"] = detail
+        rows.append(row)
+    return rows
+
+
+def _worker_readiness(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    result: dict[str, Any] = {
+        "engines": [],
+        "package_managers": [],
+        "browser": {"available": False, "detail": ""},
+    }
+    if raw.get("error"):
+        result["error"] = public_error_message(str(raw.get("error") or ""))
+    for item in raw.get("engines") or []:
+        if not isinstance(item, dict):
+            continue
+        result["engines"].append(
             {
-                "repo": repo,
-                "status": status,
-                "default_branch": str(raw.get("default_branch") or ""),
-                "is_default": _same_repo(repo, default_repo),
-                "can_start_work": status == "ready",
+                "engine": _redact(str(item.get("engine") or "")),
+                "installed": bool(item.get("installed")),
+                "authenticated": (
+                    item.get("authenticated")
+                    if item.get("authenticated") is None
+                    else bool(item.get("authenticated"))
+                ),
+                "version": _redact(str(item.get("version") or "")),
+                "detail": public_error_message(str(item.get("detail") or "")),
             }
         )
-    return rows
+    for item in raw.get("package_managers") or []:
+        if isinstance(item, str):
+            result["package_managers"].append({"name": _redact(item), "available": True})
+        elif isinstance(item, dict):
+            result["package_managers"].append(
+                {"name": _redact(str(item.get("name") or "")), "available": bool(item.get("available"))}
+            )
+    browser = raw.get("browser")
+    if isinstance(browser, dict):
+        result["browser"] = {
+            "available": bool(browser.get("available")),
+            "nodriver_installed": bool(browser.get("nodriver_installed")),
+            "chrome_found": bool(browser.get("chrome_found")),
+            "headless": bool(browser.get("headless")),
+            "default_context": _redact(str(browser.get("default_context") or "")),
+            "detail": public_error_message(str(browser.get("detail") or "")),
+        }
+    return result
 
 
 def _same_repo(repo: str, default_repo: str) -> bool:
