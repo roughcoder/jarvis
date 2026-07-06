@@ -6,6 +6,7 @@ import contextlib
 import hmac
 import json
 import logging
+from pathlib import Path
 from dataclasses import dataclass, replace
 from typing import Any, Callable
 
@@ -439,6 +440,7 @@ def make_app(
     app.add_routes([
         web.get("/v1/auth/metadata", reads.auth_metadata),
         web.get("/v1/health", reads.health),
+        web.get("/v1/capabilities", reads.capabilities),
         web.get("/v1/cockpit/catalog", reads.catalog),
         web.get("/v1/cockpit/snapshot", reads.snapshot),
         web.get("/v1/cockpit/events", sse.events),
@@ -447,6 +449,7 @@ def make_app(
         web.get("/v1/projects/{project_id}/threads", reads.project_threads),
         web.get("/v1/projects/{project_id}/files", reads.project_files),
         web.get("/v1/projects/{project_id}/memory", reads.project_memory),
+        web.get("/v1/projects/{project_id}/permissions", reads.project_permissions),
         web.get("/v1/projects/{project_id}", reads.project_detail),
         web.get("/v1/workers", reads.workers),
         web.get("/v1/workers/{worker_id}", reads.worker_detail),
@@ -510,6 +513,26 @@ class CockpitReadHandlers:
         await self.ctx.require_auth(request)
         defaults, engines = await asyncio.to_thread(_catalog_context, self.ctx.cfg)
         return web.json_response(cockpit_catalog(start_defaults=defaults, engines=engines or None))
+
+    async def capabilities(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_401(request, self.ctx.cfg)
+        auth = request.get("auth", {})
+        features = await asyncio.to_thread(_feature_availability, self.ctx.cfg)
+        return web.json_response(
+            {
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "principal": {
+                    "identity": requester.identity,
+                    "scope": requester.scope,
+                    "auth_mode": str(auth.get("mode") or ""),
+                },
+                "capabilities": _cockpit_advertised_capabilities(requester, self.ctx.cfg),
+                "routes": _route_templates(request.app),
+                "features": features,
+            }
+        )
 
     async def snapshot(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -581,6 +604,39 @@ class CockpitReadHandlers:
                 "api_version": API_VERSION,
                 "schema_version": SCHEMA_VERSION,
                 "project": project.as_dict(),
+            }
+        )
+
+    async def project_permissions(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        registry = await asyncio.to_thread(_registry_store, self.ctx.cfg)
+        project = await asyncio.to_thread(
+            _visible_project_or_404,
+            registry,
+            request.match_info["project_id"],
+            requester,
+        )
+        if project is None:
+            raise CockpitError("not_found", "project not found", status=404)
+        edit = can_edit_project(requester, project)
+        admin = can_admin_project(requester, project)
+        return web.json_response(
+            {
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "project_id": project.id,
+                "role": "owner" if admin.allowed else "member" if edit.allowed else "viewer",
+                "permissions": {
+                    "can_update": edit.allowed,
+                    "can_manage_repos": edit.allowed,
+                    "can_create_thread": edit.allowed,
+                    "can_archive_thread": edit.allowed,
+                    "can_archive": admin.allowed,
+                    "can_delete": admin.allowed,
+                    "can_manage_members": admin.allowed,
+                    "can_set_visibility": admin.allowed,
+                },
             }
         )
 
@@ -1796,6 +1852,70 @@ def _catalog_context(cfg: Config) -> tuple[dict[str, Any], list[str]]:
         "landing_mode": cfg.orchestration.landing_mode,
     }
     return defaults, engines
+
+
+def _route_templates(app: web.Application) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for route in app.router.routes():
+        method = str(route.method)
+        if method in {"HEAD", "OPTIONS"}:
+            continue
+        path = _route_path_template(route)
+        if not path:
+            continue
+        key = (method, path)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({"method": method, "path": path})
+    return rows
+
+
+def _route_path_template(route: web.AbstractRoute) -> str:
+    resource = route.resource
+    canonical = getattr(resource, "canonical", "")
+    if canonical:
+        return str(canonical)
+    info = resource.get_info() if resource is not None else {}
+    return str(info.get("path") or info.get("formatter") or "")
+
+
+def _feature_availability(cfg: Config) -> dict[str, Any]:
+    project_write_available, project_write_reason = _project_write_available(cfg)
+    workers_configured = _configured_worker_count(cfg)
+    return {
+        "project_writes": {
+            "available": project_write_available,
+            "reason": project_write_reason,
+        },
+        "mcp": {
+            "available": bool(cfg.mcp.enabled and cfg.mcp.servers),
+            "serve_configured": Path(cfg.mcp_serve.token_store_path).expanduser().exists(),
+        },
+        "worker_dispatch": {
+            "available": workers_configured > 0,
+            "workers_configured": workers_configured,
+        },
+    }
+
+
+def _cockpit_advertised_capabilities(requester: RequestContext, cfg: Config) -> list[str]:
+    enforced = resolve_capabilities(cfg.capabilities)
+    return sorted(set(requester.capabilities) & enforced)
+
+
+def _project_write_available(cfg: Config) -> tuple[bool, str]:
+    if not cfg.brain.peer_token.get_secret_value():
+        return False, "brain project operation credentials are not configured"
+    if not cfg.intercom.brain_host or int(cfg.intercom.brain_port) <= 0:
+        return False, "brain project operation endpoint is not configured"
+    return True, ""
+
+
+def _configured_worker_count(cfg: Config) -> int:
+    registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path)
+    return registry.configured_profile_count()
 
 
 def _registry_store(cfg: Config) -> RegistryStore:

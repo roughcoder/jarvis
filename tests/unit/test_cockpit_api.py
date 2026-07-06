@@ -307,6 +307,10 @@ def _cfg(
     oauth_jwks_ttl_s: str = "300",
     oauth_jwks_min_refresh_s: str = "30",
     memory_backend: str = "v2",
+    brain_peer_token: str = "",
+    mcp_enabled: str = "false",
+    mcp_servers: str = "[]",
+    mcp_serve_token_store_path: str = "jarvis-workspace/.mcp-server/tokens.json",
 ) -> Config:
     env = tmp_path / ".env"
     workspace = tmp_path / "orchestration"
@@ -337,6 +341,10 @@ def _cfg(
                 f"MEMORY_BACKEND={memory_backend}",
                 f"MEMORY_CACHE_PATH={tmp_path / 'memory-cache.json'}",
                 f"MEMORY_CURATION_OUTBOX_PATH={tmp_path / 'curation-outbox.jsonl'}",
+                f"BRAIN_PEER_TOKEN={brain_peer_token}",
+                f"MCP_ENABLED={mcp_enabled}",
+                f"MCP_SERVERS={mcp_servers}",
+                f"MCP_SERVE_TOKEN_STORE_PATH={mcp_serve_token_store_path}",
                 "WORKER_HOST=worker.test",
                 "WORKER_PORT=8780",
                 "WORKER_SUPPORTED_ENGINES=codex,claude",
@@ -461,6 +469,16 @@ def _seed_user_profiles(cfg: Config, *names: str) -> None:
             f"---\nscope: personal\nhoncho_peer: {name}\n---\n\n# {name.title()}\n",
             encoding="utf-8",
         )
+
+
+def _seed_user_profile(cfg: Config, name: str, *, capabilities: list[str] | None = None) -> None:
+    users_dir = Path(cfg.capabilities.users_dir)
+    users_dir.mkdir(parents=True, exist_ok=True)
+    caps = f"\ncapabilities: {json.dumps(capabilities)}" if capabilities is not None else ""
+    users_dir.joinpath(f"{name}.md").write_text(
+        f"---\nscope: personal\nhoncho_peer: {name}{caps}\n---\n\n# {name.title()}\n",
+        encoding="utf-8",
+    )
 
 
 def _conclusion(
@@ -1636,6 +1654,108 @@ def test_cockpit_auth_and_bad_session_ref_errors(tmp_path, monkeypatch) -> None:
     asyncio.run(_with_server(cfg, calls))
 
 
+def test_cockpit_capabilities_requires_auth_and_reports_legacy_principal(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    token_store = tmp_path / "mcp-server" / "tokens.json"
+    token_store.parent.mkdir(parents=True)
+    token_store.write_text("{}")
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        token="secret",
+        identity="neil",
+        caps="worker.job.start,worker.session.turn",
+        brain_peer_token="brain-secret",
+        mcp_enabled="true",
+        mcp_servers=json.dumps([{"name": "notes", "transport": "http", "url": "http://localhost:9999/mcp"}]),
+        mcp_serve_token_store_path=str(token_store),
+    )
+    _seed_project_registry(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        unauthorized = await client.get(f"{base}/v1/capabilities")
+        response = await client.get(f"{base}/v1/capabilities", headers={"Authorization": "Bearer secret"})
+        body = response.json()
+        routes = {(route["method"], route["path"]) for route in body["routes"]}
+        text = json.dumps(body)
+
+        assert unauthorized.status_code == 401
+        assert response.status_code == 200
+        assert body["principal"] == {"identity": "neil", "scope": "personal", "auth_mode": "legacy"}
+        assert body["capabilities"] == ["worker.job.start", "worker.session.turn"]
+        assert ("GET", "/v1/capabilities") in routes
+        assert ("GET", "/v1/projects/{project_id}/permissions") in routes
+        assert ("GET", "/v1/workers/{worker_id}") in routes
+        assert "neil-shared" not in text
+        assert "sess_123" not in text
+        assert "localhost" not in text
+        assert "worker.test" not in text
+        assert "brain-secret" not in text
+        assert str(tmp_path) not in text
+        assert body["features"] == {
+            "project_writes": {"available": True, "reason": ""},
+            "mcp": {"available": True, "serve_configured": True},
+            "worker_dispatch": {"available": True, "workers_configured": 1},
+        }
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_capabilities_reports_oauth_principal_and_unavailable_features(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    fixture, jwks_get = _oauth_fixture()
+    cfg_root = tmp_path / "oauth"
+    cfg_root.mkdir()
+    cfg = _cfg(
+        cfg_root,
+        monkeypatch,
+        identity="neil",
+        caps="worker.session.turn",
+        auth_mode="oauth",
+        oauth_issuer="https://cockpit.example",
+        oauth_audience="jarvis-brain",
+        oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+        oauth_required_scopes="jarvis:read",
+    )
+    _seed_user_profile(cfg, "jules", capabilities=["worker.job.start", "worker.session.turn"])
+    Path(cfg.orchestration.workers_path).write_text(json.dumps({"workers": []}))
+    token = fixture["sign"](subject="jules", jarvis_user="neil", scope="jarvis:read")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/capabilities", headers={"Authorization": f"Bearer {token}"})
+        body = response.json()
+
+        assert response.status_code == 200
+        assert body["principal"] == {"identity": "jules", "scope": "personal", "auth_mode": "oauth"}
+        assert body["capabilities"] == ["worker.session.turn"]
+        assert body["features"]["project_writes"]["available"] is False
+        assert body["features"]["project_writes"]["reason"]
+        assert body["features"]["mcp"] == {"available": False, "serve_configured": False}
+        assert body["features"]["worker_dispatch"] == {"available": False, "workers_configured": 0}
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=jwks_get))
+
+
+def test_cockpit_capabilities_counts_default_worker_when_profiles_file_missing(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg_root = tmp_path / "default-worker"
+    cfg_root.mkdir()
+    cfg = _cfg(cfg_root, monkeypatch, token="secret", identity="neil")
+    Path(cfg.orchestration.workers_path).unlink()
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/capabilities", headers={"Authorization": "Bearer secret"})
+        body = response.json()
+
+        assert response.status_code == 200
+        assert body["features"]["worker_dispatch"] == {"available": True, "workers_configured": 1}
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
 def test_cockpit_projects_list_is_membership_filtered(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)
@@ -1690,6 +1810,87 @@ def test_cockpit_project_detail_404s_when_not_visible(tmp_path, monkeypatch) -> 
         assert missing.json()["error"]["code"] == "not_found"
         assert missing_memory.status_code == 404
         assert missing_memory.json()["error"]["code"] == "not_found"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_project_permissions_project_effective_role(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        member = await client.get(f"{base}/v1/projects/neil-shared/permissions")
+        non_member_private = await client.get(f"{base}/v1/projects/alice-private/permissions")
+        non_member_household = await client.get(f"{base}/v1/projects/house-story/permissions")
+        archived = await client.get(f"{base}/v1/projects/old-project/permissions")
+        text = json.dumps({"member": member.json(), "archived": archived.json()})
+
+        assert member.status_code == 200
+        assert member.json() == {
+            "api_version": "v1",
+            "schema_version": 1,
+            "project_id": "neil-shared",
+            "role": "member",
+            "permissions": {
+                "can_update": True,
+                "can_manage_repos": True,
+                "can_create_thread": True,
+                "can_archive_thread": True,
+                "can_archive": False,
+                "can_delete": False,
+                "can_manage_members": False,
+                "can_set_visibility": False,
+            },
+        }
+        assert non_member_private.status_code == 404
+        assert non_member_private.json()["error"]["code"] == "not_found"
+        assert non_member_household.status_code == 200
+        assert non_member_household.json() == {
+            "api_version": "v1",
+            "schema_version": 1,
+            "project_id": "house-story",
+            "role": "viewer",
+            "permissions": {
+                "can_update": False,
+                "can_manage_repos": False,
+                "can_create_thread": False,
+                "can_archive_thread": False,
+                "can_archive": False,
+                "can_delete": False,
+                "can_manage_members": False,
+                "can_set_visibility": False,
+            },
+        }
+        assert archived.status_code == 200
+        assert archived.json()["role"] == "owner"
+        archived_permissions = archived.json()["permissions"]
+        assert all(archived_permissions.values())
+        assert "localhost" not in text
+        assert str(tmp_path) not in text
+        assert "token" not in text.lower()
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_project_permissions_owner_gets_admin_actions(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg_root = tmp_path / "owner"
+    cfg_root.mkdir()
+    cfg = _cfg(cfg_root, monkeypatch, identity="alice")
+    _seed_project_registry(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/projects/neil-shared/permissions")
+        body = response.json()
+
+        assert response.status_code == 200
+        assert body["role"] == "owner"
+        assert body["project_id"] == "neil-shared"
+        permissions = body["permissions"]
+        assert all(permissions.values())
 
     import asyncio
 

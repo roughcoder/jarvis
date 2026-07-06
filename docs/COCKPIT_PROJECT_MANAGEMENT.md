@@ -89,6 +89,14 @@ External agent ──MCP tool──▶ mcp-serve ──protocol──▶ brain �
 Enforced in the shared gate (`capabilities.py`), the same place the read matrix
 lives, so REST, MCP, and the thread inherit it. Deny by default.
 
+The Cockpit can query the effective projection for the current caller with
+`GET /v1/projects/{id}/permissions`. Its booleans mirror the shared
+`can_edit_project` member gate and `can_admin_project` owner gate used by the
+brain in `project_management.py`; it is a read-only projection, not a separate
+policy source. A visible non-member is reported as `role: "viewer"` with all
+booleans false; projects outside the caller's visibility set still return 404.
+`can_archive_thread` mirrors the member gate on the thread archive routes.
+
 | Operation | Who |
 | --- | --- |
 | Create project | Any principal (becomes `owner`). |
