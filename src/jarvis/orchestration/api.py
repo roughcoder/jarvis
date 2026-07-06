@@ -1430,10 +1430,9 @@ class CockpitWriteHandlers:
         thread_id = request.match_info["thread_id"]
         scope_name = "project_thread_archive" if archived else "project_thread_unarchive"
         scope = f"{scope_name}/{project.id}/{thread_id}"
-        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
-            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
-            if cached is not None:
-                return web.json_response(cached)
+        fingerprint_body = {**body, "project_id": project.id, "thread_id": thread_id, "archived": archived}
+
+        async def produce() -> dict[str, Any]:
             existing = await asyncio.to_thread(connector.index.get, project.id, thread_id)
             if existing is None:
                 raise CockpitError("not_found", "thread not found", status=404)
@@ -1449,14 +1448,24 @@ class CockpitWriteHandlers:
                 thread = await asyncio.to_thread(connector.unarchive_thread, project, thread_id)
             if thread is None:
                 raise CockpitError("not_found", "thread not found", status=404)
-            response_body = {
+            activity_type = "thread.archived" if archived else "thread.unarchived"
+            await _record_project_activity(
+                self.ctx,
+                project.id,
+                activity_type,
+                requester,
+                f"{'Archived' if archived else 'Unarchived'} project thread {thread_id}",
+                {"project_id": project.id, "thread_id": thread_id},
+            )
+            return {
                 "ok": True,
                 "api_version": API_VERSION,
                 "schema_version": SCHEMA_VERSION,
                 "project_id": project.id,
                 "thread": _thread_projection(thread),
             }
-            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def work_start(self, request: web.Request) -> web.Response:

@@ -438,6 +438,7 @@ Activity types:
 | `memory.forgotten` / `memory.corrected` | Project memory curation writes succeed. |
 | `file.uploaded` / `file.retracted` | Project upload/retraction succeeds. |
 | `thread.opened` | An orchestrator thread is created. |
+| `thread.archived` / `thread.unarchived` | A project thread is hidden or restored. |
 | `work.dispatched` | `/v1/work/start` succeeds with a visible `project_id` linkage. |
 
 #### Project Management
@@ -860,9 +861,10 @@ Current limitation: background job completion report-backs are not yet appended
 to the thread automatically. They can still run through the existing tool layer;
 thread follow-up delivery is a later connector enhancement.
 
-Thread archive/unarchive endpoints are not exposed in cockpit API v1 yet. When
-added, they should use the same project activity types
-`thread.archived` / `thread.unarchived` and resource-write envelope.
+Thread archive/unarchive (`POST .../threads/{tid}/archive` and `/unarchive`)
+emit the project activity types `thread.archived` / `thread.unarchived` and
+return the resource-write envelope; the write honours `idempotency_key` with
+the same principal-scoped semantics as other project writes.
 
 ### Runs
 

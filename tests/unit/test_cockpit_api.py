@@ -2608,6 +2608,7 @@ def test_cockpit_thread_archive_hides_and_unarchive_restores_listing(tmp_path, m
             json={"idempotency_key": "thread_unarchive_1"},
         )
         restored = await client.get(f"{base}/v1/projects/neil-shared/threads")
+        activity = await client.get(f"{base}/v1/projects/neil-shared/activity")
 
         assert archived.status_code == 200
         archived_thread = archived.json()["thread"]
@@ -2626,6 +2627,11 @@ def test_cockpit_thread_archive_hides_and_unarchive_restores_listing(tmp_path, m
         assert unarchived.json()["thread"]["archived_by"] == ""
         assert unarchived.json()["thread"]["archive_reason"] == ""
         assert [item["thread_id"] for item in restored.json()["threads"]] == [thread.thread_id]
+        activity_types = [item["type"] for item in activity.json()["activity"]]
+        assert "thread.archived" in activity_types
+        assert "thread.unarchived" in activity_types
+        # The idempotent replay must not have re-emitted the archive event.
+        assert activity_types.count("thread.archived") == 1
 
     import asyncio
 
