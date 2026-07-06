@@ -731,22 +731,49 @@ def test_daemon_health_reports_diagnostics_error_without_500(tmp_path, monkeypat
         "jarvis.worker.server.diagnostics",
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("diagnostics failed")),
     )
-    monkeypatch.setattr(
-        "jarvis.worker.server.repo_inventory",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("repo scan failed")),
-    )
     cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"))
 
     async def calls(base, c):  # noqa: ANN001
+        first = await c.get(base + "/health")
+        for _ in range(50):
+            second = await c.get(base + "/health")
+            body = second.json()
+            if body.get("diagnostics", {}).get("error"):
+                return first.status_code, first.json(), second.status_code, body
+            await asyncio.sleep(0.01)
+        return first.status_code, first.json(), second.status_code, second.json()
+
+    first_status, first_health, second_status, second_health = asyncio.run(_with_server(cfg, 8848, calls))
+
+    assert first_status == 200
+    assert first_health["ok"] is True
+    assert first_health["diagnostics"]["status"] == "refreshing"
+    assert second_status == 200
+    assert second_health["ok"] is True
+    assert second_health["diagnostics"]["error"] == "diagnostics failed"
+    assert second_health["repositories"] == []
+
+
+def test_daemon_health_does_not_wait_for_slow_diagnostics(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    import time
+
+    def slow_diagnostics(**_kwargs):  # noqa: ANN001
+        time.sleep(0.25)
+        return {"repositories": [{"repo": "jarvis", "status": "ready"}]}
+
+    monkeypatch.setattr("jarvis.worker.server.diagnostics", slow_diagnostics)
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"))
+
+    async def calls(base, c):  # noqa: ANN001
+        started = time.monotonic()
         response = await c.get(base + "/health")
-        return response.status_code, response.json()
+        elapsed = time.monotonic() - started
+        return elapsed, response.json()
 
-    status, health = asyncio.run(_with_server(cfg, 8848, calls))
+    elapsed, health = asyncio.run(_with_server(cfg, 8849, calls))
 
-    assert status == 200
-    assert health["ok"] is True
-    assert health["diagnostics"]["error"] == "diagnostics failed"
-    assert health["repositories"] == []
+    assert elapsed < 0.20
+    assert health["diagnostics"] == {"status": "refreshing", "repositories": []}
 
 
 def test_daemon_shell_uses_expanded_default_workspace(tmp_path, monkeypatch) -> None:  # noqa: ANN001

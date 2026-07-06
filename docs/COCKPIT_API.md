@@ -981,6 +981,9 @@ worker-profile responses set it to `null`. It is a public-safe projection of
 the worker's authorised `/health.diagnostics` block: engine install/auth/version
 state, package-manager availability, and browser readiness. Local filesystem
 paths, binary paths, and credential locations are redacted before exposure.
+If a worker has no cached diagnostics yet, or cached diagnostics are stale, the
+worker may return `{"status":"refreshing"}` while it refreshes the expensive
+checks in the background; clients should keep treating `/health.ok` as liveness.
 
 `repositories` is the Jarvis-owned repo registry for this worker. Rows come
 from the worker profile (`workers.json`) and, on probe, from the worker's

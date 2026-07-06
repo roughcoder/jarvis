@@ -160,6 +160,24 @@ def test_worker_registry_redacts_private_connection_details(monkeypatch) -> None
                         ],
                         "checked_at": "2026-07-02T23:35:00Z",
                     },
+                    "diagnostics": {
+                        "engines": [
+                            {
+                                "engine": "codex",
+                                "installed": True,
+                                "authenticated": None,
+                                "version": "codex 1.2.3",
+                                "detail": "read ~/.codex/auth.json under /Users/example/private",
+                            }
+                        ],
+                        "repositories": [
+                            {
+                                "repo": "broken",
+                                "status": "broken",
+                                "detail": "fatal: not a git repository: /Users/example/dev/broken",
+                            }
+                        ],
+                    },
                 }
             )
         return Response({"jobs": [{"status": "running"}, {"status": "done"}]})
@@ -172,8 +190,10 @@ def test_worker_registry_redacts_private_connection_details(monkeypatch) -> None
     assert public["status"] == "online"
     assert public["capacity"]["current_jobs"] == 1
     assert public["system"]["disk"][0]["mount"] is None
+    assert public["readiness"]["repositories"][0]["detail"] == "fatal: not a git repository: <local-path>"
     assert "private-host" not in json.dumps(public)
     assert "/Users/example" not in json.dumps(public)
+    assert "~/.codex" not in json.dumps(public)
     assert "secret" not in json.dumps(public)
 
 

@@ -6,6 +6,7 @@ from typing import Any, Literal
 from jarvis.capabilities import WORKER_SESSION_CREATE, WORKER_SESSION_TURN
 from jarvis.engines import default_engine, engine_ids
 from jarvis.ids import new_id, utc_now
+from jarvis.orchestration.redaction import redact
 
 
 Phase = Literal[
@@ -357,6 +358,16 @@ class WorkerProfile:
             "supported_engines": self.supported_engines,
             "engine_supports": self.engine_supports,
             "system": self.system,
-            "readiness": self.readiness,
+            "readiness": _public_value(self.readiness),
             "token_set": self.token_set,
         }
+
+
+def _public_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {str(key): _public_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_public_value(item) for item in value]
+    return value
