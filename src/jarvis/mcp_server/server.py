@@ -231,6 +231,23 @@ def build_mcp(runtime: MCPServerRuntime):  # noqa: ANN201
             title=title,
         )
 
+    @mcp.tool(name="archive_thread")
+    async def archive_thread(project_id: str, thread_id: str, reason: str = "") -> dict[str, Any]:
+        return await runtime.service.archive_thread(
+            runtime.requester(),
+            project_id=project_id,
+            thread_id=thread_id,
+            reason=reason,
+        )
+
+    @mcp.tool(name="unarchive_thread")
+    async def unarchive_thread(project_id: str, thread_id: str) -> dict[str, Any]:
+        return await runtime.service.unarchive_thread(
+            runtime.requester(),
+            project_id=project_id,
+            thread_id=thread_id,
+        )
+
     @mcp.tool(name="send_turn")
     async def send_turn(project_id: str, thread_id: str, text: str) -> dict[str, Any]:
         return await runtime.service.send_turn(

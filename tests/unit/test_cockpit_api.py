@@ -2087,6 +2087,134 @@ def test_cockpit_thread_turn_records_decision_only_through_lane2_tool(tmp_path, 
     assert [message["peer_id"] for message in memory.messages] == ["neil", "jarvis"]
 
 
+def test_cockpit_thread_archive_hides_and_unarchive_restores_listing(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    connector = CockpitConnector(cfg, memory=memory, gateway=FakeGateway(["unused"]), tts=None, tracer=None)
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_archive",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_archive"),
+            title="Archive me",
+            created_at="2026-07-05T09:00:00+00:00",
+            updated_at="2026-07-05T09:00:00+00:00",
+            created_by="neil",
+        )
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        archived = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}/archive",
+            json={"reason": "  done for now  ", "idempotency_key": "thread_archive_1"},
+        )
+        replay = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}/archive",
+            json={"reason": "  done for now  ", "idempotency_key": "thread_archive_1"},
+        )
+        default = await client.get(f"{base}/v1/projects/neil-shared/threads")
+        included = await client.get(f"{base}/v1/projects/neil-shared/threads?include_archived=true")
+        unarchived = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}/unarchive",
+            json={"idempotency_key": "thread_unarchive_1"},
+        )
+        restored = await client.get(f"{base}/v1/projects/neil-shared/threads")
+
+        assert archived.status_code == 200
+        archived_thread = archived.json()["thread"]
+        assert archived_thread["archived_at"]
+        assert archived_thread["archived_by"] == "neil"
+        assert archived_thread["archive_reason"] == "done for now"
+        assert replay.status_code == 200
+        assert replay.json()["thread"] == archived_thread
+        assert replay.json()["idempotent"] is True
+        assert default.json()["threads"] == []
+        assert [item["thread_id"] for item in included.json()["threads"]] == [thread.thread_id]
+        assert unarchived.status_code == 200
+        assert unarchived.json()["thread"]["archived_at"] == ""
+        assert unarchived.json()["thread"]["archived_by"] == ""
+        assert unarchived.json()["thread"]["archive_reason"] == ""
+        assert [item["thread_id"] for item in restored.json()["threads"]] == [thread.thread_id]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_thread_archive_non_member_gets_404(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    connector = CockpitConnector(cfg, memory=FakeProjectMemory(), gateway=FakeGateway(["unused"]), tts=None, tracer=None)
+    connector.index.save(
+        CockpitThread(
+            thread_id="thread_private",
+            project_id="alice-private",
+            session_id=orchestrator_session_id("alice-private", "thread_private"),
+            title="Private",
+            created_at="2026-07-05T09:00:00+00:00",
+            updated_at="2026-07-05T09:00:00+00:00",
+            created_by="alice",
+        )
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        archived = await client.post(
+            f"{base}/v1/projects/alice-private/threads/thread_private/archive",
+            json={"idempotency_key": "thread_archive_private"},
+        )
+        unarchived = await client.post(
+            f"{base}/v1/projects/alice-private/threads/thread_private/unarchive",
+            json={"idempotency_key": "thread_unarchive_private"},
+        )
+
+        assert archived.status_code == 404
+        assert archived.json()["error"]["code"] == "not_found"
+        assert unarchived.status_code == 404
+        assert unarchived.json()["error"]["code"] == "not_found"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_thread_turn_on_archived_thread_returns_409(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    connector = CockpitConnector(cfg, memory=FakeProjectMemory(), gateway=FakeGateway(["reply"]), tts=None, tracer=None)
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_archived",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_archived"),
+            title="Archived",
+            created_at="2026-07-05T09:00:00+00:00",
+            updated_at="2026-07-05T09:00:00+00:00",
+            created_by="neil",
+            archived_at="2026-07-05T10:00:00+00:00",
+            archived_by="neil",
+            archive_reason="done",
+        )
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}/turns",
+            json={"text": "continue"},
+        )
+
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "thread_archived"
+        assert response.json()["error"]["recoverable"] is True
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
 def test_cockpit_thread_backend_gaps_degrade_without_500(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)

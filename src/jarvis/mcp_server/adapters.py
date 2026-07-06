@@ -325,6 +325,43 @@ class JarvisMCPService:
         thread = await self.cockpit.open_thread(project, ctx, title=title)
         return {"thread": thread.as_dict()}
 
+    async def archive_thread(
+        self,
+        ctx: RequestContext,
+        *,
+        project_id: str,
+        thread_id: str,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        project = await asyncio.to_thread(self._visible_project, ctx, project_id)
+        if project is None:
+            raise MCPAccessError("project not found or not visible")
+        thread = await asyncio.to_thread(
+            self.cockpit.archive_thread,
+            project,
+            thread_id,
+            by=ctx.memory_peer,
+            reason=reason,
+        )
+        if thread is None:
+            raise MCPAccessError("thread not found")
+        return {"thread": thread.as_dict()}
+
+    async def unarchive_thread(
+        self,
+        ctx: RequestContext,
+        *,
+        project_id: str,
+        thread_id: str,
+    ) -> dict[str, Any]:
+        project = await asyncio.to_thread(self._visible_project, ctx, project_id)
+        if project is None:
+            raise MCPAccessError("project not found or not visible")
+        thread = await asyncio.to_thread(self.cockpit.unarchive_thread, project, thread_id)
+        if thread is None:
+            raise MCPAccessError("thread not found")
+        return {"thread": thread.as_dict()}
+
     async def send_turn(
         self,
         ctx: RequestContext,
@@ -339,6 +376,8 @@ class JarvisMCPService:
         thread = await asyncio.to_thread(self.cockpit.index.get, project.id, thread_id)
         if thread is None:
             raise MCPAccessError("thread not found")
+        if thread.archived_at:
+            raise MCPAccessError("thread is archived")
         reply, updated = await self.cockpit.turn(project, thread, mcp_send_turn_context(ctx), text)
         return {"reply": reply, "thread": updated.as_dict()}
 

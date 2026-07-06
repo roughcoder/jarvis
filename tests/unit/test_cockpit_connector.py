@@ -12,7 +12,7 @@ from jarvis.brain.capabilities import RequestContext
 from jarvis.brain.memory_client import MemoryMessage, SessionPeer
 from jarvis.brain.registry import ProjectEntry
 from jarvis.config import Config
-from jarvis.connectors.cockpit import CockpitConnector, orchestrator_session_id
+from jarvis.connectors.cockpit import CockpitConnector, CockpitThread, CockpitThreadIndex, orchestrator_session_id
 
 
 class FakeMemory:
@@ -167,3 +167,84 @@ def test_connector_adds_turn_author_to_thread_session_before_messages(tmp_path, 
     assert [message["peer_id"] for message in message_write["messages"]] == ["riley", "jarvis"]
     assert message_write["messages"][0]["metadata"]["channel"] == "cockpit"
     assert message_write["messages"][0]["metadata"]["device_id"] == "riley-laptop"
+
+
+def test_thread_index_archive_round_trip_and_filtering(tmp_path) -> None:
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    active = index.save(
+        CockpitThread(
+            thread_id="thread_active",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_active",
+            title="Active",
+            created_at="2026-07-05T09:00:00+00:00",
+            updated_at="2026-07-05T09:00:00+00:00",
+            created_by="neil",
+        )
+    )
+    archived = index.save(
+        CockpitThread(
+            thread_id="thread_archived",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_archived",
+            title="Archived",
+            created_at="2026-07-05T08:00:00+00:00",
+            updated_at="2026-07-05T08:00:00+00:00",
+            created_by="neil",
+        )
+    )
+
+    archived = index.set_archived("jarvis", archived.thread_id, archived=True, by="neil", reason="  done  ")
+    assert archived is not None
+    assert archived.archived_at
+    assert archived.archived_by == "neil"
+    assert archived.archive_reason == "done"
+    assert [thread.thread_id for thread in index.list("jarvis")] == [active.thread_id]
+    assert {thread.thread_id for thread in index.list("jarvis", include_archived=True)} == {
+        active.thread_id,
+        archived.thread_id,
+    }
+
+    archived_again = index.set_archived("jarvis", archived.thread_id, archived=True, by="riley", reason="new")
+    assert archived_again is not None
+    assert archived_again.archived_at == archived.archived_at
+    assert archived_again.archived_by == "neil"
+    assert archived_again.archive_reason == "done"
+
+    restored = index.set_archived("jarvis", archived.thread_id, archived=False)
+    assert restored is not None
+    assert restored.archived_at == ""
+    assert restored.archived_by == ""
+    assert restored.archive_reason == ""
+    assert {thread.thread_id for thread in index.list("jarvis")} == {active.thread_id, archived.thread_id}
+
+
+def test_thread_index_append_turn_preserves_archive_fields(tmp_path) -> None:
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    thread = index.save(
+        CockpitThread(
+            thread_id="thread_archived",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_archived",
+            title="Archived",
+            created_at="2026-07-05T08:00:00+00:00",
+            updated_at="2026-07-05T08:00:00+00:00",
+            created_by="neil",
+            archived_at="2026-07-05T09:00:00+00:00",
+            archived_by="neil",
+            archive_reason="done",
+        )
+    )
+
+    updated = index.append_turn(
+        thread,
+        user_peer_id="neil",
+        user_text="one more note",
+        assistant_peer_id="jarvis",
+        assistant_text="noted",
+    )
+
+    assert updated.archived_at == "2026-07-05T09:00:00+00:00"
+    assert updated.archived_by == "neil"
+    assert updated.archive_reason == "done"
+    assert len(updated.messages) == 2

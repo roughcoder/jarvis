@@ -19,9 +19,10 @@ Read + converse, membership-filtered by the authenticated caller:
 | `GET /v1/projects` | Registry list, membership-filtered. |
 | `GET /v1/projects/{id}` | Full entry: repos, links, members, status, `files_root`. 404 for non-members. |
 | `GET /v1/projects/{id}/memory` | Cached representation + recent findings/decisions. |
-| `GET`/`POST /v1/projects/{id}/threads` | List / open orchestrator threads. |
+| `GET`/`POST /v1/projects/{id}/threads` | List / open orchestrator threads; `GET` accepts `include_archived`. |
 | `POST /v1/projects/{id}/threads/{tid}/turns` | Send a turn (reply streams over SSE). |
-| MCP tools | `project_list`, `project_get`, project write tools, `memory_search`, `record_finding`, `record_decision`, `remember`, `forget`, `correct`, `open_thread`, `send_turn`, `upload_file`. |
+| `POST /v1/projects/{id}/threads/{tid}/archive` / `/unarchive` | Hide or restore a project thread. |
+| MCP tools | `project_list`, `project_get`, project write tools, `memory_search`, `record_finding`, `record_decision`, `remember`, `forget`, `correct`, `open_thread`, `send_turn`, `archive_thread`, `unarchive_thread`, `upload_file`. |
 
 This feature now also includes **registry-entry writes** (create/edit the entry,
 repos, members, visibility, status) and **file upload** through the same
@@ -95,9 +96,10 @@ lives, so REST, MCP, and the thread inherit it. Deny by default.
 | Repos: add / remove / reorder / set default | Member. |
 | Add finding / decision; forget / correct a memory | Member. |
 | Upload a file to the project | Member. |
+| Archive / unarchive thread | Member. |
 | Change visibility | Owner. |
 | Add / remove members | Owner. |
-| Archive / unarchive | Owner. |
+| Archive / unarchive project | Owner. |
 | Delete project | Owner. |
 
 External MCP agents run under their principal's capabilities, so an agent acting
@@ -151,6 +153,7 @@ Mirror the REST operations for external agents, forwarding to the same brain op:
 | `project_set_visibility` / `project_set_members` / `project_archive` / `project_delete` | Owner-gated registry writes. |
 | `record_finding` / `record_decision` / `forget` / `correct` | Lane 2 (record/* exist; add forget/correct). |
 | `project_list_files` / `upload_file` / `retract_file` | File manifest + vault + Honcho ingestion (see below). |
+| `open_thread` / `send_turn` / `archive_thread` / `unarchive_thread` | Orchestrator thread lifecycle and turns. |
 
 MCP writes carry `recorded_by`, `channel: mcp`, and an `agent` tag, as
 established for the MCP server lane.

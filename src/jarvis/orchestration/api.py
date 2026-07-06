@@ -478,6 +478,8 @@ def make_app(
         web.delete("/v1/projects/{project_id}/files/{doc_id}", writes.project_file_retract),
         web.post("/v1/projects/{project_id}/threads", writes.project_thread_open),
         web.post("/v1/projects/{project_id}/threads/{thread_id}/turns", writes.project_thread_turn),
+        web.post("/v1/projects/{project_id}/threads/{thread_id}/archive", writes.project_thread_archive),
+        web.post("/v1/projects/{project_id}/threads/{thread_id}/unarchive", writes.project_thread_unarchive),
         web.post("/v1/work/start", writes.work_start),
         web.post("/v1/work/resume", writes.work_resume),
         web.post("/v1/work/validate", writes.work_validate),
@@ -625,6 +627,7 @@ class CockpitReadHandlers:
         await self.ctx.require_auth(request)
         registry = await asyncio.to_thread(_registry_store, self.ctx.cfg)
         requester = _cockpit_requester_context(request, self.ctx.cfg)
+        include_archived = _include_archived(request)
         project = (
             await asyncio.to_thread(_visible_project_or_404, registry, request.match_info["project_id"], requester)
             if requester is not None
@@ -633,7 +636,7 @@ class CockpitReadHandlers:
         if project is None:
             raise CockpitError("not_found", "project not found", status=404)
         connector = _cockpit_connector(self.ctx)
-        threads = await asyncio.to_thread(connector.list_threads, project)
+        threads = await asyncio.to_thread(connector.list_threads, project, include_archived=include_archived)
         return web.json_response(
             {
                 "api_version": API_VERSION,
@@ -1025,6 +1028,8 @@ class CockpitWriteHandlers:
         thread = await asyncio.to_thread(connector.index.get, project.id, request.match_info["thread_id"])
         if thread is None:
             raise CockpitError("not_found", "thread not found", status=404)
+        if thread.archived_at:
+            raise CockpitError("thread_archived", "thread is archived", recoverable=True, status=409)
         response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
         _apply_cors_headers(request, response)
         await response.prepare(request)
@@ -1092,6 +1097,50 @@ class CockpitWriteHandlers:
         await _write_sse(response, "thread.turn.done", cursor, _sse_envelope(cursor, "thread.turn.done", payload))
         await response.write_eof()
         return response
+
+    async def project_thread_archive(self, request: web.Request) -> web.Response:
+        return await self._project_thread_archive(request, archived=True)
+
+    async def project_thread_unarchive(self, request: web.Request) -> web.Response:
+        return await self._project_thread_archive(request, archived=False)
+
+    async def _project_thread_archive(self, request: web.Request, *, archived: bool) -> web.Response:
+        await self.ctx.require_auth(request)
+        body = await _json_body(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        project = await _project_for_member_route(self.ctx, request, requester)
+        connector = _cockpit_connector(self.ctx)
+        thread_id = request.match_info["thread_id"]
+        scope_name = "project_thread_archive" if archived else "project_thread_unarchive"
+        scope = f"{scope_name}/{project.id}/{thread_id}"
+        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
+            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
+            if cached is not None:
+                return web.json_response(cached)
+            existing = await asyncio.to_thread(connector.index.get, project.id, thread_id)
+            if existing is None:
+                raise CockpitError("not_found", "thread not found", status=404)
+            if archived:
+                thread = await asyncio.to_thread(
+                    connector.archive_thread,
+                    project,
+                    thread_id,
+                    by=requester.memory_peer,
+                    reason=str(body.get("reason") or ""),
+                )
+            else:
+                thread = await asyncio.to_thread(connector.unarchive_thread, project, thread_id)
+            if thread is None:
+                raise CockpitError("not_found", "thread not found", status=404)
+            response_body = {
+                "ok": True,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "project_id": project.id,
+                "thread": _thread_projection(thread),
+            }
+            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+        return web.json_response(response_body)
 
     async def work_start(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -2050,6 +2099,9 @@ def _thread_projection(thread: CockpitThread) -> dict[str, Any]:
         "created_at": thread.created_at,
         "updated_at": thread.updated_at,
         "created_by": thread.created_by,
+        "archived_at": thread.archived_at,
+        "archived_by": thread.archived_by,
+        "archive_reason": thread.archive_reason,
     }
 
 
