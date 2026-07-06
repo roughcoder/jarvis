@@ -144,7 +144,7 @@ def _snapshot_tools(snapshot: dict[str, Any] | None) -> list[dict[str, str]]:
             {
                 "name": str(item.get("offered_name") or item.get("name") or ""),
                 "server": str(item.get("server") or ""),
-                "description": str(item.get("description") or ""),
+                "description": public_error_message(str(item.get("description") or "")),
                 "required_capability": str(item.get("required_capability") or ""),
             }
         )

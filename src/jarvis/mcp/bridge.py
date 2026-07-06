@@ -87,7 +87,7 @@ class MCPBridge:
                 {
                     "offered_name": tool.offered_name,
                     "server": tool.server,
-                    "description": tool.description,
+                    "description": public_error_message(tool.description),
                     "required_capability": tool.required_capability,
                 }
                 for tool in self.tools

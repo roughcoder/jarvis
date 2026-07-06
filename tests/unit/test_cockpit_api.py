@@ -611,7 +611,7 @@ def test_mcp_status_and_tools_use_snapshot_with_server_filter(tmp_path, monkeypa
                     {
                         "offered_name": "local_read",
                         "server": "local",
-                        "description": "Read local data",
+                        "description": "Read /Users/neil/private with sk-test123456789012",
                         "required_capability": "mcp.local",
                     },
                 ],
@@ -642,6 +642,8 @@ def test_mcp_status_and_tools_use_snapshot_with_server_filter(tmp_path, monkeypa
                 "required_capability": "mcp.linear",
             }
         ]
+        local_only = (await client.get(f"{base}/v1/mcp/tools", params={"server": "local"})).json()
+        assert local_only["tools"][0]["description"] == "Read <local-path> with <redacted-token>"
 
     asyncio.run(_with_server(cfg, calls))
 
@@ -707,6 +709,53 @@ def test_mcp_token_lifecycle_over_http(tmp_path, monkeypatch) -> None:  # noqa: 
         assert all_tokens["tokens"][0]["revoked_at"]
 
     asyncio.run(_with_server(cfg, calls))
+
+
+def test_mcp_token_issue_serializes_concurrent_writes(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="mcp.tokens.manage")
+    _seed_user_profiles(cfg, "neil")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        responses = await asyncio.gather(
+            *[
+                client.post(f"{base}/v1/mcp/tokens", json={"principal": "neil", "name": f"client-{idx}"})
+                for idx in range(12)
+            ]
+        )
+        assert {response.status_code for response in responses} == {200}
+        token_ids = {response.json()["record"]["token_id"] for response in responses}
+        assert len(token_ids) == 12
+        listed = (await client.get(f"{base}/v1/mcp/tokens")).json()["tokens"]
+        assert {record["token_id"] for record in listed} == token_ids
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_mcp_token_issue_revokes_record_when_idempotency_save_fails(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="mcp.tokens.manage")
+    _seed_user_profiles(cfg, "neil")
+    original_save = cockpit_api_module.IdempotencyStore.save
+
+    def fail_mcp_token_save(self, scope, key, body, response):  # noqa: ANN001
+        if scope == "mcp/tokens":
+            raise OSError("workspace full at /Users/neil/private")
+        return original_save(self, scope, key, body, response)
+
+    monkeypatch.setattr(cockpit_api_module.IdempotencyStore, "save", fail_mcp_token_save)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(
+            f"{base}/v1/mcp/tokens",
+            json={"principal": "neil", "name": "Codex", "idempotency_key": "issue-fails"},
+        )
+        assert response.status_code == 500
+        assert response.json()["error"]["code"] == "internal_error"
+        assert response.json()["error"]["message"] == "workspace full at <local-path>"
+
+    asyncio.run(_with_server(cfg, calls))
+    records = MCPTokenStore(cfg.mcp_serve.token_store_path).list(include_revoked=True)
+    assert len(records) == 1
+    assert records[0].revoked
 
 
 def test_mcp_token_errors_and_capability_gate(tmp_path, monkeypatch) -> None:  # noqa: ANN001

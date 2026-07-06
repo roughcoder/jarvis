@@ -123,7 +123,7 @@ def test_bridge_status_returns_public_plain_dicts(tmp_path) -> None:  # noqa: AN
             offered_name="ctx_lookup",
             server="ctx",
             server_tool="lookup",
-            description="Lookup context",
+            description="Lookup /Users/neil/private with sk-test123456789012",
             input_schema={"type": "object"},
             required_capability="mcp.ctx",
         )
@@ -155,7 +155,7 @@ def test_bridge_status_returns_public_plain_dicts(tmp_path) -> None:  # noqa: AN
         {
             "offered_name": "ctx_lookup",
             "server": "ctx",
-            "description": "Lookup context",
+            "description": "Lookup <local-path> with <redacted-token>",
             "required_capability": "mcp.ctx",
         }
     ]

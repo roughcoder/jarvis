@@ -6,6 +6,7 @@ import contextlib
 import hmac
 import json
 import logging
+import threading
 from pathlib import Path
 from dataclasses import dataclass, replace
 from typing import Any, Callable
@@ -115,6 +116,7 @@ HttpPost = Callable[..., Any]
 CONFIG_KEY = web.AppKey("config", Config)
 logger = logging.getLogger(__name__)
 SSE_REFRESH_ERROR_LOG_INTERVAL_S = 60.0
+MCP_TOKEN_STORE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -1302,7 +1304,8 @@ class CockpitWriteHandlers:
                 raise CockpitError("validation_failed", "unknown principal", status=400)
             try:
                 token, record = await asyncio.to_thread(
-                    MCPTokenStore(self.ctx.cfg.mcp_serve.token_store_path).add,
+                    _mcp_token_add,
+                    self.ctx.cfg.mcp_serve.token_store_path,
                     principal=principal,
                     name=name,
                 )
@@ -1323,7 +1326,19 @@ class CockpitWriteHandlers:
             }
             idempotent_body = dict(response_body)
             idempotent_body["token"] = ""
-            self.ctx.idempotency.save(scope, key, body, idempotent_body)
+            try:
+                self.ctx.idempotency.save(scope, key, body, idempotent_body)
+            except Exception as exc:  # noqa: BLE001 - plaintext was not delivered; revoke the active record.
+                await asyncio.to_thread(
+                    _mcp_token_revoke_after_failed_issue,
+                    self.ctx.cfg.mcp_serve.token_store_path,
+                    record.token_id,
+                )
+                raise CockpitError(
+                    "internal_error",
+                    public_error_message(str(exc) or "idempotency save failed"),
+                    status=500,
+                ) from exc
         return web.json_response(response_body)
 
     async def mcp_token_revoke(self, request: web.Request) -> web.Response:
@@ -1332,7 +1347,8 @@ class CockpitWriteHandlers:
         token_id = request.match_info["token_id"]
         try:
             record = await asyncio.to_thread(
-                MCPTokenStore(self.ctx.cfg.mcp_serve.token_store_path).revoke,
+                _mcp_token_revoke,
+                self.ctx.cfg.mcp_serve.token_store_path,
                 token_id,
             )
         except MCPTokenError as exc:
@@ -2658,6 +2674,27 @@ def _require_capability(cfg: Config, action: str) -> None:
     capabilities = resolve_capabilities(cfg.capabilities)
     if not allowed(action, capabilities, public_write_mode=cfg.orchestration.landing_mode):
         raise CockpitError("forbidden", f"missing authority: {action}", status=403)
+
+
+def _mcp_token_add(path: str, *, principal: str, name: str) -> tuple[str, Any]:
+    with MCP_TOKEN_STORE_LOCK:
+        return MCPTokenStore(path).add(principal=principal, name=name)
+
+
+def _mcp_token_revoke(path: str, token_id: str):  # noqa: ANN202
+    with MCP_TOKEN_STORE_LOCK:
+        return MCPTokenStore(path).revoke(token_id)
+
+
+def _mcp_token_revoke_after_failed_issue(path: str, token_id: str) -> None:
+    try:
+        _mcp_token_revoke(path, token_id)
+    except MCPTokenError as exc:
+        logger.error(
+            "mcp token rollback failed token_id=%s error=%s",
+            token_id,
+            public_error_message(str(exc)),
+        )
 
 
 def _limit(request: web.Request) -> int:
