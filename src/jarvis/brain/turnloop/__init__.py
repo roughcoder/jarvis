@@ -40,6 +40,7 @@ from jarvis.intercom.audio import AudioIO, MicStream
 from jarvis.intercom.vad import Endpointer, SileroVAD
 from jarvis.intercom.wake import WakeWord
 from jarvis.mcp import MCPBridge
+from jarvis.mcp.status import publish_mcp_status_snapshot
 from jarvis.services.stt import Transcriber
 from jarvis.services.tts import InworldTTS
 from jarvis.tools import build_registry
@@ -224,6 +225,7 @@ class TurnLoop:
         """Connect configured MCP servers and register their tools (best-effort —
         a failed server is skipped, never fatal). No-op when MCP is disabled."""
         await self._mcp.start()
+        await asyncio.to_thread(publish_mcp_status_snapshot, self._cfg, self._mcp)
         for tool in make_mcp_tools(self._mcp):
             self._registry.register(tool)
         register_skills(self._registry, gateway=self._gateway, cfg=self._cfg)

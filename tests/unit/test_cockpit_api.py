@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import threading
@@ -21,10 +22,12 @@ from jarvis.brain.capabilities import RequestContext, can_query_memory_peer  # n
 from jarvis.brain.memory_client import ConclusionRecord, MemoryMessage, RepresentationRecord, SessionPeer  # noqa: E402
 from jarvis.brain.memory_outbox import CurationOutbox  # noqa: E402
 from jarvis.connectors.cockpit import CockpitConnector, CockpitThread, orchestrator_session_id  # noqa: E402
-from jarvis.config import Config, WorkerConfig  # noqa: E402
+from jarvis.config import Config, MCPServerSpec, WorkerConfig  # noqa: E402
 import jarvis.orchestration.api as cockpit_api_module  # noqa: E402
 from jarvis.orchestration.api import CockpitAppContext, IdempotencyStore, SseSnapshotHub, _command_from_body, _idempotency_scope, make_app, serve  # noqa: E402
 from jarvis.orchestration.cockpit import make_session_ref  # noqa: E402
+from jarvis.mcp.status import mcp_status_path  # noqa: E402
+from jarvis.mcp_server.tokens import MCPTokenStore  # noqa: E402
 from jarvis.orchestration.models import Artifact, ExecutionEnvelope, WorkItem, WorkerProfile, WorkerSessionLink  # noqa: E402
 from jarvis.orchestration.oauth import OAuthTokenValidator, OAuthValidationError  # noqa: E402
 from jarvis.orchestration.service import StartedWork  # noqa: E402
@@ -520,6 +523,195 @@ def _sse_events(text: str) -> list[dict[str, Any]]:
             item["_event"] = event
             events.append(item)
     return events
+
+
+def test_mcp_status_uses_config_fallback_and_redacts_server_specs(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    cfg.mcp.enabled = True
+    cfg.mcp.servers = [
+        MCPServerSpec(
+            name="vault",
+            transport="http",
+            url="https://secret.example.test/mcp?token=abc",
+            headers={"Authorization": "Bearer secret-token"},
+            command="/Users/neil/private/bin/mcp",
+            args=["--secret", "abc"],
+            env={"TOKEN": "secret"},
+            capability="mcp.vault",
+        )
+    ]
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/mcp/status")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["source"] == "config"
+        assert data["generated_at"] == ""
+        assert data["servers"] == [
+            {
+                "name": "vault",
+                "transport": "http",
+                "connected": None,
+                "tool_count": 0,
+                "error": "",
+                "required_capability": "mcp.vault",
+            }
+        ]
+        raw = json.dumps(data)
+        assert "secret.example" not in raw
+        assert "Authorization" not in raw
+        assert "/Users/neil" not in raw
+        assert "token_store_path" not in raw
+        assert data["serve"]["tokens"] == {"active": 0, "revoked": 0}
+        assert data["serve"]["codex_wired"] is False
+        assert data["serve"]["codex_wired_reason"]
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_mcp_status_and_tools_use_snapshot_with_server_filter(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    store = MCPTokenStore(cfg.mcp_serve.token_store_path)
+    _token, record = store.add(principal="neil", name="Codex")
+    store.revoke(record.token_id)
+    mcp_status_path(cfg).write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-07-06T10:00:00Z",
+                "servers": [
+                    {
+                        "name": "linear",
+                        "transport": "http",
+                        "connected": True,
+                        "tool_count": 1,
+                        "error": "",
+                        "connected_at": "2026-07-06T09:59:59Z",
+                        "required_capability": "mcp.linear",
+                    },
+                    {
+                        "name": "local",
+                        "transport": "stdio",
+                        "connected": False,
+                        "tool_count": 0,
+                        "error": "failed at /Users/neil/secret with sk-test123456789012",
+                        "required_capability": "mcp.local",
+                    },
+                ],
+                "tools": [
+                    {
+                        "offered_name": "linear_search",
+                        "server": "linear",
+                        "description": "Search issues",
+                        "required_capability": "mcp.linear",
+                    },
+                    {
+                        "offered_name": "local_read",
+                        "server": "local",
+                        "description": "Read local data",
+                        "required_capability": "mcp.local",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        status = (await client.get(f"{base}/v1/mcp/status")).json()
+        assert status["source"] == "snapshot"
+        assert status["generated_at"] == "2026-07-06T10:00:00Z"
+        assert status["servers"][0]["connected"] is True
+        assert status["servers"][1]["error"] == "failed at <local-path> with <redacted-token>"
+        assert status["serve"]["tokens"] == {"active": 0, "revoked": 1}
+
+        tools = (await client.get(f"{base}/v1/mcp/tools")).json()
+        assert [tool["name"] for tool in tools["tools"]] == ["linear_search", "local_read"]
+        filtered = (await client.get(f"{base}/v1/mcp/tools", params={"server": "linear"})).json()
+        assert filtered["tools"] == [
+            {
+                "name": "linear_search",
+                "server": "linear",
+                "description": "Search issues",
+                "required_capability": "mcp.linear",
+            }
+        ]
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_mcp_token_lifecycle_over_http(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="mcp.tokens.manage")
+    _seed_user_profiles(cfg, "neil")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        issued = await client.post(
+            f"{base}/v1/mcp/tokens",
+            json={"principal": "neil", "name": "Codex", "idempotency_key": "issue-1"},
+        )
+        assert issued.status_code == 200
+        body = issued.json()
+        assert body["ok"] is True
+        assert body["token"].startswith("jv_mcp_")
+        assert body["record"]["principal"] == "neil"
+        assert set(body["record"]) == {"token_id", "principal", "name", "prefix", "created_at", "revoked_at"}
+
+        replay = await client.post(
+            f"{base}/v1/mcp/tokens",
+            json={"principal": "neil", "name": "Codex", "idempotency_key": "issue-1"},
+        )
+        assert replay.status_code == 200
+        assert replay.json()["token"] == ""
+        assert replay.json()["idempotent"] is True
+
+        listed = await client.get(f"{base}/v1/mcp/tokens")
+        assert listed.status_code == 200
+        records = listed.json()["tokens"]
+        assert len(records) == 1
+        assert records[0]["token_id"] == body["record"]["token_id"]
+        assert "token_hash" not in records[0]
+        assert body["token"] not in json.dumps(records)
+
+        revoked = await client.delete(f"{base}/v1/mcp/tokens/{body['record']['token_id']}")
+        assert revoked.status_code == 200
+        assert revoked.json()["record"]["revoked_at"]
+
+        active = (await client.get(f"{base}/v1/mcp/tokens")).json()
+        assert active["tokens"] == []
+        all_tokens = (await client.get(f"{base}/v1/mcp/tokens", params={"include_revoked": "true"})).json()
+        assert all_tokens["tokens"][0]["revoked_at"]
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_mcp_token_errors_and_capability_gate(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="mcp.tokens.manage")
+    _seed_user_profiles(cfg, "neil")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        unknown_principal = await client.post(
+            f"{base}/v1/mcp/tokens",
+            json={"principal": "alice", "name": "Codex"},
+        )
+        assert unknown_principal.status_code == 400
+        assert unknown_principal.json()["error"]["code"] == "validation_failed"
+
+        missing = await client.delete(f"{base}/v1/mcp/tokens/mcptok_missing")
+        assert missing.status_code == 404
+        assert missing.json()["error"]["code"] == "not_found"
+
+    asyncio.run(_with_server(cfg, calls))
+
+    denied_root = tmp_path / "denied"
+    denied_root.mkdir()
+    denied = _cfg(denied_root, monkeypatch, caps="")
+    _seed_user_profiles(denied, "neil")
+
+    async def denied_calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/mcp/tokens")
+        assert response.status_code == 403
+        assert response.json()["error"]["message"] == "missing authority: mcp.tokens.manage"
+
+    asyncio.run(_with_server(denied, denied_calls))
 
 
 def _oauth_fixture(*, kid: str = "test-key", include_alg: bool = True) -> tuple[dict[str, Any], Callable[..., Response]]:

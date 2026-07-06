@@ -8,13 +8,15 @@ login prompt rather than falling back. SDK-free (fake clients).
 from __future__ import annotations
 
 import asyncio
+import json
 import pathlib
 
 import pytest
 
-from jarvis.config import MCPConfig, MCPServerSpec
+from jarvis.config import Config, MCPConfig, MCPServerSpec
 from jarvis.mcp.auth import auth_path
-from jarvis.mcp.bridge import MCPBridge
+from jarvis.mcp.bridge import BridgedTool, MCPBridge
+from jarvis.mcp.status import mcp_status_path, publish_mcp_status_snapshot
 
 
 def test_auth_path_is_per_user(tmp_path) -> None:  # noqa: ANN001
@@ -101,3 +103,102 @@ def test_registered_matches_server_not_tool_name(tmp_path) -> None:  # noqa: ANN
     b._routes["notion_search"] = ("notion", "search")
     assert b._registered(MCPServerSpec(name="notion", transport="http", url="https://x/mcp"))
     assert not b._registered(MCPServerSpec(name="search", command="x"))
+
+
+def test_bridge_status_returns_public_plain_dicts(tmp_path) -> None:  # noqa: ANN001
+    cfg = MCPConfig(
+        _env_file=None,
+        enabled=True,
+        servers=[
+            MCPServerSpec(name="ctx", command="/Users/neil/private/mcp"),
+            MCPServerSpec(name="linear", transport="http", url="https://linear.app/mcp"),
+        ],
+    )
+    bridge = MCPBridge(cfg)
+    bridge._clients[("house", "ctx")] = _FakeClient("house")
+    bridge._connected_at["ctx"] = "2026-07-06T09:59:59Z"
+    bridge._errors["linear"] = "failed reading /Users/neil/private with sk-test123456789012"
+    bridge.tools = [
+        BridgedTool(
+            offered_name="ctx_lookup",
+            server="ctx",
+            server_tool="lookup",
+            description="Lookup context",
+            input_schema={"type": "object"},
+            required_capability="mcp.ctx",
+        )
+    ]
+
+    status = bridge.status()
+
+    assert status["servers"] == [
+        {
+            "name": "ctx",
+            "transport": "stdio",
+            "connected": True,
+            "tool_count": 1,
+            "error": "",
+            "connected_at": "2026-07-06T09:59:59Z",
+            "required_capability": "mcp.ctx",
+        },
+        {
+            "name": "linear",
+            "transport": "http",
+            "connected": False,
+            "tool_count": 0,
+            "error": "failed reading <local-path> with <redacted-token>",
+            "connected_at": "",
+            "required_capability": "mcp.linear",
+        },
+    ]
+    assert status["tools"] == [
+        {
+            "offered_name": "ctx_lookup",
+            "server": "ctx",
+            "description": "Lookup context",
+            "required_capability": "mcp.ctx",
+        }
+    ]
+    assert "/Users/neil" not in json.dumps(status)
+
+
+def test_status_snapshot_writer_publishes_bridge_status(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env = tmp_path / ".env"
+    env.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'workspace'}",
+                f"CAPS_USERS_DIR={tmp_path / 'users'}",
+                f"REGISTRY_PATH={tmp_path / 'registry.json'}",
+                f"MEMORY_CACHE_PATH={tmp_path / 'memory-cache.json'}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env))
+    cfg = Config()
+
+    class FakeBridge:
+        tools: list[BridgedTool] = []
+
+        def status(self) -> dict:
+            return {
+                "servers": [
+                    {
+                        "name": "ctx",
+                        "transport": "stdio",
+                        "connected": True,
+                        "tool_count": 0,
+                        "error": "",
+                        "connected_at": "2026-07-06T09:59:59Z",
+                        "required_capability": "mcp.ctx",
+                    }
+                ],
+                "tools": [],
+            }
+
+    publish_mcp_status_snapshot(cfg, FakeBridge())
+
+    data = json.loads(mcp_status_path(cfg).read_text(encoding="utf-8"))
+    assert data["servers"][0]["name"] == "ctx"
+    assert data["generated_at"]
