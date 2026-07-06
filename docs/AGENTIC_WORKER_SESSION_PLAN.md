@@ -150,17 +150,20 @@ Remaining:
 
 ### 8. Claude provider sessions
 
-Status: initial adapter done in this branch.
+Status: Python SDK upgrade done in this branch.
 
-- Added Claude provider support through `claude -p --output-format stream-json`.
-- Stored durable `--session-id` / `--resume` metadata.
-- Projected Claude stream JSON into the canonical session event stream.
+- Replaced the stopgap `claude -p --output-format stream-json` turn process
+  with one long-lived Python `claude-agent-sdk` client per worker session.
+- Stored durable `session_id` / `resume` metadata under the existing
+  `claude_session_id` and `claude_session_started` keys.
+- Projected Claude SDK messages into the canonical session event stream.
+- Routed SDK `can_use_tool` callbacks to durable approval and input requests,
+  including `AskUserQuestion`, and wired live interrupt/stop control.
+- Enforced read-only Claude sessions with `permission_mode="plan"` plus
+  defence-in-depth write/execute tool denial.
 
 Remaining:
 
-- Replace the subprocess path with a local TypeScript sidecar around
-  `@anthropic-ai/claude-agent-sdk` when richer permission/question callbacks are
-  needed.
 - Dogfood with real Claude auth and a live repository.
 
 ### 9. Approvals and input across surfaces

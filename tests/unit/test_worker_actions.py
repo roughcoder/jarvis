@@ -304,11 +304,26 @@ def test_claude_state_file_is_indeterminate_without_credentials(monkeypatch, tmp
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("CLAUDE_API_KEY", raising=False)
     monkeypatch.setattr(actions.pathlib.Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(actions, "_claude_sdk_auth_probe", lambda _binary: None)
 
     row = actions._claude_auth()  # noqa: SLF001
 
     assert row["authenticated"] is None
     assert "not cheaply determinable" in row["detail"]
+
+
+def test_claude_auth_prefers_sdk_probe_when_available(monkeypatch) -> None:  # noqa: ANN001
+    import jarvis.worker.actions as actions
+
+    monkeypatch.setattr(
+        actions,
+        "_claude_sdk_auth_probe",
+        lambda binary: {"authenticated": True, "detail": f"sdk probe ok via {binary}"},
+    )
+
+    row = actions._claude_auth("fake-claude")  # noqa: SLF001
+
+    assert row == {"authenticated": True, "detail": "sdk probe ok via fake-claude"}
 
 
 def test_slugify_makes_readable_handles() -> None:

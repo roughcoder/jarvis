@@ -334,7 +334,7 @@ def _engine_diagnostic(engine: str, *, codex_bin: str, claude_bin: str) -> dict[
     if engine_id == ENGINE_CODEX:
         row.update(_codex_auth(binary))
     elif engine_id == ENGINE_CLAUDE:
-        row.update(_claude_auth())
+        row.update(_claude_auth(binary))
     else:
         row["detail"] = "auth check not defined for this engine"
     return row
@@ -368,7 +368,51 @@ def _codex_auth_file_present() -> bool:
     )
 
 
-def _claude_auth() -> dict[str, Any]:
+def _claude_auth(binary: str = "claude") -> dict[str, Any]:
+    probe = _claude_sdk_auth_probe(binary)
+    if probe is not None:
+        return probe
+    return _claude_auth_file_check()
+
+
+def _claude_sdk_auth_probe(binary: str) -> dict[str, Any] | None:
+    try:
+        from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient  # type: ignore[import-not-found]
+    except ModuleNotFoundError as exc:
+        if exc.name == "claude_agent_sdk":
+            return None
+        raise
+
+    async def never_yielding_prompt():  # noqa: ANN202 - async generator shape is required by SDK
+        if False:
+            yield {}
+
+    async def probe() -> dict[str, Any]:
+        client = ClaudeSDKClient(
+            options=ClaudeAgentOptions(
+                cli_path=binary or None,
+                stderr=lambda _text: None,
+            )
+        )
+        try:
+            await client.connect(never_yielding_prompt())
+            info = await client.get_server_info()
+            detail = _claude_account_detail(info) or "claude-agent-sdk initialized without consuming a prompt"
+            return {"authenticated": True, "detail": detail}
+        finally:
+            await client.disconnect()
+
+    try:
+        return asyncio.run(asyncio.wait_for(probe(), timeout=8.0))
+    except Exception as exc:  # noqa: BLE001 - doctor falls back to cheap local state checks
+        fallback = _claude_auth_file_check()
+        return {
+            **fallback,
+            "detail": f"{fallback['detail']}; SDK auth probe failed: {_short_detail(str(exc) or exc.__class__.__name__)}",
+        }
+
+
+def _claude_auth_file_check() -> dict[str, Any]:
     if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_API_KEY"):
         return {"authenticated": True, "detail": "credential environment variable present"}
     home = pathlib.Path.home()
@@ -377,6 +421,33 @@ def _claude_auth() -> dict[str, Any]:
     if (home / ".claude.json").exists():
         return {"authenticated": None, "detail": "claude state present; credential status not cheaply determinable"}
     return {"authenticated": False, "detail": "claude credential state not found"}
+
+
+def _claude_account_detail(info: Any) -> str:
+    if not isinstance(info, dict):
+        return ""
+    values: list[str] = []
+    for key in ("email", "account_email", "subscription", "organization_name", "account_name"):
+        value = _find_nested_value(info, key)
+        if value:
+            values.append(f"{key.replace('_', ' ')}: {value}")
+    return "claude-agent-sdk initialized" + (f" ({', '.join(values)})" if values else "")
+
+
+def _find_nested_value(value: Any, key: str) -> str:
+    if isinstance(value, dict):
+        for item_key, item_value in value.items():
+            if str(item_key) == key and item_value:
+                return _short_detail(str(item_value))
+            nested = _find_nested_value(item_value, key)
+            if nested:
+                return nested
+    elif isinstance(value, list):
+        for item in value:
+            nested = _find_nested_value(item, key)
+            if nested:
+                return nested
+    return ""
 
 
 def _package_managers() -> list[dict[str, Any]]:

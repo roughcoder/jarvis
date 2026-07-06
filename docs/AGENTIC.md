@@ -520,12 +520,13 @@ Provider-specific events are projected into the canonical stream:
 - Codex adapter: wraps `codex app-server` and JSON-RPC over stdio, projects
   assistant/tool/approval/turn notifications, and stores the Codex thread id in
   session metadata.
-- Claude adapter: initial runtime uses `claude -p --output-format stream-json`
-  with `--session-id` / `--resume`, projects assistant/tool/result events, and
-  stores the Claude session id in session metadata.
-- Claude sidecar upgrade: replace the subprocess runtime with a small local
-  boundary peer around `@anthropic-ai/claude-agent-sdk` for prompt queues,
-  permission callbacks, structured questions, and richer interruption.
+- Claude adapter: runs an in-process Python `claude-agent-sdk` session runtime
+  with durable `session_id` / `resume` metadata, SDK permission callbacks for
+  approvals and questions, live interrupt/stop control, and canonical
+  assistant/tool/result event projection.
+- Decision: use the Python SDK directly in the worker. Parity with the
+  TypeScript package is sufficient, and a sidecar would add a second runtime and
+  daemon boundary without buying needed capability.
 - Cursor/OpenCode adapters: map their provider events into the same stream.
 
 Provider events are evidence, not authority. Jarvis still owns run ownership,
@@ -1346,14 +1347,10 @@ map.
       paths are migration targets, not product compatibility requirements.
 - [x] **Codex session adapter:** wrap `codex app-server` as a provider session
       runtime and project JSON-RPC events into canonical `SessionEvent`s.
-- [x] **Claude session adapter:** attach Claude through `claude -p
-      --output-format stream-json` with durable `--session-id` / `--resume`
-      metadata and project its structured stream into the same session event
-      stream.
-- [ ] **Claude SDK sidecar upgrade:** replace the initial Claude subprocess
-      runtime with a local TypeScript sidecar around
-      `@anthropic-ai/claude-agent-sdk` for prompt queues, questions, permission
-      callbacks, and richer live control.
+- [x] **Claude session adapter:** attach Claude through the Python
+      `claude-agent-sdk` in-process runtime with durable `session_id` /
+      `resume` metadata, prompt reuse, approvals, questions, and interrupt/stop
+      control projected into the same session event stream.
 - [ ] **T3-style cockpit:** fork/integrate a UI over Jarvis runs, worker
       sessions, event streams, approvals, interrupt/stop, artifacts, and reports
       without making the UI the orchestration source of truth.
