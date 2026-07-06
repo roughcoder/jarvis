@@ -6,6 +6,7 @@ import contextvars
 import asyncio
 import json
 import logging
+from importlib.util import find_spec
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -15,7 +16,7 @@ from jarvis.brain.capabilities import RequestContext
 from jarvis.config import Config
 from jarvis.mcp_server.adapters import JarvisMCPService, MCPAccessError
 from jarvis.mcp_server.tokens import MCPTokenStore
-from jarvis.oauth import OAuthTokenValidator, OAuthValidationError, auth_mode, required_scopes
+from jarvis.oauth import OAuthTokenValidator, OAuthValidationError, required_scopes
 from jarvis.users import User, load_users
 
 _REQUEST_CONTEXT: contextvars.ContextVar[RequestContext | None] = contextvars.ContextVar(
@@ -24,6 +25,8 @@ _REQUEST_CONTEXT: contextvars.ContextVar[RequestContext | None] = contextvars.Co
 )
 logger = logging.getLogger(__name__)
 _METADATA_PATH = "/.well-known/oauth-protected-resource"
+_AUTH_MODES = {"legacy", "oauth", "hybrid"}
+_MAX_BEARER_TOKEN_CHARS = 8192
 
 
 @dataclass(frozen=True)
@@ -336,35 +339,41 @@ class _BearerAuthASGI:
         self.service = service
         self.cfg = cfg
         self.store = MCPTokenStore(cfg.mcp_serve.token_store_path)
-        self.mode = auth_mode(str(cfg.mcp_serve.auth_mode))
+        self.mode = _strict_auth_mode(str(cfg.mcp_serve.auth_mode))
         self.resource_url = cfg.mcp_serve.resolved_resource_url
         self.oauth_issuer = str(cfg.mcp_serve.oauth_issuer).strip()
+        self.oauth_jwks_url = str(cfg.mcp_serve.oauth_jwks_url).strip()
         self.oauth_scopes = required_scopes(str(cfg.mcp_serve.oauth_required_scopes))
+        self.allow_identity_subject = cfg.mcp_serve.resolved_oauth_allow_identity_subject
         self.oauth_validator = self._build_oauth_validator(http_get or httpx.get)
 
     def _build_oauth_validator(self, http_get: Callable[..., Any]) -> OAuthTokenValidator | None:
         if self.mode not in {"oauth", "hybrid"}:
             return None
+        oauth_env_present = bool(
+            self.oauth_issuer
+            or self.oauth_jwks_url
+            or str(self.cfg.mcp_serve.resource_url).strip()
+            or str(self.cfg.mcp_serve.oauth_required_scopes).strip()
+        )
         missing = [
             name
             for name, value in {
                 "issuer": self.oauth_issuer,
-                "jwks_url": self.cfg.mcp_serve.oauth_jwks_url,
+                "jwks_url": self.oauth_jwks_url,
                 "resource_url": self.resource_url,
             }.items()
             if not str(value).strip()
         ]
         if missing:
-            logger.warning(
-                "mcp-serve OAuth disabled: missing %s",
-                ", ".join(missing),
-            )
-            return None
+            return self._disable_or_fail_oauth(f"missing {', '.join(missing)}", warn=oauth_env_present)
+        if find_spec("jwt") is None:
+            return self._disable_or_fail_oauth("PyJWT[crypto] is not installed", warn=True)
         try:
             return OAuthTokenValidator(
                 issuer=self.oauth_issuer,
                 audience=self.resource_url,
-                jwks_url=str(self.cfg.mcp_serve.oauth_jwks_url),
+                jwks_url=self.oauth_jwks_url,
                 scopes=self.oauth_scopes,
                 jarvis_user_claim="",
                 default_alg="RS256",
@@ -374,8 +383,14 @@ class _BearerAuthASGI:
                 require_jarvis_user=False,
             )
         except ValueError as exc:
-            logger.warning("mcp-serve OAuth disabled: %s", exc)
-            return None
+            return self._disable_or_fail_oauth(str(exc), warn=True)
+
+    def _disable_or_fail_oauth(self, reason: str, *, warn: bool) -> None:
+        if self.mode == "oauth":
+            raise MCPAccessError(f"mcp-serve OAuth is not configured: {reason}")
+        if warn:
+            logger.warning("mcp-serve OAuth disabled: %s", reason)
+        return None
 
     async def __call__(self, scope: dict[str, Any], receive: Callable[[], Awaitable[Any]], send: Callable[[Any], Awaitable[None]]) -> None:
         if scope.get("type") != "http":
@@ -403,25 +418,21 @@ class _BearerAuthASGI:
         if self.mode in {"legacy", "hybrid"}:
             record = self.store.resolve(token)
             if record is not None:
-                try:
-                    return self.service.context_for_principal(record.principal)
-                except MCPAccessError:
-                    if self._challenge_enabled:
-                        return None
-                    raise
+                return self.service.context_for_principal(record.principal)
         if self.mode not in {"oauth", "hybrid"} or self.oauth_validator is None:
+            return None
+        if len(token) > _MAX_BEARER_TOKEN_CHARS:
             return None
         try:
             principal = await asyncio.to_thread(self.oauth_validator.validate, token)
-            user = _user_for_oauth_subject(load_users(self.cfg.capabilities.users_dir), principal.subject)
+            users = await asyncio.to_thread(load_users, self.cfg.capabilities.users_dir)
+            user = _user_for_oauth_subject(users, principal.subject, allow_identity=self.allow_identity_subject)
             return self.service.context_for_principal(user.name)
         except (OAuthValidationError, MCPAccessError):
             return None
 
     async def _send_metadata(self, send: Callable[[Any], Awaitable[None]]) -> None:
-        if not self.oauth_issuer or (
-            self.mode in {"oauth", "hybrid"} and self.oauth_validator is None
-        ):
+        if not self.oauth_issuer:
             await _send_plain(send, 404, "not found")
             return
         await _send_json(
@@ -446,7 +457,7 @@ class _BearerAuthASGI:
 
     @property
     def _challenge_enabled(self) -> bool:
-        return self.oauth_validator is not None
+        return self.mode in {"oauth", "hybrid"} and bool(self.oauth_issuer)
 
     @property
     def _challenge_headers(self) -> list[tuple[bytes, bytes]]:
@@ -454,20 +465,37 @@ class _BearerAuthASGI:
         return [(b"www-authenticate", value.encode("ascii"))]
 
 
-def _user_for_oauth_subject(users: dict[str, User], subject: str) -> User:
-    matched: dict[str, User] = {}
+def _strict_auth_mode(value: str) -> str:
+    mode = value.strip().lower()
+    if mode not in _AUTH_MODES:
+        raise MCPAccessError(
+            f"invalid MCP_SERVE_AUTH_MODE {value!r}; expected legacy, oauth, or hybrid"
+        )
+    return mode
+
+
+def _user_for_oauth_subject(users: dict[str, User], subject: str, *, allow_identity: bool) -> User:
+    subject_matches: dict[str, User] = {}
     for user in users.values():
         if subject in user.oauth_subjects:
-            matched[user.name] = user
-    for key, user in users.items():
-        if subject in {key, user.name}:
-            matched[user.name] = user
-    if len(matched) > 1:
+            subject_matches[user.name] = user
+    if len(subject_matches) > 1:
         logger.error("mcp-serve OAuth subject maps to multiple users subject=%s", subject)
         raise OAuthValidationError("duplicate subject mapping")
-    if not matched:
+    if subject_matches:
+        return next(iter(subject_matches.values()))
+    if not allow_identity:
         raise OAuthValidationError("unknown subject")
-    return next(iter(matched.values()))
+    identity_matches: dict[str, User] = {}
+    for key, user in users.items():
+        if subject in {key, user.name}:
+            identity_matches[user.name] = user
+    if len(identity_matches) > 1:
+        logger.error("mcp-serve OAuth subject maps to multiple users subject=%s", subject)
+        raise OAuthValidationError("duplicate subject mapping")
+    if not identity_matches:
+        raise OAuthValidationError("unknown subject")
+    return next(iter(identity_matches.values()))
 
 
 def _bearer_token(headers: list[tuple[bytes, bytes]]) -> str:

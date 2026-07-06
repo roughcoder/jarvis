@@ -60,10 +60,17 @@ New env `MCP_SERVE_AUTH_MODE`, mirroring the orchestration API's model:
 | `oauth` | JWT bearer tokens only, validated per this spec. |
 | `hybrid` (default) | Try static token resolution first; if the presented bearer is not a known static token, validate it as a JWT. |
 
-In `hybrid`/`oauth` mode with incomplete OAuth config (missing issuer, JWKS
-URL, or resource URL), OAuth validation is disabled and startup logs a single
-warning; `legacy` behaviour remains. Misconfiguration must degrade, never
-crash the server or silently accept tokens.
+In `hybrid` mode with incomplete OAuth config (missing issuer, JWKS URL, or
+resource URL), OAuth validation is disabled and startup logs a single warning
+only when at least one OAuth env var was set; static-token behaviour remains.
+In `oauth` mode, incomplete or invalid OAuth config is a startup error: the
+server must fail fast with a clear message rather than booting into total
+lockout or silently falling back to static tokens. With no new env set, default
+`hybrid` mode must not log an OAuth warning and must behave like today's
+static-token auth.
+
+Unknown `MCP_SERVE_AUTH_MODE` values are configuration errors and must be
+rejected at startup; they must not silently coerce to `hybrid`.
 
 Ordering note for `hybrid`: static tokens are random opaque strings and JWTs
 are three dot-separated base64url segments — but resolution MUST NOT rely on
@@ -96,8 +103,10 @@ Unauthenticated, `Content-Type: application/json`:
 - `scopes_supported` is empty in v1: authorization is Jarvis's capability
   gate, not OAuth scopes. If `MCP_SERVE_OAUTH_REQUIRED_SCOPES` is set, list
   those scopes here.
-- Served in all auth modes; in `legacy` mode with no issuer configured the
-  route returns `404` (there is no AS to advertise).
+- Served in all auth modes whenever `MCP_SERVE_OAUTH_ISSUER` is configured,
+  even if the OAuth validation lane is disabled in degraded `hybrid` mode.
+  The route returns `404` only when no issuer is configured (there is no AS to
+  advertise).
 
 ### 401 challenge
 
@@ -140,16 +149,26 @@ The validated JWT's `sub` maps to a Jarvis user:
 1. Each user profile under `users/` MAY declare an `oauth_subjects:` list in
    front matter (e.g. `oauth_subjects: ["ba_usr_abc123"]`). A `sub` matching
    any entry resolves to that user.
-2. Fallback: a `sub` exactly equal to a user's identity key (file name /
-   `name`) resolves to that user. This preserves today's cockpit-API
-   behaviour where `sub` is the Jarvis identity.
+2. Fallback, only when no `oauth_subjects` entry matched and
+   `MCP_SERVE_OAUTH_ALLOW_IDENTITY_SUBJECT` allows it: a `sub` exactly equal to
+   a user's identity key (file name / `name`) resolves to that user. This
+   preserves today's cockpit-API behaviour where `sub` is the Jarvis identity.
 3. No match → `401` with the challenge header. **Never** auto-create users,
    never fall back to `house`.
 
-A `sub` matching more than one user is a configuration error: log and reject
-(`401`). The resolved user builds the same per-principal capability context
-the static-token lane builds today (`user.capabilities`, deny by default) —
-the MCP tool surface downstream of auth is unchanged.
+The identity fallback is controlled by `MCP_SERVE_OAUTH_ALLOW_IDENTITY_SUBJECT`.
+When unset, it defaults to enabled in `legacy`/`hybrid` mode and disabled in
+`oauth` mode, so an OAuth-only cutover requires explicit `oauth_subjects`
+linkage unless an operator deliberately enables the fallback. If set, the flag
+overrides the mode-derived default.
+
+A `sub` matching more than one user within the active mapping lane is a
+configuration error: log and reject (`401`). `oauth_subjects` matches take
+precedence over identity fallback, so a subject that is explicitly linked to
+one user and also happens to equal another user's identity resolves to the
+explicitly linked user. The resolved user builds the same per-principal
+capability context the static-token lane builds today (`user.capabilities`,
+deny by default) — the MCP tool surface downstream of auth is unchanged.
 
 The orchestration validator's `jarvis_user` claim handling is NOT used here;
 `sub` is the only identity anchor (consistent with the AUTH-ONLY V1 rule that
@@ -180,10 +199,14 @@ All new fields on `MCPServeConfig` (env prefix `MCP_SERVE_`), with
 | `MCP_SERVE_OAUTH_ISSUER` | empty | AS issuer URL (Better Auth base URL) |
 | `MCP_SERVE_OAUTH_JWKS_URL` | empty | AS JWKS endpoint |
 | `MCP_SERVE_OAUTH_REQUIRED_SCOPES` | empty | CSV, optional |
+| `MCP_SERVE_OAUTH_ALLOW_IDENTITY_SUBJECT` | true in `legacy`/`hybrid`, false in `oauth` | Allow `sub` identity fallback when no `oauth_subjects` entry matches |
 | `MCP_SERVE_OAUTH_JWKS_TTL_S` / `_MIN_REFRESH_S` | as orchestration | JWKS cache tuning |
 
 `jarvis config` must print the resolved values (secret-free — none of these
 are secrets).
+
+Deployments that enable OAuth for `jarvis mcp-serve` install the `mcp` extra;
+that extra includes `PyJWT[crypto]` for local JWKS validation.
 
 ## Status surface
 
@@ -238,17 +261,20 @@ already are. Nothing else about redaction changes.
 Unit tests (no network): a local RS256 keypair fixture minting JWTs, JWKS
 served from a stub.
 
-- Discovery: metadata shape; 404 in legacy-with-no-issuer; challenge header on
-  401 for missing/invalid/expired tokens.
+- Discovery: metadata shape; metadata served in legacy-with-issuer; 404 with
+  no issuer; challenge header on 401 for missing/invalid/expired tokens.
 - Validation matrix: happy path; wrong issuer; wrong audience (API-audience
-  token rejected); expired; bad signature; scope enforcement when configured.
-- Principal mapping: `oauth_subjects` match; identity fallback; unknown sub
-  rejected; duplicate mapping rejected; capability context matches the same
+  token rejected); expired; not-before; bad signature; scope enforcement when
+  configured.
+- Principal mapping: `oauth_subjects` match; `oauth_subjects` precedence over
+  identity fallback; identity fallback allowed/disabled by mode/config; unknown
+  sub rejected; duplicate mapping rejected; capability context matches the same
   user via the static lane.
 - Hybrid ordering: static token still resolves when OAuth configured; JWT
   works alongside; garbage bearer rejected by both lanes with one 401.
-- Degradation: partial OAuth config disables the lane with a warning, static
-  lane unaffected.
+- Degradation: partial OAuth config disables the lane with a warning in
+  `hybrid` mode and leaves static lane unaffected; the same partial config
+  fails fast in `oauth` mode.
 - `jarvis config` prints new fields; `/v1/mcp/status` serve block projection.
 
 ## Rollout

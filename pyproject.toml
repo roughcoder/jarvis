@@ -54,6 +54,7 @@ cockpit = [
 # stdio + streamable-http transports. Pure-Python, fine on the supported Python range.
 mcp = [
     "mcp>=1.2",
+    "PyJWT[crypto]>=2.8",
 ]
 # Browser lane — a real Chrome driven over CDP via nodriver (no Playwright). Worker
 # host only (the brain talks to it over HTTP). Headed + stealthy; needs Chrome.

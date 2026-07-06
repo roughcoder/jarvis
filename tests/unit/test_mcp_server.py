@@ -149,6 +149,7 @@ def _cfg(
     oauth_issuer: str = "",
     oauth_jwks_url: str = "",
     oauth_required_scopes: str = "",
+    oauth_allow_identity_subject: str = "",
 ) -> Config:
     tmp_path.mkdir(parents=True, exist_ok=True)
     env = tmp_path / ".env"
@@ -168,6 +169,7 @@ def _cfg(
                 f"MCP_SERVE_OAUTH_ISSUER={oauth_issuer}",
                 f"MCP_SERVE_OAUTH_JWKS_URL={oauth_jwks_url}",
                 f"MCP_SERVE_OAUTH_REQUIRED_SCOPES={oauth_required_scopes}",
+                f"MCP_SERVE_OAUTH_ALLOW_IDENTITY_SUBJECT={oauth_allow_identity_subject}",
                 "MCP_SERVE_OAUTH_JWKS_TTL_S=300",
                 "MCP_SERVE_OAUTH_JWKS_MIN_REFRESH_S=30",
             ]
@@ -276,19 +278,23 @@ def _oauth_fixture(*, kid: str = "mcp-test-key") -> tuple[dict[str, Any], Callab
         subject: str = "ba_neil",
         scope: str = "mcp:use",
         expires_delta: timedelta = timedelta(minutes=5),
+        not_before_delta: timedelta | None = None,
         token_kid: str = kid,
         signing_key: Any = private_pem,
     ) -> str:
         now = datetime.now(UTC)
+        claims = {
+            "iss": issuer,
+            "sub": subject,
+            "aud": audience,
+            "scope": scope,
+            "exp": now + expires_delta,
+            "iat": now,
+        }
+        if not_before_delta is not None:
+            claims["nbf"] = now + not_before_delta
         return jwt.encode(
-            {
-                "iss": issuer,
-                "sub": subject,
-                "aud": audience,
-                "scope": scope,
-                "exp": now + expires_delta,
-                "iat": now,
-            },
+            claims,
             signing_key,
             algorithm="RS256",
             headers={"kid": token_kid},
@@ -430,6 +436,22 @@ def test_oauth_discovery_404s_in_legacy_without_issuer(tmp_path, monkeypatch) ->
     assert response["status"] == 404
 
 
+def test_oauth_discovery_serves_in_legacy_with_issuer(tmp_path, monkeypatch) -> None:
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        auth_mode="legacy",
+        oauth_issuer="https://cockpit.example",
+    )
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+    app = _BearerAuthASGI(_inner_app(MCPServerRuntime(service)), service, cfg)
+
+    response = asyncio.run(_asgi_request(app, "/.well-known/oauth-protected-resource"))
+
+    assert response["status"] == 200
+    assert json.loads(response["body"])["authorization_servers"] == ["https://cockpit.example"]
+
+
 def test_oauth_validation_matrix_rejects_bad_jwts(tmp_path, monkeypatch) -> None:
     fixture, jwks_get = _oauth_fixture()
     cfg = _oauth_cfg(tmp_path, monkeypatch)
@@ -443,13 +465,14 @@ def test_oauth_validation_matrix_rejects_bad_jwts(tmp_path, monkeypatch) -> None
         fixture["sign"](audience="jarvis-cockpit-api"),
         fixture["sign"](scope="other:scope"),
         fixture["sign"](expires_delta=timedelta(minutes=-2)),
+        fixture["sign"](not_before_delta=timedelta(minutes=2)),
         _bad_signature_token(fixture),
     ]
     rejected = [asyncio.run(_asgi_request(app, "/mcp", token=token)) for token in invalid_tokens]
 
     assert valid["status"] == 200
     assert json.loads(valid["body"])["identity"] == "neil"
-    assert [response["status"] for response in rejected] == [401, 401, 401, 401, 401]
+    assert [response["status"] for response in rejected] == [401, 401, 401, 401, 401, 401]
 
 
 def test_oauth_principal_mapping_and_capability_parity(tmp_path, monkeypatch) -> None:
@@ -486,6 +509,55 @@ def test_oauth_principal_mapping_and_capability_parity(tmp_path, monkeypatch) ->
     assert oauth_neil.channel == static_neil.channel == "mcp"
 
 
+def test_oauth_subjects_precede_identity_fallback(tmp_path, monkeypatch) -> None:
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _oauth_cfg(tmp_path, monkeypatch)
+    Path(cfg.capabilities.users_dir).joinpath("neil.md").write_text(
+        "---\nscope: personal\nhoncho_peer: neil\noauth_subjects: [viewer]\ncapabilities: [memory.query, memory.curate]\n---\n# Neil\n",
+        encoding="utf-8",
+    )
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+    app = _BearerAuthASGI(_inner_app(MCPServerRuntime(service)), service, cfg, http_get=jwks_get)
+
+    response = asyncio.run(_asgi_request(app, "/mcp", token=fixture["sign"](subject="viewer")))
+
+    assert response["status"] == 200
+    assert json.loads(response["body"])["identity"] == "neil"
+
+
+def test_oauth_mode_disables_identity_fallback_unless_configured(tmp_path, monkeypatch) -> None:
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        auth_mode="oauth",
+        resource_url="http://localhost:8795",
+        oauth_issuer="https://cockpit.example",
+        oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+    )
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+    app = _BearerAuthASGI(_inner_app(MCPServerRuntime(service)), service, cfg, http_get=jwks_get)
+
+    denied = asyncio.run(_asgi_request(app, "/mcp", token=fixture["sign"](subject="viewer")))
+
+    allowed_cfg = _cfg(
+        tmp_path / "allowed",
+        monkeypatch,
+        auth_mode="oauth",
+        resource_url="http://localhost:8795",
+        oauth_issuer="https://cockpit.example",
+        oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+        oauth_allow_identity_subject="true",
+    )
+    allowed_service = JarvisMCPService(allowed_cfg, memory=FakeMemory())
+    allowed_app = _BearerAuthASGI(_inner_app(MCPServerRuntime(allowed_service)), allowed_service, allowed_cfg, http_get=jwks_get)
+    allowed = asyncio.run(_asgi_request(allowed_app, "/mcp", token=fixture["sign"](subject="viewer")))
+
+    assert denied["status"] == 401
+    assert allowed["status"] == 200
+    assert json.loads(allowed["body"])["identity"] == "viewer"
+
+
 def test_hybrid_ordering_degradation_and_jwks_fail_closed(tmp_path, monkeypatch, caplog) -> None:
     fixture, jwks_get = _oauth_fixture()
     cfg = _oauth_cfg(tmp_path, monkeypatch)
@@ -519,9 +591,14 @@ def test_hybrid_ordering_degradation_and_jwks_fail_closed(tmp_path, monkeypatch,
     partial_app = _BearerAuthASGI(_inner_app(MCPServerRuntime(partial_service)), partial_service, partial_cfg, http_get=jwks_get)
     partial_static = asyncio.run(_asgi_request(partial_app, "/mcp", token=partial_token))
     partial_jwt = asyncio.run(_asgi_request(partial_app, "/mcp", token=fixture["sign"]()))
+    partial_metadata = asyncio.run(_asgi_request(partial_app, "/.well-known/oauth-protected-resource"))
 
     assert partial_static["status"] == 200
     assert partial_jwt["status"] == 401
+    assert partial_jwt["headers"]["www-authenticate"] == (
+        'Bearer resource_metadata="http://localhost:8795/.well-known/oauth-protected-resource"'
+    )
+    assert partial_metadata["status"] == 200
     assert "OAuth disabled" in caplog.text
 
     def failing_jwks_get(_url: str, **_kwargs: Any) -> Response:
@@ -534,6 +611,81 @@ def test_hybrid_ordering_degradation_and_jwks_fail_closed(tmp_path, monkeypatch,
 
     assert asyncio.run(_asgi_request(fail_app, "/mcp", token=fixture["sign"]()))["status"] == 401
     assert asyncio.run(_asgi_request(fail_app, "/mcp", token=fail_static_token))["status"] == 200
+
+
+def test_default_hybrid_without_oauth_env_does_not_warn(tmp_path, monkeypatch, caplog) -> None:
+    cfg = _cfg(tmp_path, monkeypatch)
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+
+    _BearerAuthASGI(_inner_app(MCPServerRuntime(service)), service, cfg)
+
+    assert "OAuth disabled" not in caplog.text
+
+
+def test_oauth_mode_partial_config_fails_fast(tmp_path, monkeypatch) -> None:
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        auth_mode="oauth",
+        resource_url="http://localhost:8795",
+        oauth_issuer="https://cockpit.example",
+    )
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+
+    with pytest.raises(MCPAccessError, match="missing jwks_url"):
+        _BearerAuthASGI(_inner_app(MCPServerRuntime(service)), service, cfg)
+
+
+def test_invalid_mcp_serve_auth_mode_fails_fast(tmp_path, monkeypatch) -> None:
+    cfg = _cfg(tmp_path, monkeypatch, auth_mode="outh")
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+
+    with pytest.raises(MCPAccessError, match="invalid MCP_SERVE_AUTH_MODE"):
+        _BearerAuthASGI(_inner_app(MCPServerRuntime(service)), service, cfg)
+
+
+def test_hybrid_preserves_static_principal_403(tmp_path, monkeypatch) -> None:
+    _fixture, jwks_get = _oauth_fixture()
+    cfg = _oauth_cfg(tmp_path, monkeypatch)
+    token, _record = MCPTokenStore(cfg.mcp_serve.token_store_path).add(principal="missing")
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+    app = _BearerAuthASGI(_inner_app(MCPServerRuntime(service)), service, cfg, http_get=jwks_get)
+
+    response = asyncio.run(_asgi_request(app, "/mcp", token=token))
+
+    assert response["status"] == 403
+
+
+def test_oauth_rejects_overlong_bearer_before_jwks_fetch(tmp_path, monkeypatch) -> None:
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _oauth_cfg(tmp_path, monkeypatch)
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+    app = _BearerAuthASGI(_inner_app(MCPServerRuntime(service)), service, cfg, http_get=jwks_get)
+
+    response = asyncio.run(_asgi_request(app, "/mcp", token="x" * 9000))
+
+    assert response["status"] == 401
+    assert fixture["calls"]["jwks"] == 0
+
+
+def test_hybrid_warns_and_disables_oauth_when_pyjwt_missing(tmp_path, monkeypatch, caplog) -> None:
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _oauth_cfg(tmp_path, monkeypatch)
+    token, _record = MCPTokenStore(cfg.mcp_serve.token_store_path).add(principal="neil")
+    service = JarvisMCPService(cfg, memory=FakeMemory())
+    monkeypatch.setattr(
+        "jarvis.mcp_server.server.find_spec",
+        lambda name: None if name == "jwt" else object(),
+    )
+    app = _BearerAuthASGI(_inner_app(MCPServerRuntime(service)), service, cfg, http_get=jwks_get)
+
+    static = asyncio.run(_asgi_request(app, "/mcp", token=token))
+    jwt_response = asyncio.run(_asgi_request(app, "/mcp", token=fixture["sign"]()))
+
+    assert static["status"] == 200
+    assert jwt_response["status"] == 401
+    assert fixture["calls"]["jwks"] == 0
+    assert "PyJWT[crypto] is not installed" in caplog.text
 
 
 def test_unknown_principal_is_denied_by_default(tmp_path, monkeypatch) -> None:

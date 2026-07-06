@@ -484,6 +484,7 @@ gateway = [
 ]
 mcp = [
     { name = "mcp" },
+    { name = "pyjwt", extra = ["crypto"] },
 ]
 memory = [
     { name = "honcho-ai" },
@@ -535,6 +536,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pydantic-settings", specifier = ">=2.3" },
     { name = "pyjwt", extras = ["crypto"], marker = "extra == 'cockpit'", specifier = ">=2.8" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'mcp'", specifier = ">=2.8" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "silero-vad", marker = "extra == 'vad'", specifier = ">=5.1" },
     { name = "sounddevice", marker = "extra == 'stt'", specifier = ">=0.4.7" },

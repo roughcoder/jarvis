@@ -68,6 +68,7 @@ def test_resolved_includes_mcp_serve_oauth_fields(monkeypatch) -> None:
         "MCP_SERVE_OAUTH_ISSUER",
         "MCP_SERVE_OAUTH_JWKS_URL",
         "MCP_SERVE_OAUTH_REQUIRED_SCOPES",
+        "MCP_SERVE_OAUTH_ALLOW_IDENTITY_SUBJECT",
         "MCP_SERVE_OAUTH_JWKS_TTL_S",
         "MCP_SERVE_OAUTH_JWKS_MIN_REFRESH_S",
     )
@@ -76,6 +77,7 @@ def test_resolved_includes_mcp_serve_oauth_fields(monkeypatch) -> None:
     monkeypatch.setenv("MCP_SERVE_OAUTH_ISSUER", "https://cockpit.example")
     monkeypatch.setenv("MCP_SERVE_OAUTH_JWKS_URL", "https://cockpit.example/api/auth/jwks")
     monkeypatch.setenv("MCP_SERVE_OAUTH_REQUIRED_SCOPES", "mcp:use,mcp:write")
+    monkeypatch.setenv("MCP_SERVE_OAUTH_ALLOW_IDENTITY_SUBJECT", "true")
     monkeypatch.setenv("MCP_SERVE_OAUTH_JWKS_TTL_S", "120")
     monkeypatch.setenv("MCP_SERVE_OAUTH_JWKS_MIN_REFRESH_S", "10")
 
@@ -86,8 +88,23 @@ def test_resolved_includes_mcp_serve_oauth_fields(monkeypatch) -> None:
     assert r["mcp_serve.oauth_issuer"] == "https://cockpit.example"
     assert r["mcp_serve.oauth_jwks_url"] == "https://cockpit.example/api/auth/jwks"
     assert r["mcp_serve.oauth_required_scopes"] == "mcp:use,mcp:write"
+    assert r["mcp_serve.oauth_allow_identity_subject"] is True
     assert r["mcp_serve.oauth_jwks_ttl_s"] == 120.0
     assert r["mcp_serve.oauth_jwks_min_refresh_s"] == 10.0
+
+
+def test_mcp_serve_identity_subject_default_depends_on_auth_mode() -> None:
+    assert MCPServeConfig(_env_file=None, auth_mode="legacy").resolved_oauth_allow_identity_subject is True
+    assert MCPServeConfig(_env_file=None, auth_mode="hybrid").resolved_oauth_allow_identity_subject is True
+    assert MCPServeConfig(_env_file=None, auth_mode="oauth").resolved_oauth_allow_identity_subject is False
+    assert (
+        MCPServeConfig(
+            _env_file=None,
+            auth_mode="oauth",
+            oauth_allow_identity_subject="true",
+        ).resolved_oauth_allow_identity_subject
+        is True
+    )
 
 
 def test_memory_backend_sidecar_and_curation_outbox_are_env_driven(monkeypatch, tmp_path) -> None:

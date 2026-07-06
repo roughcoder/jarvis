@@ -651,12 +651,22 @@ class MCPServeConfig(_Base):
     oauth_issuer: str = ""
     oauth_jwks_url: str = ""
     oauth_required_scopes: str = ""
+    oauth_allow_identity_subject: str = ""
     oauth_jwks_ttl_s: float = 300.0
     oauth_jwks_min_refresh_s: float = 30.0
 
     @property
     def resolved_resource_url(self) -> str:
         return (self.resource_url or f"http://{self.host}:{self.port}").rstrip("/")
+
+    @property
+    def resolved_oauth_allow_identity_subject(self) -> bool:
+        value = str(self.oauth_allow_identity_subject).strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off"}:
+            return False
+        return str(self.auth_mode).strip().lower() != "oauth"
 
 
 class GoogleConfig(_Base):
@@ -1046,6 +1056,9 @@ class Config:
             "mcp_serve.oauth_jwks_url": self.mcp_serve.oauth_jwks_url or "<unset>",
             "mcp_serve.oauth_required_scopes": (
                 self.mcp_serve.oauth_required_scopes or "<none>"
+            ),
+            "mcp_serve.oauth_allow_identity_subject": (
+                self.mcp_serve.resolved_oauth_allow_identity_subject
             ),
             "mcp_serve.oauth_jwks_ttl_s": self.mcp_serve.oauth_jwks_ttl_s,
             "mcp_serve.oauth_jwks_min_refresh_s": (
