@@ -1546,7 +1546,7 @@ route-specific result. Memory forget/correct keep their historical top-level
 
 ### Idempotency
 
-Every cockpit write accepts an idempotency key. JSON writes use
+Every non-streaming cockpit write accepts an idempotency key. JSON writes use
 `idempotency_key` in the request body:
 
 ```json
@@ -1560,6 +1560,9 @@ Every cockpit write accepts an idempotency key. JSON writes use
 
 Multipart project file uploads use `X-Idempotency-Key` because the upload body
 is `multipart/form-data`.
+
+Exception: `POST /v1/projects/{id}/threads/{tid}/turns` is a streaming SSE
+write and does not consume idempotency keys in v1.
 
 Semantics:
 
@@ -1933,7 +1936,8 @@ or breaking status, and migration notes.
   observes.
 - Project writes now honor idempotency across create/update, owner lifecycle
   writes, findings/decisions, memory forget/correct, file upload/retract, and
-  thread open. Multipart upload uses `X-Idempotency-Key`.
+  thread open. Multipart upload uses `X-Idempotency-Key`; project thread turns
+  remain the explicit streaming exception.
 - Documented exact idempotency scope, replay, conflict, expiry, and concurrent
   same-key serialization semantics.
 - Named the two write envelopes: reconciliation packet for run/session

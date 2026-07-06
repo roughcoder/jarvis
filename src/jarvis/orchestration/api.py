@@ -756,7 +756,14 @@ class CockpitReadHandlers:
                 in {"1", "true", "yes"},
             },
         )
-        return _project_write_response(result)
+        return web.json_response(
+            {
+                "ok": True,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                **result,
+            }
+        )
 
     async def project_threads(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -997,8 +1004,11 @@ class CockpitWriteHandlers:
         await self.ctx.require_auth(request)
         requester = _requester_or_404(request, self.ctx.cfg)
         body = await _json_body(request)
-        fingerprint_body = {"project_id": request.match_info["project_id"], "visibility": body.get("visibility"), "idempotency_key": body.get("idempotency_key", "")}
-        payload = {key: value for key, value in fingerprint_body.items() if key != "idempotency_key"}
+        fingerprint_body = {**body, "project_id": request.match_info["project_id"]}
+        payload = {
+            "project_id": fingerprint_body["project_id"],
+            "visibility": fingerprint_body.get("visibility"),
+        }
         scope = f"projects/{payload['project_id']}/visibility"
 
         async def produce() -> dict[str, Any]:
@@ -1024,8 +1034,8 @@ class CockpitWriteHandlers:
         project = await _project_for_owner_route(self.ctx, request, requester)
         new_members = _members_from_body(body)
         members = _unique_member_list([*project.members, *new_members])
-        fingerprint_body = {"project_id": project.id, "members": members, "idempotency_key": body.get("idempotency_key", "")}
-        payload = {key: value for key, value in fingerprint_body.items() if key != "idempotency_key"}
+        fingerprint_body = {**body, "project_id": project.id}
+        payload = {"project_id": project.id, "members": members}
         scope = f"projects/{project.id}/members/add"
 
         async def produce() -> dict[str, Any]:
@@ -1051,8 +1061,8 @@ class CockpitWriteHandlers:
         project = await _project_for_owner_route(self.ctx, request, requester)
         member = request.match_info["member_id"]
         members = [item for item in project.members if item != member]
-        fingerprint_body = {"project_id": project.id, "members": members, "member_id": member, "idempotency_key": body.get("idempotency_key", "")}
-        payload = {key: value for key, value in fingerprint_body.items() if key not in {"idempotency_key", "member_id"}}
+        fingerprint_body = {**body, "project_id": project.id, "member_id": member}
+        payload = {"project_id": project.id, "members": members}
         scope = f"projects/{project.id}/members/remove"
 
         async def produce() -> dict[str, Any]:
@@ -1075,8 +1085,8 @@ class CockpitWriteHandlers:
         await self.ctx.require_auth(request)
         requester = _requester_or_404(request, self.ctx.cfg)
         body = await _optional_json_body(request)
-        fingerprint_body = {"project_id": request.match_info["project_id"], "archived": True, "idempotency_key": body.get("idempotency_key", "")}
-        payload = {key: value for key, value in fingerprint_body.items() if key != "idempotency_key"}
+        fingerprint_body = {**body, "project_id": request.match_info["project_id"], "archived": True}
+        payload = {"project_id": fingerprint_body["project_id"], "archived": True}
         scope = f"projects/{payload['project_id']}/archive"
 
         async def produce() -> dict[str, Any]:
@@ -1092,8 +1102,8 @@ class CockpitWriteHandlers:
         await self.ctx.require_auth(request)
         requester = _requester_or_404(request, self.ctx.cfg)
         body = await _optional_json_body(request)
-        fingerprint_body = {"project_id": request.match_info["project_id"], "archived": False, "idempotency_key": body.get("idempotency_key", "")}
-        payload = {key: value for key, value in fingerprint_body.items() if key != "idempotency_key"}
+        fingerprint_body = {**body, "project_id": request.match_info["project_id"], "archived": False}
+        payload = {"project_id": fingerprint_body["project_id"], "archived": False}
         scope = f"projects/{payload['project_id']}/unarchive"
 
         async def produce() -> dict[str, Any]:
@@ -1109,8 +1119,8 @@ class CockpitWriteHandlers:
         await self.ctx.require_auth(request)
         requester = _requester_or_404(request, self.ctx.cfg)
         body = await _optional_json_body(request)
-        fingerprint_body = {"project_id": request.match_info["project_id"], "idempotency_key": body.get("idempotency_key", "")}
-        payload = {key: value for key, value in fingerprint_body.items() if key != "idempotency_key"}
+        fingerprint_body = {**body, "project_id": request.match_info["project_id"]}
+        payload = {"project_id": fingerprint_body["project_id"]}
         scope = f"projects/{payload['project_id']}/delete"
 
         async def produce() -> dict[str, Any]:
@@ -1137,13 +1147,7 @@ class CockpitWriteHandlers:
         if not content:
             raise CockpitError("validation_failed", f"{artifact_type} content is required", status=400, recoverable=True)
         status = str(body.get("status") or ("accepted" if artifact_type == "decision" else "open")).strip()
-        fingerprint_body = {
-            "project_id": project.id,
-            "content": content,
-            "status": status,
-            "observed_at": body.get("observed_at", ""),
-            "idempotency_key": body.get("idempotency_key", ""),
-        }
+        fingerprint_body = {**body, "project_id": project.id}
         scope = f"projects/{project.id}/{artifact_type}s"
 
         async def produce() -> dict[str, Any]:
@@ -1239,12 +1243,8 @@ class CockpitWriteHandlers:
         await self.ctx.require_auth(request)
         requester = _requester_or_404(request, self.ctx.cfg)
         body = await _optional_json_body(request)
-        fingerprint_body = {
-            "project_id": request.match_info["project_id"],
-            "doc_id": request.match_info["doc_id"],
-            "idempotency_key": body.get("idempotency_key", ""),
-        }
-        payload = {key: value for key, value in fingerprint_body.items() if key != "idempotency_key"}
+        fingerprint_body = {**body, "project_id": request.match_info["project_id"], "doc_id": request.match_info["doc_id"]}
+        payload = {"project_id": fingerprint_body["project_id"], "doc_id": fingerprint_body["doc_id"]}
         scope = f"projects/{payload['project_id']}/files/retract"
 
         async def produce() -> dict[str, Any]:
@@ -1275,11 +1275,7 @@ class CockpitWriteHandlers:
         )
         if project is None or requester is None:
             raise CockpitError("not_found", "project not found", status=404)
-        fingerprint_body = {
-            "project_id": project.id,
-            "title": str(body.get("title") or ""),
-            "idempotency_key": body.get("idempotency_key", ""),
-        }
+        fingerprint_body = {**body, "project_id": project.id}
         scope = f"projects/{project.id}/threads/open"
 
         async def produce() -> dict[str, Any]:
@@ -2356,15 +2352,7 @@ def _project_brain_client(ctx: CockpitAppContext) -> BrainProjectClient:
 
 
 def _project_write_response(result: dict[str, Any]) -> web.Response:
-    body = {
-        "ok": True,
-        "api_version": API_VERSION,
-        "schema_version": SCHEMA_VERSION,
-        **result,
-    }
-    if "result" not in result:
-        body["result"] = result
-    return web.json_response(body)
+    return web.json_response(_project_write_body(result))
 
 
 def _project_write_body(result: dict[str, Any]) -> dict[str, Any]:

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import pathlib
 import re
-import contextlib
+from collections import deque
 from typing import Any
 
 from jarvis.ids import new_id, utc_now
@@ -12,6 +13,7 @@ from jarvis.orchestration.redaction import redact
 
 
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+MAX_ACTIVITY_SCAN_LINES = 5000
 
 
 class ProjectActivityLog:
@@ -20,7 +22,6 @@ class ProjectActivityLog:
     def __init__(self, root: str) -> None:
         self.root = pathlib.Path(root).expanduser() / "project-activity"
         self.root.mkdir(parents=True, exist_ok=True)
-        self._lock_path = self.root / ".lock"
 
     def append(
         self,
@@ -39,7 +40,7 @@ class ProjectActivityLog:
             "data": _redacted(data or {}),
             "occurred_at": utc_now(),
         }
-        with self._locked():
+        with self._locked(project_id):
             with self._path(project_id).open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, sort_keys=True) + "\n")
                 handle.flush()
@@ -80,8 +81,11 @@ class ProjectActivityLog:
         path = self._path(project_id)
         if not path.exists():
             return []
+        lines: deque[str] = deque(maxlen=MAX_ACTIVITY_SCAN_LINES)
+        with path.open("r", encoding="utf-8") as handle:
+            lines.extend(handle)
         rows: list[dict[str, Any]] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in lines:
             if not line.strip():
                 continue
             try:
@@ -93,14 +97,20 @@ class ProjectActivityLog:
         return rows
 
     def _path(self, project_id: str) -> pathlib.Path:
+        return self.root / f"{self._safe_project_id(project_id)}.jsonl"
+
+    def _lock_path(self, project_id: str) -> pathlib.Path:
+        return self.root / f"{self._safe_project_id(project_id)}.lock"
+
+    def _safe_project_id(self, project_id: str) -> str:
         if not _PROJECT_ID.fullmatch(project_id):
             raise ValueError(f"invalid project id {project_id!r}")
-        return self.root / f"{project_id}.jsonl"
+        return project_id
 
     @contextlib.contextmanager
-    def _locked(self):  # noqa: ANN202
+    def _locked(self, project_id: str):  # noqa: ANN202
         self.root.mkdir(parents=True, exist_ok=True)
-        with self._lock_path.open("a+", encoding="utf-8") as lock:
+        with self._lock_path(project_id).open("a+", encoding="utf-8") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             try:
                 yield

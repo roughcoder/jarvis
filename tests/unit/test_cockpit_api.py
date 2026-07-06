@@ -2285,6 +2285,7 @@ def test_cockpit_project_files_list_uses_brain_manifest_op(tmp_path, monkeypatch
 
         assert files.status_code == 200
         assert files.json()["files"] == [{"doc_id": "upload-123"}]
+        assert "result" not in files.json()
 
     import asyncio
 
@@ -2776,9 +2777,12 @@ def test_cockpit_project_activity_records_member_writes_and_paginates(tmp_path, 
         first_page = (await client.get(f"{base}/v1/projects/neil-shared/activity", params={"limit": 2})).json()
         second_page = (await client.get(f"{base}/v1/projects/neil-shared/activity", params={"cursor": first_page["next_cursor"], "limit": 10})).json()
         filtered = (await client.get(f"{base}/v1/projects/neil-shared/activity", params={"type": "file.uploaded"})).json()
+        stale = await client.get(f"{base}/v1/projects/neil-shared/activity", params={"cursor": "missing_cursor"})
 
         assert all(response.status_code == 200 for response in [update, finding, decision, forget, correct, upload, retract, thread])
         assert hidden.status_code == 404
+        assert stale.status_code == 400
+        assert stale.json()["error"]["code"] == "stale_cursor"
         assert [item["type"] for item in first_page["activity"]] == ["thread.opened", "file.retracted"]
         assert first_page["next_cursor"]
         assert {item["type"] for item in second_page["activity"]} == {
@@ -2796,7 +2800,6 @@ def test_cockpit_project_activity_records_member_writes_and_paginates(tmp_path, 
         assert "/Users/example/private" not in text
         assert "https://example.test/private" not in text
         assert "<local-path>" in text
-        assert "https://example.test/private" not in text
 
     import asyncio
 
@@ -2871,6 +2874,15 @@ def test_cockpit_project_idempotency_replay_conflict_and_no_key(tmp_path, monkey
         conflict = await client.post(f"{base}/v1/projects", json={"id": "created-one", "name": "Changed", "idempotency_key": "create-1"})
         archive = await client.post(f"{base}/v1/projects/neil-shared/archive", json={"idempotency_key": "archive-1"})
         archive_replay = await client.post(f"{base}/v1/projects/neil-shared/archive", json={"idempotency_key": "archive-1"})
+        archive_conflict = await client.post(f"{base}/v1/projects/neil-shared/archive", json={"idempotency_key": "archive-1", "reason": "different body"})
+        member = await client.post(f"{base}/v1/projects/neil-shared/members", json={"member": "jules", "idempotency_key": "member-1"})
+        registry_path = Path(cfg.registry.path)
+        registry = json.loads(registry_path.read_text())
+        for project in registry["projects"]:
+            if project["id"] == "neil-shared":
+                project["members"].append("riley")
+        registry_path.write_text(json.dumps(registry))
+        member_replay = await client.post(f"{base}/v1/projects/neil-shared/members", json={"member": "jules", "idempotency_key": "member-1"})
         no_key_a = await client.post(f"{base}/v1/projects", json={"id": "no-key", "name": "No Key"})
         no_key_b = await client.post(f"{base}/v1/projects", json={"id": "no-key", "name": "No Key"})
 
@@ -2882,6 +2894,11 @@ def test_cockpit_project_idempotency_replay_conflict_and_no_key(tmp_path, monkey
         assert conflict.json()["error"]["code"] == "idempotency_conflict"
         assert archive.status_code == 200
         assert archive_replay.json()["idempotent"] is True
+        assert archive_conflict.status_code == 409
+        assert archive_conflict.json()["error"]["code"] == "idempotency_conflict"
+        assert member.status_code == 200
+        assert member_replay.status_code == 200
+        assert member_replay.json()["idempotent"] is True
         assert no_key_a.status_code == 200
         assert no_key_b.status_code == 200
 
@@ -2891,6 +2908,9 @@ def test_cockpit_project_idempotency_replay_conflict_and_no_key(tmp_path, monkey
 
     assert [call["op"] for call in brain.calls].count("project.create") == 3
     assert [call["op"] for call in brain.calls].count("project.archive") == 1
+    assert [call["op"] for call in brain.calls].count("project.members.set") == 1
+    activity_file = Path(cfg.orchestration.workspace) / "project-activity" / "created-one.jsonl"
+    assert json.loads(activity_file.read_text().splitlines()[0])["type"] == "project.created"
 
 
 def test_cockpit_file_upload_and_retract_idempotency(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -4493,6 +4513,46 @@ def test_cockpit_work_start_manual_dispatches_worker_session(tmp_path, monkeypat
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get("")))
+
+
+def test_cockpit_work_start_records_linked_project_activity_and_skips_unlinked(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    item = WorkItem(source="manual", id="manual_activity", title="Activity dispatch", repo="roughcoder/jarvis")
+    run = store.create_run("Activity dispatch", work_items=[item])
+    session = WorkerSessionLink(worker_id="macbook-worker", session_id="sess_activity", status="running", provider="codex", engine="codex")
+    store.link_session(run.run_id, session)
+
+    def next_work(_self, _command, *, start: bool = False):  # noqa: ANN001, FBT001, FBT002
+        return StartedWork(
+            item=item,
+            worker=WorkerProfile(worker_id="macbook-worker", display_name="MacBook Pro"),
+            envelope=ExecutionEnvelope(run_id=run.run_id, repo=item.repo, prompt=item.title, worker_id="macbook-worker", session_id=session.session_id),
+            session=session,
+        )
+
+    monkeypatch.setattr("jarvis.orchestration.service.OrchestrationService.next_work", next_work)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        unlinked = await client.post(f"{base}/v1/work/start", json={"source": "manual", "repo": "roughcoder/jarvis", "phrase": "unlinked"})
+        empty = (await client.get(f"{base}/v1/projects/neil-shared/activity", params={"type": "work.dispatched"})).json()
+        linked = await client.post(
+            f"{base}/v1/work/start",
+            json={"source": "manual", "repo": "roughcoder/jarvis", "phrase": "linked", "project_id": "neil-shared"},
+        )
+        activity = (await client.get(f"{base}/v1/projects/neil-shared/activity", params={"type": "work.dispatched"})).json()["activity"]
+
+        assert unlinked.status_code == 200
+        assert linked.status_code == 200
+        assert empty["activity"] == []
+        assert [item["type"] for item in activity] == ["work.dispatched"]
+        assert activity[0]["data"]["run_id"] == run.run_id
+        assert activity[0]["data"]["session_id"] == "sess_activity"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run.run_id)))
 
 
 def test_cockpit_work_start_idempotency_serializes_concurrent_dispatch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
