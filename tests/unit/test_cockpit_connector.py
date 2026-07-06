@@ -122,6 +122,7 @@ def test_connector_opens_honcho_thread_session_before_messages(tmp_path, monkeyp
     assert memory.messages == []
     index = json.loads((tmp_path / "orchestration" / "cockpit-threads.json").read_text())
     assert index["threads"][thread.thread_id]["session_id"] == thread.session_id
+    assert "messages" not in index["threads"][thread.thread_id]
 
 
 def test_connector_adds_turn_author_to_thread_session_before_messages(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -247,3 +248,81 @@ def test_thread_index_append_turn_preserves_mid_turn_archive_fields(tmp_path) ->
     assert updated.archived_by == "neil"
     assert updated.archive_reason == "done"
     assert len(updated.messages) == 2
+    assert index.get("jarvis", turn_snapshot.thread_id).messages == ()
+    assert index.get_with_messages("jarvis", turn_snapshot.thread_id).messages == updated.messages
+
+
+def test_thread_index_retains_full_local_history_for_detail_views(tmp_path) -> None:
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    thread = index.save(
+        CockpitThread(
+            thread_id="thread_history",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_history",
+            title="History",
+            created_at="2026-07-05T08:00:00+00:00",
+            updated_at="2026-07-05T08:00:00+00:00",
+            created_by="neil",
+        )
+    )
+
+    for turn in range(13):
+        thread = index.append_turn(
+            thread,
+            user_peer_id="neil",
+            user_text=f"user {turn}",
+            assistant_peer_id="jarvis",
+            assistant_text=f"assistant {turn}",
+        )
+
+    assert len(thread.messages) == 26
+    assert thread.messages[0]["content"] == "user 0"
+    assert thread.messages[-1]["content"] == "assistant 12"
+    stored = json.loads((tmp_path / "threads.json").read_text())
+    assert "messages" not in stored["threads"][thread.thread_id]
+    assert index.get("jarvis", thread.thread_id).messages == ()
+    assert len(index.get_with_messages("jarvis", thread.thread_id).messages) == 26
+    limited = index.get_with_messages("jarvis", thread.thread_id, limit=2)
+    assert limited is not None
+    assert [message["content"] for message in limited.messages] == ["user 12", "assistant 12"]
+
+
+def test_thread_index_migrates_legacy_embedded_messages_to_transcript_file(tmp_path) -> None:
+    index_path = tmp_path / "threads.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "threads": {
+                    "thread_legacy": {
+                        "thread_id": "thread_legacy",
+                        "project_id": "jarvis",
+                        "session_id": "project:jarvis:orchestrator:thread_legacy",
+                        "title": "Legacy",
+                        "created_at": "2026-07-05T08:00:00+00:00",
+                        "updated_at": "2026-07-05T08:00:00+00:00",
+                        "created_by": "neil",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "peer_id": "neil",
+                                "content": "legacy question",
+                                "observed_at": "2026-07-05T08:01:00+00:00",
+                            }
+                        ],
+                    }
+                },
+            }
+        )
+    )
+    index = CockpitThreadIndex(index_path)
+
+    listed = index.list("jarvis")
+    detail = index.get_with_messages("jarvis", "thread_legacy")
+    compacted = json.loads(index_path.read_text())
+
+    assert [thread.thread_id for thread in listed] == ["thread_legacy"]
+    assert listed[0].messages == ()
+    assert detail is not None
+    assert [message["content"] for message in detail.messages] == ["legacy question"]
+    assert "messages" not in compacted["threads"]["thread_legacy"]

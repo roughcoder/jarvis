@@ -289,6 +289,7 @@ GET /v1/projects/{id}/files
 POST /v1/projects/{id}/files
 DELETE /v1/projects/{id}/files/{doc_id}
 GET /v1/projects/{id}/threads
+GET /v1/projects/{id}/threads/{tid}
 POST /v1/projects/{id}/threads
 POST /v1/projects/{id}/threads/{tid}/turns
 POST /v1/projects/{id}/threads/{tid}/archive
@@ -704,8 +705,8 @@ distinguish a missing project from a project outside the caller's visibility
 set. Archive/unarchive is member-gated thread content work, not owner-only
 project administration.
 
-`GET /v1/projects/{id}/threads` returns Jarvis's local thread index for the
-project. Archived threads are hidden by default; pass
+`GET /v1/projects/{id}/threads` returns Jarvis's local thread index metadata
+for the project. Archived threads are hidden by default; pass
 `?include_archived=true` or `?include_archived=1` to include them:
 
 ```json
@@ -727,6 +728,43 @@ project. Archived threads are hidden by default; pass
       "archive_reason": ""
     }
   ]
+}
+```
+
+`GET /v1/projects/{id}/threads/{tid}` returns one active or archived thread plus
+the locally recorded turn history for rendering resumed conversations:
+
+```json
+{
+  "api_version": "v1",
+  "schema_version": 1,
+  "project_id": "jarvis",
+  "thread": {
+    "thread_id": "thread_...",
+    "project_id": "jarvis",
+    "session_id": "project:jarvis:orchestrator:thread_...",
+    "title": "Planning",
+    "created_at": "2026-07-05T09:00:00+00:00",
+    "updated_at": "2026-07-06T10:00:00+00:00",
+    "created_by": "neil",
+    "archived_at": "",
+    "archived_by": "",
+    "archive_reason": "",
+    "messages": [
+      {
+        "role": "user",
+        "peer_id": "neil",
+        "content": "What should we build next?",
+        "observed_at": "2026-07-06T10:00:00+00:00"
+      },
+      {
+        "role": "assistant",
+        "peer_id": "jarvis",
+        "content": "Jarvis reply text.",
+        "observed_at": "2026-07-06T10:00:00+00:00"
+      }
+    ]
+  }
 }
 ```
 
