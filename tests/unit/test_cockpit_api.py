@@ -2116,6 +2116,7 @@ def test_cockpit_thread_archive_hides_and_unarchive_restores_listing(tmp_path, m
         )
         default = await client.get(f"{base}/v1/projects/neil-shared/threads")
         included = await client.get(f"{base}/v1/projects/neil-shared/threads?include_archived=true")
+        invalid_include = await client.get(f"{base}/v1/projects/neil-shared/threads?include_archived=junk")
         unarchived = await client.post(
             f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}/unarchive",
             json={"idempotency_key": "thread_unarchive_1"},
@@ -2132,6 +2133,8 @@ def test_cockpit_thread_archive_hides_and_unarchive_restores_listing(tmp_path, m
         assert replay.json()["idempotent"] is True
         assert default.json()["threads"] == []
         assert [item["thread_id"] for item in included.json()["threads"]] == [thread.thread_id]
+        assert invalid_include.status_code == 400
+        assert invalid_include.json()["error"]["code"] == "validation_failed"
         assert unarchived.status_code == 200
         assert unarchived.json()["thread"]["archived_at"] == ""
         assert unarchived.json()["thread"]["archived_by"] == ""

@@ -219,9 +219,9 @@ def test_thread_index_archive_round_trip_and_filtering(tmp_path) -> None:
     assert {thread.thread_id for thread in index.list("jarvis")} == {active.thread_id, archived.thread_id}
 
 
-def test_thread_index_append_turn_preserves_archive_fields(tmp_path) -> None:
+def test_thread_index_append_turn_preserves_mid_turn_archive_fields(tmp_path) -> None:
     index = CockpitThreadIndex(tmp_path / "threads.json")
-    thread = index.save(
+    turn_snapshot = index.save(
         CockpitThread(
             thread_id="thread_archived",
             project_id="jarvis",
@@ -230,21 +230,20 @@ def test_thread_index_append_turn_preserves_archive_fields(tmp_path) -> None:
             created_at="2026-07-05T08:00:00+00:00",
             updated_at="2026-07-05T08:00:00+00:00",
             created_by="neil",
-            archived_at="2026-07-05T09:00:00+00:00",
-            archived_by="neil",
-            archive_reason="done",
         )
     )
+    archived = index.set_archived("jarvis", turn_snapshot.thread_id, archived=True, by="neil", reason="done")
+    assert archived is not None
 
     updated = index.append_turn(
-        thread,
+        turn_snapshot,
         user_peer_id="neil",
         user_text="one more note",
         assistant_peer_id="jarvis",
         assistant_text="noted",
     )
 
-    assert updated.archived_at == "2026-07-05T09:00:00+00:00"
+    assert updated.archived_at == archived.archived_at
     assert updated.archived_by == "neil"
     assert updated.archive_reason == "done"
     assert len(updated.messages) == 2

@@ -9,6 +9,7 @@ from typing import Any
 
 from jarvis.brain.capabilities import (
     RequestContext,
+    can_edit_project,
     can_query_memory_peer,
     can_write_memory_peer,
     context_for_resolution,
@@ -336,6 +337,8 @@ class JarvisMCPService:
         project = await asyncio.to_thread(self._visible_project, ctx, project_id)
         if project is None:
             raise MCPAccessError("project not found or not visible")
+        if not can_edit_project(ctx, project).allowed:
+            raise MCPAccessError("project not found or not editable")
         thread = await asyncio.to_thread(
             self.cockpit.archive_thread,
             project,
@@ -357,6 +360,8 @@ class JarvisMCPService:
         project = await asyncio.to_thread(self._visible_project, ctx, project_id)
         if project is None:
             raise MCPAccessError("project not found or not visible")
+        if not can_edit_project(ctx, project).allowed:
+            raise MCPAccessError("project not found or not editable")
         thread = await asyncio.to_thread(self.cockpit.unarchive_thread, project, thread_id)
         if thread is None:
             raise MCPAccessError("thread not found")

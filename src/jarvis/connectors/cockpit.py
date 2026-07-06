@@ -12,7 +12,7 @@ import asyncio
 import json
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -145,18 +145,11 @@ class CockpitThreadIndex:
         if archived and thread.archived_at:
             return thread
         archive_reason = reason.strip()[:500]
-        updated = CockpitThread(
-            thread_id=thread.thread_id,
-            project_id=thread.project_id,
-            session_id=thread.session_id,
-            title=thread.title,
-            created_at=thread.created_at,
-            updated_at=thread.updated_at,
-            created_by=thread.created_by,
+        updated = replace(
+            thread,
             archived_at=utc_now() if archived else "",
             archived_by=by if archived else "",
             archive_reason=archive_reason if archived else "",
-            messages=thread.messages,
         )
         return self.save(updated)
 
@@ -185,18 +178,16 @@ class CockpitThreadIndex:
                 "observed_at": observed_at,
             },
         ][-THREAD_HISTORY_LIMIT:]
+        stored = self.get(thread.project_id, thread.thread_id)
+        archive_source = stored or thread
         return self.save(
-            CockpitThread(
-                thread_id=thread.thread_id,
-                project_id=thread.project_id,
-                session_id=thread.session_id,
+            replace(
+                thread,
                 title=thread.title or _thread_title(user_text),
-                created_at=thread.created_at,
                 updated_at=observed_at,
-                created_by=thread.created_by,
-                archived_at=thread.archived_at,
-                archived_by=thread.archived_by,
-                archive_reason=thread.archive_reason,
+                archived_at=archive_source.archived_at,
+                archived_by=archive_source.archived_by,
+                archive_reason=archive_source.archive_reason,
                 messages=tuple(messages),
             )
         )
