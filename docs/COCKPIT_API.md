@@ -90,6 +90,156 @@ GET /v1/cockpit/snapshot?sync=none|fast|probe
 GET /v1/cockpit/events?after=<cursor>
 ```
 
+### MCP
+
+```text
+GET    /v1/mcp/status
+GET    /v1/mcp/tools?server=<name>
+GET    /v1/mcp/tokens?include_revoked=true
+POST   /v1/mcp/tokens
+DELETE /v1/mcp/tokens/{token_id}
+```
+
+MCP status is a cockpit projection of the brain's last cold-path MCP bridge
+connect. The API process does **not** construct an `MCPBridge`, probe MCP
+servers, spawn stdio subprocesses, or pay connect timeouts. The brain publishes a
+best-effort sidecar snapshot at
+`<ORCHESTRATION_WORKSPACE>/mcp-status.json` after bridge startup/refresh; if the
+file is absent or unreadable, the API falls back to config-only server rows with
+`connected: null`, `connected_at: null`, `source: "config"`, and `stale: true`.
+Snapshot responses are fresh while `generated_at` is at most one hour old;
+snapshots older than one hour, missing timestamps, unparsable timestamps, and
+config fallback responses report `stale: true`.
+
+`GET /v1/mcp/status` response:
+
+```json
+{
+  "api_version": "v1",
+  "schema_version": 1,
+  "enabled": true,
+  "source": "snapshot",
+  "generated_at": "2026-07-06T10:00:00Z",
+  "stale": false,
+  "servers": [
+    {
+      "name": "linear",
+      "transport": "http",
+      "connected": true,
+      "tool_count": 3,
+      "error": "",
+      "connected_at": "2026-07-06T09:59:59Z",
+      "required_capability": "mcp.linear"
+    }
+  ],
+  "serve": {
+    "configured": true,
+    "host": "localhost",
+    "port": 8795,
+    "tokens": {"active": 1, "revoked": 0},
+    "codex_wired": false,
+    "codex_wired_reason": "worker Codex sessions do not currently inject the Jarvis MCP serve endpoint"
+  }
+}
+```
+
+`serve.configured` means the MCP serve token store exists. `serve.tokens` is a
+count only. `codex_wired` is reported, not enforced: today
+the worker Codex provider starts `codex app-server --stdio` and does not inject
+the Jarvis MCP serve endpoint into Codex session config, so it reports `false`.
+
+`GET /v1/mcp/tools` returns the bridged tool list from the snapshot and uses the
+same one-hour staleness rule. With no snapshot it returns `tools: []`,
+`source: "config"`, and `stale: true`. `?server=<name>` filters the returned
+list exactly by server name.
+
+```json
+{
+  "api_version": "v1",
+  "schema_version": 1,
+  "source": "snapshot",
+  "generated_at": "2026-07-06T10:00:00Z",
+  "stale": false,
+  "tools": [
+    {
+      "name": "linear_search",
+      "server": "linear",
+      "description": "Search issues",
+      "required_capability": "mcp.linear"
+    }
+  ]
+}
+```
+
+Redaction guarantee: MCP cockpit responses expose only server `name`,
+`transport`, `required_capability`, tool names/descriptions, MCP serve host/port,
+and token counts/records. They never expose MCP server `command`, `args`, `env`,
+`url`, `headers`, OAuth caches, token-store paths, plaintext tokens except at
+creation time, token hashes, local filesystem paths, or private provider values.
+Public error strings pass through Jarvis redaction.
+
+MCP token lifecycle routes manage `jarvis mcp-serve` bearer tokens. All three
+token routes require the static Jarvis capability `mcp.tokens.manage` because
+they mint or expose credential metadata.
+
+`POST /v1/mcp/tokens` body:
+
+```json
+{
+  "principal": "neil",
+  "name": "Codex laptop",
+  "idempotency_key": "operator-generated-key"
+}
+```
+
+The principal must exist under the configured `users/` directory. The response
+shows the plaintext bearer token once:
+
+```json
+{
+  "ok": true,
+  "api_version": "v1",
+  "schema_version": 1,
+  "token": "jv_mcp_...",
+  "record": {
+    "token_id": "mcptok_...",
+    "principal": "neil",
+    "name": "Codex laptop",
+    "prefix": "jv_mcp_abc123...",
+    "created_at": "2026-07-06T10:00:00Z",
+    "revoked_at": ""
+  }
+}
+```
+
+The plaintext token is never retrievable again and is not persisted in
+idempotency storage. If a successful idempotent request is replayed, the replayed
+response contains the same public record with `token: ""` and
+`idempotent: true`.
+
+`GET /v1/mcp/tokens?include_revoked=true` returns only public records:
+
+```json
+{
+  "ok": true,
+  "api_version": "v1",
+  "schema_version": 1,
+  "tokens": [
+    {
+      "token_id": "mcptok_...",
+      "principal": "neil",
+      "name": "Codex laptop",
+      "prefix": "jv_mcp_abc123...",
+      "created_at": "2026-07-06T10:00:00Z",
+      "revoked_at": ""
+    }
+  ]
+}
+```
+
+`DELETE /v1/mcp/tokens/{token_id}` revokes by id or unique prefix. Unknown ids
+return `404 not_found`; ambiguous prefixes return `409 conflict`.
+
 ### Workers
 
 ```text
@@ -1441,7 +1591,20 @@ or breaking status, and migration notes.
   from the same effective member/owner gates the brain enforces.
 - Route discovery lists HTTP method and path templates only; it does not expose
   concrete project ids, worker ids, session refs, URLs, local paths, or tokens.
->>>>>>> 129f3a8 (feat(cockpit): expose effective capability discovery)
+
+### 2026-07-06 - v1 MCP cockpit surface (compatible)
+
+- Added `GET /v1/mcp/status` backed by the brain's cold-path MCP status sidecar,
+  with config-only fallback when no snapshot exists. The API process never
+  live-probes MCP servers. Snapshots older than one hour report `stale: true`.
+- Added `GET /v1/mcp/tools` with optional `?server=` filtering over the bridged
+  tool list from the latest snapshot.
+- Added MCP serve token management routes:
+  `POST /v1/mcp/tokens`, `GET /v1/mcp/tokens`, and
+  `DELETE /v1/mcp/tokens/{token_id}`, all gated by `mcp.tokens.manage`.
+- Documented MCP response redaction guarantees, one-time plaintext token
+  visibility, token-count-only status reporting, and the reported-only
+  `codex_wired` field.
 
 ### 2026-07-04 - v1 PR review hardening (compatible)
 

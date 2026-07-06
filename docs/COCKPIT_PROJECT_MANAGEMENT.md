@@ -110,6 +110,11 @@ booleans false; projects outside the caller's visibility set still return 404.
 | Archive / unarchive project | Owner. |
 | Delete project | Owner. |
 
+Operational MCP credential management is outside project membership. Cockpit
+routes that issue, list, or revoke `jarvis mcp-serve` tokens require the static
+capability `mcp.tokens.manage`; this includes token listing because records
+expose principal names and credential labels.
+
 External MCP agents run under their principal's capabilities, so an agent acting
 as a member can edit content and repos but cannot change visibility, manage
 members, or delete — for free, via the shared matrix.

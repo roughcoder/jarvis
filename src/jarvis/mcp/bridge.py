@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from jarvis.config import MCPConfig, MCPServerSpec
+from jarvis.ids import utc_now
+from jarvis.orchestration.redaction import public_error_message
 from jarvis.mcp.client import MCPClient, MCPToolSpec
 
 _NAME_OK = re.compile(r"[^a-zA-Z0-9_-]")
@@ -54,11 +56,43 @@ class MCPBridge:
         self._client_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._routes: dict[str, tuple[str, str]] = {}  # offered name -> (server, tool)
         self._spec: dict[str, MCPServerSpec] = {}  # server name -> spec
+        self._errors: dict[str, str] = {}
+        self._connected_at: dict[str, str] = {}
         self.tools: list[BridgedTool] = []
 
     @property
     def connected(self) -> list[str]:
         return sorted({server for _, server in self._clients})
+
+    def status(self) -> dict[str, Any]:
+        """Return a public-safe bridge snapshot for the cockpit sidecar."""
+        connected = set(self.connected)
+        tool_counts: dict[str, int] = {}
+        for tool in self.tools:
+            tool_counts[tool.server] = tool_counts.get(tool.server, 0) + 1
+        return {
+            "servers": [
+                {
+                    "name": spec.name,
+                    "transport": spec.transport,
+                    "connected": spec.name in connected,
+                    "tool_count": tool_counts.get(spec.name, 0),
+                    "error": public_error_message(self._errors.get(spec.name, "")),
+                    "connected_at": self._connected_at.get(spec.name, ""),
+                    "required_capability": spec.required_capability,
+                }
+                for spec in self._cfg.servers
+            ],
+            "tools": [
+                {
+                    "offered_name": tool.offered_name,
+                    "server": tool.server,
+                    "description": public_error_message(tool.description),
+                    "required_capability": tool.required_capability,
+                }
+                for tool in self.tools
+            ],
+        }
 
     async def start(self) -> list[BridgedTool]:
         """Connect every configured server (best-effort) and return the bridged
@@ -115,11 +149,15 @@ class MCPBridge:
         except Exception as exc:  # noqa: BLE001 - one bad server/user must not be fatal
             from jarvis.mcp.auth import needs_oauth
 
+            cause = _root_cause(exc)
             hint = " — run `jarvis mcp login --user " + principal + "`" if needs_oauth(spec) else ""
-            print(f"  [mcp] {spec.name} ({principal}): connect failed ({_root_cause(exc)}){hint}")
+            print(f"  [mcp] {spec.name} ({principal}): connect failed ({cause}){hint}")
+            self._errors[spec.name] = cause
             await _safe_close(client)
             return
         self._clients[(principal, spec.name)] = client
+        self._errors.pop(spec.name, None)
+        self._connected_at[spec.name] = utc_now()
         if register:
             for t in self._select(spec, discovered):
                 self._add(spec, t)
@@ -200,6 +238,8 @@ class MCPBridge:
         self._client_locks = {}
         self._routes = {}
         self._spec = {}
+        self._errors = {}
+        self._connected_at = {}
         self.tools = []
 
 
