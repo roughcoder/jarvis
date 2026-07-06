@@ -65,7 +65,7 @@ class ClaudeProviderAdapter:
             "attached": True,
             "lifecycle": "one long-lived ClaudeSDKClient per worker session; turns are sent over streaming input",
             "backpressure": "provider thread owns the SDK asyncio loop and serializes turn ingestion",
-            "timeouts": "turn timeout maps to turn.failed; pending approvals/questions deny on timeout",
+            "timeouts": "turn timeout maps to turn.failed; approvals/questions deny after approval_timeout_s (0 = job timeout) with the turn clock paused while pending",
             "crash_recovery": "session/event history is durable; restarted workers resume from stored Claude session id",
             "event_ordering": "Claude SDK messages project to append-only SessionEvent order",
             "include_partial_messages": False,
@@ -222,6 +222,8 @@ class _ClaudeSessionRuntime:
         self._close_requested = threading.Event()
         self._current_turn: ProviderTurn | None = None
         self._turn_deadline = 0.0
+        self._turn_timeout: asyncio.Timeout | None = None
+        self._process_started_recorded = False
         self._thread = threading.Thread(
             target=self._thread_main,
             name=f"jarvis-claude-sdk-{self.session_id}",
@@ -301,7 +303,6 @@ class _ClaudeSessionRuntime:
         self._client = client
         try:
             await client.connect()
-            self._record_provider_process_started()
             while not self._close_requested.is_set():
                 item = await asyncio.to_thread(self._queue.get)
                 if isinstance(item, _StopRuntime):
@@ -325,13 +326,17 @@ class _ClaudeSessionRuntime:
         self._current_turn = turn
         timeout_s = max(1.0, float(self.worker_cfg.job_timeout_s))
         self._turn_deadline = time.monotonic() + timeout_s
+        if not self._process_started_recorded:
+            self._process_started_recorded = True
+            self._record_provider_process_started()
         try:
             if _session_cancelled(self.sessions, self.session_id):
                 return
             await client.set_permission_mode(self.authority.claude_permission_mode)
             await client.query(turn.prompt)
             terminal_seen = False
-            async with asyncio.timeout(timeout_s):
+            async with asyncio.timeout(timeout_s) as turn_timeout:
+                self._turn_timeout = turn_timeout
                 async for message in client.receive_response():
                     if _project_sdk_message(
                         message,
@@ -388,6 +393,7 @@ class _ClaudeSessionRuntime:
         finally:
             self._current_turn = None
             self._turn_deadline = 0.0
+            self._turn_timeout = None
 
     async def _can_use_tool(self, tool_name: str, tool_input: dict[str, Any], context: Any) -> Any:
         sdk = _load_sdk()
@@ -462,8 +468,14 @@ class _ClaudeSessionRuntime:
             self._pending[request_id] = pending
         self.sessions.append_event(self.session_id, event_type, data)
         self.sessions.update_status(self.session_id, waiting_status)
-        wait_s = max(0.1, self._turn_deadline - time.monotonic()) if self._turn_deadline else max(1.0, float(self.worker_cfg.job_timeout_s))
+        # A human answering is not turn compute: the wait gets its own budget
+        # (approval_timeout_s; 0 = inherit job_timeout_s) and the turn clock
+        # pauses while the request is pending.
+        wait_s = max(0.1, float(self.worker_cfg.approval_timeout_s) or float(self.worker_cfg.job_timeout_s))
+        remaining_s = max(0.1, self._turn_deadline - time.monotonic()) if self._turn_deadline else wait_s
+        self._pause_turn_clock(wait_s)
         resolved = await asyncio.to_thread(pending.done.wait, wait_s)
+        self._resume_turn_clock(remaining_s)
         if resolved:
             return dict(pending.response)
         with self._pending_lock:
@@ -478,6 +490,23 @@ class _ClaudeSessionRuntime:
         self.sessions.append_event(self.session_id, event_type, timeout_request)
         _restore_running_if_waiting(self.sessions, self.session_id, waiting_status, self.has_pending_requests)
         return None
+
+    def _pause_turn_clock(self, wait_s: float) -> None:
+        turn_timeout = self._turn_timeout
+        loop = self._loop
+        if turn_timeout is None or loop is None:
+            return
+        with contextlib.suppress(Exception):
+            turn_timeout.reschedule(loop.time() + wait_s + 5.0)
+
+    def _resume_turn_clock(self, remaining_s: float) -> None:
+        self._turn_deadline = time.monotonic() + remaining_s
+        turn_timeout = self._turn_timeout
+        loop = self._loop
+        if turn_timeout is None or loop is None:
+            return
+        with contextlib.suppress(Exception):
+            turn_timeout.reschedule(loop.time() + remaining_s)
 
     def _timeout_pending_requests(self, turn: ProviderTurn) -> None:
         with self._pending_lock:
@@ -562,6 +591,7 @@ class _ClaudeSessionRuntime:
         turn = self._current_turn
         data = {
             "turn_id": turn.turn_id if turn else "",
+            "idempotency_key": turn.idempotency_key if turn else "",
             "provider": "claude",
             "pid": "",
             "cwd": self.cwd,

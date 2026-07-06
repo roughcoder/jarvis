@@ -2578,6 +2578,7 @@ def test_daemon_claude_provider_projects_sdk_events_and_reuses_stream(tmp_path, 
     assert "tool.result" in event_types
     assert event_types.count("turn.completed") == 2
     assert [event["data"]["resume"] for event in process_events] == [False]
+    assert process_events[0]["data"]["turn_id"] == first["turn_id"]
     assert fetched["status"] == "completed"
     assert fetched["metadata"]["provider_session_id"]
     assert fetched["metadata"]["claude_session_started"] == "true"
@@ -2758,6 +2759,69 @@ def test_claude_approval_timeout_denies_and_fails_turn(tmp_path, monkeypatch) ->
     resolved = [event for event in sessions.events(session.session_id) if event.type == "approval.resolved"]
     assert resolved[-1].data["decision"] == "denied"
     assert "timed out" in resolved[-1].data["message"]
+
+
+def test_claude_approval_wait_pauses_turn_clock(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    native_id = "55555555-5555-4555-8555-555555555555"
+    _install_fake_claude_sdk(
+        monkeypatch,
+        [
+            [
+                [
+                    _FakePermissionAsk("Bash", {"command": "pytest"}, request_id="approval_slow"),
+                    _FakeResultMessage(session_id=native_id),
+                ]
+            ]
+        ],
+    )
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "claude",
+            "engine": "claude",
+            "cwd": _owned_worker_cwd(tmp_path, "claude-approval-slow"),
+            "metadata": _authority_metadata("claude", extra_actions=[WORKER_SESSION_APPROVE]),
+        }
+    )
+    adapter = claude.ClaudeProviderAdapter()
+
+    try:
+        adapter.start_turn(
+            session=session,
+            turn=ProviderTurn(turn_id="turn_slow_approval", prompt="run tests"),
+            sessions=sessions,
+            # The human answer (below) lands after the 1s job timeout; the paused
+            # turn clock is what lets the turn still complete.
+            worker_cfg=WorkerConfig(
+                _env_file=None,
+                workspace=str(tmp_path / "worker"),
+                claude_bin="fake-claude",
+                job_timeout_s=1,
+                approval_timeout_s=30,
+            ),
+        )
+        for _ in range(100):
+            if sessions.pending_requests(session.session_id):
+                break
+            time.sleep(0.02)
+        assert sessions.pending_requests(session.session_id)
+        time.sleep(1.3)
+        adapter.resolve_approval(
+            session=sessions.get(session.session_id),  # type: ignore[arg-type]
+            request={"request_id": "approval_slow", "decision": "approved"},
+            sessions=sessions,
+        )
+        for _ in range(100):
+            if any(item.type == "turn.completed" for item in sessions.events(session.session_id)):
+                break
+            time.sleep(0.02)
+    finally:
+        _stop_fake_claude_runtimes()
+
+    event_types = [event.type for event in sessions.events(session.session_id)]
+    assert "turn.completed" in event_types
+    assert "turn.failed" not in event_types
+    assert isinstance(_FakeClaudeClient.instances[0].permission_results[0], _FakePermissionResultAllow)
 
 
 def test_claude_ask_user_question_uses_input_endpoint(tmp_path, monkeypatch) -> None:  # noqa: ANN001

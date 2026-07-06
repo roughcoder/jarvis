@@ -536,6 +536,10 @@ class WorkerConfig(_Base):
     shell_secrets: str = ""
     shell_timeout_s: float = 30.0    # sync shell/applescript max runtime
     job_timeout_s: float = 1800.0    # background code job max runtime (30 min)
+    # How long a Claude session approval/question may wait for a human before
+    # auto-deny; the turn clock pauses while the request is pending, so a slow
+    # answer doesn't burn the job timeout. 0 = inherit job_timeout_s.
+    approval_timeout_s: float = 0.0
     request_timeout_s: float = 40.0  # brain->worker HTTP timeout (> shell_timeout)
     diagnostics_ttl_s: float = 60.0  # cache worker readiness checks used by /health
 
