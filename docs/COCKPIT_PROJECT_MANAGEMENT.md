@@ -19,6 +19,7 @@ Read + converse, membership-filtered by the authenticated caller:
 | `GET /v1/projects` | Registry list, membership-filtered. |
 | `GET /v1/projects/{id}` | Full entry: repos, links, members, status, `files_root`. 404 for non-members. |
 | `GET /v1/projects/{id}/memory` | Cached representation + recent findings/decisions. |
+| `GET /v1/projects/{id}/activity` | Poll-based per-project activity feed for writes, uploads/retractions, threads, and linked work dispatches. |
 | `GET`/`POST /v1/projects/{id}/threads` | List / open orchestrator threads; `GET` accepts `include_archived`. |
 | `POST /v1/projects/{id}/threads/{tid}/turns` | Send a turn (reply streams over SSE). |
 | `POST /v1/projects/{id}/threads/{tid}/archive` / `/unarchive` | Hide or restore a project thread. |
@@ -132,6 +133,7 @@ DELETE /v1/projects/{id}/members/{who}  owner: remove a member
 POST   /v1/projects/{id}/archive        owner: status -> archived (reversible)
 POST   /v1/projects/{id}/unarchive      owner: status -> active
 DELETE /v1/projects/{id}                owner: delete the entry
+GET    /v1/projects/{id}/activity       member: newest-first activity feed
 ```
 
 - `PATCH /v1/projects/{id}` accepts only member-editable fields (name, aliases,
