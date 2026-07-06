@@ -631,7 +631,7 @@ class CockpitReadHandlers:
                     "can_update": edit.allowed,
                     "can_manage_repos": edit.allowed,
                     "can_create_thread": edit.allowed,
-                    "can_archive_thread": False,
+                    "can_archive_thread": edit.allowed,
                     "can_archive": admin.allowed,
                     "can_delete": admin.allowed,
                     "can_manage_members": admin.allowed,

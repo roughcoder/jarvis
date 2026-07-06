@@ -95,7 +95,7 @@ The Cockpit can query the effective projection for the current caller with
 brain in `project_management.py`; it is a read-only projection, not a separate
 policy source. A visible non-member is reported as `role: "viewer"` with all
 booleans false; projects outside the caller's visibility set still return 404.
-`can_archive_thread` remains false until a project-thread archive route exists.
+`can_archive_thread` mirrors the member gate on the thread archive routes.
 
 | Operation | Who |
 | --- | --- |

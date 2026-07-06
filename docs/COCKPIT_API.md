@@ -603,7 +603,7 @@ Example:
     "can_update": true,
     "can_manage_repos": true,
     "can_create_thread": true,
-    "can_archive_thread": false,
+    "can_archive_thread": true,
     "can_archive": true,
     "can_delete": true,
     "can_manage_members": true,
@@ -612,8 +612,9 @@ Example:
 }
 ```
 
-`can_archive_thread` is reserved for a future thread archive route and remains
-`false` in v1 so cockpits do not render an unsupported control.
+`can_archive_thread` mirrors the member gate on
+`POST /v1/projects/{id}/threads/{tid}/archive`: thread archive/unarchive is
+member-gated content work, so it tracks `can_update`.
 
 ## Sync Modes
 

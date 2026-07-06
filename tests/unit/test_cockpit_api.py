@@ -1837,7 +1837,7 @@ def test_cockpit_project_permissions_project_effective_role(tmp_path, monkeypatc
                 "can_update": True,
                 "can_manage_repos": True,
                 "can_create_thread": True,
-                "can_archive_thread": False,
+                "can_archive_thread": True,
                 "can_archive": False,
                 "can_delete": False,
                 "can_manage_members": False,
@@ -1866,7 +1866,6 @@ def test_cockpit_project_permissions_project_effective_role(tmp_path, monkeypatc
         assert archived.status_code == 200
         assert archived.json()["role"] == "owner"
         archived_permissions = archived.json()["permissions"]
-        assert archived_permissions.pop("can_archive_thread") is False
         assert all(archived_permissions.values())
         assert "localhost" not in text
         assert str(tmp_path) not in text
@@ -1891,7 +1890,6 @@ def test_cockpit_project_permissions_owner_gets_admin_actions(tmp_path, monkeypa
         assert body["role"] == "owner"
         assert body["project_id"] == "neil-shared"
         permissions = body["permissions"]
-        assert permissions.pop("can_archive_thread") is False
         assert all(permissions.values())
 
     import asyncio
