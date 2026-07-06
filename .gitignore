@@ -3,6 +3,7 @@
 jarvis-workspace/.DS_Store
 jarvis-workspace/.mcp-auth/
 jarvis-workspace/.accounts/
+jarvis-workspace/memory/
 jarvis-workspace/orchestration/
 jarvis-workspace/worker/
 jarvis-workspace/worker/jobs/
