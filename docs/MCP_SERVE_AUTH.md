@@ -133,9 +133,9 @@ mode (the client can't tell which lane rejected it, and shouldn't).
 
 ## Token validation
 
-Reuse the existing `OAuthTokenValidator` (`src/jarvis/orchestration/oauth.py`)
-rather than writing a second validator. Checks, all mandatory in the OAuth
-lane:
+Reuse the existing `OAuthTokenValidator` (`src/jarvis/oauth.py`; the
+orchestration API imports it from there) rather than writing a second
+validator. Checks, all mandatory in the OAuth lane:
 
 1. **Signature** against the cached JWKS (`MCP_SERVE_OAUTH_JWKS_URL`), same
    TTL/min-refresh behaviour as the orchestration validator.
@@ -225,6 +225,8 @@ that extra includes `PyJWT[crypto]` for local JWKS validation.
 ```json
 "serve": {
   "configured": true,
+  "host": "jarvis.local",
+  "port": 8795,
   "auth_mode": "hybrid",
   "oauth": {
     "configured": true,
@@ -232,7 +234,9 @@ that extra includes `PyJWT[crypto]` for local JWKS validation.
     "resource": "http://jarvis.local:8795",
     "metadata_url": "http://jarvis.local:8795/.well-known/oauth-protected-resource"
   },
-  ...existing fields...
+  "tokens": {"active": 1, "revoked": 0},
+  "codex_wired": false,
+  "codex_wired_reason": "worker Codex sessions do not currently inject the Jarvis MCP serve endpoint"
 }
 ```
 
@@ -297,6 +301,7 @@ served from a stub.
 Backward compatible: with no new env set, `hybrid` mode behaves exactly like
 today's static-token auth. Commit trailers must carry `Env:` lines for every
 new variable and a `Release-note:` describing the OAuth lane. The follow-up
-(separate spec, delivered by the cockpit team) enables Better Auth's OAuth
-provider/MCP plugin and registers the Jarvis server in cockpit-launched agent
-sessions.
+(delivered by the cockpit team) enables Better Auth's OAuth provider/MCP plugin
+and registers the Jarvis server in cockpit-launched agent sessions — the
+as-built integration contract for that handover is
+`docs/MCP_SERVE_COCKPIT_INTEGRATION.md`.

@@ -133,6 +133,9 @@ keeps the original single-process behaviour. The think/speak core is shared
   routing, idle-aware timing.
 - `docs/PHASE3.md` — Phase 3 status/spec; `docs/PHASE2.md` — relocation; `docs/PI.md` —
   room device; `docs/TESTING.md` — how to test each surface.
+- `docs/MCP_SERVE_AUTH.md` — `jarvis mcp-serve` as an OAuth 2.1 protected resource
+  (discovery, audience-bound JWT validation, principal mapping);
+  `docs/MCP_SERVE_COCKPIT_INTEGRATION.md` — the cockpit handover contract for that.
 
 ## Conventions
 
