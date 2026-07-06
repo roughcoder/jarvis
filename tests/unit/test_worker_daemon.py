@@ -12,6 +12,7 @@ import asyncio
 import pathlib
 import subprocess
 import threading
+import time
 
 import httpx
 import pytest
@@ -45,7 +46,8 @@ from jarvis.worker.providers.codex import (  # noqa: E402
     _track_pending_request,
     _terminate_provider_process as codex_terminate_provider_process,
 )
-from jarvis.worker.providers.claude import _claude_session_id, _run_claude_turn  # noqa: E402
+from jarvis.worker.providers import claude  # noqa: E402
+from jarvis.worker.providers.claude import _claude_session_id  # noqa: E402
 from jarvis.worker.providers.base import ProviderTurn  # noqa: E402
 from jarvis.worker.sessions import WorkerSession  # noqa: E402
 from jarvis.worker.sessions import SessionManager  # noqa: E402
@@ -120,11 +122,184 @@ def _session_with_authority(
     )
 
 
+class _FakeClaudeOptions:
+    def __init__(self, **kwargs):  # noqa: ANN003
+        self.kwargs = dict(kwargs)
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+class _FakePermissionResultAllow:
+    def __init__(self, updated_input=None, updated_permissions=None):  # noqa: ANN001
+        self.behavior = "allow"
+        self.updated_input = updated_input
+        self.updated_permissions = updated_permissions
+
+
+class _FakePermissionResultDeny:
+    def __init__(self, message: str = "", interrupt: bool = False) -> None:
+        self.behavior = "deny"
+        self.message = message
+        self.interrupt = interrupt
+
+
+class _FakeTextBlock:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _FakeToolUseBlock:
+    def __init__(self, id: str, name: str, input: dict):  # noqa: A002
+        self.id = id
+        self.name = name
+        self.input = input
+
+
+class _FakeToolResultBlock:
+    def __init__(self, tool_use_id: str, content=None, is_error: bool | None = None):  # noqa: ANN001
+        self.tool_use_id = tool_use_id
+        self.content = content
+        self.is_error = is_error
+
+
+class _FakeAssistantMessage:
+    def __init__(self, content: list, model: str = "claude-test", session_id: str = "11111111-1111-4111-8111-111111111111") -> None:
+        self.content = content
+        self.model = model
+        self.session_id = session_id
+
+
+class _FakeUserMessage:
+    def __init__(self, content: list) -> None:
+        self.content = content
+
+
+class _FakeSystemMessage:
+    def __init__(self, subtype: str, data: dict) -> None:
+        self.subtype = subtype
+        self.data = data
+
+
+class _FakeResultMessage:
+    def __init__(self, *, subtype: str = "success", is_error: bool = False, session_id: str = "11111111-1111-4111-8111-111111111111") -> None:
+        self.subtype = subtype
+        self.is_error = is_error
+        self.session_id = session_id
+
+
+class _FakePermissionAsk:
+    def __init__(self, tool_name: str, tool_input: dict, request_id: str = "request_1") -> None:
+        self.tool_name = tool_name
+        self.tool_input = tool_input
+        self.request_id = request_id
+
+
+class _FakeClaudeContext:
+    def __init__(self, tool_use_id: str) -> None:
+        self.tool_use_id = tool_use_id
+        self.title = "Claude wants to use a tool"
+        self.display_name = "Tool"
+        self.description = "Fake permission request"
+        self.decision_reason = "test"
+        self.blocked_path = None
+
+
+class _FakeClaudeClient:
+    response_batches: list[list[list[object]]] = []
+    instances: list["_FakeClaudeClient"] = []
+
+    def __init__(self, options):  # noqa: ANN001
+        self.options = options
+        self.connected = False
+        self.disconnected = False
+        self.interrupted = False
+        self.permission_modes: list[str] = []
+        self.queries: list[str] = []
+        self.permission_results: list[object] = []
+        self._batches = _FakeClaudeClient.response_batches.pop(0)
+        self._active: list[object] = []
+        _FakeClaudeClient.instances.append(self)
+
+    async def connect(self, prompt=None) -> None:  # noqa: ANN001
+        self.connected = True
+        if prompt is not None:
+            async for _ in prompt:
+                break
+
+    async def disconnect(self) -> None:
+        self.disconnected = True
+
+    async def set_permission_mode(self, mode: str) -> None:
+        self.permission_modes.append(mode)
+
+    async def query(self, prompt: str) -> None:
+        self.queries.append(prompt)
+        self._active = self._batches[len(self.queries) - 1]
+
+    async def interrupt(self) -> None:
+        self.interrupted = True
+
+    async def receive_response(self):
+        for item in self._active:
+            if isinstance(item, _FakePermissionAsk):
+                result = await self.options.can_use_tool(
+                    item.tool_name,
+                    item.tool_input,
+                    _FakeClaudeContext(item.request_id),
+                )
+                self.permission_results.append(result)
+                continue
+            yield item
+
+
+def _fake_claude_sdk() -> object:
+    return type(
+        "FakeClaudeSDK",
+        (),
+        {
+            "AssistantMessage": _FakeAssistantMessage,
+            "ClaudeAgentOptions": _FakeClaudeOptions,
+            "ClaudeSDKClient": _FakeClaudeClient,
+            "PermissionResultAllow": _FakePermissionResultAllow,
+            "PermissionResultDeny": _FakePermissionResultDeny,
+            "ResultMessage": _FakeResultMessage,
+            "ServerToolResultBlock": _FakeToolResultBlock,
+            "ServerToolUseBlock": _FakeToolUseBlock,
+            "SystemMessage": _FakeSystemMessage,
+            "TextBlock": _FakeTextBlock,
+            "ToolResultBlock": _FakeToolResultBlock,
+            "ToolUseBlock": _FakeToolUseBlock,
+            "UserMessage": _FakeUserMessage,
+        },
+    )()
+
+
+def _install_fake_claude_sdk(monkeypatch, batches: list[list[list[object]]]) -> None:  # noqa: ANN001
+    _FakeClaudeClient.response_batches = batches
+    _FakeClaudeClient.instances = []
+    monkeypatch.setattr(claude, "_SDK", _fake_claude_sdk())
+    with claude._RUNTIME_LOCK:
+        for runtime in list(claude._RUNTIMES.values()):
+            runtime.stop()
+        claude._RUNTIMES.clear()
+
+
+def _stop_fake_claude_runtimes() -> None:
+    with claude._RUNTIME_LOCK:
+        runtimes = list(claude._RUNTIMES.values())
+    for runtime in runtimes:
+        runtime.stop()
+    with claude._RUNTIME_LOCK:
+        claude._RUNTIMES.clear()
+
+
 def test_worker_session_authority_maps_read_only_to_codex_read_only() -> None:
     authority = WorkerSessionAuthority.from_session(_session_with_authority())
 
     assert authority.codex_sandbox == "read-only"
     assert authority.codex_approval_policy == "never"
+    assert authority.claude_permission_mode == "plan"
+    assert authority.claude_tool_denial("Bash")
 
 
 def test_worker_session_authority_maps_branch_only_to_workspace_write() -> None:
@@ -156,7 +331,7 @@ def test_worker_session_authority_maps_draft_pr_and_approval_modes() -> None:
 
     assert authority.codex_sandbox == "workspace-write"
     assert authority.codex_approval_policy == "on-request"
-    assert authority.claude_permission_mode == "dontAsk"
+    assert authority.claude_permission_mode == "default"
 
 
 def test_worker_session_authority_keeps_input_separate_from_codex_approval() -> None:
@@ -357,33 +532,51 @@ def test_claude_session_id_ignores_caller_metadata_session_id() -> None:
     assert _claude_session_id(session) != "caller-native-session"
 
 
-def test_claude_turn_rechecks_cancellation_before_launch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    def fail_popen(*_args, **_kwargs):  # noqa: ANN002, ANN003
-        raise AssertionError("cancelled sessions must not launch claude")
+def test_claude_interrupt_ignores_caller_supplied_provider_pid(monkeypatch) -> None:  # noqa: ANN001
+    def fail_if_called(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("provider interrupt must use tracked runtime state")
 
-    monkeypatch.setattr("jarvis.worker.providers.claude.subprocess.Popen", fail_popen)
+    monkeypatch.setattr(claude, "_runtime_for_existing_session", lambda _session_id: None)
+    monkeypatch.setattr("os.kill", fail_if_called)
+    claude._terminate_provider_process(
+        WorkerSession(
+            session_id="sess_untrusted_pid",
+            provider="claude",
+            engine="claude",
+            metadata={"provider_pid": "1"},
+        )
+    )
+
+
+def test_claude_start_turn_rejects_missing_sdk(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):  # noqa: ANN001
+        if name == "claude_agent_sdk":
+            raise ModuleNotFoundError("No module named 'claude_agent_sdk'", name="claude_agent_sdk")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(claude, "_SDK", None)
+    monkeypatch.setattr(builtins, "__import__", fake_import)
     sessions = SessionManager(str(tmp_path / "sessions"))
     session, _ = sessions.create(
         {
             "provider": "claude",
             "engine": "claude",
-            "cwd": _owned_worker_cwd(tmp_path, "claude-cancel-before-launch"),
+            "cwd": _owned_worker_cwd(tmp_path, "claude-missing-sdk"),
             "metadata": _authority_metadata("claude"),
         }
     )
-    sessions.update_status(session.session_id, SESSION_STOPPED)
-    authority = WorkerSessionAuthority.from_session(session, provider="claude")
 
-    _run_claude_turn(
-        session.session_id,
-        ProviderTurn(turn_id="turn_cancelled", prompt="x"),
-        sessions,
-        WorkerConfig(_env_file=None, workspace=str(tmp_path / "worker")),
-        "claude-native-session",
-        authority,
-    )
-
-    assert "provider.process.started" not in [event.type for event in sessions.events(session.session_id)]
+    with pytest.raises(RuntimeError, match=r"install jarvis\[worker-claude\]"):
+        claude.ClaudeProviderAdapter().start_turn(
+            session=session,
+            turn=ProviderTurn(turn_id="turn_missing_sdk", prompt="x"),
+            sessions=sessions,
+            worker_cfg=WorkerConfig(_env_file=None, workspace=str(tmp_path / "worker")),
+        )
 
 
 def test_codex_stop_ignores_caller_supplied_provider_pid(monkeypatch) -> None:  # noqa: ANN001
@@ -410,8 +603,8 @@ def test_worker_session_authority_fails_closed_for_unsupported_landing() -> None
             )
         )
 
-    with pytest.raises(RuntimeError, match="read-only"):
-        WorkerSessionAuthority.from_session(_session_with_authority(provider="claude"), provider="claude")
+    claude_authority = WorkerSessionAuthority.from_session(_session_with_authority(provider="claude"), provider="claude")
+    assert claude_authority.claude_permission_mode == "plan"
 
 
 def test_session_manager_serializes_concurrent_session_writes(tmp_path) -> None:
@@ -2270,43 +2463,33 @@ def test_daemon_real_provider_requires_execution_envelope_authority(tmp_path) ->
     assert listed["sessions"] == []
 
 
-def test_daemon_claude_provider_projects_stream_json_events_and_resumes(tmp_path) -> None:
-    agent = tmp_path / "fake-claude"
-    agent.write_text(
-        """#!/usr/bin/env python3
-import json
-import sys
-
-
-def arg_value(flag):
-    if flag not in sys.argv:
-        return ""
-    index = sys.argv.index(flag)
-    return sys.argv[index + 1] if index + 1 < len(sys.argv) else ""
-
-
-def emit(payload):
-    print(json.dumps(payload), flush=True)
-
-
-session_id = arg_value("--session-id") or arg_value("--resume") or "11111111-1111-4111-8111-111111111111"
-emit({
-    "type": "system",
-    "subtype": "init",
-    "session_id": session_id,
-    "model": "claude-test",
-    "cwd": "/tmp",
-})
-emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "hello"}]}})
-emit({"type": "result", "subtype": "success", "session_id": session_id, "total_cost_usd": 0})
-"""
+def test_daemon_claude_provider_projects_sdk_events_and_reuses_stream(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    native_id = "11111111-1111-4111-8111-111111111111"
+    _install_fake_claude_sdk(
+        monkeypatch,
+        [
+            [
+                [
+                    _FakeSystemMessage(
+                        "init",
+                        {"type": "system", "subtype": "init", "session_id": native_id, "model": "claude-test", "cwd": "/tmp"},
+                    ),
+                    _FakeAssistantMessage([_FakeTextBlock("hello"), _FakeToolUseBlock("tool_1", "Read", {"file_path": "README.md"})], session_id=native_id),
+                    _FakeUserMessage([_FakeToolResultBlock("tool_1", "ok")]),
+                    _FakeResultMessage(session_id=native_id),
+                ],
+                [
+                    _FakeAssistantMessage([_FakeTextBlock("hello again")], session_id=native_id),
+                    _FakeResultMessage(session_id=native_id),
+                ],
+            ]
+        ],
     )
-    agent.chmod(0o755)
     cfg = WorkerConfig(
         _env_file=None,
         token="tkn",
         workspace=str(tmp_path / "worker"),
-        claude_bin=str(agent),
+        claude_bin="fake-claude",
         job_timeout_s=5,
     )
     headers = {"Authorization": "Bearer tkn"}
@@ -2367,7 +2550,10 @@ emit({"type": "result", "subtype": "success", "session_id": session_id, "total_c
         fetched = (await c.get(f"{base}/sessions/{session_id}", headers=headers)).json()
         return created, first, second, events, fetched
 
-    created, first, second, events, fetched = asyncio.run(_with_server(cfg, 8830, calls))
+    try:
+        created, first, second, events, fetched = asyncio.run(_with_server(cfg, 8830, calls))
+    finally:
+        _stop_fake_claude_runtimes()
 
     event_types = [event["type"] for event in events]
     process_events = [event for event in events if event["type"] == "provider.process.started"]
@@ -2376,11 +2562,243 @@ emit({"type": "result", "subtype": "success", "session_id": session_id, "total_c
     assert [event["type"] for event in second["events"]] == ["turn.started", "provider.started"]
     assert "provider.session.ready" in event_types
     assert "assistant.message" in event_types
+    assert "tool.call" in event_types
+    assert "tool.result" in event_types
     assert event_types.count("turn.completed") == 2
-    assert [event["data"]["resume"] for event in process_events] == [False, True]
+    assert [event["data"]["resume"] for event in process_events] == [False]
     assert fetched["status"] == "completed"
     assert fetched["metadata"]["provider_session_id"]
     assert fetched["metadata"]["claude_session_started"] == "true"
+    assert len(_FakeClaudeClient.instances) == 1
+    assert _FakeClaudeClient.instances[0].queries == ["reply with hello", "resume and reply again"]
+    assert _FakeClaudeClient.instances[0].options.kwargs["session_id"]
+    assert _FakeClaudeClient.instances[0].options.kwargs["resume"] is None
+
+
+def test_claude_provider_resumes_after_runtime_restart(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    native_id = "22222222-2222-4222-8222-222222222222"
+    _install_fake_claude_sdk(
+        monkeypatch,
+        [
+            [
+                [
+                    _FakeAssistantMessage([_FakeTextBlock("resumed")], session_id=native_id),
+                    _FakeResultMessage(session_id=native_id),
+                ]
+            ]
+        ],
+    )
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "claude",
+            "engine": "claude",
+            "cwd": _owned_worker_cwd(tmp_path, "claude-resume"),
+            "metadata": _authority_metadata("claude"),
+        }
+    )
+    sessions.update_metadata(session.session_id, {"claude_session_id": native_id, "claude_session_started": "true"})
+    session = sessions.get(session.session_id)
+    assert session is not None
+
+    try:
+        claude.ClaudeProviderAdapter().start_turn(
+            session=session,
+            turn=ProviderTurn(turn_id="turn_resume", prompt="continue"),
+            sessions=sessions,
+            worker_cfg=WorkerConfig(_env_file=None, workspace=str(tmp_path / "worker"), claude_bin="fake-claude", job_timeout_s=5),
+        )
+        for _ in range(100):
+            if any(event.type == "turn.completed" for event in sessions.events(session.session_id)):
+                break
+            time.sleep(0.02)
+    finally:
+        _stop_fake_claude_runtimes()
+
+    assert _FakeClaudeClient.instances[0].options.kwargs["session_id"] is None
+    assert _FakeClaudeClient.instances[0].options.kwargs["resume"] == native_id
+
+
+def test_claude_approval_request_resolves_through_adapter(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    native_id = "33333333-3333-4333-8333-333333333333"
+    _install_fake_claude_sdk(
+        monkeypatch,
+        [
+            [
+                [
+                    _FakePermissionAsk("Bash", {"command": "pytest"}, request_id="approval_1"),
+                    _FakeResultMessage(session_id=native_id),
+                ]
+            ]
+        ],
+    )
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "claude",
+            "engine": "claude",
+            "cwd": _owned_worker_cwd(tmp_path, "claude-approval"),
+            "metadata": _authority_metadata("claude", extra_actions=[WORKER_SESSION_APPROVE]),
+        }
+    )
+    adapter = claude.ClaudeProviderAdapter()
+
+    try:
+        adapter.start_turn(
+            session=session,
+            turn=ProviderTurn(turn_id="turn_approval", prompt="run tests"),
+            sessions=sessions,
+            worker_cfg=WorkerConfig(_env_file=None, workspace=str(tmp_path / "worker"), claude_bin="fake-claude", job_timeout_s=5),
+        )
+        for _ in range(100):
+            if sessions.pending_requests(session.session_id):
+                break
+            time.sleep(0.02)
+        assert sessions.pending_requests(session.session_id)[0]["request_id"] == "approval_1"
+
+        event = adapter.resolve_approval(
+            session=sessions.get(session.session_id),  # type: ignore[arg-type]
+            request={"request_id": "approval_1", "decision": "approved"},
+            sessions=sessions,
+        )
+        for _ in range(100):
+            if any(item.type == "turn.completed" for item in sessions.events(session.session_id)):
+                break
+            time.sleep(0.02)
+    finally:
+        _stop_fake_claude_runtimes()
+
+    assert event.type == "approval.resolved"
+    assert isinstance(_FakeClaudeClient.instances[0].permission_results[0], _FakePermissionResultAllow)
+    assert sessions.pending_requests(session.session_id) == []
+    assert sessions.get(session.session_id).status == "completed"  # type: ignore[union-attr]
+
+
+def test_claude_approval_timeout_denies_and_fails_turn(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    _install_fake_claude_sdk(
+        monkeypatch,
+        [[[_FakePermissionAsk("Bash", {"command": "pytest"}, request_id="approval_timeout")]]],
+    )
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "claude",
+            "engine": "claude",
+            "cwd": _owned_worker_cwd(tmp_path, "claude-approval-timeout"),
+            "metadata": _authority_metadata("claude", extra_actions=[WORKER_SESSION_APPROVE]),
+        }
+    )
+
+    try:
+        claude.ClaudeProviderAdapter().start_turn(
+            session=session,
+            turn=ProviderTurn(turn_id="turn_timeout", prompt="run tests"),
+            sessions=sessions,
+            worker_cfg=WorkerConfig(_env_file=None, workspace=str(tmp_path / "worker"), claude_bin="fake-claude", job_timeout_s=0.2),
+        )
+        for _ in range(100):
+            if any(event.type == "turn.failed" for event in sessions.events(session.session_id)):
+                break
+            time.sleep(0.02)
+    finally:
+        _stop_fake_claude_runtimes()
+
+    event_types = [event.type for event in sessions.events(session.session_id)]
+    assert "approval.requested" in event_types
+    assert "approval.resolved" in event_types
+    assert "turn.failed" in event_types
+    resolved = [event for event in sessions.events(session.session_id) if event.type == "approval.resolved"]
+    assert resolved[-1].data["decision"] == "denied"
+    assert "timed out" in resolved[-1].data["message"]
+
+
+def test_claude_ask_user_question_uses_input_endpoint(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    native_id = "44444444-4444-4444-8444-444444444444"
+    _install_fake_claude_sdk(
+        monkeypatch,
+        [
+            [
+                [
+                    _FakePermissionAsk("AskUserQuestion", {"question": "Proceed?"}, request_id="input_1"),
+                    _FakeResultMessage(session_id=native_id),
+                ]
+            ]
+        ],
+    )
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "claude",
+            "engine": "claude",
+            "cwd": _owned_worker_cwd(tmp_path, "claude-input"),
+            "metadata": _authority_metadata("claude", extra_actions=[WORKER_SESSION_INPUT]),
+        }
+    )
+    adapter = claude.ClaudeProviderAdapter()
+
+    try:
+        adapter.start_turn(
+            session=session,
+            turn=ProviderTurn(turn_id="turn_input", prompt="ask me"),
+            sessions=sessions,
+            worker_cfg=WorkerConfig(_env_file=None, workspace=str(tmp_path / "worker"), claude_bin="fake-claude", job_timeout_s=5),
+        )
+        for _ in range(100):
+            if sessions.pending_requests(session.session_id):
+                break
+            time.sleep(0.02)
+        assert sessions.pending_requests(session.session_id)[0]["kind"] == "input"
+        event = adapter.receive_input(
+            session=sessions.get(session.session_id),  # type: ignore[arg-type]
+            request={"request_id": "input_1", "answer": "yes"},
+            sessions=sessions,
+        )
+        for _ in range(100):
+            if any(item.type == "turn.completed" for item in sessions.events(session.session_id)):
+                break
+            time.sleep(0.02)
+    finally:
+        _stop_fake_claude_runtimes()
+
+    result = _FakeClaudeClient.instances[0].permission_results[0]
+    assert event.type == "input.received"
+    assert isinstance(result, _FakePermissionResultAllow)
+    assert result.updated_input["answer"] == "yes"
+
+
+def test_claude_interrupt_and_stop_call_live_client(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    _install_fake_claude_sdk(monkeypatch, [[[ _FakePermissionAsk("AskUserQuestion", {"question": "Wait?"}, request_id="input_wait") ]]])
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "claude",
+            "engine": "claude",
+            "cwd": _owned_worker_cwd(tmp_path, "claude-stop"),
+            "metadata": _authority_metadata("claude", extra_actions=[WORKER_SESSION_INPUT, WORKER_SESSION_INTERRUPT, WORKER_SESSION_STOP]),
+        }
+    )
+    adapter = claude.ClaudeProviderAdapter()
+
+    adapter.start_turn(
+        session=session,
+        turn=ProviderTurn(turn_id="turn_stop", prompt="wait"),
+        sessions=sessions,
+        worker_cfg=WorkerConfig(_env_file=None, workspace=str(tmp_path / "worker"), claude_bin="fake-claude", job_timeout_s=5),
+    )
+    for _ in range(100):
+        if sessions.pending_requests(session.session_id):
+            break
+        time.sleep(0.02)
+    interrupted, interrupt_event = adapter.interrupt(session=sessions.get(session.session_id), sessions=sessions)  # type: ignore[arg-type]
+    stopped, stop_event = adapter.stop(session=sessions.get(session.session_id), sessions=sessions)  # type: ignore[arg-type]
+    _stop_fake_claude_runtimes()
+
+    assert interrupt_event.type == "session.interrupted"
+    assert interrupted.status == "interrupted"
+    assert stop_event.type == "session.stopped"
+    assert stopped.status == "stopped"
+    assert _FakeClaudeClient.instances[0].interrupted is True
+    assert _FakeClaudeClient.instances[0].disconnected is True
 
 
 def test_daemon_code_dispatch_marks_nonzero_agent_exit_as_error(tmp_path) -> None:

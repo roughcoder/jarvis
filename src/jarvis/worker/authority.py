@@ -65,8 +65,6 @@ class WorkerSessionAuthority:
             raise RuntimeError(f"worker session landing policy {mode!r} requires {FORGE_BRANCH_PUSH}")
         if mode in {"draft_pr", "ready_pr", "confirm_before_pr"} and FORGE_PR_CREATE not in self.allowed:
             raise RuntimeError(f"worker session landing policy {mode!r} requires {FORGE_PR_CREATE}")
-        if provider == "claude" and self.codex_sandbox == "read-only":
-            raise RuntimeError("claude provider cannot enforce read-only worker sessions")
 
     def require(self, action: str) -> None:
         if action not in self.allowed:
@@ -94,7 +92,19 @@ class WorkerSessionAuthority:
 
     @property
     def claude_permission_mode(self) -> str:
+        if self.codex_sandbox == "read-only":
+            return "plan"
+        if self.can_resolve_approval:
+            return "default"
         return "dontAsk"
+
+    def claude_tool_denial(self, tool_name: str) -> str:
+        name = str(tool_name or "").strip()
+        if self.codex_sandbox == "read-only" and _claude_tool_may_write_or_execute(name):
+            return f"worker session is read-only; refusing Claude tool {name or '<unknown>'}"
+        if self.codex_sandbox != "read-only" and not self.can_resolve_approval:
+            return f"worker session lacks {WORKER_SESSION_APPROVE}; refusing Claude tool {name or '<unknown>'}"
+        return ""
 
     @property
     def can_resolve_approval(self) -> bool:
@@ -109,3 +119,21 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value if str(item)]
+
+
+def _claude_tool_may_write_or_execute(tool_name: str) -> bool:
+    name = tool_name.strip()
+    if not name:
+        return True
+    base = name.rsplit("__", 1)[-1] if name.startswith("mcp__") else name
+    return base in {
+        "Agent",
+        "Bash",
+        "Edit",
+        "ExitPlanMode",
+        "MultiEdit",
+        "NotebookEdit",
+        "Task",
+        "TodoWrite",
+        "Write",
+    }

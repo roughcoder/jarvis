@@ -77,9 +77,9 @@ Create a worker session record. The first implementation records durable state
 and emits `session.created`; provider adapters attach behind this contract.
 Codex sessions use `codex app-server` JSON-RPC with durable provider thread
 metadata, but the worker currently starts one app-server process per turn.
-Claude sessions currently use `claude -p --output-format stream-json` with
-durable `--session-id` / `--resume` metadata, with a Claude Agent SDK sidecar
-planned as the richer live runtime.
+Claude sessions use an in-process Python `claude-agent-sdk` runtime with durable
+`session_id` / `resume` metadata, live interrupt/stop, and SDK permission
+callbacks bridged to the same approval and input endpoints as Codex.
 Real provider sessions must include an `ExecutionEnvelope` authority context in
 session metadata. Unknown provider ids are rejected when a turn is started rather
 than falling back to a default provider.
@@ -360,6 +360,8 @@ jarvis work next --start --engine-strategy ensemble --engine codex,claude
 jarvis runs --report run_1760000000_abcd1234 --public-comment
 ```
 
-Provider adapters are expected to map Codex app-server JSON-RPC, Claude stream
-JSON / Claude Agent SDK events, Cursor, and OpenCode into this canonical event
-stream.
+Provider adapters are expected to map Codex app-server JSON-RPC, Claude Agent
+SDK events, Cursor, and OpenCode into this canonical event stream. Codex and
+Claude both surface pending approvals and user-input questions through
+`approval.requested` / `input.requested`; callers answer them with
+`POST /sessions/:id/approval` and `POST /sessions/:id/input`.

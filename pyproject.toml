@@ -45,6 +45,9 @@ memory = [
 worker = [
     "aiohttp>=3.9",
 ]
+worker-claude = [
+    "claude-agent-sdk>=0.2.110,<0.3",
+]
 # Cockpit API for T3-style operator UIs. Central orchestration-side HTTP/SSE.
 cockpit = [
     "aiohttp>=3.9",
