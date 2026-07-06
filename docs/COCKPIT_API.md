@@ -90,73 +90,6 @@ GET /v1/cockpit/snapshot?sync=none|fast|probe
 GET /v1/cockpit/events?after=<cursor>
 ```
 
-## Discovery
-
-`GET /v1/capabilities` is caller-scoped API discovery. It requires cockpit auth
-and returns only public-safe route templates, the requester's effective
-capability strings, and feature availability booleans/counts. It does not expose
-worker URLs, MCP server names or URLs, local paths, tokens, or concrete resource
-ids.
-
-Example:
-
-```json
-{
-  "api_version": "v1",
-  "schema_version": 1,
-  "principal": {
-    "identity": "neil",
-    "scope": "personal",
-    "auth_mode": "legacy"
-  },
-  "capabilities": ["worker.job.start", "worker.session.turn"],
-  "routes": [
-    {"method": "GET", "path": "/v1/capabilities"},
-    {"method": "GET", "path": "/v1/projects/{project_id}/permissions"},
-    {"method": "POST", "path": "/v1/work/start"}
-  ],
-  "features": {
-    "project_writes": {"available": true, "reason": ""},
-    "mcp": {"available": true, "serve_configured": false},
-    "worker_dispatch": {"available": true, "workers_configured": 1}
-  }
-}
-```
-
-`features.project_writes` is a wiring check for whether the API has the
-configured brain boundary credentials needed for project write forwarding. It is
-not a live brain ping. `features.mcp.available` is true only when MCP is enabled
-and at least one MCP server is configured; `serve_configured` means the Jarvis
-MCP server token store exists. `features.worker_dispatch.workers_configured` is
-the count of configured worker profiles, read without probing workers.
-
-`GET /v1/projects/{id}/permissions` returns the authenticated caller's effective
-project permissions. Non-members receive the same `404 not_found` as other
-project routes so the endpoint does not disclose private project existence.
-Archived projects still report permissions when the caller is a member and the
-project is otherwise visible.
-
-Example:
-
-```json
-{
-  "api_version": "v1",
-  "schema_version": 1,
-  "project_id": "jarvis",
-  "role": "owner",
-  "permissions": {
-    "can_update": true,
-    "can_manage_repos": true,
-    "can_create_thread": true,
-    "can_archive_thread": true,
-    "can_archive": true,
-    "can_delete": true,
-    "can_manage_members": true,
-    "can_set_visibility": true
-  }
-}
-```
-
 ### Workers
 
 ```text
@@ -609,6 +542,73 @@ POST /v1/sessions/{session_ref}/interrupt
 POST /v1/sessions/{session_ref}/stop
 POST /v1/sessions/{session_ref}/archive
 POST /v1/sessions/{session_ref}/checkpoints/restore
+```
+
+## Discovery
+
+`GET /v1/capabilities` is caller-scoped API discovery. It requires cockpit auth
+and returns only public-safe route templates, the requester's effective
+capability strings, and feature availability booleans/counts. It does not expose
+worker URLs, MCP server names or URLs, local paths, tokens, or concrete resource
+ids.
+
+Example:
+
+```json
+{
+  "api_version": "v1",
+  "schema_version": 1,
+  "principal": {
+    "identity": "neil",
+    "scope": "personal",
+    "auth_mode": "legacy"
+  },
+  "capabilities": ["worker.job.start", "worker.session.turn"],
+  "routes": [
+    {"method": "GET", "path": "/v1/capabilities"},
+    {"method": "GET", "path": "/v1/projects/{project_id}/permissions"},
+    {"method": "POST", "path": "/v1/work/start"}
+  ],
+  "features": {
+    "project_writes": {"available": true, "reason": ""},
+    "mcp": {"available": true, "serve_configured": false},
+    "worker_dispatch": {"available": true, "workers_configured": 1}
+  }
+}
+```
+
+`features.project_writes` is a wiring check for whether the API has the
+configured brain boundary credentials needed for project write forwarding. It is
+not a live brain ping. `features.mcp.available` is true only when MCP is enabled
+and at least one MCP server is configured; `serve_configured` means the Jarvis
+MCP server token store exists. `features.worker_dispatch.workers_configured` is
+the count of configured worker profiles, read without probing workers.
+
+`GET /v1/projects/{id}/permissions` returns the authenticated caller's effective
+project permissions. Projects outside the caller's visibility set still return
+`404 not_found`; visible non-members receive `role: "viewer"` with all
+permission booleans false. Archived projects still report permissions when the
+caller can see the project.
+
+Example:
+
+```json
+{
+  "api_version": "v1",
+  "schema_version": 1,
+  "project_id": "jarvis",
+  "role": "owner",
+  "permissions": {
+    "can_update": true,
+    "can_manage_repos": true,
+    "can_create_thread": true,
+    "can_archive_thread": true,
+    "can_archive": true,
+    "can_delete": true,
+    "can_manage_members": true,
+    "can_set_visibility": true
+  }
+}
 ```
 
 ## Sync Modes

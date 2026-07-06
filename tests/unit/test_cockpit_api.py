@@ -1818,8 +1818,23 @@ def test_cockpit_project_permissions_project_effective_role(tmp_path, monkeypatc
         }
         assert non_member_private.status_code == 404
         assert non_member_private.json()["error"]["code"] == "not_found"
-        assert non_member_household.status_code == 404
-        assert non_member_household.json()["error"]["code"] == "not_found"
+        assert non_member_household.status_code == 200
+        assert non_member_household.json() == {
+            "api_version": "v1",
+            "schema_version": 1,
+            "project_id": "house-story",
+            "role": "viewer",
+            "permissions": {
+                "can_update": False,
+                "can_manage_repos": False,
+                "can_create_thread": False,
+                "can_archive_thread": False,
+                "can_archive": False,
+                "can_delete": False,
+                "can_manage_members": False,
+                "can_set_visibility": False,
+            },
+        }
         assert archived.status_code == 200
         assert archived.json()["role"] == "owner"
         assert all(archived.json()["permissions"].values())

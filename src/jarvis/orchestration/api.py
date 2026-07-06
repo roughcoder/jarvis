@@ -518,6 +518,7 @@ class CockpitReadHandlers:
         await self.ctx.require_auth(request)
         requester = _requester_or_401(request, self.ctx.cfg)
         auth = request.get("auth", {})
+        features = await asyncio.to_thread(_feature_availability, self.ctx.cfg)
         return web.json_response(
             {
                 "api_version": API_VERSION,
@@ -529,7 +530,7 @@ class CockpitReadHandlers:
                 },
                 "capabilities": sorted(requester.capabilities),
                 "routes": _route_templates(request.app),
-                "features": _feature_availability(self.ctx.cfg),
+                "features": features,
             }
         )
 
@@ -619,15 +620,13 @@ class CockpitReadHandlers:
         if project is None:
             raise CockpitError("not_found", "project not found", status=404)
         edit = can_edit_project(requester, project)
-        if not edit.allowed:
-            raise CockpitError("not_found", "project not found", status=404)
         admin = can_admin_project(requester, project)
         return web.json_response(
             {
                 "api_version": API_VERSION,
                 "schema_version": SCHEMA_VERSION,
                 "project_id": project.id,
-                "role": "owner" if admin.allowed else "member",
+                "role": "owner" if admin.allowed else "member" if edit.allowed else "viewer",
                 "permissions": {
                     "can_update": edit.allowed,
                     "can_manage_repos": edit.allowed,
@@ -1911,7 +1910,7 @@ def _project_write_available(cfg: Config) -> tuple[bool, str]:
 
 def _configured_worker_count(cfg: Config) -> int:
     registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path)
-    return len(registry._load_profiles())  # noqa: SLF001
+    return registry.configured_profile_count()
 
 
 def _registry_store(cfg: Config) -> RegistryStore:

@@ -46,6 +46,10 @@ class WorkerRegistry:
             return profiles[0] if profiles else None
         return next((p for p in profiles if p.worker_id == worker_id), None)
 
+    def configured_profile_count(self) -> int:
+        """Number of explicit worker profiles configured, excluding fallback."""
+        return len(self._load_profiles())
+
     def choose(
         self,
         required: list[str] | None = None,
