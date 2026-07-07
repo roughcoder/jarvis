@@ -17,10 +17,16 @@ from typing import Any, Awaitable, Callable
 import httpx
 from aiohttp import web
 
-from jarvis.brain.memory_client import ConclusionRecord, MemoryClient, UnsupportedMemoryOperation
-from jarvis.brain.memory_outbox import CurationOutbox
-from jarvis.brain.project_management import BrainProjectClient, ProjectOperationError
-from jarvis.brain.registry import ProjectEntry, RegistryStore
+from jarvis.brain.facade import (
+    BrainProjectClient,
+    ConclusionRecord,
+    CurationOutbox,
+    MemoryClient,
+    ProjectEntry,
+    ProjectOperationError,
+    RegistryStore,
+    UnsupportedMemoryOperation,
+)
 from jarvis.capabilities import (
     WORKER_SESSION_APPROVE,
     WORKER_SESSION_INPUT,
@@ -84,15 +90,16 @@ from jarvis.orchestration.cockpit import (
     worker_profiles,
     _cursor_worker,
 )
-from jarvis.brain.capabilities import (
+from jarvis.brain.facade import (
     RequestContext,
+    Resolution,
     can_admin_project,
     can_edit_project,
     can_query_memory_peer,
     context_for_resolution,
+    load_users,
     resolve_capabilities,
 )
-from jarvis.brain.identity import Resolution, load_users
 from jarvis.orchestration.authority import allowed
 from jarvis.orchestration.activity import ProjectActivityLog
 from jarvis.orchestration.intent import parse_work_command

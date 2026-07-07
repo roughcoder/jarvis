@@ -24,25 +24,28 @@ from typing import Any
 import httpx
 
 from jarvis.capabilities import WORKER_SESSION_CREATE, WORKER_SESSION_STOP, WORKER_SESSION_TURN
-from jarvis.brain.capabilities import RequestContext
-from jarvis.brain.background import BackgroundRunner
-from jarvis.brain.contexts import ActiveProject, ContextStore
-from jarvis.brain.dialog import PROJECT_THREAD_TOOL_SURFACE_CONTRACT
-from jarvis.brain.gateway_client import GatewayClient
-from jarvis.brain.memory_client import (
+from jarvis.brain.facade import (
+    PROJECT_THREAD_TOOL_SURFACE_CONTRACT,
+    ActiveProject,
+    BackgroundRunner,
+    BrainSession,
     ConclusionRecord,
+    ContextStore,
+    CurationOutbox,
+    GatewayClient,
     MemoryBackend,
     MemoryClient,
     MemoryMessage,
+    ProjectEntry,
+    RegistryStore,
+    RequestContext,
     SessionPeer,
+    Tracer,
+    TurnResult,
     UnsupportedMemoryOperation,
+    make_memory_tools,
+    make_project_tools,
 )
-from jarvis.brain.memory_outbox import CurationOutbox
-from jarvis.brain.memory_tools import make_memory_tools
-from jarvis.brain.project_tools import make_project_tools
-from jarvis.brain.registry import ProjectEntry, RegistryStore
-from jarvis.brain.session import BrainSession, TurnResult
-from jarvis.brain.tracing import Tracer
 from jarvis.config import Config
 from jarvis.ids import new_id, utc_now
 from jarvis.orchestration.cockpit import project_session_event

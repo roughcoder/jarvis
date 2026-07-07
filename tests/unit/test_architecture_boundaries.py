@@ -76,6 +76,41 @@ def test_skills_do_not_import_user_profile_store() -> None:
     assert offenders == []
 
 
+def test_orchestration_and_connectors_reach_brain_only_via_facade() -> None:
+    """The Cockpit tiers host brain machinery in-process, but their whole brain
+    surface is the curated contract in jarvis/brain/facade.py. A deep import is
+    a contract widening by side effect — route the symbol through the facade
+    (deliberately) instead."""
+    offenders = [
+        f"{rel}: {module}"
+        for package in ("orchestration", "connectors")
+        for rel, module in _imports_under(SRC / package)
+        if (module == "jarvis.brain" or module.startswith("jarvis.brain."))
+        and module != "jarvis.brain.facade"
+    ]
+    assert offenders == []
+
+
+def test_brain_never_imports_its_hosting_tiers() -> None:
+    offenders = [
+        f"{rel}: {module}"
+        for rel, module in _imports_under(SRC / "brain")
+        if module.startswith(("jarvis.orchestration", "jarvis.connectors"))
+    ]
+    assert offenders == []
+
+
+def test_boundary_peers_import_nothing_from_brain() -> None:
+    """worker/ and remote/ talk to the brain over HTTP; they import none of it."""
+    offenders = [
+        f"{rel}: {module}"
+        for package in ("worker", "remote")
+        for rel, module in _imports_under(SRC / package)
+        if module == "jarvis.brain" or module.startswith("jarvis.brain.")
+    ]
+    assert offenders == []
+
+
 def test_moved_account_modules_are_updated_everywhere() -> None:
     stale_files = [
         path
