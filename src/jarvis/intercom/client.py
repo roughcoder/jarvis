@@ -79,6 +79,17 @@ class _CapturedUtterance:
     uplink_chunks: int
 
 
+def _new_reply_state(voice_mode: str) -> dict:
+    """Fresh per-reply state; the single source of the reply-state dict shape."""
+    return {
+        "ended": False,
+        "text": "",
+        "continue_listening": voice_mode == STAY_MODE,
+        "voice_mode": voice_mode,
+        "close_reason": "",
+    }
+
+
 def _is_passive_proactive_state(state: dict | None) -> bool:
     """Default proactive ReplyEnd metadata should not close an active conversation."""
     return bool(
@@ -284,19 +295,20 @@ class IntercomClient:
         """Read the socket for the connection's life; queue every decoded message."""
         try:
             async for raw in ws:
-                with contextlib.suppress(Exception):
+                try:
                     if isinstance(raw, bytes):
                         binary = decode_binary_audio(raw)
-                        if binary is not None:
-                            if binary.kind == "reply_audio":
-                                inbound.put_nowait(binary)
-                            continue
+                        if binary is not None and binary.kind == "reply_audio":
+                            inbound.put_nowait(binary)
                         continue
                     msg = decode(raw)
                     if isinstance(msg, DeviceRequest):
                         asyncio.create_task(self._handle_device_request(ws, msg))
                     else:
                         inbound.put_nowait(msg)
+                except Exception as exc:  # noqa: BLE001 - one bad frame must not kill the router
+                    kind = "binary" if isinstance(raw, bytes) else "text"
+                    print(f"  [intercom] dropped undecodable {kind} frame: {exc!r}")
         except Exception as exc:  # noqa: BLE001 - socket closed
             print(f"  [intercom] router stopped: {exc!r}")
             raise
@@ -420,13 +432,7 @@ class IntercomClient:
             turn_id = captured.turn_id
             metrics = captured.metrics
             conversation_started = True
-            state = {
-                "ended": False,
-                "text": "",
-                "continue_listening": active_voice_mode == STAY_MODE,
-                "voice_mode": active_voice_mode,
-                "close_reason": "",
-            }
+            state = _new_reply_state(active_voice_mode)
             interrupted = await self._play_reply(
                 ws, mic, inbound, turn_id, state, metrics
             )
@@ -523,13 +529,7 @@ class IntercomClient:
         asked to open the mic, listen for a reply and carry it into a chat."""
         print(f"  🔔 {pro.text}")
         self._panel.set("awake")
-        state = {
-            "ended": False,
-            "text": "",
-            "continue_listening": self._active_voice_mode == STAY_MODE,
-            "voice_mode": self._active_voice_mode,
-            "close_reason": "",
-        }
+        state = _new_reply_state(self._active_voice_mode)
         metrics = IntercomReplyMetrics(
             turn_id=pro.turn_id, device_id=self._device_id, kind="proactive"
         )
