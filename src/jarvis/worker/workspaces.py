@@ -9,7 +9,7 @@ from typing import Any
 from jarvis.config import WorkerConfig
 from jarvis.ids import utc_now
 from jarvis.text import slugify
-from jarvis.worker.actions import clone_repo, list_repos, resolve_repo, run_exec
+from jarvis.worker.actions import clone_repo, fetch_repo, list_repos, resolve_repo, run_exec
 
 
 WORKSPACE_STATE_FILENAME = "workspace.json"
@@ -168,9 +168,24 @@ async def materialize_worktree(
             _write_state(path, state)
             repos_dir.mkdir(parents=True, exist_ok=True)
             branch = f"{cfg.worktree_branch_prefix}/{workspace_id(conversation_id)}-{repo_key}"
+            # Always fetch before branching, even when the caller passed an explicit
+            # base_ref — without this, an explicit base_ref skipped _default_base_ref's
+            # (conditional) fetch entirely and the worktree branched from a stale local
+            # base. Best-effort: a failed fetch is a warning elsewhere in the codebase
+            # (see actions.fetch_repo's docstring), not a reason to refuse provisioning.
+            await fetch_repo(resolved, cfg.shell_timeout_s)
             base = _safe_base_ref(base_ref.strip() or await _default_base_ref(resolved, cfg.shell_timeout_s))
             if worktree.exists():
-                raise ValueError(f"worktree path already exists for repo {repo_key!r}")
+                # `existing` (looked up above) was None or not a live dir, so this is
+                # not a real name conflict — it's the orphan left by a daemon crash
+                # between `git worktree add` below and _write_state (no state row
+                # references this path, but the dir + git worktree registration +
+                # branch survived). Reconcile instead of getting stuck forever: drop
+                # the orphaned registration and fall through to recreate it cleanly.
+                await run_exec(["git", "-C", resolved, "worktree", "remove", "--force", str(worktree)], None, cfg.shell_timeout_s)
+                if worktree.exists():
+                    shutil.rmtree(worktree, ignore_errors=True)
+                await run_exec(["git", "-C", resolved, "branch", "-D", branch], None, cfg.shell_timeout_s)
             out = await run_exec(
                 ["git", "-C", resolved, "worktree", "add", "-b", branch, "--", str(worktree), base],
                 None,

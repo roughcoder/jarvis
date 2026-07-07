@@ -12,9 +12,11 @@ import os
 import pathlib
 import subprocess
 import sys
+import threading
 
 import pytest
 
+from jarvis.worker import actions
 from jarvis.worker.actions import cleanup_job, code_argv, prepare_worktree, prune_worktrees, run_exec, run_shell, worktree_inventory
 from jarvis.worker.jobs import JobManager
 
@@ -476,6 +478,46 @@ def test_worktree_inventory_skips_symlinked_directory_contents(tmp_path) -> None
 
     assert inventory["count"] == 1
     assert inventory["disk_bytes"] < 1024 * 1024
+
+
+def test_prune_worktrees_runs_disk_walk_and_session_reads_off_event_loop(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # prune_worktrees is `async` but used to run _live_session_cwds (reads every
+    # sessions/*/session.json) and _disk_usage (os.walk) synchronously inline on the
+    # event loop; delete_session and the prune endpoint `await` it directly, so a
+    # large worktree blocked the whole worker daemon for seconds. Both must run via
+    # asyncio.to_thread.
+    worktrees = tmp_path / "worker" / "worktrees"
+    sessions = tmp_path / "worker" / "sessions"
+    stale = worktrees / "old"
+    stale.mkdir(parents=True)
+    (stale / "payload.txt").write_text("stale payload")
+    session_dir = sessions / "sess_untouched"
+    session_dir.mkdir(parents=True)
+    (session_dir / "session.json").write_text(json.dumps({"status": "running", "cwd": str(worktrees / "other")}))
+
+    caller_thread = threading.get_ident()
+    disk_usage_threads: list[int] = []
+    session_read_threads: list[int] = []
+    real_disk_usage = actions._disk_usage  # noqa: SLF001
+    real_live_session_cwds = actions._live_session_cwds  # noqa: SLF001
+
+    def spy_disk_usage(path):  # noqa: ANN001
+        disk_usage_threads.append(threading.get_ident())
+        return real_disk_usage(path)
+
+    def spy_live_session_cwds(sessions_dir, worktrees_root):  # noqa: ANN001
+        session_read_threads.append(threading.get_ident())
+        return real_live_session_cwds(sessions_dir, worktrees_root)
+
+    monkeypatch.setattr(actions, "_disk_usage", spy_disk_usage)
+    monkeypatch.setattr(actions, "_live_session_cwds", spy_live_session_cwds)
+
+    result = asyncio.run(prune_worktrees(str(worktrees), str(sessions), stale_ttl_s=0))
+
+    assert result["worktrees"] == 1
+    assert not stale.exists()
+    assert disk_usage_threads and all(t != caller_thread for t in disk_usage_threads)
+    assert session_read_threads and all(t != caller_thread for t in session_read_threads)
 
 
 def test_prune_deletes_associated_jarvis_branch(tmp_path) -> None:

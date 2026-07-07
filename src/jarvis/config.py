@@ -1059,6 +1059,7 @@ class Config:
             "worker.repo_root": self.worker.repo_root or "<unset>",
             "worker.repo_access_probe_timeout_s": self.worker.repo_access_probe_timeout_s,
             "worker.repo_access_ttl_s": self.worker.repo_access_ttl_s,
+            "worker.worktree_stale_ttl_s": self.worker.worktree_stale_ttl_s,
             "remote.api_key": mask(self.remote.api_key),
             "remote.configured": self.remote.configured,
             "remote.model": self.remote.model,

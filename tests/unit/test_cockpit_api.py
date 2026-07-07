@@ -2836,6 +2836,65 @@ def test_cockpit_thread_turn_guards_fake_review_even_when_memory_tool_ran(tmp_pa
     assert memory.messages[1]["content"].startswith("I can't do that from this project conversation")
 
 
+def test_cockpit_thread_turn_does_not_guard_truthful_completed_status_reply(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # Regression: the guard used to also match backward-looking status words
+    # ("done", "finished", "completed") and bare third-person mentions with no
+    # first-person subject, so a truthful report of a *completed* child run
+    # got clobbered into the canned workspace-offer reply.
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    gateway = FakeGateway(["The code review is done — run_abc finished."])
+    connector = CockpitConnector(cfg, memory=memory, gateway=gateway, tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={})
+        thread = opened.json()["thread"]
+        response = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "Is the code review done yet?"},
+        )
+        events = _sse_events(response.text)
+        reply = next(event for event in events if event["_event"] == "thread.reply")["payload"]["reply"]
+
+        assert response.status_code == 200
+        assert reply == "The code review is done — run_abc finished."
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_thread_turn_does_not_guard_advisory_answer(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # Regression: "running the tests locally" (no first-person subject) used to
+    # match the guard's bare status branch and clobber an advisory answer that
+    # never claimed Jarvis itself was doing untooled work.
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    gateway = FakeGateway(["Run `pytest tests/unit` from the repo root for running the tests locally."])
+    connector = CockpitConnector(cfg, memory=memory, gateway=gateway, tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={})
+        thread = opened.json()["thread"]
+        response = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "How do I run the tests locally?"},
+        )
+        events = _sse_events(response.text)
+        reply = next(event for event in events if event["_event"] == "thread.reply")["payload"]["reply"]
+
+        assert response.status_code == 200
+        assert reply == "Run `pytest tests/unit` from the repo root for running the tests locally."
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
 def test_cockpit_thread_turn_labels_unescalated_chat_as_planning_only(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)
@@ -2983,6 +3042,119 @@ def test_cockpit_thread_escalates_to_workspace_without_losing_thread_history(tmp
     turn_posts = [call for call in state["posts"] if call["url"].endswith("/turns")]
     assert turn_posts
     assert "Honcho session: project:neil-shared:orchestrator:" in turn_posts[0]["json"]["prompt"]
+
+
+def test_cockpit_thread_workspace_turn_idempotency_key_differs_for_repeat_text(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # Regression: the worker idempotency key used to be derived from
+    # len(thread.messages), which is always 0 for the `thread` passed into
+    # _workspace_turn (it comes back from an index round-trip that strips
+    # messages). Sending the same text twice produced the same key, so the
+    # worker's reserve_turn treated the second send as an idempotent replay
+    # and never ran a new provider turn.
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    gateway = FakeGateway(["unused"])
+    state: dict[str, Any] = {"posts": [], "worktrees": []}
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        if url.endswith("/health"):
+            return Response(
+                {
+                    "ok": True,
+                    "agent": "codex",
+                    "default_engine": "codex",
+                    "supported_engines": ["codex"],
+                    "engine_supports": {"codex": {"streaming": True}},
+                    "repositories": [{"repo": "notes", "status": "ready"}],
+                }
+            )
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions"):
+            return Response({"sessions": []})
+        if "/sessions/" in url:
+            return Response({"session_id": "conv_thread", "provider": "codex", "engine": "codex", "status": "created"})
+        return Response({})
+
+    def worker_post(url: str, json: dict[str, Any], **_kwargs: Any) -> Response:  # noqa: A002
+        state["posts"].append({"url": url, "json": json})
+        workspace = {
+            "workspace_id": "neil-shared-thread",
+            "conversation_id": "neil-shared-thread",
+            "root": str(tmp_path / "worker" / "conversations" / "neil-shared-thread"),
+            "root_label": "neil-shared-thread",
+            "cwd_label": "neil-shared-thread",
+            "status": "ready",
+            "provision_phase": "running",
+            "worktrees": list(state["worktrees"]),
+            "created_at": "2026-07-07T00:00:00+00:00",
+            "updated_at": "2026-07-07T00:00:00+00:00",
+        }
+        if url.endswith("/conversation-workspaces"):
+            return Response({"ok": True, "workspace": workspace})
+        if url.endswith("/worktrees"):
+            state["worktrees"].append(
+                {
+                    "name": json["name"],
+                    "repo": json["repo"],
+                    "path": str(tmp_path / "worker" / "conversations" / "neil-shared-thread" / "repos" / json["name"]),
+                    "path_label": json["name"],
+                    "branch": "jarvis/neil-shared-thread-notes",
+                    "base_ref": "",
+                    "status": "ready",
+                    "provision_phase": "running",
+                }
+            )
+            workspace["worktrees"] = list(state["worktrees"])
+            return Response({"ok": True, "workspace": workspace})
+        if url.endswith("/sessions"):
+            return Response({"ok": True, "session": {**json, "status": "created"}, "event": {"event_id": "ev_create"}})
+        if url.endswith("/turns"):
+            return Response({"ok": True, "session": {"session_id": "conv_thread", "status": "running"}, "events": []})
+        return Response({"ok": False, "error": "unexpected worker post"}, status_code=400)
+
+    connector = CockpitConnector(
+        cfg,
+        memory=memory,
+        gateway=gateway,
+        tts=None,
+        tracer=None,
+        worker_get=worker_get,
+        worker_post=worker_post,
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Plan"})
+        thread = opened.json()["thread"]
+        first = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "Same message.", "workspace": {"repos": ["notes"]}},
+        )
+        second = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "Same message."},
+        )
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    turn_posts = [call for call in state["posts"] if call["url"].endswith("/turns")]
+    assert len(turn_posts) == 2
+    keys = [call["json"]["idempotency_key"] for call in turn_posts]
+    assert keys[0] != keys[1]
+    # The second turn hit an already-ready workspace with no new repo request,
+    # so it must not re-provision (no second conversation-workspaces/worktrees
+    # round-trip).
+    workspace_posts = [call for call in state["posts"] if call["url"].endswith("/conversation-workspaces")]
+    worktree_posts = [call for call in state["posts"] if call["url"].endswith("/worktrees")]
+    assert len(workspace_posts) == 1
+    assert len(worktree_posts) == 1
 
 
 def test_cockpit_thread_workspace_failure_marks_workspace_failed(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -3417,15 +3589,17 @@ def test_cockpit_thread_backend_gaps_degrade_without_500(tmp_path, monkeypatch) 
         )
         memory.create_session_error = None
         memory.create_messages_error = cockpit_api_module.UnsupportedMemoryOperation("v2 unsupported")
-        turn_failed = await client.post(
+        # A memory failure during the turn's Lane 1 persist must not break the
+        # turn (AGENTS.md: "tracing/memory must never break a turn") — the
+        # gateway reply already happened, so the turn still completes.
+        turn_ok = await client.post(
             f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}/turns",
             json={"text": "hi"},
         )
-        events = _sse_events(turn_failed.text)
+        events = _sse_events(turn_ok.text)
 
-        assert turn_failed.status_code == 200
-        assert events[-1]["_event"] == "thread.turn.error"
-        assert events[-1]["payload"]["error"]["code"] == "memory_unavailable"
+        assert turn_ok.status_code == 200
+        assert events[-1]["_event"] == "thread.turn.done"
 
     import asyncio
 
@@ -4812,8 +4986,8 @@ def test_cockpit_session_close_stops_cleans_up_and_archives(tmp_path, monkeypatc
         if url.endswith("/sessions/sess_123/stop"):
             state["status"] = "stopped"
             return Response({"ok": True, "session": {"session_id": "sess_123", "status": "stopped"}})
-        if url.endswith("/sessions/sess_123/cleanup"):
-            return Response({"ok": True, "cleaned": ["worktree"]})
+        if url.endswith("/worktrees/prune"):
+            return Response({"ok": True, "pruned": [{"name": "worktree"}], "bytes": 0, "refused": []})
         raise AssertionError(url)
 
     async def calls(base: str, client: httpx.AsyncClient) -> None:
@@ -4826,7 +5000,7 @@ def test_cockpit_session_close_stops_cleans_up_and_archives(tmp_path, monkeypatc
         assert body["session"]["archived_at"]
         assert body["cleanup"] == {"requested": True, "ok": True, "cleaned": ["worktree"]}
         assert replay.json()["idempotent"] is True
-        assert posts == ["http://worker.test/sessions/sess_123/stop", "http://worker.test/sessions/sess_123/cleanup"]
+        assert posts == ["http://worker.test/sessions/sess_123/stop", "http://worker.test/worktrees/prune"]
         run_rows = {row["run_id"]: row for row in snapshot["runs"]}
         assert run_rows[run_id]["session_count"] == 0
         assert snapshot["sessions"] == []
