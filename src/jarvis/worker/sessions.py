@@ -27,7 +27,20 @@ from jarvis.worker_session_contract import (
     resolved_request_type as contract_resolved_request_type,
 )
 
+# Why a session ended, keyed by the terminal status a transition lands on.
+# "interrupted" defaults to a user-initiated interrupt; the daemon-restart
+# sweep overrides it with "worker_lost" because only that code path knows.
+ENDED_REASONS_BY_STATUS = {
+    "completed": "completed",
+    "done": "completed",
+    "stopped": "stopped",
+    "failed": "engine_error",
+    "error": "engine_error",
+    "interrupted": "interrupted_by_user",
+}
+
 PROVIDER_OWNED_METADATA_KEYS = {
+    "ended_reason",
     "provider_pid",
     "provider_runtime",
     "provider_cwd",
@@ -175,12 +188,13 @@ class SessionManager:
                 continue
         return sorted(sessions, key=lambda x: x.updated_at)
 
-    def update_status(self, session_id: str, status: str) -> WorkerSession:
+    def update_status(self, session_id: str, status: str, *, ended_reason: str = "") -> WorkerSession:
         with self._lock:
             session = self.get(session_id)
             if session is None:
                 raise KeyError(session_id)
             session.status = status
+            _apply_ended_reason(session, status, override=ended_reason)
             session.updated_at = utc_now()
             self.save(session)
             return session
@@ -227,6 +241,7 @@ class SessionManager:
                 raise ValueError(f"invalid event type {event_type!r}")
             existing = self._idempotent_event(session.session_id, event_type, data or {})
             session.status = status
+            _apply_ended_reason(session, status)
             session.updated_at = utc_now()
             self.save(session)
             if existing is not None:
@@ -259,6 +274,7 @@ class SessionManager:
             with self.events_path(session.session_id).open("a") as f:
                 f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
             session.status = SESSION_RUNNING
+            _apply_ended_reason(session, SESSION_RUNNING)
             session.updated_at = event.time
             self.save(session)
             return session, event, True
@@ -278,6 +294,7 @@ class SessionManager:
                     {"reason": "worker daemon restarted with active session state", "previous_status": session.status},
                 )
                 session.status = SESSION_INTERRUPTED
+                _apply_ended_reason(session, SESSION_INTERRUPTED, override="worker_lost")
                 session.updated_at = event.time
                 self.save(session)
                 with self.events_path(session.session_id).open("a") as f:
@@ -393,6 +410,15 @@ class SessionManager:
             if event.type == event_type and str(event.data.get("idempotency_key") or "") == key:
                 return event
         return None
+
+
+def _apply_ended_reason(session: WorkerSession, status: str, *, override: str = "") -> None:
+    if status in ACTIVE_SESSION_STATUSES:
+        session.metadata.pop("ended_reason", None)
+        return
+    reason = override or ENDED_REASONS_BY_STATUS.get(status, "")
+    if reason:
+        session.metadata["ended_reason"] = reason
 
 
 def _valid_id(value: str) -> bool:

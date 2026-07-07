@@ -836,6 +836,8 @@ class OrchestrationConfig(_Base):
     oauth_jwks_min_refresh_s: float = 30.0
     sse_refresh_interval_s: float = 1.0
     sse_heartbeat_interval_s: float = 15.0
+    turn_attachment_max_count: int = 4
+    turn_attachment_max_bytes: int = 5 * 1024 * 1024
 
 
 class LinearConfig(_Base):

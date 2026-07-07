@@ -98,6 +98,7 @@ def start_worker_session(
     post: Callable[..., Any] | None = None,
     get: Callable[..., Any] | None = None,
     created_session_ids: set[str] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> WorkerSessionLink:
     post = post or httpx.post
     get = get or httpx.get
@@ -162,18 +163,23 @@ def start_worker_session(
                 store.link_session(envelope.run_id, _session_link_from_body(envelope, session, create_body.get("event")))
     turn_id = _turn_id(envelope)
     idempotency_key = _turn_idempotency_key(envelope)
+    turn_body: dict[str, Any] = {
+        "turn_id": turn_id,
+        "prompt": envelope.prompt,
+        "metadata": {
+            "session_name": envelope.session_name,
+            "resume_session": envelope.resume_session,
+            "execution_envelope": envelope.to_dict(),
+        },
+        "idempotency_key": idempotency_key,
+    }
+    if attachments:
+        # Attachments ride only on the turn request; the envelope is persisted
+        # to the run event log and must stay free of base64 payloads.
+        turn_body["attachments"] = attachments
     turn_response = post(
         f"{base_url}/sessions/{session['session_id']}/turns",
-        json={
-            "turn_id": turn_id,
-            "prompt": envelope.prompt,
-            "metadata": {
-                "session_name": envelope.session_name,
-                "resume_session": envelope.resume_session,
-                "execution_envelope": envelope.to_dict(),
-            },
-            "idempotency_key": idempotency_key,
-        },
+        json=turn_body,
         headers=headers,
         timeout=worker_cfg.request_timeout_s,
     )
@@ -226,6 +232,7 @@ def start_worker_ensemble(
     store: OrchestrationStore | None = None,
     post: Callable[..., Any] | None = None,
     get: Callable[..., Any] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> list[WorkerSessionLink]:
     links: list[WorkerSessionLink] = []
     created_session_ids: set[str] = set()
@@ -249,6 +256,7 @@ def start_worker_ensemble(
                 post=post,
                 get=get,
                 created_session_ids=created_session_ids,
+                attachments=attachments,
             )
             links.append(link)
     except Exception:

@@ -22,6 +22,9 @@ class ProviderTurn:
     prompt: str
     metadata: dict[str, Any] = field(default_factory=dict)
     idempotency_key: str = ""
+    # Image attachments: [{kind, mime_type, name, data_url}]. Full payloads are
+    # request-scoped only; session events must carry summaries, never base64.
+    attachments: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ProviderAdapter(Protocol):

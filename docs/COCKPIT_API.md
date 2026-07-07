@@ -951,6 +951,7 @@ POST /v1/sessions/{session_ref}/approval
 POST /v1/sessions/{session_ref}/interrupt
 POST /v1/sessions/{session_ref}/stop
 POST /v1/sessions/{session_ref}/archive
+POST /v1/sessions/{session_ref}/unarchive
 POST /v1/sessions/{session_ref}/checkpoints/restore
 ```
 
@@ -1194,7 +1195,8 @@ names.
         "interrupt": true,
         "approval_requests": true,
         "input_requests": true,
-        "checkpoints": true
+        "checkpoints": true,
+        "attachments": false
       }
     }
   ],
@@ -1362,7 +1364,7 @@ Session summaries appear in snapshots and session lists.
 ```json
 {
   "authority": "jarvis",
-  "supported_controls": ["turn", "input", "approval", "interrupt", "stop", "checkpoint_restore", "archive"],
+  "supported_controls": ["turn", "input", "approval", "interrupt", "stop", "checkpoint_restore", "archive", "unarchive"],
   "session_ref": "sessref_QF2r7mN8kT6vH3pa",
   "worker_id": "macbook-worker",
   "session_id": "sess_123",
@@ -1371,6 +1373,7 @@ Session summaries appear in snapshots and session lists.
   "provider": "codex",
   "engine": "codex",
   "status": "running",
+  "ended_reason": null,
   "repo": "roughcoder/jarvis",
   "branch": "jarvis/foo",
   "cwd_label": "jarvis",
@@ -1388,6 +1391,17 @@ Session summaries appear in snapshots and session lists.
 Use `cwd_label`, not public absolute `cwd`.
 Use `authority` and `supported_controls` to route cockpit commands. T3 should
 not infer authority only from id shape.
+
+`run_id` is nullable: worker-local sessions that never joined a run report
+`run_id: null`. It is never an empty string — clients should model the field
+as string-or-null.
+
+`ended_reason` explains why a conversation ended without guessing from status
+strings: `null` while the session is active, otherwise one of `completed`,
+`stopped`, `interrupted_by_user`, `worker_lost`, or `engine_error`. Workers
+report it authoritatively (a daemon restart marks interrupted sessions as
+`worker_lost`); for rows from workers that predate the field it is derived
+from the terminal status, and `null` means unknown.
 
 ## Request Object
 
@@ -1731,12 +1745,8 @@ is false — the same ownership rule start enforces with `WorkAlreadyOwnedError`
 `POST /v1/sessions/{session_ref}/turns` appends a prompt to one exact session. T3
 uses this for the thread composer once the operator is already inside a session.
 
-Turn attachments are explicitly unsupported in cockpit API v1. If
-`POST /v1/sessions/{session_ref}/turns` or `POST /v1/work/start` includes a
-non-empty `attachments` array, Jarvis returns `validation_failed` instead of
-silently dropping attachment data.
-
-Future attachment shape, if enabled in a later schema version:
+`POST /v1/sessions/{session_ref}/turns` and `POST /v1/work/start` accept image
+attachments:
 
 ```json
 {
@@ -1752,15 +1762,36 @@ Future attachment shape, if enabled in a later schema version:
 }
 ```
 
+Rules:
+
+- Only `kind: "image"` is supported; `mime_type` must be one of `image/png`,
+  `image/jpeg`, `image/webp`, `image/gif`, and `data_url` must be a
+  `data:<mime_type>;base64,` URL.
+- Limits are config-owned and enforced with structured `validation_failed`
+  errors that name the limit: at most
+  `ORCHESTRATION_TURN_ATTACHMENT_MAX_COUNT` attachments (default 4), each at
+  most `ORCHESTRATION_TURN_ATTACHMENT_MAX_BYTES` decoded bytes (default 5 MiB).
+- Only engines whose catalog row reports `supports.attachments: true` accept
+  them (Claude today); other engines reject the turn at the worker boundary.
+  Gate the composer on that flag.
+- Session events never carry attachment payloads — the `turn.started` event
+  records `{kind, mime_type, name, bytes}` summaries only.
+
+Project thread turns (`POST /v1/projects/{id}/threads/{tid}/turns`) still
+reject non-empty `attachments` arrays with `validation_failed`.
+
 `POST /v1/runs/{run_id}/archive` and
 `POST /v1/sessions/{session_ref}/archive` hide the selected run or session from
 cockpit snapshot/list views. Archive state is owned by Jarvis, not by T3 local
 storage. Direct detail endpoints may still resolve archived objects by id/ref
 for reconciliation.
 
-Unarchive is unsupported in v1. If Jarvis adds unarchive later, it should use
-the same consolidated archive bookkeeping path instead of letting T3 mutate
-visibility locally.
+`POST /v1/sessions/{session_ref}/unarchive` restores an archived session to
+snapshot/list views. It uses the same consolidated archive bookkeeping path as
+archive (run links and the worker-only archive index move together) and returns
+the standard reconciliation packet. Unarchiving a session that was never
+archived is a no-op; an unknown session returns `not_found`. Runs currently
+have no unarchive endpoint.
 
 `POST /v1/sessions/{session_ref}/checkpoints/restore` uses `checkpoint_id`.
 Checkpoint IDs are durable and stable within a session. Clients must not restore
@@ -1943,6 +1974,21 @@ or breaking status, and migration notes.
 - Added `serve.auth_mode` and `serve.oauth` to `GET /v1/mcp/status` so
   cockpits can display the configured MCP serve auth lane and OAuth discovery
   URLs without exposing token-store paths or JWKS internals.
+
+### 2026-07-07 - Cockpit asks: attachments, unarchive, ended_reason, snapshot hygiene (compatible)
+
+- Enabled image attachments on `POST /v1/sessions/{session_ref}/turns` and
+  `POST /v1/work/start` with config-owned count/size limits and a per-engine
+  `supports.attachments` catalog flag (Claude first). Project thread turns
+  still reject attachments.
+- Added `POST /v1/sessions/{session_ref}/unarchive` on the consolidated
+  archive bookkeeping path, and `unarchive` to session `supported_controls`.
+- Added `ended_reason`
+  (`completed|stopped|interrupted_by_user|worker_lost|engine_error`) to
+  session summaries and detail; workers record it at terminal transitions.
+- Session rows never carry an empty-string `run_id`: the field is now
+  explicitly nullable, and worker-local sessions without a run report
+  `run_id: null`.
 
 ### 2026-07-06 - Thread Archive Controls (compatible)
 

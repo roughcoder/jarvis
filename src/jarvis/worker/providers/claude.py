@@ -61,6 +61,7 @@ class ClaudeProviderAdapter:
             "questions": True,
             "checkpoints": False,
             "rollback": False,
+            "attachments": True,
             "runtime": "claude-agent-sdk in-process session runtime",
             "attached": True,
             "lifecycle": "one long-lived ClaudeSDKClient per worker session; turns are sent over streaming input",
@@ -333,7 +334,7 @@ class _ClaudeSessionRuntime:
             if _session_cancelled(self.sessions, self.session_id):
                 return
             await client.set_permission_mode(self.authority.claude_permission_mode)
-            await client.query(turn.prompt)
+            await client.query(_turn_query_input(turn))
             terminal_seen = False
             async with asyncio.timeout(timeout_s) as turn_timeout:
                 self._turn_timeout = turn_timeout
@@ -627,6 +628,35 @@ def _runtime_for_session(
         runtime.enqueue(turn)
         runtime.start()
         return runtime
+
+
+def _turn_query_input(turn: ProviderTurn) -> Any:
+    """Plain prompt string, or a streamed user message with image content blocks."""
+    if not turn.attachments:
+        return turn.prompt
+    blocks: list[dict[str, Any]] = []
+    if turn.prompt:
+        blocks.append({"type": "text", "text": turn.prompt})
+    for attachment in turn.attachments:
+        data_url = str(attachment.get("data_url") or "")
+        payload = data_url.split(",", 1)[1] if "," in data_url else ""
+        if not payload:
+            continue
+        blocks.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": str(attachment.get("mime_type") or "image/png"),
+                    "data": payload,
+                },
+            }
+        )
+
+    async def _messages():  # noqa: ANN202
+        yield {"type": "user", "message": {"role": "user", "content": blocks}, "parent_tool_use_id": None}
+
+    return _messages()
 
 
 def _runtime_for_existing_session(session_id: str) -> _ClaudeSessionRuntime | None:

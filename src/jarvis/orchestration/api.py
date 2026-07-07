@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import contextlib
 import hmac
 import json
 import logging
 import threading
+from functools import partial
 from pathlib import Path
 from dataclasses import dataclass, replace
 from typing import Any, Callable
@@ -61,6 +63,7 @@ from jarvis.orchestration.cockpit import (
     public_error_message,
     public_event_data,
     _allowed_actions_from_worker_session,
+    _ended_reason_from_worker_session,
     _session_from_link,
     run_detail_projection,
     run_report_artifact,
@@ -436,9 +439,11 @@ def make_app(
         oauth_validator=validator,
     )
     _rebuild_session_ref_index_from_store(ctx.store)
+    # Attachments travel base64-encoded (~4/3 of the decoded limit) on turn bodies.
+    attachment_budget = int(cfg.orchestration.turn_attachment_max_count) * ((int(cfg.orchestration.turn_attachment_max_bytes) * 4) // 3 + 1024)
     app = web.Application(
         middlewares=[_cors_middleware, _error_middleware],
-        client_max_size=max(1024 * 1024, int(cfg.registry.max_upload_bytes) + 1024 * 1024),
+        client_max_size=max(1024 * 1024, int(cfg.registry.max_upload_bytes) + 1024 * 1024, attachment_budget + 1024 * 1024),
     )
     app[CONFIG_KEY] = cfg
     reads = CockpitReadHandlers(ctx)
@@ -480,6 +485,7 @@ def make_app(
         web.get("/v1/sessions/{session_ref}/checkpoints", reads.session_checkpoints),
         web.post("/v1/runs/{run_id}/archive", writes.run_archive),
         web.post("/v1/sessions/{session_ref}/archive", writes.session_archive),
+        web.post("/v1/sessions/{session_ref}/unarchive", writes.session_unarchive),
         web.post("/v1/sessions/{session_ref}/checkpoints/restore", writes.session_write, name="restore_checkpoint"),
         web.post("/v1/sessions/{session_ref}/{action:turns|input|approval|interrupt|stop}", writes.session_write),
         web.get("/v1/sessions/{session_ref}", reads.session_detail),
@@ -1489,7 +1495,7 @@ class CockpitWriteHandlers:
     async def work_start(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
-        _reject_attachments(body)
+        attachments = _validate_attachments(body, self.ctx.cfg.orchestration)
         async with _idempotency_scope(self.ctx, "work/start", str(body.get("idempotency_key") or "")):
             cached = self.ctx.idempotency.get("work/start", str(body.get("idempotency_key") or ""), body)
             if cached is not None:
@@ -1497,7 +1503,10 @@ class CockpitWriteHandlers:
             command, manual_item = _command_from_body(body, start=True)
             service = self.ctx.service(manual_item=manual_item)
             try:
-                result = await asyncio.to_thread(service.next_work, command, start=True)
+                next_work = partial(service.next_work, command, start=True)
+                if attachments:
+                    next_work = partial(next_work, attachments=attachments)
+                result = await asyncio.to_thread(next_work)
             except (MissingAuthorityError, NoEligibleWorkerError, WorkAlreadyOwnedError, MissingWorkRepoError, WorkerDispatchError) as exc:
                 error = _service_error(exc)
                 if isinstance(exc, (MissingWorkRepoError, WorkerDispatchError)):
@@ -1513,7 +1522,7 @@ class CockpitWriteHandlers:
     async def work_validate(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
-        _reject_attachments(body)
+        _validate_attachments(body, self.ctx.cfg.orchestration)
         command, manual_item = _command_from_body(body, start=False)
         service = self.ctx.service(manual_item=manual_item)
         validation = await asyncio.to_thread(service.validate_work, command, manual_item=manual_item)
@@ -1656,13 +1665,30 @@ class CockpitWriteHandlers:
             self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
         return web.json_response(response_body)
 
+    async def session_unarchive(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        body = await _json_body(request)
+        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
+        scope = f"sessions/{ref.worker_id}/{ref.session_id}/unarchive"
+        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
+            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
+            if cached is not None:
+                return web.json_response(cached)
+            _require_capability(self.ctx.cfg, "orchestration.runs.write")
+            run = await asyncio.to_thread(_unarchive_session, self.ctx.store, ref)
+            response_body = _unarchive_session_packet(run, ref)
+            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+        return web.json_response(response_body)
+
     async def session_write(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
         action = request.match_info.get("action", "restore_checkpoint")
         body = await _json_body(request)
         if action == "turns":
-            _reject_attachments(body)
+            attachments = _validate_attachments(body, self.ctx.cfg.orchestration)
+            if attachments:
+                body["attachments"] = attachments
         scope = f"sessions/{ref.worker_id}/{ref.session_id}/{action}"
         async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
             cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
@@ -2081,6 +2107,7 @@ def _fallback_session_row(store: OrchestrationStore, ref: SessionRef, raw: dict[
         "provider": str(session_raw.get("provider") or ""),
         "engine": str(session_raw.get("engine") or session_raw.get("provider") or ""),
         "status": str(session_raw.get("status") or ""),
+        "ended_reason": _ended_reason_from_worker_session(session_raw),
         "repo": str(session_raw.get("repo") or ""),
         "branch": str(session_raw.get("branch") or ""),
         "cwd": str(session_raw.get("cwd") or ""),
@@ -2168,7 +2195,61 @@ def _reject_attachments(body: dict[str, Any]) -> None:
     attachments = body.get("attachments")
     if attachments in (None, []):
         return
-    raise CockpitError("validation_failed", "turn attachments are not supported by Jarvis cockpit API v1", recoverable=True, status=400)
+    raise CockpitError("validation_failed", "turn attachments are not supported on this endpoint", recoverable=True, status=400)
+
+
+ATTACHMENT_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+
+
+def _validate_attachments(body: dict[str, Any], orchestration) -> list[dict[str, Any]]:  # noqa: ANN001
+    attachments = body.get("attachments")
+    if attachments in (None, []):
+        return []
+    if not isinstance(attachments, list):
+        raise CockpitError("validation_failed", "attachments must be an array", recoverable=True, status=400)
+    max_count = max(0, int(orchestration.turn_attachment_max_count))
+    max_bytes = max(1, int(orchestration.turn_attachment_max_bytes))
+    if len(attachments) > max_count:
+        raise CockpitError(
+            "validation_failed",
+            f"too many attachments: {len(attachments)} exceeds the limit of {max_count} (ORCHESTRATION_TURN_ATTACHMENT_MAX_COUNT)",
+            recoverable=True,
+            status=400,
+        )
+    normalized: list[dict[str, Any]] = []
+    for index, raw in enumerate(attachments):
+        label = f"attachments[{index}]"
+        if not isinstance(raw, dict):
+            raise CockpitError("validation_failed", f"{label} must be an object", recoverable=True, status=400)
+        kind = str(raw.get("kind") or "")
+        if kind != "image":
+            raise CockpitError("validation_failed", f'{label}: only kind "image" is supported', recoverable=True, status=400)
+        mime_type = str(raw.get("mime_type") or "")
+        if mime_type not in ATTACHMENT_IMAGE_MIME_TYPES:
+            supported = ", ".join(sorted(ATTACHMENT_IMAGE_MIME_TYPES))
+            raise CockpitError("validation_failed", f"{label}: mime_type must be one of {supported}", recoverable=True, status=400)
+        data_url = str(raw.get("data_url") or "")
+        prefix = f"data:{mime_type};base64,"
+        if not data_url.startswith(prefix):
+            raise CockpitError(
+                "validation_failed",
+                f'{label}: data_url must start with "data:{mime_type};base64,"',
+                recoverable=True,
+                status=400,
+            )
+        try:
+            decoded_bytes = len(base64.b64decode(data_url[len(prefix) :], validate=True))
+        except (binascii.Error, ValueError) as exc:
+            raise CockpitError("validation_failed", f"{label}: data_url payload is not valid base64", recoverable=True, status=400) from exc
+        if decoded_bytes > max_bytes:
+            raise CockpitError(
+                "validation_failed",
+                f"{label} is {decoded_bytes} bytes decoded; the limit is {max_bytes} bytes (ORCHESTRATION_TURN_ATTACHMENT_MAX_BYTES)",
+                recoverable=True,
+                status=400,
+            )
+        normalized.append({"kind": "image", "mime_type": mime_type, "name": str(raw.get("name") or ""), "data_url": data_url})
+    return normalized
 
 
 def _run_or_404(store: OrchestrationStore, run_id: str):
@@ -2191,6 +2272,13 @@ def _archive_run(store: OrchestrationStore, run_id: str):
 
 def _archive_session(store: OrchestrationStore, ref: SessionRef):
     return store.archive_cockpit_session(ref.worker_id, ref.session_id)
+
+
+def _unarchive_session(store: OrchestrationStore, ref: SessionRef):
+    try:
+        return store.unarchive_cockpit_session(ref.worker_id, ref.session_id)
+    except KeyError as exc:
+        raise CockpitError("not_found", "session not found", status=404) from exc
 
 
 def _archive_run_packet(run) -> dict[str, Any]:  # noqa: ANN001
@@ -2225,6 +2313,33 @@ def _archive_session_packet(run, ref: SessionRef) -> dict[str, Any]:  # noqa: AN
     return {
         "ok": True,
         "cursor": snapshot_cursor({"run": run_row, "session": session_row, "archived": True}),
+        "run": run_row,
+        "session": session_row,
+        "events": [],
+        "requests": [],
+        "artifacts": [],
+    }
+
+
+def _unarchive_session_packet(run, ref: SessionRef) -> dict[str, Any]:  # noqa: ANN001
+    if hasattr(run, "sessions"):
+        session = next((item for item in run.sessions if item.worker_id == ref.worker_id and item.session_id == ref.session_id), None)
+        session_row = session_summary(_session_from_link(session, run)) if session is not None else {}
+        run_row = run_summary(run)
+    else:
+        session_row = session_summary(
+            {
+                "session_ref": make_session_ref(ref.worker_id, ref.session_id),
+                "worker_id": ref.worker_id,
+                "session_id": ref.session_id,
+                "status": "",
+                "archived_at": "",
+            }
+        )
+        run_row = {}
+    return {
+        "ok": True,
+        "cursor": snapshot_cursor({"run": run_row, "session": session_row, "archived": False}),
         "run": run_row,
         "session": session_row,
         "events": [],
@@ -2984,6 +3099,7 @@ def _worker_session_row(raw: dict[str, Any], worker_id: str) -> dict[str, Any]:
         "provider": str(raw.get("provider") or ""),
         "engine": str(raw.get("engine") or raw.get("provider") or ""),
         "status": str(raw.get("status") or ""),
+        "ended_reason": _ended_reason_from_worker_session(raw),
         "repo": str(raw.get("repo") or ""),
         "branch": str(raw.get("branch") or ""),
         "cwd": str(raw.get("cwd") or ""),

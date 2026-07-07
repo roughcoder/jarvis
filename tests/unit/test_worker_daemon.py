@@ -3434,3 +3434,130 @@ def test_cleanup_all_removes_scratch_dir(tmp_path) -> None:
     cwd, clean = asyncio.run(_with_server(cfg, 8815, calls))
     assert "scratchy" in clean["cleaned"]
     assert not pathlib.Path(cwd).exists()
+
+
+def test_daemon_session_turn_attachments_summarised_and_delivered(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+    attachment = {"kind": "image", "mime_type": "image/png", "name": "shot.png", "data_url": "data:image/png;base64,cG5n"}
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={"provider": "fake", "engine": "fake", "metadata": _authority_metadata("fake")},
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        turn = (
+            await c.post(
+                f"{base}/sessions/{session_id}/turns",
+                json={"prompt": "see this", "attachments": [attachment], "metadata": _control_metadata(WORKER_SESSION_TURN)},
+                headers=headers,
+            )
+        ).json()
+        events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+        fetched = (await c.get(f"{base}/sessions/{session_id}", headers=headers)).json()
+        return turn, events, fetched
+
+    turn, events, fetched = asyncio.run(_with_server(cfg, 8860, calls))
+
+    assert turn["ok"] is True
+    started = next(event for event in events if event["type"] == "turn.started")
+    assert started["data"]["attachments"] == [{"kind": "image", "mime_type": "image/png", "name": "shot.png", "bytes": 3}]
+    import json as json_module
+
+    assert "data_url" not in json_module.dumps(events)
+    assert fetched["status"] == "completed"
+    assert fetched["metadata"]["ended_reason"] == "completed"
+
+
+def test_daemon_session_turn_attachments_rejected_without_capability(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+    monkeypatch.setattr(
+        "jarvis.worker.providers.fake.FakeProviderAdapter.capabilities",
+        lambda _self: {"streaming": True},
+    )
+    attachment = {"kind": "image", "mime_type": "image/png", "name": "shot.png", "data_url": "data:image/png;base64,cG5n"}
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={"provider": "fake", "engine": "fake", "metadata": _authority_metadata("fake")},
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        turn = await c.post(
+            f"{base}/sessions/{session_id}/turns",
+            json={"prompt": "see this", "attachments": [attachment], "metadata": _control_metadata(WORKER_SESSION_TURN)},
+            headers=headers,
+        )
+        events = (await c.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+        return turn.status_code, turn.json(), events
+
+    status_code, body, events = asyncio.run(_with_server(cfg, 8861, calls))
+
+    assert status_code == 400
+    assert "does not support turn attachments" in body["error"]
+    assert [event["type"] for event in events] == ["session.created"]
+
+
+def test_session_manager_records_ended_reason_on_terminal_transitions(tmp_path) -> None:
+    manager = SessionManager(str(tmp_path / "sessions"))
+    session, _ = manager.create({"provider": "fake", "engine": "fake"})
+
+    manager.update_status(session.session_id, "completed")
+    assert manager.get(session.session_id).metadata["ended_reason"] == "completed"
+
+    manager.update_status(session.session_id, "running")
+    assert "ended_reason" not in manager.get(session.session_id).metadata
+
+    manager.update_status(session.session_id, "interrupted")
+    assert manager.get(session.session_id).metadata["ended_reason"] == "interrupted_by_user"
+
+    manager.update_status(session.session_id, "stopped")
+    assert manager.get(session.session_id).metadata["ended_reason"] == "stopped"
+
+    manager.update_status(session.session_id, "failed")
+    assert manager.get(session.session_id).metadata["ended_reason"] == "engine_error"
+
+
+def test_session_manager_marks_stale_active_sessions_worker_lost(tmp_path) -> None:
+    store_dir = str(tmp_path / "sessions")
+    manager = SessionManager(store_dir)
+    session, _ = manager.create({"provider": "fake", "engine": "fake"})
+    manager.update_status(session.session_id, "running")
+
+    reloaded = SessionManager(store_dir).get(session.session_id)
+
+    assert reloaded is not None
+    assert reloaded.status == "interrupted"
+    assert reloaded.metadata["ended_reason"] == "worker_lost"
+
+
+def test_claude_turn_query_input_builds_image_blocks() -> None:
+    from jarvis.worker.providers.claude import _turn_query_input
+
+    plain = ProviderTurn(turn_id="t_plain", prompt="just text")
+    assert _turn_query_input(plain) == "just text"
+
+    turn = ProviderTurn(
+        turn_id="t_img",
+        prompt="look at this",
+        attachments=[{"kind": "image", "mime_type": "image/png", "name": "s.png", "data_url": "data:image/png;base64,cG5n"}],
+    )
+
+    async def collect():  # noqa: ANN202
+        return [message async for message in _turn_query_input(turn)]
+
+    messages = asyncio.run(collect())
+
+    assert len(messages) == 1
+    content = messages[0]["message"]["content"]
+    assert messages[0]["type"] == "user"
+    assert content[0] == {"type": "text", "text": "look at this"}
+    assert content[1] == {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "cG5n"}}

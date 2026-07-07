@@ -102,7 +102,13 @@ class OrchestrationService:
         source = self.source_factory(command.source, self.cfg)
         return source.pr_comments(self._repo(command), number)  # type: ignore[attr-defined]
 
-    def next_work(self, command: WorkCommand, *, start: bool = False) -> WorkItem | StartedWork | None:
+    def next_work(
+        self,
+        command: WorkCommand,
+        *,
+        start: bool = False,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> WorkItem | StartedWork | None:
         self._require(required_for_command(command.operation, command.source))
         source = self.source_factory(command.source, self.cfg)
         item = source.next(repo=self._repo(command), filters=command.filters)
@@ -144,6 +150,9 @@ class OrchestrationService:
             raise WorkAlreadyOwnedError(item, exc.owner) from exc
 
         try:
+            # Passed only when present so monkeypatched/legacy dispatch
+            # signatures keep working for attachment-less starts.
+            extra = {"attachments": attachments} if attachments else {}
             if command.engine_strategy == "ensemble":
                 sessions = executor.start_worker_ensemble(
                     envelope,
@@ -151,10 +160,11 @@ class OrchestrationService:
                     worker_cfg=self.cfg.worker,
                     worker=worker,
                     store=store,
+                    **extra,
                 )
                 session = sessions[0]
             else:
-                session = executor.start_worker_session(envelope, worker_cfg=self.cfg.worker, worker=worker, store=store)
+                session = executor.start_worker_session(envelope, worker_cfg=self.cfg.worker, worker=worker, store=store, **extra)
                 sessions = [session]
         except Exception as exc:  # noqa: BLE001 - dispatch failure must release the local claim
             store.set_phase(envelope.run_id, "failed", f"Worker dispatch failed: {exc}")
