@@ -1590,6 +1590,11 @@ class CockpitWriteHandlers:
                     memory_deleted = True
                 except UnsupportedMemoryOperation as exc:
                     notes.append(str(exc))
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code == 404:
+                        notes.append("memory session already absent")
+                    else:
+                        raise CockpitError("memory_unavailable", public_error_message(str(exc)), recoverable=True, status=503) from exc
                 except Exception as exc:
                     raise CockpitError("memory_unavailable", public_error_message(str(exc)), recoverable=True, status=503) from exc
             thread, deleted = await asyncio.to_thread(connector.delete_thread, project, thread_id)
@@ -2495,6 +2500,7 @@ def _archive_session_packet(run, ref: SessionRef) -> dict[str, Any]:  # noqa: AN
 def _delete_session_packet(ctx: CockpitAppContext, ref: SessionRef) -> dict[str, Any]:
     if ctx.store.deleted_worker_session(ref.worker_id, ref.session_id) is not None:
         summary = _reclamation_summary()
+        deleted = False
     else:
         worker_summary = _delete_worker_session(ctx.cfg, ref, delete=ctx.delete)
         store_summary = ctx.store.delete_cockpit_session(ref.worker_id, ref.session_id)
@@ -2504,6 +2510,7 @@ def _delete_session_packet(ctx: CockpitAppContext, ref: SessionRef) -> dict[str,
             worktrees=int(worker_summary.get("worktrees") or 0),
             bytes_reclaimed=int(worker_summary.get("bytes") or 0),
         )
+        deleted = bool(store_summary.get("deleted"))
     session_row = session_summary(
         {
             "session_ref": make_session_ref(ref.worker_id, ref.session_id),
@@ -2514,7 +2521,7 @@ def _delete_session_packet(ctx: CockpitAppContext, ref: SessionRef) -> dict[str,
     )
     return {
         "ok": True,
-        "deleted": any(summary.values()),
+        "deleted": deleted,
         "cursor": snapshot_cursor({"session": session_row, "deleted": True, "reclamation": summary}),
         "run": {},
         "session": session_row,

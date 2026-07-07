@@ -994,6 +994,19 @@ def test_worker_delete_session_refuses_live_worktree(tmp_path) -> None:
     assert worktree.exists()
 
 
+def test_worker_prune_rejects_non_numeric_stale_ttl(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"), worktree_stale_ttl_s=0)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[int, dict]:
+        response = await client.post(f"{base}/worktrees/prune", json={"stale_ttl_s": "soon"})
+        return response.status_code, response.json()
+
+    status_code, body = asyncio.run(_with_server(cfg, 8852, calls))
+
+    assert status_code == 400
+    assert body["error"] == "stale_ttl_s must be numeric"
+
+
 def test_daemon_health_reports_diagnostics_error_without_500(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     monkeypatch.setattr(
         "jarvis.worker.server.diagnostics",

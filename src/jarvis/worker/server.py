@@ -787,7 +787,10 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         except Exception:
             return web.json_response({"error": "bad json"}, status=400)
         target = str(body.get("target") or body.get("name") or body.get("worktree") or "").strip()
-        ttl_s = float(body.get("stale_ttl_s") if body.get("stale_ttl_s") is not None else cfg.worktree_stale_ttl_s)
+        try:
+            ttl_s = float(body.get("stale_ttl_s") if body.get("stale_ttl_s") is not None else cfg.worktree_stale_ttl_s)
+        except (TypeError, ValueError):
+            return web.json_response({"error": "stale_ttl_s must be numeric"}, status=400)
         result = await prune_worktrees(
             str(workspace / "worktrees"),
             str(workspace / "sessions"),

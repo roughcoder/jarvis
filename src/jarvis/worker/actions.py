@@ -523,19 +523,20 @@ async def prune_worktrees(
     root = pathlib.Path(worktrees_dir).expanduser().resolve(strict=False)
     live = _live_session_cwds(sessions_dir, root)
     if target:
-        candidates = [_worktree_target(root, target)]
+        candidate, reason = _worktree_target(root, target)
+        candidates = [(candidate, target, reason)]
     else:
         candidates = [
-            path
+            (path, path.name, "")
             for path in _worktree_children(root)
             if _stale_worktree(path, root, live, stale_ttl_s)
         ]
     pruned = []
     refused = []
     reclaimed = 0
-    for path in candidates:
+    for path, label, reason in candidates:
         if path is None:
-            refused.append({"target": target, "reason": "worktree not found"})
+            refused.append({"target": label, "reason": reason or "worktree not found"})
             continue
         if not _is_under(path, [root]):
             refused.append({"target": str(path), "reason": "outside worktree root"})
@@ -841,17 +842,19 @@ def _worktree_children(root: pathlib.Path) -> list[pathlib.Path]:
     return sorted(path for path in root.iterdir() if path.is_dir())
 
 
-def _worktree_target(root: pathlib.Path, target: str) -> pathlib.Path | None:
+def _worktree_target(root: pathlib.Path, target: str) -> tuple[pathlib.Path | None, str]:
     text = str(target or "").strip()
     if not text:
-        return None
+        return None, "worktree not found"
     raw = pathlib.Path(text).expanduser()
     path = raw if raw.is_absolute() else root / raw.name
     path = path.resolve(strict=False)
     root = root.resolve(strict=False)
-    if not path.is_relative_to(root) or not path.is_dir():
-        return None
-    return path
+    if not path.is_relative_to(root):
+        return None, "outside worktree root"
+    if not path.is_dir():
+        return None, "worktree not found"
+    return path, ""
 
 
 def _live_session_cwds(sessions_dir: str, worktrees_root: pathlib.Path) -> set[str]:
@@ -897,20 +900,58 @@ def _stale_worktree(
 def _disk_usage(path: pathlib.Path) -> int:
     total = 0
     try:
-        for item in path.rglob("*"):
-            try:
-                total += item.lstat().st_size
-            except OSError:
-                continue
         total += path.lstat().st_size
+        for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+            base = pathlib.Path(dirpath)
+            kept_dirs = []
+            for dirname in dirnames:
+                item = base / dirname
+                try:
+                    total += item.lstat().st_size
+                except OSError:
+                    continue
+                if not item.is_symlink():
+                    kept_dirs.append(dirname)
+            dirnames[:] = kept_dirs
+            for filename in filenames:
+                item = base / filename
+                try:
+                    total += item.lstat().st_size
+                except OSError:
+                    continue
     except OSError:
         return 0
     return total
 
 
+async def _worktree_branch(path: pathlib.Path, timeout_s: float) -> tuple[str, str]:
+    branch = await run_exec(["git", "-C", str(path), "rev-parse", "--abbrev-ref", "HEAD"], None, timeout_s)
+    common_dir = await run_exec(["git", "-C", str(path), "rev-parse", "--git-common-dir"], None, timeout_s)
+    if branch.startswith("error:") or common_dir.startswith("error:"):
+        return "", ""
+    branch_name = branch.strip()
+    common_path = common_dir.strip()
+    if not common_path:
+        return branch_name, ""
+    git_dir = pathlib.Path(common_path)
+    if not git_dir.is_absolute():
+        git_dir = (path / git_dir).resolve(strict=False)
+    return branch_name, str(git_dir)
+
+
+async def _delete_worktree_branch(git_dir: str, branch: str, timeout_s: float) -> None:
+    if not git_dir or not branch.startswith("jarvis/"):
+        return
+    await run_exec(["git", f"--git-dir={git_dir}", "branch", "-D", branch], None, timeout_s)
+
+
 async def _remove_worktree_path(path: pathlib.Path, timeout_s: float) -> None:
     git_dir = path / ".git"
+    branch = ""
+    common_git_dir = ""
     if git_dir.exists() or git_dir.is_file():
+        branch, common_git_dir = await _worktree_branch(path, timeout_s)
         await run_exec(["git", "-C", str(path), "worktree", "remove", "--force", str(path)], None, timeout_s)
+        await _delete_worktree_branch(common_git_dir, branch, timeout_s)
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)

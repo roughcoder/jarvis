@@ -80,6 +80,7 @@ class FakeProjectMemory:
         self.deleted_sessions: list[str] = []
         self.create_session_error: Exception | None = None
         self.create_messages_error: Exception | None = None
+        self.delete_session_error: Exception | None = None
 
     def read_cached_representation(self, user: str | None = None) -> str:
         self.cached_reads.append(user or "")
@@ -148,6 +149,8 @@ class FakeProjectMemory:
         return rows
 
     def delete_session(self, session_id: str) -> None:
+        if self.delete_session_error is not None:
+            raise self.delete_session_error
         self.deleted_sessions.append(session_id)
 
     async def write_turn(self, user_text: str, assistant_text: str, *, user: str | None = None) -> None:
@@ -2778,6 +2781,48 @@ def test_cockpit_thread_delete_removes_index_and_memory_session_idempotently(tmp
     assert memory.deleted_sessions == [thread.session_id]
 
 
+def test_cockpit_thread_delete_treats_missing_v3_memory_session_as_reclaimed(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil", memory_backend="v3")
+    _seed_project_registry(cfg)
+    request = httpx.Request("DELETE", "http://memory/v3/workspaces/ws/sessions/missing")
+    memory = FakeProjectMemory()
+    memory.delete_session_error = httpx.HTTPStatusError(
+        "not found",
+        request=request,
+        response=httpx.Response(404, request=request),
+    )
+    connector = CockpitConnector(cfg, memory=memory, gateway=FakeGateway(["unused"]), tts=None, tracer=None)
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_missing_memory",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_missing_memory"),
+            title="Delete missing memory",
+            created_at="2026-07-05T09:00:00+00:00",
+            updated_at="2026-07-05T09:00:00+00:00",
+            created_by="neil",
+            messages=(),
+        )
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+    monkeypatch.setattr(cockpit_api_module, "MemoryClient", lambda _cfg: memory)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.delete(f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}")
+        listed = await client.get(f"{base}/v1/projects/neil-shared/threads?include_archived=true")
+
+        assert response.status_code == 200
+        assert response.json()["deleted"] is True
+        assert response.json()["reclamation"]["memory_sessions"] == 0
+        assert response.json()["reclamation"]["notes"] == ["memory session already absent"]
+        assert listed.json()["threads"] == []
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+    assert memory.deleted_sessions == []
+
+
 def test_cockpit_thread_archive_non_member_gets_404(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)
@@ -4287,6 +4332,45 @@ def test_cockpit_delete_session_prunes_worker_and_is_idempotent(tmp_path, monkey
 
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id), http_delete=delete))
     assert len(deletes) == 1
+
+
+def test_cockpit_delete_empty_worker_only_session_marks_deleted(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    ref = make_session_ref("macbook-worker", "worker_only_empty")
+    store.record_session_refs(
+        [
+            {
+                "session_ref": ref,
+                "worker_id": "macbook-worker",
+                "session_id": "worker_only_empty",
+            }
+        ]
+    )
+
+    def delete(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions/worker_only_empty"):
+            return Response({"error": "not found"}, status_code=404)
+        raise AssertionError(url)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        first = await client.delete(f"{base}/v1/sessions/{ref}")
+        second = await client.delete(f"{base}/v1/sessions/{ref}")
+        detail = await client.get(f"{base}/v1/sessions/{ref}")
+
+        assert first.status_code == 200
+        assert first.json()["deleted"] is True
+        assert first.json()["reclamation"]["records"] == 0
+        assert first.json()["reclamation"]["events"] == 0
+        assert first.json()["reclamation"]["worktrees"] == 0
+        assert second.status_code == 200
+        assert second.json()["deleted"] is False
+        assert detail.json()["deleted"] is True
+        assert detail.json()["session"]["status"] == "deleted"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get("run_missing"), http_delete=delete))
 
 
 def test_cockpit_delete_run_deletes_owned_sessions_and_records(tmp_path, monkeypatch) -> None:  # noqa: ANN001
