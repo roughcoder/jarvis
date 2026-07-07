@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import shutil
 import threading
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -233,6 +234,12 @@ class SessionManager:
             session.updated_at = utc_now()
             self.save(session)
             return session
+
+    def delete(self, session_id: str) -> None:
+        with self._lock:
+            directory = self.session_dir(session_id)
+            if directory.exists():
+                shutil.rmtree(directory)
 
     def append_event(self, session_id: str, event_type: str, data: dict[str, Any] | None = None) -> SessionEvent:
         with self._lock:

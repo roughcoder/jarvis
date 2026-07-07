@@ -65,6 +65,7 @@ from jarvis.worker_session_contract import (
     EVENT_INPUT_RECEIVED,
     EVENT_SESSION_INTERRUPTED,
     EVENT_SESSION_STOPPED,
+    EVENT_TURN_STARTED,
     EVENT_TURN_FAILED,
     EVENT_PROVISIONING_PROGRESS,
     SESSION_FAILED,
@@ -290,6 +291,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             branch = None
             resolved = ""
             cleanup_owned = True
+            provisioning: list[dict[str, Any]] = []
             if args.get("cwd") and resume_session:
                 if not session_id:
                     return web.json_response({"ok": False, "error": "resume cwd requires session_id"}, status=400)
@@ -302,8 +304,6 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             elif args.get("repo"):
                 # Resolve the repo name to a real path (clone it if missing) before
                 # isolating it on a fresh worktree branch — never the user's checkout.
-                provisioning: list[dict[str, Any]] = []
-
                 def collect(phase: str, status: str = "started", **data: Any) -> None:
                     provisioning.append({"phase": phase, "status": status, **data})
 
@@ -458,7 +458,11 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             WorkerSessionAuthority.for_session_create(body or {})
             session_id = str((body or {}).get("session_id") or "").strip()
             if session_id and sessions.session_path(session_id).exists():
-                raise ValueError(f"worker session already exists: {session_id}")
+                existing = sessions.get(session_id)
+                if existing is not None and _failed_unstarted_provisioning_session(existing, sessions):
+                    sessions.delete(session_id)
+                else:
+                    raise ValueError(f"worker session already exists: {session_id}")
             if (body or {}).get("cwd"):
                 cwd, err = _worker_owned_cwd(str((body or {}).get("cwd") or ""), workspace)
                 if err:
@@ -991,6 +995,18 @@ async def _provision_session_if_requested(
         metadata=metadata,
     )
     return updated, events
+
+
+def _failed_unstarted_provisioning_session(session: WorkerSession, sessions: SessionManager) -> bool:
+    if session.status != SESSION_FAILED:
+        return False
+    events = sessions.events(session.session_id)
+    if any(event.type == EVENT_TURN_STARTED for event in events):
+        return False
+    return any(
+        event.type == EVENT_PROVISIONING_PROGRESS and event.data.get("status") == "failed"
+        for event in events
+    )
 
 
 async def _provision_worktree(

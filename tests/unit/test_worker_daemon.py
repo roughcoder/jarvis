@@ -3230,6 +3230,34 @@ def test_daemon_resume_rejects_cwd_outside_worker_workspace(tmp_path) -> None:
     assert "refusing to resume outside worker-owned workspace" in response.json()["error"]
 
 
+def test_daemon_resume_code_with_repo_returns_empty_provisioning(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"), codex_bin="echo")
+    cwd = pathlib.Path(_owned_worker_cwd(tmp_path, "resume-run"))
+
+    async def calls(base, c):  # noqa: ANN001
+        response = await c.post(
+            base + "/run",
+            json={
+                "action": "code",
+                "args": {
+                    "prompt": "follow up",
+                    "agent": "codex",
+                    "session_id": "550e8400-e29b-41d4-a716-446655440001",
+                    "resume_session": True,
+                    "cwd": str(cwd),
+                    "repo": "roughcoder/jarvis",
+                },
+            },
+        )
+        return response.status_code, response.json()
+
+    status, data = asyncio.run(_with_server(cfg, 8836, calls))
+
+    assert status == 200
+    assert data["ok"] is True
+    assert data["provisioning"] == []
+
+
 def test_daemon_rejects_unsupported_code_engine(tmp_path) -> None:
     cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"), codex_bin="echo")
 
@@ -3528,6 +3556,52 @@ def test_session_provisioning_warm_fetch_failure_warns_and_dispatches(tmp_path, 
         if event["type"] == "provisioning.progress" and event["data"].get("status") == "completed"
     ]
     assert phases == ["resolving-access", "cloning", "creating-worktree"]
+
+
+def test_session_provisioning_failed_unstarted_session_can_retry(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    dev = tmp_path / "dev"
+    dev.mkdir()
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="",
+        workspace=str(tmp_path / "ws"),
+        repo_root=str(dev),
+        clone_missing=False,
+    )
+
+    def fake_probe(repo_ref, *, timeout_s, ttl_s):  # noqa: ANN001, ANN202
+        return {"repo": repo_ref, "accessible": True, "public": False, "reason_code": "accessible"}
+
+    monkeypatch.setattr("jarvis.worker.server.probe_repo_access", fake_probe)
+    body = {
+        "session_id": "sess_retry_provision",
+        "provider": "fake",
+        "engine": "fake",
+        "repo": "roughcoder/missing",
+        "metadata": {
+            **_authority_metadata("fake"),
+            "provision_workspace": True,
+        },
+    }
+
+    async def calls(base, c):  # noqa: ANN001
+        first = await c.post(base + "/sessions", json=body)
+        repo = dev / "missing"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "--allow-empty", "-qm", "init"], cwd=repo, check=True)
+        second = await c.post(base + "/sessions", json=body)
+        events = (await c.get(base + "/sessions/sess_retry_provision/events")).json()["events"]
+        return first.status_code, first.json(), second.status_code, second.json(), events
+
+    first_status, first, second_status, second, events = asyncio.run(_with_server(cfg, 8837, calls))
+
+    assert first_status == 400
+    assert first["session"]["status"] == "failed"
+    assert second_status == 200
+    assert second["ok"] is True
+    assert pathlib.Path(second["session"]["cwd"]).exists()
+    assert [event["type"] for event in events].count("session.created") == 1
 
 
 def test_git_ls_remote_access_probe_does_not_claim_private_repo_is_public(monkeypatch) -> None:  # noqa: ANN001

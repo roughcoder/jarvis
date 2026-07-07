@@ -596,10 +596,9 @@ def _reason_code(reason: str) -> str:
 def _repo_access_summary(worker: WorkerProfile, repo: str) -> dict[str, Any] | None:
     if not repo:
         return None
-    repo_name = repo.rsplit("/", 1)[-1]
     for row in worker.repo_access:
         candidate = str(row.get("repo") or "")
-        if candidate in {repo, repo_name} or candidate.rsplit("/", 1)[-1] == repo_name:
+        if _repo_ref_matches_access_row(repo, candidate):
             return {
                 "repo": candidate or repo,
                 "accessible": bool(row.get("accessible")),
@@ -609,6 +608,20 @@ def _repo_access_summary(worker: WorkerProfile, repo: str) -> dict[str, Any] | N
                 "cached": bool(row.get("cached")),
             }
     return None
+
+
+def _repo_ref_matches_access_row(requested: str, candidate: str) -> bool:
+    if not candidate:
+        return False
+    if _is_owner_name_ref(requested):
+        return candidate == requested
+    repo_name = requested.rsplit("/", 1)[-1]
+    return candidate in {requested, repo_name} or candidate.rsplit("/", 1)[-1] == repo_name
+
+
+def _is_owner_name_ref(value: str) -> bool:
+    text = str(value or "").strip()
+    return text.count("/") == 1 and not text.startswith(("http://", "https://", "git@"))
 
 
 def _selection_warnings(rows: list[dict[str, Any]], command: WorkCommand) -> list[dict[str, str]]:

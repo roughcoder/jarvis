@@ -49,7 +49,7 @@ class WorkerRegistry:
         return next((p for p in profiles if p.worker_id == worker_id), None)
 
     def with_repo_access(self, profiles: list[WorkerProfile], repo: str) -> list[WorkerProfile]:
-        if not repo:
+        if not repo or not _should_probe_repo_access(repo):
             return profiles
         return [self._probe_repo_access(profile, repo) for profile in profiles]
 
@@ -386,12 +386,36 @@ def _safe_mount(raw: Any) -> str | None:
 
 
 def _repo_access_row(profile: WorkerProfile, repo: str) -> dict[str, Any] | None:
-    repo_name = repo.rsplit("/", 1)[-1]
     for row in profile.repo_access:
         candidate = str(row.get("repo") or "")
-        if candidate in {repo, repo_name} or candidate.rsplit("/", 1)[-1] == repo_name:
+        if _repo_ref_matches_access_row(repo, candidate):
             return row
     return None
+
+
+def _should_probe_repo_access(repo_ref: str) -> bool:
+    text = str(repo_ref or "").strip()
+    if not text:
+        return False
+    if pathlib.Path(text).expanduser().is_absolute():
+        return False
+    if text.startswith(("http://", "https://", "git@")):
+        return "github.com" in text
+    return text.count("/") == 1
+
+
+def _repo_ref_matches_access_row(requested: str, candidate: str) -> bool:
+    if not candidate:
+        return False
+    if _is_owner_name_ref(requested):
+        return candidate == requested
+    repo_name = requested.rsplit("/", 1)[-1]
+    return candidate in {requested, repo_name} or candidate.rsplit("/", 1)[-1] == repo_name
+
+
+def _is_owner_name_ref(value: str) -> bool:
+    text = str(value or "").strip()
+    return text.count("/") == 1 and not text.startswith(("http://", "https://", "git@"))
 
 
 def _string_or_none(value: Any) -> str | None:

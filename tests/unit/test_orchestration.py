@@ -1002,6 +1002,122 @@ def test_orchestration_validate_reports_repo_access_probe_failure(tmp_path, monk
     assert row["repo_access"]["reason_code"] == "repo-access-probe-failed"
 
 
+def test_orchestration_repo_access_cache_matches_owner_name_exactly(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    workers_path = tmp_path / "workers.json"
+    workers_path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "local-worker",
+                        "display_name": "Local",
+                        "base_url": "http://worker.test",
+                        "capabilities": ["git", "codex"],
+                        "status": "online",
+                        "supported_engines": ["codex"],
+                        "repo_access": [{"repo": "org-a/foo", "accessible": True, "reason_code": "accessible"}],
+                    }
+                ]
+            }
+        )
+    )
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                f"ORCHESTRATION_WORKERS_PATH={workers_path}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+
+    def repo_access_probe(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {
+                "access": {
+                    "repo": "org-b/foo",
+                    "accessible": False,
+                    "public": False,
+                    "reason_code": "identity-lacks-repo-access",
+                }
+            },
+        )
+
+    monkeypatch.setattr("jarvis.orchestration.workers.httpx.post", repo_access_probe)
+    cfg = load_config()
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"worker.job.start", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: None,
+    )
+
+    validation = service.validate_work(
+        WorkCommand("start_next_work", source="manual"),
+        manual_item=WorkItem(source="manual", id="manual", title="Manual", repo="org-b/foo"),
+    )
+
+    row = validation["compatibility"]["workers"][0]
+    assert validation["can_start"] is False
+    assert row["repo_access"]["repo"] == "org-b/foo"
+    assert row["reason_codes"] == ["identity-lacks-repo-access"]
+
+
+def test_orchestration_bare_repo_name_uses_checkout_without_access_probe(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    workers_path = tmp_path / "workers.json"
+    workers_path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "local-worker",
+                        "display_name": "Local",
+                        "base_url": "http://worker.test",
+                        "capabilities": ["git", "codex"],
+                        "status": "online",
+                        "supported_engines": ["codex"],
+                        "repositories": [{"repo": "polymarket", "status": "ready", "default_branch": "main"}],
+                    }
+                ]
+            }
+        )
+    )
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                f"ORCHESTRATION_WORKERS_PATH={workers_path}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+    monkeypatch.setattr(
+        "jarvis.orchestration.workers.httpx.post",
+        lambda *_args, **_kwargs: pytest.fail("bare local repo names must not use repo_access probes"),
+    )
+    cfg = load_config()
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"worker.job.start", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: None,
+    )
+
+    validation = service.validate_work(
+        WorkCommand("start_next_work", source="manual"),
+        manual_item=WorkItem(source="manual", id="manual", title="Manual", repo="polymarket"),
+    )
+
+    assert validation["can_start"] is True
+    assert validation["compatibility"]["workers"][0]["repo_access"] is None
+    assert validation["compatibility"]["workers"][0]["reason_codes"] == ["selected"]
+
+
 def test_orchestration_validate_warns_when_requested_worker_lacks_access_but_other_has_it(
     tmp_path, monkeypatch
 ) -> None:  # noqa: ANN001
