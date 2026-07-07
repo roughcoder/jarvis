@@ -493,6 +493,9 @@ class WorkerConfig(_Base):
     # HTTP request body ceiling. Must fit turn attachments after base64
     # encoding (the cockpit's per-turn budget is ~28 MiB at its defaults).
     max_request_bytes: int = 32 * 1024 * 1024
+    # Durable project-conversation workspaces live here. Empty means
+    # "<worker.workspace>/conversations"; set an absolute path to move the cache.
+    conversation_workspace_root: str = ""
     # Where the user's git repos live, so a job can name a repo ("polymarket")
     # instead of an absolute path. Empty = names must be absolute paths.
     repo_root: str = ""
@@ -1051,6 +1054,8 @@ class Config:
             "worker.agent": self.worker.agent,
             "worker.supported_engines": self.worker.supported_engines or "<default agent only>",
             "worker.workspace": self.worker.workspace,
+            "worker.max_request_bytes": self.worker.max_request_bytes,
+            "worker.conversation_workspace_root": self.worker.conversation_workspace_root or "<worker.workspace>/conversations",
             "worker.repo_root": self.worker.repo_root or "<unset>",
             "worker.repo_access_probe_timeout_s": self.worker.repo_access_probe_timeout_s,
             "worker.repo_access_ttl_s": self.worker.repo_access_ttl_s,

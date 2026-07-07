@@ -60,6 +60,13 @@ from jarvis.worker.actions import (
 from jarvis.worker.jobs import JobManager, slugify
 from jarvis.worker.providers import ProviderTurn, provider_for
 from jarvis.worker.sessions import SessionManager, WorkerSession
+from jarvis.worker.workspaces import (
+    conversation_workspace_root,
+    ensure_workspace,
+    get_workspace,
+    materialize_worktree,
+    remove_worktree,
+)
 from jarvis.system_info import system_info_cached
 from jarvis.worker_session_contract import (
     CHECKPOINT_ID_KEY,
@@ -191,6 +198,8 @@ def _attachment_summaries(attachments: list[dict[str, Any]]) -> list[dict[str, A
 
 def make_app(cfg: WorkerConfig) -> web.Application:
     workspace = _worker_workspace(cfg)
+    conversation_root = conversation_workspace_root(cfg, workspace)
+    conversation_root.mkdir(parents=True, exist_ok=True)
     # Persist jobs to disk under the workspace so they survive a daemon restart.
     jobs = JobManager(store_dir=str(workspace / "jobs"))
     sessions = SessionManager(store_dir=str(workspace / "sessions"))
@@ -467,7 +476,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 else:
                     raise ValueError(f"worker session already exists: {session_id}")
             if (body or {}).get("cwd"):
-                cwd, err = _worker_owned_cwd(str((body or {}).get("cwd") or ""), workspace)
+                cwd, err = _worker_owned_cwd(str((body or {}).get("cwd") or ""), workspace, conversation_root=conversation_root)
                 if err:
                     raise ValueError(err)
                 body["cwd"] = cwd
@@ -481,7 +490,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             return web.json_response({"ok": False, "error": "bad json"}, status=400)
         events = [event.to_dict()]
         try:
-            session, provisioning_events = await _provision_session_if_requested(session, body or {}, cfg, workspace, sessions)
+            session, provisioning_events = await _provision_session_if_requested(session, body or {}, cfg, workspace, sessions, conversation_root=conversation_root)
             events.extend(event.to_dict() for event in provisioning_events)
         except ValueError as exc:
             failed = sessions.update_status(session.session_id, SESSION_FAILED)
@@ -551,6 +560,72 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             return web.json_response({"error": "no such session"}, status=404)
         return web.json_response({"checkpoints": sessions.checkpoints(session_id)})
 
+    async def create_conversation_workspace(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            body = await request.json()
+            conversation_id = str(body.get("conversation_id") or "").strip()
+            if not conversation_id:
+                return web.json_response({"ok": False, "error": "conversation_id is required"}, status=400)
+            workspace_state = ensure_workspace(
+                root=conversation_root,
+                conversation_id=conversation_id,
+                metadata=dict(body.get("metadata") or {}),
+            )
+        except (OSError, ValueError) as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        except Exception:
+            return web.json_response({"ok": False, "error": "bad json"}, status=400)
+        return web.json_response({"ok": True, "workspace": workspace_state})
+
+    async def get_conversation_workspace(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            workspace_state = get_workspace(conversation_root, request.match_info["conversation_id"])
+        except FileNotFoundError:
+            return web.json_response({"error": "no such conversation workspace"}, status=404)
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        return web.json_response({"ok": True, "workspace": workspace_state})
+
+    async def create_conversation_worktree(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            body = await request.json()
+            repo = str(body.get("repo") or "").strip()
+            if not repo:
+                return web.json_response({"ok": False, "error": "repo is required"}, status=400)
+            workspace_state = await materialize_worktree(
+                cfg=cfg,
+                root=conversation_root,
+                conversation_id=request.match_info["conversation_id"],
+                repo_ref=repo,
+                repo_name=str(body.get("name") or ""),
+                base_ref=str(body.get("base_ref") or ""),
+            )
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        except Exception:
+            return web.json_response({"ok": False, "error": "bad json"}, status=400)
+        return web.json_response({"ok": True, "workspace": workspace_state})
+
+    async def delete_conversation_worktree(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            workspace_state = await remove_worktree(
+                cfg=cfg,
+                root=conversation_root,
+                conversation_id=request.match_info["conversation_id"],
+                repo_name=request.match_info["repo_name"],
+            )
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        return web.json_response({"ok": True, "workspace": workspace_state})
+
     async def restore_session_checkpoint(request: web.Request) -> web.Response:
         if not authorised(request):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -599,7 +674,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         authority_error = _require_session_control_authority(session, WORKER_SESSION_TURN, body)
         if authority_error is not None:
             return authority_error
-        cwd_error = _session_cwd_error(session, workspace)
+        cwd_error = _session_cwd_error(session, workspace, conversation_root)
         if cwd_error:
             return web.json_response({"ok": False, "error": cwd_error}, status=400)
         turn_id = _clean_request_id(body.get("turn_id") or uuid.uuid4().hex, "turn")
@@ -816,6 +891,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             "supported_engines": supported_engines,
             "engine_supports": _engine_supports(supported_engines),
             "workspace": str(workspace),
+            "conversation_workspace_root": str(conversation_root),
             "repo_root_configured": bool(cfg.repo_root),
             "browser_enabled": browser_cfg.enabled,
             "gui_provider_configured": bool(cfg.peekaboo_ai_providers),
@@ -884,6 +960,10 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         web.post("/sessions", create_session),
         web.get("/sessions", list_sessions),
         web.get("/sessions/requests", list_session_requests),
+        web.post("/conversation-workspaces", create_conversation_workspace),
+        web.get("/conversation-workspaces/{conversation_id}", get_conversation_workspace),
+        web.post("/conversation-workspaces/{conversation_id}/worktrees", create_conversation_worktree),
+        web.delete("/conversation-workspaces/{conversation_id}/worktrees/{repo_name}", delete_conversation_worktree),
         web.get("/sessions/{id}/events", get_session_events),
         web.get("/sessions/{id}/requests", get_session_requests),
         web.get("/sessions/{id}/checkpoints", get_session_checkpoints),
@@ -1047,12 +1127,13 @@ async def _provision_session_if_requested(
     cfg: WorkerConfig,
     workspace: pathlib.Path,
     sessions: SessionManager,
+    conversation_root: pathlib.Path | None = None,
 ) -> tuple[WorkerSession, list[Any]]:
     data = dict(body)
     metadata = dict(data.get("metadata") or {})
     envelope = metadata.get("execution_envelope")
     if data.get("cwd"):
-        cwd, err = _worker_owned_cwd(str(data.get("cwd") or ""), workspace)
+        cwd, err = _worker_owned_cwd(str(data.get("cwd") or ""), workspace, conversation_root=conversation_root)
         if err:
             raise ValueError(err)
         return sessions.update_workspace(session.session_id, cwd=cwd), []
@@ -1169,9 +1250,19 @@ def _resume_cwd(cwd: str, workspace: pathlib.Path) -> tuple[str, str]:
     return _worker_owned_cwd(cwd, workspace, action="resume")
 
 
-def _worker_owned_cwd(cwd: str, workspace: pathlib.Path, *, action: str = "session") -> tuple[str, str]:
+def _worker_owned_cwd(
+    cwd: str,
+    workspace: pathlib.Path,
+    *,
+    conversation_root: pathlib.Path | None = None,
+    action: str = "session",
+) -> tuple[str, str]:
     path = pathlib.Path(cwd).expanduser().resolve(strict=False)
-    allowed_roots = [(workspace / "runs").resolve(), (workspace / "worktrees").resolve()]
+    allowed_roots = [
+        (workspace / "runs").resolve(),
+        (workspace / "worktrees").resolve(),
+        (conversation_root or workspace / "conversations").resolve(),
+    ]
     if not any(path.is_relative_to(root) for root in allowed_roots):
         return "", f"refusing to {action} outside worker-owned workspace: {cwd}"
     if not path.is_dir():
@@ -1179,12 +1270,17 @@ def _worker_owned_cwd(cwd: str, workspace: pathlib.Path, *, action: str = "sessi
     return str(path), ""
 
 
-def _session_cwd_error(session: WorkerSession, workspace: pathlib.Path) -> str:
+def _session_cwd_error(session: WorkerSession, workspace: pathlib.Path, conversation_root: pathlib.Path) -> str:
     if session.provider not in {"codex", "claude"}:
         return ""
     if not session.cwd:
         return f"worker session cwd is required for {session.provider} provider turns"
-    _cwd, err = _worker_owned_cwd(session.cwd, workspace, action="start provider turn")
+    _cwd, err = _worker_owned_cwd(
+        session.cwd,
+        workspace,
+        conversation_root=conversation_root,
+        action="start provider turn",
+    )
     return err
 
 

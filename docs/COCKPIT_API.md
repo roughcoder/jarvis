@@ -746,11 +746,36 @@ for the project. Archived threads are hidden by default; pass
       "created_by": "neil",
       "archived_at": "",
       "archived_by": "",
-      "archive_reason": ""
+      "archive_reason": "",
+      "workspace": {
+        "worker_id": "macbook-worker",
+        "session_id": "conv_thread_...",
+        "engine": "codex",
+        "workspace_id": "jarvis-thread-...",
+        "root_label": "jarvis-thread-...",
+        "cwd_label": "jarvis-thread-...",
+        "status": "ready",
+        "provision_phase": "running",
+        "worktrees": [
+          {
+            "name": "runtime",
+            "repo": "roughcoder/jarvis",
+            "path_label": "runtime",
+            "branch": "jarvis/jarvis-thread-runtime",
+            "base_ref": "origin/main",
+            "status": "ready",
+            "provision_phase": "running"
+          }
+        ]
+      }
     }
   ]
 }
 ```
+
+`workspace` is present only after the thread has escalated. It is a redacted
+projection: local absolute paths remain worker/private state and are represented
+only by labels.
 
 Thread enrichment fields (on list, detail, open, turn, archive, and rename
 responses alike):
@@ -762,8 +787,9 @@ responses alike):
 - `model` is the LLM gateway route the thread's turns use (a LiteLLM route
   name such as `fast`, not a provider model id).
 - `worker_id` is `null` and `host` is the brain host: thread turns execute on
-  the brain. `worker_id` will populate when a thread is linked to a worker
-  session (the orchestration chat tree).
+  the brain while the thread is planning-only. Once a thread escalates to a
+  workspace, the nested `workspace.worker_id` and `workspace.session_id`
+  identify the worker provider session.
 - `status` is `created` (no turns yet), `running` (a turn is in flight),
   `completed` (last turn finished), or `failed` (last turn errored; the live
   `running`/`failed` states are process-local and revert to the durable
@@ -857,6 +883,20 @@ Thread open response:
 {"text": "What should we build next?"}
 ```
 
+To escalate the thread into a workspace-backed provider session, include a
+`workspace` object. `repos` may be repo names from the project registry or full
+remote refs; omitted repos materialize the project default repo when one exists.
+
+```json
+{
+  "text": "Inspect the runtime repo and summarize the failing tests.",
+  "workspace": {
+    "repos": [{"name": "runtime", "base_ref": "origin/main"}],
+    "engine": "codex"
+  }
+}
+```
+
 and returns `text/event-stream` frames:
 
 ```text
@@ -888,10 +928,14 @@ The `thread.reply` and `thread.turn.done` payload shape is:
 }
 ```
 
-The turn is driven by the shared `BrainSession.respond_text` core under the
-requester's capabilities with the active project set. Context is assembled live
-at turn start from the registry entry, live/cached project representation,
-recent `finding`/`decision` conclusions, and the recent thread transcript.
+Until escalation, the turn is driven by the shared `BrainSession.respond_text`
+core under the requester's capabilities with the active project set. Context is
+assembled live at turn start from the registry entry, live/cached project
+representation, recent `finding`/`decision` conclusions, and the recent thread
+transcript. The prompt explicitly labels the thread as planning-only, so Jarvis
+must not claim to inspect repository files before a workspace exists. After
+escalation, the thread keeps the same Honcho session and transcript, but turns
+are sent to the worker provider session with the conversation workspace as cwd.
 Turns on archived threads are rejected before streaming starts:
 
 ```json

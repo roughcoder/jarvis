@@ -2622,6 +2622,152 @@ def test_cockpit_thread_turn_streams_reply_and_writes_lane1_attribution(tmp_path
     assert "Live project representation:\nlive shared context" in system_prompt
 
 
+def test_cockpit_thread_turn_labels_unescalated_chat_as_planning_only(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory(cached="cached shared context", live="live shared context")
+    gateway = FakeGateway(["We need to escalate before I can inspect files."])
+    connector = CockpitConnector(cfg, memory=memory, gateway=gateway, tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Plan"})
+        thread = opened.json()["thread"]
+        response = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "What should we plan first?"},
+        )
+        events = _sse_events(response.text)
+
+        assert response.status_code == 200
+        assert events[-1]["_event"] == "thread.turn.done"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    system_prompt = gateway.messages[0][0]["content"]
+    assert "Conversation workspace: planning-only" in system_prompt
+    assert "do not claim to inspect repository files" in system_prompt
+
+
+def test_cockpit_thread_escalates_to_workspace_without_losing_thread_history(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    gateway = FakeGateway(["Planning reply."])
+    state: dict[str, Any] = {"posts": [], "worktrees": []}
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        if url.endswith("/health"):
+            return Response(
+                {
+                    "ok": True,
+                    "agent": "codex",
+                    "default_engine": "codex",
+                    "supported_engines": ["codex", "claude"],
+                    "engine_supports": {"codex": {"streaming": True}},
+                    "repositories": [{"repo": "notes", "status": "ready"}],
+                }
+            )
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions"):
+            return Response({"sessions": []})
+        if "/sessions/" in url:
+            return Response({"session_id": "conv_thread", "provider": "codex", "engine": "codex", "status": "created"})
+        return Response({})
+
+    def worker_post(url: str, json: dict[str, Any], **_kwargs: Any) -> Response:  # noqa: A002
+        state["posts"].append({"url": url, "json": json})
+        workspace = {
+            "workspace_id": "neil-shared-thread",
+            "conversation_id": "neil-shared-thread",
+            "root": str(tmp_path / "worker" / "conversations" / "neil-shared-thread"),
+            "root_label": "neil-shared-thread",
+            "cwd_label": "neil-shared-thread",
+            "status": "ready",
+            "provision_phase": "running",
+            "worktrees": list(state["worktrees"]),
+            "created_at": "2026-07-07T00:00:00+00:00",
+            "updated_at": "2026-07-07T00:00:00+00:00",
+        }
+        if url.endswith("/conversation-workspaces"):
+            return Response({"ok": True, "workspace": workspace})
+        if url.endswith("/worktrees"):
+            state["worktrees"].append(
+                {
+                    "name": json["name"],
+                    "repo": json["repo"],
+                    "path": str(tmp_path / "worker" / "conversations" / "neil-shared-thread" / "repos" / json["name"]),
+                    "path_label": json["name"],
+                    "branch": "jarvis/neil-shared-thread-notes",
+                    "base_ref": "",
+                    "status": "ready",
+                    "provision_phase": "running",
+                }
+            )
+            workspace["worktrees"] = list(state["worktrees"])
+            return Response({"ok": True, "workspace": workspace})
+        if url.endswith("/sessions"):
+            return Response({"ok": True, "session": {**json, "status": "created"}, "event": {"event_id": "ev_create"}})
+        if url.endswith("/turns"):
+            return Response({"ok": True, "session": {"session_id": "conv_thread", "status": "running"}, "events": []})
+        return Response({"ok": False, "error": "unexpected worker post"}, status_code=400)
+
+    connector = CockpitConnector(
+        cfg,
+        memory=memory,
+        gateway=gateway,
+        tts=None,
+        tracer=None,
+        worker_get=worker_get,
+        worker_post=worker_post,
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Plan"})
+        thread = opened.json()["thread"]
+        first = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "Plan the rollout."},
+        )
+        second = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "Inspect the notes repo.", "workspace": {"repos": ["notes"]}},
+        )
+        listed = await client.get(f"{base}/v1/projects/neil-shared/threads")
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        done = [event for event in _sse_events(second.text) if event["_event"] == "thread.turn.done"][-1]
+        workspace = done["payload"]["thread"]["workspace"]
+        assert workspace["worker_id"] == "macbook-worker"
+        assert workspace["session_id"].startswith("conv_thread")
+        assert workspace["worktrees"][0]["name"] == "notes"
+        assert "root" not in workspace
+        assert listed.json()["threads"][0]["workspace"]["cwd_label"] == "neil-shared-thread"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    assert [message["content"] for message in memory.messages] == [
+        "Plan the rollout.",
+        "Planning reply.",
+        "Inspect the notes repo.",
+        "Workspace turn started.",
+    ]
+    stored = connector.index.list("neil-shared", include_archived=True)[0]
+    with_messages = connector.index.get_with_messages("neil-shared", stored.thread_id)
+    assert with_messages is not None
+    assert len(with_messages.messages) == 4
+    turn_posts = [call for call in state["posts"] if call["url"].endswith("/turns")]
+    assert turn_posts
+    assert "Honcho session: project:neil-shared:orchestrator:" in turn_posts[0]["json"]["prompt"]
+
+
 def test_cockpit_thread_turn_records_decision_only_through_lane2_tool(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(
         tmp_path,

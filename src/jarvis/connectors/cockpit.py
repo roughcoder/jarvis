@@ -10,14 +10,19 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import os
 import tempfile
 import threading
-from dataclasses import dataclass, replace
+from collections.abc import Callable
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+import httpx
+
+from jarvis.capabilities import WORKER_SESSION_CREATE, WORKER_SESSION_STOP, WORKER_SESSION_TURN
 from jarvis.brain.capabilities import RequestContext
 from jarvis.brain.background import BackgroundRunner
 from jarvis.brain.contexts import ActiveProject, ContextStore
@@ -41,9 +46,11 @@ from jarvis.ids import new_id, utc_now
 from jarvis.orchestration.models import WorkCommand, WorkItem
 from jarvis.orchestration.service import StartedWork, OrchestrationService
 from jarvis.orchestration.redaction import public_error_message
+from jarvis.orchestration.workers import WorkerRegistry, worker_token_value
 from jarvis.tools import build_registry
 from jarvis.tools.background import make_background_tool
 from jarvis.tools.base import Tool
+from jarvis.text import slugify
 from jarvis.users import load_users
 
 
@@ -68,6 +75,7 @@ class CockpitThread:
     archive_reason: str = ""
     last_turn_at: str = ""
     messages: tuple[dict[str, str], ...] = ()
+    workspace: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], *, include_messages: bool = True) -> "CockpitThread":
@@ -85,6 +93,7 @@ class CockpitThread:
             archive_reason=str(data.get("archive_reason") or ""),
             last_turn_at=str(data.get("last_turn_at") or ""),
             messages=tuple(_normalized_messages(data.get("messages") or ())) if include_messages else (),
+            workspace=dict(data.get("workspace") or {}),
         )
 
     def as_dict(self, *, include_messages: bool = False) -> dict[str, Any]:
@@ -104,6 +113,8 @@ class CockpitThread:
         }
         if include_messages:
             data["messages"] = [dict(message) for message in self.messages]
+        if self.workspace:
+            data["workspace"] = dict(self.workspace)
         return data
 
 
@@ -448,12 +459,16 @@ class CockpitConnector:
         gateway: Any | None = None,
         tts: Any | None = None,
         tracer: Any | None = None,
+        worker_post: Callable[..., Any] | None = None,
+        worker_get: Callable[..., Any] | None = None,
     ) -> None:
         self._cfg = cfg
         self._memory = memory or MemoryClient(cfg.memory)
         self._gateway = gateway
         self._tts = tts
         self._tracer = tracer or Tracer(cfg.trace)
+        self._worker_post = worker_post or httpx.post
+        self._worker_get = worker_get or httpx.get
         self._index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
 
     @property
@@ -525,11 +540,23 @@ class CockpitConnector:
         text: str,
         *,
         attachments: list[dict[str, Any]] | None = None,
+        workspace_request: dict[str, Any] | None = None,
+        progress: Callable[[dict[str, Any]], Any] | None = None,
     ) -> tuple[str, CockpitThread]:
         text = text.strip()
         if not text:
             raise ValueError("turn text is required")
         context_thread = self._index.get_with_messages(project.id, thread.thread_id, limit=THREAD_HISTORY_LIMIT) or thread
+        workspace_request = _workspace_request(project, text, workspace_request)
+        if context_thread.workspace or workspace_request:
+            return await self._workspace_turn(
+                project,
+                context_thread,
+                requester,
+                _text_with_attachment_markers(text, attachments),
+                workspace_request=workspace_request,
+                progress=progress,
+            )
         project_context = _project_context(self._memory, project, context_thread)
         view = CockpitMemoryView(
             self._memory,
@@ -575,6 +602,250 @@ class CockpitConnector:
             assistant_text=reply,
         )
         return reply, updated
+
+    async def _workspace_turn(
+        self,
+        project: ProjectEntry,
+        thread: CockpitThread,
+        requester: RequestContext,
+        text: str,
+        *,
+        workspace_request: dict[str, Any],
+        progress: Callable[[dict[str, Any]], Any] | None,
+    ) -> tuple[str, CockpitThread]:
+        if progress is not None:
+            progress({"phase": "resolving-access", "thread_id": thread.thread_id})
+        thread = await self._ensure_workspace(project, thread, requester, workspace_request=workspace_request, progress=progress)
+        worker_id = str(thread.workspace.get("worker_id") or "")
+        session_id = str(thread.workspace.get("session_id") or "")
+        if not worker_id or not session_id:
+            raise RuntimeError("conversation workspace has no worker session")
+        if progress is not None:
+            progress({"phase": "running", "thread_id": thread.thread_id, "workspace": _workspace_public(thread.workspace)})
+        turn = await asyncio.to_thread(
+            self._post_worker_json,
+            worker_id,
+            f"/sessions/{session_id}/turns",
+            {
+                "prompt": _workspace_prompt(project, thread, text),
+                "metadata": {
+                    "surface": "cockpit_thread",
+                    "project_id": project.id,
+                    "thread_id": thread.thread_id,
+                    "honcho_session_id": thread.session_id,
+                    "allowed_actions": [WORKER_SESSION_TURN],
+                },
+                "idempotency_key": f"thread-turn:{thread.thread_id}:{len(thread.messages)}:{_stable_text_hash(text)}",
+            },
+        )
+        if not turn.get("ok", True):
+            raise RuntimeError(str(turn.get("error") or "worker rejected conversation turn"))
+        reply = "Workspace turn started."
+        await asyncio.to_thread(
+            self._persist_turn,
+            thread.session_id,
+            requester.memory_peer,
+            requester.device_id,
+            text,
+            reply,
+        )
+        updated = self._index.append_turn(
+            thread,
+            user_peer_id=requester.memory_peer,
+            user_text=text,
+            assistant_peer_id=self._cfg.memory.assistant_peer_id,
+            assistant_text=reply,
+        )
+        return reply, updated
+
+    async def _ensure_workspace(
+        self,
+        project: ProjectEntry,
+        thread: CockpitThread,
+        requester: RequestContext,
+        *,
+        workspace_request: dict[str, Any],
+        progress: Callable[[dict[str, Any]], Any] | None,
+    ) -> CockpitThread:
+        state = dict(thread.workspace or {})
+        worker_id = str(state.get("worker_id") or workspace_request.get("worker_id") or "")
+        profile = WorkerRegistry(
+            self._cfg.worker,
+            profiles_path=self._cfg.orchestration.workers_path,
+            http_get=self._worker_get,
+        ).choose(
+            required=["git"],
+            preferred=[worker_id] if worker_id else None,
+            engine=str(workspace_request.get("engine") or ""),
+        )
+        if profile is None:
+            raise RuntimeError("no eligible worker found for conversation workspace")
+        worker_id = profile.worker_id
+        conversation_id = _conversation_workspace_id(project, thread)
+        thread = self._index.save(
+            replace(
+                thread,
+                workspace={
+                    **state,
+                    "worker_id": worker_id,
+                    "workspace_id": conversation_id,
+                    "provision_phase": "resolving-access",
+                    "status": "provisioning",
+                },
+            )
+        )
+        workspace = await asyncio.to_thread(
+            self._post_worker_json,
+            worker_id,
+            "/conversation-workspaces",
+            {
+                "conversation_id": conversation_id,
+                "metadata": {
+                    "project_id": project.id,
+                    "thread_id": thread.thread_id,
+                    "honcho_session_id": thread.session_id,
+                    "created_by": requester.memory_peer,
+                },
+            },
+        )
+        workspace_state = dict(workspace.get("workspace") or {})
+        thread = self._index.save(
+            replace(
+                thread,
+                workspace={
+                    **state,
+                    "worker_id": worker_id,
+                    **workspace_state,
+                },
+            )
+        )
+        repos = _workspace_repos(project, workspace_request)
+        for repo in repos:
+            thread = self._index.save(
+                replace(
+                    thread,
+                    workspace={
+                        **thread.workspace,
+                        "provision_phase": "cloning",
+                        "status": "provisioning",
+                    },
+                )
+            )
+            if progress is not None:
+                progress({"phase": "cloning", "thread_id": thread.thread_id, "repo": repo.get("name") or repo.get("repo")})
+            thread = self._index.save(
+                replace(
+                    thread,
+                    workspace={
+                        **thread.workspace,
+                        "provision_phase": "creating-worktree",
+                        "status": "provisioning",
+                    },
+                )
+            )
+            if progress is not None:
+                progress({"phase": "creating-worktree", "thread_id": thread.thread_id, "repo": repo.get("name") or repo.get("repo")})
+            materialized = await asyncio.to_thread(
+                self._post_worker_json,
+                worker_id,
+                f"/conversation-workspaces/{conversation_id}/worktrees",
+                repo,
+            )
+            workspace_state = dict(materialized.get("workspace") or workspace_state)
+            thread = self._index.save(
+                replace(
+                    thread,
+                    workspace={
+                        **thread.workspace,
+                        **workspace_state,
+                    },
+                )
+            )
+        session_id = str(state.get("session_id") or f"conv_{slugify(thread.thread_id)}")
+        engine = str(workspace_request.get("engine") or profile.default_engine or profile.agent or self._cfg.worker.agent)
+        await asyncio.to_thread(
+            self._ensure_worker_session,
+            worker_id,
+            session_id,
+            {
+                "session_id": session_id,
+                "provider": engine,
+                "engine": engine,
+                "cwd": str(workspace_state.get("root") or ""),
+                "title": thread.title or project.name,
+                "metadata": {
+                    "execution_envelope": {
+                        "run_id": thread.thread_id,
+                        "engine": engine,
+                        "allowed_actions": [WORKER_SESSION_CREATE, WORKER_SESSION_TURN, WORKER_SESSION_STOP],
+                        "landing": {"mode": "branch_only", "allow_merge": False},
+                    },
+                    "allowed_actions": [WORKER_SESSION_CREATE, WORKER_SESSION_TURN, WORKER_SESSION_STOP],
+                    "landing": {"mode": "branch_only", "allow_merge": False},
+                    "conversation_workspace": True,
+                    "workspace_id": workspace_state.get("workspace_id") or "",
+                    "project_id": project.id,
+                    "thread_id": thread.thread_id,
+                    "honcho_session_id": thread.session_id,
+                },
+            },
+        )
+        updated = replace(
+            thread,
+            workspace={
+                **state,
+                "worker_id": worker_id,
+                "session_id": session_id,
+                "engine": engine,
+                **workspace_state,
+            },
+        )
+        return self._index.save(updated)
+
+    def _ensure_worker_session(self, worker_id: str, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return self._post_worker_json(worker_id, "/sessions", body)
+        except RuntimeError as exc:
+            if "already exists" not in str(exc):
+                raise
+            return self._get_worker_json(worker_id, f"/sessions/{session_id}")
+
+    def _post_worker_json(self, worker_id: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        profile = WorkerRegistry(
+            self._cfg.worker,
+            profiles_path=self._cfg.orchestration.workers_path,
+            http_get=self._worker_get,
+        ).get(worker_id, probe=False)
+        if profile is None:
+            raise RuntimeError(f"worker {worker_id!r} is not configured")
+        response = self._worker_post(
+            f"{profile.base_url}{path}",
+            json=body,
+            headers=_worker_headers(self._cfg.worker, profile),
+            timeout=self._cfg.worker.request_timeout_s,
+        )
+        data = _json_response(response)
+        if getattr(response, "status_code", 200) >= 400 or data.get("ok") is False:
+            raise RuntimeError(str(data.get("error") or getattr(response, "text", "") or "worker request failed"))
+        return data
+
+    def _get_worker_json(self, worker_id: str, path: str) -> dict[str, Any]:
+        profile = WorkerRegistry(
+            self._cfg.worker,
+            profiles_path=self._cfg.orchestration.workers_path,
+            http_get=self._worker_get,
+        ).get(worker_id, probe=False)
+        if profile is None:
+            raise RuntimeError(f"worker {worker_id!r} is not configured")
+        response = self._worker_get(
+            f"{profile.base_url}{path}",
+            headers=_worker_headers(self._cfg.worker, profile),
+            timeout=self._cfg.worker.request_timeout_s,
+        )
+        data = _json_response(response)
+        if getattr(response, "status_code", 200) >= 400:
+            raise RuntimeError(str(data.get("error") or getattr(response, "text", "") or "worker request failed"))
+        return data
 
     def _make_session(
         self,
@@ -752,6 +1023,14 @@ def _project_context(memory: MemoryBackend, project: ProjectEntry, thread: Cockp
                 content = content[:799] + "..."
             history.append(f"- {role} ({peer}): {content}")
         parts.append("Recent orchestrator thread history:\n" + "\n".join(history))
+    if thread.workspace:
+        parts.append("Conversation workspace:\n" + json.dumps(_workspace_public(thread.workspace), sort_keys=True))
+    else:
+        parts.append(
+            "Conversation workspace: planning-only. No checkout is materialized for this "
+            "thread yet, so do not claim to inspect repository files. If code access is "
+            "needed, say that the conversation needs to escalate to a workspace first."
+        )
     return "\n\n".join(parts)
 
 
@@ -940,3 +1219,102 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+def _workspace_request(project: ProjectEntry, text: str, request: dict[str, Any] | None) -> dict[str, Any]:
+    if request:
+        return dict(request)
+    if project.repos and _looks_like_repo_work(text):
+        return {"escalate": True}
+    return {}
+
+
+def _looks_like_repo_work(text: str) -> bool:
+    lowered = text.lower()
+    triggers = ("repo", "repository", "code", "checkout", "worktree", "branch", "file", "grep", "diff", "test")
+    return any(trigger in lowered for trigger in triggers)
+
+
+def _workspace_repos(project: ProjectEntry, request: dict[str, Any]) -> list[dict[str, str]]:
+    raw = request.get("repos")
+    rows: list[dict[str, str]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str):
+                rows.append(_repo_payload(project, item, base_ref=str(request.get("base_ref") or "")))
+            elif isinstance(item, dict):
+                name = str(item.get("name") or item.get("repo") or "")
+                rows.append(_repo_payload(project, name, base_ref=str(item.get("base_ref") or request.get("base_ref") or "")))
+    if rows:
+        return rows
+    defaults = [repo for repo in project.repos if repo.default]
+    selected = defaults[:1] or list(project.repos[:1])
+    return [{"name": repo.name, "repo": repo.remote, "base_ref": str(request.get("base_ref") or "")} for repo in selected]
+
+
+def _repo_payload(project: ProjectEntry, name: str, *, base_ref: str = "") -> dict[str, str]:
+    match = next((repo for repo in project.repos if repo.name == name or repo.remote == name), None)
+    if match is not None:
+        return {"name": match.name, "repo": match.remote, "base_ref": base_ref}
+    return {"name": Path(name).name, "repo": name, "base_ref": base_ref}
+
+
+def _conversation_workspace_id(project: ProjectEntry, thread: CockpitThread) -> str:
+    return slugify(f"{project.id}-{thread.thread_id}")
+
+
+def _workspace_prompt(project: ProjectEntry, thread: CockpitThread, text: str) -> str:
+    workspace = _workspace_public(thread.workspace)
+    return (
+        f"Project: {project.name} ({project.id})\n"
+        f"Honcho session: {thread.session_id}\n"
+        f"Conversation workspace: {json.dumps(workspace, sort_keys=True)}\n\n"
+        f"User turn:\n{text}"
+    )
+
+
+def _workspace_public(workspace: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "worker_id": str(workspace.get("worker_id") or ""),
+        "session_id": str(workspace.get("session_id") or ""),
+        "engine": str(workspace.get("engine") or ""),
+        "workspace_id": str(workspace.get("workspace_id") or ""),
+        "root_label": str(workspace.get("root_label") or ""),
+        "cwd_label": str(workspace.get("cwd_label") or workspace.get("root_label") or ""),
+        "status": str(workspace.get("status") or ""),
+        "provision_phase": str(workspace.get("provision_phase") or ""),
+        "worktrees": [
+            {
+                "name": str(item.get("name") or ""),
+                "repo": str(item.get("repo") or ""),
+                "path_label": str(item.get("path_label") or ""),
+                "branch": str(item.get("branch") or ""),
+                "base_ref": str(item.get("base_ref") or ""),
+                "status": str(item.get("status") or ""),
+                "provision_phase": str(item.get("provision_phase") or ""),
+            }
+            for item in workspace.get("worktrees", [])
+            if isinstance(item, dict)
+        ],
+        "created_at": str(workspace.get("created_at") or ""),
+        "updated_at": str(workspace.get("updated_at") or ""),
+    }
+
+
+def _stable_text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _worker_headers(worker_cfg: Any, profile: Any) -> dict[str, str]:
+    token = worker_token_value(profile.token_env) if getattr(profile, "token_env", "") else ""
+    if not token and getattr(profile, "worker_id", "") == "local-worker":
+        token = worker_cfg.token.get_secret_value()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _json_response(response: Any) -> dict[str, Any]:
+    try:
+        data = response.json()
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}

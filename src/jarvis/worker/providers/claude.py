@@ -926,7 +926,16 @@ def _session_cwd(session: WorkerSession, worker_cfg: WorkerConfig) -> str:
 
 def _worker_owned_path(path: Path, worker_cfg: WorkerConfig) -> bool:
     workspace = Path(worker_cfg.workspace).expanduser().resolve(strict=False)
-    roots = [(workspace / "runs").resolve(strict=False), (workspace / "worktrees").resolve(strict=False)]
+    conversations = (
+        Path(worker_cfg.conversation_workspace_root).expanduser().resolve(strict=False)
+        if worker_cfg.conversation_workspace_root
+        else (workspace / "conversations").resolve(strict=False)
+    )
+    roots = [
+        (workspace / "runs").resolve(strict=False),
+        (workspace / "worktrees").resolve(strict=False),
+        conversations,
+    ]
     return any(path.is_relative_to(root) for root in roots)
 
 
