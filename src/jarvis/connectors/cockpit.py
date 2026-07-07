@@ -58,6 +58,7 @@ class CockpitThread:
     archived_at: str = ""
     archived_by: str = ""
     archive_reason: str = ""
+    last_turn_at: str = ""
     messages: tuple[dict[str, str], ...] = ()
 
     @classmethod
@@ -73,6 +74,7 @@ class CockpitThread:
             archived_at=str(data.get("archived_at") or ""),
             archived_by=str(data.get("archived_by") or ""),
             archive_reason=str(data.get("archive_reason") or ""),
+            last_turn_at=str(data.get("last_turn_at") or ""),
             messages=tuple(_normalized_messages(data.get("messages") or ())) if include_messages else (),
         )
 
@@ -88,6 +90,7 @@ class CockpitThread:
             "archived_at": self.archived_at,
             "archived_by": self.archived_by,
             "archive_reason": self.archive_reason,
+            "last_turn_at": self.last_turn_at,
         }
         if include_messages:
             data["messages"] = [dict(message) for message in self.messages]
@@ -194,6 +197,7 @@ class CockpitThreadIndex:
                 archived_at=archive_source.archived_at,
                 archived_by=archive_source.archived_by,
                 archive_reason=archive_source.archive_reason,
+                last_turn_at=observed_at,
                 messages=(),
             )
         )
@@ -370,6 +374,15 @@ class CockpitConnector:
     def unarchive_thread(self, project: ProjectEntry, thread_id: str) -> CockpitThread | None:
         return self._index.set_archived(project.id, thread_id, archived=False)
 
+    def rename_thread(self, project: ProjectEntry, thread_id: str, title: str) -> CockpitThread | None:
+        thread = self._index.get(project.id, thread_id)
+        if thread is None:
+            return None
+        title = " ".join(title.split())
+        if not title or title == thread.title:
+            return thread
+        return self._index.save(replace(thread, title=title[:200], updated_at=utc_now()))
+
     async def open_thread(
         self,
         project: ProjectEntry,
@@ -410,6 +423,8 @@ class CockpitConnector:
         thread: CockpitThread,
         requester: RequestContext,
         text: str,
+        *,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> tuple[str, CockpitThread]:
         text = text.strip()
         if not text:
@@ -433,24 +448,28 @@ class CockpitConnector:
             device_id=requester.device_id,
         )
         result = TurnResult()
-        reply = await session.respond_text(text, trace, result)
+        reply = await session.respond_text(text, trace, result, attachments=attachments)
         session.finalize(text, result, trace)
         await _drain_cold_tasks(session)
         if self._tracer is not None:
             self._tracer.emit(trace)
         reply = result.reply or reply
+        # Durable stores (transcript + memory) keep the text plus a compact
+        # marker per image — later turns and the deriver know an image was
+        # shared, but base64 payloads live only in the gateway request.
+        persisted_text = _text_with_attachment_markers(text, attachments)
         await asyncio.to_thread(
             self._persist_turn,
             thread.session_id,
             requester.memory_peer,
             requester.device_id,
-            text,
+            persisted_text,
             reply,
         )
         updated = self._index.append_turn(
             thread,
             user_peer_id=requester.memory_peer,
-            user_text=text,
+            user_text=persisted_text,
             assistant_peer_id=self._cfg.memory.assistant_peer_id,
             assistant_text=reply,
         )
@@ -665,6 +684,17 @@ async def _drain_cold_tasks(session: BrainSession) -> None:
     if not tasks:
         return
     await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _text_with_attachment_markers(text: str, attachments: list[dict[str, Any]] | None) -> str:
+    if not attachments:
+        return text
+    markers = []
+    for attachment in attachments:
+        name = str(attachment.get("name") or "image")
+        mime_type = str(attachment.get("mime_type") or "")
+        markers.append(f"[image attached: {name}{f' ({mime_type})' if mime_type else ''}]")
+    return "\n".join([text, *markers])
 
 
 def _thread_title(text: str) -> str:

@@ -242,7 +242,12 @@ CATALOG_ENGINE_LABELS = {
 }
 
 
-def cockpit_catalog(*, start_defaults: dict[str, Any] | None = None, engines: list[str] | None = None) -> dict[str, Any]:
+def cockpit_catalog(
+    *,
+    start_defaults: dict[str, Any] | None = None,
+    engines: list[str] | None = None,
+    engine_supports: dict[str, dict[str, bool]] | None = None,
+) -> dict[str, Any]:
     defaults = {
         "source": "manual",
         "worker_id": "",
@@ -257,6 +262,7 @@ def cockpit_catalog(*, start_defaults: dict[str, Any] | None = None, engines: li
         _engine_catalog(
             engine,
             *CATALOG_ENGINE_LABELS.get(engine, (engine.capitalize(), f"{engine.capitalize()} provider session")),
+            supports=(engine_supports or {}).get(engine),
         )
         for engine in engine_ids
     ]
@@ -320,6 +326,7 @@ def cockpit_snapshot(
         archived_run_ids=archived_run_ids,
         archived_session_refs=archived_session_refs,
     )
+    store.record_session_refs(_session_ref_index_rows(sessions.values()))
     requests = aggregate_requests(worker_cfg=worker_cfg, workers_path=workers_path, http_get=http_get) if include_worker_state else []
     # Workers keep reporting pending requests for locally-archived runs and
     # sessions; keep the top-level array consistent with the visible rows: a
@@ -336,7 +343,6 @@ def cockpit_snapshot(
         session_summary(session, requests=requests, checkpoints=checkpoints)
         for session in sorted(sessions.values(), key=lambda x: str(x.get("updated_at") or ""))
     ]
-    store.record_session_refs(_session_ref_index_rows(sessions.values()))
     return {
         "api_version": API_VERSION,
         "schema_version": SCHEMA_VERSION,
@@ -801,11 +807,14 @@ def session_summary(
         "session_ref": ref,
         "worker_id": session.get("worker_id", ""),
         "session_id": session.get("session_id", ""),
-        "run_id": session.get("run_id", ""),
+        # Explicitly null, never "": worker-local sessions can legitimately
+        # exist without a run and clients model the field as nullable.
+        "run_id": str(session.get("run_id") or "") or None,
         "title": _redact(str(session.get("title") or "")),
         "provider": session.get("provider", ""),
         "engine": session.get("engine", ""),
         "status": session.get("status", ""),
+        "ended_reason": ended_reason_for_session(session),
         "repo": session.get("repo", ""),
         "branch": session.get("branch", ""),
         "cwd_label": cwd_label(str(session.get("cwd") or "")),
@@ -818,6 +827,28 @@ def session_summary(
         "updated_at": session.get("updated_at", ""),
         "archived_at": session.get("archived_at") or None,
     }
+
+
+# Why a conversation ended, as promised to cockpit clients. Workers report the
+# authoritative value in session metadata (they know user-interrupt from daemon
+# restart); the status map is a fallback for workers that predate it.
+ENDED_REASONS_BY_STATUS = {
+    "completed": "completed",
+    "done": "completed",
+    "stopped": "stopped",
+    "failed": "engine_error",
+    "error": "engine_error",
+}
+
+
+def ended_reason_for_session(session: dict[str, Any]) -> str | None:
+    status = str(session.get("status") or "")
+    if status in ACTIVE_SESSION_STATUSES or not status:
+        return None
+    reported = str(session.get("ended_reason") or "")
+    if reported:
+        return reported
+    return ENDED_REASONS_BY_STATUS.get(status)
 
 
 def canonical_event_type(value: Any) -> str:
@@ -1027,6 +1058,7 @@ def _session_from_link(link: WorkerSessionLink, run: OrchestrationRun) -> dict[s
         "provider": link.provider,
         "engine": link.engine,
         "status": link.status,
+        "ended_reason": link.ended_reason,
         "repo": _run_repo(run),
         "branch": link.branch,
         "cwd": link.cwd,
@@ -1049,6 +1081,7 @@ def _session_from_worker(raw: dict[str, Any], worker_id: str, *, run: Orchestrat
         "provider": str(raw.get("provider") or ""),
         "engine": str(raw.get("engine") or raw.get("provider") or ""),
         "status": str(raw.get("status") or ""),
+        "ended_reason": _ended_reason_from_worker_session(raw),
         "repo": str(raw.get("repo") or (_run_repo(run) if run else "")),
         "branch": str(raw.get("branch") or ""),
         "cwd": str(raw.get("cwd") or ""),
@@ -1058,6 +1091,16 @@ def _session_from_worker(raw: dict[str, Any], worker_id: str, *, run: Orchestrat
         "archived_at": "",
         "allowed_actions": _allowed_actions_from_worker_session(raw),
     }
+
+
+def _ended_reason_from_worker_session(raw: dict[str, Any]) -> str:
+    direct = str(raw.get("ended_reason") or "")
+    if direct:
+        return direct
+    metadata = raw.get("metadata")
+    if isinstance(metadata, dict):
+        return str(metadata.get("ended_reason") or "")
+    return ""
 
 
 def _allowed_actions_from_worker_session(raw: dict[str, Any]) -> list[str]:
@@ -1079,12 +1122,17 @@ def _allowed_actions_from_worker_session(raw: dict[str, Any]) -> list[str]:
 def _session_supported_controls(session: dict[str, Any]) -> list[str]:
     allowed_actions = set(session.get("allowed_actions") or DEFAULT_SESSION_ALLOWED_ACTIONS)
     controls = [control for control, action in SESSION_CONTROL_ACTIONS.items() if action in allowed_actions]
-    controls.append("archive")
+    controls.extend(["archive", "unarchive"])
     return controls
 
 
-def _engine_catalog(engine: str, display_name: str, description: str) -> dict[str, Any]:
-    return {"engine": engine, "display_name": display_name, "description": description, "supports": _empty_engine_supports()}
+def _engine_catalog(engine: str, display_name: str, description: str, *, supports: dict[str, bool] | None = None) -> dict[str, Any]:
+    return {
+        "engine": engine,
+        "display_name": display_name,
+        "description": description,
+        "supports": {**_empty_engine_supports(), **{str(key): bool(value) for key, value in (supports or {}).items()}},
+    }
 
 
 def _engine_row(engine: str, *, default: bool, worker_status: str, supports: dict[str, bool]) -> dict[str, Any]:
@@ -1105,6 +1153,7 @@ def _empty_engine_supports() -> dict[str, bool]:
         "approval_requests": False,
         "input_requests": False,
         "checkpoints": False,
+        "attachments": False,
     }
 
 

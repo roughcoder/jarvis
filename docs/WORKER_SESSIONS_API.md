@@ -133,7 +133,11 @@ Response:
 
 ### `GET /sessions/:id`
 
-Inspect a single session.
+Inspect a single session. Terminal sessions carry `metadata.ended_reason`
+(`completed`, `stopped`, `interrupted_by_user`, `worker_lost`, or
+`engine_error`): the worker records it whenever a session reaches a terminal
+status (a daemon restart with active session state records `worker_lost`) and
+clears it when a new turn starts.
 
 ### `GET /sessions/:id/events`
 
@@ -212,9 +216,18 @@ Request:
   "metadata": {
     "surface": "t3",
     "principal": "local-user"
-  }
+  },
+  "attachments": [
+    {"kind": "image", "mime_type": "image/png", "name": "screenshot.png", "data_url": "data:image/png;base64,..."}
+  ]
 }
 ```
+
+`attachments` is optional and only accepted when the session's provider
+reports the `attachments` capability (Claude and Codex); other providers reject
+the turn with HTTP 400 before any state changes. The full base64 payloads are
+handed to the provider only — the recorded `turn.started` event carries
+`{kind, mime_type, name, bytes}` summaries, never payload data.
 
 Response:
 

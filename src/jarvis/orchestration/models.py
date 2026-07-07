@@ -95,6 +95,7 @@ class WorkerSessionLink:
     worker_id: str
     session_id: str
     status: str = "created"
+    ended_reason: str = ""
     provider: str = "codex"
     engine: str = "codex"
     branch: str = ""

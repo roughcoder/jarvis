@@ -40,6 +40,12 @@ class ActiveWorkerSessionError(RuntimeError):
         self.session = session
 
 
+class RunArchivedError(RuntimeError):
+    def __init__(self, run_id: str) -> None:
+        super().__init__(f"run {run_id} is archived")
+        self.run_id = run_id
+
+
 class OrchestrationStore:
     """File-backed run graph store.
 
@@ -226,6 +232,36 @@ class OrchestrationStore:
                 return run
             return archived
 
+    def unarchive_cockpit_session(self, worker_id: str, session_id: str) -> OrchestrationRun | dict[str, str]:
+        """Restore a session consistently across run links and worker-only indexes."""
+
+        with self._locked():
+            # An archived run hides all of its sessions regardless of the
+            # session-level flag; without a run unarchive endpoint, clearing
+            # the session flag would report success while the row stays
+            # invisible. Refuse instead of lying.
+            for run in self.list_runs():
+                if run.archived_at and any(x.worker_id == worker_id and x.session_id == session_id for x in run.sessions):
+                    raise RunArchivedError(run.run_id)
+            was_archived = self._unarchive_worker_session_unlocked(worker_id, session_id)
+            for run in self.list_runs():
+                session = next((x for x in run.sessions if x.worker_id == worker_id and x.session_id == session_id), None)
+                if session is None:
+                    continue
+                if session.archived_at:
+                    session.archived_at = ""
+                    self.save(run)
+                    self.append_event(
+                        run.run_id,
+                        "session_unarchived",
+                        f"Worker session {worker_id}/{session_id} restored to cockpit views",
+                        {"worker_id": worker_id, "session_id": session_id},
+                    )
+                return run
+            if not was_archived:
+                raise KeyError(session_id)
+            return {"worker_id": worker_id, "session_id": session_id, "archived_at": ""}
+
     def archive_worker_session(self, worker_id: str, session_id: str) -> dict[str, str]:
         with self._locked():
             return self._archive_worker_session_unlocked(worker_id, session_id)
@@ -387,7 +423,7 @@ class OrchestrationStore:
             if session is None:
                 raise KeyError(session_id)
             changed: dict[str, str | list[str]] = {}
-            for field in ("status", "provider", "engine", "branch", "cwd", "last_event_id", "allowed_actions"):
+            for field in ("status", "ended_reason", "provider", "engine", "branch", "cwd", "last_event_id", "allowed_actions"):
                 value = updates.get(field)
                 if value is None:
                     continue
@@ -513,6 +549,13 @@ class OrchestrationStore:
         archived[key] = item
         _atomic_write_json(self._archived_sessions_path, list(archived.values()))
         return item
+
+    def _unarchive_worker_session_unlocked(self, worker_id: str, session_id: str) -> bool:
+        archived = self.archived_worker_sessions()
+        if archived.pop(f"{worker_id}\0{session_id}", None) is None:
+            return False
+        _atomic_write_json(self._archived_sessions_path, list(archived.values()))
+        return True
 
 
 def _same_work_item(left: WorkItem, right: WorkItem) -> bool:

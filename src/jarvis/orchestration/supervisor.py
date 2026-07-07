@@ -160,11 +160,15 @@ def sync_run_sessions(
             if events:
                 persist_session_events(store, run.run_id, link.session_id, events)
             before = link.to_dict()
+            metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
             store.update_session(
                 run.run_id,
                 link.session_id,
                 worker_id=link.worker_id,
                 status=str(data.get("status") or link.status),
+                # Persisted so terminal rows keep their reason after the
+                # worker goes offline; cleared ("") when a new turn starts.
+                ended_reason=str(data.get("ended_reason") or metadata.get("ended_reason") or ""),
                 provider=str(data.get("provider") or link.provider or ""),
                 engine=str(data.get("engine") or link.engine or ""),
                 branch=str(data.get("branch") or link.branch or ""),

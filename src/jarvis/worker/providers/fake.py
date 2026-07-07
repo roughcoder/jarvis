@@ -37,6 +37,7 @@ class FakeProviderAdapter:
             "questions": True,
             "checkpoints": True,
             "rollback": False,
+            "attachments": True,
             "lifecycle": "in-process deterministic fake provider",
             "backpressure": "synchronous append; bounded by HTTP request",
             "event_ordering": "append order in events.jsonl",

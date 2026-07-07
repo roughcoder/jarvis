@@ -151,8 +151,35 @@ def _engine_supports(engines: list[str]) -> dict[str, dict[str, bool]]:
             "approval_requests": bool(capabilities.get("approval_requests", capabilities.get("approvals"))),
             "input_requests": bool(capabilities.get("input_requests", capabilities.get("questions"))),
             "checkpoints": bool(capabilities.get("checkpoints")),
+            "attachments": bool(capabilities.get("attachments")),
         }
     return supports
+
+
+def _turn_attachments(body: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Turn attachments from a request body; [] when absent, None when malformed."""
+    raw = body.get("attachments")
+    if raw in (None, []):
+        return []
+    if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
+        return None
+    return [dict(item) for item in raw]
+
+
+def _attachment_summaries(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for item in attachments:
+        data_url = str(item.get("data_url") or "")
+        payload = data_url.split(",", 1)[1] if "," in data_url else ""
+        summaries.append(
+            {
+                "kind": str(item.get("kind") or ""),
+                "mime_type": str(item.get("mime_type") or ""),
+                "name": str(item.get("name") or ""),
+                "bytes": (len(payload) * 3) // 4,
+            }
+        )
+    return summaries
 
 
 def make_app(cfg: WorkerConfig) -> web.Application:
@@ -550,12 +577,24 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             adapter = provider_for(session.provider)
         except ValueError as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        attachments = _turn_attachments(body)
+        if attachments is None:
+            return web.json_response({"ok": False, "error": "attachments must be an array of objects"}, status=400)
+        if attachments and not adapter.capabilities().get("attachments"):
+            return web.json_response(
+                {"ok": False, "error": f"provider {session.provider!r} does not support turn attachments"},
+                status=400,
+            )
         turn_data = {
             "turn_id": turn_id,
             "prompt": str(body.get("prompt") or ""),
             "metadata": dict(body.get("metadata") or {}),
             "idempotency_key": idempotency_key,
         }
+        if attachments:
+            # Events are durable and replayed to cockpits; keep them to
+            # summaries and hand the base64 payloads only to the provider.
+            turn_data["attachments"] = _attachment_summaries(attachments)
         try:
             session, started, reserved = sessions.reserve_turn(session.session_id, turn_data)
         except RuntimeError as exc:
@@ -578,6 +617,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                     prompt=str(body.get("prompt") or ""),
                     metadata=dict(body.get("metadata") or {}),
                     idempotency_key=idempotency_key,
+                    attachments=attachments,
                 ),
                 sessions=sessions,
                 worker_cfg=cfg,
@@ -691,7 +731,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-    app = web.Application()
+    app = web.Application(client_max_size=max(1024 * 1024, int(cfg.max_request_bytes)))
     app["browser_holder"] = browser_holder  # for clean shutdown in serve()
     app["browser_cfg"] = browser_cfg
     app.on_cleanup.append(_cleanup_diagnostics)

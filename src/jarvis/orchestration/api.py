@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import contextlib
+import socket
 import hmac
 import json
 import logging
 import threading
+from functools import partial
 from pathlib import Path
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 import httpx
@@ -61,6 +64,7 @@ from jarvis.orchestration.cockpit import (
     public_error_message,
     public_event_data,
     _allowed_actions_from_worker_session,
+    _ended_reason_from_worker_session,
     _session_from_link,
     run_detail_projection,
     run_report_artifact,
@@ -106,7 +110,7 @@ from jarvis.orchestration.service import (
     WorkerDispatchError,
 )
 from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource, WorkSource
-from jarvis.orchestration.store import OrchestrationStore
+from jarvis.orchestration.store import OrchestrationStore, RunArchivedError
 from jarvis.orchestration.supervisor import final_session_phase
 from jarvis.orchestration.workers import WorkerRegistry
 from jarvis.system_info import system_info_cached
@@ -131,6 +135,11 @@ class CockpitAppContext:
     idempotency_lock_refs: dict[str, int]
     source_factory: Callable[[str, Any], WorkSource]
     oauth_validator: OAuthTokenValidator | None = None
+    # Live project-thread turn state, keyed (project_id, thread_id). Values are
+    # (status, ended_reason). Process-local by design: thread turns only run
+    # through this API, and a restart safely reverts rows to the durable
+    # created/completed derivation.
+    thread_turn_states: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
 
     async def require_auth(self, request: web.Request) -> None:
         orchestration = self.cfg.orchestration
@@ -436,9 +445,11 @@ def make_app(
         oauth_validator=validator,
     )
     _rebuild_session_ref_index_from_store(ctx.store)
+    # Attachments travel base64-encoded (~4/3 of the decoded limit) on turn bodies.
+    attachment_budget = int(cfg.orchestration.turn_attachment_max_count) * ((int(cfg.orchestration.turn_attachment_max_bytes) * 4) // 3 + 1024)
     app = web.Application(
         middlewares=[_cors_middleware, _error_middleware],
-        client_max_size=max(1024 * 1024, int(cfg.registry.max_upload_bytes) + 1024 * 1024),
+        client_max_size=max(1024 * 1024, int(cfg.registry.max_upload_bytes) + 1024 * 1024, attachment_budget + 1024 * 1024),
     )
     app[CONFIG_KEY] = cfg
     reads = CockpitReadHandlers(ctx)
@@ -480,6 +491,7 @@ def make_app(
         web.get("/v1/sessions/{session_ref}/checkpoints", reads.session_checkpoints),
         web.post("/v1/runs/{run_id}/archive", writes.run_archive),
         web.post("/v1/sessions/{session_ref}/archive", writes.session_archive),
+        web.post("/v1/sessions/{session_ref}/unarchive", writes.session_unarchive),
         web.post("/v1/sessions/{session_ref}/checkpoints/restore", writes.session_write, name="restore_checkpoint"),
         web.post("/v1/sessions/{session_ref}/{action:turns|input|approval|interrupt|stop}", writes.session_write),
         web.get("/v1/sessions/{session_ref}", reads.session_detail),
@@ -497,6 +509,7 @@ def make_app(
         web.post("/v1/projects/{project_id}/files", writes.project_file_upload),
         web.delete("/v1/projects/{project_id}/files/{doc_id}", writes.project_file_retract),
         web.post("/v1/projects/{project_id}/threads", writes.project_thread_open),
+        web.patch("/v1/projects/{project_id}/threads/{thread_id}", writes.project_thread_rename),
         web.post("/v1/projects/{project_id}/threads/{thread_id}/turns", writes.project_thread_turn),
         web.post("/v1/projects/{project_id}/threads/{thread_id}/archive", writes.project_thread_archive),
         web.post("/v1/projects/{project_id}/threads/{thread_id}/unarchive", writes.project_thread_unarchive),
@@ -528,8 +541,8 @@ class CockpitReadHandlers:
 
     async def catalog(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
-        defaults, engines = await asyncio.to_thread(_catalog_context, self.ctx.cfg)
-        return web.json_response(cockpit_catalog(start_defaults=defaults, engines=engines or None))
+        defaults, engines, engine_supports = await asyncio.to_thread(_catalog_context, self.ctx.cfg)
+        return web.json_response(cockpit_catalog(start_defaults=defaults, engines=engines or None, engine_supports=engine_supports))
 
     async def capabilities(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -795,7 +808,7 @@ class CockpitReadHandlers:
                 "api_version": API_VERSION,
                 "schema_version": SCHEMA_VERSION,
                 "project_id": project.id,
-                "threads": [_thread_projection(thread) for thread in threads],
+                "threads": [_thread_projection(thread, self.ctx) for thread in threads],
             }
         )
 
@@ -812,7 +825,7 @@ class CockpitReadHandlers:
                 "api_version": API_VERSION,
                 "schema_version": SCHEMA_VERSION,
                 "project_id": project.id,
-                "thread": _thread_detail_projection(thread),
+                "thread": _thread_detail_projection(thread, self.ctx),
             }
         )
 
@@ -1338,7 +1351,7 @@ class CockpitWriteHandlers:
                 f"Opened project thread {thread.thread_id}",
                 {"project_id": project.id, "thread_id": thread.thread_id},
             )
-            return _project_write_body({"project_id": project.id, "thread": _thread_projection(thread)})
+            return _project_write_body({"project_id": project.id, "thread": _thread_projection(thread, self.ctx)})
 
         response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
         return web.json_response(response_body)
@@ -1346,7 +1359,7 @@ class CockpitWriteHandlers:
     async def project_thread_turn(self, request: web.Request) -> web.StreamResponse:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
-        _reject_attachments(body)
+        attachments = _validate_attachments(body, self.ctx.cfg.orchestration)
         text = str(body.get("text") or body.get("message") or body.get("prompt") or "").strip()
         if not text:
             raise CockpitError("validation_failed", "turn text is required", recoverable=True, status=400)
@@ -1379,9 +1392,12 @@ class CockpitWriteHandlers:
                 {"project_id": project.id, "thread_id": thread.thread_id},
             ),
         )
+        state_key = (project.id, thread.thread_id)
+        self.ctx.thread_turn_states[state_key] = ("running", "")
         try:
-            reply, updated = await connector.turn(project, thread, requester, text)
+            reply, updated = await connector.turn(project, thread, requester, text, attachments=attachments or None)
         except (UnsupportedMemoryOperation, TimeoutError, OSError, RuntimeError) as exc:
+            self.ctx.thread_turn_states[state_key] = ("failed", "engine_error")
             await _write_sse(
                 response,
                 "thread.turn.error",
@@ -1403,6 +1419,7 @@ class CockpitWriteHandlers:
             await response.write_eof()
             return response
         except Exception as exc:  # noqa: BLE001 - preserve SSE contract after prepare.
+            self.ctx.thread_turn_states[state_key] = ("failed", "engine_error")
             await _write_sse(
                 response,
                 "thread.turn.error",
@@ -1423,15 +1440,52 @@ class CockpitWriteHandlers:
             )
             await response.write_eof()
             return response
+        self.ctx.thread_turn_states.pop(state_key, None)
         payload = {
             "project_id": project.id,
-            "thread": _thread_projection(updated),
+            "thread": _thread_projection(updated, self.ctx),
             "reply": reply,
         }
         await _write_sse(response, "thread.reply", cursor, _sse_envelope(cursor, "thread.reply", payload))
         await _write_sse(response, "thread.turn.done", cursor, _sse_envelope(cursor, "thread.turn.done", payload))
         await response.write_eof()
         return response
+
+    async def project_thread_rename(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        body = await _json_body(request)
+        title = " ".join(str(body.get("title") or "").split())
+        if not title:
+            raise CockpitError("validation_failed", "title is required", recoverable=True, status=400)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        project = await _project_for_member_route(self.ctx, request, requester)
+        connector = _cockpit_connector(self.ctx)
+        thread_id = request.match_info["thread_id"]
+        scope = f"project_thread_rename/{project.id}/{thread_id}"
+        fingerprint_body = {**body, "project_id": project.id, "thread_id": thread_id, "title": title}
+
+        async def produce() -> dict[str, Any]:
+            thread = await asyncio.to_thread(connector.rename_thread, project, thread_id, title)
+            if thread is None:
+                raise CockpitError("not_found", "thread not found", status=404)
+            await _record_project_activity(
+                self.ctx,
+                project.id,
+                "thread.renamed",
+                requester,
+                f"Renamed project thread {thread_id}",
+                {"project_id": project.id, "thread_id": thread_id, "title": thread.title},
+            )
+            return {
+                "ok": True,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "project_id": project.id,
+                "thread": _thread_projection(thread, self.ctx),
+            }
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
+        return web.json_response(response_body)
 
     async def project_thread_archive(self, request: web.Request) -> web.Response:
         return await self._project_thread_archive(request, archived=True)
@@ -1480,7 +1534,7 @@ class CockpitWriteHandlers:
                 "api_version": API_VERSION,
                 "schema_version": SCHEMA_VERSION,
                 "project_id": project.id,
-                "thread": _thread_projection(thread),
+                "thread": _thread_projection(thread, self.ctx),
             }
 
         response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
@@ -1489,7 +1543,7 @@ class CockpitWriteHandlers:
     async def work_start(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
-        _reject_attachments(body)
+        attachments = _validate_attachments(body, self.ctx.cfg.orchestration)
         async with _idempotency_scope(self.ctx, "work/start", str(body.get("idempotency_key") or "")):
             cached = self.ctx.idempotency.get("work/start", str(body.get("idempotency_key") or ""), body)
             if cached is not None:
@@ -1497,7 +1551,10 @@ class CockpitWriteHandlers:
             command, manual_item = _command_from_body(body, start=True)
             service = self.ctx.service(manual_item=manual_item)
             try:
-                result = await asyncio.to_thread(service.next_work, command, start=True)
+                next_work = partial(service.next_work, command, start=True)
+                if attachments:
+                    next_work = partial(next_work, attachments=attachments)
+                result = await asyncio.to_thread(next_work)
             except (MissingAuthorityError, NoEligibleWorkerError, WorkAlreadyOwnedError, MissingWorkRepoError, WorkerDispatchError) as exc:
                 error = _service_error(exc)
                 if isinstance(exc, (MissingWorkRepoError, WorkerDispatchError)):
@@ -1513,7 +1570,7 @@ class CockpitWriteHandlers:
     async def work_validate(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
-        _reject_attachments(body)
+        _validate_attachments(body, self.ctx.cfg.orchestration)
         command, manual_item = _command_from_body(body, start=False)
         service = self.ctx.service(manual_item=manual_item)
         validation = await asyncio.to_thread(service.validate_work, command, manual_item=manual_item)
@@ -1656,13 +1713,30 @@ class CockpitWriteHandlers:
             self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
         return web.json_response(response_body)
 
+    async def session_unarchive(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        body = await _json_body(request)
+        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
+        scope = f"sessions/{ref.worker_id}/{ref.session_id}/unarchive"
+        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
+            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
+            if cached is not None:
+                return web.json_response(cached)
+            _require_capability(self.ctx.cfg, "orchestration.runs.write")
+            run = await asyncio.to_thread(_unarchive_session, self.ctx.store, ref)
+            response_body = _unarchive_session_packet(run, ref)
+            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+        return web.json_response(response_body)
+
     async def session_write(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
         action = request.match_info.get("action", "restore_checkpoint")
         body = await _json_body(request)
         if action == "turns":
-            _reject_attachments(body)
+            attachments = _validate_attachments(body, self.ctx.cfg.orchestration)
+            if attachments:
+                body["attachments"] = attachments
         scope = f"sessions/{ref.worker_id}/{ref.session_id}/{action}"
         async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
             cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
@@ -2061,6 +2135,7 @@ def _fallback_session_row(store: OrchestrationStore, ref: SessionRef, raw: dict[
                     "provider": str(session_raw.get("provider") or link.provider),
                     "engine": str(session_raw.get("engine") or link.engine),
                     "status": str(session_raw.get("status") or link.status),
+                    "ended_reason": _ended_reason_from_worker_session(session_raw) or link.ended_reason,
                     "repo": next((item.item.repo for item in run.work_items if item.item.repo), ""),
                     "branch": str(session_raw.get("branch") or link.branch),
                     "cwd": str(session_raw.get("cwd") or link.cwd),
@@ -2081,6 +2156,7 @@ def _fallback_session_row(store: OrchestrationStore, ref: SessionRef, raw: dict[
         "provider": str(session_raw.get("provider") or ""),
         "engine": str(session_raw.get("engine") or session_raw.get("provider") or ""),
         "status": str(session_raw.get("status") or ""),
+        "ended_reason": _ended_reason_from_worker_session(session_raw),
         "repo": str(session_raw.get("repo") or ""),
         "branch": str(session_raw.get("branch") or ""),
         "cwd": str(session_raw.get("cwd") or ""),
@@ -2168,7 +2244,61 @@ def _reject_attachments(body: dict[str, Any]) -> None:
     attachments = body.get("attachments")
     if attachments in (None, []):
         return
-    raise CockpitError("validation_failed", "turn attachments are not supported by Jarvis cockpit API v1", recoverable=True, status=400)
+    raise CockpitError("validation_failed", "turn attachments are not supported on this endpoint", recoverable=True, status=400)
+
+
+ATTACHMENT_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+
+
+def _validate_attachments(body: dict[str, Any], orchestration) -> list[dict[str, Any]]:  # noqa: ANN001
+    attachments = body.get("attachments")
+    if attachments in (None, []):
+        return []
+    if not isinstance(attachments, list):
+        raise CockpitError("validation_failed", "attachments must be an array", recoverable=True, status=400)
+    max_count = max(0, int(orchestration.turn_attachment_max_count))
+    max_bytes = max(1, int(orchestration.turn_attachment_max_bytes))
+    if len(attachments) > max_count:
+        raise CockpitError(
+            "validation_failed",
+            f"too many attachments: {len(attachments)} exceeds the limit of {max_count} (ORCHESTRATION_TURN_ATTACHMENT_MAX_COUNT)",
+            recoverable=True,
+            status=400,
+        )
+    normalized: list[dict[str, Any]] = []
+    for index, raw in enumerate(attachments):
+        label = f"attachments[{index}]"
+        if not isinstance(raw, dict):
+            raise CockpitError("validation_failed", f"{label} must be an object", recoverable=True, status=400)
+        kind = str(raw.get("kind") or "")
+        if kind != "image":
+            raise CockpitError("validation_failed", f'{label}: only kind "image" is supported', recoverable=True, status=400)
+        mime_type = str(raw.get("mime_type") or "")
+        if mime_type not in ATTACHMENT_IMAGE_MIME_TYPES:
+            supported = ", ".join(sorted(ATTACHMENT_IMAGE_MIME_TYPES))
+            raise CockpitError("validation_failed", f"{label}: mime_type must be one of {supported}", recoverable=True, status=400)
+        data_url = str(raw.get("data_url") or "")
+        prefix = f"data:{mime_type};base64,"
+        if not data_url.startswith(prefix):
+            raise CockpitError(
+                "validation_failed",
+                f'{label}: data_url must start with "data:{mime_type};base64,"',
+                recoverable=True,
+                status=400,
+            )
+        try:
+            decoded_bytes = len(base64.b64decode(data_url[len(prefix) :], validate=True))
+        except (binascii.Error, ValueError) as exc:
+            raise CockpitError("validation_failed", f"{label}: data_url payload is not valid base64", recoverable=True, status=400) from exc
+        if decoded_bytes > max_bytes:
+            raise CockpitError(
+                "validation_failed",
+                f"{label} is {decoded_bytes} bytes decoded; the limit is {max_bytes} bytes (ORCHESTRATION_TURN_ATTACHMENT_MAX_BYTES)",
+                recoverable=True,
+                status=400,
+            )
+        normalized.append({"kind": "image", "mime_type": mime_type, "name": str(raw.get("name") or ""), "data_url": data_url})
+    return normalized
 
 
 def _run_or_404(store: OrchestrationStore, run_id: str):
@@ -2191,6 +2321,20 @@ def _archive_run(store: OrchestrationStore, run_id: str):
 
 def _archive_session(store: OrchestrationStore, ref: SessionRef):
     return store.archive_cockpit_session(ref.worker_id, ref.session_id)
+
+
+def _unarchive_session(store: OrchestrationStore, ref: SessionRef):
+    try:
+        return store.unarchive_cockpit_session(ref.worker_id, ref.session_id)
+    except KeyError as exc:
+        raise CockpitError("not_found", "session not found", status=404) from exc
+    except RunArchivedError as exc:
+        raise CockpitError(
+            "run_archived",
+            f"run {exc.run_id} is archived; the session stays hidden until its run is restored",
+            recoverable=True,
+            status=409,
+        ) from exc
 
 
 def _archive_run_packet(run) -> dict[str, Any]:  # noqa: ANN001
@@ -2233,6 +2377,33 @@ def _archive_session_packet(run, ref: SessionRef) -> dict[str, Any]:  # noqa: AN
     }
 
 
+def _unarchive_session_packet(run, ref: SessionRef) -> dict[str, Any]:  # noqa: ANN001
+    if hasattr(run, "sessions"):
+        session = next((item for item in run.sessions if item.worker_id == ref.worker_id and item.session_id == ref.session_id), None)
+        session_row = session_summary(_session_from_link(session, run)) if session is not None else {}
+        run_row = run_summary(run)
+    else:
+        session_row = session_summary(
+            {
+                "session_ref": make_session_ref(ref.worker_id, ref.session_id),
+                "worker_id": ref.worker_id,
+                "session_id": ref.session_id,
+                "status": "",
+                "archived_at": "",
+            }
+        )
+        run_row = {}
+    return {
+        "ok": True,
+        "cursor": snapshot_cursor({"run": run_row, "session": session_row, "archived": False}),
+        "run": run_row,
+        "session": session_row,
+        "events": [],
+        "requests": [],
+        "artifacts": [],
+    }
+
+
 def _cockpit_snapshot(ctx: CockpitAppContext, mode: str) -> dict[str, Any]:
     return cockpit_snapshot(
         store=ctx.store,
@@ -2244,22 +2415,29 @@ def _cockpit_snapshot(ctx: CockpitAppContext, mode: str) -> dict[str, Any]:
     )
 
 
-def _catalog_context(cfg: Config) -> tuple[dict[str, Any], list[str]]:
+def _catalog_context(cfg: Config) -> tuple[dict[str, Any], list[str], dict[str, dict[str, bool]]]:
     registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path)
     profiles = registry.profiles(probe=False)
     worker = profiles[0] if profiles else None
     engines: list[str] = []
+    # Last-known provider capabilities, OR-ed across workers: engine supports
+    # are provider-side, so any worker reporting a flag speaks for the engine.
+    engine_supports: dict[str, dict[str, bool]] = {}
     for profile in profiles:
         for engine in profile.supported_engines:
             if engine and engine not in engines:
                 engines.append(engine)
+        for engine, supports in profile.engine_supports.items():
+            merged = engine_supports.setdefault(engine, {})
+            for key, value in supports.items():
+                merged[key] = bool(merged.get(key)) or bool(value)
     defaults = {
         "worker_id": worker.worker_id if worker else "",
         "engine": (worker.default_engine or worker.agent) if worker else "",
         "repo": (worker.default_repo if worker else "") or cfg.orchestration.default_repo,
         "landing_mode": cfg.orchestration.landing_mode,
     }
-    return defaults, engines
+    return defaults, engines, engine_supports
 
 
 def _route_templates(app: web.Application) -> list[dict[str, str]]:
@@ -2718,12 +2896,24 @@ def _cockpit_connector(ctx: CockpitAppContext) -> CockpitConnector:
     return CockpitConnector(ctx.cfg)
 
 
-def _thread_projection(thread: CockpitThread) -> dict[str, Any]:
+def _thread_projection(thread: CockpitThread, ctx: CockpitAppContext | None = None) -> dict[str, Any]:
+    status, ended_reason = _thread_status(thread, ctx)
     return {
         "thread_id": thread.thread_id,
         "project_id": thread.project_id,
         "session_id": thread.session_id,
         "title": thread.title,
+        # Project threads are brain conversations: the engine is Jarvis itself,
+        # the model is the LLM gateway route its turns use, and they execute on
+        # the brain host — worker_id stays null until a thread is linked to a
+        # worker session (orchestration chat tree). thread.session_id is the
+        # memory session id — it never matches a worker session.
+        "engine": "jarvis",
+        "model": _thread_model(ctx),
+        "worker_id": None,
+        "host": _BRAIN_HOSTNAME,
+        "status": status,
+        "ended_reason": ended_reason or None,
         "created_at": thread.created_at,
         "updated_at": thread.updated_at,
         "created_by": thread.created_by,
@@ -2733,8 +2923,27 @@ def _thread_projection(thread: CockpitThread) -> dict[str, Any]:
     }
 
 
-def _thread_detail_projection(thread: CockpitThread) -> dict[str, Any]:
-    row = _thread_projection(thread)
+_BRAIN_HOSTNAME = socket.gethostname()
+
+
+def _thread_model(ctx: CockpitAppContext | None) -> str:
+    if ctx is None:
+        return ""
+    gateway = ctx.cfg.gateway
+    return str(gateway.voice_model or gateway.fast_model)
+
+
+def _thread_status(thread: CockpitThread, ctx: CockpitAppContext | None) -> tuple[str, str]:
+    live = ctx.thread_turn_states.get((thread.project_id, thread.thread_id)) if ctx is not None else None
+    if live is not None:
+        return live
+    if thread.last_turn_at or thread.messages:
+        return "completed", "completed"
+    return "created", ""
+
+
+def _thread_detail_projection(thread: CockpitThread, ctx: CockpitAppContext | None = None) -> dict[str, Any]:
+    row = _thread_projection(thread, ctx)
     row["messages"] = [
         {
             "role": message.get("role", ""),
@@ -2984,6 +3193,7 @@ def _worker_session_row(raw: dict[str, Any], worker_id: str) -> dict[str, Any]:
         "provider": str(raw.get("provider") or ""),
         "engine": str(raw.get("engine") or raw.get("provider") or ""),
         "status": str(raw.get("status") or ""),
+        "ended_reason": _ended_reason_from_worker_session(raw),
         "repo": str(raw.get("repo") or ""),
         "branch": str(raw.get("branch") or ""),
         "cwd": str(raw.get("cwd") or ""),

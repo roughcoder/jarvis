@@ -1587,7 +1587,7 @@ def test_cockpit_session_supported_controls_follow_allowed_actions(tmp_path, mon
     async def calls(base: str, client: httpx.AsyncClient) -> None:
         snapshot = (await client.get(f"{base}/v1/cockpit/snapshot")).json()
 
-        assert snapshot["sessions"][0]["supported_controls"] == ["turn", "stop", "archive"]
+        assert snapshot["sessions"][0]["supported_controls"] == ["turn", "stop", "archive", "unarchive"]
 
     import asyncio
 
@@ -2402,7 +2402,8 @@ def test_cockpit_app_client_max_size_tracks_upload_limit(tmp_path, monkeypatch) 
 
     app = make_app(cfg)
 
-    assert app._client_max_size == 4 * 1024 * 1024  # noqa: SLF001
+    attachment_budget = cfg.orchestration.turn_attachment_max_count * ((cfg.orchestration.turn_attachment_max_bytes * 4) // 3 + 1024)
+    assert app._client_max_size == max(4 * 1024 * 1024, attachment_budget + 1024 * 1024)  # noqa: SLF001
 
 
 def test_cockpit_project_memory_returns_representation_and_conclusions(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -4331,28 +4332,53 @@ def test_cockpit_archive_worker_only_session_hides_it_from_worker_views(tmp_path
     asyncio.run(_with_server(cfg, calls, http_get=get))
 
 
-def test_cockpit_turn_and_start_reject_attachments_in_v1(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+def test_cockpit_turn_attachments_validated_and_proxied(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, caps="worker.session.turn,worker.job.start,worker.session.create,forge.github.branch.push")
+    cfg.orchestration.turn_attachment_max_count = 2
     _store, run_id = _seed_run(cfg)
     ref = make_session_ref("macbook-worker", "sess_123")
+    posts: list[dict[str, Any]] = []
 
-    def post(_url: str, **_kwargs) -> Response:  # noqa: ANN001
-        raise AssertionError("attachment-bearing cockpit requests should fail before worker dispatch")
+    def post(url: str, **kwargs) -> Response:  # noqa: ANN001
+        posts.append({"url": url, "json": kwargs.get("json")})
+        return Response({"ok": True, "session": {"session_id": "sess_123", "status": "running"}, "events": []})
 
-    attachment = {"kind": "image", "mime_type": "image/png", "name": "screenshot.png", "data_url": "data:image/png;base64,AAAA"}
+    attachment = {"kind": "image", "mime_type": "image/png", "name": "screenshot.png", "data_url": "data:image/png;base64,cG5n"}
 
     async def calls(base: str, client: httpx.AsyncClient) -> None:
         turn = await client.post(f"{base}/v1/sessions/{ref}/turns", json={"idempotency_key": "turn_attach", "prompt": "see this", "attachments": [attachment]})
-        start = await client.post(
-            f"{base}/v1/work/start",
-            json={"idempotency_key": "start_attach", "source": "manual", "repo": "roughcoder/jarvis", "phrase": "start", "attachments": [attachment]},
-        )
+        assert turn.status_code == 200
+        assert posts[-1]["json"]["attachments"] == [attachment]
 
-        assert turn.status_code == 400
-        assert start.status_code == 400
-        assert turn.json()["error"]["code"] == "validation_failed"
-        assert start.json()["error"]["recoverable"] is True
-        assert "attachments are not supported" in start.json()["error"]["message"]
+        bad_mime = {**attachment, "mime_type": "image/tiff", "data_url": "data:image/tiff;base64,cG5n"}
+        rejected_mime = await client.post(f"{base}/v1/sessions/{ref}/turns", json={"idempotency_key": "turn_tiff", "prompt": "x", "attachments": [bad_mime]})
+        assert rejected_mime.status_code == 400
+        assert rejected_mime.json()["error"]["code"] == "validation_failed"
+        assert "mime_type" in rejected_mime.json()["error"]["message"]
+
+        too_many = await client.post(
+            f"{base}/v1/sessions/{ref}/turns",
+            json={"idempotency_key": "turn_many", "prompt": "x", "attachments": [attachment, attachment, attachment]},
+        )
+        assert too_many.status_code == 400
+        assert "ORCHESTRATION_TURN_ATTACHMENT_MAX_COUNT" in too_many.json()["error"]["message"]
+
+        cfg.orchestration.turn_attachment_max_bytes = 2
+        oversize = await client.post(f"{base}/v1/sessions/{ref}/turns", json={"idempotency_key": "turn_big", "prompt": "x", "attachments": [attachment]})
+        assert oversize.status_code == 400
+        assert "ORCHESTRATION_TURN_ATTACHMENT_MAX_BYTES" in oversize.json()["error"]["message"]
+        assert oversize.json()["error"]["recoverable"] is True
+        cfg.orchestration.turn_attachment_max_bytes = 5 * 1024 * 1024
+
+        bad_start = await client.post(
+            f"{base}/v1/work/start",
+            json={"idempotency_key": "start_attach", "source": "manual", "repo": "roughcoder/jarvis", "phrase": "start", "attachments": [{"kind": "file"}]},
+        )
+        assert bad_start.status_code == 400
+        assert bad_start.json()["error"]["code"] == "validation_failed"
+
+        # Only the valid first turn reached the worker boundary.
+        assert len(posts) == 1
 
     import asyncio
 
@@ -5559,3 +5585,284 @@ def test_cockpit_work_validate_reports_already_owned_items(tmp_path, monkeypatch
     assert any("already owned" in reason for reason in validation["reasons"])
     # Validation stayed read-only: the owning run is still the only one.
     assert [existing.run_id for existing in store.list_runs()] == [run.run_id]
+
+
+def test_cockpit_unarchive_session_restores_it_to_views(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    _store, run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        archived = await client.post(f"{base}/v1/sessions/{ref}/archive", json={"idempotency_key": "arch_1"})
+        hidden = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+        restored = await client.post(f"{base}/v1/sessions/{ref}/unarchive", json={"idempotency_key": "unarch_1"})
+        replay = await client.post(f"{base}/v1/sessions/{ref}/unarchive", json={"idempotency_key": "unarch_1"})
+        visible = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+        detail = (await client.get(f"{base}/v1/sessions/{ref}")).json()
+
+        assert archived.status_code == 200
+        assert hidden["sessions"] == []
+        assert restored.status_code == 200
+        assert restored.json()["ok"] is True
+        assert restored.json()["session"]["archived_at"] is None
+        assert replay.json()["idempotent"] is True
+        assert visible["sessions"][0]["session_ref"] == ref
+        assert visible["sessions"][0]["archived_at"] is None
+        assert detail["session"]["archived_at"] is None
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+
+def test_cockpit_unarchive_unknown_session_returns_not_found(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    _store, run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_never_seen")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(f"{base}/v1/sessions/{ref}/unarchive", json={"idempotency_key": "unarch_missing"})
+
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "not_found"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+
+def test_cockpit_worker_only_session_has_null_run_id_and_ended_reason(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    ref = make_session_ref("macbook-worker", "sess_worker_only")
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/health"):
+            return Response({"ok": True, "agent": "codex", "supported_engines": ["codex"]})
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions"):
+            return Response(
+                {
+                    "sessions": [
+                        {
+                            "session_id": "sess_worker_only",
+                            "provider": "codex",
+                            "engine": "codex",
+                            "status": "interrupted",
+                            "repo": "roughcoder/jarvis",
+                            "title": "Worker-only session",
+                            "metadata": {"ended_reason": "worker_lost"},
+                        }
+                    ]
+                }
+            )
+        if url.endswith("/sessions/requests"):
+            return Response({"requests": []})
+        if url.endswith("/sessions/checkpoints"):
+            return Response({"checkpoints": []})
+        raise AssertionError(url)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        snapshot = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+
+        row = snapshot["sessions"][0]
+        assert row["session_ref"] == ref
+        assert row["run_id"] is None
+        assert row["ended_reason"] == "worker_lost"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
+def test_cockpit_session_summary_derives_ended_reason_from_status(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.cockpit import session_summary as summary
+
+    def row(status: str, ended_reason: str = "") -> dict:
+        return {
+            "session_ref": make_session_ref("macbook-worker", "sess_x"),
+            "worker_id": "macbook-worker",
+            "session_id": "sess_x",
+            "status": status,
+            "ended_reason": ended_reason,
+        }
+
+    assert summary(row("running"))["ended_reason"] is None
+    assert summary(row("completed"))["ended_reason"] == "completed"
+    assert summary(row("done"))["ended_reason"] == "completed"
+    assert summary(row("stopped"))["ended_reason"] == "stopped"
+    assert summary(row("failed"))["ended_reason"] == "engine_error"
+    assert summary(row("interrupted"))["ended_reason"] is None
+    assert summary(row("interrupted", "worker_lost"))["ended_reason"] == "worker_lost"
+    assert summary(row("interrupted", "interrupted_by_user"))["ended_reason"] == "interrupted_by_user"
+
+
+def test_cockpit_thread_turn_attachments_reach_gateway_without_persisting_payload(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    gateway = FakeGateway(["I can see the screenshot."])
+    connector = CockpitConnector(cfg, memory=memory, gateway=gateway, tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+    attachment = {"kind": "image", "mime_type": "image/png", "name": "bug.png", "data_url": "data:image/png;base64,cG5n"}
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Bug hunt"})
+        thread = opened.json()["thread"]
+        response = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "Here is the bug", "attachments": [attachment]},
+        )
+        detail = await client.get(f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}")
+
+        assert response.status_code == 200
+        assert [event["_event"] for event in _sse_events(response.text)][-1] == "thread.turn.done"
+        user_message = gateway.messages[-1][-1]
+        assert user_message["role"] == "user"
+        assert user_message["content"][0] == {"type": "text", "text": "Here is the bug"}
+        assert user_message["content"][1] == {"type": "image_url", "image_url": {"url": attachment["data_url"]}}
+        messages = detail.json()["thread"]["messages"]
+        assert messages[0]["content"] == "Here is the bug\n[image attached: bug.png (image/png)]"
+        assert "base64,cG5n" not in json.dumps(messages)
+
+        rejected = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "bad", "attachments": [{"kind": "image", "mime_type": "image/tiff", "data_url": "data:image/tiff;base64,cG5n"}]},
+        )
+        assert rejected.status_code == 400
+        assert rejected.json()["error"]["code"] == "validation_failed"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    assert memory.messages[0]["content"] == "Here is the bug\n[image attached: bug.png (image/png)]"
+
+
+def test_cockpit_thread_projection_carries_engine_model_status(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    gateway = FakeGateway(["Done thinking."])
+    connector = CockpitConnector(cfg, memory=memory, gateway=gateway, tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = (await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Enrichment"})).json()["thread"]
+
+        assert opened["engine"] == "jarvis"
+        assert opened["model"] == str(cfg.gateway.voice_model or cfg.gateway.fast_model)
+        assert opened["worker_id"] is None
+        assert opened["host"]
+        assert opened["status"] == "created"
+        assert opened["ended_reason"] is None
+
+        turn = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}/turns",
+            json={"text": "Think about it"},
+        )
+        done = [event for event in _sse_events(turn.text) if event["_event"] == "thread.turn.done"][0]
+        listed = (await client.get(f"{base}/v1/projects/neil-shared/threads")).json()["threads"]
+        detail = (await client.get(f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}")).json()["thread"]
+
+        assert done["payload"]["thread"]["status"] == "completed"
+        assert done["payload"]["thread"]["ended_reason"] == "completed"
+        assert listed[0]["engine"] == "jarvis"
+        assert listed[0]["status"] == "completed"
+        assert detail["status"] == "completed"
+        assert detail["ended_reason"] == "completed"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_thread_rename_persists_and_records_activity(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    connector = CockpitConnector(cfg, memory=memory, gateway=FakeGateway([]), tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = (await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Old name"})).json()["thread"]
+        renamed = await client.patch(
+            f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}",
+            json={"title": "  New   name  ", "idempotency_key": "rename_1"},
+        )
+        listed = (await client.get(f"{base}/v1/projects/neil-shared/threads")).json()["threads"]
+        detail = (await client.get(f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}")).json()["thread"]
+        activity = (await client.get(f"{base}/v1/projects/neil-shared/activity")).json()
+        missing_title = await client.patch(
+            f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}",
+            json={},
+        )
+        unknown = await client.patch(
+            f"{base}/v1/projects/neil-shared/threads/thread_missing",
+            json={"title": "X"},
+        )
+
+        assert renamed.status_code == 200
+        assert renamed.json()["thread"]["title"] == "New name"
+        assert listed[0]["title"] == "New name"
+        assert detail["title"] == "New name"
+        assert any(item.get("type") == "thread.renamed" for item in activity.get("activity", []))
+        assert missing_title.status_code == 400
+        assert unknown.status_code == 404
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_catalog_merges_worker_reported_engine_supports() -> None:
+    from jarvis.orchestration.cockpit import cockpit_catalog
+
+    catalog = cockpit_catalog(
+        engines=["claude", "codex"],
+        engine_supports={"claude": {"streaming": True, "attachments": True}},
+    )
+
+    rows = {row["engine"]: row for row in catalog["engines"]}
+    assert rows["claude"]["supports"]["attachments"] is True
+    assert rows["claude"]["supports"]["streaming"] is True
+    assert rows["codex"]["supports"]["attachments"] is False
+
+
+def test_cockpit_stored_session_link_keeps_ended_reason_offline(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    store, run_id = _seed_run(cfg)
+    store.update_session(run_id, "sess_123", worker_id="macbook-worker", status="interrupted", ended_reason="worker_lost")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        # sync=none renders from the stored link only — no live worker call.
+        snapshot = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "none"})).json()
+
+        row = snapshot["sessions"][0]
+        assert row["status"] == "interrupted"
+        assert row["ended_reason"] == "worker_lost"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+
+def test_cockpit_unarchive_session_rejected_while_run_archived(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    _store, run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        archived_session = await client.post(f"{base}/v1/sessions/{ref}/archive", json={"idempotency_key": "arch_sess"})
+        archived_run = await client.post(f"{base}/v1/runs/{run_id}/archive", json={"idempotency_key": "arch_run"})
+        blocked = await client.post(f"{base}/v1/sessions/{ref}/unarchive", json={"idempotency_key": "unarch_blocked"})
+
+        assert archived_session.status_code == 200
+        assert archived_run.status_code == 200
+        assert blocked.status_code == 409
+        assert blocked.json()["error"]["code"] == "run_archived"
+        assert blocked.json()["error"]["recoverable"] is True
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
