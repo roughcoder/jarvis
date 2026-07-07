@@ -1648,6 +1648,9 @@ class CockpitWriteHandlers:
             if thread is None:
                 raise CockpitError("not_found", "thread not found", status=404)
             if deleted:
+                # R3: removing a node reparents its children up — promote child
+                # runs and threads to root, same as archive; never orphan them.
+                await asyncio.to_thread(self.ctx.store.promote_children, thread_id)
                 await _record_project_activity(
                     self.ctx,
                     project.id,
