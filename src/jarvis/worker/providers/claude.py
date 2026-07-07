@@ -15,6 +15,7 @@ from jarvis.config import WorkerConfig
 from jarvis.worker.authority import WorkerSessionAuthority
 from jarvis.worker.providers.base import ProviderTurn
 from jarvis.worker.sessions import SessionEvent, SessionManager, WorkerSession
+from jarvis.worker.workspaces import is_worker_owned_path_for_config
 from jarvis.worker_session_contract import (
     CANCELLED_SESSION_STATUSES,
     EVENT_APPROVAL_REQUESTED,
@@ -913,7 +914,7 @@ def _session_cwd(session: WorkerSession, worker_cfg: WorkerConfig) -> str:
         if not candidate:
             continue
         path = Path(candidate).expanduser().resolve(strict=False)
-        if not _worker_owned_path(path, worker_cfg):
+        if not is_worker_owned_path_for_config(path, worker_cfg):
             rejected.append(str(path))
             continue
         if path.is_dir():
@@ -922,12 +923,6 @@ def _session_cwd(session: WorkerSession, worker_cfg: WorkerConfig) -> str:
     if rejected:
         raise RuntimeError(f"worker session cwd is not a valid worker-owned directory: {', '.join(rejected)}")
     raise RuntimeError("worker session cwd is required for claude provider turns")
-
-
-def _worker_owned_path(path: Path, worker_cfg: WorkerConfig) -> bool:
-    workspace = Path(worker_cfg.workspace).expanduser().resolve(strict=False)
-    roots = [(workspace / "runs").resolve(strict=False), (workspace / "worktrees").resolve(strict=False)]
-    return any(path.is_relative_to(root) for root in roots)
 
 
 def _session_cancelled(sessions: SessionManager, session_id: str) -> bool:

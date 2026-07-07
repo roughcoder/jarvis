@@ -103,6 +103,21 @@ def _owned_worker_cwd(tmp_path, name: str = "session") -> str:  # noqa: ANN001
     return str(cwd)
 
 
+def _git_repo(root: pathlib.Path, name: str) -> pathlib.Path:
+    repo = root / name
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    (repo / "README.md").write_text(f"{name}\n")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    return repo
+
+
 def _session_with_authority(
     *,
     provider: str = "codex",
@@ -1109,6 +1124,159 @@ def test_daemon_health_does_not_wait_for_slow_diagnostics(tmp_path, monkeypatch)
 
     assert elapsed < 0.20
     assert health["diagnostics"] == {"status": "refreshing", "repositories": []}
+
+
+def test_daemon_conversation_workspace_created_lazily(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        missing = await c.get(f"{base}/conversation-workspaces/thread_alpha", headers=headers)
+        created = (
+            await c.post(
+                f"{base}/conversation-workspaces",
+                json={"conversation_id": "thread_alpha", "metadata": {"project_id": "project-one"}},
+                headers=headers,
+            )
+        ).json()
+        fetched = (await c.get(f"{base}/conversation-workspaces/thread_alpha", headers=headers)).json()
+        return missing.status_code, created, fetched
+
+    missing_status, created, fetched = asyncio.run(_with_server(cfg, 8850, calls))
+
+    assert missing_status == 404
+    assert created["ok"] is True
+    assert created["workspace"]["workspace_id"] == "thread-alpha"
+    assert created["workspace"]["provision_phase"] == "running"
+    assert fetched["workspace"]["worktrees"] == []
+
+
+def test_daemon_conversation_workspace_materializes_multiple_repos(tmp_path) -> None:
+    dev = tmp_path / "dev"
+    runtime = _git_repo(dev, "jarvis")
+    cockpit = _git_repo(dev, "jarvis-cockpit")
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="tkn",
+        workspace=str(tmp_path / "worker"),
+        repo_root=str(dev),
+        clone_missing=False,
+    )
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        await c.post(f"{base}/conversation-workspaces", json={"conversation_id": "thread_multi"}, headers=headers)
+        first = (
+            await c.post(
+                f"{base}/conversation-workspaces/thread_multi/worktrees",
+                json={"name": "runtime", "repo": "roughcoder/jarvis"},
+                headers=headers,
+            )
+        ).json()
+        second = (
+            await c.post(
+                f"{base}/conversation-workspaces/thread_multi/worktrees",
+                json={"name": "cockpit", "repo": "roughcoder/jarvis-cockpit"},
+                headers=headers,
+            )
+        ).json()
+        return first, second
+
+    first, second = asyncio.run(_with_server(cfg, 8851, calls))
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    workspace = second["workspace"]
+    assert workspace["root"].endswith("thread-multi")
+    assert {row["name"] for row in workspace["worktrees"]} == {"runtime", "cockpit"}
+    paths = {row["name"]: pathlib.Path(row["path"]) for row in workspace["worktrees"]}
+    assert paths["runtime"].is_dir()
+    assert paths["cockpit"].is_dir()
+    assert paths["runtime"].parent.parent == pathlib.Path(workspace["root"])
+    assert runtime != paths["runtime"]
+    assert cockpit != paths["cockpit"]
+
+
+def test_daemon_conversation_workspace_serializes_concurrent_materialization(tmp_path) -> None:
+    dev = tmp_path / "dev"
+    _git_repo(dev, "jarvis")
+    _git_repo(dev, "jarvis-cockpit")
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="tkn",
+        workspace=str(tmp_path / "worker"),
+        repo_root=str(dev),
+        clone_missing=False,
+    )
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        await c.post(f"{base}/conversation-workspaces", json={"conversation_id": "thread_race"}, headers=headers)
+        first, second = await asyncio.gather(
+            c.post(
+                f"{base}/conversation-workspaces/thread_race/worktrees",
+                json={"name": "runtime", "repo": "roughcoder/jarvis"},
+                headers=headers,
+            ),
+            c.post(
+                f"{base}/conversation-workspaces/thread_race/worktrees",
+                json={"name": "cockpit", "repo": "roughcoder/jarvis-cockpit"},
+                headers=headers,
+            ),
+        )
+        fetched = (await c.get(f"{base}/conversation-workspaces/thread_race", headers=headers)).json()
+        return first.json(), second.json(), fetched
+
+    first, second, fetched = asyncio.run(_with_server(cfg, 8853, calls))
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert {row["name"] for row in fetched["workspace"]["worktrees"]} == {"runtime", "cockpit"}
+
+
+def test_daemon_conversation_workspace_rejects_option_like_base_ref(tmp_path) -> None:
+    dev = tmp_path / "dev"
+    _git_repo(dev, "jarvis")
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="tkn",
+        workspace=str(tmp_path / "worker"),
+        repo_root=str(dev),
+        clone_missing=False,
+    )
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        response = await c.post(
+            f"{base}/conversation-workspaces/thread_base/worktrees",
+            json={"name": "runtime", "repo": "roughcoder/jarvis", "base_ref": "-bad"},
+            headers=headers,
+        )
+        fetched = (await c.get(f"{base}/conversation-workspaces/thread_base", headers=headers)).json()
+        return response.status_code, response.json(), fetched
+
+    status, body, fetched = asyncio.run(_with_server(cfg, 8854, calls))
+
+    assert status == 400
+    assert body["ok"] is False
+    assert "invalid base ref" in body["error"]
+    assert fetched["workspace"]["status"] == "failed"
+    assert fetched["workspace"]["provision_phase"] == "failed"
+    assert fetched["workspace"]["worktrees"] == []
+
+
+def test_provider_cwd_accepts_configured_conversation_workspace(tmp_path) -> None:
+    root = tmp_path / "conversation-cache"
+    cwd = root / "thread-alpha"
+    cwd.mkdir(parents=True)
+    cfg = WorkerConfig(
+        _env_file=None,
+        workspace=str(tmp_path / "worker"),
+        conversation_workspace_root=str(root),
+    )
+    session = WorkerSession(session_id="sess_workspace", provider="codex", engine="codex", cwd=str(cwd))
+
+    assert codex_session_cwd(session, cfg) == str(cwd.resolve())
 
 
 def test_daemon_shell_uses_expanded_default_workspace(tmp_path, monkeypatch) -> None:  # noqa: ANN001

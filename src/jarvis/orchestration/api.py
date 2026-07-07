@@ -30,7 +30,13 @@ from jarvis.capabilities import (
     WORKER_SESSION_TURN,
 )
 from jarvis.config import Config, insecure_bind
-from jarvis.connectors.cockpit import CockpitConnector, CockpitThread, CockpitThreadIndex, THREAD_INDEX_FILENAME
+from jarvis.connectors.cockpit import (
+    CockpitConnector,
+    CockpitThread,
+    CockpitThreadIndex,
+    THREAD_INDEX_FILENAME,
+    workspace_public,
+)
 from jarvis.ids import new_id, utc_now
 from jarvis.mcp.status import (
     MCP_TOKENS_MANAGE_CAPABILITY,
@@ -1458,7 +1464,14 @@ class CockpitWriteHandlers:
         state_key = (project.id, thread.thread_id)
         self.ctx.thread_turn_states[state_key] = ("running", "")
         try:
-            reply, updated = await connector.turn(project, thread, requester, text, attachments=attachments or None)
+            reply, updated = await connector.turn(
+                project,
+                thread,
+                requester,
+                text,
+                attachments=attachments or None,
+                workspace_request=dict(body["workspace"]) if isinstance(body.get("workspace"), dict) else None,
+            )
         except (UnsupportedMemoryOperation, TimeoutError, OSError, RuntimeError) as exc:
             self.ctx.thread_turn_states[state_key] = ("failed", "engine_error")
             await _write_sse(
@@ -3379,7 +3392,7 @@ def _make_thread_children_promoter(cfg: Config) -> Callable[[str], object]:
 
 def _thread_projection(thread: CockpitThread, ctx: CockpitAppContext | None = None) -> dict[str, Any]:
     status, ended_reason = _thread_status(thread, ctx)
-    return {
+    data = {
         "thread_id": thread.thread_id,
         "chat_id": thread.thread_id,
         "parent_chat_id": thread.parent_chat_id,
@@ -3404,6 +3417,9 @@ def _thread_projection(thread: CockpitThread, ctx: CockpitAppContext | None = No
         "archived_by": thread.archived_by,
         "archive_reason": thread.archive_reason,
     }
+    if thread.workspace:
+        data["workspace"] = workspace_public(thread.workspace)
+    return data
 
 
 _BRAIN_HOSTNAME = socket.gethostname()
