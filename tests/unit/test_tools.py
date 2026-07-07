@@ -17,10 +17,11 @@ from jarvis.tools import build_registry
 from jarvis.tools.base import ToolError
 from jarvis.tools.files import _resolve_within, make_files_tools
 from jarvis.tools.web_search import _format_tavily
+from conftest import request_context
 
 
 def _ctx(*caps: str) -> RequestContext:
-    return RequestContext("dev", "house", "house", frozenset(caps))
+    return request_context(*caps)
 
 
 def _cfg(tmp_path, **over) -> ToolsConfig:

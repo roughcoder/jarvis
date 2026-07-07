@@ -289,6 +289,35 @@ def start_worker_ensemble(
     return links
 
 
+def _stop_control_envelope(envelope: ExecutionEnvelope) -> dict[str, Any]:
+    control_envelope = envelope.to_dict()
+    control_envelope["allowed_actions"] = sorted({*control_envelope.get("allowed_actions", []), WORKER_SESSION_STOP})
+    return control_envelope
+
+
+def _post_session_stop(
+    session_id: str,
+    *,
+    control_envelope: dict[str, Any],
+    base_url: str,
+    headers: dict[str, str],
+    http_post: Callable[..., Any],
+    timeout_s: float,
+    rejection_message: str,
+) -> None:
+    """One stop-protocol call: POST /sessions/{id}/stop, raise on any worker refusal."""
+    response = http_post(
+        f"{base_url}/sessions/{session_id}/stop",
+        json={"metadata": {"execution_envelope": control_envelope}},
+        headers=headers,
+        timeout=timeout_s,
+    )
+    body = _json_body(response)
+    _raise_worker_error(response, body)
+    if not body.get("ok"):
+        raise RuntimeError(body.get("error") or rejection_message)
+
+
 def _stop_started_sessions(
     links: list[WorkerSessionLink],
     *,
@@ -303,22 +332,20 @@ def _stop_started_sessions(
         return
     http_post = post or httpx.post
     base_url, headers = _worker_endpoint(worker_cfg, worker)
-    control_envelope = envelope.to_dict()
-    control_envelope["allowed_actions"] = sorted({*control_envelope.get("allowed_actions", []), WORKER_SESSION_STOP})
+    control_envelope = _stop_control_envelope(envelope)
     for link in reversed(links):
         if created_session_ids is not None and link.session_id not in created_session_ids:
             continue
         try:
-            response = http_post(
-                f"{base_url}/sessions/{link.session_id}/stop",
-                json={"metadata": {"execution_envelope": control_envelope}},
+            _post_session_stop(
+                link.session_id,
+                control_envelope=control_envelope,
+                base_url=base_url,
                 headers=headers,
-                timeout=worker_cfg.request_timeout_s,
+                http_post=http_post,
+                timeout_s=worker_cfg.request_timeout_s,
+                rejection_message="worker rejected rollback stop",
             )
-            body = _json_body(response)
-            _raise_worker_error(response, body)
-            if not body.get("ok"):
-                raise RuntimeError(body.get("error") or "worker rejected rollback stop")
         except Exception:  # noqa: BLE001 - preserve original ensemble dispatch failure
             if store is not None:
                 store.append_event(
@@ -327,7 +354,6 @@ def _stop_started_sessions(
                     f"Could not stop worker session {link.session_id} after ensemble dispatch failure",
                     {"session_id": link.session_id},
                 )
-            pass
         else:
             if store is not None:
                 try:
@@ -348,21 +374,18 @@ def _stop_created_session_after_turn_rejection(
     session_id = str(session.get("session_id") or "").strip()
     if not session_id:
         return
-    control_envelope = envelope.to_dict()
-    control_envelope["allowed_actions"] = sorted({*control_envelope.get("allowed_actions", []), WORKER_SESSION_STOP})
     http_post = post or httpx.post
     base_url, headers = _worker_endpoint(worker_cfg, worker)
     try:
-        response = http_post(
-            f"{base_url}/sessions/{session_id}/stop",
-            json={"metadata": {"execution_envelope": control_envelope}},
+        _post_session_stop(
+            session_id,
+            control_envelope=_stop_control_envelope(envelope),
+            base_url=base_url,
             headers=headers,
-            timeout=worker_cfg.request_timeout_s,
+            http_post=http_post,
+            timeout_s=worker_cfg.request_timeout_s,
+            rejection_message="worker rejected turn-failure cleanup stop",
         )
-        body = _json_body(response)
-        _raise_worker_error(response, body)
-        if not body.get("ok"):
-            raise RuntimeError(body.get("error") or "worker rejected turn-failure cleanup stop")
     except Exception as exc:  # noqa: BLE001 - preserve the original turn rejection
         if store is not None:
             store.append_event(

@@ -9,6 +9,7 @@ from jarvis.brain.project_tools import PROJECT_SWITCH_CAPABILITY, make_project_t
 from jarvis.brain.registry import ProjectEntry, RegistryStore
 from jarvis.config import MemoryConfig
 from jarvis.runtime import RequestContext, ToolRegistry
+from conftest import request_context
 
 
 def _ctx(
@@ -16,12 +17,11 @@ def _ctx(
     identity: str = "neil",
     device_id: str = "office-mac",
 ) -> RequestContext:
-    return RequestContext(
-        device_id,
-        identity,
-        "personal",
-        frozenset(caps),
-        channel="voice",
+    return request_context(
+        *caps,
+        device_id=device_id,
+        identity=identity,
+        scope="personal",
         peer=identity,
     )
 

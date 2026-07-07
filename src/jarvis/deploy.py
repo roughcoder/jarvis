@@ -862,14 +862,17 @@ def _hardware_evidence(
 def _redact_text(value: str, *, limit: int = 4000) -> str:
     text = value[:limit]
     patterns = [
-        re.compile(r"(?i)(token|secret|password|api[_-]?key|authorization)(\s*[:=]\s*)([^\s,}]+)"),
-        re.compile(r'(?i)("(?:token|secret|password|api[_-]?key|authorization)"\s*:\s*)"[^"]*"'),
+        (
+            re.compile(r"(?i)(token|secret|password|api[_-]?key|authorization)(\s*[:=]\s*)([^\s,}]+)"),
+            r"\1\2[redacted]",
+        ),
+        (
+            re.compile(r'(?i)("(?:token|secret|password|api[_-]?key|authorization)"\s*:\s*)"[^"]*"'),
+            '\\1"[redacted]"',
+        ),
     ]
-    for pattern in patterns:
-        if pattern.pattern.startswith('(?i)("'):
-            text = pattern.sub('\\1"[redacted]"', text)
-        else:
-            text = pattern.sub(r"\1\2[redacted]", text)
+    for pattern, replacement in patterns:
+        text = pattern.sub(replacement, text)
     if len(value) > limit:
         text += "\n[truncated]"
     return text
@@ -884,12 +887,14 @@ def _xml_escape(value: str) -> str:
     )
 
 
-def _systemd_escape(value: str) -> str:
+def _double_quote_escape(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _dotenv_quote(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+# systemd unit values and dotenv values share the same double-quote escaping;
+# keep them as one implementation so a quoting fix can't land on only one.
+_systemd_escape = _double_quote_escape
+_dotenv_quote = _double_quote_escape
 
 
 def _shell_quote(value: str) -> str:

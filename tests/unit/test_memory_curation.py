@@ -15,17 +15,11 @@ from jarvis.brain.memory_tools import make_memory_tools
 from jarvis.brain.registry import ContactEntry, ProjectEntry, RegistryStore
 from jarvis.config import MemoryConfig
 from jarvis.runtime import RequestContext, ToolRegistry
+from conftest import request_context
 
 
 def _ctx(*caps: str, identity: str = "neil", peer: str = "neil") -> RequestContext:
-    return RequestContext(
-        "dev",
-        identity,
-        "personal",
-        frozenset(caps),
-        channel="voice",
-        peer=peer,
-    )
+    return request_context(*caps, identity=identity, scope="personal", peer=peer)
 
 
 def _memory_cfg(tmp_path: Path, **over: Any) -> MemoryConfig:
@@ -42,6 +36,12 @@ def _memory_cfg(tmp_path: Path, **over: Any) -> MemoryConfig:
         _env_file=None,
         **values,
     )
+
+
+def _json(request: httpx.Request) -> dict[str, Any]:
+    if not request.content:
+        return {}
+    return json.loads(request.content.decode("utf-8"))
 
 
 def _registry(tmp_path: Path) -> RegistryStore:
@@ -67,6 +67,18 @@ def _registry(tmp_path: Path) -> RegistryStore:
         )
     )
     return store
+
+
+def _contact(**overrides: object) -> ContactEntry:
+    values: dict[str, object] = {
+        "id": "klaus",
+        "display_name": "Klaus Schmidt",
+        "owner": "neil",
+        "members": ("neil",),
+        "visibility": "shared",
+    }
+    values.update(overrides)
+    return ContactEntry(**values)
 
 
 class FakeMemory:
@@ -210,6 +222,155 @@ def test_outbox_retry_exhaustion_notifies_once_per_failed_entry(tmp_path) -> Non
     assert first == {"delivered": 0, "failed": 2}
     assert second == {"delivered": 0, "failed": 0}
     assert len(notifications) == 2
+
+
+def test_contact_merge_copies_loser_conclusions_to_survivor_through_outbox(tmp_path) -> None:
+    sidecar_path = tmp_path / "sidecar.json"
+    cfg = _memory_cfg(tmp_path, conclusion_sidecar_path=str(sidecar_path))
+    loser_row = {
+        "id": "loser-c1",
+        "content": "Sarah J prefers email after six.",
+        "observer_id": "neil",
+        "observed_id": encode_honcho_id("contact:sarah-wa"),
+        "level": "explicit",
+    }
+    survivor_row = {
+        "id": "survivor-c1",
+        "content": "Sarah Jones lives in Berlin.",
+        "observer_id": "neil",
+        "observed_id": encode_honcho_id("contact:sarah"),
+        "level": "explicit",
+    }
+    rows = [loser_row, survivor_row]
+    created_payloads: list[dict[str, Any]] = []
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                cfg.workspace_id: {
+                    "loser-c1": {
+                        "recorded_by": "neil",
+                        "observed_at": "2026-07-04",
+                        "channel": "voice",
+                        "content_hash": "sha256:loser-original",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/conclusions/list"):
+            filters = _json(request).get("filters", {})
+            matched = rows
+            for key, value in filters.items():
+                matched = [row for row in matched if row.get(key) == value]
+            return httpx.Response(200, json={"items": matched})
+        if request.url.path.endswith("/conclusions") and request.method == "POST":
+            payload = _json(request)["conclusions"][0]
+            created_payloads.append(payload)
+            row = {
+                "id": f"copy-{len(created_payloads)}",
+                "content": payload["content"],
+                "observer_id": payload["observer_id"],
+                "observed_id": payload["observed_id"],
+                "level": payload["level"],
+            }
+            rows.append(row)
+            return httpx.Response(201, json=[row])
+        return httpx.Response(201, json={"id": _json(request).get("id", "")})
+
+    memory = HonchoV3MemoryClient(cfg, transport=httpx.MockTransport(handler))
+    outbox = CurationOutbox(cfg.curation_outbox_path, backoff_initial_s=0)
+    store = RegistryStore(tmp_path / "registry.json", memory=memory, curation_outbox=outbox)
+    store.save_contact(_contact(id="sarah", display_name="Sarah Jones"))
+    store.save_contact(_contact(id="sarah-wa", display_name="Sarah J"))
+
+    survivor = store.merge_contacts("sarah", "sarah-wa")
+    pending = outbox.pending_entries(observed_id=survivor.peer_id)
+    flushed = outbox.flush_sync(memory)
+
+    assert survivor.peer_id == "contact:sarah"
+    assert [entry.content for entry in pending] == ["Sarah J prefers email after six."]
+    assert flushed == {"delivered": 1, "failed": 0}
+    survivor_rows = [
+        row for row in rows
+        if row["observed_id"] == encode_honcho_id("contact:sarah")
+    ]
+    assert [row["content"] for row in survivor_rows] == [
+        "Sarah Jones lives in Berlin.",
+        "Sarah J prefers email after six.",
+    ]
+    metadata = created_payloads[0]["metadata"]
+    assert metadata["recorded_by"] == "neil"
+    assert metadata["observed_at"] == "2026-07-04"
+    assert metadata["channel"] == "voice"
+    assert metadata["copied_from_peer_id"] == "contact:sarah-wa"
+    assert metadata["copied_from_conclusion_id"] == "loser-c1"
+    assert metadata["copied_from_content_hash"] == "sha256:loser-original"
+    assert metadata["copied_reason"] == "contact_merge"
+    assert metadata["content_hash"] != "sha256:loser-original"
+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    assert sidecar[cfg.workspace_id]["copy-1"]["copied_from_conclusion_id"] == "loser-c1"
+
+
+def test_contact_merge_copy_delivery_failure_is_retried_by_outbox_without_breaking_merge(tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/conclusions/list"):
+            filters = _json(request).get("filters", {})
+            if filters.get("observed_id") == encode_honcho_id("contact:sarah-wa"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "items": [
+                            {
+                                "id": "loser-c1",
+                                "content": "Sarah J prefers email after six.",
+                                "observer_id": "neil",
+                                "observed_id": encode_honcho_id("contact:sarah-wa"),
+                                "level": "explicit",
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(503, json={"error": "memory unavailable"})
+        return httpx.Response(201, json={"id": _json(request).get("id", "")})
+
+    cfg = _memory_cfg(
+        tmp_path,
+        conclusion_sidecar_path=str(tmp_path / "sidecar.json"),
+    )
+    Path(cfg.conclusion_sidecar_path).write_text(
+        json.dumps(
+            {
+                cfg.workspace_id: {
+                    "loser-c1": {
+                        "recorded_by": "neil",
+                        "observed_at": "2026-07-04",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory = HonchoV3MemoryClient(cfg, transport=httpx.MockTransport(handler))
+    outbox = CurationOutbox(
+        cfg.curation_outbox_path,
+        max_retries=2,
+        backoff_initial_s=0,
+    )
+    store = RegistryStore(tmp_path / "registry.json", memory=memory, curation_outbox=outbox)
+    store.save_contact(_contact(id="sarah", display_name="Sarah Jones"))
+    store.save_contact(_contact(id="sarah-wa", display_name="Sarah J"))
+
+    survivor = store.merge_contacts("sarah", "sarah-wa")
+    flush_result = outbox.flush_sync(memory)
+
+    assert survivor.id == "sarah"
+    assert store.get_contact("sarah-wa").status == "merged"
+    assert flush_result == {"delivered": 0, "failed": 1}
+    events = [json.loads(line)["event"] for line in Path(cfg.curation_outbox_path).read_text().splitlines()]
+    assert events == ["queued", "attempt", "attempt", "failed"]
 
 
 def test_outbox_cancellation_suppresses_pending_lines_and_delivery(tmp_path) -> None:

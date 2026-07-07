@@ -115,7 +115,7 @@ def test_fetch_backend_tries_remaining_vetted_addresses(monkeypatch) -> None:  #
 
 def test_fetch_dns_resolution_has_own_timeout(monkeypatch) -> None:  # noqa: ANN001
     def slow_getaddrinfo(host, port, **_kwargs):  # noqa: ANN001
-        time.sleep(0.2)
+        time.sleep(0.05)  # just needs to exceed the 0.01s resolution timeout
         return [(None, None, None, None, ("93.184.216.34", port))]
 
     monkeypatch.setattr("jarvis.tools.fetch.socket.getaddrinfo", slow_getaddrinfo)

@@ -17,6 +17,7 @@ from jarvis.accounts import (
 )
 from jarvis.runtime import RequestContext
 from jarvis.users import HOUSE
+from conftest import request_context
 
 
 def _ctx(
@@ -26,11 +27,10 @@ def _ctx(
     channel: str = "voice",
     confidence: str = "strong",
 ) -> RequestContext:
-    return RequestContext(
-        "dev",
-        identity,
-        scope,
-        frozenset(caps),
+    return request_context(
+        *caps,
+        identity=identity,
+        scope=scope,
         channel=channel,
         confidence=confidence,
     )

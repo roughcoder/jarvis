@@ -16,6 +16,7 @@ from jarvis.brain.skills import (
 )
 from jarvis.config import load_config
 from jarvis.tools.base import Tool, ToolRegistry
+from conftest import request_context
 
 _SKILL = """---
 name: news_briefing
@@ -28,7 +29,7 @@ Search the web and summarise in three sentences.
 
 
 def _ctx(*caps: str) -> RequestContext:
-    return RequestContext("mac", "neil", "personal", frozenset(caps))
+    return request_context(*caps, device_id="mac", identity="neil", scope="personal")
 
 
 def _registry() -> ToolRegistry:

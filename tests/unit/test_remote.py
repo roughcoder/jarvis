@@ -16,10 +16,11 @@ from jarvis.brain.context import RequestContext
 from jarvis.config import RemoteConfig
 from jarvis.remote.client import RemoteClient
 from jarvis.tools.remote import make_remote_tools
+from conftest import request_context
 
 
 def _ctx(*caps: str) -> RequestContext:
-    return RequestContext("neil-mac", "neil", "personal", frozenset(caps))
+    return request_context(*caps, device_id="neil-mac", identity="neil", scope="personal")
 
 
 def test_client_builds_correct_requests(monkeypatch) -> None:

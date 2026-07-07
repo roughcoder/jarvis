@@ -37,9 +37,10 @@ wake = [
     "openwakeword>=0.6",
     "pvporcupine>=3.0",
 ]
-memory = [
-    "honcho-ai>=1.5",
-]
+# The memory client is deliberately raw-REST over httpx (the honcho-ai SDK is
+# /v3-only while we drive both /v2 and /v3 by hand) — no SDK dependency needed;
+# the extra is kept so documented `--extra memory` installs stay valid.
+memory = []
 # The worker Mac daemon — installed ONLY on the worker host, not the brain or an
 # intercom (it talks to the brain over HTTP; nothing imports it). Phase 3c.
 worker = [

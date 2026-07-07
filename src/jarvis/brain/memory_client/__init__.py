@@ -1,8 +1,9 @@
 """Memory backend selector.
 
 `MemoryClient(cfg)` remains the compatibility constructor used by the brain.
-The default backend is v2; setting `MEMORY_BACKEND=v3` returns the Honcho v3
-HTTP client without changing `BrainSession` or the turn loop.
+The default backend is v3 (production cut over 2026-07-05); setting
+`MEMORY_BACKEND=v2` returns the legacy Honcho v2 client, kept for rollback,
+without changing `BrainSession` or the turn loop.
 """
 
 from __future__ import annotations

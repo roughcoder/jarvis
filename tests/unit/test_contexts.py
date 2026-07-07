@@ -33,12 +33,15 @@ def test_memory_cache_is_per_user(tmp_path) -> None:  # noqa: ANN001
 
 def test_memory_session_and_peer_per_user() -> None:
     cfg = MemoryConfig(_env_file=None, user_peer_id="user")
-    mc = MemoryClient(cfg)
+    mc = MemoryClient(cfg)  # v3 default
     assert mc._session_id(None) == "voice"
     assert mc._session_id("user") == "voice"  # default principal
-    assert mc._session_id("jules") == "voice-jules"
+    assert mc._session_id("jules") == "voice:jules"
     assert mc._peer("jules") == "jules"
     assert mc._peer(None) == "user"
+    # The rollback v2 backend keeps its legacy separator.
+    v2 = MemoryClient(MemoryConfig(_env_file=None, user_peer_id="user", backend="v2"))
+    assert v2._session_id("jules") == "voice-jules"
 
 
 def test_context_store_isolates_and_reuses_sessions() -> None:

@@ -22,19 +22,18 @@ from jarvis.brain.registry import ContactEntry, ProjectEntry, RegistryStore
 from jarvis.brain.server import BrainServer
 from jarvis.config import CapabilityConfig
 from jarvis.users import User
+from conftest import request_context
 
 
 def _ctx(*caps: str) -> RequestContext:
-    return RequestContext(
-        device_id="dev", identity="house", scope="house", capabilities=frozenset(caps)
-    )
+    return request_context(*caps)
 
 
 # --- the gate --------------------------------------------------------------
 
 
 def test_require_passes_when_granted() -> None:
-    require(_ctx("web.search"), "web.search")  # no raise
+    assert require(_ctx("web.search"), "web.search") is None  # grants by not raising
 
 
 def test_require_denies_when_not_granted() -> None:
