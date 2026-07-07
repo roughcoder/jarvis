@@ -212,7 +212,18 @@ class WorkerRegistry:
             )
             response.raise_for_status()
             data = response.json()
-        except Exception:  # noqa: BLE001 - validation reports unknown rather than crashing
+        except Exception as exc:  # noqa: BLE001 - validation reports unknown rather than crashing
+            profile.repo_access = [
+                *profile.repo_access,
+                {
+                    "repo": repo,
+                    "accessible": False,
+                    "public": False,
+                    "reason_code": "repo-access-probe-failed",
+                    "reason": str(exc)[:200] or exc.__class__.__name__,
+                },
+            ]
+            profile.__post_init__()
             return profile
         access = data.get("access") if isinstance(data, dict) else None
         if isinstance(access, dict):

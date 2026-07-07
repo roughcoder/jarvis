@@ -3481,7 +3481,7 @@ def test_session_provisioning_emits_progress_phases(tmp_path, monkeypatch) -> No
     assert pathlib.Path(created["session"]["cwd"]).exists()
 
 
-def test_session_provisioning_fetch_failure_is_visible(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+def test_session_provisioning_warm_fetch_failure_warns_and_dispatches(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     dev = tmp_path / "dev"
     repo = dev / "jarvis"
     repo.mkdir(parents=True)
@@ -3509,19 +3509,41 @@ def test_session_provisioning_fetch_failure_is_visible(tmp_path, monkeypatch) ->
                 "provision_workspace": True,
             },
         }
-        response = await c.post(base + "/sessions", json=body)
-        return response.status_code, response.json()
+        created = (await c.post(base + "/sessions", json=body)).json()
+        events = (await c.get(base + "/sessions/sess_fetch_fail/events")).json()["events"]
+        return created, events
 
-    status, data = asyncio.run(_with_server(cfg, 8826, calls))
-    assert status == 400
-    assert data["ok"] is False
-    assert "cannot lock ref" in data["error"]
-    failed = [
-        event for event in data["events"]
-        if event["type"] == "provisioning.progress" and event["data"].get("status") == "failed"
+    created, events = asyncio.run(_with_server(cfg, 8826, calls))
+    assert created["ok"] is True
+    assert pathlib.Path(created["session"]["cwd"]).exists()
+    warnings = [
+        event for event in events
+        if event["type"] == "provisioning.progress" and event["data"].get("status") == "warning"
     ]
-    assert failed[-1]["data"]["phase"] == "provisioning"
-    assert "cannot lock ref" in failed[-2]["data"]["message"]
+    assert warnings[-1]["data"]["phase"] == "cloning"
+    assert "cannot lock ref" in warnings[-1]["data"]["message"]
+    phases = [
+        event["data"]["phase"]
+        for event in events
+        if event["type"] == "provisioning.progress" and event["data"].get("status") == "completed"
+    ]
+    assert phases == ["resolving-access", "cloning", "creating-worktree"]
+
+
+def test_git_ls_remote_access_probe_does_not_claim_private_repo_is_public(monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.worker import actions
+
+    class Result:
+        returncode = 0
+        stdout = "abc123\tHEAD"
+        stderr = ""
+
+    monkeypatch.setattr(actions.subprocess, "run", lambda *_args, **_kwargs: Result())
+
+    access = actions._probe_repo_with_git("roughcoder/private", timeout_s=1.0)  # noqa: SLF001
+
+    assert access["accessible"] is True
+    assert access["public"] is False
 
 
 def test_cleanup_all_removes_scratch_dir(tmp_path) -> None:

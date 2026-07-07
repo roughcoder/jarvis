@@ -464,6 +464,9 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 if err:
                     raise ValueError(err)
                 body["cwd"] = cwd
+            # Provisioned sessions are created before workspace materialization
+            # so provisioning events have a durable session to attach to. No
+            # provider starts in this window; /turns runs later and requires cwd.
             session, event = sessions.create(body or {})
         except (RuntimeError, ValueError) as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
@@ -1032,8 +1035,7 @@ async def _provision_worktree(
         return "", "", None, message
     fetch_err = await fetch_repo(resolved, cfg.clone_timeout_s)
     if fetch_err:
-        progress("cloning", "failed", message=fetch_err)
-        return "", "", None, fetch_err
+        progress("cloning", "warning", message=fetch_err)
     progress("cloning", "completed", repo_path=resolved)
     progress("creating-worktree")
     cwd, branch, err = await prepare_worktree(

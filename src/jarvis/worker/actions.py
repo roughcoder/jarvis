@@ -342,6 +342,8 @@ def git_identity(*, ttl_s: float = 0.0) -> dict[str, Any]:
     if not shutil.which("gh"):
         row["detail"] = "gh binary not found"
     else:
+        # These are fixed quick identity sub-probes. The caller-controlled repo
+        # access timeout applies to network authorization checks below.
         user = _run_quick(["gh", "api", "user", "--jq", ".login"], timeout_s=8.0)
         if user.returncode == 0 and user.output.strip():
             row.update(
@@ -367,6 +369,8 @@ def git_identity(*, ttl_s: float = 0.0) -> dict[str, Any]:
 
 
 def _git_config(key: str) -> str:
+    # Identity display is a health/readiness quick check, not the repo access
+    # decision itself; keep it bounded independently of the slower access probe.
     result = _run_quick(["git", "config", "--global", "--get", key], timeout_s=3.0)
     return _short_detail(result.output) if result.returncode == 0 else ""
 
@@ -481,9 +485,9 @@ def _probe_repo_with_git(repo: str, *, timeout_s: float) -> dict[str, Any]:
     if result.returncode == 0:
         return {
             "accessible": True,
-            "public": True,
+            "public": False,
             "reason_code": "accessible",
-            "reason": "Repo is publicly readable.",
+            "reason": "Git can read this repo with the worker's configured credentials.",
         }
     return {
         "accessible": False,
@@ -686,7 +690,12 @@ async def clone_repo(name: str, repo_root: str, timeout_s: float) -> tuple[str |
 
 
 async def fetch_repo(repo: str, timeout_s: float) -> str | None:
-    """Best-effort fetch for an existing repo; returns an operator-visible error."""
+    """Best-effort fetch for an existing repo; returns an operator-visible error.
+
+    This intentionally runs against the current checkout until the worker grows
+    a bare-mirror cache. Callers must treat failures as warnings when a usable
+    local checkout already exists.
+    """
     remote = await run_exec(["git", "-C", repo, "remote", "get-url", "origin"], None, min(timeout_s, 10.0))
     if remote.startswith("error"):
         return None

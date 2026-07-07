@@ -387,6 +387,7 @@ def _cfg(
                         "status": "online",
                         "agent": "codex",
                         "supported_engines": ["codex", "claude"],
+                        "repo_access": [{"repo": "roughcoder/jarvis", "accessible": True, "reason_code": "accessible"}],
                         "engine_supports": {
                             "codex": {
                                 "streaming": True,
@@ -4694,7 +4695,7 @@ def test_cockpit_work_start_manual_dispatches_worker_session(tmp_path, monkeypat
         assert body["ok"] is True
         assert body["run"]["repo"] == "roughcoder/jarvis"
         assert body["session"]["session_ref"].startswith("sessref_")
-        assert [url.rsplit("/", 1)[-1] for url in post_calls] == ["run", "sessions", "turns"]
+        assert [url.rsplit("/", 1)[-1] for url in post_calls] == ["sessions", "turns"]
         # The synchronous create/provision and first-turn events from dispatch land in the run log.
         store = OrchestrationStore(cfg.orchestration.workspace)
         run_id = body["run"]["run_id"]
@@ -5045,7 +5046,14 @@ def test_cockpit_work_validate_reports_selection_without_creating_a_run(tmp_path
             "eligible": True,
             "reasons": ["selected"],
             "reason_codes": ["selected"],
-            "repo_access": None,
+            "repo_access": {
+                "repo": "roughcoder/jarvis",
+                "accessible": True,
+                "public": False,
+                "reason_code": "accessible",
+                "checked_at": None,
+                "cached": False,
+            },
         }
     ]
     assert validation["compatibility"]["warnings"] == []
@@ -5072,6 +5080,7 @@ def test_cockpit_work_validate_reports_worker_repo_compatibility(tmp_path, monke
                         "capabilities": ["git", "codex"],
                         "status": "online",
                         "supported_engines": ["codex"],
+                        "repo_access": [{"repo": "roughcoder/jarvis", "accessible": True, "reason_code": "accessible"}],
                         "repositories": [{"repo": "jarvis", "status": "ready", "default_branch": "main"}],
                     },
                     {
@@ -5081,6 +5090,7 @@ def test_cockpit_work_validate_reports_worker_repo_compatibility(tmp_path, monke
                         "capabilities": ["git", "codex"],
                         "status": "online",
                         "supported_engines": ["codex"],
+                        "repo_access": [{"repo": "roughcoder/jarvis", "accessible": True, "reason_code": "accessible"}],
                         "repositories": [{"repo": "other", "status": "ready", "default_branch": "main"}],
                     },
                 ]
@@ -5111,14 +5121,28 @@ def test_cockpit_work_validate_reports_worker_repo_compatibility(tmp_path, monke
                     "eligible": True,
                     "reasons": ["selected"],
                     "reason_codes": ["selected"],
-                    "repo_access": None,
+                    "repo_access": {
+                        "repo": "roughcoder/jarvis",
+                        "accessible": True,
+                        "public": False,
+                        "reason_code": "accessible",
+                        "checked_at": None,
+                        "cached": False,
+                    },
                 },
                 {
                     "worker_id": "hive-worker",
                     "eligible": True,
                     "reasons": ["eligible", "repo not checked out"],
                     "reason_codes": ["eligible", "repo-not-warm"],
-                    "repo_access": None,
+                    "repo_access": {
+                        "repo": "roughcoder/jarvis",
+                        "accessible": True,
+                        "public": False,
+                        "reason_code": "accessible",
+                        "checked_at": None,
+                        "cached": False,
+                    },
                 },
             ],
         }
@@ -5556,6 +5580,7 @@ def test_cockpit_work_start_capacity_uses_probed_worker_state(tmp_path, monkeypa
     def probe(_self, profile):  # noqa: ANN001
         profile.status = "online"
         profile.current_jobs = profile.max_concurrent_jobs
+        profile.repo_access = [{"repo": "roughcoder/jarvis", "accessible": True, "reason_code": "accessible"}]
         return profile
 
     monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", probe)

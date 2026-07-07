@@ -1048,6 +1048,7 @@ class Config:
             "worker.supported_engines": self.worker.supported_engines or "<default agent only>",
             "worker.workspace": self.worker.workspace,
             "worker.repo_root": self.worker.repo_root or "<unset>",
+            "worker.repo_access_probe_timeout_s": self.worker.repo_access_probe_timeout_s,
             "worker.repo_access_ttl_s": self.worker.repo_access_ttl_s,
             "remote.api_key": mask(self.remote.api_key),
             "remote.configured": self.remote.configured,
