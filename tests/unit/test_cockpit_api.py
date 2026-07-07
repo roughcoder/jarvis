@@ -2754,8 +2754,16 @@ def test_cockpit_thread_delete_removes_index_and_memory_session_idempotently(tmp
             created_at="2026-07-05T09:00:00+00:00",
             updated_at="2026-07-05T09:00:00+00:00",
             created_by="neil",
-            messages=({"role": "user", "peer_id": "neil", "content": "hi", "observed_at": "now"},),
         )
+    )
+    # Seed the transcript through the real storage path (messages live in the
+    # per-thread transcript file, not inline on the index).
+    thread = connector.index.append_turn(
+        thread,
+        user_peer_id="neil",
+        user_text="hi",
+        assistant_peer_id="jarvis",
+        assistant_text="hello",
     )
     monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
     monkeypatch.setattr(cockpit_api_module, "MemoryClient", lambda _cfg: memory)
@@ -2768,7 +2776,7 @@ def test_cockpit_thread_delete_removes_index_and_memory_session_idempotently(tmp
         assert first.status_code == 200
         assert first.json()["deleted"] is True
         assert first.json()["reclamation"]["records"] == 1
-        assert first.json()["reclamation"]["events"] == 1
+        assert first.json()["reclamation"]["events"] == 2
         assert first.json()["reclamation"]["memory_sessions"] == 1
         assert second.status_code == 200
         assert second.json()["deleted"] is False
@@ -2779,6 +2787,7 @@ def test_cockpit_thread_delete_removes_index_and_memory_session_idempotently(tmp
 
     asyncio.run(_with_server(cfg, calls))
     assert memory.deleted_sessions == [thread.session_id]
+    assert not (connector.index.transcripts_dir / "neil-shared" / "thread_delete.json").exists()
 
 
 def test_cockpit_thread_delete_treats_missing_v3_memory_session_as_reclaimed(tmp_path, monkeypatch) -> None:  # noqa: ANN001

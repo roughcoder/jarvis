@@ -169,12 +169,19 @@ class CockpitThreadIndex:
         raw = threads.pop(thread_id, None)
         if isinstance(raw, dict) and str(raw.get("project_id") or "") == project_id:
             thread = CockpitThread.from_dict(raw)
+            # Messages may live in the transcript file, inline, or the legacy key;
+            # count them all for the reclamation summary, then reclaim the file.
+            messages = self._thread_messages(thread)
             deleted[thread_id] = {
                 **thread.as_dict(include_messages=False),
                 "deleted_at": utc_now(),
             }
             _atomic_write_json(self.path, data)
-            return thread, True
+            try:
+                self._transcript_path(project_id, thread_id).unlink(missing_ok=True)
+            except OSError:
+                pass
+            return replace(thread, messages=tuple(messages)), True
         if raw is not None:
             threads[thread_id] = raw
         tombstone = deleted.get(thread_id)
