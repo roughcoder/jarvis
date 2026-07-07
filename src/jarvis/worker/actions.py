@@ -541,7 +541,7 @@ async def prune_worktrees(
         if not _is_under(path, [root]):
             refused.append({"target": str(path), "reason": "outside worktree root"})
             continue
-        if str(path.resolve(strict=False)) in live:
+        if _overlaps_live_session(path, live):
             refused.append({"target": path.name, "reason": "live session uses this worktree"})
             continue
         bytes_before = _disk_usage(path)
@@ -885,7 +885,7 @@ def _stale_worktree(
     resolved = path.resolve(strict=False)
     if not resolved.is_relative_to(worktrees_root.resolve(strict=False)):
         return False
-    if str(resolved) in live_cwds:
+    if _overlaps_live_session(resolved, live_cwds):
         return False
     ttl = max(0.0, float(stale_ttl_s or 0.0))
     if ttl <= 0:
@@ -895,6 +895,15 @@ def _stale_worktree(
     except OSError:
         return False
     return time.time() - mtime >= ttl
+
+
+def _overlaps_live_session(path: pathlib.Path, live_cwds: set[str]) -> bool:
+    resolved = path.resolve(strict=False)
+    for live_text in live_cwds:
+        live = pathlib.Path(live_text).resolve(strict=False)
+        if resolved == live or resolved.is_relative_to(live) or live.is_relative_to(resolved):
+            return True
+    return False
 
 
 def _disk_usage(path: pathlib.Path) -> int:

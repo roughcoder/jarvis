@@ -731,7 +731,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             return web.json_response({"error": "unauthorized"}, status=401)
         session_id = request.match_info["id"]
         session = sessions.get(session_id)
-        if session is None:
+        if session is None or session.session_id != session_id:
             return web.json_response({"error": "no such session"}, status=404)
         if session.status in ACTIVE_SESSION_STATUSES:
             return web.json_response({"ok": False, "error": "worker session is live"}, status=409)
@@ -803,6 +803,12 @@ def make_app(cfg: WorkerConfig) -> web.Application:
 
     async def health(request: web.Request) -> web.Response:
         supported_engines = engine_ids(cfg.supported_engines, default_engine=cfg.agent)
+        inventory = await asyncio.to_thread(
+            worktree_inventory,
+            str(workspace / "worktrees"),
+            str(workspace / "sessions"),
+            stale_ttl_s=cfg.worktree_stale_ttl_s,
+        )
         body = {
             "ok": True,
             "agent": cfg.agent,
@@ -813,11 +819,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             "repo_root_configured": bool(cfg.repo_root),
             "browser_enabled": browser_cfg.enabled,
             "gui_provider_configured": bool(cfg.peekaboo_ai_providers),
-            "worktree_inventory": worktree_inventory(
-                str(workspace / "worktrees"),
-                str(workspace / "sessions"),
-                stale_ttl_s=cfg.worktree_stale_ttl_s,
-            ),
+            "worktree_inventory": inventory,
         }
         if authorised(request):
             body["system"] = system_info_cached()

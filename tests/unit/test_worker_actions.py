@@ -428,6 +428,25 @@ def test_worktree_inventory_counts_bytes_and_stale_while_sparing_live_sessions(t
     assert live.exists()
 
 
+def test_prune_spares_worktree_when_live_session_uses_subdirectory(tmp_path) -> None:
+    worktrees = tmp_path / "worker" / "worktrees"
+    sessions = tmp_path / "worker" / "sessions"
+    worktree = worktrees / "live-parent"
+    live_cwd = worktree / "subdir"
+    live_cwd.mkdir(parents=True)
+    (live_cwd / "payload.txt").write_text("live payload")
+    session_dir = sessions / "sess_live"
+    session_dir.mkdir(parents=True)
+    (session_dir / "session.json").write_text(json.dumps({"status": "running", "cwd": str(live_cwd)}))
+
+    inventory = worktree_inventory(str(worktrees), str(sessions), stale_ttl_s=0)
+    result = asyncio.run(prune_worktrees(str(worktrees), str(sessions), stale_ttl_s=0))
+
+    assert inventory["stale_count"] == 0
+    assert result["worktrees"] == 0
+    assert worktree.exists()
+
+
 def test_prune_refuses_target_outside_worktree_root(tmp_path) -> None:
     worktrees = tmp_path / "worker" / "worktrees"
     outside = tmp_path / "outside"

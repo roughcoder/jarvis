@@ -2550,6 +2550,8 @@ def _delete_run_packet(ctx: CockpitAppContext, run_id: str) -> dict[str, Any]:
             "artifacts": [],
             "reclamation": summary,
         }
+    if run.jobs:
+        raise CockpitError("conflict", "run still has worker jobs; clean up jobs before deleting the run", recoverable=True, status=409)
     records = 0
     events = 0
     worktrees = 0

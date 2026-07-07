@@ -994,6 +994,38 @@ def test_worker_delete_session_refuses_live_worktree(tmp_path) -> None:
     assert worktree.exists()
 
 
+def test_worker_delete_session_requires_exact_id(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"), worktree_stale_ttl_s=0)
+    worktree = tmp_path / "worker" / "worktrees" / "prefix"
+    worktree.mkdir(parents=True)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[int, int, dict]:
+        created = await client.post(
+            f"{base}/sessions",
+            json={
+                "session_id": "sess_exact_delete",
+                "provider": "fake",
+                "engine": "fake",
+                "cwd": str(worktree),
+                "metadata": _authority_metadata("fake", extra_actions=[WORKER_SESSION_STOP]),
+            },
+        )
+        await client.post(
+            f"{base}/sessions/sess_exact_delete/stop",
+            json={"metadata": _control_metadata(WORKER_SESSION_STOP)},
+        )
+        fuzzy = await client.delete(f"{base}/sessions/sess_exact")
+        exact = await client.get(f"{base}/sessions/sess_exact_delete")
+        return created.status_code, fuzzy.status_code, exact.json()
+
+    created_status, fuzzy_status, exact = asyncio.run(_with_server(cfg, 8852, calls))
+
+    assert created_status == 200
+    assert fuzzy_status == 404
+    assert exact["session_id"] == "sess_exact_delete"
+    assert worktree.exists()
+
+
 def test_worker_prune_rejects_non_numeric_stale_ttl(tmp_path) -> None:
     cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"), worktree_stale_ttl_s=0)
 
@@ -1001,10 +1033,32 @@ def test_worker_prune_rejects_non_numeric_stale_ttl(tmp_path) -> None:
         response = await client.post(f"{base}/worktrees/prune", json={"stale_ttl_s": "soon"})
         return response.status_code, response.json()
 
-    status_code, body = asyncio.run(_with_server(cfg, 8852, calls))
+    status_code, body = asyncio.run(_with_server(cfg, 8853, calls))
 
     assert status_code == 400
     assert body["error"] == "stale_ttl_s must be numeric"
+
+
+def test_worker_health_scans_worktree_inventory_off_event_loop(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"), worktree_stale_ttl_s=0)
+    caller_thread = threading.get_ident()
+    scan_threads: list[int] = []
+
+    def inventory(*_args, **_kwargs) -> dict[str, int]:  # noqa: ANN002, ANN003
+        scan_threads.append(threading.get_ident())
+        return {"count": 0, "disk_bytes": 0, "stale_count": 0}
+
+    monkeypatch.setattr("jarvis.worker.server.worktree_inventory", inventory)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict:
+        response = await client.get(f"{base}/health")
+        return response.json()
+
+    body = asyncio.run(_with_server(cfg, 8854, calls))
+
+    assert body["worktree_inventory"] == {"count": 0, "disk_bytes": 0, "stale_count": 0}
+    assert scan_threads
+    assert all(thread_id != caller_thread for thread_id in scan_threads)
 
 
 def test_daemon_health_reports_diagnostics_error_without_500(tmp_path, monkeypatch) -> None:  # noqa: ANN001

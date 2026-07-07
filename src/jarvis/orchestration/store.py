@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import fcntl
+import hashlib
+import hmac
 import json
 import pathlib
 import re
@@ -21,6 +24,9 @@ from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES
 
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+_SESSION_REF_PREFIX = "sessref_"
+_SESSION_REF_SIGNING_CONTEXT = b"jarvis-cockpit-session-ref-v1"
+_SESSION_REF_SIGNATURE_BYTES = 12
 
 
 class ActiveWorkItemError(RuntimeError):
@@ -507,6 +513,7 @@ class OrchestrationStore:
             shutil.rmtree(directory, ignore_errors=True)
             self._record_deleted_run_unlocked(run.run_id)
             for session in run.sessions:
+                self._record_session_ref_unlocked(session.worker_id, session.session_id)
                 self._record_deleted_session_unlocked(session.worker_id, session.session_id)
             return {"deleted": True, "run_id": run.run_id, "records": records, "events": events}
 
@@ -637,6 +644,24 @@ class OrchestrationStore:
         records[run_id] = {"key": run_id, "run_id": run_id, "deleted_at": utc_now()}
         _atomic_write_json(self._deleted_runs_path, list(records.values()))
 
+    def _record_session_ref_unlocked(self, worker_id: str, session_id: str) -> None:
+        records = self.session_ref_index()
+        session_ref = _make_session_ref(worker_id, session_id)
+        existing = records.get(session_ref)
+        if (
+            existing is not None
+            and existing.get("worker_id") == worker_id
+            and existing.get("session_id") == session_id
+        ):
+            return
+        records[session_ref] = {
+            "session_ref": session_ref,
+            "worker_id": worker_id,
+            "session_id": session_id,
+            "updated_at": utc_now(),
+        }
+        _atomic_write_json(self._session_refs_path, list(records.values()))
+
     def _record_deleted_session_unlocked(self, worker_id: str, session_id: str) -> None:
         records = self._deleted_records(self._deleted_sessions_path)
         key = f"{worker_id}\0{session_id}"
@@ -664,3 +689,10 @@ def _atomic_write_json(path: pathlib.Path, data: object) -> None:
     tmp = path.with_suffix(f"{path.suffix}.tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
     tmp.replace(path)
+
+
+def _make_session_ref(worker_id: str, session_id: str) -> str:
+    raw = f"{worker_id}\0{session_id}".encode("utf-8")
+    digest = hmac.new(_SESSION_REF_SIGNING_CONTEXT, _SESSION_REF_SIGNING_CONTEXT + b"\0" + raw, hashlib.sha256).digest()
+    token = base64.urlsafe_b64encode(digest[:_SESSION_REF_SIGNATURE_BYTES]).decode("ascii").rstrip("=")
+    return f"{_SESSION_REF_PREFIX}{token}"

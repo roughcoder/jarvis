@@ -28,7 +28,7 @@ from jarvis.orchestration.api import CockpitAppContext, IdempotencyStore, SseSna
 from jarvis.orchestration.cockpit import make_session_ref  # noqa: E402
 from jarvis.mcp.status import mcp_status_path  # noqa: E402
 from jarvis.mcp_server.tokens import MCPTokenStore  # noqa: E402
-from jarvis.orchestration.models import Artifact, ExecutionEnvelope, WorkItem, WorkerProfile, WorkerSessionLink  # noqa: E402
+from jarvis.orchestration.models import Artifact, ExecutionEnvelope, WorkItem, WorkerJobLink, WorkerProfile, WorkerSessionLink  # noqa: E402
 from jarvis.orchestration.oauth import OAuthTokenValidator, OAuthValidationError  # noqa: E402
 from jarvis.orchestration.service import StartedWork  # noqa: E402
 from jarvis.orchestration.store import OrchestrationStore  # noqa: E402
@@ -4387,6 +4387,7 @@ def test_cockpit_delete_run_deletes_owned_sessions_and_records(tmp_path, monkeyp
         second = await client.delete(f"{base}/v1/runs/{run_id}")
         listed = (await client.get(f"{base}/v1/runs")).json()
         detail = (await client.get(f"{base}/v1/runs/{run_id}")).json()
+        session_detail = (await client.get(f"{base}/v1/sessions/{make_session_ref('macbook-worker', 'sess_123')}")).json()
 
         assert first.status_code == 200
         assert first.json()["reclamation"]["records"] >= 3
@@ -4398,6 +4399,40 @@ def test_cockpit_delete_run_deletes_owned_sessions_and_records(tmp_path, monkeyp
         assert listed["runs"] == []
         assert detail["deleted"] is True
         assert detail["run"]["status"] == "deleted"
+        assert session_detail["deleted"] is True
+        assert session_detail["session"]["status"] == "deleted"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id), http_delete=delete))
+
+
+def test_cockpit_delete_run_refuses_job_backed_runs(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    store, run_id = _seed_run(cfg)
+    store.link_job(
+        run_id,
+        WorkerJobLink(
+            worker_id="macbook-worker",
+            job_id="job_running",
+            status="running",
+            engine="codex",
+            branch="jarvis/job",
+            cwd="/Users/example/private/jarvis/.worktrees/job",
+        ),
+    )
+
+    def delete(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        raise AssertionError(f"worker delete should not be called for job-backed runs: {url}")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.delete(f"{base}/v1/runs/{run_id}")
+        listed = (await client.get(f"{base}/v1/runs")).json()
+
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "conflict"
+        assert "worker jobs" in response.json()["error"]["message"]
+        assert listed["runs"][0]["run_id"] == run_id
 
     import asyncio
 
