@@ -12,7 +12,7 @@ import threading
 from functools import partial
 from pathlib import Path
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import httpx
 from aiohttp import web
@@ -1684,10 +1684,9 @@ class CockpitWriteHandlers:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
         attachments = _validate_attachments(body, self.ctx.cfg.orchestration)
-        async with _idempotency_scope(self.ctx, "work/start", str(body.get("idempotency_key") or "")):
-            cached = self.ctx.idempotency.get("work/start", str(body.get("idempotency_key") or ""), body)
-            if cached is not None:
-                return web.json_response(cached)
+        cacheable_error: dict[str, Any] | None = None
+
+        async def produce() -> dict[str, Any]:
             command, manual_item = _command_from_body(body, start=True)
             service = self.ctx.service(manual_item=manual_item)
             try:
@@ -1699,15 +1698,25 @@ class CockpitWriteHandlers:
                     next_work = partial(next_work, parent_chat_id=parent_chat_id)
                 result = await asyncio.to_thread(next_work)
             except (MissingAuthorityError, NoEligibleWorkerError, WorkAlreadyOwnedError, MissingWorkRepoError, WorkerDispatchError) as exc:
+                nonlocal cacheable_error
                 error = _service_error(exc)
                 if isinstance(exc, (MissingWorkRepoError, WorkerDispatchError)):
-                    self.ctx.idempotency.save("work/start", str(body.get("idempotency_key") or ""), body, error.body())
+                    cacheable_error = error.body()
                 raise error from exc
             if result is None or not isinstance(result, StartedWork):
                 raise CockpitError("not_found", "no eligible work item found", recoverable=True, status=404)
             response_body = _started_work_packet(self.ctx.store, result)
             await _record_work_dispatched_activity(self.ctx, request, body, result)
-            self.ctx.idempotency.save("work/start", str(body.get("idempotency_key") or ""), body, response_body)
+            return response_body
+
+        response_body = await _idempotent_write_body(
+            self.ctx,
+            "work/start",
+            str(body.get("idempotency_key") or ""),
+            body,
+            produce,
+            cache_error_body=lambda _exc: cacheable_error,
+        )
         return web.json_response(response_body)
 
     async def work_validate(self, request: web.Request) -> web.Response:
@@ -1813,17 +1822,17 @@ class CockpitWriteHandlers:
     async def work_resume(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
-        async with _idempotency_scope(self.ctx, "work/resume", str(body.get("idempotency_key") or "")):
-            cached = self.ctx.idempotency.get("work/resume", str(body.get("idempotency_key") or ""), body)
-            if cached is not None:
-                return web.json_response(cached)
+        scope = "work/resume"
+
+        async def produce() -> dict[str, Any]:
             service = self.ctx.service()
             try:
                 result = await asyncio.to_thread(service.resume_run, str(body.get("run_id") or "latest"), prompt=str(body.get("prompt") or ""))
             except (MissingAuthorityError, NoEligibleWorkerError, ResumeRunError, WorkerDispatchError) as exc:
                 raise _service_error(exc) from exc
-            response_body = _started_work_packet(self.ctx.store, result)
-            self.ctx.idempotency.save("work/resume", str(body.get("idempotency_key") or ""), body, response_body)
+            return _started_work_packet(self.ctx.store, result)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce)
         return web.json_response(response_body)
 
     async def run_archive(self, request: web.Request) -> web.Response:
@@ -2493,6 +2502,9 @@ async def _idempotent_write_body(
     producer: Callable[[], Any],
     *,
     requester: RequestContext | None = None,
+    cache_response_body: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    cache_error_body: Callable[[Exception], dict[str, Any] | None] | None = None,
+    on_save_error: Callable[[Exception], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     if requester is not None:
         scope = f"{scope}/principal/{_idempotency_principal(requester)}"
@@ -2500,8 +2512,21 @@ async def _idempotent_write_body(
         cached = ctx.idempotency.get(scope, key, fingerprint_body)
         if cached is not None:
             return cached
-        response_body = await producer()
-        ctx.idempotency.save(scope, key, fingerprint_body, response_body)
+        try:
+            response_body = await producer()
+        except Exception as exc:
+            if cache_error_body is not None:
+                error_body = cache_error_body(exc)
+                if error_body is not None:
+                    ctx.idempotency.save(scope, key, fingerprint_body, error_body)
+            raise
+        cached_response_body = cache_response_body(response_body) if cache_response_body is not None else response_body
+        try:
+            ctx.idempotency.save(scope, key, fingerprint_body, cached_response_body)
+        except Exception as exc:
+            if on_save_error is not None:
+                await on_save_error(exc)
+            raise
         return response_body
 
 
