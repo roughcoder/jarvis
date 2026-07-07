@@ -844,10 +844,19 @@ def _print_session_events(events: list[dict], *, json_output: bool) -> int:
 
 
 def _orch_store(cfg=None):  # noqa: ANN001, ANN202
+    from jarvis.orchestration.api import _make_thread_child_terminal_notifier, _make_thread_children_promoter
     from jarvis.orchestration.store import OrchestrationStore
 
     cfg = cfg or load_config()
-    return OrchestrationStore(cfg.orchestration.workspace)
+    # Wire the same thread-children promoter/notifier callbacks the cockpit API
+    # uses. Without them a CLI-driven archive/delete would promote child RUNS
+    # but silently orphan child THREADS in the cockpit thread index (a CLI
+    # archive and an API archive must behave identically).
+    return OrchestrationStore(
+        cfg.orchestration.workspace,
+        thread_child_terminal_notifier=_make_thread_child_terminal_notifier(cfg),
+        thread_children_promoter=_make_thread_children_promoter(cfg),
+    )
 
 
 def _cmd_runs(args: argparse.Namespace) -> int:

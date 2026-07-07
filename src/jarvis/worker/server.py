@@ -79,6 +79,7 @@ from jarvis.worker_session_contract import (
     EVENT_TURN_STARTED,
     EVENT_TURN_FAILED,
     EVENT_PROVISIONING_PROGRESS,
+    FAILED_SESSION_STATUSES,
     SESSION_FAILED,
     SESSION_INTERRUPTED,
     SESSION_STOPPED,
@@ -212,6 +213,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
     browser_cfg = BrowserConfig()
     browser_holder: dict = {}
     diagnostics_state: dict[str, Any] = {"value": None, "expires_at": 0.0, "task": None}
+    worktree_inventory_state: dict[str, Any] = {"value": None, "expires_at": 0.0}
 
     async def browser_dispatch(action: str, args: dict) -> web.Response:
         if not browser_cfg.enabled:
@@ -308,7 +310,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             if args.get("cwd") and resume_session:
                 if not session_id:
                     return web.json_response({"ok": False, "error": "resume cwd requires session_id"}, status=400)
-                job_cwd, err = _resume_cwd(str(args["cwd"]), workspace)
+                job_cwd, err = _resume_cwd(str(args["cwd"]), workspace, conversation_root)
                 if err:
                     return web.json_response({"ok": False, "error": err}, status=400)
                 branch = str(args.get("branch") or "") or None
@@ -493,7 +495,9 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         try:
             session, provisioning_events = await _provision_session_if_requested(session, body or {}, cfg, workspace, sessions, conversation_root=conversation_root)
             events.extend(event.to_dict() for event in provisioning_events)
-        except ValueError as exc:
+        except Exception as exc:  # noqa: BLE001 - any provisioning failure (OSError disk-full,
+            # KeyError from a malformed workspace state, etc.), not just ValueError, must land
+            # the session in FAILED-with-provisioning-failed-event so it's reclaimable on retry.
             failed = sessions.update_status(session.session_id, SESSION_FAILED)
             sessions.append_event(
                 session.session_id,
@@ -821,10 +825,15 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 stale_ttl_s=0.0,
                 timeout_s=cfg.shell_timeout_s,
             )
+            # "outside worktree root" means the session's cwd lives under another
+            # worker-owned root (conversations/ or runs/, not worktrees/) — prune
+            # correctly refuses to touch it, but that's not a reason to block the
+            # session RECORD deletion itself. Only a genuinely live/refused worktree
+            # (still in worktrees/, still referenced) should 409 here.
             blocking = [
                 item
                 for item in prune.get("refused", [])
-                if item.get("reason") not in {"worktree not found"}
+                if item.get("reason") not in {"worktree not found", "outside worktree root"}
             ]
             if blocking:
                 return web.json_response({"ok": False, "error": blocking[0].get("reason") or "worktree prune refused"}, status=409)
@@ -877,14 +886,29 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         status = 200 if result.get("ok") else 409
         return web.json_response(result, status=status)
 
-    async def health(request: web.Request) -> web.Response:
-        supported_engines = engine_ids(cfg.supported_engines, default_engine=cfg.agent)
-        inventory = await asyncio.to_thread(
+    async def _cached_worktree_inventory() -> dict[str, Any]:
+        # /health is a probe endpoint the cockpit hits continuously (SSE ~1s, ~3s
+        # timeout). worktree_inventory() is a full os.walk lstat of every worktree —
+        # cheap on a small workspace but easily probe-timeout-exceeding on a large
+        # one, which flaps the worker offline. Cache it on the same TTL as
+        # diagnostics; still off the event loop (asyncio.to_thread) on a cache miss.
+        now = asyncio.get_running_loop().time()
+        cached = worktree_inventory_state.get("value")
+        if cached is not None and float(worktree_inventory_state.get("expires_at") or 0.0) > now:
+            return dict(cached)
+        value = await asyncio.to_thread(
             worktree_inventory,
             str(workspace / "worktrees"),
             str(workspace / "sessions"),
             stale_ttl_s=cfg.worktree_stale_ttl_s,
         )
+        worktree_inventory_state["value"] = value
+        worktree_inventory_state["expires_at"] = now + max(0.0, cfg.diagnostics_ttl_s)
+        return dict(value)
+
+    async def health(request: web.Request) -> web.Response:
+        supported_engines = engine_ids(cfg.supported_engines, default_engine=cfg.agent)
+        inventory = await _cached_worktree_inventory()
         body = {
             "ok": True,
             "agent": cfg.agent,
@@ -934,6 +958,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 claude_bin=cfg.claude_bin,
                 browser_cfg=browser_cfg,
                 ttl_s=cfg.diagnostics_ttl_s,
+                probe_timeout_s=cfg.repo_access_probe_timeout_s,
             )
             if not isinstance(value, dict):
                 value = {"error": "invalid diagnostics payload", "repositories": []}
@@ -1168,15 +1193,26 @@ async def _provision_session_if_requested(
 
 
 def _failed_unstarted_provisioning_session(session: WorkerSession, sessions: SessionManager) -> bool:
-    if session.status != SESSION_FAILED:
+    """A session record is reclaimable (delete-then-recreate on retry with the same
+    deterministic session_id) when it's terminal AND never started a turn — not just
+    a provisioning failure (the original, narrower check): a session stopped or
+    interrupted before its first turn is just as safely reclaimable.
+
+    SESSION_CREATED is deliberately NOT reclaimable here: it's ambiguous between
+    "ready for its first turn" (provisioning succeeded — update_workspace doesn't
+    change status) and "orphaned by a mid-provisioning crash", with no reliable
+    signal in persisted state to tell them apart. Treating CREATED as reclaimable
+    would let a duplicate create request destroy a live, ready session. The crash
+    case this might otherwise cover already lands in SESSION_FAILED instead, now that
+    create_session's except clause (above) catches any provisioning exception, not
+    just ValueError.
+
+    Any turn_started event means real work may be in flight — never reclaim that.
+    """
+    if session.status not in FAILED_SESSION_STATUSES:
         return False
     events = sessions.events(session.session_id)
-    if any(event.type == EVENT_TURN_STARTED for event in events):
-        return False
-    return any(
-        event.type == EVENT_PROVISIONING_PROGRESS and event.data.get("status") == "failed"
-        for event in events
-    )
+    return not any(event.type == EVENT_TURN_STARTED for event in events)
 
 
 async def _provision_worktree(
@@ -1247,8 +1283,8 @@ def _should_probe_repo_access(repo_ref: str) -> bool:
     return text.count("/") == 1
 
 
-def _resume_cwd(cwd: str, workspace: pathlib.Path) -> tuple[str, str]:
-    return worker_owned_cwd(cwd, workspace, action="resume")
+def _resume_cwd(cwd: str, workspace: pathlib.Path, conversation_root: pathlib.Path) -> tuple[str, str]:
+    return worker_owned_cwd(cwd, workspace, conversation_root=conversation_root, action="resume")
 
 
 def _session_cwd_error(session: WorkerSession, workspace: pathlib.Path, conversation_root: pathlib.Path) -> str:

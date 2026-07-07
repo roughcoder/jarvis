@@ -1061,11 +1061,13 @@ def archived_session_refs_for_store(store: OrchestrationStore, runs: list[Orches
 
 
 def deleted_session_refs_for_store(store: OrchestrationStore) -> set[str]:
-    return {
-        make_session_ref(str(item.get("worker_id") or ""), str(item.get("session_id") or ""))
-        for item in store.deleted_worker_sessions().values()
-        if item.get("worker_id") and item.get("session_id")
-    }
+    # store.deleted_session_refs() caches on deleted-sessions.json's mtime;
+    # cockpit_snapshot() (and therefore this) runs every SSE refresh tick
+    # (~1s) while any client is connected, so recomputing the HMAC per
+    # tombstone on every tick would be wasted work for records that only
+    # change on an explicit delete. store's ref algorithm matches
+    # make_session_ref() here (same prefix/context/signature length).
+    return store.deleted_session_refs()
 
 
 def project_artifact(artifact: Artifact, run: OrchestrationRun) -> dict[str, Any]:

@@ -68,15 +68,16 @@ _WORK_SESSION_OFFER = (
     "/v1/work/start as a work session and I can handle it there."
 )
 _WORK_ACTION_CLAIM_RE = re.compile(
-    r"\b("
-    r"(?:i(?:'|’)ll|i will|i(?:'|’)m|i am|i(?:'|’)ve|i have)\s+"
+    # Only the fabrication mode: a first-person present/future claim that THIS
+    # conversation is doing untooled work on the real repo/tests right now
+    # ("I'll start a code review", "I'm reviewing the repo", "I've started
+    # running pytest"). No bare/third-person or backward-looking ("...done",
+    # "...finished", "...completed") branches here — those match truthful status
+    # reports about already-completed or child-run work (e.g. "the code review
+    # is done — run_abc finished") and must not be clobbered.
+    r"\b(?:i(?:'|’)ll|i will|i(?:'|’)m|i am|i(?:'|’)ve|i have)\s+"
     r"(?:start(?:ed|ing)?|begin(?:ning|begun)?|run(?:ning)?|review(?:ing)?|inspect(?:ing)?|check(?:ing)?|look(?:ing)?\s+through)"
-    r"[^.?!\n]{0,120}\b(?:code\s+review|review|repo|repository|codebase|pull\s+request|pr|tests?|test\s+suite|pytest|ruff|lint|typecheck)\b|"
-    r"\b(?:code\s+review|review|tests?|test\s+suite|pytest|ruff|lint|repo|repository|codebase)\b"
-    r"[^.?!\n]{0,80}\b(?:underway|in\s+progress|running|started|completed|done|finished)\b|"
-    r"\b(?:reviewing|inspecting|checking)\s+(?:the\s+)?(?:repo|repository|code|codebase|pull\s+request|pr)\b|"
-    r"\brunning\s+(?:the\s+)?(?:tests?|test\s+suite|pytest|ruff|lint|typecheck)\b"
-    r")",
+    r"[^.?!\n]{0,120}\b(?:code\s+review|review|repo|repository|codebase|pull\s+request|pr|tests?|test\s+suite|pytest|ruff|lint|typecheck)\b",
     re.IGNORECASE,
 )
 _WORK_ACTION_TOOL_NAMES = {"spawn_child_work_session"}
@@ -210,31 +211,36 @@ class CockpitThreadIndex:
             return self.save(updated)
 
     def delete(self, project_id: str, thread_id: str) -> tuple[CockpitThread | None, bool]:
-        data = self._read()
-        threads = data.setdefault("threads", {})
-        deleted = data.setdefault("deleted_threads", {})
-        raw = threads.pop(thread_id, None)
-        if isinstance(raw, dict) and str(raw.get("project_id") or "") == project_id:
-            thread = CockpitThread.from_dict(raw)
-            # Messages may live in the transcript file, inline, or the legacy key;
-            # count them all for the reclamation summary, then reclaim the file.
-            messages = self._thread_messages(thread)
-            deleted[thread_id] = {
-                **thread.as_dict(include_messages=False),
-                "deleted_at": utc_now(),
-            }
-            _atomic_write_json(self.path, data)
-            try:
-                self._transcript_path(project_id, thread_id).unlink(missing_ok=True)
-            except OSError:
-                pass
-            return replace(thread, messages=tuple(messages)), True
-        if raw is not None:
-            threads[thread_id] = raw
-        tombstone = deleted.get(thread_id)
-        if isinstance(tombstone, dict) and str(tombstone.get("project_id") or "") == project_id:
-            return CockpitThread.from_dict(tombstone), False
-        return None, False
+        # Hold the same lock as every other mutator: an unlocked read-modify-write
+        # here can race a concurrent append_turn/save and resurrect a just-deleted
+        # thread (its transcript already unlinked) or clobber a concurrent
+        # rename/promotion.
+        with _THREAD_INDEX_LOCK:
+            data = self._read()
+            threads = data.setdefault("threads", {})
+            deleted = data.setdefault("deleted_threads", {})
+            raw = threads.pop(thread_id, None)
+            if isinstance(raw, dict) and str(raw.get("project_id") or "") == project_id:
+                thread = CockpitThread.from_dict(raw)
+                # Messages may live in the transcript file, inline, or the legacy key;
+                # count them all for the reclamation summary, then reclaim the file.
+                messages = self._thread_messages(thread)
+                deleted[thread_id] = {
+                    **thread.as_dict(include_messages=False),
+                    "deleted_at": utc_now(),
+                }
+                _atomic_write_json(self.path, data)
+                try:
+                    self._transcript_path(project_id, thread_id).unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return replace(thread, messages=tuple(messages)), True
+            if raw is not None:
+                threads[thread_id] = raw
+            tombstone = deleted.get(thread_id)
+            if isinstance(tombstone, dict) and str(tombstone.get("project_id") or "") == project_id:
+                return CockpitThread.from_dict(tombstone), False
+            return None, False
     def rename(self, project_id: str, thread_id: str, title: str) -> CockpitThread | None:
         with _THREAD_INDEX_LOCK:
             thread = self.get(project_id, thread_id)
@@ -389,7 +395,7 @@ class CockpitThreadIndex:
     ) -> list[dict[str, Any]]:
         messages = self._read_thread_messages(thread)
         if not messages:
-            messages = [dict(message) for message in seed_messages] or self._legacy_thread_messages(thread.thread_id)
+            messages = [dict(message) for message in seed_messages]
         if limit is not None:
             if limit <= 0:
                 return []
@@ -418,12 +424,6 @@ class CockpitThreadIndex:
                 "messages": messages,
             },
         )
-
-    def _legacy_thread_messages(self, thread_id: str) -> list[dict[str, Any]]:
-        raw = self._read().get("threads", {}).get(thread_id)
-        if not isinstance(raw, dict):
-            return []
-        return _normalized_messages(raw.get("messages") or ())
 
     def _transcript_path(self, project_id: str, thread_id: str) -> Path:
         return self.transcripts_dir / _safe_path_segment(project_id) / f"{_safe_path_segment(thread_id)}.json"
@@ -535,10 +535,23 @@ class CockpitConnector:
         self._worker_post = worker_post or httpx.post
         self._worker_get = worker_get or httpx.get
         self._index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
+        self._worker_registry: WorkerRegistry | None = None
 
     @property
     def index(self) -> CockpitThreadIndex:
         return self._index
+
+    def _registry(self) -> WorkerRegistry:
+        # Built once and reused: WorkerRegistry() re-reads workers.json from disk on
+        # construction, and each workspace turn used to make one per worker HTTP call
+        # (~5+ per turn) for no reason.
+        if self._worker_registry is None:
+            self._worker_registry = WorkerRegistry(
+                self._cfg.worker,
+                profiles_path=self._cfg.orchestration.workers_path,
+                http_get=self._worker_get,
+            )
+        return self._worker_registry
 
     def list_threads(self, project: ProjectEntry, *, include_archived: bool = False) -> list[CockpitThread]:
         return self._index.list(project.id, include_archived=include_archived)
@@ -613,7 +626,7 @@ class CockpitConnector:
             raise ValueError("turn text is required")
         context_thread = self._index.get_with_messages(project.id, thread.thread_id, limit=THREAD_HISTORY_LIMIT) or thread
         explicit_workspace_request = workspace_request is not None
-        workspace_request = _workspace_request(project, text, workspace_request)
+        workspace_request = dict(workspace_request or {})
         if context_thread.workspace or explicit_workspace_request:
             reply, updated = await self._workspace_turn(
                 project,
@@ -657,14 +670,21 @@ class CockpitConnector:
         # marker per image — later turns and the deriver know an image was
         # shared, but base64 payloads live only in the gateway request.
         persisted_text = _text_with_attachment_markers(text, attachments)
-        await asyncio.to_thread(
-            self._persist_turn,
-            thread.session_id,
-            requester.memory_peer,
-            requester.device_id,
-            persisted_text,
-            reply,
-        )
+        # Best-effort per AGENTS.md: tracing/memory must never break a turn. The
+        # worker/reply already happened, so a Honcho outage here must not raise
+        # out of the turn handler and turn a delivered reply into a user-facing
+        # error.
+        try:
+            await asyncio.to_thread(
+                self._persist_turn,
+                thread.session_id,
+                requester.memory_peer,
+                requester.device_id,
+                persisted_text,
+                reply,
+            )
+        except Exception:
+            pass
         updated = self._index.append_turn(
             thread,
             user_peer_id=requester.memory_peer,
@@ -707,19 +727,32 @@ class CockpitConnector:
                     "honcho_session_id": thread.session_id,
                     "allowed_actions": [WORKER_SESSION_TURN],
                 },
-                "idempotency_key": f"thread-turn:{thread.thread_id}:{len(thread.messages)}:{_stable_text_hash(text)}",
+                # `thread` here comes from _ensure_workspace, whose index round-trip
+                # always returns messages=() (CockpitThreadIndex.save() strips them),
+                # so a len(thread.messages) key would be constant and every repeat of
+                # the same text would collide as a "replay" the worker never re-runs.
+                # A fresh id() per call keeps each real turn distinct; the cockpit
+                # doesn't retry the same turn object, so there is no dedupe need here.
+                "idempotency_key": f"thread-turn:{thread.thread_id}:{new_id('turn')}:{_stable_text_hash(text)}",
             },
         )
         if not turn.get("ok", True):
             raise RuntimeError(str(turn.get("error") or "worker rejected conversation turn"))
         reply = "Workspace turn is running."
-        await asyncio.to_thread(
-            self._persist_user_turn,
-            thread.session_id,
-            requester.memory_peer,
-            requester.device_id,
-            text,
-        )
+        # Best-effort per AGENTS.md: a memory outage here must not raise out of
+        # the turn handler after the worker turn was already dispatched — that
+        # would surface an error to the user for a turn that is actually running,
+        # and skip recording the pending-turn marker below.
+        try:
+            await asyncio.to_thread(
+                self._persist_user_turn,
+                thread.session_id,
+                requester.memory_peer,
+                requester.device_id,
+                text,
+            )
+        except Exception:
+            pass
         updated = self._index.append_pending_turn(
             thread,
             user_peer_id=requester.memory_peer,
@@ -737,14 +770,17 @@ class CockpitConnector:
         workspace_request: dict[str, Any],
         progress: Callable[[dict[str, Any]], Any] | None,
     ) -> CockpitThread:
+        # Skip the full re-handshake (worker choose()/probe, workspace POST, worktree
+        # POSTs, session create-or-get, index saves) when the workspace is already
+        # provisioned and this call isn't asking for a repo it doesn't already have.
+        # Every user turn in an existing workspace thread used to pay ~5+ sequential
+        # worker round-trips for nothing.
+        if _workspace_is_ready(thread) and not _workspace_needs_new_repo(project, thread, workspace_request):
+            return thread
         state = dict(thread.workspace or {})
         try:
             worker_id = str(state.get("worker_id") or workspace_request.get("worker_id") or "")
-            profile = WorkerRegistry(
-                self._cfg.worker,
-                profiles_path=self._cfg.orchestration.workers_path,
-                http_get=self._worker_get,
-            ).choose(
+            profile = self._registry().choose(
                 required=["git"],
                 preferred=[worker_id] if worker_id else None,
                 engine=str(workspace_request.get("engine") or ""),
@@ -895,11 +931,7 @@ class CockpitConnector:
             return self._get_worker_json(worker_id, f"/sessions/{session_id}")
 
     def _post_worker_json(self, worker_id: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
-        profile = WorkerRegistry(
-            self._cfg.worker,
-            profiles_path=self._cfg.orchestration.workers_path,
-            http_get=self._worker_get,
-        ).get(worker_id, probe=False)
+        profile = self._registry().get(worker_id, probe=False)
         if profile is None:
             raise RuntimeError(f"worker {worker_id!r} is not configured")
         response = self._worker_post(
@@ -914,11 +946,7 @@ class CockpitConnector:
         return data
 
     def _get_worker_json(self, worker_id: str, path: str) -> dict[str, Any]:
-        profile = WorkerRegistry(
-            self._cfg.worker,
-            profiles_path=self._cfg.orchestration.workers_path,
-            http_get=self._worker_get,
-        ).get(worker_id, probe=False)
+        profile = self._registry().get(worker_id, probe=False)
         if profile is None:
             raise RuntimeError(f"worker {worker_id!r} is not configured")
         response = self._worker_get(
@@ -1254,6 +1282,11 @@ def _project_default_repo(project: ProjectEntry) -> str:
 
 
 def _safe_thread_tool_events(session_ref: str, tool_messages: list) -> tuple[dict[str, Any], ...]:
+    # Best-effort: tool-event projection is a display nicety, not part of the
+    # turn contract, so any drift here must not break the turn — but note this
+    # does mean a single malformed message drops the whole turn's tool events
+    # rather than just that one. Left broad on purpose; narrowing needs a look
+    # at _thread_tool_events' call/result pairing invariants, out of scope here.
     try:
         return tuple(_thread_tool_events(session_ref, tool_messages))
     except Exception:
@@ -1336,6 +1369,11 @@ def _thread_tool_event(
         "time": utc_now(),
         "data": data,
     }
+    # project_session_event() requires worker_id to mint a session_ref, but the
+    # real session_ref (thread-scoped, not worker-scoped) is set explicitly
+    # below and overwrites it — worker_id="" is a throwaway. Leaving it: fixing
+    # this cleanly means giving project_session_event() an optional worker_id,
+    # which lives in orchestration/cockpit.py, out of scope here.
     projected = project_session_event(raw, worker_id="", sequence=sequence)
     return {
         **projected,
@@ -1492,11 +1530,27 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
             os.unlink(tmp)
 
 
-def _workspace_request(project: ProjectEntry, text: str, request: dict[str, Any] | None) -> dict[str, Any]:
-    _ = project, text
-    if request is not None:
-        return dict(request)
-    return {}
+def _workspace_is_ready(thread: CockpitThread) -> bool:
+    workspace = thread.workspace or {}
+    return (
+        bool(workspace.get("worker_id"))
+        and bool(workspace.get("session_id"))
+        and str(workspace.get("status") or "") == "ready"
+    )
+
+
+def _workspace_needs_new_repo(project: ProjectEntry, thread: CockpitThread, workspace_request: dict[str, Any]) -> bool:
+    # Only an explicit repos ask can justify re-provisioning an already-ready
+    # workspace; a bare re-request of the same turn must not re-clone/re-attach.
+    if not workspace_request.get("repos"):
+        return False
+    existing = {
+        (str(item.get("name") or ""), str(item.get("repo") or ""))
+        for item in thread.workspace.get("worktrees", [])
+        if isinstance(item, dict)
+    }
+    requested = _workspace_repos(project, workspace_request)
+    return any((repo.get("name"), repo.get("repo")) not in existing for repo in requested)
 
 
 def _workspace_repos(project: ProjectEntry, request: dict[str, Any]) -> list[dict[str, str]]:

@@ -534,14 +534,31 @@ def _worker_target_engines(worker: WorkerProfile, command: WorkCommand, target_e
     return [target_engine or fallback]
 
 
+# Access denials the worker's probe actively asserted (the identity really
+# cannot read the repo). Anything else — probe errors, unsupported refs,
+# timeouts — is a "we don't know" result, not a denial, and must not hard-
+# exclude a worker that otherwise has a warm local checkout (regression from
+# PR #97: a transient probe failure was making every worker ineligible).
+_AFFIRMATIVE_DENIAL_REASON_CODES = frozenset(
+    {"identity-lacks-repo-access", "worker-not-connected-to-github"}
+)
+
+
 def _repo_compatibility_reason(worker: WorkerProfile, repo: str) -> str:
     if not repo:
         return ""
     access = _repo_access_summary(worker, repo)
+    probe_advisory = ""
     if access and access.get("accessible") is False:
-        return str(access.get("reason_code") or "identity-lacks-repo-access")
+        reason_code = str(access.get("reason_code") or "identity-lacks-repo-access")
+        if reason_code in _AFFIRMATIVE_DENIAL_REASON_CODES:
+            return reason_code
+        # Non-affirmative (probe-failed, unsupported ref, etc.): don't hard-
+        # exclude on it. Remember it as an advisory in case checkout state
+        # below has no better answer either.
+        probe_advisory = reason_code
     if worker.readiness is None and not worker.repositories:
-        return ""
+        return probe_advisory
     repo_name = repo.rsplit("/", 1)[-1]
     for row in worker.repositories:
         candidate = str(row.get("repo") or row.get("name") or "")
@@ -551,12 +568,19 @@ def _repo_compatibility_reason(worker: WorkerProfile, repo: str) -> str:
         if status != "ready":
             detail = public_error_message(str(row.get("detail") or ""))
             return f"repo checkout broken: {detail}" if detail else "repo checkout broken"
+        # Warm checkout confirmed ready: on-disk evidence outweighs an earlier
+        # inconclusive probe result.
         return ""
-    return "repo not checked out"
+    return probe_advisory or "repo not checked out"
 
 
 def _is_advisory_reason(reason: str) -> bool:
-    return reason == "repo not checked out"
+    if reason == "repo not checked out":
+        return True
+    return reason not in _AFFIRMATIVE_DENIAL_REASON_CODES and reason in {
+        "repo-access-probe-failed",
+        "repo-reference-unsupported",
+    }
 
 
 def _engine_readiness_reason(worker: WorkerProfile, engine: str) -> str:

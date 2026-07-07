@@ -78,6 +78,12 @@ class OrchestrationStore:
         self._deleted_sessions_path = self.root / "deleted-sessions.json"
         self._thread_child_terminal_notifier = thread_child_terminal_notifier
         self._thread_children_promoter = thread_children_promoter
+        # Cache for deleted_session_refs(): (mtime_ns, refs). The SSE hub calls
+        # cockpit_snapshot() every sse_refresh_interval_s (~1s) while any
+        # client is connected, which was recomputing an HMAC session-ref per
+        # tombstone on every tick even though deleted-sessions.json only
+        # changes on an explicit delete.
+        self._deleted_session_refs_cache: tuple[int | None, set[str]] | None = None
 
     def run_dir(self, run_id: str) -> pathlib.Path:
         if not _RUN_ID.fullmatch(run_id):
@@ -216,12 +222,17 @@ class OrchestrationStore:
             run = self.get(run_id)
             if run is None:
                 raise KeyError(run_id)
+            already_archived = bool(run.archived_at)
             self._promote_children_unlocked(run.run_id)
             self._promote_thread_children(run.run_id)
-            if not run.archived_at:
+            if not already_archived:
+                # _promote_children_unlocked() re-gets and saves this SAME run
+                # (to clear its own child_chat_ids/child_run_ids as a promoted
+                # ex-parent), so the `run` object fetched above is now stale.
+                # Re-fetch and touch only archived_at, so this save can't
+                # clobber whatever promote just persisted.
+                run = self.get(run_id) or run
                 run.archived_at = utc_now()
-                run.child_chat_ids = []
-                run.child_run_ids = []
                 self.save(run)
                 self.append_event(run_id, "run_archived", "Run archived from cockpit views")
             return run
@@ -470,6 +481,27 @@ class OrchestrationStore:
     def deleted_worker_sessions(self) -> dict[str, dict[str, str]]:
         return self._deleted_records(self._deleted_sessions_path)
 
+    def deleted_session_refs(self) -> set[str]:
+        """Session refs for tombstoned sessions, cached until the file changes.
+
+        See the comment on _deleted_session_refs_cache in __init__ for why this
+        is cached rather than recomputed on every snapshot.
+        """
+        try:
+            mtime = self._deleted_sessions_path.stat().st_mtime_ns
+        except OSError:
+            mtime = None
+        cached = self._deleted_session_refs_cache
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        refs = {
+            _make_session_ref(str(item.get("worker_id") or ""), str(item.get("session_id") or ""))
+            for item in self.deleted_worker_sessions().values()
+            if item.get("worker_id") and item.get("session_id")
+        }
+        self._deleted_session_refs_cache = (mtime, refs)
+        return refs
+
     def link_work_item(self, run_id: str, item: WorkItem, role: str = "related") -> OrchestrationRun:
         run = self.get(run_id)
         if run is None:
@@ -629,9 +661,7 @@ class OrchestrationStore:
             directory = self.run_dir(run.run_id)
             shutil.rmtree(directory, ignore_errors=True)
             self._record_deleted_run_unlocked(run.run_id)
-            for session in run.sessions:
-                self._record_session_ref_unlocked(session.worker_id, session.session_id)
-                self._record_deleted_session_unlocked(session.worker_id, session.session_id)
+            self._record_sessions_deleted_unlocked(run.sessions)
             return {"deleted": True, "run_id": run.run_id, "records": records, "events": events}
 
     def delete_cockpit_session(self, worker_id: str, session_id: str) -> dict[str, int | str | bool]:
@@ -799,6 +829,52 @@ class OrchestrationStore:
         records = self._deleted_records(self._deleted_runs_path)
         records[run_id] = {"key": run_id, "run_id": run_id, "deleted_at": utc_now()}
         _atomic_write_json(self._deleted_runs_path, list(records.values()))
+
+    def _record_sessions_deleted_unlocked(self, sessions: list[WorkerSessionLink]) -> None:
+        """Record session-refs + tombstones for every session on a deleted run.
+
+        Reads/writes each index file once regardless of session count, instead
+        of the per-session read+rewrite that _record_session_ref_unlocked and
+        _record_deleted_session_unlocked do individually — deleting a run with
+        many sessions used to be O(#sessions) full-file rewrites of both
+        session-refs.json and deleted-sessions.json under the store lock.
+        """
+
+        if not sessions:
+            return
+        refs = self.session_ref_index()
+        refs_changed = False
+        updated_at = utc_now()
+        for session in sessions:
+            session_ref = _make_session_ref(session.worker_id, session.session_id)
+            existing = refs.get(session_ref)
+            if (
+                existing is not None
+                and existing.get("worker_id") == session.worker_id
+                and existing.get("session_id") == session.session_id
+            ):
+                continue
+            refs[session_ref] = {
+                "session_ref": session_ref,
+                "worker_id": session.worker_id,
+                "session_id": session.session_id,
+                "updated_at": updated_at,
+            }
+            refs_changed = True
+        if refs_changed:
+            _atomic_write_json(self._session_refs_path, list(refs.values()))
+
+        deleted = self._deleted_records(self._deleted_sessions_path)
+        deleted_at = utc_now()
+        for session in sessions:
+            key = f"{session.worker_id}\0{session.session_id}"
+            deleted[key] = {
+                "key": key,
+                "worker_id": session.worker_id,
+                "session_id": session.session_id,
+                "deleted_at": deleted_at,
+            }
+        _atomic_write_json(self._deleted_sessions_path, list(deleted.values()))
 
     def _record_session_ref_unlocked(self, worker_id: str, session_id: str) -> None:
         records = self.session_ref_index()

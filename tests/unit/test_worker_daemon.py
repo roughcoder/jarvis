@@ -982,6 +982,45 @@ def test_worker_delete_session_prunes_owned_worktree_and_record(tmp_path) -> Non
     assert not worktree.exists()
 
 
+def test_worker_delete_session_prunes_conversation_cwd_outside_worktree_root(tmp_path) -> None:
+    # A session whose cwd is a conversation-workspace worktree (not under
+    # <workspace>/worktrees) is a legitimate worker-owned root. prune_worktrees
+    # correctly refuses to touch it ("outside worktree root"), but that refusal
+    # must not block the session RECORD from being deleted (regression: it used
+    # to 409 forever for every session under conversations/ or runs/).
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"), worktree_stale_ttl_s=0)
+    conversation_cwd = tmp_path / "worker" / "conversations" / "thread" / "repos" / "jarvis"
+    conversation_cwd.mkdir(parents=True)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[dict, int, dict]:
+        created = await client.post(
+            f"{base}/sessions",
+            json={
+                "session_id": "sess_delete_conversation",
+                "provider": "fake",
+                "engine": "fake",
+                "cwd": str(conversation_cwd),
+                "metadata": _authority_metadata("fake", extra_actions=[WORKER_SESSION_STOP]),
+            },
+        )
+        await client.post(
+            f"{base}/sessions/sess_delete_conversation/stop",
+            json={"metadata": _control_metadata(WORKER_SESSION_STOP)},
+        )
+        deleted = await client.delete(f"{base}/sessions/sess_delete_conversation")
+        missing = await client.get(f"{base}/sessions/sess_delete_conversation")
+        return created.json(), missing.status_code, deleted.json()
+
+    created, missing_status, deleted = asyncio.run(_with_server(cfg, 8862, calls))
+
+    assert created["ok"] is True
+    assert deleted["ok"] is True
+    assert missing_status == 404
+    assert deleted["reclamation"]["records"] == 1
+    # The conversation worktree itself is untouched — only the session record is gone.
+    assert conversation_cwd.exists()
+
+
 def test_worker_delete_session_refuses_live_worktree(tmp_path) -> None:
     cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"), worktree_stale_ttl_s=0)
     worktree = tmp_path / "worker" / "worktrees" / "live"
@@ -1074,6 +1113,34 @@ def test_worker_health_scans_worktree_inventory_off_event_loop(tmp_path, monkeyp
     assert body["worktree_inventory"] == {"count": 0, "disk_bytes": 0, "stale_count": 0}
     assert scan_threads
     assert all(thread_id != caller_thread for thread_id in scan_threads)
+
+
+def test_daemon_health_caches_worktree_inventory_within_diagnostics_ttl(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # worktree_inventory() (a full os.walk lstat of every worktree) was recomputed
+    # uncached on every /health request while sibling diagnostics used a TTL cache.
+    # The cockpit probes /health continuously (SSE ~1s, ~3s timeout); a large
+    # worktree walk could exceed the probe timeout and flap the worker offline.
+    cfg = WorkerConfig(
+        _env_file=None, token="", workspace=str(tmp_path / "worker"), worktree_stale_ttl_s=0, diagnostics_ttl_s=60
+    )
+    scan_count = {"n": 0}
+
+    def inventory(*_args, **_kwargs) -> dict[str, int]:  # noqa: ANN002, ANN003
+        scan_count["n"] += 1
+        return {"count": scan_count["n"], "disk_bytes": 0, "stale_count": 0}
+
+    monkeypatch.setattr("jarvis.worker.server.worktree_inventory", inventory)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[dict, dict]:
+        first = await client.get(f"{base}/health")
+        second = await client.get(f"{base}/health")
+        return first.json(), second.json()
+
+    first, second = asyncio.run(_with_server(cfg, 8866, calls))
+
+    assert scan_count["n"] == 1
+    assert first["worktree_inventory"] == {"count": 1, "disk_bytes": 0, "stale_count": 0}
+    assert second["worktree_inventory"] == first["worktree_inventory"]
 
 
 def test_daemon_health_reports_diagnostics_error_without_500(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -1263,6 +1330,80 @@ def test_daemon_conversation_workspace_rejects_option_like_base_ref(tmp_path) ->
     assert fetched["workspace"]["status"] == "failed"
     assert fetched["workspace"]["provision_phase"] == "failed"
     assert fetched["workspace"]["worktrees"] == []
+
+
+def test_materialize_worktree_recovers_from_orphaned_worktree(tmp_path) -> None:
+    # Simulate a daemon crash between `git worktree add` and _write_state: the
+    # worktree dir + git worktree registration + branch exist on disk, but no
+    # workspace.json row references it (materialize_worktree's `existing` lookup
+    # is keyed off the state row, which is what's missing). Before the fix this
+    # hit `raise ValueError("worktree path already exists ...")` forever, with
+    # nothing to prune the orphan. materialize_worktree must reconcile and proceed.
+    from jarvis.worker.workspaces import materialize_worktree, workspace_id, workspace_path
+
+    dev = tmp_path / "dev"
+    repo = _git_repo(dev, "jarvis")
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "ws"), repo_root=str(dev), clone_missing=False)
+    root = tmp_path / "conversations"
+    conversation_id = "thread_orphan"
+
+    path = workspace_path(root, conversation_id)
+    path.mkdir(parents=True)
+    repos_dir = path / "repos"
+    repos_dir.mkdir()
+    orphan = repos_dir / "jarvis"
+    orphan_branch = f"jarvis/{workspace_id(conversation_id)}-jarvis"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", orphan_branch, str(orphan)],
+        check=True,
+        capture_output=True,
+    )
+    assert orphan.is_dir()
+
+    result = asyncio.run(
+        materialize_worktree(cfg=cfg, root=root, conversation_id=conversation_id, repo_ref="roughcoder/jarvis")
+    )
+
+    assert result["status"] == "ready"
+    assert len(result["worktrees"]) == 1
+    recovered = pathlib.Path(result["worktrees"][0]["path"])
+    assert recovered.is_dir()
+    assert recovered == orphan
+
+
+def test_materialize_worktree_fetches_before_branching_with_explicit_base_ref(tmp_path, monkeypatch) -> None:
+    # An explicit base_ref used to skip _default_base_ref's (conditional) fetch
+    # entirely, so the worktree branched from a stale local base. materialize_worktree
+    # must fetch unconditionally before creating the worktree.
+    from jarvis.worker import workspaces as workspaces_module
+    from jarvis.worker.workspaces import materialize_worktree
+
+    dev = tmp_path / "dev"
+    repo = _git_repo(dev, "jarvis")
+    subprocess.run(["git", "-C", str(repo), "branch", "-m", "main"], check=True, capture_output=True)
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "ws"), repo_root=str(dev), clone_missing=False)
+
+    fetch_calls: list[str] = []
+    real_fetch_repo = workspaces_module.fetch_repo
+
+    async def spy_fetch_repo(repo_path, timeout_s):  # noqa: ANN001
+        fetch_calls.append(repo_path)
+        return await real_fetch_repo(repo_path, timeout_s)
+
+    monkeypatch.setattr(workspaces_module, "fetch_repo", spy_fetch_repo)
+
+    result = asyncio.run(
+        materialize_worktree(
+            cfg=cfg,
+            root=tmp_path / "conversations",
+            conversation_id="thread_fetch",
+            repo_ref="roughcoder/jarvis",
+            base_ref="main",
+        )
+    )
+
+    assert result["status"] == "ready"
+    assert fetch_calls == [str(repo)]
 
 
 def test_provider_cwd_accepts_configured_conversation_workspace(tmp_path) -> None:
@@ -1746,6 +1887,62 @@ def test_daemon_session_creation_provisions_repo_worktree(tmp_path) -> None:
     assert cwd != repo
     assert created["session"]["branch"].startswith("jarvis/")
     assert created["session"]["metadata"]["source_repo"] == str(repo)
+
+
+def test_daemon_session_create_nonvalueerror_provisioning_failure_is_reclaimable(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # A non-ValueError provisioning failure (OSError disk-full from prepare_worktree's
+    # mkdir, KeyError from a malformed workspace, etc.) used to escape create_session's
+    # `except ValueError` and become a bare 500 with the session stuck in status
+    # 'created' — no provisioning-failed event, so _failed_unstarted_provisioning_session
+    # could never reclaim it and a retry with the same deterministic session_id 400s
+    # forever. It must land in the same FAILED-with-provisioning-failed-event path as
+    # a ValueError, so a retry with the same session_id succeeds.
+    dev = tmp_path / "dev"
+    repo = dev / "jarvis"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "--allow-empty", "-qm", "init"], cwd=repo, check=True)
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "ws"), repo_root=str(dev))
+
+    def fake_probe(repo_ref, *, timeout_s, ttl_s):  # noqa: ANN001, ANN202
+        return {"repo": repo_ref, "accessible": True, "public": False, "reason_code": "accessible"}
+
+    monkeypatch.setattr("jarvis.worker.server.probe_repo_access", fake_probe)
+
+    import jarvis.worker.server as worker_server
+
+    real_prepare_worktree = worker_server.prepare_worktree
+    calls_made = {"n": 0}
+
+    async def flaky_prepare_worktree(*args, **kwargs):  # noqa: ANN002, ANN003
+        calls_made["n"] += 1
+        if calls_made["n"] == 1:
+            raise OSError("disk full")
+        return await real_prepare_worktree(*args, **kwargs)
+
+    monkeypatch.setattr("jarvis.worker.server.prepare_worktree", flaky_prepare_worktree)
+
+    body = {
+        "session_id": "sess_oserror_provision",
+        "provider": "fake",
+        "engine": "fake",
+        "repo": "roughcoder/jarvis",
+        "metadata": {**_authority_metadata("fake"), "provision_workspace": True},
+    }
+
+    async def calls(base, c):  # noqa: ANN001
+        first = await c.post(base + "/sessions", json=body)
+        second = await c.post(base + "/sessions", json=body)
+        return first.status_code, first.json(), second.status_code, second.json()
+
+    first_status, first, second_status, second = asyncio.run(_with_server(cfg, 8863, calls))
+
+    assert first_status == 400
+    assert first["ok"] is False
+    assert first["session"]["status"] == "failed"
+    assert second_status == 200
+    assert second["ok"] is True
+    assert pathlib.Path(second["session"]["cwd"]).exists()
 
 
 def test_daemon_duplicate_session_id_rejects_before_worktree_provisioning(tmp_path) -> None:
@@ -3431,6 +3628,46 @@ def test_daemon_resume_cwd_requires_session_id(tmp_path) -> None:
     assert "resume cwd requires session_id" in response.json()["error"]
 
 
+def test_daemon_resume_cwd_accepts_conversation_workspace_root(tmp_path) -> None:
+    # _resume_cwd used to call worker_owned_cwd WITHOUT the server's resolved
+    # conversation_root, so a custom WORKER_CONVERSATION_WORKSPACE_ROOT (outside the
+    # worker workspace) was accepted by session create/turns but refused here. All
+    # three cwd-validating paths must agree on what's worker-owned.
+    conversation_root = tmp_path / "conversations-external"
+    session_cwd = conversation_root / "thread" / "repos" / "jarvis"
+    session_cwd.mkdir(parents=True)
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="",
+        workspace=str(tmp_path / "worker"),
+        claude_bin="echo",
+        supported_engines="codex,claude",
+        conversation_workspace_root=str(conversation_root),
+    )
+
+    async def calls(base, c):  # noqa: ANN001
+        return await c.post(
+            base + "/run",
+            json={
+                "action": "code",
+                "args": {
+                    "prompt": "follow up",
+                    "agent": "claude",
+                    "session_id": "550e8400-e29b-41d4-a716-446655440000",
+                    "resume_session": True,
+                    "cwd": str(session_cwd),
+                },
+            },
+        )
+
+    response = asyncio.run(_with_server(cfg, 8864, calls))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["cwd"] == str(session_cwd)
+
+
 def test_daemon_prune_keeps_workspace_used_by_running_resume(tmp_path) -> None:
     import subprocess
 
@@ -3900,6 +4137,37 @@ def test_session_provisioning_failed_unstarted_session_can_retry(tmp_path, monke
     assert second["ok"] is True
     assert pathlib.Path(second["session"]["cwd"]).exists()
     assert [event["type"] for event in events].count("session.created") == 1
+
+
+def test_session_stopped_before_first_turn_is_reclaimable_on_retry(tmp_path) -> None:
+    # _failed_unstarted_provisioning_session used to only reclaim SESSION_FAILED
+    # sessions with a provisioning-failed event. Generalized: ANY terminal-or-created
+    # session that never started a turn is reclaimable (e.g. stopped before its first
+    # turn) — a retry with the same deterministic session_id must succeed rather than
+    # 400 forever with "worker session already exists".
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"))
+    body = {
+        "session_id": "sess_stopped_before_turn",
+        "provider": "fake",
+        "engine": "fake",
+        "metadata": _authority_metadata("fake", extra_actions=[WORKER_SESSION_STOP]),
+    }
+
+    async def calls(base, c):  # noqa: ANN001
+        first = await c.post(base + "/sessions", json=body)
+        await c.post(
+            f"{base}/sessions/sess_stopped_before_turn/stop",
+            json={"metadata": _control_metadata(WORKER_SESSION_STOP)},
+        )
+        second = await c.post(base + "/sessions", json=body)
+        return first.status_code, second.status_code, second.json()
+
+    first_status, second_status, second = asyncio.run(_with_server(cfg, 8865, calls))
+
+    assert first_status == 200
+    assert second_status == 200
+    assert second["ok"] is True
+    assert second["session"]["session_id"] == "sess_stopped_before_turn"
 
 
 def test_git_ls_remote_access_probe_does_not_claim_private_repo_is_public(monkeypatch) -> None:  # noqa: ANN001

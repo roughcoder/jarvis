@@ -277,6 +277,7 @@ def diagnostics(
     claude_bin: str,
     browser_cfg: Any,
     ttl_s: float,
+    probe_timeout_s: float = 8.0,
 ) -> dict[str, Any]:
     """Cheap worker readiness diagnostics for health/doctor surfaces.
 
@@ -305,7 +306,7 @@ def diagnostics(
                 _engine_diagnostic(engine, codex_bin=codex_bin, claude_bin=claude_bin)
                 for engine in engines
             ],
-            "git_identity": git_identity(ttl_s=ttl_s),
+            "git_identity": git_identity(ttl_s=ttl_s, timeout_s=probe_timeout_s),
             "repositories": repo_inventory(repo_root, ttl_s=ttl_s),
             "package_managers": _package_managers(),
             "browser": _browser_diagnostic(browser_cfg),
@@ -319,7 +320,7 @@ def diagnostics(
     return rows
 
 
-def git_identity(*, ttl_s: float = 0.0) -> dict[str, Any]:
+def git_identity(*, ttl_s: float = 0.0, timeout_s: float = 8.0) -> dict[str, Any]:
     """Public-safe view of the worker's GitHub identity.
 
     GitHub credentials live on the worker device. The brain only receives the
@@ -344,9 +345,10 @@ def git_identity(*, ttl_s: float = 0.0) -> dict[str, Any]:
     if not shutil.which("gh"):
         row["detail"] = "gh binary not found"
     else:
-        # These are fixed quick identity sub-probes. The caller-controlled repo
-        # access timeout applies to network authorization checks below.
-        user = _run_quick(["gh", "api", "user", "--jq", ".login"], timeout_s=8.0)
+        # These are network calls to GitHub (same probe class as probe_repo_access),
+        # so they honor the caller-configured timeout (WORKER_REPO_ACCESS_PROBE_TIMEOUT_S
+        # / cfg.repo_access_probe_timeout_s) instead of a hardcoded value.
+        user = _run_quick(["gh", "api", "user", "--jq", ".login"], timeout_s=timeout_s)
         if user.returncode == 0 and user.output.strip():
             row.update(
                 {
@@ -358,7 +360,7 @@ def git_identity(*, ttl_s: float = 0.0) -> dict[str, Any]:
                 }
             )
         else:
-            status = _run_quick(["gh", "auth", "status", "-h", "github.com"], timeout_s=8.0)
+            status = _run_quick(["gh", "auth", "status", "-h", "github.com"], timeout_s=timeout_s)
             detail = _short_detail(status.output or user.output)
             row["detail"] = detail or "gh authentication not connected"
             if status.returncode == 0:
@@ -521,14 +523,19 @@ async def prune_worktrees(
     timeout_s: float = 30.0,
 ) -> dict[str, Any]:
     root = pathlib.Path(worktrees_dir).expanduser().resolve(strict=False)
-    live = _live_session_cwds(sessions_dir, root)
+    # This is `async` (delete_session/the prune endpoint `await` it directly), but the
+    # session-json reads and disk walks below are synchronous filesystem work — run
+    # them via asyncio.to_thread so a large worktree doesn't block the whole daemon's
+    # event loop (and every other in-flight request) for seconds.
+    live = await asyncio.to_thread(_live_session_cwds, sessions_dir, root)
     if target:
         candidate, reason = _worktree_target(root, target)
         candidates = [(candidate, target, reason)]
     else:
+        children = await asyncio.to_thread(_worktree_children, root)
         candidates = [
             (path, path.name, "")
-            for path in _worktree_children(root)
+            for path in children
             if _stale_worktree(path, root, live, stale_ttl_s)
         ]
     pruned = []
@@ -544,7 +551,7 @@ async def prune_worktrees(
         if _overlaps_live_session(path, live):
             refused.append({"target": path.name, "reason": "live session uses this worktree"})
             continue
-        bytes_before = _disk_usage(path)
+        bytes_before = await asyncio.to_thread(_disk_usage, path)
         await _remove_worktree_path(path, timeout_s)
         if path.exists():
             refused.append({"target": path.name, "reason": "remove failed"})

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -27,7 +28,13 @@ from jarvis.orchestration.models import (
 from jarvis.orchestration.policy import envelope_allowed_actions, required_for_worker_dispatch
 from jarvis.orchestration.reports import build_run_report, public_status_comment
 from jarvis.orchestration.schedules import ScheduleStore, dispatch_due_schedules
-from jarvis.orchestration.service import MissingWorkRepoError, NoEligibleWorkerError, OrchestrationService, StartedWork
+from jarvis.orchestration.service import (
+    MissingWorkRepoError,
+    NoEligibleWorkerError,
+    OrchestrationService,
+    StartedWork,
+    _reason_code,
+)
 from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource
 from jarvis.orchestration.store import ActiveWorkItemError, OrchestrationStore
 from jarvis.orchestration.supervisor import sync_run_jobs, sync_run_sessions
@@ -48,6 +55,43 @@ def _item(**kw) -> WorkItem:  # noqa: ANN003
 
 def _access(repo: str = "roughcoder/jarvis") -> dict[str, object]:
     return {"repo": repo, "accessible": True, "public": False, "reason_code": "accessible"}
+
+
+def test_reason_code_mapping_is_pinned() -> None:
+    # _reason_code() maps English eligibility prose to machine codes the
+    # cockpit UI branches on, using exact matches for some reasons and
+    # prefix/substring matches for others (e.g. "missing capability X",
+    # "engine X unsupported"). There's no compile-time link between the
+    # prose emitted by _worker_exclusion_reasons()/_engine_readiness_reason()
+    # and this table, so a reword of either would silently degrade the code
+    # to "unknown" without this test catching it.
+    exact = {
+        "repo not checked out": "repo-not-warm",
+        "worker offline": "worker-offline",
+        "worker at capacity": "worker-at-capacity",
+        "worker-not-connected-to-github": "worker-not-connected-to-github",
+        "identity-lacks-repo-access": "identity-lacks-repo-access",
+        "repo-private-choose-other-worker": "repo-private-choose-other-worker",
+        "repo-access-probe-failed": "repo-access-probe-failed",
+        "repo-reference-unsupported": "repo-reference-unsupported",
+        "selected": "selected",
+        "eligible": "eligible",
+    }
+    for reason, code in exact.items():
+        assert _reason_code(reason) == code
+
+    prefix_matched = {
+        "different worker requested: worker-b": "different-worker-requested",
+        "missing capability gui": "missing-capability",
+        "engine claude unsupported": "engine-unsupported",
+        "engine claude unavailable": "engine-unavailable",
+        "engine claude unauthenticated": "engine-unauthenticated",
+        "repo checkout broken: detached HEAD": "repo-checkout-broken",
+    }
+    for reason, code in prefix_matched.items():
+        assert _reason_code(reason) == code
+
+    assert _reason_code("some brand new wording nobody mapped yet") == "unknown"
 
 
 def test_run_graph_persists_run_and_events(tmp_path) -> None:
@@ -85,6 +129,67 @@ def test_session_ref_index_skips_unchanged_mapping_writes(tmp_path, monkeypatch)
 
     assert len(writes) == 2
     assert store.session_ref_index()["sessref_123"]["worker_id"] == "worker-b"
+
+
+def test_delete_run_batches_session_index_rewrites(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # delete_run() used to call _record_session_ref_unlocked() +
+    # _record_deleted_session_unlocked() per session, each doing a full
+    # read+rewrite of session-refs.json / deleted-sessions.json -- O(#sessions)
+    # whole-file rewrites of both files under the store lock. It must now
+    # write each file at most once regardless of session count.
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Many sessions")
+    for i in range(5):
+        store.link_session(
+            run.run_id,
+            WorkerSessionLink(worker_id="worker-a", session_id=f"sess_{i}", status="completed"),
+        )
+
+    writes: list[str] = []
+    real_write = store_module._atomic_write_json  # noqa: SLF001
+
+    def write_json(path, data):  # noqa: ANN001
+        writes.append(path.name)
+        real_write(path, data)
+
+    monkeypatch.setattr(store_module, "_atomic_write_json", write_json)
+
+    result = store.delete_run(run.run_id)
+
+    assert result["deleted"] is True
+    assert writes.count("session-refs.json") == 1
+    assert writes.count("deleted-sessions.json") == 1
+    for i in range(5):
+        assert store.deleted_worker_session("worker-a", f"sess_{i}") is not None
+
+
+def test_deleted_session_refs_cached_until_file_changes(tmp_path) -> None:
+    # cockpit_snapshot() calls deleted_session_refs_for_store() (which wraps
+    # this) on every SSE refresh tick (~1s) while any client is connected;
+    # recomputing an HMAC per tombstone that often is wasted work when
+    # deletes are rare. deleted_session_refs() must cache on
+    # deleted-sessions.json's mtime and only recompute when it changes.
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Session to delete")
+    store.link_session(run.run_id, WorkerSessionLink(worker_id="worker-a", session_id="sess_1", status="completed"))
+
+    assert store.deleted_session_refs() == set()
+
+    store.delete_run(run.run_id)
+    first = store.deleted_session_refs()
+    assert len(first) == 1
+
+    # Cache hit: repeated calls without a file change return the identical
+    # cached set object, not a freshly recomputed one.
+    assert store.deleted_session_refs() is first
+
+    other_run = store.create_run("Second session to delete")
+    store.link_session(other_run.run_id, WorkerSessionLink(worker_id="worker-b", session_id="sess_2", status="completed"))
+    store.delete_run(other_run.run_id)
+
+    second = store.deleted_session_refs()
+    assert second is not first
+    assert len(second) == 2
 
 
 def test_active_primary_owner_prevents_duplicate_work(tmp_path) -> None:
@@ -125,10 +230,80 @@ def test_archive_run_promotes_child_chats_to_root(tmp_path) -> None:
     assert any(event.type == "chat_reparented" for event in store.events(child.run_id))
 
 
+def test_archive_run_does_not_clobber_fields_touched_by_promote(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # archive_run() did run = self.get(run_id); _promote_children_unlocked(run.run_id)
+    # -- but _promote_children_unlocked() re-gets and saves that SAME run (as
+    # the promoted ex-parent, to clear its own child_chat_ids/child_run_ids)
+    # before returning. archive_run then set archived_at on the STALE
+    # pre-promote `run` object and saved it again, silently reverting any
+    # other field promote's save had just persisted. Only correct by luck
+    # because both saves happened to touch the same two list fields.
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Parent orchestrator")
+    original_promote = OrchestrationStore._promote_children_unlocked  # noqa: SLF001
+
+    def promote_and_mutate(self, parent_chat_id):  # noqa: ANN001
+        promoted = original_promote(self, parent_chat_id)
+        # Simulate promote's save touching an unrelated field on the run
+        # being archived -- archive_run must not later overwrite this with a
+        # stale pre-promote copy.
+        current = self.get(parent_chat_id)
+        if current is not None:
+            current.objective = "mutated-by-promote"
+            self.save(current)
+        return promoted
+
+    monkeypatch.setattr(OrchestrationStore, "_promote_children_unlocked", promote_and_mutate)
+
+    archived = store.archive_run(run.run_id)
+    reloaded = store.get(run.run_id)
+
+    assert archived.archived_at
+    assert reloaded is not None
+    assert reloaded.archived_at
+    assert reloaded.objective == "mutated-by-promote"
+
+
 def test_archive_run_promotes_child_project_threads_to_root(tmp_path) -> None:
     index = CockpitThreadIndex(tmp_path / "cockpit-threads.json")
     store = OrchestrationStore(str(tmp_path), thread_children_promoter=index.promote_children)
     parent = store.create_run("Parent orchestrator")
+    thread = index.save(
+        CockpitThread(
+            thread_id="thread_child",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_child",
+            title="Child thread",
+            created_at="2026-07-05T09:00:00+00:00",
+            updated_at="2026-07-05T09:00:00+00:00",
+            created_by="neil",
+            parent_chat_id=parent.run_id,
+        )
+    )
+
+    store.archive_run(parent.run_id)
+
+    promoted = index.get("jarvis", thread.thread_id)
+    assert promoted is not None
+    assert promoted.parent_chat_id == ""
+
+
+def test_orch_store_wires_thread_children_promoter(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # cli.py's _orch_store() used to construct OrchestrationStore without the
+    # thread_children_promoter/notifier callbacks the cockpit API wires in, so
+    # a CLI-driven archive/delete would promote child RUNS but silently orphan
+    # child THREADS in the cockpit thread index. CLI and API archiving must
+    # behave identically.
+    from jarvis.cli import _orch_store
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}\n")
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    cfg = load_config()
+
+    store = _orch_store(cfg)
+    parent = store.create_run("Parent orchestrator")
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
     thread = index.save(
         CockpitThread(
             thread_id="thread_child",
@@ -1088,12 +1263,77 @@ def test_orchestration_validate_reports_repo_access_probe_failure(tmp_path, monk
         manual_item=WorkItem(source="manual", id="manual", title="Manual", repo="roughcoder/private"),
     )
 
-    assert validation["can_start"] is False
+    # A probe failure is not an affirmative access denial (see
+    # test_orchestration_probe_failure_stays_eligible_with_warm_checkout for
+    # the regression this guards against), so it must not hard-exclude the
+    # worker -- it only surfaces as an advisory reason code.
+    assert validation["can_start"] is True
     assert "repo-access-probe-failed" in validation["reason_codes"]
     row = validation["compatibility"]["workers"][0]
-    assert row["eligible"] is False
-    assert row["reason_codes"] == ["repo-access-probe-failed"]
+    assert row["eligible"] is True
+    assert "repo-access-probe-failed" in row["reason_codes"]
     assert row["repo_access"]["reason_code"] == "repo-access-probe-failed"
+
+
+def test_orchestration_probe_failure_stays_eligible_with_warm_checkout(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # Regression guard for PR #97: a worker whose repo-access probe raised
+    # (network hiccup, an older worker 400ing on the unknown action, etc.) used
+    # to be hard-excluded even when its repo was already cloned and ready --
+    # dispatch raised NoEligibleWorkerError for every worker in that case.
+    # A probe failure is not an affirmative "this identity cannot access the
+    # repo" answer, so it must not outweigh a warm, ready local checkout.
+    env_file = tmp_path / ".env"
+    workers_path = tmp_path / "workers.json"
+    workers_path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "local-worker",
+                        "display_name": "Local",
+                        "capabilities": ["git", "codex"],
+                        "status": "online",
+                        "supported_engines": ["codex"],
+                        "repo_access": [
+                            {
+                                "repo": "roughcoder/jarvis",
+                                "accessible": False,
+                                "reason_code": "repo-access-probe-failed",
+                            }
+                        ],
+                        "repositories": [{"repo": "jarvis", "status": "ready", "default_branch": "main"}],
+                    }
+                ]
+            }
+        )
+    )
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                f"ORCHESTRATION_WORKERS_PATH={workers_path}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+    cfg = load_config()
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"worker.job.start", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: None,
+    )
+
+    validation = service.validate_work(
+        WorkCommand("start_next_work", source="manual"),
+        manual_item=WorkItem(source="manual", id="manual", title="Manual", repo="roughcoder/jarvis"),
+    )
+
+    assert validation["can_start"] is True
+    row = validation["compatibility"]["workers"][0]
+    assert row["eligible"] is True
+    assert "repo-access-probe-failed" not in row["reason_codes"]
 
 
 def test_orchestration_repo_access_cache_matches_owner_name_exactly(tmp_path, monkeypatch) -> None:  # noqa: ANN001

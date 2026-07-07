@@ -1845,7 +1845,7 @@ class CockpitWriteHandlers:
         await self.ctx.require_auth(request)
         body = await _optional_json_body(request)
         run_id = request.match_info["run_id"]
-        scope = f"runs/{run_id}/delete"
+        scope = _principal_scoped(request, self.ctx.cfg, f"runs/{run_id}/delete")
         async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
             cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
             if cached is not None:
@@ -1859,7 +1859,7 @@ class CockpitWriteHandlers:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
         run_id = request.match_info["run_id"]
-        scope = f"runs/{run_id}/rename"
+        scope = _principal_scoped(request, self.ctx.cfg, f"runs/{run_id}/rename")
         async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
             cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
             if cached is not None:
@@ -1883,7 +1883,7 @@ class CockpitWriteHandlers:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
-        scope = f"sessions/{ref.worker_id}/{ref.session_id}/archive"
+        scope = _principal_scoped(request, self.ctx.cfg, f"sessions/{ref.worker_id}/{ref.session_id}/archive")
         async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
             cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
             if cached is not None:
@@ -1898,7 +1898,7 @@ class CockpitWriteHandlers:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
-        scope = f"sessions/{ref.worker_id}/{ref.session_id}/unarchive"
+        scope = _principal_scoped(request, self.ctx.cfg, f"sessions/{ref.worker_id}/{ref.session_id}/unarchive")
         async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
             cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
             if cached is not None:
@@ -1913,7 +1913,7 @@ class CockpitWriteHandlers:
         await self.ctx.require_auth(request)
         body = await _optional_json_body(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
-        scope = f"sessions/{ref.worker_id}/{ref.session_id}/delete"
+        scope = _principal_scoped(request, self.ctx.cfg, f"sessions/{ref.worker_id}/{ref.session_id}/delete")
         async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
             cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
             if cached is not None:
@@ -1927,7 +1927,7 @@ class CockpitWriteHandlers:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
-        scope = f"sessions/{ref.worker_id}/{ref.session_id}/rename"
+        scope = _principal_scoped(request, self.ctx.cfg, f"sessions/{ref.worker_id}/{ref.session_id}/rename")
         async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
             cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
             if cached is not None:
@@ -1952,7 +1952,7 @@ class CockpitWriteHandlers:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
-        scope = f"sessions/{ref.worker_id}/{ref.session_id}/close"
+        scope = _principal_scoped(request, self.ctx.cfg, f"sessions/{ref.worker_id}/{ref.session_id}/close")
         async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
             cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
             if cached is not None:
@@ -2507,6 +2507,22 @@ async def _idempotent_write_body(
 
 def _idempotency_principal(requester: RequestContext) -> str:
     return "\0".join((requester.scope, requester.identity, requester.memory_peer, requester.channel))
+
+
+def _principal_scoped(request: web.Request, cfg: Config, scope: str) -> str:
+    """Fold the caller's principal into an idempotency scope.
+
+    Mirrors what _idempotent_write_body() does for the scope-based handlers.
+    The hand-rolled write handlers below (run_delete, run_rename,
+    session_archive/unarchive/rename/close/delete) build their idempotency
+    scope from the resource id alone, so two DIFFERENT principals hitting the
+    same resource+action with the same Idempotency-Key would replay each
+    other's cached destructive result. Scoping on the caller closes that gap.
+    """
+    requester = _cockpit_requester_context(request, cfg)
+    if requester is None:
+        return scope
+    return f"{scope}/principal/{_idempotency_principal(requester)}"
 
 
 def _reject_attachments(body: dict[str, Any]) -> None:
@@ -3619,30 +3635,40 @@ def _cleanup_child_session_worktree(
     """Narrow lifecycle hook for sibling lifecycle-cleanup work.
 
     The cleanup branch owns inventory/GC. This hook only asks the worker that owns
-    the session to clean that session's worktree and records best-effort evidence.
+    the session to reclaim that session's worktree and records best-effort evidence.
+
+    Worker/server.py has no per-session "/sessions/{id}/cleanup" route (that was
+    a doomed 404 every close, so the worktree never actually got reclaimed here
+    -- it just leaked until the separate GC pass caught it). The worker's real
+    contract for this is POST /worktrees/prune with the worktree path as
+    `target`; close only stops the session (see the /stop call above), it must
+    not delete the session record, so DELETE /sessions/{id} is not used here.
     """
     run_id = _session_run_id_from_store(store, ref)
-    payload = {
-        "reason": str(body.get("reason") or "session closed"),
-        "metadata": {
-            "source": "cockpit.session.close",
-            "session_id": ref.session_id,
-            "run_id": run_id,
-            # TODO(feat/lifecycle-cleanup): replace this endpoint contract with
-            # the finalized worker worktree cleanup/prune interface.
-            "cleanup_contract": "session-worktree-v1",
-        },
-    }
-    try:
-        raw = _worker_post_json(cfg, ref.worker_id, f"/sessions/{ref.session_id}/cleanup", payload, post=post)
-    except Exception as exc:  # noqa: BLE001 - close/archive must not depend on cleanup availability
-        result = {"requested": True, "ok": False, "error": public_error_message(str(exc))}
+    target = _session_cwd_from_store(store, ref)
+    if not target:
+        # Nothing to prune (no recorded worktree cwd) -- report as a no-op
+        # rather than guessing a path.
+        result: dict[str, Any] = {"requested": False, "ok": True, "cleaned": []}
     else:
-        result = {
-            "requested": True,
-            "ok": bool(raw.get("ok", True)),
-            "cleaned": list(raw.get("cleaned") or []),
+        payload = {
+            "target": target,
+            "stale_ttl_s": 0.0,
+            "reason": str(body.get("reason") or "session closed"),
         }
+        try:
+            raw = _worker_post_json(cfg, ref.worker_id, "/worktrees/prune", payload, post=post)
+        except Exception as exc:  # noqa: BLE001 - close/archive must not depend on cleanup availability
+            result = {"requested": True, "ok": False, "error": public_error_message(str(exc))}
+        else:
+            result = {
+                "requested": True,
+                "ok": bool(raw.get("ok", True)),
+                "cleaned": [
+                    str(item.get("name") or item) if isinstance(item, dict) else str(item)
+                    for item in raw.get("pruned") or []
+                ],
+            }
     if run_id:
         store.append_event(
             run_id,
@@ -3856,6 +3882,14 @@ def _session_run_id_from_store(store: OrchestrationStore, ref: SessionRef) -> st
     for run in store.list_runs():
         if any(link.worker_id == ref.worker_id and link.session_id == ref.session_id for link in run.sessions):
             return run.run_id
+    return ""
+
+
+def _session_cwd_from_store(store: OrchestrationStore, ref: SessionRef) -> str:
+    for run in store.list_runs():
+        for link in run.sessions:
+            if link.worker_id == ref.worker_id and link.session_id == ref.session_id:
+                return link.cwd
     return ""
 
 
