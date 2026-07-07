@@ -477,7 +477,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 else:
                     raise ValueError(f"worker session already exists: {session_id}")
             if (body or {}).get("cwd"):
-                cwd, err = _worker_owned_cwd(str((body or {}).get("cwd") or ""), workspace, conversation_root=conversation_root)
+                cwd, err = worker_owned_cwd(str((body or {}).get("cwd") or ""), workspace, conversation_root=conversation_root)
                 if err:
                     raise ValueError(err)
                 body["cwd"] = cwd
