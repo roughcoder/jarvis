@@ -265,6 +265,15 @@ remote worker URLs or tokens. Put secrets in env vars and reference them from
 profiles with `token_env`; tokens can come from the process environment or the
 configured `JARVIS_ENV_FILE`.
 
+Worker rows include public hygiene metadata when probed:
+
+```json
+{"worktree_inventory": {"count": 3, "disk_bytes": 123456, "stale_count": 1}}
+```
+
+These are counts only; cockpit projections do not expose worker-local absolute
+worktree paths.
+
 ### Projects
 
 ```text
@@ -295,6 +304,7 @@ PATCH /v1/projects/{id}/threads/{tid}
 POST /v1/projects/{id}/threads/{tid}/turns
 POST /v1/projects/{id}/threads/{tid}/archive
 POST /v1/projects/{id}/threads/{tid}/unarchive
+DELETE /v1/projects/{id}/threads/{tid}
 ```
 
 Projects are read from the Jarvis registry, not Honcho. The cockpit never talks
@@ -954,6 +964,11 @@ emit the project activity types `thread.archived` / `thread.unarchived` and
 return the resource-write envelope; the write honours `idempotency_key` with
 the same principal-scoped semantics as other project writes.
 
+`DELETE /v1/projects/{id}/threads/{tid}` deletes the local thread index row and
+the backing Honcho memory session when the configured memory backend supports
+session deletion. It returns a reclamation summary. Repeated deletes return
+`deleted: false`; unknown thread ids return `404 not_found`.
+
 ### Runs
 
 ```text
@@ -962,6 +977,7 @@ GET /v1/runs/{run_id}
 GET /v1/runs/{run_id}/events?after=<cursor>&limit=100
 GET /v1/runs/{run_id}/artifacts?after=<cursor>&limit=100
 POST /v1/runs/{run_id}/archive
+DELETE /v1/runs/{run_id}
 ```
 
 ### Sessions
@@ -972,6 +988,7 @@ GET /v1/sessions/{session_ref}
 GET /v1/sessions/{session_ref}/events?after=<cursor>&limit=100
 GET /v1/sessions/{session_ref}/requests
 GET /v1/sessions/{session_ref}/checkpoints
+DELETE /v1/sessions/{session_ref}
 ```
 
 ### Work
@@ -1888,7 +1905,8 @@ enter durable state on this lane either.
 `POST /v1/sessions/{session_ref}/archive` hide the selected run or session from
 cockpit snapshot/list views. Archive state is owned by Jarvis, not by T3 local
 storage. Direct detail endpoints may still resolve archived objects by id/ref
-for reconciliation.
+for reconciliation. Archive is hide-only and returns a zero reclamation summary;
+it does not free memory sessions, worker records, events, or worktrees.
 
 `POST /v1/sessions/{session_ref}/unarchive` restores an archived session to
 snapshot/list views. It uses the same consolidated archive bookkeeping path as
@@ -1898,6 +1916,14 @@ archived is a no-op; an unknown session returns `not_found`. Runs currently
 have no unarchive endpoint, so unarchiving a session whose parent run is
 archived returns `409 run_archived` (the row would stay hidden either way)
 instead of reporting a restore that has no visible effect.
+
+`DELETE /v1/sessions/{session_ref}` and `DELETE /v1/runs/{run_id}` remove
+Jarvis-owned records and call the owning worker over HTTP to delete worker
+session state and prune owned worktrees. Delete responses include
+`reclamation.records`, `reclamation.events`, `reclamation.worktrees`, and
+`reclamation.bytes`; repeated deletes return `deleted: false` from a local
+tombstone, while never-known ids return `404 not_found`. See
+[`COCKPIT_LIFECYCLE.md`](COCKPIT_LIFECYCLE.md) for the full cleanup contract.
 
 `POST /v1/sessions/{session_ref}/checkpoints/restore` uses `checkpoint_id`.
 Checkpoint IDs are durable and stable within a session. Clients must not restore

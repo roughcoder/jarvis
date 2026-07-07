@@ -322,6 +322,7 @@ class WorkerProfile:
     git_identity: dict[str, Any] = field(default_factory=dict)
     repo_access: list[dict[str, Any]] = field(default_factory=list)
     repositories: list[dict[str, Any]] = field(default_factory=list)
+    worktree_inventory: dict[str, Any] = field(default_factory=dict)
     readiness: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
@@ -338,6 +339,8 @@ class WorkerProfile:
         if not isinstance(self.repositories, list):
             self.repositories = []
         self.repositories = [dict(item) for item in self.repositories if isinstance(item, dict) and (item.get("repo") or item.get("name"))]
+        if not isinstance(self.worktree_inventory, dict):
+            self.worktree_inventory = {}
         if self.readiness is not None and not isinstance(self.readiness, dict):
             self.readiness = None
 

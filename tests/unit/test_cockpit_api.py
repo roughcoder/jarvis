@@ -77,6 +77,7 @@ class FakeProjectMemory:
         self.sessions: list[dict[str, Any]] = []
         self.messages: list[dict[str, Any]] = []
         self.created_conclusions: list[dict[str, Any]] = []
+        self.deleted_sessions: list[str] = []
         self.create_session_error: Exception | None = None
         self.create_messages_error: Exception | None = None
 
@@ -145,6 +146,9 @@ class FakeProjectMemory:
         ]
         self.messages.extend(rows)
         return rows
+
+    def delete_session(self, session_id: str) -> None:
+        self.deleted_sessions.append(session_id)
 
     async def write_turn(self, user_text: str, assistant_text: str, *, user: str | None = None) -> None:
         self.messages.append(
@@ -286,8 +290,8 @@ class FakeGateway:
         return item
 
 
-async def _with_server(cfg: Config, fn: Callable[[str, httpx.AsyncClient], Any], *, http_get=None, http_post=None) -> Any:  # noqa: ANN001
-    runner = web.AppRunner(make_app(cfg, http_get=http_get, http_post=http_post))
+async def _with_server(cfg: Config, fn: Callable[[str, httpx.AsyncClient], Any], *, http_get=None, http_post=None, http_delete=None) -> Any:  # noqa: ANN001
+    runner = web.AppRunner(make_app(cfg, http_get=http_get, http_post=http_post, http_delete=http_delete))
     await runner.setup()
     site = web.TCPSite(runner, "localhost", 0)
     await site.start()
@@ -1039,6 +1043,7 @@ def _fake_get(run_id: str):  # noqa: ANN202
                     "agent": "codex",
                     "supported_engines": ["codex", "claude"],
                     "system": _worker_system_health(),
+                    "worktree_inventory": {"count": 3, "disk_bytes": 2048, "stale_count": 1},
                 }
             )
         if url.endswith("/jobs"):
@@ -1232,6 +1237,8 @@ def test_cockpit_catalog_snapshot_and_worker_projection(tmp_path, monkeypatch) -
         assert workers["workers"][0]["engines"][0]["supports"]["checkpoints"] is True
         assert workers["workers"][0]["engines"][1]["engine"] == "claude"
         assert workers["workers"][0]["engines"][1]["supports"]["interrupt"] is False
+        assert workers["workers"][0]["worktree_inventory"] == {"count": 3, "disk_bytes": 2048, "stale_count": 1}
+        assert snapshot["workers"][0]["worktree_inventory"]["stale_count"] == 1
         assert snapshot["workers"][0]["system"]["cpu_model"] == "Apple M4 Pro"
         assert workers["workers"][0]["system"] == worker_detail["system"]
         assert workers["workers"][0]["system"]["disk"] == [
@@ -2730,6 +2737,47 @@ def test_cockpit_thread_archive_hides_and_unarchive_restores_listing(tmp_path, m
     asyncio.run(_with_server(cfg, calls))
 
 
+def test_cockpit_thread_delete_removes_index_and_memory_session_idempotently(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    connector = CockpitConnector(cfg, memory=memory, gateway=FakeGateway(["unused"]), tts=None, tracer=None)
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_delete",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_delete"),
+            title="Delete me",
+            created_at="2026-07-05T09:00:00+00:00",
+            updated_at="2026-07-05T09:00:00+00:00",
+            created_by="neil",
+            messages=({"role": "user", "peer_id": "neil", "content": "hi", "observed_at": "now"},),
+        )
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+    monkeypatch.setattr(cockpit_api_module, "MemoryClient", lambda _cfg: memory)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        first = await client.delete(f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}")
+        second = await client.delete(f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}")
+        listed = await client.get(f"{base}/v1/projects/neil-shared/threads?include_archived=true")
+
+        assert first.status_code == 200
+        assert first.json()["deleted"] is True
+        assert first.json()["reclamation"]["records"] == 1
+        assert first.json()["reclamation"]["events"] == 1
+        assert first.json()["reclamation"]["memory_sessions"] == 1
+        assert second.status_code == 200
+        assert second.json()["deleted"] is False
+        assert second.json()["reclamation"]["memory_sessions"] == 0
+        assert listed.json()["threads"] == []
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+    assert memory.deleted_sessions == [thread.session_id]
+
+
 def test_cockpit_thread_archive_non_member_gets_404(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)
@@ -2936,6 +2984,38 @@ def test_cockpit_project_activity_records_owner_writes(tmp_path, monkeypatch) ->
     import asyncio
 
     asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_project_delete_blocks_when_threads_exist(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="alice")
+    _seed_project_registry(cfg)
+    brain = FakeProjectBrainClient()
+    memory = FakeProjectMemory()
+    connector = CockpitConnector(cfg, memory=memory, gateway=FakeGateway(["unused"]), tts=None, tracer=None)
+    connector.index.save(
+        CockpitThread(
+            thread_id="thread_child",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_child"),
+            title="Child work",
+            created_at="2026-07-05T09:00:00+00:00",
+            updated_at="2026-07-05T09:00:00+00:00",
+            created_by="alice",
+        )
+    )
+    monkeypatch.setattr(cockpit_api_module, "_project_brain_client", lambda _ctx: brain)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.request("DELETE", f"{base}/v1/projects/neil-shared", json={})
+
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "project_not_empty"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+    assert [call["op"] for call in brain.calls if call["op"] == "project.delete"] == []
 
 
 def test_cockpit_project_activity_remains_readable_after_delete(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -4144,6 +4224,100 @@ def test_cockpit_archive_session_hides_it_without_archiving_run(tmp_path, monkey
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+
+def test_cockpit_archive_reclaims_nothing(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    _store, run_id = _seed_run(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(f"{base}/v1/runs/{run_id}/archive", json={})
+
+        assert response.status_code == 200
+        assert response.json()["reclamation"] == {
+            "records": 0,
+            "events": 0,
+            "worktrees": 0,
+            "bytes": 0,
+            "memory_sessions": 0,
+            "notes": [],
+        }
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+
+def test_cockpit_delete_session_prunes_worker_and_is_idempotent(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    _store, run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+    deletes: list[str] = []
+
+    def delete(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        deletes.append(url)
+        if url.endswith("/sessions/sess_123"):
+            return Response(
+                {
+                    "ok": True,
+                    "deleted": True,
+                    "reclamation": {"records": 1, "events": 3, "worktrees": 1, "bytes": 4096},
+                }
+            )
+        raise AssertionError(url)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        first = await client.delete(f"{base}/v1/sessions/{ref}")
+        second = await client.delete(f"{base}/v1/sessions/{ref}")
+        sessions = (await client.get(f"{base}/v1/sessions", params={"sync": "fast"})).json()
+        detail = (await client.get(f"{base}/v1/sessions/{ref}")).json()
+
+        assert first.status_code == 200
+        assert first.json()["reclamation"]["records"] == 2
+        assert first.json()["reclamation"]["events"] == 3
+        assert first.json()["reclamation"]["worktrees"] == 1
+        assert first.json()["reclamation"]["bytes"] == 4096
+        assert second.status_code == 200
+        assert second.json()["deleted"] is False
+        assert sessions["sessions"] == []
+        assert detail["deleted"] is True
+        assert detail["session"]["status"] == "deleted"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id), http_delete=delete))
+    assert len(deletes) == 1
+
+
+def test_cockpit_delete_run_deletes_owned_sessions_and_records(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    _store, run_id = _seed_run(cfg)
+
+    def delete(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions/sess_123"):
+            return Response({"ok": True, "reclamation": {"records": 1, "events": 2, "worktrees": 1, "bytes": 512}})
+        raise AssertionError(url)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        first = await client.delete(f"{base}/v1/runs/{run_id}")
+        second = await client.delete(f"{base}/v1/runs/{run_id}")
+        listed = (await client.get(f"{base}/v1/runs")).json()
+        detail = (await client.get(f"{base}/v1/runs/{run_id}")).json()
+
+        assert first.status_code == 200
+        assert first.json()["reclamation"]["records"] >= 3
+        assert first.json()["reclamation"]["events"] >= 3
+        assert first.json()["reclamation"]["worktrees"] == 1
+        assert first.json()["reclamation"]["bytes"] == 512
+        assert second.status_code == 200
+        assert second.json()["deleted"] is False
+        assert listed["runs"] == []
+        assert detail["deleted"] is True
+        assert detail["run"]["status"] == "deleted"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id), http_delete=delete))
 
 
 def test_cockpit_worker_only_sessions_include_checkpoint_counts(tmp_path, monkeypatch) -> None:  # noqa: ANN001

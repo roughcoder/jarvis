@@ -48,12 +48,14 @@ from jarvis.worker.actions import (
     list_repos,
     prepare_worktree,
     probe_repo_access,
+    prune_worktrees,
     resolve_repo,
     run_applescript,
     run_exec,
     run_peekaboo,
     run_shell,
     take_screenshot,
+    worktree_inventory,
 )
 from jarvis.worker.jobs import JobManager, slugify
 from jarvis.worker.providers import ProviderTurn, provider_for
@@ -61,6 +63,7 @@ from jarvis.worker.sessions import SessionManager, WorkerSession
 from jarvis.system_info import system_info_cached
 from jarvis.worker_session_contract import (
     CHECKPOINT_ID_KEY,
+    ACTIVE_SESSION_STATUSES,
     EVENT_APPROVAL_RESOLVED,
     EVENT_INPUT_RECEIVED,
     EVENT_SESSION_INTERRUPTED,
@@ -723,6 +726,78 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             return web.json_response({"error": "unauthorized"}, status=401)
         return await _provider_terminal_event(request, sessions, "stop")
 
+    async def delete_session(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        session_id = request.match_info["id"]
+        session = sessions.get(session_id)
+        if session is None:
+            return web.json_response({"error": "no such session"}, status=404)
+        if session.status in ACTIVE_SESSION_STATUSES:
+            return web.json_response({"ok": False, "error": "worker session is live"}, status=409)
+        events_count = len(sessions.events(session.session_id))
+        prune = {"ok": True, "worktrees": 0, "bytes": 0, "pruned": [], "refused": []}
+        if session.cwd:
+            prune = await prune_worktrees(
+                str(workspace / "worktrees"),
+                str(workspace / "sessions"),
+                target=session.cwd,
+                stale_ttl_s=0.0,
+                timeout_s=cfg.shell_timeout_s,
+            )
+            blocking = [
+                item
+                for item in prune.get("refused", [])
+                if item.get("reason") not in {"worktree not found"}
+            ]
+            if blocking:
+                return web.json_response({"ok": False, "error": blocking[0].get("reason") or "worktree prune refused"}, status=409)
+        removed = sessions.remove(session.session_id)
+        return web.json_response(
+            {
+                "ok": True,
+                "deleted": removed,
+                "session_id": session.session_id,
+                "reclamation": {
+                    "records": 1 if removed else 0,
+                    "events": events_count,
+                    "worktrees": int(prune.get("worktrees") or 0),
+                    "bytes": int(prune.get("bytes") or 0),
+                },
+                "worktree_prune": prune,
+            }
+        )
+
+    async def list_worktrees(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        inventory = await asyncio.to_thread(
+            worktree_inventory,
+            str(workspace / "worktrees"),
+            str(workspace / "sessions"),
+            stale_ttl_s=cfg.worktree_stale_ttl_s,
+        )
+        return web.json_response({"ok": True, "worktree_inventory": inventory})
+
+    async def prune_worktree_request(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            body = await request.json() if request.can_read_body else {}
+        except Exception:
+            return web.json_response({"error": "bad json"}, status=400)
+        target = str(body.get("target") or body.get("name") or body.get("worktree") or "").strip()
+        ttl_s = float(body.get("stale_ttl_s") if body.get("stale_ttl_s") is not None else cfg.worktree_stale_ttl_s)
+        result = await prune_worktrees(
+            str(workspace / "worktrees"),
+            str(workspace / "sessions"),
+            target=target,
+            stale_ttl_s=ttl_s,
+            timeout_s=cfg.shell_timeout_s,
+        )
+        status = 200 if result.get("ok") else 409
+        return web.json_response(result, status=status)
+
     async def health(request: web.Request) -> web.Response:
         supported_engines = engine_ids(cfg.supported_engines, default_engine=cfg.agent)
         body = {
@@ -735,6 +810,11 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             "repo_root_configured": bool(cfg.repo_root),
             "browser_enabled": browser_cfg.enabled,
             "gui_provider_configured": bool(cfg.peekaboo_ai_providers),
+            "worktree_inventory": worktree_inventory(
+                str(workspace / "worktrees"),
+                str(workspace / "sessions"),
+                stale_ttl_s=cfg.worktree_stale_ttl_s,
+            ),
         }
         if authorised(request):
             body["system"] = system_info_cached()
@@ -808,7 +888,10 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         web.post("/sessions/{id}/approval", session_approval),
         web.post("/sessions/{id}/interrupt", session_interrupt),
         web.post("/sessions/{id}/stop", session_stop),
+        web.delete("/sessions/{id}", delete_session),
         web.get("/sessions/{id}", get_session),
+        web.get("/worktrees", list_worktrees),
+        web.post("/worktrees/prune", prune_worktree_request),
         web.get("/health", health),
     ])
     return app

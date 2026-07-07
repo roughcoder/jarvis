@@ -7,11 +7,12 @@ background-job lifecycle. Uses `echo`/missing binaries so it's fast and safe.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import pathlib
 import sys
 
-from jarvis.worker.actions import cleanup_job, code_argv, prepare_worktree, run_exec, run_shell
+from jarvis.worker.actions import cleanup_job, code_argv, prepare_worktree, prune_worktrees, run_exec, run_shell, worktree_inventory
 from jarvis.worker.jobs import JobManager
 
 
@@ -397,6 +398,44 @@ def test_cleanup_refuses_repo_worktree_outside_owned_roots(tmp_path) -> None:
 
     assert out.startswith("refused")
     assert (user_dir / "keep.txt").exists()
+
+
+def test_worktree_inventory_counts_bytes_and_stale_while_sparing_live_sessions(tmp_path) -> None:
+    worktrees = tmp_path / "worker" / "worktrees"
+    sessions = tmp_path / "worker" / "sessions"
+    stale = worktrees / "old"
+    live = worktrees / "live"
+    stale.mkdir(parents=True)
+    live.mkdir(parents=True)
+    (stale / "payload.txt").write_text("stale payload")
+    (live / "payload.txt").write_text("live payload")
+    session_dir = sessions / "sess_live"
+    session_dir.mkdir(parents=True)
+    (session_dir / "session.json").write_text(json.dumps({"status": "running", "cwd": str(live)}))
+
+    inventory = worktree_inventory(str(worktrees), str(sessions), stale_ttl_s=0)
+    result = asyncio.run(prune_worktrees(str(worktrees), str(sessions), stale_ttl_s=0))
+
+    assert inventory["count"] == 2
+    assert inventory["disk_bytes"] >= len("stale payload") + len("live payload")
+    assert inventory["stale_count"] == 1
+    assert result["worktrees"] == 1
+    assert result["bytes"] >= len("stale payload")
+    assert not stale.exists()
+    assert live.exists()
+
+
+def test_prune_refuses_target_outside_worktree_root(tmp_path) -> None:
+    worktrees = tmp_path / "worker" / "worktrees"
+    outside = tmp_path / "outside"
+    worktrees.mkdir(parents=True)
+    outside.mkdir()
+
+    result = asyncio.run(prune_worktrees(str(worktrees), target=str(outside), stale_ttl_s=0))
+
+    assert result["ok"] is False
+    assert result["refused"][0]["reason"] == "worktree not found"
+    assert outside.exists()
 
 
 def test_jobs_named_and_findable() -> None:

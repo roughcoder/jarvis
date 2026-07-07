@@ -405,6 +405,17 @@ class SessionManager:
             )
         return checkpoints
 
+    def remove(self, session_id: str) -> bool:
+        with self._lock:
+            try:
+                directory = self.session_dir(session_id)
+            except ValueError:
+                return False
+            if not directory.exists():
+                return False
+            shutil.rmtree(directory)
+            return True
+
     def save(self, session: WorkerSession) -> None:
         with self._lock:
             directory = self.session_dir(session.session_id)

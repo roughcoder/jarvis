@@ -54,6 +54,7 @@ from jarvis.orchestration.cockpit import (
     canonical_event_type,
     cockpit_catalog,
     cockpit_snapshot,
+    deleted_session_refs_for_store,
     make_session_ref,
     paged,
     project_worker_profile,
@@ -118,6 +119,7 @@ from jarvis.users import HOUSE
 
 HttpGet = Callable[..., Any]
 HttpPost = Callable[..., Any]
+HttpDelete = Callable[..., Any]
 CONFIG_KEY = web.AppKey("config", Config)
 logger = logging.getLogger(__name__)
 SSE_REFRESH_ERROR_LOG_INTERVAL_S = 60.0
@@ -140,6 +142,7 @@ class CockpitAppContext:
     # through this API, and a restart safely reverts rows to the durable
     # created/completed derivation.
     thread_turn_states: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+    delete: HttpDelete = httpx.delete
 
     async def require_auth(self, request: web.Request) -> None:
         orchestration = self.cfg.orchestration
@@ -415,6 +418,7 @@ def make_app(
     *,
     http_get: HttpGet | None = None,
     http_post: HttpPost | None = None,
+    http_delete: HttpDelete | None = None,
     source_factory: Callable[[str, Any], WorkSource] | None = None,
 ) -> web.Application:
     orchestration = cfg.orchestration
@@ -437,6 +441,7 @@ def make_app(
         cfg=cfg,
         get=http_get or httpx.get,
         post=http_post or httpx.post,
+        delete=http_delete or httpx.delete,
         store=OrchestrationStore(cfg.orchestration.workspace),
         idempotency=IdempotencyStore(cfg.orchestration.workspace),
         idempotency_locks={},
@@ -490,8 +495,10 @@ def make_app(
         web.get("/v1/sessions/{session_ref}/requests", reads.session_requests),
         web.get("/v1/sessions/{session_ref}/checkpoints", reads.session_checkpoints),
         web.post("/v1/runs/{run_id}/archive", writes.run_archive),
+        web.delete("/v1/runs/{run_id}", writes.run_delete),
         web.post("/v1/sessions/{session_ref}/archive", writes.session_archive),
         web.post("/v1/sessions/{session_ref}/unarchive", writes.session_unarchive),
+        web.delete("/v1/sessions/{session_ref}", writes.session_delete),
         web.post("/v1/sessions/{session_ref}/checkpoints/restore", writes.session_write, name="restore_checkpoint"),
         web.post("/v1/sessions/{session_ref}/{action:turns|input|approval|interrupt|stop}", writes.session_write),
         web.get("/v1/sessions/{session_ref}", reads.session_detail),
@@ -513,6 +520,7 @@ def make_app(
         web.post("/v1/projects/{project_id}/threads/{thread_id}/turns", writes.project_thread_turn),
         web.post("/v1/projects/{project_id}/threads/{thread_id}/archive", writes.project_thread_archive),
         web.post("/v1/projects/{project_id}/threads/{thread_id}/unarchive", writes.project_thread_unarchive),
+        web.delete("/v1/projects/{project_id}/threads/{thread_id}", writes.project_thread_delete),
         web.post("/v1/work/start", writes.work_start),
         web.post("/v1/work/resume", writes.work_resume),
         web.post("/v1/work/validate", writes.work_validate),
@@ -857,6 +865,10 @@ class CockpitReadHandlers:
 
     async def run_detail(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
+        deleted = await asyncio.to_thread(self.ctx.store.deleted_run, request.match_info["run_id"])
+        if deleted is not None:
+            row = _deleted_run_row(deleted)
+            return web.json_response({"run": row, "summary": row, "deleted": True})
         run = await asyncio.to_thread(_run_or_404, self.ctx.store, request.match_info["run_id"])
         requests = await asyncio.to_thread(
             aggregate_requests,
@@ -905,7 +917,7 @@ class CockpitReadHandlers:
             worker_by_id={worker["worker_id"]: worker for worker in workers},
             include_worker_state=include_worker_state,
             archived_run_ids={run.run_id for run in all_runs if run.archived_at},
-            archived_session_refs=archived_session_refs_for_store(self.ctx.store, all_runs),
+            archived_session_refs=archived_session_refs_for_store(self.ctx.store, all_runs) | deleted_session_refs_for_store(self.ctx.store),
         )
         requests = []
         checkpoints = []
@@ -930,6 +942,9 @@ class CockpitReadHandlers:
     async def session_detail(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
+        deleted = await asyncio.to_thread(self.ctx.store.deleted_worker_session, ref.worker_id, ref.session_id)
+        if deleted is not None:
+            return web.json_response({"session": _deleted_session_row(ref, deleted), "raw": {}, "deleted": True})
         raw: dict[str, Any] = {}
         has_stored_projection = await asyncio.to_thread(_has_stored_session_projection, self.ctx.store, ref)
         row = await asyncio.to_thread(_fallback_session_row, self.ctx.store, ref, {})
@@ -1166,11 +1181,26 @@ class CockpitWriteHandlers:
 
         async def produce() -> dict[str, Any]:
             visible_to: list[str] = []
+            project_for_guard = None
             with contextlib.suppress(Exception):
                 registry = await asyncio.to_thread(_registry_store, self.ctx.cfg)
                 project = registry.get_project(str(payload["project_id"]))
                 if project is not None:
+                    project_for_guard = project
                     visible_to = sorted({project.owner, *project.members})
+            if project_for_guard is not None:
+                threads = await asyncio.to_thread(
+                    _cockpit_connector(self.ctx).list_threads,
+                    project_for_guard,
+                    include_archived=True,
+                )
+                if threads:
+                    raise CockpitError(
+                        "project_not_empty",
+                        "project has threads; delete or archive child work before deleting the project",
+                        recoverable=True,
+                        status=409,
+                    )
             result = await _project_brain_write(self.ctx, requester, "project.delete", payload)
             project_id = _project_id_from_result(result, str(payload["project_id"]))
             await _record_project_activity(
@@ -1540,6 +1570,59 @@ class CockpitWriteHandlers:
         response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
         return web.json_response(response_body)
 
+    async def project_thread_delete(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        body = await _optional_json_body(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        project = await _project_for_member_route(self.ctx, request, requester)
+        thread_id = request.match_info["thread_id"]
+        scope = f"projects/{project.id}/threads/{thread_id}/delete"
+        fingerprint_body = {**body, "project_id": project.id, "thread_id": thread_id}
+
+        async def produce() -> dict[str, Any]:
+            connector = _cockpit_connector(self.ctx)
+            existing = await asyncio.to_thread(connector.index.get, project.id, thread_id)
+            memory_deleted = False
+            notes: list[str] = []
+            if existing is not None:
+                try:
+                    await asyncio.to_thread(MemoryClient(self.ctx.cfg.memory).delete_session, existing.session_id)
+                    memory_deleted = True
+                except UnsupportedMemoryOperation as exc:
+                    notes.append(str(exc))
+                except Exception as exc:
+                    raise CockpitError("memory_unavailable", public_error_message(str(exc)), recoverable=True, status=503) from exc
+            thread, deleted = await asyncio.to_thread(connector.delete_thread, project, thread_id)
+            if thread is None:
+                raise CockpitError("not_found", "thread not found", status=404)
+            if deleted:
+                await _record_project_activity(
+                    self.ctx,
+                    project.id,
+                    "thread.deleted",
+                    requester,
+                    f"Deleted project thread {thread_id}",
+                    {"project_id": project.id, "thread_id": thread_id},
+                )
+            summary = _reclamation_summary(
+                records=1 if deleted else 0,
+                events=len(thread.messages) if deleted else 0,
+                memory_sessions=1 if memory_deleted else 0,
+                notes=notes,
+            )
+            return {
+                "ok": True,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "deleted": deleted,
+                "project_id": project.id,
+                "thread_id": thread_id,
+                "reclamation": summary,
+            }
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
+        return web.json_response(response_body)
+
     async def work_start(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
@@ -1698,6 +1781,20 @@ class CockpitWriteHandlers:
             self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
         return web.json_response(response_body)
 
+    async def run_delete(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        body = await _optional_json_body(request)
+        run_id = request.match_info["run_id"]
+        scope = f"runs/{run_id}/delete"
+        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
+            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
+            if cached is not None:
+                return web.json_response(cached)
+            _require_capability(self.ctx.cfg, "orchestration.runs.write")
+            response_body = await asyncio.to_thread(_delete_run_packet, self.ctx, run_id)
+            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+        return web.json_response(response_body)
+
     async def session_archive(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
@@ -1725,6 +1822,20 @@ class CockpitWriteHandlers:
             _require_capability(self.ctx.cfg, "orchestration.runs.write")
             run = await asyncio.to_thread(_unarchive_session, self.ctx.store, ref)
             response_body = _unarchive_session_packet(run, ref)
+            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+        return web.json_response(response_body)
+
+    async def session_delete(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        body = await _optional_json_body(request)
+        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
+        scope = f"sessions/{ref.worker_id}/{ref.session_id}/delete"
+        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
+            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
+            if cached is not None:
+                return web.json_response(cached)
+            _require_capability(self.ctx.cfg, "orchestration.runs.write")
+            response_body = await asyncio.to_thread(_delete_session_packet, self.ctx, ref)
             self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
         return web.json_response(response_body)
 
@@ -2339,14 +2450,16 @@ def _unarchive_session(store: OrchestrationStore, ref: SessionRef):
 
 def _archive_run_packet(run) -> dict[str, Any]:  # noqa: ANN001
     run_row = run_summary(run)
+    reclamation = _reclamation_summary()
     return {
         "ok": True,
-        "cursor": snapshot_cursor({"run": run_row, "archived": True}),
+        "cursor": snapshot_cursor({"run": run_row, "archived": True, "reclamation": reclamation}),
         "run": run_row,
         "session": {},
         "events": [],
         "requests": [],
         "artifacts": [],
+        "reclamation": reclamation,
     }
 
 
@@ -2366,14 +2479,182 @@ def _archive_session_packet(run, ref: SessionRef) -> dict[str, Any]:  # noqa: AN
             }
         )
         run_row = {}
+    reclamation = _reclamation_summary()
     return {
         "ok": True,
-        "cursor": snapshot_cursor({"run": run_row, "session": session_row, "archived": True}),
+        "cursor": snapshot_cursor({"run": run_row, "session": session_row, "archived": True, "reclamation": reclamation}),
         "run": run_row,
         "session": session_row,
         "events": [],
         "requests": [],
         "artifacts": [],
+        "reclamation": reclamation,
+    }
+
+
+def _delete_session_packet(ctx: CockpitAppContext, ref: SessionRef) -> dict[str, Any]:
+    if ctx.store.deleted_worker_session(ref.worker_id, ref.session_id) is not None:
+        summary = _reclamation_summary()
+    else:
+        worker_summary = _delete_worker_session(ctx.cfg, ref, delete=ctx.delete)
+        store_summary = ctx.store.delete_cockpit_session(ref.worker_id, ref.session_id)
+        summary = _reclamation_summary(
+            records=int(worker_summary.get("records") or 0) + int(store_summary.get("records") or 0),
+            events=int(worker_summary.get("events") or 0) + int(store_summary.get("events") or 0),
+            worktrees=int(worker_summary.get("worktrees") or 0),
+            bytes_reclaimed=int(worker_summary.get("bytes") or 0),
+        )
+    session_row = session_summary(
+        {
+            "session_ref": make_session_ref(ref.worker_id, ref.session_id),
+            "worker_id": ref.worker_id,
+            "session_id": ref.session_id,
+            "status": "deleted",
+        }
+    )
+    return {
+        "ok": True,
+        "deleted": any(summary.values()),
+        "cursor": snapshot_cursor({"session": session_row, "deleted": True, "reclamation": summary}),
+        "run": {},
+        "session": session_row,
+        "events": [],
+        "requests": [],
+        "artifacts": [],
+        "reclamation": summary,
+    }
+
+
+def _delete_run_packet(ctx: CockpitAppContext, run_id: str) -> dict[str, Any]:
+    run = ctx.store.get(run_id)
+    if run is None:
+        if ctx.store.deleted_run(run_id) is None:
+            raise CockpitError("not_found", "run not found", status=404)
+        summary = _reclamation_summary()
+        run_row = {"run_id": run_id, "status": "deleted"}
+        return {
+            "ok": True,
+            "deleted": False,
+            "cursor": snapshot_cursor({"run": run_row, "deleted": True, "reclamation": summary}),
+            "run": run_row,
+            "session": {},
+            "events": [],
+            "requests": [],
+            "artifacts": [],
+            "reclamation": summary,
+        }
+    records = 0
+    events = 0
+    worktrees = 0
+    bytes_reclaimed = 0
+    for session in run.sessions:
+        worker_summary = _delete_worker_session(
+            ctx.cfg,
+            SessionRef(worker_id=session.worker_id, session_id=session.session_id),
+            delete=ctx.delete,
+        )
+        records += int(worker_summary.get("records") or 0)
+        events += int(worker_summary.get("events") or 0)
+        worktrees += int(worker_summary.get("worktrees") or 0)
+        bytes_reclaimed += int(worker_summary.get("bytes") or 0)
+    store_summary = ctx.store.delete_run(run.run_id)
+    records += int(store_summary.get("records") or 0)
+    events += int(store_summary.get("events") or 0)
+    summary = _reclamation_summary(
+        records=records,
+        events=events,
+        worktrees=worktrees,
+        bytes_reclaimed=bytes_reclaimed,
+    )
+    run_row = {**run_summary(run), "status": "deleted"}
+    return {
+        "ok": True,
+        "deleted": bool(store_summary.get("deleted")),
+        "cursor": snapshot_cursor({"run": run_row, "deleted": True, "reclamation": summary}),
+        "run": run_row,
+        "session": {},
+        "events": [],
+        "requests": [],
+        "artifacts": [],
+        "reclamation": summary,
+    }
+
+
+def _deleted_run_row(deleted: dict[str, str]) -> dict[str, Any]:
+    return {
+        "authority": "jarvis",
+        "supported_controls": [],
+        "run_id": str(deleted.get("run_id") or ""),
+        "title": "Deleted run",
+        "objective": "",
+        "status": "deleted",
+        "phase": "deleted",
+        "repo": "",
+        "branch": "",
+        "session_count": 0,
+        "active_session_count": 0,
+        "pending_input_count": 0,
+        "pending_approval_count": 0,
+        "artifact_count": 0,
+        "primary_artifact_ids": [],
+        "latest_activity_at": str(deleted.get("deleted_at") or ""),
+        "latest_cursor": "",
+        "created_at": "",
+        "updated_at": str(deleted.get("deleted_at") or ""),
+        "terminal_reason": None,
+        "state_reason": "Run has been deleted",
+        "blocked_reason": None,
+        "waiting_on": [],
+        "last_error": None,
+        "archived_at": None,
+        "deleted_at": str(deleted.get("deleted_at") or ""),
+    }
+
+
+def _deleted_session_row(ref: SessionRef, deleted: dict[str, str]) -> dict[str, Any]:
+    return session_summary(
+        {
+            "session_ref": make_session_ref(ref.worker_id, ref.session_id),
+            "worker_id": ref.worker_id,
+            "session_id": ref.session_id,
+            "status": "deleted",
+            "updated_at": str(deleted.get("deleted_at") or ""),
+        }
+    ) | {"deleted_at": str(deleted.get("deleted_at") or "")}
+
+
+def _delete_worker_session(cfg: Config, ref: SessionRef, *, delete: HttpDelete) -> dict[str, int]:
+    try:
+        raw = _worker_delete_json(cfg, ref.worker_id, f"/sessions/{ref.session_id}", delete=delete)
+    except CockpitError as exc:
+        if exc.code == "not_found":
+            return {"records": 0, "events": 0, "worktrees": 0, "bytes": 0}
+        raise
+    reclamation = raw.get("reclamation") if isinstance(raw.get("reclamation"), dict) else {}
+    return {
+        "records": int(reclamation.get("records") or 0),
+        "events": int(reclamation.get("events") or 0),
+        "worktrees": int(reclamation.get("worktrees") or 0),
+        "bytes": int(reclamation.get("bytes") or 0),
+    }
+
+
+def _reclamation_summary(
+    *,
+    records: int = 0,
+    events: int = 0,
+    worktrees: int = 0,
+    bytes_reclaimed: int = 0,
+    memory_sessions: int = 0,
+    notes: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "records": max(0, int(records)),
+        "events": max(0, int(events)),
+        "worktrees": max(0, int(worktrees)),
+        "bytes": max(0, int(bytes_reclaimed)),
+        "memory_sessions": max(0, int(memory_sessions)),
+        "notes": list(notes or []),
     }
 
 
@@ -3180,6 +3461,33 @@ def _worker_post_json(cfg: Config, worker_id: str, path: str, body: dict[str, An
             raise CockpitError("validation_failed", message, recoverable=True, status=400)
         raise CockpitError("worker_unavailable", message, recoverable=True, status=502)
     return data if isinstance(data, dict) else {}
+
+
+def _worker_delete_json(cfg: Config, worker_id: str, path: str, *, delete: HttpDelete) -> dict[str, Any]:
+    profile = _worker_profile(cfg, worker_id)
+    try:
+        response = delete(f"{profile.base_url}{path}", headers=worker_headers(cfg.worker, profile), timeout=cfg.worker.request_timeout_s)
+    except Exception as exc:  # noqa: BLE001
+        message = public_error_message(str(exc) or "worker delete failed")
+        raise CockpitError("worker_unavailable", message, recoverable=True, status=502) from exc
+    status = getattr(response, "status_code", 200)
+    try:
+        data = response.json() if hasattr(response, "json") else {}
+    except Exception:
+        data = {}
+        if status < 400:
+            raise CockpitError("worker_unavailable", "worker returned invalid JSON", recoverable=True, status=502) from None
+    if not isinstance(data, dict):
+        data = {}
+    if status == 404:
+        raise CockpitError("not_found", "worker resource not found", status=404)
+    if status == 409:
+        raise CockpitError("conflict", public_error_message(str(data.get("error") or "worker refused delete")), recoverable=True, status=409)
+    if status == 401:
+        raise CockpitError("worker_unavailable", "worker authentication failed", recoverable=True, status=502)
+    if status >= 400:
+        raise CockpitError("worker_unavailable", _response_error(response) or "worker delete failed", recoverable=True, status=502)
+    return data
 
 
 def _worker_session_row(raw: dict[str, Any], worker_id: str) -> dict[str, Any]:

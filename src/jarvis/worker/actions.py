@@ -7,6 +7,7 @@ aiohttp — so the actions are unit-testable on their own.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import pathlib
 import shutil
@@ -17,6 +18,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from jarvis.engines import ENGINE_CLAUDE, ENGINE_CODEX, code_engine_argv, normalize_engine_id
+from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES
 
 
 # A model-driven shell runs with ONLY these operational vars from the host env — never
@@ -496,6 +498,67 @@ def _probe_repo_with_git(repo: str, *, timeout_s: float) -> dict[str, Any]:
     }
 
 
+def worktree_inventory(worktrees_dir: str, sessions_dir: str = "", *, stale_ttl_s: float = 0.0) -> dict[str, Any]:
+    root = pathlib.Path(worktrees_dir).expanduser().resolve(strict=False)
+    live = _live_session_cwds(sessions_dir, root)
+    count = 0
+    disk_bytes = 0
+    stale_count = 0
+    for path in _worktree_children(root):
+        count += 1
+        disk_bytes += _disk_usage(path)
+        if _stale_worktree(path, root, live, stale_ttl_s):
+            stale_count += 1
+    return {"count": count, "disk_bytes": disk_bytes, "stale_count": stale_count}
+
+
+async def prune_worktrees(
+    worktrees_dir: str,
+    sessions_dir: str = "",
+    *,
+    target: str = "",
+    stale_ttl_s: float = 0.0,
+    timeout_s: float = 30.0,
+) -> dict[str, Any]:
+    root = pathlib.Path(worktrees_dir).expanduser().resolve(strict=False)
+    live = _live_session_cwds(sessions_dir, root)
+    if target:
+        candidates = [_worktree_target(root, target)]
+    else:
+        candidates = [
+            path
+            for path in _worktree_children(root)
+            if _stale_worktree(path, root, live, stale_ttl_s)
+        ]
+    pruned = []
+    refused = []
+    reclaimed = 0
+    for path in candidates:
+        if path is None:
+            refused.append({"target": target, "reason": "worktree not found"})
+            continue
+        if not _is_under(path, [root]):
+            refused.append({"target": str(path), "reason": "outside worktree root"})
+            continue
+        if str(path.resolve(strict=False)) in live:
+            refused.append({"target": path.name, "reason": "live session uses this worktree"})
+            continue
+        bytes_before = _disk_usage(path)
+        await _remove_worktree_path(path, timeout_s)
+        if path.exists():
+            refused.append({"target": path.name, "reason": "remove failed"})
+            continue
+        reclaimed += bytes_before
+        pruned.append({"name": path.name, "bytes": bytes_before})
+    return {
+        "ok": not refused,
+        "worktrees": len(pruned),
+        "bytes": reclaimed,
+        "pruned": pruned,
+        "refused": refused,
+    }
+
+
 def _engine_diagnostic(engine: str, *, codex_bin: str, claude_bin: str) -> dict[str, Any]:
     engine_id = normalize_engine_id(engine)
     binary = codex_bin if engine_id == ENGINE_CODEX else claude_bin if engine_id == ENGINE_CLAUDE else engine_id
@@ -770,3 +833,84 @@ async def cleanup_job(
         shutil.rmtree(cwd, ignore_errors=True)
         return f"removed {cwd}"
     return "nothing to remove"
+
+
+def _worktree_children(root: pathlib.Path) -> list[pathlib.Path]:
+    if not root.is_dir():
+        return []
+    return sorted(path for path in root.iterdir() if path.is_dir())
+
+
+def _worktree_target(root: pathlib.Path, target: str) -> pathlib.Path | None:
+    text = str(target or "").strip()
+    if not text:
+        return None
+    raw = pathlib.Path(text).expanduser()
+    path = raw if raw.is_absolute() else root / raw.name
+    path = path.resolve(strict=False)
+    root = root.resolve(strict=False)
+    if not path.is_relative_to(root) or not path.is_dir():
+        return None
+    return path
+
+
+def _live_session_cwds(sessions_dir: str, worktrees_root: pathlib.Path) -> set[str]:
+    root = pathlib.Path(sessions_dir).expanduser() if sessions_dir else pathlib.Path()
+    if not root.is_dir():
+        return set()
+    live: set[str] = set()
+    worktrees_root = worktrees_root.resolve(strict=False)
+    for path in root.glob("*/session.json"):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if str(data.get("status") or "") not in ACTIVE_SESSION_STATUSES:
+            continue
+        cwd = pathlib.Path(str(data.get("cwd") or "")).expanduser().resolve(strict=False)
+        if cwd.is_relative_to(worktrees_root):
+            live.add(str(cwd))
+    return live
+
+
+def _stale_worktree(
+    path: pathlib.Path,
+    worktrees_root: pathlib.Path,
+    live_cwds: set[str],
+    stale_ttl_s: float,
+) -> bool:
+    resolved = path.resolve(strict=False)
+    if not resolved.is_relative_to(worktrees_root.resolve(strict=False)):
+        return False
+    if str(resolved) in live_cwds:
+        return False
+    ttl = max(0.0, float(stale_ttl_s or 0.0))
+    if ttl <= 0:
+        return True
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return False
+    return time.time() - mtime >= ttl
+
+
+def _disk_usage(path: pathlib.Path) -> int:
+    total = 0
+    try:
+        for item in path.rglob("*"):
+            try:
+                total += item.lstat().st_size
+            except OSError:
+                continue
+        total += path.lstat().st_size
+    except OSError:
+        return 0
+    return total
+
+
+async def _remove_worktree_path(path: pathlib.Path, timeout_s: float) -> None:
+    git_dir = path / ".git"
+    if git_dir.exists() or git_dir.is_file():
+        await run_exec(["git", "-C", str(path), "worktree", "remove", "--force", str(path)], None, timeout_s)
+    if path.exists():
+        shutil.rmtree(path, ignore_errors=True)
