@@ -3875,6 +3875,48 @@ def test_cockpit_project_idempotency_is_principal_scoped(tmp_path, monkeypatch) 
     assert [call["op"] for call in brain.calls].count("project.delete") == 2
 
 
+def test_cockpit_run_archive_idempotency_is_principal_scoped(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        caps="orchestration.runs.write",
+        auth_mode="oauth",
+        oauth_issuer="https://cockpit.example",
+        oauth_audience="jarvis-brain",
+        oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+        oauth_required_scopes="jarvis:read",
+    )
+    _seed_user_profiles(cfg, "alice", "neil")
+    _store, run_id = _seed_run(cfg)
+
+    def get(url: str, **kwargs) -> Response:  # noqa: ANN001
+        if "jwks" in url:
+            return jwks_get(url, **kwargs)
+        return _fake_get(run_id)(url, **kwargs)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        alice = {"Authorization": f"Bearer {fixture['sign'](subject='alice', jarvis_user='alice', scope='jarvis:read')}"}
+        neil = {"Authorization": f"Bearer {fixture['sign'](subject='neil', jarvis_user='neil', scope='jarvis:read')}"}
+        body = {"idempotency_key": "archive-shared"}
+
+        first = await client.post(f"{base}/v1/runs/{run_id}/archive", headers=alice, json=body)
+        replay = await client.post(f"{base}/v1/runs/{run_id}/archive", headers=alice, json=body)
+        cross_principal = await client.post(f"{base}/v1/runs/{run_id}/archive", headers=neil, json=body)
+
+        assert first.status_code == 200
+        assert replay.status_code == 200
+        assert replay.json()["idempotent"] is True
+        # A different principal reusing the same key must execute the action,
+        # not be served the first principal's cached result.
+        assert cross_principal.status_code == 200
+        assert "idempotent" not in cross_principal.json()
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
 def test_cockpit_file_upload_and_retract_idempotency(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)

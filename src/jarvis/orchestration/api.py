@@ -1830,7 +1830,7 @@ class CockpitWriteHandlers:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
         run_id = request.match_info["run_id"]
-        scope = f"runs/{run_id}/archive"
+        scope = _principal_scoped(request, self.ctx.cfg, f"runs/{run_id}/archive")
         async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
             cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
             if cached is not None:
@@ -1984,7 +1984,7 @@ class CockpitWriteHandlers:
             attachments = _validate_attachments(body, self.ctx.cfg.orchestration)
             if attachments:
                 body["attachments"] = attachments
-        scope = f"sessions/{ref.worker_id}/{ref.session_id}/{action}"
+        scope = _principal_scoped(request, self.ctx.cfg, f"sessions/{ref.worker_id}/{ref.session_id}/{action}")
         async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
             cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
             if cached is not None:
