@@ -305,7 +305,7 @@ def cockpit_snapshot(
     sync = sync_state(store=store, worker_cfg=worker_cfg, workers_path=workers_path, sync_mode=sync_mode, http_get=http_get)
     all_runs = store.list_runs()
     archived_run_ids = {run.run_id for run in all_runs if run.archived_at}
-    archived_session_refs = archived_session_refs_for_store(store, all_runs)
+    archived_session_refs = archived_session_refs_for_store(store, all_runs) | deleted_session_refs_for_store(store)
     runs = [run for run in all_runs if not run.archived_at]
     include_worker_state = sync["mode"] in {"fast", "probe"}
     workers = worker_profiles(
@@ -431,8 +431,25 @@ def project_worker_profile(profile: WorkerProfile, *, default_repo: str = "") ->
         "git_identity": _worker_git_identity(profile.git_identity),
         "repo_access": _repo_access_rows(profile.repo_access),
         "repositories": _repository_rows(profile.repositories, profile.default_repo or default_repo),
+        "worktree_inventory": _worktree_inventory(profile.worktree_inventory),
         "public_metadata": {},
     }
+
+
+def _worktree_inventory(raw: Any) -> dict[str, int]:
+    data = raw if isinstance(raw, dict) else {}
+    return {
+        "count": _nonnegative_int(data.get("count")),
+        "disk_bytes": _nonnegative_int(data.get("disk_bytes")),
+        "stale_count": _nonnegative_int(data.get("stale_count")),
+    }
+
+
+def _nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _repository_rows(raw_rows: list[dict[str, Any]], default_repo: str) -> list[dict[str, Any]]:
@@ -1017,6 +1034,14 @@ def archived_session_refs_for_store(store: OrchestrationStore, runs: list[Orches
         if item.get("worker_id") and item.get("session_id")
     )
     return refs
+
+
+def deleted_session_refs_for_store(store: OrchestrationStore) -> set[str]:
+    return {
+        make_session_ref(str(item.get("worker_id") or ""), str(item.get("session_id") or ""))
+        for item in store.deleted_worker_sessions().values()
+        if item.get("worker_id") and item.get("session_id")
+    }
 
 
 def project_artifact(artifact: Artifact, run: OrchestrationRun) -> dict[str, Any]:

@@ -162,6 +162,33 @@ class CockpitThreadIndex:
         )
         return self.save(updated)
 
+    def delete(self, project_id: str, thread_id: str) -> tuple[CockpitThread | None, bool]:
+        data = self._read()
+        threads = data.setdefault("threads", {})
+        deleted = data.setdefault("deleted_threads", {})
+        raw = threads.pop(thread_id, None)
+        if isinstance(raw, dict) and str(raw.get("project_id") or "") == project_id:
+            thread = CockpitThread.from_dict(raw)
+            # Messages may live in the transcript file, inline, or the legacy key;
+            # count them all for the reclamation summary, then reclaim the file.
+            messages = self._thread_messages(thread)
+            deleted[thread_id] = {
+                **thread.as_dict(include_messages=False),
+                "deleted_at": utc_now(),
+            }
+            _atomic_write_json(self.path, data)
+            try:
+                self._transcript_path(project_id, thread_id).unlink(missing_ok=True)
+            except OSError:
+                pass
+            return replace(thread, messages=tuple(messages)), True
+        if raw is not None:
+            threads[thread_id] = raw
+        tombstone = deleted.get(thread_id)
+        if isinstance(tombstone, dict) and str(tombstone.get("project_id") or "") == project_id:
+            return CockpitThread.from_dict(tombstone), False
+        return None, False
+
     def append_turn(
         self,
         thread: CockpitThread,
@@ -270,6 +297,8 @@ class CockpitThreadIndex:
             return {"version": 1, "threads": {}}
         if not isinstance(data.get("threads"), dict):
             data["threads"] = {}
+        if not isinstance(data.get("deleted_threads"), dict):
+            data["deleted_threads"] = {}
         data.setdefault("version", 1)
         if self._migrate_legacy_messages(data):
             _atomic_write_json(self.path, data)
@@ -382,6 +411,8 @@ class CockpitConnector:
         if not title or title == thread.title:
             return thread
         return self._index.save(replace(thread, title=title[:200], updated_at=utc_now()))
+    def delete_thread(self, project: ProjectEntry, thread_id: str) -> tuple[CockpitThread | None, bool]:
+        return self._index.delete(project.id, thread_id)
 
     async def open_thread(
         self,

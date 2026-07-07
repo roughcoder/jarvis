@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import fcntl
+import hashlib
+import hmac
 import json
 import pathlib
 import re
+import shutil
 
 from jarvis.ids import new_id, utc_now
 from jarvis.orchestration.models import (
@@ -20,6 +24,9 @@ from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES
 
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+_SESSION_REF_PREFIX = "sessref_"
+_SESSION_REF_SIGNING_CONTEXT = b"jarvis-cockpit-session-ref-v1"
+_SESSION_REF_SIGNATURE_BYTES = 12
 
 
 class ActiveWorkItemError(RuntimeError):
@@ -60,6 +67,8 @@ class OrchestrationStore:
         self._lock_path = self.root / ".lock"
         self._archived_sessions_path = self.root / "archived-sessions.json"
         self._session_refs_path = self.root / "session-refs.json"
+        self._deleted_runs_path = self.root / "deleted-runs.json"
+        self._deleted_sessions_path = self.root / "deleted-sessions.json"
 
     def run_dir(self, run_id: str) -> pathlib.Path:
         if not _RUN_ID.fullmatch(run_id):
@@ -345,6 +354,15 @@ class OrchestrationStore:
     def resolve_session_ref(self, session_ref: str) -> dict[str, str] | None:
         return self.session_ref_index().get(session_ref)
 
+    def deleted_run(self, run_id: str) -> dict[str, str] | None:
+        return self._deleted_records(self._deleted_runs_path).get(run_id)
+
+    def deleted_worker_session(self, worker_id: str, session_id: str) -> dict[str, str] | None:
+        return self._deleted_records(self._deleted_sessions_path).get(f"{worker_id}\0{session_id}")
+
+    def deleted_worker_sessions(self) -> dict[str, dict[str, str]]:
+        return self._deleted_records(self._deleted_sessions_path)
+
     def link_work_item(self, run_id: str, item: WorkItem, role: str = "related") -> OrchestrationRun:
         run = self.get(run_id)
         if run is None:
@@ -481,6 +499,53 @@ class OrchestrationStore:
             self.append_event(run_id, "job_removed", f"Removed worker job link {job_id}", {"job_id": job_id})
             return run
 
+    def delete_run(self, run_id: str) -> dict[str, int | str | bool]:
+        with self._locked():
+            run = self.get(run_id)
+            if run is None:
+                deleted = self.deleted_run(run_id)
+                if deleted is not None:
+                    return {"deleted": False, "run_id": run_id, "records": 0, "events": 0}
+                raise KeyError(run_id)
+            events = len(self.events(run.run_id))
+            records = 1 + len(run.sessions) + len(run.jobs) + len(run.artifacts)
+            directory = self.run_dir(run.run_id)
+            shutil.rmtree(directory, ignore_errors=True)
+            self._record_deleted_run_unlocked(run.run_id)
+            for session in run.sessions:
+                self._record_session_ref_unlocked(session.worker_id, session.session_id)
+                self._record_deleted_session_unlocked(session.worker_id, session.session_id)
+            return {"deleted": True, "run_id": run.run_id, "records": records, "events": events}
+
+    def delete_cockpit_session(self, worker_id: str, session_id: str) -> dict[str, int | str | bool]:
+        with self._locked():
+            deleted = self.deleted_worker_session(worker_id, session_id)
+            if deleted is not None:
+                return {"deleted": False, "worker_id": worker_id, "session_id": session_id, "records": 0, "events": 0}
+            records = 0
+            for run in self.list_runs():
+                before = len(run.sessions)
+                run.sessions = [
+                    session
+                    for session in run.sessions
+                    if not (session.worker_id == worker_id and session.session_id == session_id)
+                ]
+                if len(run.sessions) != before:
+                    records += before - len(run.sessions)
+                    self.save(run)
+                    self.append_event(
+                        run.run_id,
+                        "session_deleted",
+                        f"Worker session {worker_id}/{session_id} deleted from cockpit",
+                        {"worker_id": worker_id, "session_id": session_id},
+                    )
+            archived = self.archived_worker_sessions()
+            if archived.pop(f"{worker_id}\0{session_id}", None) is not None:
+                records += 1
+                _atomic_write_json(self._archived_sessions_path, list(archived.values()))
+            self._record_deleted_session_unlocked(worker_id, session_id)
+            return {"deleted": True, "worker_id": worker_id, "session_id": session_id, "records": records, "events": 0}
+
     def update_job(self, run_id: str, job_id: str, **updates: str) -> OrchestrationRun:
         with self._locked():
             run = self.get(run_id)
@@ -556,6 +621,57 @@ class OrchestrationStore:
             return False
         _atomic_write_json(self._archived_sessions_path, list(archived.values()))
         return True
+    def _deleted_records(self, path: pathlib.Path) -> dict[str, dict[str, str]]:
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+        result: dict[str, dict[str, str]] = {}
+        if not isinstance(data, list):
+            return result
+        for raw in data:
+            if not isinstance(raw, dict):
+                continue
+            key = str(raw.get("key") or "")
+            if key:
+                result[key] = {str(k): str(v) for k, v in raw.items()}
+        return result
+
+    def _record_deleted_run_unlocked(self, run_id: str) -> None:
+        records = self._deleted_records(self._deleted_runs_path)
+        records[run_id] = {"key": run_id, "run_id": run_id, "deleted_at": utc_now()}
+        _atomic_write_json(self._deleted_runs_path, list(records.values()))
+
+    def _record_session_ref_unlocked(self, worker_id: str, session_id: str) -> None:
+        records = self.session_ref_index()
+        session_ref = _make_session_ref(worker_id, session_id)
+        existing = records.get(session_ref)
+        if (
+            existing is not None
+            and existing.get("worker_id") == worker_id
+            and existing.get("session_id") == session_id
+        ):
+            return
+        records[session_ref] = {
+            "session_ref": session_ref,
+            "worker_id": worker_id,
+            "session_id": session_id,
+            "updated_at": utc_now(),
+        }
+        _atomic_write_json(self._session_refs_path, list(records.values()))
+
+    def _record_deleted_session_unlocked(self, worker_id: str, session_id: str) -> None:
+        records = self._deleted_records(self._deleted_sessions_path)
+        key = f"{worker_id}\0{session_id}"
+        records[key] = {
+            "key": key,
+            "worker_id": worker_id,
+            "session_id": session_id,
+            "deleted_at": utc_now(),
+        }
+        _atomic_write_json(self._deleted_sessions_path, list(records.values()))
 
 
 def _same_work_item(left: WorkItem, right: WorkItem) -> bool:
@@ -573,3 +689,10 @@ def _atomic_write_json(path: pathlib.Path, data: object) -> None:
     tmp = path.with_suffix(f"{path.suffix}.tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
     tmp.replace(path)
+
+
+def _make_session_ref(worker_id: str, session_id: str) -> str:
+    raw = f"{worker_id}\0{session_id}".encode("utf-8")
+    digest = hmac.new(_SESSION_REF_SIGNING_CONTEXT, _SESSION_REF_SIGNING_CONTEXT + b"\0" + raw, hashlib.sha256).digest()
+    token = base64.urlsafe_b64encode(digest[:_SESSION_REF_SIGNATURE_BYTES]).decode("ascii").rstrip("=")
+    return f"{_SESSION_REF_PREFIX}{token}"

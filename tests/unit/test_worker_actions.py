@@ -7,11 +7,15 @@ background-job lifecycle. Uses `echo`/missing binaries so it's fast and safe.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import pathlib
+import subprocess
 import sys
 
-from jarvis.worker.actions import cleanup_job, code_argv, prepare_worktree, run_exec, run_shell
+import pytest
+
+from jarvis.worker.actions import cleanup_job, code_argv, prepare_worktree, prune_worktrees, run_exec, run_shell, worktree_inventory
 from jarvis.worker.jobs import JobManager
 
 
@@ -397,6 +401,104 @@ def test_cleanup_refuses_repo_worktree_outside_owned_roots(tmp_path) -> None:
 
     assert out.startswith("refused")
     assert (user_dir / "keep.txt").exists()
+
+
+def test_worktree_inventory_counts_bytes_and_stale_while_sparing_live_sessions(tmp_path) -> None:
+    worktrees = tmp_path / "worker" / "worktrees"
+    sessions = tmp_path / "worker" / "sessions"
+    stale = worktrees / "old"
+    live = worktrees / "live"
+    stale.mkdir(parents=True)
+    live.mkdir(parents=True)
+    (stale / "payload.txt").write_text("stale payload")
+    (live / "payload.txt").write_text("live payload")
+    session_dir = sessions / "sess_live"
+    session_dir.mkdir(parents=True)
+    (session_dir / "session.json").write_text(json.dumps({"status": "running", "cwd": str(live)}))
+
+    inventory = worktree_inventory(str(worktrees), str(sessions), stale_ttl_s=0)
+    result = asyncio.run(prune_worktrees(str(worktrees), str(sessions), stale_ttl_s=0))
+
+    assert inventory["count"] == 2
+    assert inventory["disk_bytes"] >= len("stale payload") + len("live payload")
+    assert inventory["stale_count"] == 1
+    assert result["worktrees"] == 1
+    assert result["bytes"] >= len("stale payload")
+    assert not stale.exists()
+    assert live.exists()
+
+
+def test_prune_spares_worktree_when_live_session_uses_subdirectory(tmp_path) -> None:
+    worktrees = tmp_path / "worker" / "worktrees"
+    sessions = tmp_path / "worker" / "sessions"
+    worktree = worktrees / "live-parent"
+    live_cwd = worktree / "subdir"
+    live_cwd.mkdir(parents=True)
+    (live_cwd / "payload.txt").write_text("live payload")
+    session_dir = sessions / "sess_live"
+    session_dir.mkdir(parents=True)
+    (session_dir / "session.json").write_text(json.dumps({"status": "running", "cwd": str(live_cwd)}))
+
+    inventory = worktree_inventory(str(worktrees), str(sessions), stale_ttl_s=0)
+    result = asyncio.run(prune_worktrees(str(worktrees), str(sessions), stale_ttl_s=0))
+
+    assert inventory["stale_count"] == 0
+    assert result["worktrees"] == 0
+    assert worktree.exists()
+
+
+def test_prune_refuses_target_outside_worktree_root(tmp_path) -> None:
+    worktrees = tmp_path / "worker" / "worktrees"
+    outside = tmp_path / "outside"
+    worktrees.mkdir(parents=True)
+    outside.mkdir()
+
+    result = asyncio.run(prune_worktrees(str(worktrees), target=str(outside), stale_ttl_s=0))
+
+    assert result["ok"] is False
+    assert result["refused"][0]["reason"] == "outside worktree root"
+    assert outside.exists()
+
+
+def test_worktree_inventory_skips_symlinked_directory_contents(tmp_path) -> None:
+    worktrees = tmp_path / "worker" / "worktrees"
+    worktree = worktrees / "linked"
+    outside = tmp_path / "outside"
+    worktree.mkdir(parents=True)
+    outside.mkdir()
+    (outside / "large.bin").write_bytes(b"x" * 1024 * 1024)
+    try:
+        os.symlink(outside, worktree / "outside-link", target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    inventory = worktree_inventory(str(worktrees), stale_ttl_s=0)
+
+    assert inventory["count"] == 1
+    assert inventory["disk_bytes"] < 1024 * 1024
+
+
+def test_prune_deletes_associated_jarvis_branch(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    worktrees = tmp_path / "worker" / "worktrees"
+    worktree = worktrees / "branch-prune"
+    repo.mkdir()
+    worktrees.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test User"], check=True)
+    (repo / "README.md").write_text("base\n")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "initial"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-b", "jarvis/branch-prune", str(worktree)], check=True, capture_output=True)
+
+    result = asyncio.run(prune_worktrees(str(worktrees), target=str(worktree), stale_ttl_s=0))
+    branch = subprocess.run(["git", "-C", str(repo), "branch", "--list", "jarvis/branch-prune"], check=True, capture_output=True, text=True)
+
+    assert result["ok"] is True
+    assert result["worktrees"] == 1
+    assert not worktree.exists()
+    assert branch.stdout.strip() == ""
 
 
 def test_jobs_named_and_findable() -> None:

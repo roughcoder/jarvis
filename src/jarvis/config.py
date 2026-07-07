@@ -531,6 +531,9 @@ class WorkerConfig(_Base):
     # Repo jobs run on an isolated worktree branch "<prefix>/<name>-<id>", never
     # the user's checkout.
     worktree_branch_prefix: str = "jarvis"
+    # Worker-owned worktrees with no live session older than this can be pruned.
+    # Set to 0 to treat every non-live worktree as stale for explicit sweeps.
+    worktree_stale_ttl_s: float = 7 * 24 * 60 * 60
     verbose: bool = True             # log each dispatched action + full peekaboo output
     # Secrets Jarvis may USE (not see) in shell commands: a comma-separated allowlist
     # of env var NAMES the worker injects into the shell environment (read from the

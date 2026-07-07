@@ -193,6 +193,8 @@ class WorkerRegistry:
                 profile.repositories = [
                     dict(item) for item in diagnostics["repositories"] if isinstance(item, dict)
                 ]
+        if isinstance(data.get("worktree_inventory"), dict):
+            profile.worktree_inventory = dict(data["worktree_inventory"])
         profile.system = _system_from_health(data.get("system"))
         profile.__post_init__()
         return profile
