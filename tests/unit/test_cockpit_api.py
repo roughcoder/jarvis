@@ -5451,6 +5451,112 @@ def test_cockpit_work_start_records_linked_project_activity_and_skips_unlinked(t
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run.run_id)))
 
 
+def test_cockpit_work_start_projects_run_and_session_linkage_survives_reload(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.cockpit import aggregate_sessions, run_detail_projection, run_summary, session_summary
+
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    created_run_ids: list[str] = []
+    seen_project_ids: list[str] = []
+
+    def next_work(_self, command, *, start: bool = False):  # noqa: ANN001, FBT001, FBT002
+        project_id = str(command.filters.get("project_id") or "")
+        seen_project_ids.append(project_id)
+        engine = str(command.target_engine_id or "codex")
+        item = WorkItem(
+            source="manual",
+            id=f"manual_{len(created_run_ids)}",
+            title="Projected dispatch",
+            repo=str(command.filters.get("repo") or "roughcoder/jarvis"),
+        )
+        store = OrchestrationStore(cfg.orchestration.workspace)
+        run = store.create_run(item.title, work_items=[item], project_id=project_id, engine=engine)
+        session = WorkerSessionLink(
+            worker_id="macbook-worker",
+            session_id=f"sess_projected_{len(created_run_ids)}",
+            status="running",
+            provider=engine,
+            engine=engine,
+            project_id=project_id,
+            branch="jarvis/projected-dispatch",
+        )
+        store.link_session(run.run_id, session)
+        created_run_ids.append(run.run_id)
+        return StartedWork(
+            item=item,
+            worker=WorkerProfile(worker_id="macbook-worker", display_name="MacBook Pro"),
+            envelope=ExecutionEnvelope(
+                run_id=run.run_id,
+                repo=item.repo,
+                prompt=item.title,
+                worker_id="macbook-worker",
+                engine=engine,
+                project_id=project_id,
+                session_id=session.session_id,
+            ),
+            session=session,
+        )
+
+    monkeypatch.setattr("jarvis.orchestration.service.OrchestrationService.next_work", next_work)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        linked = await client.post(
+            f"{base}/v1/work/start",
+            json={
+                "source": "manual",
+                "repo": "roughcoder/jarvis",
+                "phrase": "linked",
+                "project_id": "neil-shared",
+                "engine": "claude",
+            },
+        )
+        legacy = await client.post(
+            f"{base}/v1/work/start",
+            json={"source": "manual", "repo": "roughcoder/jarvis", "phrase": "legacy"},
+        )
+        linked_body = linked.json()
+        legacy_body = legacy.json()
+
+        assert linked.status_code == 200, linked_body
+        assert legacy.status_code == 200, legacy_body
+        assert linked_body["run"]["project_id"] == "neil-shared"
+        assert linked_body["run"]["engine"] == "claude"
+        assert linked_body["session"]["project_id"] == "neil-shared"
+        assert linked_body["session"]["engine"] == "claude"
+        assert legacy_body["run"]["project_id"] is None
+        assert legacy_body["run"]["engine"] == "codex"
+        assert legacy_body["session"]["project_id"] is None
+        assert legacy_body["session"]["engine"] == "codex"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get("")))
+
+    assert seen_project_ids == ["neil-shared", ""]
+    reloaded = OrchestrationStore(cfg.orchestration.workspace)
+    linked_run = reloaded.get(created_run_ids[0])
+    legacy_run = reloaded.get(created_run_ids[1])
+    assert linked_run is not None
+    assert legacy_run is not None
+
+    linked_sessions = aggregate_sessions(
+        runs=[linked_run],
+        worker_cfg=cfg.worker,
+        workers_path=cfg.orchestration.workers_path,
+        include_worker_state=False,
+    )
+    linked_session = session_summary(next(iter(linked_sessions.values())))
+    linked_detail = run_detail_projection(linked_run)
+
+    assert run_summary(linked_run)["project_id"] == "neil-shared"
+    assert run_summary(linked_run)["engine"] == "claude"
+    assert linked_detail["sessions"][0]["project_id"] == "neil-shared"
+    assert linked_session["project_id"] == "neil-shared"
+    assert linked_session["engine"] == "claude"
+    assert run_summary(legacy_run)["project_id"] is None
+    assert run_detail_projection(legacy_run)["sessions"][0]["project_id"] is None
+
+
 def test_cockpit_work_start_idempotency_serializes_concurrent_dispatch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, caps="worker.job.start,worker.session.create,worker.session.turn,forge.github.branch.push")
     store = OrchestrationStore(cfg.orchestration.workspace)

@@ -1454,6 +1454,8 @@ Run summaries appear in snapshots and run lists.
   "objective": "Expose live worker sessions",
   "status": "active",
   "phase": "running",
+  "project_id": "jarvis",
+  "engine": "codex",
   "repo": "roughcoder/jarvis",
   "branch": "jarvis/foo",
   "session_count": 2,
@@ -1500,6 +1502,10 @@ must treat empty strings as "not available", not as errors.
 not expose raw work item bodies, source-internal IDs, worker `cwd` paths, or raw
 provider metadata.
 
+`project_id` is the durable registry project linkage captured at dispatch time.
+It is `null` for older runs or work started outside a project. `engine` is the
+selected worker engine for the run, or an empty string when unavailable.
+
 ## SessionSummary
 
 Session summaries appear in snapshots and session lists.
@@ -1512,6 +1518,7 @@ Session summaries appear in snapshots and session lists.
   "worker_id": "macbook-worker",
   "session_id": "sess_123",
   "run_id": "run_123",
+  "project_id": "jarvis",
   "title": "Codex implementation",
   "provider": "codex",
   "engine": "codex",
@@ -1534,6 +1541,8 @@ Session summaries appear in snapshots and session lists.
 Use `cwd_label`, not public absolute `cwd`.
 Use `authority` and `supported_controls` to route cockpit commands. T3 should
 not infer authority only from id shape.
+`project_id` mirrors the durable run/session dispatch linkage and is `null` for
+legacy or unlinked sessions.
 
 `run_id` is nullable: worker-local sessions that never joined a run report
 `run_id: null`. It is never an empty string — clients should model the field
@@ -2166,6 +2175,16 @@ full projection; filtering clients should ignore rows they do not care about.
 
 Future API changes should be appended here with date, schema version, compatible
 or breaking status, and migration notes.
+
+### 2026-07-07 - Project-linked run/session projections (compatible)
+
+Additive Batch 3 cockpit projection fields. `schema_version` stays 1.
+
+- Run summaries, run details, and session summaries now include durable
+  `project_id` linkage for work dispatched from a registry project, plus the
+  selected run `engine`.
+- Older or unlinked runs/sessions report `project_id: null`, preserving the
+  cockpit legacy fallback path.
 
 ### 2026-07-07 - Worker repo access and provisioning visibility (compatible)
 

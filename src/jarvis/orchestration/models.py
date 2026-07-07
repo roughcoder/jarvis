@@ -98,6 +98,7 @@ class WorkerSessionLink:
     ended_reason: str = ""
     provider: str = "codex"
     engine: str = "codex"
+    project_id: str = ""
     branch: str = ""
     cwd: str = ""
     last_event_id: str = ""
@@ -180,6 +181,7 @@ class ExecutionEnvelope:
     worker_id: str = "local-worker"
     engine: str = "codex"
     engine_strategy: str = "single"
+    project_id: str = ""
     base_ref: str = "main"
     branch_name: str = ""
     cwd: str = ""
@@ -214,6 +216,8 @@ class OrchestrationRun:
     child_chat_ids: list[str] = field(default_factory=list)
     parent_run_id: str | None = None
     child_run_ids: list[str] = field(default_factory=list)
+    project_id: str = ""
+    engine: str = ""
     work_items: list[WorkItemLink] = field(default_factory=list)
     jobs: list[WorkerJobLink] = field(default_factory=list)
     sessions: list[WorkerSessionLink] = field(default_factory=list)
@@ -232,8 +236,10 @@ class OrchestrationRun:
             status=data.get("status", "active"),
             parent_chat_id=data.get("parent_chat_id") or data.get("parent_run_id"),
             child_chat_ids=list(data.get("child_chat_ids") or data.get("child_run_ids") or []),
-            parent_run_id=data.get("parent_run_id"),
-            child_run_ids=list(data.get("child_run_ids", [])),
+            parent_run_id=data.get("parent_run_id") or data.get("parent_chat_id"),
+            child_run_ids=list(data.get("child_run_ids") or data.get("child_chat_ids") or []),
+            project_id=data.get("project_id", ""),
+            engine=data.get("engine", ""),
             work_items=[WorkItemLink.from_dict(x) for x in data.get("work_items", [])],
             jobs=[WorkerJobLink.from_dict(x) for x in data.get("jobs", [])],
             sessions=[WorkerSessionLink.from_dict(x) for x in data.get("sessions", [])],
@@ -254,6 +260,8 @@ class OrchestrationRun:
             "child_chat_ids": self.child_chat_ids,
             "parent_run_id": self.parent_run_id,
             "child_run_ids": self.child_run_ids,
+            "project_id": self.project_id,
+            "engine": self.engine,
             "work_items": [x.to_dict() for x in self.work_items],
             "jobs": [x.to_dict() for x in self.jobs],
             "sessions": [x.to_dict() for x in self.sessions],

@@ -215,6 +215,7 @@ def start_worker_session(
         status=current.get("status", SESSION_RUNNING),
         provider=current.get("provider") or envelope.engine,
         engine=current.get("engine") or envelope.engine,
+        project_id=envelope.project_id,
         branch=current.get("branch") or envelope.branch_name,
         cwd=current.get("cwd") or envelope.cwd,
         last_event_id=str(events[-1].get("event_id") or "") if events else "",
@@ -430,6 +431,7 @@ def _session_link_from_body(
         status=session.get("status", SESSION_RUNNING),
         provider=session.get("provider") or envelope.engine,
         engine=session.get("engine") or envelope.engine,
+        project_id=envelope.project_id,
         branch=session.get("branch") or envelope.branch_name,
         cwd=session.get("cwd") or envelope.cwd,
         last_event_id=str((event or {}).get("event_id") or ""),
@@ -534,7 +536,15 @@ def create_run_and_envelope(
     parent_chat_id: str = "",
 ) -> ExecutionEnvelope:
     objective = items[0].title if items else command.filters.get("text", command.operation)
-    run = store.create_run(str(objective), work_items=items, parent_chat_id=parent_chat_id or None)
+    project_id = str(command.filters.get("project_id") or "")
+    selected_engine = engine or worker.default_engine or worker.agent
+    run = store.create_run(
+        str(objective),
+        work_items=items,
+        parent_chat_id=parent_chat_id or None,
+        project_id=project_id,
+        engine=selected_engine,
+    )
     store.set_phase(run.run_id, "claimed", "Work item claimed locally by Jarvis")
     envelope = build_execution_envelope(
         run_id=run.run_id,
@@ -542,7 +552,7 @@ def create_run_and_envelope(
         items=items,
         worker_id=worker.worker_id,
         landing_mode=landing_mode,
-        engine=engine or worker.default_engine or worker.agent,
+        engine=selected_engine,
         engine_strategy=command.engine_strategy,
     )
     if extra_allowed_actions:
