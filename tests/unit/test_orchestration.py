@@ -107,6 +107,72 @@ def test_completed_phase_is_terminal(tmp_path) -> None:
     assert store.active_primary_owner(item) is None
 
 
+def test_archive_run_promotes_child_chats_to_root(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    parent = store.create_run("Parent orchestrator")
+    child = store.create_run("Child work", parent_chat_id=parent.run_id)
+
+    archived = store.archive_run(parent.run_id)
+    reloaded_child = store.get(child.run_id)
+
+    assert archived.archived_at
+    assert archived.child_chat_ids == []
+    assert reloaded_child is not None
+    assert reloaded_child.parent_chat_id is None
+    assert reloaded_child.parent_run_id is None
+    assert reloaded_child.archived_at == ""
+    assert any(event.type == "chat_reparented" for event in store.events(child.run_id))
+
+
+def test_terminal_child_notifies_parent_chat(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    parent = store.create_run("Parent orchestrator")
+    child = store.create_run("Child work", parent_chat_id=parent.run_id)
+
+    store.set_phase(child.run_id, "completed", "done")
+    store.set_phase(child.run_id, "completed", "done")
+
+    notifications = [event for event in store.events(parent.run_id) if event.type == "child_terminal"]
+    assert len(notifications) == 1
+    assert notifications[0].data["child_chat_id"] == child.run_id
+    assert notifications[0].data["phase"] == "completed"
+
+
+def test_terminal_child_notifies_parent_project_thread(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    threads_path = tmp_path / "cockpit-threads.json"
+    threads_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "threads": {
+                    "thread_parent": {
+                        "thread_id": "thread_parent",
+                        "project_id": "jarvis",
+                        "session_id": "project:jarvis:orchestrator:thread_parent",
+                        "title": "Parent",
+                        "created_at": "2026-07-05T09:00:00+00:00",
+                        "updated_at": "2026-07-05T09:00:00+00:00",
+                        "created_by": "neil",
+                        "messages": [],
+                    }
+                },
+            }
+        )
+    )
+    child = store.create_run("Child work", parent_chat_id="thread_parent")
+
+    store.set_phase(child.run_id, "completed", "done")
+    store.set_phase(child.run_id, "completed", "done")
+
+    stored = json.loads(threads_path.read_text())
+    messages = stored["threads"]["thread_parent"]["messages"]
+    assert len(messages) == 1
+    assert messages[0]["role"] == "system"
+    assert messages[0]["child_chat_id"] == child.run_id
+    assert messages[0]["phase"] == "completed"
+
+
 def test_active_primary_owner_scopes_github_numbers_by_repo(tmp_path) -> None:
     store = OrchestrationStore(str(tmp_path))
     run = store.create_run("first", work_items=[_item(id="#1", repo="owner/a")])

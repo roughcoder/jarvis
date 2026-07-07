@@ -826,6 +826,7 @@ class OrchestrationConfig(_Base):
     schedules_path: str = "jarvis-workspace/orchestration/schedules.json"
     default_repo: str = ""
     default_timezone: str = "Europe/London"
+    orchestrator_model: str = "strong"
     landing_mode: str = "draft_pr"
     api_host: str = "localhost"
     api_port: int = 8790
@@ -1102,6 +1103,7 @@ class Config:
             "orchestration.workers_path": self.orchestration.workers_path,
             "orchestration.schedules_path": self.orchestration.schedules_path,
             "orchestration.default_repo": self.orchestration.default_repo or "<unset>",
+            "orchestration.orchestrator_model": self.orchestration.orchestrator_model,
             "orchestration.landing_mode": self.orchestration.landing_mode,
             "orchestration.api_host": self.orchestration.api_host,
             "orchestration.api_port": self.orchestration.api_port,

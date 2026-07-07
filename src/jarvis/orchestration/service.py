@@ -108,6 +108,7 @@ class OrchestrationService:
         *,
         start: bool = False,
         attachments: list[dict[str, Any]] | None = None,
+        parent_chat_id: str = "",
     ) -> WorkItem | StartedWork | None:
         self._require(required_for_command(command.operation, command.source))
         source = self.source_factory(command.source, self.cfg)
@@ -145,6 +146,7 @@ class OrchestrationService:
                 landing_mode=self.cfg.orchestration.landing_mode,
                 engine=engine,
                 extra_allowed_actions=[WORKER_SESSION_STOP] if command.engine_strategy == "ensemble" else None,
+                parent_chat_id=parent_chat_id,
             )
         except ActiveWorkItemError as exc:
             raise WorkAlreadyOwnedError(item, exc.owner) from exc

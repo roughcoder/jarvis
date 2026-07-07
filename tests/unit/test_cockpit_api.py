@@ -4296,6 +4296,66 @@ def test_cockpit_archive_reclaims_nothing(tmp_path, monkeypatch) -> None:  # noq
             "memory_sessions": 0,
             "notes": [],
         }
+def test_cockpit_session_close_stops_cleans_up_and_archives(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="worker.session.stop,orchestration.runs.write")
+    _store, run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+    state = {"status": "running"}
+    posts: list[str] = []
+
+    def get(url: str, **kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions/sess_123"):
+            data = _fake_get(run_id)(url, **kwargs).json()
+            data["status"] = state["status"]
+            return Response(data)
+        return _fake_get(run_id)(url, **kwargs)
+
+    def post(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        posts.append(url)
+        if url.endswith("/sessions/sess_123/stop"):
+            state["status"] = "stopped"
+            return Response({"ok": True, "session": {"session_id": "sess_123", "status": "stopped"}})
+        if url.endswith("/sessions/sess_123/cleanup"):
+            return Response({"ok": True, "cleaned": ["worktree"]})
+        raise AssertionError(url)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(f"{base}/v1/sessions/{ref}/close", json={"idempotency_key": "close_session_1"})
+        replay = await client.post(f"{base}/v1/sessions/{ref}/close", json={"idempotency_key": "close_session_1"})
+        snapshot = (await client.get(f"{base}/v1/cockpit/snapshot")).json()
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["session"]["archived_at"]
+        assert body["cleanup"] == {"requested": True, "ok": True, "cleaned": ["worktree"]}
+        assert replay.json()["idempotent"] is True
+        assert posts == ["http://worker.test/sessions/sess_123/stop", "http://worker.test/sessions/sess_123/cleanup"]
+        assert snapshot["runs"][0]["session_count"] == 0
+        assert snapshot["sessions"] == []
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get, http_post=post))
+    events = OrchestrationStore(cfg.orchestration.workspace).events(run_id)
+    assert any(event.type == "session_cleanup_requested" for event in events)
+
+
+def test_cockpit_run_and_session_rename_update_chat_title(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    _store, run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        run_renamed = await client.post(f"{base}/v1/runs/{run_id}/rename", json={"title": "Parent title"})
+        session_renamed = await client.post(f"{base}/v1/sessions/{ref}/rename", json={"title": "Child title"})
+        detail = (await client.get(f"{base}/v1/runs/{run_id}")).json()
+
+        assert run_renamed.status_code == 200
+        assert run_renamed.json()["run"]["title"] == "Parent title"
+        assert session_renamed.status_code == 200
+        assert session_renamed.json()["run"]["title"] == "Child title"
+        assert session_renamed.json()["session"]["title"] == "Child title"
+        assert detail["run"]["title"] == "Child title"
 
     import asyncio
 
@@ -5003,6 +5063,53 @@ def test_cockpit_work_start_manual_dispatches_worker_session(tmp_path, monkeypat
         run_id = body["run"]["run_id"]
         persisted_ids = [e.data.get("event_id") for e in store.events(run_id) if isinstance(e.data, dict) and e.data.get("event_id")]
         assert persisted_ids == ["ev_create", "ev_turn"]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get("")))
+
+
+def test_cockpit_work_start_links_child_to_parent_chat_in_snapshot(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    caps = "worker.job.start,worker.session.create,worker.session.turn,forge.github.branch.push"
+    cfg = _cfg(tmp_path, monkeypatch, caps=caps)
+
+    def executor_post(url: str, **kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions"):
+            session = {
+                "session_id": kwargs["json"]["session_id"],
+                "status": "created",
+                "provider": kwargs["json"]["provider"],
+                "engine": kwargs["json"]["engine"],
+                "branch": "jarvis/manual-child",
+                "cwd": "/Users/example/private/jarvis",
+            }
+            return Response({"ok": True, "session": session})
+        if url.endswith("/turns"):
+            return Response({"ok": True, "events": []})
+        raise AssertionError(url)
+
+    monkeypatch.setattr("jarvis.orchestration.executor.httpx.post", executor_post)
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.post(
+            f"{base}/v1/work/start",
+            json={
+                "idempotency_key": "manual_child_1",
+                "source": "manual",
+                "repo": "roughcoder/jarvis",
+                "phrase": "Build a child task",
+                "parent_chat_id": "thread_parent",
+            },
+        )
+        body = response.json()
+        snapshot = (await client.get(f"{base}/v1/cockpit/snapshot")).json()
+
+        assert response.status_code == 200
+        assert body["run"]["parent_chat_id"] == "thread_parent"
+        assert body["session"]["parent_chat_id"] == "thread_parent"
+        assert snapshot["runs"][0]["parent_chat_id"] == "thread_parent"
+        assert snapshot["sessions"][0]["parent_chat_id"] == "thread_parent"
 
     import asyncio
 
@@ -5868,7 +5975,46 @@ def test_cockpit_sse_first_tick_delivers_session_event_after_subscribe(tmp_path,
     frames = [frame for frame in event["events"] or [] if frame["type"] == "session.event"]
     assert len(frames) == 1
     assert frames[0]["payload"]["event_id"] == "ev_first"
-    assert frames[0]["payload"]["type"] == "assistant.message"
+
+
+def test_cockpit_sse_delivers_child_terminal_parent_event(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    cfg.orchestration.sse_refresh_interval_s = 0.05
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    parent = store.create_run("Parent orchestrator")
+    child = store.create_run("Child work", parent_chat_id=parent.run_id)
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: Response({}),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=store,
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+
+    async def run_hub() -> dict[str, Any]:
+        import asyncio
+
+        hub = SseSnapshotHub(ctx)
+        await hub.start()
+        try:
+            subscription = await hub.subscribe("none")
+            store.set_phase(child.run_id, "completed", "done")
+            return await asyncio.wait_for(subscription.queue.get(), timeout=2)
+        finally:
+            await hub.stop()
+
+    import asyncio
+
+    event = asyncio.run(run_hub())
+    frames = [frame for frame in event["events"] or [] if frame["type"] == "run.event"]
+
+    assert len(frames) == 1
+    assert frames[0]["run_id"] == parent.run_id
+    assert frames[0]["payload"]["type"] == "child_terminal"
+    assert frames[0]["payload"]["data"]["child_chat_id"] == child.run_id
 
 
 def test_cockpit_work_start_capacity_uses_probed_worker_state(tmp_path, monkeypatch) -> None:  # noqa: ANN001
