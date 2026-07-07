@@ -666,6 +666,9 @@ def aggregate_sessions(
                 worker_row = _session_from_worker(raw, profile.worker_id, run=run)
                 if ref in sessions:
                     stored = sessions[ref]
+                    worker_row["project_id"] = worker_row.get("project_id") or stored.get("project_id", "")
+                    worker_row["run_id"] = worker_row.get("run_id") or stored.get("run_id", "")
+                    worker_row["title"] = worker_row.get("title") or stored.get("title", "")
                     worker_row["latest_event_cursor"] = worker_row.get("latest_event_cursor") or stored.get("latest_event_cursor", "")
                     worker_row["archived_at"] = stored.get("archived_at") or worker_row.get("archived_at", "")
                     worker_row["allowed_actions"] = worker_row.get("allowed_actions") or stored.get("allowed_actions", [])
@@ -786,6 +789,7 @@ def run_summary(
     run_artifacts = [artifact for artifact in artifacts if artifact.get("run_id") == run.run_id]
     repo = _run_repo(run)
     branch = next((session.branch for session in visible_sessions if session.branch), "")
+    engine = run.engine or next((session.engine for session in visible_sessions if session.engine), "")
     pending_input = sum(1 for request in run_requests if request.get("kind") == "input")
     pending_approval = sum(1 for request in run_requests if request.get("kind") == "approval")
     reason = _redact(run.terminal_reason)
@@ -808,6 +812,8 @@ def run_summary(
         "objective": _redact(run.objective),
         "status": run.status,
         "phase": run.phase,
+        "project_id": run.project_id or None,
+        "engine": engine,
         "repo": repo,
         "branch": branch,
         "session_count": len(visible_sessions),
@@ -892,6 +898,7 @@ def session_summary(
         "run_id": str(session.get("run_id") or "") or None,
         "chat_id": str(session.get("run_id") or ""),
         "parent_chat_id": session.get("parent_chat_id") or "",
+        "project_id": session.get("project_id") or None,
         "title": _redact(str(session.get("title") or "")),
         "provider": session.get("provider", ""),
         "engine": session.get("engine", ""),
@@ -1144,6 +1151,7 @@ def _session_from_link(link: WorkerSessionLink, run: OrchestrationRun) -> dict[s
         "worker_id": link.worker_id,
         "session_id": link.session_id,
         "run_id": run.run_id,
+        "project_id": link.project_id or run.project_id,
         "title": run.objective,
         "parent_chat_id": run.parent_chat_id or "",
         "provider": link.provider,
@@ -1168,6 +1176,7 @@ def _session_from_worker(raw: dict[str, Any], worker_id: str, *, run: Orchestrat
         "worker_id": worker_id,
         "session_id": session_id,
         "run_id": str(raw.get("run_id") or (run.run_id if run else "")),
+        "project_id": str(raw.get("project_id") or (run.project_id if run else "")),
         "title": str(raw.get("title") or (run.objective if run else "")),
         "parent_chat_id": str(raw.get("parent_chat_id") or (run.parent_chat_id if run else "") or ""),
         "provider": str(raw.get("provider") or ""),

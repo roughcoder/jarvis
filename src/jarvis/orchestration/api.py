@@ -2265,6 +2265,9 @@ def _command_from_body(body: dict[str, Any], *, start: bool) -> tuple[WorkComman
         command.source = str(body["source"])
     if body.get("repo"):
         command.filters["repo"] = str(body["repo"])
+    project_id = _work_project_id(body)
+    if project_id:
+        command.filters["project_id"] = project_id
     if body.get("worker_id"):
         command.target_worker_id = str(body["worker_id"])
     if body.get("engine"):
@@ -2302,6 +2305,7 @@ def _started_work_packet(store: OrchestrationStore, result: StartedWork) -> dict
             "session_id": session.session_id,
             "run_id": result.envelope.run_id,
             "parent_chat_id": run.parent_chat_id if run else "",
+            "project_id": result.envelope.project_id,
             "title": result.item.title,
             "provider": session.provider,
             "engine": session.engine,
@@ -2391,6 +2395,7 @@ def _fallback_session_row(store: OrchestrationStore, ref: SessionRef, raw: dict[
                     "session_id": link.session_id,
                     "run_id": run.run_id,
                     "parent_chat_id": run.parent_chat_id or "",
+                    "project_id": link.project_id or run.project_id,
                     "title": run.objective,
                     "provider": str(session_raw.get("provider") or link.provider),
                     "engine": str(session_raw.get("engine") or link.engine),
@@ -2413,6 +2418,7 @@ def _fallback_session_row(store: OrchestrationStore, ref: SessionRef, raw: dict[
         "session_id": session_id,
         "run_id": str(session_raw.get("run_id") or ""),
         "parent_chat_id": str(session_raw.get("parent_chat_id") or ""),
+        "project_id": str(session_raw.get("project_id") or ""),
         "title": str(session_raw.get("title") or ""),
         "provider": str(session_raw.get("provider") or ""),
         "engine": str(session_raw.get("engine") or session_raw.get("provider") or ""),
@@ -3764,6 +3770,7 @@ def _worker_session_row(raw: dict[str, Any], worker_id: str) -> dict[str, Any]:
         "session_id": session_id,
         "run_id": str(raw.get("run_id") or ""),
         "parent_chat_id": str(raw.get("parent_chat_id") or ""),
+        "project_id": str(raw.get("project_id") or ""),
         "title": str(raw.get("title") or ""),
         "provider": str(raw.get("provider") or ""),
         "engine": str(raw.get("engine") or raw.get("provider") or ""),

@@ -101,6 +101,8 @@ class OrchestrationStore:
         work_items: list[WorkItem] | None = None,
         parent_run_id: str | None = None,
         parent_chat_id: str | None = None,
+        project_id: str = "",
+        engine: str = "",
     ) -> OrchestrationRun:
         items = work_items or []
         parent_chat_id = parent_chat_id or parent_run_id
@@ -114,6 +116,9 @@ class OrchestrationStore:
                 objective=objective,
                 parent_chat_id=parent_chat_id,
                 parent_run_id=parent_run_id,
+                child_run_ids=[],
+                project_id=project_id,
+                engine=engine,
                 work_items=[
                     WorkItemLink(item=item, role="primary" if i == 0 else "related")
                     for i, item in enumerate(items)
@@ -496,6 +501,7 @@ class OrchestrationStore:
             existing.status = session.status
             existing.provider = session.provider
             existing.engine = session.engine
+            existing.project_id = session.project_id or existing.project_id
             existing.branch = session.branch
             existing.cwd = session.cwd
             existing.last_event_id = session.last_event_id
@@ -504,6 +510,10 @@ class OrchestrationStore:
             run.phase = "running"
             run.status = "active"
             run.terminal_reason = ""
+        if session.project_id and not run.project_id:
+            run.project_id = session.project_id
+        if session.engine and not run.engine:
+            run.engine = session.engine
         self.save(run)
         self.append_event(run_id, "session_started", f"Worker session {session.session_id} started", session.to_dict())
         return run
@@ -523,6 +533,7 @@ class OrchestrationStore:
                 existing.status = session.status
                 existing.provider = session.provider
                 existing.engine = session.engine
+                existing.project_id = session.project_id or existing.project_id
                 existing.branch = session.branch
                 existing.cwd = session.cwd
                 existing.last_event_id = session.last_event_id
@@ -530,6 +541,10 @@ class OrchestrationStore:
             run.phase = "running"
             run.status = "active"
             run.terminal_reason = ""
+            if session.project_id and not run.project_id:
+                run.project_id = session.project_id
+            if session.engine and not run.engine:
+                run.engine = session.engine
             self.save(run)
             self.append_event(run_id, "session_reserved", f"Reserved worker session {session.session_id}", session.to_dict())
             return run
@@ -543,7 +558,7 @@ class OrchestrationStore:
             if session is None:
                 raise KeyError(session_id)
             changed: dict[str, str | list[str]] = {}
-            for field in ("status", "ended_reason", "provider", "engine", "branch", "cwd", "last_event_id", "allowed_actions"):
+            for field in ("status", "ended_reason", "provider", "engine", "project_id", "branch", "cwd", "last_event_id", "allowed_actions"):
                 value = updates.get(field)
                 if value is None:
                     continue

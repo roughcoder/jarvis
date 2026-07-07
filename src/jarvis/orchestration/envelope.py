@@ -27,6 +27,7 @@ def build_execution_envelope(
 ) -> ExecutionEnvelope:
     primary = items[0] if items else WorkItem(source="direct", id=run_id, title=command.filters.get("text", "Direct request"))
     repo = primary.repo or str(command.filters.get("repo", ""))
+    project_id = str(command.filters.get("project_id") or "")
     title = primary.title or command.filters.get("text", "Jarvis work")
     proof = _task_proof(primary, command)
     prompt = _prompt(command, items, landing_mode, proof)
@@ -40,6 +41,7 @@ def build_execution_envelope(
         worker_id=worker_id or command.target_worker_id or "local-worker",
         engine=engine,
         engine_strategy=engine_strategy,
+        project_id=project_id,
         branch_name=branch,
         session_id=session_id,
         session_name=session_name,

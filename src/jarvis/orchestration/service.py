@@ -140,7 +140,12 @@ class OrchestrationService:
             dispatch_actions = [*dispatch_actions, WORKER_SESSION_STOP]
         self._require(dispatch_actions)
         if not item.repo:
-            run = store.create_run(str(item.title), work_items=[item], parent_chat_id=parent_chat_id)
+            run = store.create_run(
+                str(item.title),
+                work_items=[item],
+                parent_chat_id=parent_chat_id,
+                project_id=str(command.filters.get("project_id") or ""),
+            )
             store.set_phase(run.run_id, "needs_human", "Work item has no repo/default repo; cannot start a coding worker")
             raise MissingWorkRepoError(item, run.run_id)
         registry = WorkerRegistry(self.cfg.worker, profiles_path=self.cfg.orchestration.workers_path)
@@ -421,6 +426,7 @@ class OrchestrationService:
             worker_id=previous.worker_id,
             engine=previous.engine,
             engine_strategy="single",
+            project_id=run.project_id or previous.project_id,
             branch_name=previous.branch,
             cwd=previous.cwd,
             session_id=previous.session_id,
@@ -436,6 +442,7 @@ class OrchestrationService:
             status=SESSION_RUNNING,
             provider=previous.provider,
             engine=previous.engine,
+            project_id=run.project_id or previous.project_id,
             branch=previous.branch,
             cwd=previous.cwd,
             last_event_id=previous.last_event_id,
