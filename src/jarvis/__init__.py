@@ -1,3 +1,3 @@
 """Jarvis — all-local voice assistant (Phase 1)."""
 
-__version__ = "0.22.0"
+__version__ = "0.22.1"
