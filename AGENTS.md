@@ -61,6 +61,7 @@ src/jarvis/
   browser/             self-contained Chrome-over-CDP host (nodriver, no Playwright); embedded in the worker, extractable; two contexts (device | jarvis)
   remote/              Claude Managed Agents client (cloud coding lane, dormant)
   connectors/          non-voice channels: whatsapp/ (wraps wacli) + text.py (terminal console, the headless harness) — bridge to the brain over the protocol
+  orchestration/       work-dispatch + Cockpit API tier (jarvis api): runs/sessions/projects store, executor, supervisor — talks to the worker over HTTP; imports brain modules in-process (one-directional: brain never imports it)
 ```
 
 Keep the turn loop, audio I/O, memory/gateway clients, the worker, and the remote

@@ -442,20 +442,6 @@ wheels = [
 ]
 
 [[package]]
-name = "honcho-ai"
-version = "2.1.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "httpx", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or sys_platform == 'darwin'" },
-    { name = "pydantic", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or sys_platform == 'darwin'" },
-    { name = "typing-extensions", marker = "(python_full_version < '3.12' and platform_machine == 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.12' and sys_platform == 'darwin')" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/eb/15/31d391c007047cd40cd05943312d807b16f7b977c168fce1f3efdc8dff27/honcho_ai-2.1.2.tar.gz", hash = "sha256:f2c01463931e1a16cc4396790e1b0387d596fb5eb8d6dc830d6ab742f8701224", size = 48699, upload-time = "2026-05-23T21:55:29.205Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/cd/c3/e8aa785fd37092e856be70dbe53b4f289ba6500392cdc727ebb6f1cdbea4/honcho_ai-2.1.2-py3-none-any.whl", hash = "sha256:a22220f01a63f6a3c1d4625aaef0a142577b83981c42dcb61177631863fbaa4f", size = 58910, upload-time = "2026-05-23T21:55:30.3Z" },
-]
-
-[[package]]
 name = "httpcore"
 version = "1.0.9"
 source = { registry = "https://pypi.org/simple" }
@@ -558,9 +544,6 @@ mcp = [
     { name = "mcp", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or sys_platform == 'darwin'" },
     { name = "pyjwt", extra = ["crypto"], marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or sys_platform == 'darwin'" },
 ]
-memory = [
-    { name = "honcho-ai", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or sys_platform == 'darwin'" },
-]
 stt = [
     { name = "faster-whisper", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or sys_platform == 'darwin'" },
     { name = "numpy", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or sys_platform == 'darwin'" },
@@ -600,7 +583,6 @@ requires-dist = [
     { name = "aiohttp", marker = "extra == 'worker'", specifier = ">=3.9" },
     { name = "claude-agent-sdk", marker = "extra == 'worker-claude'", specifier = ">=0.2.110,<0.3" },
     { name = "faster-whisper", marker = "extra == 'stt'", specifier = ">=1.0" },
-    { name = "honcho-ai", marker = "extra == 'memory'", specifier = ">=1.5" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.2" },
     { name = "nodriver", marker = "extra == 'browser'", specifier = ">=0.37" },

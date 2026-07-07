@@ -34,7 +34,7 @@ def _ctx(*caps: str) -> RequestContext:
 
 
 def test_require_passes_when_granted() -> None:
-    require(_ctx("web.search"), "web.search")  # no raise
+    assert require(_ctx("web.search"), "web.search") is None  # grants by not raising
 
 
 def test_require_denies_when_not_granted() -> None:

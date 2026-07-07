@@ -546,14 +546,8 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
     """List the worker daemon's recent jobs (deep-work jobs + their results)."""
     import datetime
 
-    import httpx
-
     cfg = load_config()
-    base = cfg.worker.base_url
-    headers = {}
-    tok = cfg.worker.token.get_secret_value()
-    if tok:
-        headers["Authorization"] = f"Bearer {tok}"
+    httpx, base, headers, timeout = _worker_http(cfg)
 
     if args.prune:  # clean up all finished jobs (worktrees + branches)
         try:
@@ -561,7 +555,7 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
                 f"{base}/run",
                 json={"action": "cleanup", "args": {"job": ""}},
                 headers=headers,
-                timeout=30,
+                timeout=timeout,
             )
             cleaned = r.json().get("cleaned", [])
         except Exception as exc:  # noqa: BLE001
@@ -576,7 +570,7 @@ def _cmd_jobs(args: argparse.Namespace) -> int:
         return 0
 
     try:
-        r = httpx.get(f"{base}/jobs", headers=headers, timeout=5)
+        r = httpx.get(f"{base}/jobs", headers=headers, timeout=timeout)
         r.raise_for_status()
         jobs = r.json().get("jobs", [])
     except Exception as exc:  # noqa: BLE001
