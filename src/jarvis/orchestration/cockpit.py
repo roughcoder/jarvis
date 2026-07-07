@@ -130,6 +130,7 @@ PUBLIC_EVENT_DATA_KEYS = {
     "detail",
     "exit_code",
     "id",
+    "item",
     "label",
     "message_id",
     "options",

@@ -206,6 +206,24 @@ def test_system_prompt_tells_memory_caps_to_honor_retractions() -> None:
     assert "authoritative over any derived restatement" in prompt
 
 
+def test_system_prompt_accepts_project_thread_capability_contract() -> None:
+    sess = BrainSession(
+        load_config(),
+        RequestContext("dev", "neil", "personal", frozenset(), channel="cockpit"),
+        gateway=None,
+        tts=None,
+        memory=None,
+        tracer=None,
+        registry=None,
+        extra_system_prompt="Project-thread capability contract: no repo access here.",
+    )
+
+    prompt = sess._system_prompt("")
+
+    assert "Project-thread capability contract" in prompt
+    assert "no repo access here" in prompt
+
+
 def test_ambient_prompt_includes_active_project_cached_representation(tmp_path) -> None:
     active = ActiveProject(id="jarvis", name="Jarvis", peer_id="project:jarvis")
     memory = _CachedMemory()

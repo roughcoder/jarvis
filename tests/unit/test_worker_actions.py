@@ -251,7 +251,7 @@ def test_worker_diagnostics_reports_engines_packages_browser_and_uses_ttl(monkey
     )
 
     assert first == second
-    assert calls["run"] == 2  # version + auth status only once
+    assert calls["run"] == 4  # version + auth status + git identity only once
     assert first["engines"][0]["installed"] is True
     assert first["engines"][0]["authenticated"] is True
     assert {"name": "uv", "available": True} in first["package_managers"]

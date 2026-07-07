@@ -2588,6 +2588,7 @@ def test_cockpit_thread_turn_streams_reply_and_writes_lane1_attribution(tmp_path
         assert response.headers["Content-Type"].startswith("text/event-stream")
         assert reply_events[0]["payload"]["reply"] == "The route should stream over SSE."
         assert done_events
+        assert not any(event["_event"] in {"tool.call", "tool.result"} for event in events)
         assert detail.status_code == 200
         messages = detail.json()["thread"]["messages"]
         assert messages == [
@@ -2620,6 +2621,219 @@ def test_cockpit_thread_turn_streams_reply_and_writes_lane1_attribution(tmp_path
     system_prompt = gateway.messages[0][0]["content"]
     assert "Project registry entry" in system_prompt
     assert "Live project representation:\nlive shared context" in system_prompt
+    assert "Project-thread capability contract" in system_prompt
+
+
+def test_cockpit_thread_turn_streams_tool_events_and_persists_detail_messages(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        identity="neil",
+        caps="memory.curate",
+        memory_backend="v3",
+    )
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    gateway = FakeGateway(
+        [
+            _Msg(
+                tool_calls=[
+                    _Call(
+                        "call_1",
+                        "add_finding",
+                        json.dumps(
+                            {
+                                "project": "Neil Shared",
+                                "content": "Thread turns should expose tool calls.",
+                                "token": "sk-abcdefghijklmnopqrstuvwxyz",
+                            }
+                        ),
+                    )
+                ]
+            ),
+            _Msg(content="Recorded that finding."),
+        ]
+    )
+    connector = CockpitConnector(cfg, memory=memory, gateway=gateway, tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={})
+        thread = opened.json()["thread"]
+        response = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "Record the finding about thread tool events."},
+        )
+        events = _sse_events(response.text)
+        tool_call = next(event for event in events if event["_event"] == "tool.call")
+        tool_result = next(event for event in events if event["_event"] == "tool.result")
+        done = next(event for event in events if event["_event"] == "thread.turn.done")
+
+        assert response.status_code == 200
+        assert tool_call["payload"]["type"] == "tool.call"
+        assert tool_call["payload"]["session_ref"] == thread["session_id"]
+        assert tool_call["payload"]["run_id"] == ""
+        assert tool_call["payload"]["data"]["item"]["type"] == "tool_use"
+        assert tool_call["payload"]["data"]["item"]["name"] == "add_finding"
+        assert tool_call["payload"]["data"]["item"]["input"] == {
+            "project": "Neil Shared",
+            "content": "Thread turns should expose tool calls.",
+        }
+        assert "arguments" not in tool_call["payload"]["data"]
+        assert "token" not in json.dumps(tool_call["payload"]["data"])
+        assert tool_result["payload"]["type"] == "tool.result"
+        assert tool_result["payload"]["data"]["item"]["type"] == "tool_result"
+        assert tool_result["payload"]["data"]["item"]["name"] == "add_finding"
+        assert "queued finding" in tool_result["payload"]["data"]["item"]["content"]
+        detail_events = [
+            message["event"]
+            for message in done["payload"]["thread"]["messages"]
+            if message.get("role") == "event"
+        ]
+        assert [event["type"] for event in detail_events] == ["tool.call", "tool.result"]
+        assert detail_events[0]["data"]["item"]["name"] == "add_finding"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    outbox_text = Path(cfg.memory.curation_outbox_path).read_text()
+    assert "Thread turns should expose tool calls." in outbox_text
+    assert [message["peer_id"] for message in memory.messages] == ["neil", "jarvis"]
+
+
+def test_cockpit_thread_turn_declines_unavailable_code_review_instead_of_faking_progress(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    gateway = FakeGateway(["I'll start a code review of the runtime repo now. It's underway."])
+    connector = CockpitConnector(cfg, memory=memory, gateway=gateway, tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={})
+        thread = opened.json()["thread"]
+        response = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "Please do a code review of the runtime repo."},
+        )
+        events = _sse_events(response.text)
+        reply = next(event for event in events if event["_event"] == "thread.reply")["payload"]["reply"]
+
+        assert response.status_code == 200
+        assert "can't do that from this project conversation" in reply
+        assert "/v1/work/start" in reply
+        assert "underway" not in reply.lower()
+        assert not any(event["_event"] in {"tool.call", "tool.result"} for event in events)
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    assert memory.messages[1]["content"].startswith("I can't do that from this project conversation")
+
+
+@pytest.mark.parametrize(
+    ("user_text", "model_reply"),
+    [
+        (
+            "Should I run the tests before merging?",
+            "Yes. Run the touched unit tests and ruff before merging.",
+        ),
+        (
+            "how do I run the tests locally?",
+            "Use uv run pytest for tests and uv run ruff check src/ for lint.",
+        ),
+        (
+            "Can you review the code style conventions we agreed on?",
+            "The convention is to keep diffs tight, use existing patterns, and verify with focused tests.",
+        ),
+    ],
+)
+def test_cockpit_thread_turn_preserves_advisory_replies_without_tool_calls(
+    tmp_path,
+    monkeypatch,
+    user_text: str,
+    model_reply: str,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    gateway = FakeGateway([model_reply])
+    connector = CockpitConnector(cfg, memory=memory, gateway=gateway, tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={})
+        thread = opened.json()["thread"]
+        response = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": user_text},
+        )
+        events = _sse_events(response.text)
+        reply = next(event for event in events if event["_event"] == "thread.reply")["payload"]["reply"]
+
+        assert response.status_code == 200
+        assert reply == model_reply
+        assert not any(event["_event"] in {"tool.call", "tool.result"} for event in events)
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    assert memory.messages[1]["content"] == model_reply
+
+
+def test_cockpit_thread_turn_guards_fake_review_even_when_memory_tool_ran(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        identity="neil",
+        caps="memory.curate",
+        memory_backend="v3",
+    )
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    gateway = FakeGateway(
+        [
+            _Msg(
+                tool_calls=[
+                    _Call(
+                        "call_1",
+                        "add_finding",
+                        json.dumps({"project": "Neil Shared", "content": "Record the review request."}),
+                    )
+                ]
+            ),
+            _Msg(content="I've started a code review of the runtime repo. It's underway."),
+        ]
+    )
+    connector = CockpitConnector(cfg, memory=memory, gateway=gateway, tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={})
+        thread = opened.json()["thread"]
+        response = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "Please review the runtime repo and remember that I asked."},
+        )
+        events = _sse_events(response.text)
+        reply = next(event for event in events if event["_event"] == "thread.reply")["payload"]["reply"]
+
+        assert response.status_code == 200
+        assert "can't do that from this project conversation" in reply
+        assert "underway" not in reply.lower()
+        assert [event["_event"] for event in events if event["_event"] in {"tool.call", "tool.result"}] == [
+            "tool.call",
+            "tool.result",
+        ]
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    assert memory.messages[1]["content"].startswith("I can't do that from this project conversation")
 
 
 def test_cockpit_thread_turn_labels_unescalated_chat_as_planning_only(tmp_path, monkeypatch) -> None:  # noqa: ANN001

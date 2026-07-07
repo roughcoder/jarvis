@@ -901,8 +901,67 @@ and returns `text/event-stream` frames:
 
 ```text
 event: thread.turn.started
+event: tool.call
+event: tool.result
 event: thread.reply
 event: thread.turn.done
+```
+
+`tool.call` and `tool.result` frames are emitted only when the brain actually
+called a tool during the turn. A turn with no tool calls emits none. These
+frames are best-effort: failure to write an action frame must not fail the turn.
+Their `payload` uses the same projected event shape as
+`GET /v1/sessions/{session_ref}/events`:
+
+```json
+{
+  "event_id": "ev_...",
+  "sequence": 1,
+  "session_ref": "project:jarvis:orchestrator:thread_...",
+  "run_id": "",
+  "type": "tool.call",
+  "occurred_at": "2026-07-07T10:00:00+00:00",
+  "turn_id": "turn_...",
+  "message_id": "call_...",
+  "data": {
+    "id": "call_...",
+    "item": {
+      "id": "call_...",
+      "type": "tool_use",
+      "name": "add_finding",
+      "input": {
+        "project": "Jarvis",
+        "content": "Thread turns should expose tool calls."
+      }
+    }
+  }
+}
+```
+
+A matching result frame keeps the same projected wrapper and uses a
+provider-shaped result item:
+
+```json
+{
+  "event_id": "ev_...",
+  "sequence": 2,
+  "session_ref": "project:jarvis:orchestrator:thread_...",
+  "run_id": "",
+  "type": "tool.result",
+  "occurred_at": "2026-07-07T10:00:01+00:00",
+  "turn_id": "turn_...",
+  "message_id": "call_...",
+  "data": {
+    "id": "call_...",
+    "item": {
+      "id": "call_...",
+      "type": "tool_result",
+      "tool_use_id": "call_...",
+      "name": "add_finding",
+      "content": "Noted - queued finding for Jarvis."
+    }
+  }
+}
 ```
 
 The `thread.reply` and `thread.turn.done` payload shape is:
@@ -1002,6 +1061,46 @@ reply as `jarvis` to the named session. Shared project memory updates remain
 Lane 2 only: the orchestrator must call the existing curation tools such as
 `add_finding` or `record_decision`; it does not silently auto-curate project
 memory from every reply.
+
+When a tool ran, the returned thread projection's `messages` array can include
+event messages alongside user and assistant messages:
+
+```json
+{
+  "role": "event",
+  "peer_id": "jarvis",
+  "content": "tool.call add_finding",
+  "observed_at": "2026-07-07T10:00:00+00:00",
+  "event": {
+    "event_id": "ev_...",
+    "sequence": 1,
+    "session_ref": "project:jarvis:orchestrator:thread_...",
+    "run_id": "",
+    "type": "tool.call",
+    "occurred_at": "2026-07-07T10:00:00+00:00",
+    "turn_id": "turn_...",
+    "message_id": "call_...",
+    "data": {
+      "id": "call_...",
+      "item": {
+        "id": "call_...",
+        "type": "tool_use",
+        "name": "add_finding",
+        "input": {
+          "project": "Jarvis",
+          "content": "Thread turns should expose tool calls."
+        }
+      }
+    }
+  }
+}
+```
+
+Project-thread conversations do not imply repo/worktree capabilities. If the
+brain is asked to review code, inspect a repository, run tests, or perform other
+workspace work and no real tool is available and called, it must say that the
+conversation cannot do that work and offer the `/v1/work/start` work-session
+lane instead of reporting fake progress or results.
 
 Current limitation: background job completion report-backs are not yet appended
 to the thread automatically. They can still run through the existing tool layer;
@@ -2185,6 +2284,19 @@ Additive Batch 3 cockpit projection fields. `schema_version` stays 1.
   selected run `engine`.
 - Older or unlinked runs/sessions report `project_id: null`, preserving the
   cockpit legacy fallback path.
+
+### 2026-07-07 - Project-thread tool events and honesty guard (compatible)
+
+- `POST /v1/projects/{id}/threads/{tid}/turns` now emits `tool.call` and
+  `tool.result` SSE frames when the brain actually calls project-thread tools.
+  Payloads use the same projected event shape as work-session events so cockpit
+  clients can reuse existing action renderers.
+- Thread turn responses can include event messages with an `event` payload in
+  the returned thread projection, allowing tool calls such as `add_finding` and
+  `record_decision` to appear inline with the conversation.
+- Project-thread prompts and the server-side guard now reject un-tooled
+  repo/workspace actions such as code review or test execution and point users
+  to `/v1/work/start` instead of narrating fake progress.
 
 ### 2026-07-07 - Worker repo access and provisioning visibility (compatible)
 
