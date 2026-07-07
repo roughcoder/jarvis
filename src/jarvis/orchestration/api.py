@@ -4,13 +4,14 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import socket
 import hmac
 import json
 import logging
 import threading
 from functools import partial
 from pathlib import Path
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 import httpx
@@ -134,6 +135,11 @@ class CockpitAppContext:
     idempotency_lock_refs: dict[str, int]
     source_factory: Callable[[str, Any], WorkSource]
     oauth_validator: OAuthTokenValidator | None = None
+    # Live project-thread turn state, keyed (project_id, thread_id). Values are
+    # (status, ended_reason). Process-local by design: thread turns only run
+    # through this API, and a restart safely reverts rows to the durable
+    # created/completed derivation.
+    thread_turn_states: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
 
     async def require_auth(self, request: web.Request) -> None:
         orchestration = self.cfg.orchestration
@@ -503,6 +509,7 @@ def make_app(
         web.post("/v1/projects/{project_id}/files", writes.project_file_upload),
         web.delete("/v1/projects/{project_id}/files/{doc_id}", writes.project_file_retract),
         web.post("/v1/projects/{project_id}/threads", writes.project_thread_open),
+        web.patch("/v1/projects/{project_id}/threads/{thread_id}", writes.project_thread_rename),
         web.post("/v1/projects/{project_id}/threads/{thread_id}/turns", writes.project_thread_turn),
         web.post("/v1/projects/{project_id}/threads/{thread_id}/archive", writes.project_thread_archive),
         web.post("/v1/projects/{project_id}/threads/{thread_id}/unarchive", writes.project_thread_unarchive),
@@ -534,8 +541,8 @@ class CockpitReadHandlers:
 
     async def catalog(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
-        defaults, engines = await asyncio.to_thread(_catalog_context, self.ctx.cfg)
-        return web.json_response(cockpit_catalog(start_defaults=defaults, engines=engines or None))
+        defaults, engines, engine_supports = await asyncio.to_thread(_catalog_context, self.ctx.cfg)
+        return web.json_response(cockpit_catalog(start_defaults=defaults, engines=engines or None, engine_supports=engine_supports))
 
     async def capabilities(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -801,7 +808,7 @@ class CockpitReadHandlers:
                 "api_version": API_VERSION,
                 "schema_version": SCHEMA_VERSION,
                 "project_id": project.id,
-                "threads": [_thread_projection(thread) for thread in threads],
+                "threads": [_thread_projection(thread, self.ctx) for thread in threads],
             }
         )
 
@@ -818,7 +825,7 @@ class CockpitReadHandlers:
                 "api_version": API_VERSION,
                 "schema_version": SCHEMA_VERSION,
                 "project_id": project.id,
-                "thread": _thread_detail_projection(thread),
+                "thread": _thread_detail_projection(thread, self.ctx),
             }
         )
 
@@ -1344,7 +1351,7 @@ class CockpitWriteHandlers:
                 f"Opened project thread {thread.thread_id}",
                 {"project_id": project.id, "thread_id": thread.thread_id},
             )
-            return _project_write_body({"project_id": project.id, "thread": _thread_projection(thread)})
+            return _project_write_body({"project_id": project.id, "thread": _thread_projection(thread, self.ctx)})
 
         response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
         return web.json_response(response_body)
@@ -1352,7 +1359,7 @@ class CockpitWriteHandlers:
     async def project_thread_turn(self, request: web.Request) -> web.StreamResponse:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
-        _reject_attachments(body)
+        attachments = _validate_attachments(body, self.ctx.cfg.orchestration)
         text = str(body.get("text") or body.get("message") or body.get("prompt") or "").strip()
         if not text:
             raise CockpitError("validation_failed", "turn text is required", recoverable=True, status=400)
@@ -1385,9 +1392,12 @@ class CockpitWriteHandlers:
                 {"project_id": project.id, "thread_id": thread.thread_id},
             ),
         )
+        state_key = (project.id, thread.thread_id)
+        self.ctx.thread_turn_states[state_key] = ("running", "")
         try:
-            reply, updated = await connector.turn(project, thread, requester, text)
+            reply, updated = await connector.turn(project, thread, requester, text, attachments=attachments or None)
         except (UnsupportedMemoryOperation, TimeoutError, OSError, RuntimeError) as exc:
+            self.ctx.thread_turn_states[state_key] = ("failed", "engine_error")
             await _write_sse(
                 response,
                 "thread.turn.error",
@@ -1409,6 +1419,7 @@ class CockpitWriteHandlers:
             await response.write_eof()
             return response
         except Exception as exc:  # noqa: BLE001 - preserve SSE contract after prepare.
+            self.ctx.thread_turn_states[state_key] = ("failed", "engine_error")
             await _write_sse(
                 response,
                 "thread.turn.error",
@@ -1429,15 +1440,52 @@ class CockpitWriteHandlers:
             )
             await response.write_eof()
             return response
+        self.ctx.thread_turn_states.pop(state_key, None)
         payload = {
             "project_id": project.id,
-            "thread": _thread_projection(updated),
+            "thread": _thread_projection(updated, self.ctx),
             "reply": reply,
         }
         await _write_sse(response, "thread.reply", cursor, _sse_envelope(cursor, "thread.reply", payload))
         await _write_sse(response, "thread.turn.done", cursor, _sse_envelope(cursor, "thread.turn.done", payload))
         await response.write_eof()
         return response
+
+    async def project_thread_rename(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        body = await _json_body(request)
+        title = " ".join(str(body.get("title") or "").split())
+        if not title:
+            raise CockpitError("validation_failed", "title is required", recoverable=True, status=400)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        project = await _project_for_member_route(self.ctx, request, requester)
+        connector = _cockpit_connector(self.ctx)
+        thread_id = request.match_info["thread_id"]
+        scope = f"project_thread_rename/{project.id}/{thread_id}"
+        fingerprint_body = {**body, "project_id": project.id, "thread_id": thread_id, "title": title}
+
+        async def produce() -> dict[str, Any]:
+            thread = await asyncio.to_thread(connector.rename_thread, project, thread_id, title)
+            if thread is None:
+                raise CockpitError("not_found", "thread not found", status=404)
+            await _record_project_activity(
+                self.ctx,
+                project.id,
+                "thread.renamed",
+                requester,
+                f"Renamed project thread {thread_id}",
+                {"project_id": project.id, "thread_id": thread_id, "title": thread.title},
+            )
+            return {
+                "ok": True,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "project_id": project.id,
+                "thread": _thread_projection(thread, self.ctx),
+            }
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
+        return web.json_response(response_body)
 
     async def project_thread_archive(self, request: web.Request) -> web.Response:
         return await self._project_thread_archive(request, archived=True)
@@ -1486,7 +1534,7 @@ class CockpitWriteHandlers:
                 "api_version": API_VERSION,
                 "schema_version": SCHEMA_VERSION,
                 "project_id": project.id,
-                "thread": _thread_projection(thread),
+                "thread": _thread_projection(thread, self.ctx),
             }
 
         response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
@@ -2359,22 +2407,29 @@ def _cockpit_snapshot(ctx: CockpitAppContext, mode: str) -> dict[str, Any]:
     )
 
 
-def _catalog_context(cfg: Config) -> tuple[dict[str, Any], list[str]]:
+def _catalog_context(cfg: Config) -> tuple[dict[str, Any], list[str], dict[str, dict[str, bool]]]:
     registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path)
     profiles = registry.profiles(probe=False)
     worker = profiles[0] if profiles else None
     engines: list[str] = []
+    # Last-known provider capabilities, OR-ed across workers: engine supports
+    # are provider-side, so any worker reporting a flag speaks for the engine.
+    engine_supports: dict[str, dict[str, bool]] = {}
     for profile in profiles:
         for engine in profile.supported_engines:
             if engine and engine not in engines:
                 engines.append(engine)
+        for engine, supports in profile.engine_supports.items():
+            merged = engine_supports.setdefault(engine, {})
+            for key, value in supports.items():
+                merged[key] = bool(merged.get(key)) or bool(value)
     defaults = {
         "worker_id": worker.worker_id if worker else "",
         "engine": (worker.default_engine or worker.agent) if worker else "",
         "repo": (worker.default_repo if worker else "") or cfg.orchestration.default_repo,
         "landing_mode": cfg.orchestration.landing_mode,
     }
-    return defaults, engines
+    return defaults, engines, engine_supports
 
 
 def _route_templates(app: web.Application) -> list[dict[str, str]]:
@@ -2833,12 +2888,24 @@ def _cockpit_connector(ctx: CockpitAppContext) -> CockpitConnector:
     return CockpitConnector(ctx.cfg)
 
 
-def _thread_projection(thread: CockpitThread) -> dict[str, Any]:
+def _thread_projection(thread: CockpitThread, ctx: CockpitAppContext | None = None) -> dict[str, Any]:
+    status, ended_reason = _thread_status(thread, ctx)
     return {
         "thread_id": thread.thread_id,
         "project_id": thread.project_id,
         "session_id": thread.session_id,
         "title": thread.title,
+        # Project threads are brain conversations: the engine is Jarvis itself,
+        # the model is the LLM gateway route its turns use, and they execute on
+        # the brain host — worker_id stays null until a thread is linked to a
+        # worker session (orchestration chat tree). thread.session_id is the
+        # memory session id — it never matches a worker session.
+        "engine": "jarvis",
+        "model": _thread_model(ctx),
+        "worker_id": None,
+        "host": _BRAIN_HOSTNAME,
+        "status": status,
+        "ended_reason": ended_reason or None,
         "created_at": thread.created_at,
         "updated_at": thread.updated_at,
         "created_by": thread.created_by,
@@ -2848,8 +2915,27 @@ def _thread_projection(thread: CockpitThread) -> dict[str, Any]:
     }
 
 
-def _thread_detail_projection(thread: CockpitThread) -> dict[str, Any]:
-    row = _thread_projection(thread)
+_BRAIN_HOSTNAME = socket.gethostname()
+
+
+def _thread_model(ctx: CockpitAppContext | None) -> str:
+    if ctx is None:
+        return ""
+    gateway = ctx.cfg.gateway
+    return str(gateway.voice_model or gateway.fast_model)
+
+
+def _thread_status(thread: CockpitThread, ctx: CockpitAppContext | None) -> tuple[str, str]:
+    live = ctx.thread_turn_states.get((thread.project_id, thread.thread_id)) if ctx is not None else None
+    if live is not None:
+        return live
+    if thread.last_turn_at or thread.messages:
+        return "completed", "completed"
+    return "created", ""
+
+
+def _thread_detail_projection(thread: CockpitThread, ctx: CockpitAppContext | None = None) -> dict[str, Any]:
+    row = _thread_projection(thread, ctx)
     row["messages"] = [
         {
             "role": message.get("role", ""),

@@ -5695,3 +5695,135 @@ def test_cockpit_session_summary_derives_ended_reason_from_status(tmp_path, monk
     assert summary(row("interrupted"))["ended_reason"] is None
     assert summary(row("interrupted", "worker_lost"))["ended_reason"] == "worker_lost"
     assert summary(row("interrupted", "interrupted_by_user"))["ended_reason"] == "interrupted_by_user"
+
+
+def test_cockpit_thread_turn_attachments_reach_gateway_without_persisting_payload(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    gateway = FakeGateway(["I can see the screenshot."])
+    connector = CockpitConnector(cfg, memory=memory, gateway=gateway, tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+    attachment = {"kind": "image", "mime_type": "image/png", "name": "bug.png", "data_url": "data:image/png;base64,cG5n"}
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Bug hunt"})
+        thread = opened.json()["thread"]
+        response = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "Here is the bug", "attachments": [attachment]},
+        )
+        detail = await client.get(f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}")
+
+        assert response.status_code == 200
+        assert [event["_event"] for event in _sse_events(response.text)][-1] == "thread.turn.done"
+        user_message = gateway.messages[-1][-1]
+        assert user_message["role"] == "user"
+        assert user_message["content"][0] == {"type": "text", "text": "Here is the bug"}
+        assert user_message["content"][1] == {"type": "image_url", "image_url": {"url": attachment["data_url"]}}
+        messages = detail.json()["thread"]["messages"]
+        assert messages[0]["content"] == "Here is the bug\n[image attached: bug.png (image/png)]"
+        assert "base64,cG5n" not in json.dumps(messages)
+
+        rejected = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "bad", "attachments": [{"kind": "image", "mime_type": "image/tiff", "data_url": "data:image/tiff;base64,cG5n"}]},
+        )
+        assert rejected.status_code == 400
+        assert rejected.json()["error"]["code"] == "validation_failed"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    assert memory.messages[0]["content"] == "Here is the bug\n[image attached: bug.png (image/png)]"
+
+
+def test_cockpit_thread_projection_carries_engine_model_status(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    gateway = FakeGateway(["Done thinking."])
+    connector = CockpitConnector(cfg, memory=memory, gateway=gateway, tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = (await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Enrichment"})).json()["thread"]
+
+        assert opened["engine"] == "jarvis"
+        assert opened["model"] == str(cfg.gateway.voice_model or cfg.gateway.fast_model)
+        assert opened["worker_id"] is None
+        assert opened["host"]
+        assert opened["status"] == "created"
+        assert opened["ended_reason"] is None
+
+        turn = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}/turns",
+            json={"text": "Think about it"},
+        )
+        done = [event for event in _sse_events(turn.text) if event["_event"] == "thread.turn.done"][0]
+        listed = (await client.get(f"{base}/v1/projects/neil-shared/threads")).json()["threads"]
+        detail = (await client.get(f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}")).json()["thread"]
+
+        assert done["payload"]["thread"]["status"] == "completed"
+        assert done["payload"]["thread"]["ended_reason"] == "completed"
+        assert listed[0]["engine"] == "jarvis"
+        assert listed[0]["status"] == "completed"
+        assert detail["status"] == "completed"
+        assert detail["ended_reason"] == "completed"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_thread_rename_persists_and_records_activity(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    connector = CockpitConnector(cfg, memory=memory, gateway=FakeGateway([]), tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = (await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Old name"})).json()["thread"]
+        renamed = await client.patch(
+            f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}",
+            json={"title": "  New   name  ", "idempotency_key": "rename_1"},
+        )
+        listed = (await client.get(f"{base}/v1/projects/neil-shared/threads")).json()["threads"]
+        detail = (await client.get(f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}")).json()["thread"]
+        activity = (await client.get(f"{base}/v1/projects/neil-shared/activity")).json()
+        missing_title = await client.patch(
+            f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}",
+            json={},
+        )
+        unknown = await client.patch(
+            f"{base}/v1/projects/neil-shared/threads/thread_missing",
+            json={"title": "X"},
+        )
+
+        assert renamed.status_code == 200
+        assert renamed.json()["thread"]["title"] == "New name"
+        assert listed[0]["title"] == "New name"
+        assert detail["title"] == "New name"
+        assert any(item.get("type") == "thread.renamed" for item in activity.get("activity", []))
+        assert missing_title.status_code == 400
+        assert unknown.status_code == 404
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_catalog_merges_worker_reported_engine_supports() -> None:
+    from jarvis.orchestration.cockpit import cockpit_catalog
+
+    catalog = cockpit_catalog(
+        engines=["claude", "codex"],
+        engine_supports={"claude": {"streaming": True, "attachments": True}},
+    )
+
+    rows = {row["engine"]: row for row in catalog["engines"]}
+    assert rows["claude"]["supports"]["attachments"] is True
+    assert rows["claude"]["supports"]["streaming"] is True
+    assert rows["codex"]["supports"]["attachments"] is False

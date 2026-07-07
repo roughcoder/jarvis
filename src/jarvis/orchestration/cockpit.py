@@ -242,7 +242,12 @@ CATALOG_ENGINE_LABELS = {
 }
 
 
-def cockpit_catalog(*, start_defaults: dict[str, Any] | None = None, engines: list[str] | None = None) -> dict[str, Any]:
+def cockpit_catalog(
+    *,
+    start_defaults: dict[str, Any] | None = None,
+    engines: list[str] | None = None,
+    engine_supports: dict[str, dict[str, bool]] | None = None,
+) -> dict[str, Any]:
     defaults = {
         "source": "manual",
         "worker_id": "",
@@ -257,6 +262,7 @@ def cockpit_catalog(*, start_defaults: dict[str, Any] | None = None, engines: li
         _engine_catalog(
             engine,
             *CATALOG_ENGINE_LABELS.get(engine, (engine.capitalize(), f"{engine.capitalize()} provider session")),
+            supports=(engine_supports or {}).get(engine),
         )
         for engine in engine_ids
     ]
@@ -1119,8 +1125,13 @@ def _session_supported_controls(session: dict[str, Any]) -> list[str]:
     return controls
 
 
-def _engine_catalog(engine: str, display_name: str, description: str) -> dict[str, Any]:
-    return {"engine": engine, "display_name": display_name, "description": description, "supports": _empty_engine_supports()}
+def _engine_catalog(engine: str, display_name: str, description: str, *, supports: dict[str, bool] | None = None) -> dict[str, Any]:
+    return {
+        "engine": engine,
+        "display_name": display_name,
+        "description": description,
+        "supports": {**_empty_engine_supports(), **{str(key): bool(value) for key, value in (supports or {}).items()}},
+    }
 
 
 def _engine_row(engine: str, *, default: bool, worker_status: str, supports: dict[str, bool]) -> dict[str, Any]:

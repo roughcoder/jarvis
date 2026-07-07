@@ -486,12 +486,27 @@ class BrainSession:
                 self._active_project_refresh_peers(),
             )
 
-    async def respond_text(self, user_text: str, trace, result: TurnResult) -> str:  # noqa: ANN001
+    async def respond_text(self, user_text: str, trace, result: TurnResult, *, attachments: list[dict] | None = None) -> str:  # noqa: ANN001
         """Text-only turn: the SAME think core as respond() but it returns the reply
         text and plays NO audio (a text client wants ReplyText only). Reuses the tool
         loop, so tools work in text mode — the harness can drive the browser, etc.
-        Call finalize() afterwards for end-detection + memory, exactly like respond()."""
+        Call finalize() afterwards for end-detection + memory, exactly like respond().
+
+        `attachments` ([{mime_type, data_url, name}]) become image content blocks on
+        THIS turn's user message only — history and memory keep the plain text, so
+        base64 never enters durable state. Images route to the vision model, the
+        same override the vision tools use."""
         model = self._initial_model(user_text)
+        user_message: dict[str, Any] = {"role": "user", "content": user_text}
+        if attachments:
+            user_message["content"] = [
+                {"type": "text", "text": user_text},
+                *[
+                    {"type": "image_url", "image_url": {"url": str(attachment.get("data_url") or "")}}
+                    for attachment in attachments
+                ],
+            ]
+            model = self._cfg.gateway.vision_model or model
         memory, project_memory, active_project, withdrawn_memory = self._read_ambient_memory()
         messages = [
             {
@@ -504,7 +519,7 @@ class BrainSession:
                 ),
             },
             *self._history,
-            {"role": "user", "content": user_text},
+            user_message,
         ]
         tool_schemas = await self._offer_tools(user_text)
         if tool_schemas:

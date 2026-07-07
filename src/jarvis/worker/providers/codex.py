@@ -59,6 +59,7 @@ class CodexProviderAdapter:
             "questions": True,
             "checkpoints": True,
             "rollback": False,
+            "attachments": True,
             "runtime": "codex app-server JSON-RPC over stdio",
             "attached": True,
             "lifecycle": "spawn app-server process; initialize; thread/start or thread/resume; turn/start; ingest notifications",
@@ -181,6 +182,17 @@ _PENDING_LOCK = threading.Lock()
 _PENDING_REQUESTS: dict[tuple[str, str], _PendingCodexRequest] = {}
 _PROCESS_LOCK = threading.Lock()
 _PROVIDER_PROCESSES: dict[str, subprocess.Popen[str]] = {}
+
+
+def _turn_input(turn: ProviderTurn) -> list[dict[str, Any]]:
+    """turn/start UserInput items: the prompt text plus one app-server image
+    item per attachment (data URLs go straight into the `url` variant)."""
+    items: list[dict[str, Any]] = [{"type": "text", "text": turn.prompt}]
+    for attachment in turn.attachments:
+        url = str(attachment.get("data_url") or "")
+        if url:
+            items.append({"type": "image", "url": url})
+    return items
 
 
 def _run_codex_turn(
@@ -316,7 +328,7 @@ def _run_codex_turn(
                     "threadId": thread_id,
                     "cwd": cwd,
                     "approvalPolicy": authority.codex_approval_policy,
-                    "input": [{"type": "text", "text": turn.prompt}],
+                    "input": _turn_input(turn),
                 },
             },
         )

@@ -224,7 +224,7 @@ Request:
 ```
 
 `attachments` is optional and only accepted when the session's provider
-reports the `attachments` capability (Claude today); other providers reject
+reports the `attachments` capability (Claude and Codex); other providers reject
 the turn with HTTP 400 before any state changes. The full base64 payloads are
 handed to the provider only — the recorded `turn.started` event carries
 `{kind, mime_type, name, bytes}` summaries, never payload data.

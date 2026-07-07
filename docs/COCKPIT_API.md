@@ -291,6 +291,7 @@ DELETE /v1/projects/{id}/files/{doc_id}
 GET /v1/projects/{id}/threads
 GET /v1/projects/{id}/threads/{tid}
 POST /v1/projects/{id}/threads
+PATCH /v1/projects/{id}/threads/{tid}
 POST /v1/projects/{id}/threads/{tid}/turns
 POST /v1/projects/{id}/threads/{tid}/archive
 POST /v1/projects/{id}/threads/{tid}/unarchive
@@ -450,6 +451,7 @@ Activity types:
 | `file.uploaded` / `file.retracted` | Project upload/retraction succeeds. |
 | `thread.opened` | An orchestrator thread is created. |
 | `thread.archived` / `thread.unarchived` | A project thread is hidden or restored. |
+| `thread.renamed` | A project thread title is changed. |
 | `work.dispatched` | `/v1/work/start` succeeds with a visible `project_id` linkage. |
 
 #### Project Management
@@ -720,6 +722,12 @@ for the project. Archived threads are hidden by default; pass
       "project_id": "jarvis",
       "session_id": "project:jarvis:orchestrator:thread_...",
       "title": "Planning",
+      "engine": "jarvis",
+      "model": "fast",
+      "worker_id": null,
+      "host": "mac-mini.local",
+      "status": "created",
+      "ended_reason": null,
       "created_at": "2026-07-05T09:00:00+00:00",
       "updated_at": "2026-07-05T09:00:00+00:00",
       "created_by": "neil",
@@ -730,6 +738,25 @@ for the project. Archived threads are hidden by default; pass
   ]
 }
 ```
+
+Thread enrichment fields (on list, detail, open, turn, archive, and rename
+responses alike):
+
+- `engine` is always `"jarvis"`: project threads are brain conversations, not
+  worker sessions. `thread.session_id` is the memory session id and never
+  matches a worker `session_id`/`session_ref` — do not join threads against
+  the snapshot sessions array.
+- `model` is the LLM gateway route the thread's turns use (a LiteLLM route
+  name such as `fast`, not a provider model id).
+- `worker_id` is `null` and `host` is the brain host: thread turns execute on
+  the brain. `worker_id` will populate when a thread is linked to a worker
+  session (the orchestration chat tree).
+- `status` is `created` (no turns yet), `running` (a turn is in flight),
+  `completed` (last turn finished), or `failed` (last turn errored; the live
+  `running`/`failed` states are process-local and revert to the durable
+  `created`/`completed` derivation after a brain restart).
+- `ended_reason` uses the session taxonomy: `null` while created/running,
+  `completed` after a normal turn, `engine_error` after a failed one.
 
 `GET /v1/projects/{id}/threads/{tid}` returns one active or archived thread plus
 the locally recorded turn history for rendering resumed conversations:
@@ -744,6 +771,12 @@ the locally recorded turn history for rendering resumed conversations:
     "project_id": "jarvis",
     "session_id": "project:jarvis:orchestrator:thread_...",
     "title": "Planning",
+    "engine": "jarvis",
+    "model": "fast",
+    "worker_id": null,
+    "host": "mac-mini.local",
+    "status": "completed",
+    "ended_reason": "completed",
     "created_at": "2026-07-05T09:00:00+00:00",
     "updated_at": "2026-07-06T10:00:00+00:00",
     "created_by": "neil",
@@ -858,6 +891,13 @@ Turns on archived threads are rejected before streaming starts:
 ```
 
 The status is `409`; callers must explicitly unarchive first.
+
+`PATCH /v1/projects/{id}/threads/{tid}` renames a thread. It is member-gated
+and idempotency-keyed like archive, accepts `{"title": "...", "idempotency_key":
+"..."}` (title is whitespace-normalized, capped at 200 chars, and required),
+emits the `thread.renamed` project activity, and returns the same
+`{ok, project_id, thread}` body with the updated projection. The new title is
+reflected in list and detail responses.
 
 `POST /v1/projects/{id}/threads/{tid}/archive` accepts:
 
@@ -1772,13 +1812,17 @@ Rules:
   `ORCHESTRATION_TURN_ATTACHMENT_MAX_COUNT` attachments (default 4), each at
   most `ORCHESTRATION_TURN_ATTACHMENT_MAX_BYTES` decoded bytes (default 5 MiB).
 - Only engines whose catalog row reports `supports.attachments: true` accept
-  them (Claude today); other engines reject the turn at the worker boundary.
+  them (Claude and Codex); other engines reject the turn at the worker boundary.
   Gate the composer on that flag.
 - Session events never carry attachment payloads — the `turn.started` event
   records `{kind, mime_type, name, bytes}` summaries only.
 
-Project thread turns (`POST /v1/projects/{id}/threads/{tid}/turns`) still
-reject non-empty `attachments` arrays with `validation_failed`.
+Project thread turns (`POST /v1/projects/{id}/threads/{tid}/turns`) accept
+the same attachment shape and limits. Images become gateway content blocks on
+that turn (routed via the configured vision model, `GATEWAY_VISION_MODEL`);
+the durable thread transcript and memory record the text plus a compact
+`[image attached: <name> (<mime>)]` marker per image — base64 payloads never
+enter durable state on this lane either.
 
 `POST /v1/runs/{run_id}/archive` and
 `POST /v1/sessions/{session_ref}/archive` hide the selected run or session from
@@ -1975,12 +2019,30 @@ or breaking status, and migration notes.
   cockpits can display the configured MCP serve auth lane and OAuth discovery
   URLs without exposing token-store paths or JWKS internals.
 
+### 2026-07-07 - Cockpit asks batch 2: thread enrichment, thread attachments, rename (compatible)
+
+- Project thread projections (list, detail, open, turn, archive, rename) gain
+  `engine` ("jarvis"), `model` (gateway route), `worker_id` (null until
+  threads link to worker sessions), `host` (brain hostname), `status`
+  (`created|running|completed|failed`), and `ended_reason`. Documented that
+  `thread.session_id` is the memory session id and never joins to snapshot
+  worker sessions.
+- `POST /v1/projects/{id}/threads/{tid}/turns` accepts the same image
+  attachments as the session lane; images route through the gateway vision
+  model and durable transcripts record markers, never base64.
+- Codex worker sessions accept attachments too (app-server `image` input
+  items), so both Claude and Codex report `supports.attachments: true`.
+- Added `PATCH /v1/projects/{id}/threads/{tid}` thread rename (member-gated,
+  idempotency-keyed, emits `thread.renamed`).
+- `GET /v1/cockpit/catalog` engine rows now carry worker-reported `supports`
+  flags (previously always false there); `supports.attachments` is readable
+  where the cockpit gates its composer.
+
 ### 2026-07-07 - Cockpit asks: attachments, unarchive, ended_reason, snapshot hygiene (compatible)
 
 - Enabled image attachments on `POST /v1/sessions/{session_ref}/turns` and
   `POST /v1/work/start` with config-owned count/size limits and a per-engine
-  `supports.attachments` catalog flag (Claude first). Project thread turns
-  still reject attachments.
+  `supports.attachments` catalog flag. (Batch 2, same day, added Codex and extended attachments to project thread turns.)
 - Added `POST /v1/sessions/{session_ref}/unarchive` on the consolidated
   archive bookkeeping path, and `unarchive` to session `supported_controls`.
 - Added `ended_reason`

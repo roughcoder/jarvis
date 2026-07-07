@@ -3561,3 +3561,20 @@ def test_claude_turn_query_input_builds_image_blocks() -> None:
     assert messages[0]["type"] == "user"
     assert content[0] == {"type": "text", "text": "look at this"}
     assert content[1] == {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "cG5n"}}
+
+
+def test_codex_turn_input_appends_image_items() -> None:
+    from jarvis.worker.providers.codex import _turn_input
+
+    plain = ProviderTurn(turn_id="t_plain", prompt="just text")
+    assert _turn_input(plain) == [{"type": "text", "text": "just text"}]
+
+    turn = ProviderTurn(
+        turn_id="t_img",
+        prompt="look at this",
+        attachments=[{"kind": "image", "mime_type": "image/png", "name": "s.png", "data_url": "data:image/png;base64,cG5n"}],
+    )
+    assert _turn_input(turn) == [
+        {"type": "text", "text": "look at this"},
+        {"type": "image", "url": "data:image/png;base64,cG5n"},
+    ]
