@@ -35,6 +35,7 @@ TURN_RESUMABLE_SESSION_STATUSES = SUCCESS_SESSION_STATUSES
 EVENT_SESSION_CREATED = "session.created"
 EVENT_SESSION_INTERRUPTED = "session.interrupted"
 EVENT_SESSION_STOPPED = "session.stopped"
+EVENT_PROVISIONING_PROGRESS = "provisioning.progress"
 EVENT_TURN_STARTED = "turn.started"
 EVENT_TURN_COMPLETED = "turn.completed"
 EVENT_TURN_FAILED = "turn.failed"

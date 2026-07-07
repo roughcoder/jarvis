@@ -3419,6 +3419,111 @@ def test_list_repos_action(tmp_path) -> None:
     assert data["repos"] == ["alpha"]
 
 
+def test_repo_access_action_reports_worker_probe(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "ws"))
+
+    def fake_probe(repo, *, timeout_s, ttl_s):  # noqa: ANN001, ANN202
+        return {
+            "repo": repo,
+            "accessible": True,
+            "public": False,
+            "reason_code": "accessible",
+            "ttl_s": ttl_s,
+        }
+
+    monkeypatch.setattr("jarvis.worker.server.probe_repo_access", fake_probe)
+
+    async def calls(base, c):  # noqa: ANN001
+        return (await c.post(base + "/run", json={"action": "repo_access", "args": {"repo": "roughcoder/jarvis"}})).json()
+
+    data = asyncio.run(_with_server(cfg, 8824, calls))
+    assert data["ok"] is True
+    assert data["access"]["repo"] == "roughcoder/jarvis"
+    assert data["access"]["reason_code"] == "accessible"
+
+
+def test_session_provisioning_emits_progress_phases(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    dev = tmp_path / "dev"
+    repo = dev / "jarvis"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "--allow-empty", "-qm", "init"], cwd=repo, check=True)
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "ws"), repo_root=str(dev))
+
+    def fake_probe(repo_ref, *, timeout_s, ttl_s):  # noqa: ANN001, ANN202
+        return {"repo": repo_ref, "accessible": True, "public": False, "reason_code": "accessible"}
+
+    monkeypatch.setattr("jarvis.worker.server.probe_repo_access", fake_probe)
+
+    async def calls(base, c):  # noqa: ANN001
+        body = {
+            "session_id": "sess_provision",
+            "provider": "fake",
+            "engine": "fake",
+            "repo": "roughcoder/jarvis",
+            "metadata": {
+                **_authority_metadata("fake"),
+                "provision_workspace": True,
+            },
+        }
+        created = (await c.post(base + "/sessions", json=body)).json()
+        events = (await c.get(base + "/sessions/sess_provision/events")).json()["events"]
+        return created, events
+
+    created, events = asyncio.run(_with_server(cfg, 8825, calls))
+    assert created["ok"] is True
+    phases = [
+        event["data"]["phase"]
+        for event in events
+        if event["type"] == "provisioning.progress" and event["data"].get("status") == "completed"
+    ]
+    assert phases == ["resolving-access", "cloning", "creating-worktree"]
+    assert pathlib.Path(created["session"]["cwd"]).exists()
+
+
+def test_session_provisioning_fetch_failure_is_visible(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    dev = tmp_path / "dev"
+    repo = dev / "jarvis"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "--allow-empty", "-qm", "init"], cwd=repo, check=True)
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "ws"), repo_root=str(dev))
+
+    def fake_probe(repo_ref, *, timeout_s, ttl_s):  # noqa: ANN001, ANN202
+        return {"repo": repo_ref, "accessible": True, "public": False, "reason_code": "accessible"}
+
+    async def fake_fetch(repo_path, timeout_s):  # noqa: ANN001, ANN202
+        return "couldn't fetch: fatal: cannot lock ref 'refs/heads/jarvis/test'"
+
+    monkeypatch.setattr("jarvis.worker.server.probe_repo_access", fake_probe)
+    monkeypatch.setattr("jarvis.worker.server.fetch_repo", fake_fetch)
+
+    async def calls(base, c):  # noqa: ANN001
+        body = {
+            "session_id": "sess_fetch_fail",
+            "provider": "fake",
+            "engine": "fake",
+            "repo": "roughcoder/jarvis",
+            "metadata": {
+                **_authority_metadata("fake"),
+                "provision_workspace": True,
+            },
+        }
+        response = await c.post(base + "/sessions", json=body)
+        return response.status_code, response.json()
+
+    status, data = asyncio.run(_with_server(cfg, 8826, calls))
+    assert status == 400
+    assert data["ok"] is False
+    assert "cannot lock ref" in data["error"]
+    failed = [
+        event for event in data["events"]
+        if event["type"] == "provisioning.progress" and event["data"].get("status") == "failed"
+    ]
+    assert failed[-1]["data"]["phase"] == "provisioning"
+    assert "cannot lock ref" in failed[-2]["data"]["message"]
+
+
 def test_cleanup_all_removes_scratch_dir(tmp_path) -> None:
     import pathlib
 

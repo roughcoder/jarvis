@@ -209,6 +209,31 @@ class SessionManager:
             self.save(session)
             return session
 
+    def update_workspace(
+        self,
+        session_id: str,
+        *,
+        cwd: str = "",
+        branch: str = "",
+        repo: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> WorkerSession:
+        with self._lock:
+            session = self.get(session_id)
+            if session is None:
+                raise KeyError(session_id)
+            if cwd:
+                session.cwd = cwd
+            if branch:
+                session.branch = branch
+            if repo:
+                session.repo = repo
+            if metadata:
+                session.metadata.update(metadata)
+            session.updated_at = utc_now()
+            self.save(session)
+            return session
+
     def append_event(self, session_id: str, event_type: str, data: dict[str, Any] | None = None) -> SessionEvent:
         with self._lock:
             session = self.get(session_id)

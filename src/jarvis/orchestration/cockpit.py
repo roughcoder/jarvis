@@ -428,6 +428,8 @@ def project_worker_profile(profile: WorkerProfile, *, default_repo: str = "") ->
             "queued_sessions": 0,
         },
         "system": project_worker_system(profile.system),
+        "git_identity": _worker_git_identity(profile.git_identity),
+        "repo_access": _repo_access_rows(profile.repo_access),
         "repositories": _repository_rows(profile.repositories, profile.default_repo or default_repo),
         "public_metadata": {},
     }
@@ -451,6 +453,53 @@ def _repository_rows(raw_rows: list[dict[str, Any]], default_repo: str) -> list[
         if detail:
             row["detail"] = detail
         rows.append(row)
+    return rows
+
+
+def _worker_git_identity(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {
+            "provider": "github",
+            "connected": False,
+            "authenticated": False,
+            "auth_fresh": False,
+            "login": "",
+            "checked_at": None,
+            "detail": "",
+        }
+    return {
+        "provider": _redact(str(raw.get("provider") or "github")),
+        "connected": bool(raw.get("connected")),
+        "authenticated": raw.get("authenticated") if raw.get("authenticated") is None else bool(raw.get("authenticated")),
+        "auth_fresh": raw.get("auth_fresh") if raw.get("auth_fresh") is None else bool(raw.get("auth_fresh")),
+        "login": _redact(str(raw.get("login") or "")),
+        "git_user_name": _redact(str(raw.get("git_user_name") or "")),
+        "git_user_email": _redact(str(raw.get("git_user_email") or "")),
+        "checked_at": raw.get("checked_at"),
+        "detail": public_error_message(str(raw.get("detail") or "")),
+    }
+
+
+def _repo_access_rows(raw_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for raw in raw_rows or []:
+        if not isinstance(raw, dict):
+            continue
+        repo = str(raw.get("repo") or "")
+        if not repo:
+            continue
+        rows.append(
+            {
+                "repo": _redact(repo),
+                "accessible": bool(raw.get("accessible")),
+                "public": bool(raw.get("public")),
+                "reason_code": _redact(str(raw.get("reason_code") or "")),
+                "reason": public_error_message(str(raw.get("reason") or "")),
+                "checked_at": raw.get("checked_at"),
+                "ttl_s": raw.get("ttl_s"),
+                "cached": bool(raw.get("cached")),
+            }
+        )
     return rows
 
 

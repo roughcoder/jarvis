@@ -193,6 +193,8 @@ class OrchestrationService:
     ) -> WorkerSelection:
         target_engine = normalize_engine_id(_first_engine(command.target_engine_id))
         profiles = registry.profiles(probe=True)
+        if item.repo:
+            profiles = registry.with_repo_access(profiles, item.repo)
         selected: WorkerProfile | None = None
         selected_engine = ""
         selected_engines: list[str] = []
@@ -227,6 +229,8 @@ class OrchestrationService:
                     "worker_id": worker.worker_id,
                     "eligible": eligible,
                     "reasons": [_public_reason(reason) for reason in display_reasons],
+                    "reason_codes": [_reason_code(reason) for reason in display_reasons],
+                    "repo_access": _repo_access_summary(worker, item.repo),
                 }
             )
         if selected is None and any_eligible_except_capacity:
@@ -235,6 +239,7 @@ class OrchestrationService:
             "repo": item.repo or None,
             "workers": rows,
             "selected_worker_id": selected.worker_id if selected else None,
+            "warnings": _selection_warnings(rows, command),
         }
         return WorkerSelection(
             worker=selected,
@@ -305,6 +310,8 @@ class OrchestrationService:
         compatibility = selection.compatibility
         compatibility["repo"] = repo or None
         compatibility["selected_worker_id"] = worker_id or None
+        warnings = compatibility.get("warnings") if isinstance(compatibility.get("warnings"), list) else []
+        warning_codes = [str(item.get("code") or "") for item in warnings if isinstance(item, dict) and item.get("code")]
         if missing_authority:
             reasons.append(f"missing authority: {', '.join(missing_authority)}")
         if missing:
@@ -325,6 +332,9 @@ class OrchestrationService:
             "compatibility": compatibility,
             "missing": missing,
             "missing_authority": missing_authority,
+            "reason_codes": _validation_reason_codes(reasons, selection.compatibility, missing_authority),
+            "warnings": warnings,
+            "warning_codes": warning_codes,
             "reasons": reasons,
             "notes": notes,
         }
@@ -501,6 +511,9 @@ def _worker_target_engines(worker: WorkerProfile, command: WorkCommand, target_e
 def _repo_compatibility_reason(worker: WorkerProfile, repo: str) -> str:
     if not repo:
         return ""
+    access = _repo_access_summary(worker, repo)
+    if access and access.get("accessible") is False:
+        return str(access.get("reason_code") or "identity-lacks-repo-access")
     if worker.readiness is None and not worker.repositories:
         return ""
     repo_name = repo.rsplit("/", 1)[-1]
@@ -538,7 +551,121 @@ def _engine_readiness_reason(worker: WorkerProfile, engine: str) -> str:
 
 
 def _public_reason(reason: str) -> str:
+    messages = {
+        "worker-not-connected-to-github": "Connect GitHub on this worker.",
+        "identity-lacks-repo-access": "This worker identity cannot access the repo.",
+        "repo-private-choose-other-worker": "Repo is private; choose a worker signed in as an identity with access.",
+        "repo-access-probe-failed": "Repo access probe failed.",
+        "repo-reference-unsupported": "Repo reference is not supported for worker access probing.",
+    }
+    if reason in messages:
+        return messages[reason]
     return public_error_message(_redact_text(reason))
+
+
+def _reason_code(reason: str) -> str:
+    known = {
+        "selected": "selected",
+        "eligible": "eligible",
+        "repo not checked out": "repo-not-warm",
+        "worker offline": "worker-offline",
+        "worker at capacity": "worker-at-capacity",
+        "worker-not-connected-to-github": "worker-not-connected-to-github",
+        "identity-lacks-repo-access": "identity-lacks-repo-access",
+        "repo-private-choose-other-worker": "repo-private-choose-other-worker",
+        "repo-access-probe-failed": "repo-access-probe-failed",
+        "repo-reference-unsupported": "repo-reference-unsupported",
+    }
+    if reason in known:
+        return known[reason]
+    if reason.startswith("different worker requested"):
+        return "different-worker-requested"
+    if reason.startswith("missing capability"):
+        return "missing-capability"
+    if reason.startswith("engine ") and reason.endswith(" unsupported"):
+        return "engine-unsupported"
+    if reason.startswith("engine ") and "unavailable" in reason:
+        return "engine-unavailable"
+    if reason.startswith("engine ") and "unauthenticated" in reason:
+        return "engine-unauthenticated"
+    if reason.startswith("repo checkout broken"):
+        return "repo-checkout-broken"
+    return "unknown"
+
+
+def _repo_access_summary(worker: WorkerProfile, repo: str) -> dict[str, Any] | None:
+    if not repo:
+        return None
+    repo_name = repo.rsplit("/", 1)[-1]
+    for row in worker.repo_access:
+        candidate = str(row.get("repo") or "")
+        if candidate in {repo, repo_name} or candidate.rsplit("/", 1)[-1] == repo_name:
+            return {
+                "repo": candidate or repo,
+                "accessible": bool(row.get("accessible")),
+                "public": bool(row.get("public")),
+                "reason_code": str(row.get("reason_code") or ""),
+                "checked_at": row.get("checked_at"),
+                "cached": bool(row.get("cached")),
+            }
+    return None
+
+
+def _selection_warnings(rows: list[dict[str, Any]], command: WorkCommand) -> list[dict[str, str]]:
+    if not command.target_worker_id:
+        return []
+    target = next((row for row in rows if row.get("worker_id") == command.target_worker_id), None)
+    if not target:
+        return []
+    target_codes = set(target.get("reason_codes") or [])
+    if not ({"worker-not-connected-to-github", "identity-lacks-repo-access"} & target_codes):
+        return []
+    other_has_access = any(
+        row.get("worker_id") != command.target_worker_id
+        and isinstance(row.get("repo_access"), dict)
+        and row["repo_access"].get("accessible") is True
+        for row in rows
+    )
+    if not other_has_access:
+        return []
+    return [
+        {
+            "code": "repo-private-choose-other-worker",
+            "message": _public_reason("repo-private-choose-other-worker"),
+        }
+    ]
+
+
+def _validation_reason_codes(
+    reasons: list[str],
+    compatibility: dict[str, Any],
+    missing_authority: list[str],
+) -> list[str]:
+    codes = []
+    for reason in reasons:
+        if reason.startswith("missing authority"):
+            codes.append("missing-authority")
+        elif reason.startswith("work item has no repo"):
+            codes.append("missing-repo")
+        elif reason == "No eligible worker found.":
+            codes.append("no-eligible-worker")
+        elif reason == "All eligible workers are at capacity.":
+            codes.append("worker-at-capacity")
+        else:
+            codes.append(_reason_code(reason))
+    for action in missing_authority:
+        if action and "missing-authority" not in codes:
+            codes.append("missing-authority")
+    for row in compatibility.get("workers") or []:
+        if not isinstance(row, dict):
+            continue
+        for code in row.get("reason_codes") or []:
+            if code not in {"selected", "eligible", "repo-not-warm"} and code not in codes:
+                codes.append(str(code))
+    for warning in compatibility.get("warnings") or []:
+        if isinstance(warning, dict) and warning.get("code") and warning["code"] not in codes:
+            codes.append(str(warning["code"]))
+    return codes
 
 
 def _session_is_active(status: str) -> bool:

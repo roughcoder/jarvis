@@ -42,10 +42,12 @@ from jarvis.worker.actions import (
     cleanup_job,
     clone_repo,
     code_argv,
+    fetch_repo,
     gui_doctor,
     diagnostics,
     list_repos,
     prepare_worktree,
+    probe_repo_access,
     resolve_repo,
     run_applescript,
     run_exec,
@@ -64,6 +66,7 @@ from jarvis.worker_session_contract import (
     EVENT_SESSION_INTERRUPTED,
     EVENT_SESSION_STOPPED,
     EVENT_TURN_FAILED,
+    EVENT_PROVISIONING_PROGRESS,
     SESSION_FAILED,
     SESSION_INTERRUPTED,
     SESSION_STOPPED,
@@ -299,26 +302,24 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             elif args.get("repo"):
                 # Resolve the repo name to a real path (clone it if missing) before
                 # isolating it on a fresh worktree branch — never the user's checkout.
-                resolved = resolve_repo(args["repo"], cfg.repo_root)
-                if resolved is None and cfg.clone_missing and cfg.repo_root:
-                    resolved, clone_err = await clone_repo(
-                        args["repo"], cfg.repo_root, cfg.clone_timeout_s
-                    )
-                    if resolved is None:
-                        return web.json_response({"ok": False, "error": clone_err}, status=400)
-                if resolved is None:
-                    avail = list_repos(cfg.repo_root)
-                    hint = f" I can see: {', '.join(avail)}." if avail else ""
-                    return web.json_response(
-                        {"ok": False, "error": f"couldn't find a repo called {args['repo']!r}.{hint}"},
-                        status=404,
-                    )
-                job_cwd, branch, err = await prepare_worktree(
-                    resolved, str(workspace / "worktrees"), slug,
-                    cfg.worktree_branch_prefix, cfg.shell_timeout_s,
+                provisioning: list[dict[str, Any]] = []
+
+                def collect(phase: str, status: str = "started", **data: Any) -> None:
+                    provisioning.append({"phase": phase, "status": status, **data})
+
+                resolved, job_cwd, branch, err = await _provision_worktree(
+                    str(args["repo"]),
+                    cfg,
+                    workspace,
+                    slug,
+                    progress=collect,
                 )
                 if err:
-                    return web.json_response({"ok": False, "error": err}, status=400)
+                    status = 404 if err.startswith("couldn't find") else 400
+                    return web.json_response(
+                        {"ok": False, "error": err, "provisioning": provisioning},
+                        status=status,
+                    )
             else:
                 # No repo: an isolated per-job scratch dir.
                 job_cwd = str(workspace / "runs" / f"{slug}-{uuid.uuid4().hex[:6]}")
@@ -347,6 +348,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                     "engine": job.engine,
                     "session_id": job.session_id or "",
                     "session_name": job.session_name,
+                    "provisioning": provisioning if args.get("repo") else [],
                 }
             )
         if action == "peekaboo":
@@ -372,6 +374,17 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             return await browser_dispatch(action, args)
         if action == "list_repos":
             return web.json_response({"ok": True, "repos": list_repos(cfg.repo_root)})
+        if action == "repo_access":
+            repo = str(args.get("repo") or "").strip()
+            if not repo:
+                return web.json_response({"ok": False, "error": "repo is required"}, status=400)
+            access = await asyncio.to_thread(
+                probe_repo_access,
+                repo,
+                timeout_s=cfg.repo_access_probe_timeout_s,
+                ttl_s=cfg.repo_access_ttl_s,
+            )
+            return web.json_response({"ok": True, "access": access})
         if action == "cleanup":
             ref = (args.get("job") or "").strip()
             finished = {"done", "error", "interrupted"}
@@ -446,13 +459,33 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             session_id = str((body or {}).get("session_id") or "").strip()
             if session_id and sessions.session_path(session_id).exists():
                 raise ValueError(f"worker session already exists: {session_id}")
-            body = await _prepare_session_body(body or {}, cfg, workspace)
+            if (body or {}).get("cwd"):
+                cwd, err = _worker_owned_cwd(str((body or {}).get("cwd") or ""), workspace)
+                if err:
+                    raise ValueError(err)
+                body["cwd"] = cwd
             session, event = sessions.create(body or {})
         except (RuntimeError, ValueError) as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400)
         except Exception:
             return web.json_response({"ok": False, "error": "bad json"}, status=400)
-        return web.json_response({"ok": True, "session": session.to_dict(), "event": event.to_dict()})
+        events = [event.to_dict()]
+        try:
+            session, provisioning_events = await _provision_session_if_requested(session, body or {}, cfg, workspace, sessions)
+            events.extend(event.to_dict() for event in provisioning_events)
+        except ValueError as exc:
+            failed = sessions.update_status(session.session_id, SESSION_FAILED)
+            sessions.append_event(
+                session.session_id,
+                EVENT_PROVISIONING_PROGRESS,
+                {"phase": "provisioning", "status": "failed", "error": str(exc)},
+            )
+            events = [event.to_dict() for event in sessions.events(session.session_id)]
+            return web.json_response(
+                {"ok": False, "error": str(exc), "session": failed.to_dict(), "events": events},
+                status=400,
+            )
+        return web.json_response({"ok": True, "session": session.to_dict(), "event": events[-1], "events": events})
 
     async def list_sessions(request: web.Request) -> web.Response:
         if not authorised(request):
@@ -585,6 +618,13 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 {"ok": False, "error": f"provider {session.provider!r} does not support turn attachments"},
                 status=400,
             )
+        running_event = None
+        if session.metadata.get("provision_workspace") is True:
+            running_event = sessions.append_event(
+                session.session_id,
+                EVENT_PROVISIONING_PROGRESS,
+                {"phase": "running", "status": "started", "turn_id": turn_id},
+            )
         turn_data = {
             "turn_id": turn_id,
             "prompt": str(body.get("prompt") or ""),
@@ -605,7 +645,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                     "ok": True,
                     "session": session.to_dict(),
                     "turn_id": str(started.data.get("turn_id") or turn_id),
-                    "events": [started.to_dict()],
+                    "events": [*([running_event.to_dict()] if running_event else []), started.to_dict()],
                     "idempotent": True,
                 }
             )
@@ -635,7 +675,11 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                     "error": str(exc),
                     "session": sessions.get(session.session_id).to_dict(),  # type: ignore[union-attr]
                     "turn_id": turn_id,
-                    "events": [started.to_dict(), failed.to_dict()],
+                    "events": [
+                        *([running_event.to_dict()] if running_event else []),
+                        started.to_dict(),
+                        failed.to_dict(),
+                    ],
                 },
                 status=400,
             )
@@ -644,7 +688,11 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 "ok": True,
                 "session": sessions.get(session.session_id).to_dict(),  # type: ignore[union-attr]
                 "turn_id": turn_id,
-                "events": [started.to_dict(), *[event.to_dict() for event in provider_events]],
+                "events": [
+                    *([running_event.to_dict()] if running_event else []),
+                    started.to_dict(),
+                    *[event.to_dict() for event in provider_events],
+                ],
             }
         )
 
@@ -685,6 +733,8 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             body["system"] = system_info_cached()
             readiness = _diagnostics_payload(supported_engines)
             body["diagnostics"] = readiness
+            if isinstance(readiness, dict) and isinstance(readiness.get("git_identity"), dict):
+                body["git_identity"] = readiness["git_identity"]
             body["repositories"] = readiness.get("repositories") if isinstance(readiness, dict) else []
             if not isinstance(body["repositories"], list):
                 body["repositories"] = []
@@ -896,7 +946,13 @@ async def _terminal_session_event(
     return web.json_response({"ok": True, "session": session.to_dict(), "event": event.to_dict()})
 
 
-async def _prepare_session_body(body: dict, cfg: WorkerConfig, workspace: pathlib.Path) -> dict:
+async def _provision_session_if_requested(
+    session: WorkerSession,
+    body: dict,
+    cfg: WorkerConfig,
+    workspace: pathlib.Path,
+    sessions: SessionManager,
+) -> tuple[WorkerSession, list[Any]]:
     data = dict(body)
     metadata = dict(data.get("metadata") or {})
     envelope = metadata.get("execution_envelope")
@@ -904,22 +960,82 @@ async def _prepare_session_body(body: dict, cfg: WorkerConfig, workspace: pathli
         cwd, err = _worker_owned_cwd(str(data.get("cwd") or ""), workspace)
         if err:
             raise ValueError(err)
-        data["cwd"] = cwd
-    if data.get("cwd") or not data.get("repo") or not isinstance(envelope, dict):
-        return data
-    if metadata.get("provision_workspace") is not True:
-        return data
+        return sessions.update_workspace(session.session_id, cwd=cwd), []
+    if not data.get("repo") or not isinstance(envelope, dict) or metadata.get("provision_workspace") is not True:
+        return session, []
     repo_ref = str(data.get("repo") or "")
+    slug = slugify(str(data.get("title") or data.get("branch") or data.get("run_id") or repo_ref or "session"))
+    events = []
+
+    def progress(phase: str, status: str = "started", **payload: Any) -> None:
+        events.append(
+            sessions.append_event(
+                session.session_id,
+                EVENT_PROVISIONING_PROGRESS,
+                {"phase": phase, "status": status, **payload},
+            )
+        )
+
+    resolved, cwd, branch, err = await _provision_worktree(repo_ref, cfg, workspace, slug, progress=progress)
+    if err:
+        raise ValueError(err)
+    metadata["source_repo"] = resolved
+    updated = sessions.update_workspace(
+        session.session_id,
+        cwd=cwd or "",
+        branch=branch or str(data.get("branch") or ""),
+        repo=resolved or repo_ref,
+        metadata=metadata,
+    )
+    return updated, events
+
+
+async def _provision_worktree(
+    repo_ref: str,
+    cfg: WorkerConfig,
+    workspace: pathlib.Path,
+    slug: str,
+    *,
+    progress: Any,
+) -> tuple[str, str, str | None, str]:
+    progress("resolving-access")
+    if _should_probe_repo_access(repo_ref):
+        access = await asyncio.to_thread(
+            probe_repo_access,
+            repo_ref,
+            timeout_s=cfg.repo_access_probe_timeout_s,
+            ttl_s=cfg.repo_access_ttl_s,
+        )
+        if not access.get("accessible"):
+            progress(
+                "resolving-access",
+                "failed",
+                reason_code=str(access.get("reason_code") or "identity-lacks-repo-access"),
+                message=str(access.get("reason") or "worker identity cannot access repo"),
+            )
+            return "", "", None, str(access.get("reason") or f"worker identity cannot access {repo_ref!r}")
+        progress("resolving-access", "completed", access=access)
+    else:
+        progress("resolving-access", "completed", access={"repo": repo_ref, "accessible": True, "source": "local"})
     resolved = resolve_repo(repo_ref, cfg.repo_root)
+    progress("cloning")
     if resolved is None and cfg.clone_missing and cfg.repo_root:
         resolved, clone_err = await clone_repo(repo_ref, cfg.repo_root, cfg.clone_timeout_s)
         if resolved is None:
-            raise ValueError(clone_err or f"couldn't clone {repo_ref!r}")
+            progress("cloning", "failed", message=clone_err or f"couldn't clone {repo_ref!r}")
+            return "", "", None, clone_err or f"couldn't clone {repo_ref!r}"
     if resolved is None:
         avail = list_repos(cfg.repo_root)
         hint = f" I can see: {', '.join(avail)}." if avail else ""
-        raise ValueError(f"couldn't find a repo called {repo_ref!r}.{hint}")
-    slug = slugify(str(data.get("title") or data.get("branch") or data.get("run_id") or repo_ref or "session"))
+        message = f"couldn't find a repo called {repo_ref!r}.{hint}"
+        progress("cloning", "failed", message=message)
+        return "", "", None, message
+    fetch_err = await fetch_repo(resolved, cfg.clone_timeout_s)
+    if fetch_err:
+        progress("cloning", "failed", message=fetch_err)
+        return "", "", None, fetch_err
+    progress("cloning", "completed", repo_path=resolved)
+    progress("creating-worktree")
     cwd, branch, err = await prepare_worktree(
         resolved,
         str(workspace / "worktrees"),
@@ -928,12 +1044,19 @@ async def _prepare_session_body(body: dict, cfg: WorkerConfig, workspace: pathli
         cfg.shell_timeout_s,
     )
     if err:
-        raise ValueError(err)
-    data["cwd"] = cwd or ""
-    data["branch"] = branch or str(data.get("branch") or "")
-    metadata["source_repo"] = resolved
-    data["metadata"] = metadata
-    return data
+        progress("creating-worktree", "failed", message=err)
+        return resolved, "", None, err
+    progress("creating-worktree", "completed", cwd=cwd or "", branch=branch or "")
+    return resolved, cwd or "", branch, ""
+
+
+def _should_probe_repo_access(repo_ref: str) -> bool:
+    text = str(repo_ref or "").strip()
+    if pathlib.Path(text).expanduser().is_absolute():
+        return False
+    if text.startswith(("http://", "https://", "git@")):
+        return "github.com" in text
+    return text.count("/") == 1
 
 
 def _resume_cwd(cwd: str, workspace: pathlib.Path) -> tuple[str, str]:

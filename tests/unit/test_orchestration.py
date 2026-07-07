@@ -835,6 +835,7 @@ def test_orchestration_validate_compatibility_matches_selection(tmp_path, monkey
                         "capabilities": ["git", "codex"],
                         "status": "online",
                         "supported_engines": ["codex"],
+                        "repo_access": [{"repo": "roughcoder/jarvis", "accessible": True, "reason_code": "accessible"}],
                         "repositories": [{"repo": "jarvis", "status": "ready", "default_branch": "main"}],
                     },
                     {
@@ -843,6 +844,7 @@ def test_orchestration_validate_compatibility_matches_selection(tmp_path, monkey
                         "capabilities": ["git", "codex"],
                         "status": "online",
                         "supported_engines": ["codex"],
+                        "repo_access": [{"repo": "roughcoder/jarvis", "accessible": True, "reason_code": "accessible"}],
                         "repositories": [{"repo": "other", "status": "ready", "default_branch": "main"}],
                     },
                 ]
@@ -886,7 +888,134 @@ def test_orchestration_validate_compatibility_matches_selection(tmp_path, monkey
         "worker_id": "remote-worker",
         "eligible": True,
         "reasons": ["eligible", "repo not checked out"],
+        "reason_codes": ["eligible", "repo-not-warm"],
+        "repo_access": {
+            "repo": "roughcoder/jarvis",
+            "accessible": True,
+            "public": False,
+            "reason_code": "accessible",
+            "checked_at": None,
+            "cached": False,
+        },
     }
+
+
+def test_orchestration_validate_blocks_when_no_worker_identity_can_access_repo(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    workers_path = tmp_path / "workers.json"
+    workers_path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "local-worker",
+                        "display_name": "Local",
+                        "capabilities": ["git", "codex"],
+                        "status": "online",
+                        "supported_engines": ["codex"],
+                        "repo_access": [
+                            {
+                                "repo": "roughcoder/private",
+                                "accessible": False,
+                                "reason_code": "identity-lacks-repo-access",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                f"ORCHESTRATION_WORKERS_PATH={workers_path}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+    cfg = load_config()
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"worker.job.start", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: None,
+    )
+
+    validation = service.validate_work(
+        WorkCommand("start_next_work", source="manual"),
+        manual_item=WorkItem(source="manual", id="manual", title="Manual", repo="roughcoder/private"),
+    )
+
+    assert validation["can_start"] is False
+    assert "identity-lacks-repo-access" in validation["reason_codes"]
+    assert validation["compatibility"]["workers"][0]["eligible"] is False
+    assert validation["compatibility"]["workers"][0]["reason_codes"] == ["identity-lacks-repo-access"]
+
+
+def test_orchestration_validate_warns_when_requested_worker_lacks_access_but_other_has_it(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    workers_path = tmp_path / "workers.json"
+    workers_path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {
+                        "worker_id": "no-access",
+                        "display_name": "No Access",
+                        "capabilities": ["git", "codex"],
+                        "status": "online",
+                        "supported_engines": ["codex"],
+                        "repo_access": [
+                            {
+                                "repo": "roughcoder/private",
+                                "accessible": False,
+                                "reason_code": "worker-not-connected-to-github",
+                            }
+                        ],
+                    },
+                    {
+                        "worker_id": "has-access",
+                        "display_name": "Has Access",
+                        "capabilities": ["git", "codex"],
+                        "status": "online",
+                        "supported_engines": ["codex"],
+                        "repo_access": [{"repo": "roughcoder/private", "accessible": True, "reason_code": "accessible"}],
+                    },
+                ]
+            }
+        )
+    )
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                f"ORCHESTRATION_WORKERS_PATH={workers_path}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", lambda _self, profile: profile)
+    cfg = load_config()
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"worker.job.start", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: None,
+    )
+
+    validation = service.validate_work(
+        WorkCommand("start_next_work", source="manual", target_worker_id="no-access"),
+        manual_item=WorkItem(source="manual", id="manual", title="Manual", repo="roughcoder/private"),
+    )
+
+    assert validation["can_start"] is False
+    assert validation["warning_codes"] == ["repo-private-choose-other-worker"]
+    assert "repo-private-choose-other-worker" in validation["reason_codes"]
+    assert validation["compatibility"]["workers"][1]["reason_codes"] == ["different-worker-requested"]
 
 
 def test_orchestration_dispatch_allows_clone_on_demand_when_repo_missing(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -902,6 +1031,7 @@ def test_orchestration_dispatch_allows_clone_on_demand_when_repo_missing(tmp_pat
                         "capabilities": ["git", "codex"],
                         "status": "online",
                         "supported_engines": ["codex"],
+                        "repo_access": [{"repo": "roughcoder/jarvis", "accessible": True, "reason_code": "accessible"}],
                         "repositories": [{"repo": "other", "status": "ready", "default_branch": "main"}],
                     }
                 ]

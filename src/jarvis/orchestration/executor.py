@@ -152,6 +152,11 @@ def start_worker_session(
                 )
                 create_body = {"event": None}
             else:
+                status_code = getattr(create_response, "status_code", 200)
+                if store is not None and isinstance(create_body.get("session"), dict) and (
+                    status_code >= 400 or create_body.get("ok") is False
+                ):
+                    _persist_create_response_events(store, envelope, create_body)
                 _raise_worker_error(create_response, create_body)
                 if not create_body.get("ok"):
                     raise RuntimeError(create_body.get("error") or "worker rejected session")
@@ -161,6 +166,7 @@ def start_worker_session(
                     created_session_ids.add(str(session.get("session_id") or session_id))
             if store is not None:
                 store.link_session(envelope.run_id, _session_link_from_body(envelope, session, create_body.get("event")))
+                _persist_create_response_events(store, envelope, create_body)
     turn_id = _turn_id(envelope)
     idempotency_key = _turn_idempotency_key(envelope)
     turn_body: dict[str, Any] = {
@@ -427,6 +433,24 @@ def _session_link_from_body(
         last_event_id=str((event or {}).get("event_id") or ""),
         allowed_actions=list(envelope.allowed_actions),
     )
+
+
+def _persist_create_response_events(
+    store: OrchestrationStore,
+    envelope: ExecutionEnvelope,
+    body: dict[str, Any],
+) -> None:
+    session = body.get("session")
+    if not isinstance(session, dict):
+        return
+    events = [event for event in body.get("events") or [] if isinstance(event, dict)]
+    if not events and isinstance(body.get("event"), dict):
+        events = [body["event"]]
+    if not events:
+        return
+    link = _session_link_from_body(envelope, session, events[-1])
+    store.link_session(envelope.run_id, link)
+    persist_session_events(store, envelope.run_id, link.session_id, events)
 
 
 def _job_name(envelope: ExecutionEnvelope) -> str:
