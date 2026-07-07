@@ -27,10 +27,12 @@ class WorkerRegistry:
         *,
         profiles_path: str = "",
         http_get: Callable[..., Any] | None = None,
+        http_post: Callable[..., Any] | None = None,
     ) -> None:
         self.worker_cfg = worker_cfg
         self.profiles_path = pathlib.Path(profiles_path).expanduser() if profiles_path else None
         self._http_get = http_get or httpx.get
+        self._http_post = http_post or httpx.post
 
     def profiles(self, *, probe: bool = False) -> list[WorkerProfile]:
         profiles = self._load_profiles()
@@ -45,6 +47,11 @@ class WorkerRegistry:
         if not worker_id:
             return profiles[0] if profiles else None
         return next((p for p in profiles if p.worker_id == worker_id), None)
+
+    def with_repo_access(self, profiles: list[WorkerProfile], repo: str) -> list[WorkerProfile]:
+        if not repo or not _should_probe_repo_access(repo):
+            return profiles
+        return [self._probe_repo_access(profile, repo) for profile in profiles]
 
     def configured_profile_count(self) -> int:
         """Profiles available for dispatch, including the default fallback.
@@ -138,13 +145,9 @@ class WorkerRegistry:
         if not profile.base_url:
             profile.status = "unknown"
             return profile
-        headers = {}
-        token = self._token_env_value(profile.token_env) if profile.token_env else ""
-        if not token and profile.worker_id == "local-worker":
-            token = self.worker_cfg.token.get_secret_value()
+        headers = self._headers(profile)
+        token = headers.get("Authorization", "").removeprefix("Bearer ")
         profile.token_set = bool(token)
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
         try:
             health = self._http_get(f"{profile.base_url}/health", headers=headers, timeout=3)
             health.raise_for_status()
@@ -175,17 +178,60 @@ class WorkerRegistry:
             profile.engine_supports = _engine_supports_from_mapping(data["engine_supports"])
         elif isinstance(data.get("engines"), list):
             profile.engine_supports = _engine_supports_from_rows(data["engines"])
+        if isinstance(data.get("git_identity"), dict):
+            profile.git_identity = dict(data["git_identity"])
+        if isinstance(data.get("repo_access"), list):
+            profile.repo_access = [dict(item) for item in data["repo_access"] if isinstance(item, dict)]
         if isinstance(data.get("repositories"), list):
             profile.repositories = [dict(item) for item in data["repositories"] if isinstance(item, dict)]
         if isinstance(data.get("diagnostics"), dict):
             diagnostics = dict(data["diagnostics"])
             profile.readiness = diagnostics
+            if isinstance(diagnostics.get("git_identity"), dict):
+                profile.git_identity = dict(diagnostics["git_identity"])
             if isinstance(diagnostics.get("repositories"), list):
                 profile.repositories = [
                     dict(item) for item in diagnostics["repositories"] if isinstance(item, dict)
                 ]
         profile.system = _system_from_health(data.get("system"))
         profile.__post_init__()
+        return profile
+
+    def _probe_repo_access(self, profile: WorkerProfile, repo: str) -> WorkerProfile:
+        if _repo_access_row(profile, repo) is not None:
+            return profile
+        if profile.status == "offline" or not profile.base_url:
+            return profile
+        headers = self._headers(profile)
+        try:
+            response = self._http_post(
+                f"{profile.base_url}/run",
+                json={"action": "repo_access", "args": {"repo": repo}},
+                headers=headers,
+                timeout=self.worker_cfg.request_timeout_s,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:  # noqa: BLE001 - validation reports unknown rather than crashing
+            profile.repo_access = [
+                *profile.repo_access,
+                {
+                    "repo": repo,
+                    "accessible": False,
+                    "public": False,
+                    "reason_code": "repo-access-probe-failed",
+                    "reason": str(exc)[:200] or exc.__class__.__name__,
+                },
+            ]
+            profile.__post_init__()
+            return profile
+        access = data.get("access") if isinstance(data, dict) else None
+        if isinstance(access, dict):
+            profile.repo_access = [*profile.repo_access, dict(access)]
+            identity = access.get("git_identity")
+            if isinstance(identity, dict) and not profile.git_identity:
+                profile.git_identity = dict(identity)
+            profile.__post_init__()
         return profile
 
     def _session_data(self, base_url: str, headers: dict[str, str]) -> list[dict[str, Any]]:
@@ -199,6 +245,12 @@ class WorkerRegistry:
 
     def _token_env_value(self, name: str) -> str:
         return worker_token_value(name)
+
+    def _headers(self, profile: WorkerProfile) -> dict[str, str]:
+        token = self._token_env_value(profile.token_env) if profile.token_env else ""
+        if not token and profile.worker_id == "local-worker":
+            token = self.worker_cfg.token.get_secret_value()
+        return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 def local_worker_display_name() -> str:
@@ -331,6 +383,39 @@ def _safe_mount(raw: Any) -> str | None:
     if text == "/":
         return "/"
     return None
+
+
+def _repo_access_row(profile: WorkerProfile, repo: str) -> dict[str, Any] | None:
+    for row in profile.repo_access:
+        candidate = str(row.get("repo") or "")
+        if _repo_ref_matches_access_row(repo, candidate):
+            return row
+    return None
+
+
+def _should_probe_repo_access(repo_ref: str) -> bool:
+    text = str(repo_ref or "").strip()
+    if not text:
+        return False
+    if pathlib.Path(text).expanduser().is_absolute():
+        return False
+    if text.startswith(("http://", "https://", "git@")):
+        return "github.com" in text
+    return text.count("/") == 1
+
+
+def _repo_ref_matches_access_row(requested: str, candidate: str) -> bool:
+    if not candidate:
+        return False
+    if _is_owner_name_ref(requested):
+        return candidate == requested
+    repo_name = requested.rsplit("/", 1)[-1]
+    return candidate in {requested, repo_name} or candidate.rsplit("/", 1)[-1] == repo_name
+
+
+def _is_owner_name_ref(value: str) -> bool:
+    text = str(value or "").strip()
+    return text.count("/") == 1 and not text.startswith(("http://", "https://", "git@"))
 
 
 def _string_or_none(value: Any) -> str | None:

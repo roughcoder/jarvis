@@ -3230,6 +3230,34 @@ def test_daemon_resume_rejects_cwd_outside_worker_workspace(tmp_path) -> None:
     assert "refusing to resume outside worker-owned workspace" in response.json()["error"]
 
 
+def test_daemon_resume_code_with_repo_returns_empty_provisioning(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"), codex_bin="echo")
+    cwd = pathlib.Path(_owned_worker_cwd(tmp_path, "resume-run"))
+
+    async def calls(base, c):  # noqa: ANN001
+        response = await c.post(
+            base + "/run",
+            json={
+                "action": "code",
+                "args": {
+                    "prompt": "follow up",
+                    "agent": "codex",
+                    "session_id": "550e8400-e29b-41d4-a716-446655440001",
+                    "resume_session": True,
+                    "cwd": str(cwd),
+                    "repo": "roughcoder/jarvis",
+                },
+            },
+        )
+        return response.status_code, response.json()
+
+    status, data = asyncio.run(_with_server(cfg, 8836, calls))
+
+    assert status == 200
+    assert data["ok"] is True
+    assert data["provisioning"] == []
+
+
 def test_daemon_rejects_unsupported_code_engine(tmp_path) -> None:
     cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"), codex_bin="echo")
 
@@ -3417,6 +3445,179 @@ def test_list_repos_action(tmp_path) -> None:
 
     data = asyncio.run(_with_server(cfg, 8818, calls))
     assert data["repos"] == ["alpha"]
+
+
+def test_repo_access_action_reports_worker_probe(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "ws"))
+
+    def fake_probe(repo, *, timeout_s, ttl_s):  # noqa: ANN001, ANN202
+        return {
+            "repo": repo,
+            "accessible": True,
+            "public": False,
+            "reason_code": "accessible",
+            "ttl_s": ttl_s,
+        }
+
+    monkeypatch.setattr("jarvis.worker.server.probe_repo_access", fake_probe)
+
+    async def calls(base, c):  # noqa: ANN001
+        return (await c.post(base + "/run", json={"action": "repo_access", "args": {"repo": "roughcoder/jarvis"}})).json()
+
+    data = asyncio.run(_with_server(cfg, 8824, calls))
+    assert data["ok"] is True
+    assert data["access"]["repo"] == "roughcoder/jarvis"
+    assert data["access"]["reason_code"] == "accessible"
+
+
+def test_session_provisioning_emits_progress_phases(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    dev = tmp_path / "dev"
+    repo = dev / "jarvis"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "--allow-empty", "-qm", "init"], cwd=repo, check=True)
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "ws"), repo_root=str(dev))
+
+    def fake_probe(repo_ref, *, timeout_s, ttl_s):  # noqa: ANN001, ANN202
+        return {"repo": repo_ref, "accessible": True, "public": False, "reason_code": "accessible"}
+
+    monkeypatch.setattr("jarvis.worker.server.probe_repo_access", fake_probe)
+
+    async def calls(base, c):  # noqa: ANN001
+        body = {
+            "session_id": "sess_provision",
+            "provider": "fake",
+            "engine": "fake",
+            "repo": "roughcoder/jarvis",
+            "metadata": {
+                **_authority_metadata("fake"),
+                "provision_workspace": True,
+            },
+        }
+        created = (await c.post(base + "/sessions", json=body)).json()
+        events = (await c.get(base + "/sessions/sess_provision/events")).json()["events"]
+        return created, events
+
+    created, events = asyncio.run(_with_server(cfg, 8825, calls))
+    assert created["ok"] is True
+    phases = [
+        event["data"]["phase"]
+        for event in events
+        if event["type"] == "provisioning.progress" and event["data"].get("status") == "completed"
+    ]
+    assert phases == ["resolving-access", "cloning", "creating-worktree"]
+    assert pathlib.Path(created["session"]["cwd"]).exists()
+
+
+def test_session_provisioning_warm_fetch_failure_warns_and_dispatches(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    dev = tmp_path / "dev"
+    repo = dev / "jarvis"
+    repo.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "--allow-empty", "-qm", "init"], cwd=repo, check=True)
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "ws"), repo_root=str(dev))
+
+    def fake_probe(repo_ref, *, timeout_s, ttl_s):  # noqa: ANN001, ANN202
+        return {"repo": repo_ref, "accessible": True, "public": False, "reason_code": "accessible"}
+
+    async def fake_fetch(repo_path, timeout_s):  # noqa: ANN001, ANN202
+        return "couldn't fetch: fatal: cannot lock ref 'refs/heads/jarvis/test'"
+
+    monkeypatch.setattr("jarvis.worker.server.probe_repo_access", fake_probe)
+    monkeypatch.setattr("jarvis.worker.server.fetch_repo", fake_fetch)
+
+    async def calls(base, c):  # noqa: ANN001
+        body = {
+            "session_id": "sess_fetch_fail",
+            "provider": "fake",
+            "engine": "fake",
+            "repo": "roughcoder/jarvis",
+            "metadata": {
+                **_authority_metadata("fake"),
+                "provision_workspace": True,
+            },
+        }
+        created = (await c.post(base + "/sessions", json=body)).json()
+        events = (await c.get(base + "/sessions/sess_fetch_fail/events")).json()["events"]
+        return created, events
+
+    created, events = asyncio.run(_with_server(cfg, 8826, calls))
+    assert created["ok"] is True
+    assert pathlib.Path(created["session"]["cwd"]).exists()
+    warnings = [
+        event for event in events
+        if event["type"] == "provisioning.progress" and event["data"].get("status") == "warning"
+    ]
+    assert warnings[-1]["data"]["phase"] == "cloning"
+    assert "cannot lock ref" in warnings[-1]["data"]["message"]
+    phases = [
+        event["data"]["phase"]
+        for event in events
+        if event["type"] == "provisioning.progress" and event["data"].get("status") == "completed"
+    ]
+    assert phases == ["resolving-access", "cloning", "creating-worktree"]
+
+
+def test_session_provisioning_failed_unstarted_session_can_retry(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    dev = tmp_path / "dev"
+    dev.mkdir()
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="",
+        workspace=str(tmp_path / "ws"),
+        repo_root=str(dev),
+        clone_missing=False,
+    )
+
+    def fake_probe(repo_ref, *, timeout_s, ttl_s):  # noqa: ANN001, ANN202
+        return {"repo": repo_ref, "accessible": True, "public": False, "reason_code": "accessible"}
+
+    monkeypatch.setattr("jarvis.worker.server.probe_repo_access", fake_probe)
+    body = {
+        "session_id": "sess_retry_provision",
+        "provider": "fake",
+        "engine": "fake",
+        "repo": "roughcoder/missing",
+        "metadata": {
+            **_authority_metadata("fake"),
+            "provision_workspace": True,
+        },
+    }
+
+    async def calls(base, c):  # noqa: ANN001
+        first = await c.post(base + "/sessions", json=body)
+        repo = dev / "missing"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "--allow-empty", "-qm", "init"], cwd=repo, check=True)
+        second = await c.post(base + "/sessions", json=body)
+        events = (await c.get(base + "/sessions/sess_retry_provision/events")).json()["events"]
+        return first.status_code, first.json(), second.status_code, second.json(), events
+
+    first_status, first, second_status, second, events = asyncio.run(_with_server(cfg, 8837, calls))
+
+    assert first_status == 400
+    assert first["session"]["status"] == "failed"
+    assert second_status == 200
+    assert second["ok"] is True
+    assert pathlib.Path(second["session"]["cwd"]).exists()
+    assert [event["type"] for event in events].count("session.created") == 1
+
+
+def test_git_ls_remote_access_probe_does_not_claim_private_repo_is_public(monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.worker import actions
+
+    class Result:
+        returncode = 0
+        stdout = "abc123\tHEAD"
+        stderr = ""
+
+    monkeypatch.setattr(actions.subprocess, "run", lambda *_args, **_kwargs: Result())
+
+    access = actions._probe_repo_with_git("roughcoder/private", timeout_s=1.0)  # noqa: SLF001
+
+    assert access["accessible"] is True
+    assert access["public"] is False
 
 
 def test_cleanup_all_removes_scratch_dir(tmp_path) -> None:

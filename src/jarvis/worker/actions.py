@@ -26,6 +26,7 @@ _SAFE_ENV_KEYS = (
     "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "SHELL", "TZ",
 )
 _DIAGNOSTICS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_REPO_ACCESS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
 
 def _safe_base_env() -> dict:
@@ -302,6 +303,7 @@ def diagnostics(
                 _engine_diagnostic(engine, codex_bin=codex_bin, claude_bin=claude_bin)
                 for engine in engines
             ],
+            "git_identity": git_identity(ttl_s=ttl_s),
             "repositories": repo_inventory(repo_root, ttl_s=ttl_s),
             "package_managers": _package_managers(),
             "browser": _browser_diagnostic(browser_cfg),
@@ -313,6 +315,185 @@ def diagnostics(
     if ttl_s > 0:
         _DIAGNOSTICS_CACHE[cache_key] = (now + ttl_s, dict(rows))
     return rows
+
+
+def git_identity(*, ttl_s: float = 0.0) -> dict[str, Any]:
+    """Public-safe view of the worker's GitHub identity.
+
+    GitHub credentials live on the worker device. The brain only receives the
+    account label and freshness signal needed to decide dispatch eligibility.
+    """
+    cache_key = "git_identity"
+    now = time.monotonic()
+    cached = _DIAGNOSTICS_CACHE.get(cache_key)
+    if ttl_s > 0 and cached is not None and cached[0] > now:
+        return dict(cached[1])
+    row: dict[str, Any] = {
+        "provider": "github",
+        "connected": False,
+        "authenticated": False,
+        "auth_fresh": False,
+        "login": "",
+        "git_user_name": _git_config("user.name"),
+        "git_user_email": _git_config("user.email"),
+        "checked_at": int(time.time()),
+        "detail": "",
+    }
+    if not shutil.which("gh"):
+        row["detail"] = "gh binary not found"
+    else:
+        # These are fixed quick identity sub-probes. The caller-controlled repo
+        # access timeout applies to network authorization checks below.
+        user = _run_quick(["gh", "api", "user", "--jq", ".login"], timeout_s=8.0)
+        if user.returncode == 0 and user.output.strip():
+            row.update(
+                {
+                    "connected": True,
+                    "authenticated": True,
+                    "auth_fresh": True,
+                    "login": _short_detail(user.output.strip()),
+                    "detail": "gh user probe succeeded",
+                }
+            )
+        else:
+            status = _run_quick(["gh", "auth", "status", "-h", "github.com"], timeout_s=8.0)
+            detail = _short_detail(status.output or user.output)
+            row["detail"] = detail or "gh authentication not connected"
+            if status.returncode == 0:
+                row["connected"] = True
+                row["authenticated"] = None
+                row["auth_fresh"] = None
+    if ttl_s > 0:
+        _DIAGNOSTICS_CACHE[cache_key] = (now + ttl_s, dict(row))
+    return row
+
+
+def _git_config(key: str) -> str:
+    # Identity display is a health/readiness quick check, not the repo access
+    # decision itself; keep it bounded independently of the slower access probe.
+    result = _run_quick(["git", "config", "--global", "--get", key], timeout_s=3.0)
+    return _short_detail(result.output) if result.returncode == 0 else ""
+
+
+def probe_repo_access(repo: str, *, timeout_s: float, ttl_s: float) -> dict[str, Any]:
+    """Check whether this worker identity can read a GitHub repo.
+
+    The probe is intentionally equivalent to "could dispatch materialize this?"
+    and is cached per worker process. It reports public access as accessible even
+    without a connected GitHub identity.
+    """
+    repo_ref = _normalize_github_repo(repo)
+    now = time.monotonic()
+    cache_key = f"repo_access:{repo_ref or repo}"
+    cached = _REPO_ACCESS_CACHE.get(cache_key)
+    if ttl_s > 0 and cached is not None and cached[0] > now:
+        row = dict(cached[1])
+        row["cached"] = True
+        return row
+    identity = git_identity(ttl_s=ttl_s)
+    row: dict[str, Any] = {
+        "repo": repo_ref or str(repo or ""),
+        "accessible": False,
+        "public": False,
+        "reason_code": "",
+        "reason": "",
+        "checked_at": int(time.time()),
+        "ttl_s": ttl_s,
+        "cached": False,
+        "git_identity": {
+            "provider": identity.get("provider") or "github",
+            "connected": bool(identity.get("connected")),
+            "login": str(identity.get("login") or ""),
+            "auth_fresh": identity.get("auth_fresh"),
+        },
+    }
+    if not repo_ref:
+        row.update(
+            {
+                "reason_code": "repo-reference-unsupported",
+                "reason": "repo access probe only supports GitHub owner/name refs",
+            }
+        )
+        return row
+    gh_row = _probe_repo_with_gh(repo_ref, timeout_s=timeout_s)
+    if gh_row is not None:
+        row.update(gh_row)
+    else:
+        row.update(_probe_repo_with_git(repo_ref, timeout_s=timeout_s))
+    if not row["accessible"] and not identity.get("connected"):
+        row["reason_code"] = "worker-not-connected-to-github"
+        row["reason"] = "Connect GitHub on this worker."
+    elif not row["accessible"] and not row.get("reason_code"):
+        row["reason_code"] = "identity-lacks-repo-access"
+        row["reason"] = f"Request access to {repo_ref} for this worker identity."
+    if ttl_s > 0:
+        _REPO_ACCESS_CACHE[cache_key] = (now + ttl_s, dict(row))
+    return row
+
+
+def _normalize_github_repo(repo: str) -> str:
+    text = str(repo or "").strip()
+    if text.startswith("git@github.com:"):
+        text = text.removeprefix("git@github.com:")
+    elif text.startswith("https://github.com/"):
+        text = text.removeprefix("https://github.com/")
+    text = text.removesuffix(".git").strip("/")
+    parts = [part for part in text.split("/") if part]
+    if len(parts) == 2 and all(part.replace("-", "").replace("_", "").replace(".", "").isalnum() for part in parts):
+        return "/".join(parts)
+    return ""
+
+
+def _probe_repo_with_gh(repo: str, *, timeout_s: float) -> dict[str, Any] | None:
+    if not shutil.which("gh"):
+        return None
+    result = _run_quick(
+        ["gh", "repo", "view", repo, "--json", "nameWithOwner,visibility", "--jq", ".nameWithOwner + \" \" + .visibility"],
+        timeout_s=timeout_s,
+    )
+    if result.returncode != 0:
+        return None
+    parts = result.output.strip().split()
+    visibility = parts[1].lower() if len(parts) > 1 else ""
+    return {
+        "repo": parts[0] if parts else repo,
+        "accessible": True,
+        "public": visibility == "public",
+        "reason_code": "accessible",
+        "reason": "Worker GitHub identity can read this repo.",
+    }
+
+
+def _probe_repo_with_git(repo: str, *, timeout_s: float) -> dict[str, Any]:
+    remote = f"https://github.com/{repo}.git"
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "--exit-code", remote],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout_s,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "accessible": False,
+            "reason_code": "repo-access-probe-failed",
+            "reason": _short_detail(str(exc) or exc.__class__.__name__),
+        }
+    if result.returncode == 0:
+        return {
+            "accessible": True,
+            "public": False,
+            "reason_code": "accessible",
+            "reason": "Git can read this repo with the worker's configured credentials.",
+        }
+    return {
+        "accessible": False,
+        "reason_code": "identity-lacks-repo-access",
+        "reason": _short_detail((result.stderr or result.stdout) or "git ls-remote failed"),
+    }
 
 
 def _engine_diagnostic(engine: str, *, codex_bin: str, claude_bin: str) -> dict[str, Any]:
@@ -506,6 +687,22 @@ async def clone_repo(name: str, repo_root: str, timeout_s: float) -> tuple[str |
     if (dest / ".git").exists():
         return str(dest), None
     return None, f"couldn't clone {name!r}: {out[:200]}"
+
+
+async def fetch_repo(repo: str, timeout_s: float) -> str | None:
+    """Best-effort fetch for an existing repo; returns an operator-visible error.
+
+    This intentionally runs against the current checkout until the worker grows
+    a bare-mirror cache. Callers must treat failures as warnings when a usable
+    local checkout already exists.
+    """
+    remote = await run_exec(["git", "-C", repo, "remote", "get-url", "origin"], None, min(timeout_s, 10.0))
+    if remote.startswith("error"):
+        return None
+    out = await run_exec(["git", "-C", repo, "fetch", "--prune", "origin"], None, timeout_s)
+    if out.startswith("error"):
+        return f"couldn't fetch {repo!r}: {out[:500]}"
+    return None
 
 
 async def prepare_worktree(

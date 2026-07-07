@@ -319,6 +319,8 @@ class WorkerProfile:
     supported_engines: list[str] = field(default_factory=list)
     engine_supports: dict[str, dict[str, bool]] = field(default_factory=dict)
     system: dict[str, Any] = field(default_factory=dict)
+    git_identity: dict[str, Any] = field(default_factory=dict)
+    repo_access: list[dict[str, Any]] = field(default_factory=list)
     repositories: list[dict[str, Any]] = field(default_factory=list)
     readiness: dict[str, Any] | None = None
 
@@ -328,6 +330,11 @@ class WorkerProfile:
         self.agent = self.default_engine
         if not isinstance(self.system, dict):
             self.system = {}
+        if not isinstance(self.git_identity, dict):
+            self.git_identity = {}
+        if not isinstance(self.repo_access, list):
+            self.repo_access = []
+        self.repo_access = [dict(item) for item in self.repo_access if isinstance(item, dict) and item.get("repo")]
         if not isinstance(self.repositories, list):
             self.repositories = []
         self.repositories = [dict(item) for item in self.repositories if isinstance(item, dict) and (item.get("repo") or item.get("name"))]
@@ -359,6 +366,9 @@ class WorkerProfile:
             "supported_engines": self.supported_engines,
             "engine_supports": self.engine_supports,
             "system": self.system,
+            "git_identity": _public_value(self.git_identity),
+            "repo_access": _public_value(self.repo_access),
+            "repositories": _public_value(self.repositories),
             "readiness": _public_value(self.readiness),
             "token_set": self.token_set,
         }

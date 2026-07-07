@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import shutil
 import threading
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -208,6 +209,37 @@ class SessionManager:
             session.updated_at = utc_now()
             self.save(session)
             return session
+
+    def update_workspace(
+        self,
+        session_id: str,
+        *,
+        cwd: str = "",
+        branch: str = "",
+        repo: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> WorkerSession:
+        with self._lock:
+            session = self.get(session_id)
+            if session is None:
+                raise KeyError(session_id)
+            if cwd:
+                session.cwd = cwd
+            if branch:
+                session.branch = branch
+            if repo:
+                session.repo = repo
+            if metadata:
+                session.metadata.update(metadata)
+            session.updated_at = utc_now()
+            self.save(session)
+            return session
+
+    def delete(self, session_id: str) -> None:
+        with self._lock:
+            directory = self.session_dir(session_id)
+            if directory.exists():
+                shutil.rmtree(directory)
 
     def append_event(self, session_id: str, event_type: str, data: dict[str, Any] | None = None) -> SessionEvent:
         with self._lock:

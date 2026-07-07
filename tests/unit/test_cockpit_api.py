@@ -387,6 +387,7 @@ def _cfg(
                         "status": "online",
                         "agent": "codex",
                         "supported_engines": ["codex", "claude"],
+                        "repo_access": [{"repo": "roughcoder/jarvis", "accessible": True, "reason_code": "accessible"}],
                         "engine_supports": {
                             "codex": {
                                 "streaming": True,
@@ -4694,12 +4695,12 @@ def test_cockpit_work_start_manual_dispatches_worker_session(tmp_path, monkeypat
         assert body["ok"] is True
         assert body["run"]["repo"] == "roughcoder/jarvis"
         assert body["session"]["session_ref"].startswith("sessref_")
-        assert len(post_calls) == 2
-        # The synchronous first-turn events from dispatch land in the run log.
+        assert [url.rsplit("/", 1)[-1] for url in post_calls] == ["sessions", "turns"]
+        # The synchronous create/provision and first-turn events from dispatch land in the run log.
         store = OrchestrationStore(cfg.orchestration.workspace)
         run_id = body["run"]["run_id"]
         persisted_ids = [e.data.get("event_id") for e in store.events(run_id) if isinstance(e.data, dict) and e.data.get("event_id")]
-        assert persisted_ids == ["ev_turn"]
+        assert persisted_ids == ["ev_create", "ev_turn"]
 
     import asyncio
 
@@ -4919,6 +4920,25 @@ def test_cockpit_worker_repositories_projection_marks_default_repo() -> None:
     profile = WorkerProfile(
         worker_id="macbook-worker",
         display_name="MacBook Pro",
+        git_identity={
+            "provider": "github",
+            "connected": True,
+            "authenticated": True,
+            "auth_fresh": True,
+            "login": "octocat",
+            "detail": "gh user probe succeeded",
+        },
+        repo_access=[
+            {
+                "repo": "roughcoder/jarvis",
+                "accessible": True,
+                "public": False,
+                "reason_code": "accessible",
+                "reason": "Worker GitHub identity can read this repo.",
+                "checked_at": 1751371200,
+                "ttl_s": 300,
+            }
+        ],
         repositories=[
             {"repo": "jarvis", "default_branch": "main", "status": "ready"},
             {"repo": "polymarket", "default_branch": "develop", "status": "cloning"},
@@ -4927,13 +4947,18 @@ def test_cockpit_worker_repositories_projection_marks_default_repo() -> None:
         ],
     )
 
-    rows = project_worker_profile(profile, default_repo="roughcoder/jarvis")["repositories"]
+    projected = project_worker_profile(profile, default_repo="roughcoder/jarvis")
+    rows = projected["repositories"]
 
     assert rows == [
         {"repo": "jarvis", "status": "ready", "default_branch": "main", "is_default": True, "can_start_work": True},
         {"repo": "polymarket", "status": "cloning", "default_branch": "develop", "is_default": False, "can_start_work": False},
         {"repo": "legacy-name-key", "status": "ready", "default_branch": "", "is_default": False, "can_start_work": True},
     ]
+    assert projected["git_identity"]["login"] == "octocat"
+    assert projected["git_identity"]["connected"] is True
+    assert projected["repo_access"][0]["repo"] == "roughcoder/jarvis"
+    assert projected["repo_access"][0]["reason_code"] == "accessible"
 
 
 def test_cockpit_workers_probe_surfaces_health_published_repositories(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -5016,8 +5041,25 @@ def test_cockpit_work_validate_reports_selection_without_creating_a_run(tmp_path
     assert validation["compatibility"]["repo"] == "roughcoder/jarvis"
     assert validation["compatibility"]["selected_worker_id"] == "macbook-worker"
     assert validation["compatibility"]["workers"] == [
-        {"worker_id": "macbook-worker", "eligible": True, "reasons": ["selected"]}
+        {
+            "worker_id": "macbook-worker",
+            "eligible": True,
+            "reasons": ["selected"],
+            "reason_codes": ["selected"],
+            "repo_access": {
+                "repo": "roughcoder/jarvis",
+                "accessible": True,
+                "public": False,
+                "reason_code": "accessible",
+                "checked_at": None,
+                "cached": False,
+            },
+        }
     ]
+    assert validation["compatibility"]["warnings"] == []
+    assert validation["reason_codes"] == []
+    assert validation["warnings"] == []
+    assert validation["warning_codes"] == []
     assert validation["missing"] == []
     assert validation["missing_authority"] == []
     assert OrchestrationStore(cfg.orchestration.workspace).list_runs() == []
@@ -5038,6 +5080,7 @@ def test_cockpit_work_validate_reports_worker_repo_compatibility(tmp_path, monke
                         "capabilities": ["git", "codex"],
                         "status": "online",
                         "supported_engines": ["codex"],
+                        "repo_access": [{"repo": "roughcoder/jarvis", "accessible": True, "reason_code": "accessible"}],
                         "repositories": [{"repo": "jarvis", "status": "ready", "default_branch": "main"}],
                     },
                     {
@@ -5047,6 +5090,7 @@ def test_cockpit_work_validate_reports_worker_repo_compatibility(tmp_path, monke
                         "capabilities": ["git", "codex"],
                         "status": "online",
                         "supported_engines": ["codex"],
+                        "repo_access": [{"repo": "roughcoder/jarvis", "accessible": True, "reason_code": "accessible"}],
                         "repositories": [{"repo": "other", "status": "ready", "default_branch": "main"}],
                     },
                 ]
@@ -5069,12 +5113,39 @@ def test_cockpit_work_validate_reports_worker_repo_compatibility(tmp_path, monke
 
     assert validation["compatibility"] == {
         "repo": "roughcoder/jarvis",
-        "selected_worker_id": "macbook-worker",
-        "workers": [
-            {"worker_id": "macbook-worker", "eligible": True, "reasons": ["selected"]},
-            {"worker_id": "hive-worker", "eligible": True, "reasons": ["eligible", "repo not checked out"]},
-        ],
-    }
+            "selected_worker_id": "macbook-worker",
+            "warnings": [],
+            "workers": [
+                {
+                    "worker_id": "macbook-worker",
+                    "eligible": True,
+                    "reasons": ["selected"],
+                    "reason_codes": ["selected"],
+                    "repo_access": {
+                        "repo": "roughcoder/jarvis",
+                        "accessible": True,
+                        "public": False,
+                        "reason_code": "accessible",
+                        "checked_at": None,
+                        "cached": False,
+                    },
+                },
+                {
+                    "worker_id": "hive-worker",
+                    "eligible": True,
+                    "reasons": ["eligible", "repo not checked out"],
+                    "reason_codes": ["eligible", "repo-not-warm"],
+                    "repo_access": {
+                        "repo": "roughcoder/jarvis",
+                        "accessible": True,
+                        "public": False,
+                        "reason_code": "accessible",
+                        "checked_at": None,
+                        "cached": False,
+                    },
+                },
+            ],
+        }
 
 
 def test_cockpit_work_validate_flags_missing_repo_without_side_effects(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -5509,6 +5580,7 @@ def test_cockpit_work_start_capacity_uses_probed_worker_state(tmp_path, monkeypa
     def probe(_self, profile):  # noqa: ANN001
         profile.status = "online"
         profile.current_jobs = profile.max_concurrent_jobs
+        profile.repo_access = [{"repo": "roughcoder/jarvis", "accessible": True, "reason_code": "accessible"}]
         return profile
 
     monkeypatch.setattr("jarvis.orchestration.workers.WorkerRegistry._probe", probe)

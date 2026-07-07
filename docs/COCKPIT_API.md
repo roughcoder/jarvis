@@ -1265,6 +1265,29 @@ names.
       "detail": "ready"
     }
   },
+  "git_identity": {
+    "provider": "github",
+    "connected": true,
+    "authenticated": true,
+    "auth_fresh": true,
+    "login": "octocat",
+    "git_user_name": "Mona Lisa",
+    "git_user_email": "mona@example.test",
+    "checked_at": 1751371200,
+    "detail": "gh user probe succeeded"
+  },
+  "repo_access": [
+    {
+      "repo": "roughcoder/jarvis",
+      "accessible": true,
+      "public": false,
+      "reason_code": "accessible",
+      "reason": "Worker GitHub identity can read this repo.",
+      "checked_at": 1751371200,
+      "ttl_s": 300,
+      "cached": false
+    }
+  ],
   "repositories": [
     {
       "repo": "jarvis",
@@ -1281,11 +1304,21 @@ names.
 `readiness` is populated only for probed responses (`?probe=true`). Static
 worker-profile responses set it to `null`. It is a public-safe projection of
 the worker's authorised `/health.diagnostics` block: engine install/auth/version
-state, package-manager availability, and browser readiness. Local filesystem
-paths, binary paths, and credential locations are redacted before exposure.
+state, GitHub identity freshness, package-manager availability, and browser
+readiness. Local filesystem paths, binary paths, and credential locations are
+redacted before exposure.
 If a worker has no cached diagnostics yet, or cached diagnostics are stale, the
 worker may return `{"status":"refreshing"}` while it refreshes the expensive
 checks in the background; clients should keep treating `/health.ok` as liveness.
+
+`git_identity` reports the GitHub account held by the worker device, not the
+dispatching Jarvis principal. `repo_access` contains cached/on-demand access
+probe rows for repos the brain has asked that worker about. `accessible: true`
+means the worker can materialize the repo now; `public: true` means the repo is
+readable without relying on a private worker identity. Common remediation
+`reason_code` values include `worker-not-connected-to-github`,
+`identity-lacks-repo-access`, `repo-access-probe-failed`, and
+`repo-reference-unsupported`.
 
 `repositories` is the Jarvis-owned repo registry for this worker. Rows come
 from the worker profile (`workers.json`) and, on probe, from the worker's
@@ -1297,8 +1330,10 @@ those checks failed and `detail` may explain why. `is_default` marks the repo
 matching the worker profile's own `default_repo` when set, otherwise
 `ORCHESTRATION_DEFAULT_REPO` (an `org/name` default matches a bare checkout
 name on the trailing segment). `can_start_work` is true when the repo's status
-is `ready`. Workers that publish nothing return `[]` — the cockpit should then
-fall back to `start_options.defaults.repo` or a manual repo field.
+is `ready`, but checkout readiness is only a warm-cache latency hint; access
+eligibility comes from `repo_access`. Workers that publish nothing return `[]`
+— the cockpit should then fall back to `start_options.defaults.repo` or a
+manual repo field.
 
 `last_seen_at` is stamped when a probe of the worker last succeeded; without a
 probe in the current request it may be empty even for a worker recorded as
@@ -1747,18 +1782,33 @@ failed start records. Use it to power start-wizard validation.
         {
           "worker_id": "macbook-worker",
           "eligible": true,
-          "reasons": ["selected"]
+          "reasons": ["selected"],
+          "reason_codes": ["selected"],
+          "repo_access": null
         },
         {
           "worker_id": "hive-worker",
           "eligible": true,
-          "reasons": ["eligible", "repo not checked out"]
+          "reasons": ["eligible", "repo not checked out"],
+          "reason_codes": ["eligible", "repo-not-warm"],
+          "repo_access": {
+            "repo": "roughcoder/jarvis",
+            "accessible": true,
+            "public": false,
+            "reason_code": "accessible",
+            "checked_at": 1751371200,
+            "cached": false
+          }
         }
       ],
-      "selected_worker_id": "macbook-worker"
+      "selected_worker_id": "macbook-worker",
+      "warnings": []
     },
     "missing": ["repo"],
     "missing_authority": [],
+    "reason_codes": ["missing-repo"],
+    "warnings": [],
+    "warning_codes": [],
     "reasons": ["work item has no repo/default repo; cannot start a coding worker"],
     "notes": []
   }
@@ -1768,14 +1818,21 @@ failed start records. Use it to power start-wizard validation.
 `worker_id`/`engine`/`engines` report the selection Jarvis would make;
 `missing` lists absent required fields, `missing_authority` lists denied
 capability actions, and `reasons` is the human-readable roll-up.
+`reason_codes`, worker-row `reason_codes`, and `warning_codes` are
+machine-readable and stable enough for UI branching.
 `compatibility` explains worker↔repo selection from the same probed registry
 path used by `/v1/work/start`. `compatibility.repo` is the resolved repo, each
 worker row says whether that worker is eligible, and `reasons` explains either
 the chosen row (`selected`), an alternate eligible row (`eligible`), advisory
 compatibility notes such as `repo not checked out` (the worker may clone on
-demand), or why a worker was excluded (for example `repo checkout broken`,
-`engine codex unavailable`, `engine codex unauthenticated`, `worker offline`,
-or `worker at capacity`). For github and linear sources, Jarvis peeks at the
+dispatch because access is already confirmed), or why a worker was excluded
+(for example `identity-lacks-repo-access`, `worker-not-connected-to-github`,
+`repo checkout broken`, `engine codex unavailable`,
+`engine codex unauthenticated`, `worker offline`, or `worker at capacity`).
+Jarvis blocks only when no worker identity can access the repo and the repo is
+not public. If a requested worker lacks access but another worker has it,
+`warnings` includes `repo-private-choose-other-worker`. For github and linear
+sources, Jarvis peeks at the
 source read-only (`next()` lists without claiming) and reports the candidate as
 `work_item`
 (`{source, id, title, repo, kind}`); if the source has no eligible item,
@@ -2017,6 +2074,19 @@ full projection; filtering clients should ignore rows they do not care about.
 
 Future API changes should be appended here with date, schema version, compatible
 or breaking status, and migration notes.
+
+### 2026-07-07 - Worker repo access and provisioning visibility (compatible)
+
+- Added `WorkerProfile.git_identity` and `WorkerProfile.repo_access` so
+  cockpits can show the GitHub identity a worker will fetch/push as and the
+  cached/on-demand repo access probes for that identity.
+- `/v1/work/validate` now treats repo checkout state as a warm-cache hint and
+  uses worker repo access as the eligibility predicate. It adds top-level and
+  worker-row `reason_codes`, plus `warnings`/`warning_codes` such as
+  `repo-private-choose-other-worker`.
+- Worker dispatch provisioning now emits `provisioning.progress` session events
+  for `resolving-access`, `cloning`, `creating-worktree`, and `running`, with
+  phase-specific failures surfaced in the worker response and run timeline.
 
 ### 2026-07-06 - MCP serve OAuth status projection (compatible)
 
