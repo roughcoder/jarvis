@@ -7,6 +7,7 @@ from jarvis.account_router import AccountRouter, classify_email_recipient
 from jarvis.accounts import AccountBinding
 from jarvis.runtime import RequestContext
 from jarvis.users import HOUSE
+from conftest import request_context
 
 
 def _ctx(
@@ -15,7 +16,7 @@ def _ctx(
     scope: str = "house",
     confidence: str = "strong",
 ) -> RequestContext:
-    return RequestContext("dev", identity, scope, frozenset(caps), confidence=confidence)
+    return request_context(*caps, identity=identity, scope=scope, confidence=confidence)
 
 
 def _binding(kind: str, *grants: str, principal: str = HOUSE, provider: str = "fake") -> AccountBinding:

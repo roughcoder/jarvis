@@ -15,17 +15,11 @@ from jarvis.brain.memory_tools import make_memory_tools
 from jarvis.brain.registry import ContactEntry, ProjectEntry, RegistryStore
 from jarvis.config import MemoryConfig
 from jarvis.runtime import RequestContext, ToolRegistry
+from conftest import request_context
 
 
 def _ctx(*caps: str, identity: str = "neil", peer: str = "neil") -> RequestContext:
-    return RequestContext(
-        "dev",
-        identity,
-        "personal",
-        frozenset(caps),
-        channel="voice",
-        peer=peer,
-    )
+    return request_context(*caps, identity=identity, scope="personal", peer=peer)
 
 
 def _memory_cfg(tmp_path: Path, **over: Any) -> MemoryConfig:

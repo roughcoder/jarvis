@@ -14,10 +14,11 @@ from jarvis.brain.context import RequestContext
 from jarvis.config import WorkerConfig, load_config
 from jarvis.tools import build_registry
 from jarvis.tools.worker import make_worker_tools
+from conftest import request_context
 
 
 def _ctx(*caps: str) -> RequestContext:
-    return RequestContext("neil-mac", "neil", "personal", frozenset(caps))
+    return request_context(*caps, device_id="neil-mac", identity="neil", scope="personal")
 
 
 def test_worker_tools_registered_and_gated() -> None:

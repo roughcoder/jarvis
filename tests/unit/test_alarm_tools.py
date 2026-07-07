@@ -8,12 +8,13 @@ from jarvis.brain.context import RequestContext
 from jarvis.brain.scheduler import Scheduler
 from jarvis.config import load_config
 from jarvis.tools.alarm import make_alarm_tools
+from conftest import request_context
 
 _NAMES = {"set_alarm", "cancel_alarm", "list_alarms"}
 
 
 def _ctx(*caps: str, device: str = "mac") -> RequestContext:
-    return RequestContext(device, "neil", "personal", frozenset(caps))
+    return request_context(*caps, device_id=device, identity="neil", scope="personal")
 
 
 def _tools():  # noqa: ANN202

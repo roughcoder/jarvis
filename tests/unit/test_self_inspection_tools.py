@@ -10,10 +10,17 @@ from jarvis.brain.context import RequestContext
 from jarvis.config import CapabilityConfig, ToolsConfig
 from jarvis.tools import build_registry
 from jarvis.tools.self_inspection import make_self_tools
+from conftest import request_context
 
 
 def _ctx(*caps: str) -> RequestContext:
-    return RequestContext("local-mac", "neil", "personal", frozenset(caps), channel="text")
+    return request_context(
+        *caps,
+        device_id="local-mac",
+        identity="neil",
+        scope="personal",
+        channel="text",
+    )
 
 
 def test_self_tools_registered_and_gated() -> None:

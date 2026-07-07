@@ -12,6 +12,7 @@ from jarvis.runtime import RequestContext
 from jarvis.tools import build_registry
 from jarvis.tools.google import make_google_tools
 from jarvis.users import HOUSE
+from conftest import request_context
 
 
 def _ctx(
@@ -20,7 +21,13 @@ def _ctx(
     scope: str = HOUSE,
     confidence: str = "strong",
 ) -> RequestContext:
-    return RequestContext("mac", identity, scope, frozenset(caps), confidence=confidence)
+    return request_context(
+        *caps,
+        device_id="mac",
+        identity=identity,
+        scope=scope,
+        confidence=confidence,
+    )
 
 
 def _binding(kind: str, *grants: str) -> AccountBinding:

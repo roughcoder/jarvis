@@ -17,10 +17,11 @@ from jarvis.brain.session import _AGENCY, _BACKGROUND_GUIDANCE, BrainSession
 from jarvis.config import WorkerConfig, load_config
 from jarvis.tools.base import Tool, ToolError, ToolRegistry
 from jarvis.tools.worker import make_worker_tools
+from conftest import request_context
 
 
 def _ctx(*caps: str) -> RequestContext:
-    return RequestContext("d", "house", "house", frozenset(caps))
+    return request_context(*caps, device_id="d")
 
 
 # --- timeout legibility + per-tool override --------------------------------

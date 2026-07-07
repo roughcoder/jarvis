@@ -16,12 +16,13 @@ from jarvis.config import BrowserConfig, ToolsConfig, WorkerConfig, load_config
 from jarvis.tools import build_registry
 from jarvis.tools.base import ToolRegistry
 from jarvis.tools.browser import make_browser_tools
+from conftest import request_context
 
 _BROWSER = {"browser_open", "browser_snapshot", "browser_click", "browser_type", "browser_read", "browser_press"}
 
 
 def _ctx(*caps: str) -> RequestContext:
-    return RequestContext("d", "neil", "personal", frozenset(caps))
+    return request_context(*caps, device_id="d", identity="neil", scope="personal")
 
 
 def test_browser_tools_gated_by_capability() -> None:
