@@ -3014,6 +3014,55 @@ def test_cockpit_thread_delete_removes_index_and_memory_session_idempotently(tmp
     assert not (connector.index.transcripts_dir / "neil-shared" / "thread_delete.json").exists()
 
 
+def test_cockpit_thread_delete_promotes_children_to_root(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    connector = CockpitConnector(cfg, memory=memory, gateway=FakeGateway(["unused"]), tts=None, tracer=None)
+    parent = connector.index.save(
+        CockpitThread(
+            thread_id="thread_parent_del",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_parent_del"),
+            title="Parent",
+            created_at="2026-07-05T09:00:00+00:00",
+            updated_at="2026-07-05T09:00:00+00:00",
+            created_by="neil",
+        )
+    )
+    child_thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_child_del",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_child_del"),
+            title="Child",
+            created_at="2026-07-05T09:00:00+00:00",
+            updated_at="2026-07-05T09:00:00+00:00",
+            created_by="neil",
+            parent_chat_id=parent.thread_id,
+        )
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+    monkeypatch.setattr(cockpit_api_module, "MemoryClient", lambda _cfg: memory)
+    store = OrchestrationStore(cfg.orchestration.workspace, thread_children_promoter=connector.index.promote_children)
+    child_run = store.create_run("Child work", parent_chat_id=parent.thread_id)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.delete(f"{base}/v1/projects/neil-shared/threads/{parent.thread_id}")
+        assert response.status_code == 200
+        assert response.json()["deleted"] is True
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+    promoted_thread = connector.index.get("neil-shared", child_thread.thread_id)
+    assert promoted_thread is not None
+    assert promoted_thread.parent_chat_id == ""
+    reloaded_run = OrchestrationStore(cfg.orchestration.workspace).get(child_run.run_id)
+    assert reloaded_run is not None
+    assert reloaded_run.parent_chat_id is None
+
+
 def test_cockpit_thread_delete_treats_missing_v3_memory_session_as_reclaimed(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil", memory_backend="v3")
     _seed_project_registry(cfg)

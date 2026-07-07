@@ -223,7 +223,9 @@ class OrchestrationStore:
 
     def promote_children(self, parent_chat_id: str) -> list[OrchestrationRun]:
         with self._locked():
-            return self._promote_children_unlocked(parent_chat_id)
+            promoted = self._promote_children_unlocked(parent_chat_id)
+        self._promote_thread_children(parent_chat_id)
+        return promoted
 
     def rename_run(self, run_id: str, title: str) -> OrchestrationRun:
         title = " ".join(title.split())
