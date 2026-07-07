@@ -91,6 +91,17 @@ class TurnLoop:
         )
         users = load_users(cfg.capabilities.users_dir)
         self._store = ContextStore(self._make_session)
+        self._curation_outbox = CurationOutbox(
+            self._cfg.memory.curation_outbox_path,
+            max_retries=self._cfg.memory.curation_outbox_max_retries,
+            backoff_initial_s=self._cfg.memory.curation_outbox_backoff_initial_s,
+            backoff_max_s=self._cfg.memory.curation_outbox_backoff_max_s,
+        )
+        self._registry_store = RegistryStore(
+            self._cfg.registry.path,
+            memory=memory,
+            curation_outbox=self._curation_outbox,
+        )
         self._register_memory_tools(memory, users)
         self._register_project_tools(memory)
         # MCP servers connect at startup (off the hot path); OAuth servers connect
@@ -107,28 +118,20 @@ class TurnLoop:
         self.state = State.PASSIVE
 
     def _register_memory_tools(self, memory: MemoryClient, users: dict) -> None:
-        outbox = CurationOutbox(
-            self._cfg.memory.curation_outbox_path,
-            max_retries=self._cfg.memory.curation_outbox_max_retries,
-            backoff_initial_s=self._cfg.memory.curation_outbox_backoff_initial_s,
-            backoff_max_s=self._cfg.memory.curation_outbox_backoff_max_s,
-        )
-        store = RegistryStore(self._cfg.registry.path)
         for tool in make_memory_tools(
             self._cfg.memory,
             memory=memory,
-            outbox=outbox,
-            registry=store,
+            outbox=self._curation_outbox,
+            registry=self._registry_store,
             users=users,
         ):
             self._registry.register(tool)
 
     def _register_project_tools(self, memory: MemoryClient) -> None:
-        store = RegistryStore(self._cfg.registry.path)
         for tool in make_project_tools(
             self._cfg.memory,
             memory=memory,
-            registry=store,
+            registry=self._registry_store,
             contexts=self._store,
         ):
             self._registry.register(tool)

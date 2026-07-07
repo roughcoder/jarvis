@@ -3016,7 +3016,11 @@ def _configured_worker_count(cfg: Config) -> int:
 
 
 def _registry_store(cfg: Config) -> RegistryStore:
-    return RegistryStore(cfg.registry.path)
+    return RegistryStore(
+        cfg.registry.path,
+        memory=MemoryClient(cfg.memory),
+        curation_outbox=_curation_outbox(cfg),
+    )
 
 
 def _legacy_cockpit_requester_id(cfg: Config) -> str:

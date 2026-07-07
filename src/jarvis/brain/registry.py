@@ -15,7 +15,12 @@ import tempfile
 from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Literal
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from jarvis.brain.memory_client import MemoryBackend
+    from jarvis.brain.memory_outbox import CurationOutbox
 
 
 Visibility = Literal["household", "private", "shared"]
@@ -305,8 +310,18 @@ class RegistryStore:
     consistent, but concurrent RegistryStore instances would be last-writer-wins.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        memory: "MemoryBackend | None" = None,
+        memory_factory: "Callable[[], MemoryBackend] | None" = None,
+        curation_outbox: "CurationOutbox | None" = None,
+    ) -> None:
         self.path = Path(path).expanduser()
+        self._memory = memory
+        self._memory_factory = memory_factory
+        self._curation_outbox = curation_outbox
         self._projects: dict[str, ProjectEntry] = {}
         self._contacts: dict[str, ContactEntry] = {}
         self.load()
@@ -495,9 +510,47 @@ class RegistryStore:
         return updated_survivor
 
     def _after_contact_merge(self, survivor: ContactEntry, loser: ContactEntry) -> None:
-        # TODO(memory-step): copy explicit Honcho conclusions from loser.peer_id
-        # to survivor.peer_id once the curation/outbox lane exists.
-        _ = (survivor, loser)
+        memory = self._memory
+        if memory is None and self._memory_factory is not None:
+            memory = self._memory_factory()
+            self._memory = memory
+        if memory is None or self._curation_outbox is None:
+            print(
+                "  [memory] contact merged without conclusion copy - "
+                "registry store is not memory-wired"
+            )
+            return
+        try:
+            conclusions = memory.list_conclusions(
+                observed_id=loser.peer_id,
+                level="explicit",
+            )
+        except Exception as exc:  # noqa: BLE001 - merge must not depend on memory availability.
+            print(f"  [memory] contact-merge conclusion copy skipped: {exc}")
+            return
+
+        for conclusion in conclusions:
+            content = conclusion.content.strip()
+            if not content:
+                continue
+            metadata = dict(conclusion.metadata)
+            original_content_hash = str(metadata.pop("content_hash", "") or "")
+            if original_content_hash:
+                metadata.setdefault("copied_from_content_hash", original_content_hash)
+            metadata.setdefault("copied_from_peer_id", loser.peer_id)
+            metadata.setdefault("copied_from_conclusion_id", conclusion.id)
+            metadata.setdefault("copied_reason", "contact_merge")
+            observer_id = (
+                survivor.peer_id
+                if conclusion.observer_id == loser.peer_id
+                else conclusion.observer_id
+            )
+            self._curation_outbox.enqueue_create(
+                observed_id=survivor.peer_id,
+                observer_id=observer_id,
+                content=content,
+                metadata=metadata,
+            )
 
     def _validate_contact_identifiers(self) -> None:
         seen: dict[str, str] = {}

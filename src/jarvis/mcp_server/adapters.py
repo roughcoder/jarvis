@@ -81,6 +81,7 @@ class JarvisMCPService:
         self._cockpit = cockpit
         self._project_client = project_client
         self._users = users
+        self._curation_outbox: CurationOutbox | None = None
 
     @property
     def users(self) -> dict[str, User]:
@@ -91,7 +92,11 @@ class JarvisMCPService:
     @property
     def registry(self) -> RegistryStore:
         if self._registry is None:
-            self._registry = RegistryStore(self.cfg.registry.path)
+            self._registry = RegistryStore(
+                self.cfg.registry.path,
+                memory_factory=lambda: self.memory,
+                curation_outbox=self._outbox(),
+            )
         return self._registry
 
     @property
@@ -509,12 +514,14 @@ class JarvisMCPService:
             raise MCPAccessError(str(exc)) from exc
 
     def _outbox(self) -> CurationOutbox:
-        return CurationOutbox(
-            self.cfg.memory.curation_outbox_path,
-            max_retries=self.cfg.memory.curation_outbox_max_retries,
-            backoff_initial_s=self.cfg.memory.curation_outbox_backoff_initial_s,
-            backoff_max_s=self.cfg.memory.curation_outbox_backoff_max_s,
-        )
+        if self._curation_outbox is None:
+            self._curation_outbox = CurationOutbox(
+                self.cfg.memory.curation_outbox_path,
+                max_retries=self.cfg.memory.curation_outbox_max_retries,
+                backoff_initial_s=self.cfg.memory.curation_outbox_backoff_initial_s,
+                backoff_max_s=self.cfg.memory.curation_outbox_backoff_max_s,
+            )
+        return self._curation_outbox
 
     async def _brain_project_write(self, ctx: RequestContext, op: str, payload: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -628,7 +635,11 @@ class MCPCockpitConnector(CockpitConnector):
         contexts = ContextStore(lambda _ctx: None)  # type: ignore[arg-type]
         active = ActiveProject(id=project.id, name=project.name, peer_id=project.peer_id)
         contexts.set_active_project(ctx, active)
-        registry_store = RegistryStore(self._cfg.registry.path)
+        registry_store = RegistryStore(
+            self._cfg.registry.path,
+            memory=memory,
+            curation_outbox=self._curation_outbox,
+        )
         users = load_users(self._cfg.capabilities.users_dir)
         tools = build_registry(
             self._cfg.tools,
@@ -640,16 +651,10 @@ class MCPCockpitConnector(CockpitConnector):
             capabilities=self._cfg.capabilities,
             memory=memory,
         )
-        outbox = CurationOutbox(
-            self._cfg.memory.curation_outbox_path,
-            max_retries=self._cfg.memory.curation_outbox_max_retries,
-            backoff_initial_s=self._cfg.memory.curation_outbox_backoff_initial_s,
-            backoff_max_s=self._cfg.memory.curation_outbox_backoff_max_s,
-        )
         for tool in make_memory_tools(
             self._cfg.memory,
             memory=memory,
-            outbox=outbox,
+            outbox=self._curation_outbox,
             registry=registry_store,
             users=users,
         ):
