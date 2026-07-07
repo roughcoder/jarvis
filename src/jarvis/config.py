@@ -75,7 +75,7 @@ class MemoryConfig(_Base):
 
     model_config = SettingsConfigDict(env_prefix="MEMORY_", env_file=".env", extra="ignore")
 
-    backend: str = "v2"  # v2 stays default until the Honcho v3 cutover.
+    backend: str = "v3"  # production cut over 2026-07-05; v2 retained for rollback only.
     host: str = "localhost"
     port: int = 8000
     api_key: SecretStr = SecretStr("")  # shared secret on the Honcho server

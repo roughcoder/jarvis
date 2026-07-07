@@ -39,8 +39,14 @@ def _json(request: httpx.Request) -> dict[str, Any]:
     return json.loads(request.content.decode("utf-8"))
 
 
-def test_memory_client_factory_keeps_v2_default() -> None:
+def test_memory_client_factory_defaults_to_v3() -> None:
     client = MemoryClient(MemoryConfig(_env_file=None))
+
+    assert isinstance(client, HonchoV3MemoryClient)
+
+
+def test_memory_client_factory_keeps_v2_for_rollback() -> None:
+    client = MemoryClient(MemoryConfig(_env_file=None, backend="v2"))
 
     assert isinstance(client, HonchoV2MemoryClient)
     with pytest.raises(UnsupportedMemoryOperation):
