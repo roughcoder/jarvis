@@ -3578,3 +3578,9 @@ def test_codex_turn_input_appends_image_items() -> None:
         {"type": "text", "text": "look at this"},
         {"type": "image", "url": "data:image/png;base64,cG5n"},
     ]
+
+
+def test_worker_app_client_max_size_fits_attachment_budget(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    app = make_app(cfg)
+    assert app._client_max_size == max(1024 * 1024, cfg.max_request_bytes)  # noqa: SLF001

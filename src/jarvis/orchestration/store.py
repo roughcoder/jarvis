@@ -40,6 +40,12 @@ class ActiveWorkerSessionError(RuntimeError):
         self.session = session
 
 
+class RunArchivedError(RuntimeError):
+    def __init__(self, run_id: str) -> None:
+        super().__init__(f"run {run_id} is archived")
+        self.run_id = run_id
+
+
 class OrchestrationStore:
     """File-backed run graph store.
 
@@ -230,6 +236,13 @@ class OrchestrationStore:
         """Restore a session consistently across run links and worker-only indexes."""
 
         with self._locked():
+            # An archived run hides all of its sessions regardless of the
+            # session-level flag; without a run unarchive endpoint, clearing
+            # the session flag would report success while the row stays
+            # invisible. Refuse instead of lying.
+            for run in self.list_runs():
+                if run.archived_at and any(x.worker_id == worker_id and x.session_id == session_id for x in run.sessions):
+                    raise RunArchivedError(run.run_id)
             was_archived = self._unarchive_worker_session_unlocked(worker_id, session_id)
             for run in self.list_runs():
                 session = next((x for x in run.sessions if x.worker_id == worker_id and x.session_id == session_id), None)
@@ -410,7 +423,7 @@ class OrchestrationStore:
             if session is None:
                 raise KeyError(session_id)
             changed: dict[str, str | list[str]] = {}
-            for field in ("status", "provider", "engine", "branch", "cwd", "last_event_id", "allowed_actions"):
+            for field in ("status", "ended_reason", "provider", "engine", "branch", "cwd", "last_event_id", "allowed_actions"):
                 value = updates.get(field)
                 if value is None:
                     continue

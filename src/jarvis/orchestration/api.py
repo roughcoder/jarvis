@@ -110,7 +110,7 @@ from jarvis.orchestration.service import (
     WorkerDispatchError,
 )
 from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource, WorkSource
-from jarvis.orchestration.store import OrchestrationStore
+from jarvis.orchestration.store import OrchestrationStore, RunArchivedError
 from jarvis.orchestration.supervisor import final_session_phase
 from jarvis.orchestration.workers import WorkerRegistry
 from jarvis.system_info import system_info_cached
@@ -2135,6 +2135,7 @@ def _fallback_session_row(store: OrchestrationStore, ref: SessionRef, raw: dict[
                     "provider": str(session_raw.get("provider") or link.provider),
                     "engine": str(session_raw.get("engine") or link.engine),
                     "status": str(session_raw.get("status") or link.status),
+                    "ended_reason": _ended_reason_from_worker_session(session_raw) or link.ended_reason,
                     "repo": next((item.item.repo for item in run.work_items if item.item.repo), ""),
                     "branch": str(session_raw.get("branch") or link.branch),
                     "cwd": str(session_raw.get("cwd") or link.cwd),
@@ -2327,6 +2328,13 @@ def _unarchive_session(store: OrchestrationStore, ref: SessionRef):
         return store.unarchive_cockpit_session(ref.worker_id, ref.session_id)
     except KeyError as exc:
         raise CockpitError("not_found", "session not found", status=404) from exc
+    except RunArchivedError as exc:
+        raise CockpitError(
+            "run_archived",
+            f"run {exc.run_id} is archived; the session stays hidden until its run is restored",
+            recoverable=True,
+            status=409,
+        ) from exc
 
 
 def _archive_run_packet(run) -> dict[str, Any]:  # noqa: ANN001

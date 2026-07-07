@@ -490,6 +490,9 @@ class WorkerConfig(_Base):
     token: SecretStr = SecretStr("")  # shared pairing token
     allow_insecure: bool = False     # permit a no-token, non-loopback bind (else refuse to start)
     workspace: str = "~/.jarvis/worker"  # default cwd for actions/jobs
+    # HTTP request body ceiling. Must fit turn attachments after base64
+    # encoding (the cockpit's per-turn budget is ~28 MiB at its defaults).
+    max_request_bytes: int = 32 * 1024 * 1024
     # Where the user's git repos live, so a job can name a repo ("polymarket")
     # instead of an absolute path. Empty = names must be absolute paths.
     repo_root: str = ""

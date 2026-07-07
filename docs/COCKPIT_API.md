@@ -1440,8 +1440,11 @@ as string-or-null.
 strings: `null` while the session is active, otherwise one of `completed`,
 `stopped`, `interrupted_by_user`, `worker_lost`, or `engine_error`. Workers
 report it authoritatively (a daemon restart marks interrupted sessions as
-`worker_lost`); for rows from workers that predate the field it is derived
-from the terminal status, and `null` means unknown.
+`worker_lost`); the sync loop persists it on the stored session link, so
+terminal rows keep their reason even when the worker is offline or the
+snapshot is taken without live worker state. For rows from workers that
+predate the field it is derived from the terminal status, and `null` means
+unknown.
 
 ## Request Object
 
@@ -1835,7 +1838,9 @@ snapshot/list views. It uses the same consolidated archive bookkeeping path as
 archive (run links and the worker-only archive index move together) and returns
 the standard reconciliation packet. Unarchiving a session that was never
 archived is a no-op; an unknown session returns `not_found`. Runs currently
-have no unarchive endpoint.
+have no unarchive endpoint, so unarchiving a session whose parent run is
+archived returns `409 run_archived` (the row would stay hidden either way)
+instead of reporting a restore that has no visible effect.
 
 `POST /v1/sessions/{session_ref}/checkpoints/restore` uses `checkpoint_id`.
 Checkpoint IDs are durable and stable within a session. Clients must not restore
@@ -2037,6 +2042,11 @@ or breaking status, and migration notes.
 - `GET /v1/cockpit/catalog` engine rows now carry worker-reported `supports`
   flags (previously always false there); `supports.attachments` is readable
   where the cockpit gates its composer.
+- Review fixes: the worker daemon's request body ceiling now fits the
+  attachment budget (`WORKER_MAX_REQUEST_BYTES`, default 32 MiB); the sync
+  loop persists `ended_reason` on stored session links so terminal rows keep
+  their reason with the worker offline; unarchiving a session under an
+  archived run returns `409 run_archived` instead of a no-op success.
 
 ### 2026-07-07 - Cockpit asks: attachments, unarchive, ended_reason, snapshot hygiene (compatible)
 

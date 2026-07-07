@@ -731,7 +731,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-    app = web.Application()
+    app = web.Application(client_max_size=max(1024 * 1024, int(cfg.max_request_bytes)))
     app["browser_holder"] = browser_holder  # for clean shutdown in serve()
     app["browser_cfg"] = browser_cfg
     app.on_cleanup.append(_cleanup_diagnostics)

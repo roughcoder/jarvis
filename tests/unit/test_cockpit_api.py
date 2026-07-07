@@ -5827,3 +5827,42 @@ def test_cockpit_catalog_merges_worker_reported_engine_supports() -> None:
     assert rows["claude"]["supports"]["attachments"] is True
     assert rows["claude"]["supports"]["streaming"] is True
     assert rows["codex"]["supports"]["attachments"] is False
+
+
+def test_cockpit_stored_session_link_keeps_ended_reason_offline(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    store, run_id = _seed_run(cfg)
+    store.update_session(run_id, "sess_123", worker_id="macbook-worker", status="interrupted", ended_reason="worker_lost")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        # sync=none renders from the stored link only — no live worker call.
+        snapshot = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "none"})).json()
+
+        row = snapshot["sessions"][0]
+        assert row["status"] == "interrupted"
+        assert row["ended_reason"] == "worker_lost"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+
+def test_cockpit_unarchive_session_rejected_while_run_archived(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    _store, run_id = _seed_run(cfg)
+    ref = make_session_ref("macbook-worker", "sess_123")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        archived_session = await client.post(f"{base}/v1/sessions/{ref}/archive", json={"idempotency_key": "arch_sess"})
+        archived_run = await client.post(f"{base}/v1/runs/{run_id}/archive", json={"idempotency_key": "arch_run"})
+        blocked = await client.post(f"{base}/v1/sessions/{ref}/unarchive", json={"idempotency_key": "unarch_blocked"})
+
+        assert archived_session.status_code == 200
+        assert archived_run.status_code == 200
+        assert blocked.status_code == 409
+        assert blocked.json()["error"]["code"] == "run_archived"
+        assert blocked.json()["error"]["recoverable"] is True
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))

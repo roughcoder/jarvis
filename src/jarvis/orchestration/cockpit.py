@@ -1058,6 +1058,7 @@ def _session_from_link(link: WorkerSessionLink, run: OrchestrationRun) -> dict[s
         "provider": link.provider,
         "engine": link.engine,
         "status": link.status,
+        "ended_reason": link.ended_reason,
         "repo": _run_repo(run),
         "branch": link.branch,
         "cwd": link.cwd,
