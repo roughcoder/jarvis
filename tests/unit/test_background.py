@@ -20,10 +20,11 @@ from jarvis.brain.session import BrainSession
 from jarvis.config import BackgroundConfig, ToolsConfig, load_config
 from jarvis.tools import build_registry
 from jarvis.tools.background import make_background_tool
+from conftest import request_context
 
 
 def _ctx(*caps: str) -> RequestContext:
-    return RequestContext("dev", "neil", "personal", frozenset(caps))
+    return request_context(*caps, identity="neil", scope="personal")
 
 
 class _FakeSession:

@@ -14,6 +14,7 @@ from jarvis.config import ToolsConfig
 from jarvis.mcp.bridge import BridgedTool
 from jarvis.tools import build_registry
 from jarvis.tools.mcp import make_mcp_tools
+from conftest import request_context
 
 
 class _FakeBridge:
@@ -44,7 +45,7 @@ def _bt(server: str, tool: str, cap: str | None = None) -> BridgedTool:
 
 
 def _ctx(*caps: str) -> RequestContext:
-    return RequestContext("neil-mac", "neil", "personal", frozenset(caps))
+    return request_context(*caps, device_id="neil-mac", identity="neil", scope="personal")
 
 
 def test_tools_built_with_capability_and_schema() -> None:

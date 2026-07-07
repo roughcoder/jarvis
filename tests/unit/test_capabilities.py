@@ -22,12 +22,11 @@ from jarvis.brain.registry import ContactEntry, ProjectEntry, RegistryStore
 from jarvis.brain.server import BrainServer
 from jarvis.config import CapabilityConfig
 from jarvis.users import User
+from conftest import request_context
 
 
 def _ctx(*caps: str) -> RequestContext:
-    return RequestContext(
-        device_id="dev", identity="house", scope="house", capabilities=frozenset(caps)
-    )
+    return request_context(*caps)
 
 
 # --- the gate --------------------------------------------------------------

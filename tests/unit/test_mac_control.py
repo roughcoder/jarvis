@@ -9,10 +9,11 @@ from jarvis.config import ToolsConfig, WorkerConfig
 from jarvis.tools import build_registry
 from jarvis.tools.worker import make_worker_tools
 from jarvis.worker.actions import gui_doctor, run_peekaboo
+from conftest import request_context
 
 
 def _ctx(*caps: str) -> RequestContext:
-    return RequestContext("mac", "neil", "personal", frozenset(caps))
+    return request_context(*caps, device_id="mac", identity="neil", scope="personal")
 
 
 # GUI control is agent-only now: control_mac (act) + look_at_screen (read). The atomic

@@ -12,6 +12,7 @@ from jarvis.brain.project_management import ProjectOperationError, ProjectOperat
 from jarvis.brain.registry import RegistryStore
 from jarvis.config import Config
 from jarvis.runtime import RequestContext
+from conftest import request_context
 
 
 class FakeMemory:
@@ -87,7 +88,7 @@ def _seed(store: RegistryStore) -> None:
 
 
 def _ctx(identity: str, caps: frozenset[str] = frozenset()) -> RequestContext:
-    return RequestContext("dev", identity, "personal", caps, channel="cockpit", peer=identity)
+    return request_context(*caps, identity=identity, scope="personal", channel="cockpit", peer=identity)
 
 
 def _service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[ProjectOperationService, RegistryStore, FakeMemory]:

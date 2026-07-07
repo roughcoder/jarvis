@@ -13,6 +13,7 @@ from jarvis.brain.context import RequestContext
 from jarvis.brain.profile import forget_fact, parse_facts, read_facts, remember_fact
 from jarvis.config import CapabilityConfig
 from jarvis.tools.profile import make_profile_tools
+from conftest import request_context
 
 _FILE = """---
 whatsapp: ["447921815819"]
@@ -76,7 +77,7 @@ def test_read_facts_missing_file(tmp_path) -> None:  # noqa: ANN001
 
 
 def _ctx(identity="neil", scope="personal") -> RequestContext:  # noqa: ANN001
-    return RequestContext("dev", identity, scope, frozenset({"profile.write"}))
+    return request_context("profile.write", identity=identity, scope=scope)
 
 
 def _tools(tmp_path):  # noqa: ANN001, ANN202
