@@ -55,5 +55,9 @@
   },
   "74fa19d1beba": {
     "Release-note": "skip"
+  },
+  "fb77bdae84d8": {
+    "Release-note": "Worker health checks no longer block on slow worktree inventory scans, preventing Cockpit from marking healthy workers offline.",
+    "Env": "no changes."
   }
 }
