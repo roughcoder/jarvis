@@ -53,6 +53,7 @@ SESSION_CONTROL_ACTIONS = {
     "approval": WORKER_SESSION_APPROVE,
     "interrupt": WORKER_SESSION_INTERRUPT,
     "stop": WORKER_SESSION_STOP,
+    "close": WORKER_SESSION_STOP,
     "checkpoint_restore": WORKER_SESSION_RESTORE,
 }
 DEFAULT_SESSION_ALLOWED_ACTIONS = [WORKER_SESSION_TURN, WORKER_SESSION_INTERRUPT, WORKER_SESSION_STOP]
@@ -1213,7 +1214,7 @@ def _allowed_actions_from_worker_session(raw: dict[str, Any]) -> list[str]:
 def _session_supported_controls(session: dict[str, Any]) -> list[str]:
     allowed_actions = set(session.get("allowed_actions") or DEFAULT_SESSION_ALLOWED_ACTIONS)
     controls = [control for control, action in SESSION_CONTROL_ACTIONS.items() if action in allowed_actions]
-    controls.extend(["archive", "unarchive"])
+    controls.extend(["archive", "unarchive", "rename"])
     return controls
 
 

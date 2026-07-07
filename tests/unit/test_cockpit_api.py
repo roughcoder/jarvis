@@ -1598,7 +1598,7 @@ def test_cockpit_session_supported_controls_follow_allowed_actions(tmp_path, mon
     async def calls(base: str, client: httpx.AsyncClient) -> None:
         snapshot = (await client.get(f"{base}/v1/cockpit/snapshot")).json()
 
-        assert snapshot["sessions"][0]["supported_controls"] == ["turn", "stop", "archive", "unarchive"]
+        assert snapshot["sessions"][0]["supported_controls"] == ["turn", "stop", "close", "archive", "unarchive", "rename"]
 
     import asyncio
 
@@ -4298,7 +4298,17 @@ def test_cockpit_archive_reclaims_nothing(tmp_path, monkeypatch) -> None:  # noq
         }
 def test_cockpit_session_close_stops_cleans_up_and_archives(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, caps="worker.session.stop,orchestration.runs.write")
-    _store, run_id = _seed_run(cfg)
+    store, run_id = _seed_run(cfg)
+    parent = store.create_run("Parent orchestrator")
+    child = store.get(run_id)
+    assert child is not None
+    child.parent_chat_id = parent.run_id
+    child.parent_run_id = parent.run_id
+    store.save(child)
+    parent.child_chat_ids.append(run_id)
+    parent.child_run_ids.append(run_id)
+    store.save(parent)
+    grandchild = store.create_run("Grandchild work", parent_chat_id=run_id)
     ref = make_session_ref("macbook-worker", "sess_123")
     state = {"status": "running"}
     posts: list[str] = []
@@ -4330,13 +4340,25 @@ def test_cockpit_session_close_stops_cleans_up_and_archives(tmp_path, monkeypatc
         assert body["cleanup"] == {"requested": True, "ok": True, "cleaned": ["worktree"]}
         assert replay.json()["idempotent"] is True
         assert posts == ["http://worker.test/sessions/sess_123/stop", "http://worker.test/sessions/sess_123/cleanup"]
-        assert snapshot["runs"][0]["session_count"] == 0
+        run_rows = {row["run_id"]: row for row in snapshot["runs"]}
+        assert run_rows[run_id]["session_count"] == 0
         assert snapshot["sessions"] == []
 
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=get, http_post=post))
-    events = OrchestrationStore(cfg.orchestration.workspace).events(run_id)
+    reloaded = OrchestrationStore(cfg.orchestration.workspace)
+    events = reloaded.events(run_id)
+    closed = reloaded.get(run_id)
+    reloaded_parent = reloaded.get(parent.run_id)
+    reloaded_grandchild = reloaded.get(grandchild.run_id)
+    assert closed is not None
+    assert closed.parent_chat_id is None
+    assert closed.child_chat_ids == []
+    assert reloaded_parent is not None
+    assert run_id not in reloaded_parent.child_chat_ids
+    assert reloaded_grandchild is not None
+    assert reloaded_grandchild.parent_chat_id is None
     assert any(event.type == "session_cleanup_requested" for event in events)
 
 

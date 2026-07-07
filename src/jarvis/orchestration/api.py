@@ -30,7 +30,7 @@ from jarvis.capabilities import (
     WORKER_SESSION_TURN,
 )
 from jarvis.config import Config, insecure_bind
-from jarvis.connectors.cockpit import CockpitConnector, CockpitThread
+from jarvis.connectors.cockpit import CockpitConnector, CockpitThread, CockpitThreadIndex, THREAD_INDEX_FILENAME
 from jarvis.ids import new_id, utc_now
 from jarvis.mcp.status import (
     MCP_TOKENS_MANAGE_CAPABILITY,
@@ -194,7 +194,13 @@ class CockpitAppContext:
             raise CockpitError("unauthorized", "unauthorized", status=401)
 
     def service(self, *, manual_item: WorkItem | None = None) -> OrchestrationService:
-        return _service(self.cfg, self.source_factory, manual_item=manual_item)
+        return _service(
+            self.cfg,
+            self.source_factory,
+            manual_item=manual_item,
+            thread_child_terminal_notifier=_make_thread_child_terminal_notifier(self.cfg),
+            thread_children_promoter=_make_thread_children_promoter(self.cfg),
+        )
 
 
 @dataclass(frozen=True)
@@ -453,7 +459,11 @@ def make_app(
         get=http_get or httpx.get,
         post=http_post or httpx.post,
         delete=http_delete or httpx.delete,
-        store=OrchestrationStore(cfg.orchestration.workspace),
+        store=OrchestrationStore(
+            cfg.orchestration.workspace,
+            thread_child_terminal_notifier=_make_thread_child_terminal_notifier(cfg),
+            thread_children_promoter=_make_thread_children_promoter(cfg),
+        ),
         idempotency=IdempotencyStore(cfg.orchestration.workspace),
         idempotency_locks={},
         idempotency_lock_refs={},
@@ -1926,7 +1936,7 @@ class CockpitWriteHandlers:
             )
             write_packet = await asyncio.to_thread(_session_write_packet, self.ctx.cfg, self.ctx.store, ref, raw, get=self.ctx.get)
             cleanup = await asyncio.to_thread(_cleanup_child_session_worktree, self.ctx.cfg, self.ctx.store, ref, body, post=self.ctx.post)
-            archived = await asyncio.to_thread(_archive_session, self.ctx.store, ref)
+            archived = await asyncio.to_thread(_close_session, self.ctx.store, ref)
             response_body = _close_session_packet(archived, ref, write_packet, cleanup)
             self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
         return web.json_response(response_body)
@@ -2192,13 +2202,26 @@ class _ManualWorkSource:
         return False
 
 
-def _service(cfg: Config, source_factory: Callable[[str, Any], WorkSource], *, manual_item: WorkItem | None = None) -> OrchestrationService:
+def _service(
+    cfg: Config,
+    source_factory: Callable[[str, Any], WorkSource],
+    *,
+    manual_item: WorkItem | None = None,
+    thread_child_terminal_notifier: Callable[[str, Any], bool] | None = None,
+    thread_children_promoter: Callable[[str], object] | None = None,
+) -> OrchestrationService:
     def factory(name: str, inner_cfg: Any = None) -> WorkSource:
         if name == "manual":
             return _ManualWorkSource(manual_item)
         return source_factory(name, inner_cfg)
 
-    return OrchestrationService(cfg=cfg, capabilities=resolve_capabilities(cfg.capabilities), source_factory=factory)
+    return OrchestrationService(
+        cfg=cfg,
+        capabilities=resolve_capabilities(cfg.capabilities),
+        source_factory=factory,
+        thread_child_terminal_notifier=thread_child_terminal_notifier,
+        thread_children_promoter=thread_children_promoter,
+    )
 
 
 def _command_from_body(body: dict[str, Any], *, start: bool) -> tuple[WorkCommand, WorkItem | None]:
@@ -2527,6 +2550,10 @@ def _archive_run(store: OrchestrationStore, run_id: str):
 
 def _archive_session(store: OrchestrationStore, ref: SessionRef):
     return store.archive_cockpit_session(ref.worker_id, ref.session_id)
+
+
+def _close_session(store: OrchestrationStore, ref: SessionRef):
+    return store.close_cockpit_session(ref.worker_id, ref.session_id)
 
 
 def _unarchive_session(store: OrchestrationStore, ref: SessionRef):
@@ -3322,6 +3349,16 @@ def _project_memory_conclusion(conclusion: ConclusionRecord) -> dict[str, str]:
 
 def _cockpit_connector(ctx: CockpitAppContext) -> CockpitConnector:
     return CockpitConnector(ctx.cfg)
+
+
+def _make_thread_child_terminal_notifier(cfg: Config) -> Callable[[str, Any], bool]:
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
+    return index.append_child_terminal_system_message
+
+
+def _make_thread_children_promoter(cfg: Config) -> Callable[[str], object]:
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
+    return index.promote_children
 
 
 def _thread_projection(thread: CockpitThread, ctx: CockpitAppContext | None = None) -> dict[str, Any]:

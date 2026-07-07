@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -85,10 +86,14 @@ class OrchestrationService:
         cfg: Any,
         capabilities: set[str],
         source_factory: SourceFactory,
+        thread_child_terminal_notifier: Callable[[str, Any], bool] | None = None,
+        thread_children_promoter: Callable[[str], object] | None = None,
     ) -> None:
         self.cfg = cfg
         self.capabilities = capabilities
         self.source_factory = source_factory
+        self.thread_child_terminal_notifier = thread_child_terminal_notifier
+        self.thread_children_promoter = thread_children_promoter
 
     def check_work(self, command: WorkCommand, *, limit: int = 10) -> list[WorkItem]:
         self._require(required_for_command(command.operation, command.source))
@@ -116,7 +121,11 @@ class OrchestrationService:
         if item is None:
             return None
 
-        store = OrchestrationStore(self.cfg.orchestration.workspace)
+        store = OrchestrationStore(
+            self.cfg.orchestration.workspace,
+            thread_child_terminal_notifier=self.thread_child_terminal_notifier,
+            thread_children_promoter=self.thread_children_promoter,
+        )
         repo = self._repo(command)
         if repo and not item.repo:
             item.repo = repo
@@ -131,7 +140,7 @@ class OrchestrationService:
             dispatch_actions = [*dispatch_actions, WORKER_SESSION_STOP]
         self._require(dispatch_actions)
         if not item.repo:
-            run = store.create_run(str(item.title), work_items=[item])
+            run = store.create_run(str(item.title), work_items=[item], parent_chat_id=parent_chat_id)
             store.set_phase(run.run_id, "needs_human", "Work item has no repo/default repo; cannot start a coding worker")
             raise MissingWorkRepoError(item, run.run_id)
         registry = WorkerRegistry(self.cfg.worker, profiles_path=self.cfg.orchestration.workers_path)
@@ -290,7 +299,11 @@ class OrchestrationService:
         if manual_item is not None or work_item is not None:
             # Read-only mirror of the ownership check /v1/work/start enforces,
             # so the wizard cannot green-light a guaranteed duplicate start.
-            owner = OrchestrationStore(self.cfg.orchestration.workspace).active_primary_owner(item)
+            owner = OrchestrationStore(
+                self.cfg.orchestration.workspace,
+                thread_child_terminal_notifier=self.thread_child_terminal_notifier,
+                thread_children_promoter=self.thread_children_promoter,
+            ).active_primary_owner(item)
             if owner is not None:
                 owned_by = owner.run_id
                 reasons.append(f"work item {item.source}:{item.id} is already owned by run {owner.run_id}")
@@ -363,7 +376,11 @@ class OrchestrationService:
 
     def resume_run(self, run_ref: str = "latest", *, prompt: str = "") -> StartedWork:
         self._require(required_for_command("resume_run", "jarvis"))
-        store = OrchestrationStore(self.cfg.orchestration.workspace)
+        store = OrchestrationStore(
+            self.cfg.orchestration.workspace,
+            thread_child_terminal_notifier=self.thread_child_terminal_notifier,
+            thread_children_promoter=self.thread_children_promoter,
+        )
         run = _resolve_run(store, run_ref)
         if run is None:
             raise ResumeRunError(f"No run found for {run_ref!r}.")
