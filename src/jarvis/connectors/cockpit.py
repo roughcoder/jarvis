@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import tempfile
 import threading
 from collections.abc import Callable
@@ -26,6 +27,7 @@ from jarvis.capabilities import WORKER_SESSION_CREATE, WORKER_SESSION_STOP, WORK
 from jarvis.brain.capabilities import RequestContext
 from jarvis.brain.background import BackgroundRunner
 from jarvis.brain.contexts import ActiveProject, ContextStore
+from jarvis.brain.dialog import PROJECT_THREAD_TOOL_SURFACE_CONTRACT
 from jarvis.brain.gateway_client import GatewayClient
 from jarvis.brain.memory_client import (
     ConclusionRecord,
@@ -43,6 +45,7 @@ from jarvis.brain.session import BrainSession, TurnResult
 from jarvis.brain.tracing import Tracer
 from jarvis.config import Config
 from jarvis.ids import new_id, utc_now
+from jarvis.orchestration.cockpit import project_session_event
 from jarvis.orchestration.models import WorkCommand, WorkItem
 from jarvis.orchestration.service import StartedWork, OrchestrationService
 from jarvis.orchestration.redaction import public_error_message
@@ -52,12 +55,31 @@ from jarvis.tools.background import make_background_tool
 from jarvis.tools.base import Tool
 from jarvis.text import slugify
 from jarvis.users import load_users
+from jarvis.worker_session_contract import EVENT_TOOL_CALL, EVENT_TOOL_RESULT
 
 
 THREAD_INDEX_FILENAME = "cockpit-threads.json"
 THREAD_TRANSCRIPTS_DIRNAME = "cockpit-thread-transcripts"
 THREAD_HISTORY_LIMIT = 24
 _THREAD_INDEX_LOCK = threading.RLock()
+_WORK_SESSION_OFFER = (
+    "I can't do that from this project conversation because it has no workspace, "
+    "repo checkout, test runner, or code-review tool attached. Dispatch it through "
+    "/v1/work/start as a work session and I can handle it there."
+)
+_WORK_ACTION_CLAIM_RE = re.compile(
+    r"\b("
+    r"(?:i(?:'|’)ll|i will|i(?:'|’)m|i am|i(?:'|’)ve|i have)\s+"
+    r"(?:start(?:ed|ing)?|begin(?:ning|begun)?|run(?:ning)?|review(?:ing)?|inspect(?:ing)?|check(?:ing)?|look(?:ing)?\s+through)"
+    r"[^.?!\n]{0,120}\b(?:code\s+review|review|repo|repository|codebase|pull\s+request|pr|tests?|test\s+suite|pytest|ruff|lint|typecheck)\b|"
+    r"\b(?:code\s+review|review|tests?|test\s+suite|pytest|ruff|lint|repo|repository|codebase)\b"
+    r"[^.?!\n]{0,80}\b(?:underway|in\s+progress|running|started|completed|done|finished)\b|"
+    r"\b(?:reviewing|inspecting|checking)\s+(?:the\s+)?(?:repo|repository|code|codebase|pull\s+request|pr)\b|"
+    r"\brunning\s+(?:the\s+)?(?:tests?|test\s+suite|pytest|ruff|lint|typecheck)\b"
+    r")",
+    re.IGNORECASE,
+)
+_WORK_ACTION_TOOL_NAMES = {"spawn_child_work_session"}
 
 
 @dataclass(frozen=True)
@@ -74,7 +96,7 @@ class CockpitThread:
     archived_by: str = ""
     archive_reason: str = ""
     last_turn_at: str = ""
-    messages: tuple[dict[str, str], ...] = ()
+    messages: tuple[dict[str, Any], ...] = ()
     workspace: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -273,6 +295,7 @@ class CockpitThreadIndex:
         user_text: str,
         assistant_peer_id: str,
         assistant_text: str,
+        events: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
     ) -> CockpitThread:
         with _THREAD_INDEX_LOCK:
             observed_at = utc_now()
@@ -292,6 +315,7 @@ class CockpitThreadIndex:
                     "content": assistant_text,
                     "observed_at": observed_at,
                 },
+                *_thread_event_messages(events, assistant_peer_id=assistant_peer_id),
             ]
             updated = self.save(
                 replace(
@@ -361,8 +385,8 @@ class CockpitThreadIndex:
         thread: CockpitThread,
         *,
         limit: int | None = None,
-        seed_messages: tuple[dict[str, str], ...] = (),
-    ) -> list[dict[str, str]]:
+        seed_messages: tuple[dict[str, Any], ...] = (),
+    ) -> list[dict[str, Any]]:
         messages = self._read_thread_messages(thread)
         if not messages:
             messages = [dict(message) for message in seed_messages] or self._legacy_thread_messages(thread.thread_id)
@@ -372,7 +396,7 @@ class CockpitThreadIndex:
             messages = messages[-limit:]
         return messages
 
-    def _read_thread_messages(self, thread: CockpitThread) -> list[dict[str, str]]:
+    def _read_thread_messages(self, thread: CockpitThread) -> list[dict[str, Any]]:
         path = self._transcript_path(thread.project_id, thread.thread_id)
         if not path.exists():
             return []
@@ -384,7 +408,7 @@ class CockpitThreadIndex:
             return []
         return _normalized_messages(data.get("messages") or ())
 
-    def _write_thread_messages(self, thread: CockpitThread, messages: list[dict[str, str]]) -> None:
+    def _write_thread_messages(self, thread: CockpitThread, messages: list[dict[str, Any]]) -> None:
         _atomic_write_json(
             self._transcript_path(thread.project_id, thread.thread_id),
             {
@@ -395,7 +419,7 @@ class CockpitThreadIndex:
             },
         )
 
-    def _legacy_thread_messages(self, thread_id: str) -> list[dict[str, str]]:
+    def _legacy_thread_messages(self, thread_id: str) -> list[dict[str, Any]]:
         raw = self._read().get("threads", {}).get(thread_id)
         if not isinstance(raw, dict):
             return []
@@ -583,7 +607,7 @@ class CockpitConnector:
         attachments: list[dict[str, Any]] | None = None,
         workspace_request: dict[str, Any] | None = None,
         progress: Callable[[dict[str, Any]], Any] | None = None,
-    ) -> tuple[str, CockpitThread]:
+    ) -> tuple[str, CockpitThread, tuple[dict[str, Any], ...]]:
         text = text.strip()
         if not text:
             raise ValueError("turn text is required")
@@ -591,7 +615,7 @@ class CockpitConnector:
         explicit_workspace_request = workspace_request is not None
         workspace_request = _workspace_request(project, text, workspace_request)
         if context_thread.workspace or explicit_workspace_request:
-            return await self._workspace_turn(
+            reply, updated = await self._workspace_turn(
                 project,
                 context_thread,
                 requester,
@@ -599,6 +623,7 @@ class CockpitConnector:
                 workspace_request=workspace_request,
                 progress=progress,
             )
+            return reply, updated, ()
         project_context = _project_context(self._memory, project, context_thread)
         view = CockpitMemoryView(
             self._memory,
@@ -619,6 +644,10 @@ class CockpitConnector:
         )
         result = TurnResult()
         reply = await session.respond_text(text, trace, result, attachments=attachments)
+        events = _safe_thread_tool_events(thread.session_id, result.tool_messages)
+        guarded_reply = _guard_project_thread_reply(result.raw or reply, events)
+        if guarded_reply != (result.raw or reply):
+            result.raw = guarded_reply
         session.finalize(text, result, trace)
         await _drain_cold_tasks(session)
         if self._tracer is not None:
@@ -642,8 +671,9 @@ class CockpitConnector:
             user_text=persisted_text,
             assistant_peer_id=self._cfg.memory.assistant_peer_id,
             assistant_text=reply,
+            events=events,
         )
-        return reply, updated
+        return reply, updated, events
 
     async def _workspace_turn(
         self,
@@ -969,6 +999,7 @@ class CockpitConnector:
             registry=tools,
             memory_user=ctx.memory_peer,
             active_project_getter=lambda: active,
+            extra_system_prompt=PROJECT_THREAD_TOOL_SURFACE_CONTRACT,
         )
         session.load_soul()
         return session
@@ -1063,6 +1094,30 @@ def _thread_peers(
         SessionPeer(peer_id=requester.memory_peer, observe_me=True, observe_others=True),
         SessionPeer(peer_id=cfg.memory.assistant_peer_id, observe_me=False, observe_others=True),
     ]
+
+
+def _thread_event_messages(
+    events: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    *,
+    assistant_peer_id: str,
+) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        event_type = str(event.get("type") or "")
+        name = _thread_event_tool_name(event)
+        content = " ".join(part for part in (event_type, name) if part)
+        messages.append(
+            {
+                "role": "event",
+                "peer_id": assistant_peer_id,
+                "content": content,
+                "observed_at": str(event.get("occurred_at") or ""),
+                "event": dict(event),
+            }
+        )
+    return messages
 
 
 def _cockpit_project_context(requester: RequestContext) -> RequestContext:
@@ -1198,6 +1253,140 @@ def _project_default_repo(project: ProjectEntry) -> str:
     return ""
 
 
+def _safe_thread_tool_events(session_ref: str, tool_messages: list) -> tuple[dict[str, Any], ...]:
+    try:
+        return tuple(_thread_tool_events(session_ref, tool_messages))
+    except Exception:
+        return ()
+
+
+def _thread_tool_events(session_ref: str, tool_messages: list) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    calls_by_id: dict[str, dict[str, Any]] = {}
+    turn_id = new_id("turn")
+    sequence = 0
+    for message in tool_messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or ():
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                call_id = str(call.get("id") or new_id("call"))
+                name = str(function.get("name") or "")
+                arguments = str(function.get("arguments") or "")
+                calls_by_id[call_id] = {"id": call_id, "name": name, "arguments": arguments}
+                sequence += 1
+                events.append(
+                    _thread_tool_event(
+                        session_ref,
+                        event_type=EVENT_TOOL_CALL,
+                        sequence=sequence,
+                        turn_id=turn_id,
+                        data={
+                            "id": call_id,
+                            "item": {
+                                "id": call_id,
+                                "type": "tool_use",
+                                "name": name,
+                                "input": _tool_input(arguments),
+                            },
+                        },
+                    )
+                )
+        elif message.get("role") == "tool":
+            call_id = str(message.get("tool_call_id") or "")
+            call = calls_by_id.get(call_id, {"id": call_id, "name": "", "arguments": ""})
+            sequence += 1
+            content = str(message.get("content") or "")
+            events.append(
+                _thread_tool_event(
+                    session_ref,
+                    event_type=EVENT_TOOL_RESULT,
+                    sequence=sequence,
+                    turn_id=turn_id,
+                    data={
+                        "id": call_id,
+                        "item": {
+                            "id": call_id,
+                            "type": "tool_result",
+                            "tool_use_id": call_id,
+                            "name": call.get("name") or "",
+                            "content": content,
+                        },
+                    },
+                )
+            )
+    return events
+
+
+def _thread_tool_event(
+    session_ref: str,
+    *,
+    event_type: str,
+    sequence: int,
+    turn_id: str,
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    raw = {
+        "event_id": new_id("ev"),
+        "session_id": session_ref,
+        "type": event_type,
+        "time": utc_now(),
+        "data": data,
+    }
+    projected = project_session_event(raw, worker_id="", sequence=sequence)
+    return {
+        **projected,
+        "session_ref": session_ref,
+        "run_id": "",
+        "turn_id": turn_id,
+    }
+
+
+def _json_or_text(value: str) -> Any:
+    if not value:
+        return {}
+    try:
+        return json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return value
+
+
+def _tool_input(arguments: str) -> dict[str, Any]:
+    parsed = _json_or_text(arguments)
+    if isinstance(parsed, dict):
+        return parsed
+    if parsed in ("", [], {}):
+        return {}
+    return {"arguments": parsed}
+
+
+def _guard_project_thread_reply(
+    reply: str,
+    events: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+) -> str:
+    if not _claims_workspace_action(reply) or _has_workspace_action_event(events):
+        return reply
+    return _WORK_SESSION_OFFER
+
+
+def _claims_workspace_action(text: str) -> bool:
+    normalized = " ".join((text or "").split())
+    return bool(_WORK_ACTION_CLAIM_RE.search(normalized))
+
+
+def _has_workspace_action_event(events: tuple[dict[str, Any], ...] | list[dict[str, Any]]) -> bool:
+    return any(_thread_event_tool_name(event) in _WORK_ACTION_TOOL_NAMES for event in events if isinstance(event, dict))
+
+
+def _thread_event_tool_name(event: dict[str, Any]) -> str:
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    item = data.get("item") if isinstance(data.get("item"), dict) else {}
+    return str(item.get("name") or data.get("name") or "")
+
+
 def _safe_project_representation(memory: MemoryBackend, peer_id: str) -> str:
     cached = ""
     try:
@@ -1264,12 +1453,12 @@ def _thread_title(text: str) -> str:
     return title if len(title) <= 72 else title[:71] + "..."
 
 
-def _normalized_messages(messages: Any) -> list[dict[str, str]]:
-    normalized: list[dict[str, str]] = []
+def _normalized_messages(messages: Any) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
     for item in messages:
         if not isinstance(item, dict):
             continue
-        message = {
+        message: dict[str, Any] = {
             "role": str(item.get("role") or ""),
             "peer_id": str(item.get("peer_id") or ""),
             "content": str(item.get("content") or ""),
@@ -1278,6 +1467,9 @@ def _normalized_messages(messages: Any) -> list[dict[str, str]]:
         for key in ("type", "child_chat_id", "child_run_id", "phase", "status", "terminal_reason"):
             if key in item:
                 message[key] = str(item.get(key) or "")
+        event = item.get("event")
+        if isinstance(event, dict):
+            message["event"] = dict(event)
         normalized.append(message)
     return normalized
 

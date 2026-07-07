@@ -277,6 +277,7 @@ class BrainSession:
         memory_user: str | None = None,
         memory_notify: Callable[[str], Awaitable[None]] | None = None,
         active_project_getter: Callable[[], Any | None] | None = None,
+        extra_system_prompt: str = "",
         relevance=None,  # noqa: ANN001 - optional EmbeddingRelevance (else keyword prefilter)
     ) -> None:
         self._cfg = cfg
@@ -291,6 +292,7 @@ class BrainSession:
         self._memory = memory
         self._memory_notify = memory_notify
         self._active_project_getter = active_project_getter
+        self._extra_system_prompt = extra_system_prompt.strip()
         self._tracer = tracer
         self._registry = registry
         self._soul = ""  # personality (SOUL.md), loaded at start
@@ -638,6 +640,8 @@ class BrainSession:
         if voice_controls:
             parts.append(_END_INSTRUCTION)
         parts.append(_AGENCY)  # act-by-default + persistence (stable, cacheable)
+        if self._extra_system_prompt:
+            parts.append(self._extra_system_prompt)
         if self._ctx.can("background.run"):
             parts.append(_BACKGROUND_GUIDANCE)
         if self._ctx.can("profile.write"):

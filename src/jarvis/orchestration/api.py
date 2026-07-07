@@ -1464,7 +1464,7 @@ class CockpitWriteHandlers:
         state_key = (project.id, thread.thread_id)
         self.ctx.thread_turn_states[state_key] = ("running", "")
         try:
-            reply, updated = await connector.turn(
+            reply, updated, events = await connector.turn(
                 project,
                 thread,
                 requester,
@@ -1519,9 +1519,11 @@ class CockpitWriteHandlers:
         self.ctx.thread_turn_states.pop(state_key, None)
         payload = {
             "project_id": project.id,
-            "thread": _thread_projection(updated, self.ctx),
+            "thread": _thread_projection(updated, self.ctx, include_messages=True),
             "reply": reply,
         }
+        for event in events:
+            await _try_write_thread_event(response, cursor, event)
         await _write_sse(response, "thread.reply", cursor, _sse_envelope(cursor, "thread.reply", payload))
         await _write_sse(response, "thread.turn.done", cursor, _sse_envelope(cursor, "thread.turn.done", payload))
         await response.write_eof()
@@ -3399,7 +3401,12 @@ def _make_thread_children_promoter(cfg: Config) -> Callable[[str], object]:
     return index.promote_children
 
 
-def _thread_projection(thread: CockpitThread, ctx: CockpitAppContext | None = None) -> dict[str, Any]:
+def _thread_projection(
+    thread: CockpitThread,
+    ctx: CockpitAppContext | None = None,
+    *,
+    include_messages: bool = False,
+) -> dict[str, Any]:
     status, ended_reason = _thread_status(thread, ctx)
     data = {
         "thread_id": thread.thread_id,
@@ -3428,7 +3435,19 @@ def _thread_projection(thread: CockpitThread, ctx: CockpitAppContext | None = No
     }
     if thread.workspace:
         data["workspace"] = workspace_public(thread.workspace)
+    if include_messages:
+        data["messages"] = [dict(message) for message in thread.messages]
     return data
+
+
+async def _try_write_thread_event(response: web.StreamResponse, cursor: str, event: dict[str, Any]) -> None:
+    event_type = canonical_event_type(event.get("type"))
+    if not event_type:
+        return
+    try:
+        await _write_sse(response, event_type, cursor, _sse_envelope(cursor, event_type, dict(event)))
+    except Exception as exc:  # noqa: BLE001 - thread tool events are best-effort.
+        logger.debug("failed to write project-thread event %s: %s", event_type, exc)
 
 
 _BRAIN_HOSTNAME = socket.gethostname()

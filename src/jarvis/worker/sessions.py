@@ -15,12 +15,18 @@ from jarvis.worker_session_contract import (
     EVENT_CHECKPOINT_RESTORED,
     EVENT_SESSION_CREATED,
     EVENT_SESSION_INTERRUPTED,
+    EVENT_SESSION_STOPPED,
+    EVENT_TURN_COMPLETED,
+    EVENT_TURN_FAILED,
     EVENT_TURN_STARTED,
     FAILED_SESSION_STATUSES,
     IDEMPOTENT_SESSION_EVENT_TYPES,
     SESSION_CREATED,
+    SESSION_COMPLETED,
+    SESSION_FAILED,
     SESSION_INTERRUPTED,
     SESSION_RUNNING,
+    SESSION_STOPPED,
     SUCCESS_SESSION_STATUSES,
     TURN_RESUMABLE_SESSION_STATUSES,
     TURN_STARTABLE_SESSION_STATUSES,
@@ -285,6 +291,25 @@ class SessionManager:
             self.save(session)
             return event
 
+    def restore_running_if_waiting(self, session_id: str, waiting_status: str, *, has_pending_requests: bool) -> WorkerSession | None:
+        with self._lock:
+            session = self.get(session_id)
+            if session is None or session.status != waiting_status:
+                return session
+            terminal_status = self._terminal_status_from_events(session.session_id)
+            if terminal_status is not None:
+                session.status = terminal_status
+                _apply_ended_reason(session, terminal_status)
+                session.updated_at = utc_now()
+                self.save(session)
+                return session
+            if not has_pending_requests:
+                session.status = SESSION_RUNNING
+                _apply_ended_reason(session, SESSION_RUNNING)
+                session.updated_at = utc_now()
+                self.save(session)
+            return session
+
     def reserve_turn(self, session_id: str, data: dict[str, Any]) -> tuple[WorkerSession, SessionEvent, bool]:
         with self._lock:
             session = self.get(session_id)
@@ -331,6 +356,19 @@ class SessionManager:
                 self.save(session)
                 with self.events_path(session.session_id).open("a") as f:
                     f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
+
+    def _terminal_status_from_events(self, session_id: str) -> str | None:
+        status_by_event = {
+            EVENT_SESSION_INTERRUPTED: SESSION_INTERRUPTED,
+            EVENT_SESSION_STOPPED: SESSION_STOPPED,
+            EVENT_TURN_COMPLETED: SESSION_COMPLETED,
+            EVENT_TURN_FAILED: SESSION_FAILED,
+        }
+        for event in reversed(self.events(session_id)):
+            status = status_by_event.get(event.type)
+            if status is not None:
+                return status
+        return None
 
     def events(self, session_id: str, *, after: str = "", limit: int | None = None) -> list[SessionEvent]:
         try:

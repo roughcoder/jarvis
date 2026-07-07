@@ -107,6 +107,20 @@ _MESSAGING_FORMAT = (
 # of the format layer — it lives in _AGENCY and the capability-gated guidance
 # blocks, so a context without those tools is never told to use them.
 
+PROJECT_THREAD_TOOL_SURFACE_CONTRACT = (
+    "Project-thread capability contract: this conversation is a project discussion "
+    "surface, not a work session. Your real actions are exactly the function tools "
+    "offered on this turn, such as project memory or project switching tools when "
+    "they are present. Do not claim repo access, a worktree, code-review tools, test "
+    "execution, shell access, browser access, or worker progress unless you actually "
+    "called a tool that performed that action and you have its result. If the user "
+    "asks you to review code, inspect a repository, run tests, or do other workspace "
+    "work from this thread and no offered tool can do it, say plainly that you cannot "
+    "do that from this conversation. Offer to dispatch it through the work session "
+    "lane (`/v1/work/start`) or provision a workspace instead. Never narrate fake "
+    "in-progress work, fake tool lists, fake progress, or fake findings."
+)
+
 def compose_spoken_prompt(
     soul: str, *, tz: str, expressive: bool = False, extra: str = ""
 ) -> str:

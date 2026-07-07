@@ -705,29 +705,11 @@ def _has_pending_requests(session_id: str) -> bool:
 
 
 def _restore_running_if_waiting(sessions: SessionManager, session_id: str, waiting_status: str) -> None:
-    session = sessions.get(session_id)
-    if session is None or session.status != waiting_status:
-        return
-    terminal_status = _terminal_status_from_events(sessions, session_id)
-    if terminal_status is not None:
-        sessions.update_status(session_id, terminal_status)
-        return
-    if not _has_pending_requests(session_id):
-        sessions.update_status(session_id, SESSION_RUNNING)
-
-
-def _terminal_status_from_events(sessions: SessionManager, session_id: str) -> str | None:
-    status_by_event = {
-        EVENT_SESSION_INTERRUPTED: SESSION_INTERRUPTED,
-        EVENT_SESSION_STOPPED: SESSION_STOPPED,
-        EVENT_TURN_COMPLETED: SESSION_COMPLETED,
-        EVENT_TURN_FAILED: SESSION_FAILED,
-    }
-    for event in reversed(sessions.events(session_id)):
-        status = status_by_event.get(event.type)
-        if status is not None:
-            return status
-    return None
+    sessions.restore_running_if_waiting(
+        session_id,
+        waiting_status,
+        has_pending_requests=_has_pending_requests(session_id),
+    )
 
 
 def _clear_pending_requests(session_id: str, process: subprocess.Popen[str]) -> None:
