@@ -1853,40 +1853,39 @@ class CockpitWriteHandlers:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
         run_id = request.match_info["run_id"]
-        scope = _principal_scoped(request, self.ctx.cfg, f"runs/{run_id}/archive")
-        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
-            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
-            if cached is not None:
-                return web.json_response(cached)
+        requester = _cockpit_requester_context(request, self.ctx.cfg)
+        scope = f"runs/{run_id}/archive"
+
+        async def produce() -> dict[str, Any]:
             _require_capability(self.ctx.cfg, "orchestration.runs.write")
             run = await asyncio.to_thread(_archive_run, self.ctx.store, run_id)
-            response_body = _archive_run_packet(run)
-            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+            return _archive_run_packet(run)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def run_delete(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _optional_json_body(request)
         run_id = request.match_info["run_id"]
-        scope = _principal_scoped(request, self.ctx.cfg, f"runs/{run_id}/delete")
-        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
-            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
-            if cached is not None:
-                return web.json_response(cached)
+        requester = _cockpit_requester_context(request, self.ctx.cfg)
+        scope = f"runs/{run_id}/delete"
+
+        async def produce() -> dict[str, Any]:
             _require_capability(self.ctx.cfg, "orchestration.runs.write")
-            response_body = await asyncio.to_thread(_delete_run_packet, self.ctx, run_id)
-            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+            return await asyncio.to_thread(_delete_run_packet, self.ctx, run_id)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def run_rename(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
         run_id = request.match_info["run_id"]
-        scope = _principal_scoped(request, self.ctx.cfg, f"runs/{run_id}/rename")
-        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
-            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
-            if cached is not None:
-                return web.json_response(cached)
+        requester = _cockpit_requester_context(request, self.ctx.cfg)
+        scope = f"runs/{run_id}/rename"
+
+        async def produce() -> dict[str, Any]:
             _require_capability(self.ctx.cfg, "orchestration.runs.write")
             try:
                 run = await asyncio.to_thread(
@@ -1898,8 +1897,9 @@ class CockpitWriteHandlers:
                 raise CockpitError("not_found", "run not found", status=404) from exc
             except ValueError as exc:
                 raise CockpitError("validation_failed", str(exc), recoverable=True, status=400) from exc
-            response_body = _rename_run_packet(run)
-            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+            return _rename_run_packet(run)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def session_archive(self, request: web.Request) -> web.Response:
