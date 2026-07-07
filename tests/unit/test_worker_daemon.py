@@ -1105,8 +1105,13 @@ def test_worker_health_scans_worktree_inventory_off_event_loop(tmp_path, monkeyp
     monkeypatch.setattr("jarvis.worker.server.worktree_inventory", inventory)
 
     async def calls(base: str, client: httpx.AsyncClient) -> dict:
-        response = await client.get(f"{base}/health")
-        return response.json()
+        for _ in range(50):
+            response = await client.get(f"{base}/health")
+            body = response.json()
+            if body["worktree_inventory"].get("count") == 0 and "status" not in body["worktree_inventory"]:
+                return body
+            await asyncio.sleep(0.01)
+        return body
 
     body = asyncio.run(_with_server(cfg, 8854, calls))
 
@@ -1132,15 +1137,59 @@ def test_daemon_health_caches_worktree_inventory_within_diagnostics_ttl(tmp_path
     monkeypatch.setattr("jarvis.worker.server.worktree_inventory", inventory)
 
     async def calls(base: str, client: httpx.AsyncClient) -> tuple[dict, dict]:
-        first = await client.get(f"{base}/health")
+        first = None
+        for _ in range(50):
+            response = await client.get(f"{base}/health")
+            first = response.json()
+            if first["worktree_inventory"].get("count") == 1:
+                break
+            await asyncio.sleep(0.01)
+        assert first is not None
         second = await client.get(f"{base}/health")
-        return first.json(), second.json()
+        return first, second.json()
 
     first, second = asyncio.run(_with_server(cfg, 8866, calls))
 
     assert scan_count["n"] == 1
     assert first["worktree_inventory"] == {"count": 1, "disk_bytes": 0, "stale_count": 0}
     assert second["worktree_inventory"] == first["worktree_inventory"]
+
+
+def test_daemon_health_does_not_block_on_slow_worktree_inventory(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = WorkerConfig(
+        _env_file=None, token="", workspace=str(tmp_path / "worker"), worktree_stale_ttl_s=0, diagnostics_ttl_s=60
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def inventory(*_args, **_kwargs) -> dict[str, int]:  # noqa: ANN002, ANN003
+        started.set()
+        release.wait(timeout=5)
+        return {"count": 9, "disk_bytes": 123, "stale_count": 1}
+
+    monkeypatch.setattr("jarvis.worker.server.worktree_inventory", inventory)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[float, dict, dict]:
+        start = time.monotonic()
+        first = await client.get(f"{base}/health")
+        elapsed = time.monotonic() - start
+        first_body = first.json()
+        assert started.wait(timeout=1)
+        release.set()
+        second_body = first_body
+        for _ in range(50):
+            second = await client.get(f"{base}/health")
+            second_body = second.json()
+            if second_body["worktree_inventory"].get("count") == 9:
+                break
+            await asyncio.sleep(0.01)
+        return elapsed, first_body, second_body
+
+    elapsed, first, second = asyncio.run(_with_server(cfg, 8867, calls))
+
+    assert elapsed < 0.5
+    assert first["worktree_inventory"] == {"count": 0, "disk_bytes": 0, "stale_count": 0, "status": "refreshing"}
+    assert second["worktree_inventory"] == {"count": 9, "disk_bytes": 123, "stale_count": 1}
 
 
 def test_daemon_health_reports_diagnostics_error_without_500(tmp_path, monkeypatch) -> None:  # noqa: ANN001

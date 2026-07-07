@@ -213,7 +213,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
     browser_cfg = BrowserConfig()
     browser_holder: dict = {}
     diagnostics_state: dict[str, Any] = {"value": None, "expires_at": 0.0, "task": None}
-    worktree_inventory_state: dict[str, Any] = {"value": None, "expires_at": 0.0}
+    worktree_inventory_state: dict[str, Any] = {"value": None, "expires_at": 0.0, "task": None}
 
     async def browser_dispatch(action: str, args: dict) -> web.Response:
         if not browser_cfg.enabled:
@@ -886,25 +886,43 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         status = 200 if result.get("ok") else 409
         return web.json_response(result, status=status)
 
+    def _refreshing_worktree_inventory() -> dict[str, Any]:
+        return {"count": 0, "disk_bytes": 0, "stale_count": 0, "status": "refreshing"}
+
+    async def _refresh_worktree_inventory() -> None:
+        try:
+            value = await asyncio.to_thread(
+                worktree_inventory,
+                str(workspace / "worktrees"),
+                str(workspace / "sessions"),
+                stale_ttl_s=cfg.worktree_stale_ttl_s,
+            )
+            if not isinstance(value, dict):
+                value = {"count": 0, "disk_bytes": 0, "stale_count": 0, "error": "invalid inventory payload"}
+        except Exception as exc:  # noqa: BLE001 - health must remain a liveness endpoint
+            value = {"count": 0, "disk_bytes": 0, "stale_count": 0, "error": str(exc)[:200] or exc.__class__.__name__}
+        worktree_inventory_state["value"] = value
+        worktree_inventory_state["expires_at"] = asyncio.get_running_loop().time() + max(0.0, cfg.diagnostics_ttl_s)
+        worktree_inventory_state["task"] = None
+
     async def _cached_worktree_inventory() -> dict[str, Any]:
         # /health is a probe endpoint the cockpit hits continuously (SSE ~1s, ~3s
         # timeout). worktree_inventory() is a full os.walk lstat of every worktree —
         # cheap on a small workspace but easily probe-timeout-exceeding on a large
-        # one, which flaps the worker offline. Cache it on the same TTL as
-        # diagnostics; still off the event loop (asyncio.to_thread) on a cache miss.
+        # one, which flaps the worker offline. Cache it on the same TTL as diagnostics
+        # and refresh in the background so a cache miss never blocks liveness.
         now = asyncio.get_running_loop().time()
         cached = worktree_inventory_state.get("value")
         if cached is not None and float(worktree_inventory_state.get("expires_at") or 0.0) > now:
             return dict(cached)
-        value = await asyncio.to_thread(
-            worktree_inventory,
-            str(workspace / "worktrees"),
-            str(workspace / "sessions"),
-            stale_ttl_s=cfg.worktree_stale_ttl_s,
-        )
-        worktree_inventory_state["value"] = value
-        worktree_inventory_state["expires_at"] = now + max(0.0, cfg.diagnostics_ttl_s)
-        return dict(value)
+        task = worktree_inventory_state.get("task")
+        if task is None or task.done():
+            worktree_inventory_state["task"] = asyncio.create_task(_refresh_worktree_inventory())
+        if isinstance(cached, dict):
+            payload = dict(cached)
+            payload["status"] = "refreshing"
+            return payload
+        return _refreshing_worktree_inventory()
 
     async def health(request: web.Request) -> web.Response:
         supported_engines = engine_ids(cfg.supported_engines, default_engine=cfg.agent)
@@ -975,10 +993,18 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
+    async def _cleanup_worktree_inventory(_app: web.Application) -> None:
+        task = worktree_inventory_state.get("task")
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
     app = web.Application(client_max_size=max(1024 * 1024, int(cfg.max_request_bytes)))
     app["browser_holder"] = browser_holder  # for clean shutdown in serve()
     app["browser_cfg"] = browser_cfg
     app.on_cleanup.append(_cleanup_diagnostics)
+    app.on_cleanup.append(_cleanup_worktree_inventory)
     app.add_routes([
         web.post("/run", run),
         web.get("/jobs/{id}", get_job),
