@@ -536,6 +536,12 @@ class CockpitConnector:
         self._worker_get = worker_get or httpx.get
         self._index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
         self._worker_registry: WorkerRegistry | None = None
+        self._curation_outbox = CurationOutbox(
+            self._cfg.memory.curation_outbox_path,
+            max_retries=self._cfg.memory.curation_outbox_max_retries,
+            backoff_initial_s=self._cfg.memory.curation_outbox_backoff_initial_s,
+            backoff_max_s=self._cfg.memory.curation_outbox_backoff_max_s,
+        )
 
     @property
     def index(self) -> CockpitThreadIndex:
@@ -971,7 +977,11 @@ class CockpitConnector:
         contexts = ContextStore(lambda _ctx: None)  # type: ignore[arg-type]
         active = ActiveProject(id=project.id, name=project.name, peer_id=project.peer_id)
         contexts.set_active_project(ctx, active)
-        registry_store = RegistryStore(self._cfg.registry.path)
+        registry_store = RegistryStore(
+            self._cfg.registry.path,
+            memory=memory,
+            curation_outbox=self._curation_outbox,
+        )
         users = load_users(self._cfg.capabilities.users_dir)
         tools = build_registry(
             self._cfg.tools,
@@ -983,16 +993,10 @@ class CockpitConnector:
             capabilities=self._cfg.capabilities,
             memory=memory,
         )
-        outbox = CurationOutbox(
-            self._cfg.memory.curation_outbox_path,
-            max_retries=self._cfg.memory.curation_outbox_max_retries,
-            backoff_initial_s=self._cfg.memory.curation_outbox_backoff_initial_s,
-            backoff_max_s=self._cfg.memory.curation_outbox_backoff_max_s,
-        )
         for tool in make_memory_tools(
             self._cfg.memory,
             memory=memory,
-            outbox=outbox,
+            outbox=self._curation_outbox,
             registry=registry_store,
             users=users,
         ):

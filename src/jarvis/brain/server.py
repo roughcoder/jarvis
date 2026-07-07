@@ -191,7 +191,17 @@ class BrainServer:
         self._gateway = GatewayClient(cfg.gateway)
         self._tts = InworldTTS(cfg.tts)
         self._memory = MemoryClient(cfg.memory)
-        self._registry_store = RegistryStore(cfg.registry.path)
+        self._curation_outbox = CurationOutbox(
+            self._cfg.memory.curation_outbox_path,
+            max_retries=self._cfg.memory.curation_outbox_max_retries,
+            backoff_initial_s=self._cfg.memory.curation_outbox_backoff_initial_s,
+            backoff_max_s=self._cfg.memory.curation_outbox_backoff_max_s,
+        )
+        self._registry_store = RegistryStore(
+            cfg.registry.path,
+            memory=self._memory,
+            curation_outbox=self._curation_outbox,
+        )
         self._project_ops = ProjectOperationService(
             cfg,
             registry=self._registry_store,
@@ -240,16 +250,10 @@ class BrainServer:
                 self._registry.register(tool)
 
     def _register_memory_tools(self, users: dict) -> None:
-        outbox = CurationOutbox(
-            self._cfg.memory.curation_outbox_path,
-            max_retries=self._cfg.memory.curation_outbox_max_retries,
-            backoff_initial_s=self._cfg.memory.curation_outbox_backoff_initial_s,
-            backoff_max_s=self._cfg.memory.curation_outbox_backoff_max_s,
-        )
         for tool in make_memory_tools(
             self._cfg.memory,
             memory=self._memory,
-            outbox=outbox,
+            outbox=self._curation_outbox,
             registry=self._registry_store,
             users=users,
         ):
