@@ -1197,6 +1197,74 @@ def test_daemon_conversation_workspace_materializes_multiple_repos(tmp_path) -> 
     assert cockpit != paths["cockpit"]
 
 
+def test_daemon_conversation_workspace_serializes_concurrent_materialization(tmp_path) -> None:
+    dev = tmp_path / "dev"
+    _git_repo(dev, "jarvis")
+    _git_repo(dev, "jarvis-cockpit")
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="tkn",
+        workspace=str(tmp_path / "worker"),
+        repo_root=str(dev),
+        clone_missing=False,
+    )
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        await c.post(f"{base}/conversation-workspaces", json={"conversation_id": "thread_race"}, headers=headers)
+        first, second = await asyncio.gather(
+            c.post(
+                f"{base}/conversation-workspaces/thread_race/worktrees",
+                json={"name": "runtime", "repo": "roughcoder/jarvis"},
+                headers=headers,
+            ),
+            c.post(
+                f"{base}/conversation-workspaces/thread_race/worktrees",
+                json={"name": "cockpit", "repo": "roughcoder/jarvis-cockpit"},
+                headers=headers,
+            ),
+        )
+        fetched = (await c.get(f"{base}/conversation-workspaces/thread_race", headers=headers)).json()
+        return first.json(), second.json(), fetched
+
+    first, second, fetched = asyncio.run(_with_server(cfg, 8853, calls))
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert {row["name"] for row in fetched["workspace"]["worktrees"]} == {"runtime", "cockpit"}
+
+
+def test_daemon_conversation_workspace_rejects_option_like_base_ref(tmp_path) -> None:
+    dev = tmp_path / "dev"
+    _git_repo(dev, "jarvis")
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="tkn",
+        workspace=str(tmp_path / "worker"),
+        repo_root=str(dev),
+        clone_missing=False,
+    )
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        response = await c.post(
+            f"{base}/conversation-workspaces/thread_base/worktrees",
+            json={"name": "runtime", "repo": "roughcoder/jarvis", "base_ref": "-bad"},
+            headers=headers,
+        )
+        fetched = (await c.get(f"{base}/conversation-workspaces/thread_base", headers=headers)).json()
+        return response.status_code, response.json(), fetched
+
+    status, body, fetched = asyncio.run(_with_server(cfg, 8854, calls))
+
+    assert status == 400
+    assert body["ok"] is False
+    assert "invalid base ref" in body["error"]
+    assert fetched["workspace"]["status"] == "failed"
+    assert fetched["workspace"]["provision_phase"] == "failed"
+    assert fetched["workspace"]["worktrees"] == []
+
+
 def test_provider_cwd_accepts_configured_conversation_workspace(tmp_path) -> None:
     root = tmp_path / "conversation-cache"
     cwd = root / "thread-alpha"

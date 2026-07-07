@@ -66,6 +66,7 @@ from jarvis.worker.workspaces import (
     get_workspace,
     materialize_worktree,
     remove_worktree,
+    worker_owned_cwd,
 )
 from jarvis.system_info import system_info_cached
 from jarvis.worker_session_contract import (
@@ -568,7 +569,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             conversation_id = str(body.get("conversation_id") or "").strip()
             if not conversation_id:
                 return web.json_response({"ok": False, "error": "conversation_id is required"}, status=400)
-            workspace_state = ensure_workspace(
+            workspace_state = await ensure_workspace(
                 root=conversation_root,
                 conversation_id=conversation_id,
                 metadata=dict(body.get("metadata") or {}),
@@ -1133,7 +1134,7 @@ async def _provision_session_if_requested(
     metadata = dict(data.get("metadata") or {})
     envelope = metadata.get("execution_envelope")
     if data.get("cwd"):
-        cwd, err = _worker_owned_cwd(str(data.get("cwd") or ""), workspace, conversation_root=conversation_root)
+        cwd, err = worker_owned_cwd(str(data.get("cwd") or ""), workspace, conversation_root=conversation_root)
         if err:
             raise ValueError(err)
         return sessions.update_workspace(session.session_id, cwd=cwd), []
@@ -1247,27 +1248,7 @@ def _should_probe_repo_access(repo_ref: str) -> bool:
 
 
 def _resume_cwd(cwd: str, workspace: pathlib.Path) -> tuple[str, str]:
-    return _worker_owned_cwd(cwd, workspace, action="resume")
-
-
-def _worker_owned_cwd(
-    cwd: str,
-    workspace: pathlib.Path,
-    *,
-    conversation_root: pathlib.Path | None = None,
-    action: str = "session",
-) -> tuple[str, str]:
-    path = pathlib.Path(cwd).expanduser().resolve(strict=False)
-    allowed_roots = [
-        (workspace / "runs").resolve(),
-        (workspace / "worktrees").resolve(),
-        (conversation_root or workspace / "conversations").resolve(),
-    ]
-    if not any(path.is_relative_to(root) for root in allowed_roots):
-        return "", f"refusing to {action} outside worker-owned workspace: {cwd}"
-    if not path.is_dir():
-        return "", f"{action} cwd does not exist: {cwd}"
-    return str(path), ""
+    return worker_owned_cwd(cwd, workspace, action="resume")
 
 
 def _session_cwd_error(session: WorkerSession, workspace: pathlib.Path, conversation_root: pathlib.Path) -> str:
@@ -1275,7 +1256,7 @@ def _session_cwd_error(session: WorkerSession, workspace: pathlib.Path, conversa
         return ""
     if not session.cwd:
         return f"worker session cwd is required for {session.provider} provider turns"
-    _cwd, err = _worker_owned_cwd(
+    _cwd, err = worker_owned_cwd(
         session.cwd,
         workspace,
         conversation_root=conversation_root,

@@ -35,7 +35,7 @@ from jarvis.connectors.cockpit import (
     CockpitThread,
     CockpitThreadIndex,
     THREAD_INDEX_FILENAME,
-    _workspace_public,
+    workspace_public,
 )
 from jarvis.ids import new_id, utc_now
 from jarvis.mcp.status import (
@@ -1470,7 +1470,7 @@ class CockpitWriteHandlers:
                 requester,
                 text,
                 attachments=attachments or None,
-                workspace_request=dict(body.get("workspace") or {}) if isinstance(body.get("workspace"), dict) else None,
+                workspace_request=dict(body["workspace"]) if isinstance(body.get("workspace"), dict) else None,
             )
         except (UnsupportedMemoryOperation, TimeoutError, OSError, RuntimeError) as exc:
             self.ctx.thread_turn_states[state_key] = ("failed", "engine_error")
@@ -3418,7 +3418,7 @@ def _thread_projection(thread: CockpitThread, ctx: CockpitAppContext | None = No
         "archive_reason": thread.archive_reason,
     }
     if thread.workspace:
-        data["workspace"] = _workspace_public(thread.workspace)
+        data["workspace"] = workspace_public(thread.workspace)
     return data
 
 

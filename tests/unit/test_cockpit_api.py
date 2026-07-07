@@ -2635,12 +2635,13 @@ def test_cockpit_thread_turn_labels_unescalated_chat_as_planning_only(tmp_path, 
         thread = opened.json()["thread"]
         response = await client.post(
             f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
-            json={"text": "What should we plan first?"},
+            json={"text": "Inspect the notes repo files and plan the tests."},
         )
         events = _sse_events(response.text)
 
         assert response.status_code == 200
         assert events[-1]["_event"] == "thread.turn.done"
+        assert "workspace" not in events[-1]["payload"]["thread"]
 
     import asyncio
 
@@ -2742,6 +2743,8 @@ def test_cockpit_thread_escalates_to_workspace_without_losing_thread_history(tmp
         assert first.status_code == 200
         assert second.status_code == 200
         done = [event for event in _sse_events(second.text) if event["_event"] == "thread.turn.done"][-1]
+        reply = [event for event in _sse_events(second.text) if event["_event"] == "thread.reply"][-1]
+        assert reply["payload"]["reply"] == "Workspace turn is running."
         workspace = done["payload"]["thread"]["workspace"]
         assert workspace["worker_id"] == "macbook-worker"
         assert workspace["session_id"].startswith("conv_thread")
@@ -2757,15 +2760,90 @@ def test_cockpit_thread_escalates_to_workspace_without_losing_thread_history(tmp
         "Plan the rollout.",
         "Planning reply.",
         "Inspect the notes repo.",
-        "Workspace turn started.",
     ]
     stored = connector.index.list("neil-shared", include_archived=True)[0]
     with_messages = connector.index.get_with_messages("neil-shared", stored.thread_id)
     assert with_messages is not None
     assert len(with_messages.messages) == 4
+    assert with_messages.messages[-1]["content"] == "[workspace turn pending]"
     turn_posts = [call for call in state["posts"] if call["url"].endswith("/turns")]
     assert turn_posts
     assert "Honcho session: project:neil-shared:orchestrator:" in turn_posts[0]["json"]["prompt"]
+
+
+def test_cockpit_thread_workspace_failure_marks_workspace_failed(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        if url.endswith("/health"):
+            return Response(
+                {
+                    "ok": True,
+                    "agent": "codex",
+                    "default_engine": "codex",
+                    "supported_engines": ["codex"],
+                    "engine_supports": {"codex": {"streaming": True}},
+                    "repositories": [{"repo": "notes", "status": "ready"}],
+                }
+            )
+        if url.endswith("/sessions"):
+            return Response({"sessions": []})
+        return Response({})
+
+    def worker_post(url: str, json: dict[str, Any], **_kwargs: Any) -> Response:  # noqa: A002
+        if url.endswith("/conversation-workspaces"):
+            return Response(
+                {
+                    "ok": True,
+                    "workspace": {
+                        "workspace_id": "neil-shared-thread",
+                        "conversation_id": "neil-shared-thread",
+                        "root": str(tmp_path / "worker" / "conversations" / "neil-shared-thread"),
+                        "root_label": "neil-shared-thread",
+                        "cwd_label": "neil-shared-thread",
+                        "status": "ready",
+                        "provision_phase": "running",
+                        "worktrees": [],
+                    },
+                }
+            )
+        if url.endswith("/worktrees"):
+            return Response({"ok": False, "error": "clone failed"}, status_code=400)
+        return Response({"ok": False, "error": "unexpected worker post"}, status_code=400)
+
+    connector = CockpitConnector(
+        cfg,
+        memory=memory,
+        gateway=FakeGateway(["unused"]),
+        tts=None,
+        tracer=None,
+        worker_get=worker_get,
+        worker_post=worker_post,
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Plan"})
+        thread = opened.json()["thread"]
+        failed = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "Inspect the notes repo.", "workspace": {"repos": ["notes"]}},
+        )
+        detail = await client.get(f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}")
+        return {"events": _sse_events(failed.text), "detail": detail.json()}
+
+    import asyncio
+
+    result = asyncio.run(_with_server(cfg, calls))
+
+    errors = [event for event in result["events"] if event["_event"] == "thread.turn.error"]
+    assert errors
+    thread = result["detail"]["thread"]
+    assert thread["status"] == "failed"
+    assert thread["workspace"]["status"] == "failed"
+    assert thread["workspace"]["provision_phase"] == "failed"
 
 
 def test_cockpit_thread_turn_records_decision_only_through_lane2_tool(tmp_path, monkeypatch) -> None:  # noqa: ANN001
