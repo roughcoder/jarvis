@@ -1828,6 +1828,15 @@ class CockpitWriteHandlers:
         body = await _optional_json_body(request)
         run_id = request.match_info["run_id"]
         scope = f"runs/{run_id}/delete"
+        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
+            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
+            if cached is not None:
+                return web.json_response(cached)
+            _require_capability(self.ctx.cfg, "orchestration.runs.write")
+            response_body = await asyncio.to_thread(_delete_run_packet, self.ctx, run_id)
+            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+        return web.json_response(response_body)
+
     async def run_rename(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
@@ -1838,7 +1847,6 @@ class CockpitWriteHandlers:
             if cached is not None:
                 return web.json_response(cached)
             _require_capability(self.ctx.cfg, "orchestration.runs.write")
-            response_body = await asyncio.to_thread(_delete_run_packet, self.ctx, run_id)
             try:
                 run = await asyncio.to_thread(
                     self.ctx.store.rename_run,
@@ -1888,6 +1896,15 @@ class CockpitWriteHandlers:
         body = await _optional_json_body(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
         scope = f"sessions/{ref.worker_id}/{ref.session_id}/delete"
+        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
+            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
+            if cached is not None:
+                return web.json_response(cached)
+            _require_capability(self.ctx.cfg, "orchestration.runs.write")
+            response_body = await asyncio.to_thread(_delete_session_packet, self.ctx, ref)
+            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+        return web.json_response(response_body)
+
     async def session_rename(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
@@ -1898,7 +1915,6 @@ class CockpitWriteHandlers:
             if cached is not None:
                 return web.json_response(cached)
             _require_capability(self.ctx.cfg, "orchestration.runs.write")
-            response_body = await asyncio.to_thread(_delete_session_packet, self.ctx, ref)
             run_id = await asyncio.to_thread(_session_run_id_from_store, self.ctx.store, ref)
             if not run_id:
                 raise CockpitError("not_found", "session run not found", status=404)
