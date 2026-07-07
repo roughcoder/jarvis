@@ -1741,10 +1741,10 @@ class CockpitWriteHandlers:
         body = await _json_body(request)
         scope = "mcp/tokens"
         key = str(body.get("idempotency_key") or "")
-        async with _idempotency_scope(self.ctx, scope, key):
-            cached = self.ctx.idempotency.get(scope, key, body)
-            if cached is not None:
-                return web.json_response(cached)
+        issued_token_id: str | None = None
+
+        async def produce() -> dict[str, Any]:
+            nonlocal issued_token_id
             principal = str(body.get("principal") or "").strip()
             name = str(body.get("name") or "").strip()
             if not principal:
@@ -1766,28 +1766,42 @@ class CockpitWriteHandlers:
                 record.principal,
                 record.name,
             )
-            response_body = {
+            issued_token_id = record.token_id
+            return {
                 "ok": True,
                 "api_version": API_VERSION,
                 "schema_version": SCHEMA_VERSION,
                 "token": token,
                 "record": token_record_public(record),
             }
+
+        def cache_response_body(response_body: dict[str, Any]) -> dict[str, Any]:
             idempotent_body = dict(response_body)
             idempotent_body["token"] = ""
-            try:
-                self.ctx.idempotency.save(scope, key, body, idempotent_body)
-            except Exception as exc:  # noqa: BLE001 - plaintext was not delivered; revoke the active record.
+            return idempotent_body
+
+        async def revoke_after_save_error(exc: Exception) -> None:
+            if issued_token_id:
                 await asyncio.to_thread(
                     _mcp_token_revoke_after_failed_issue,
                     self.ctx.cfg.mcp_serve.token_store_path,
-                    record.token_id,
+                    issued_token_id,
                 )
-                raise CockpitError(
-                    "internal_error",
-                    public_error_message(str(exc) or "idempotency save failed"),
-                    status=500,
-                ) from exc
+            raise CockpitError(
+                "internal_error",
+                public_error_message(str(exc) or "idempotency save failed"),
+                status=500,
+            ) from exc
+
+        response_body = await _idempotent_write_body(
+            self.ctx,
+            scope,
+            key,
+            body,
+            produce,
+            cache_response_body=cache_response_body,
+            on_save_error=revoke_after_save_error,
+        )
         return web.json_response(response_body)
 
     async def mcp_token_revoke(self, request: web.Request) -> web.Response:
