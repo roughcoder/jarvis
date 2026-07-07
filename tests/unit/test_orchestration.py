@@ -8,6 +8,7 @@ import pytest
 
 from jarvis.capabilities import WORKER_SESSION_STOP
 from jarvis.config import WorkerConfig, load_config
+from jarvis.connectors.cockpit import CockpitThread, CockpitThreadIndex
 from jarvis.orchestration import store as store_module
 from jarvis.orchestration.authority import allowed
 from jarvis.orchestration.campaign import CampaignPolicy, create_campaign
@@ -105,6 +106,99 @@ def test_completed_phase_is_terminal(tmp_path) -> None:
     assert completed.status == "terminal"
     assert completed.terminal_reason == "Smoke dispatch verified"
     assert store.active_primary_owner(item) is None
+
+
+def test_archive_run_promotes_child_chats_to_root(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    parent = store.create_run("Parent orchestrator")
+    child = store.create_run("Child work", parent_chat_id=parent.run_id)
+
+    archived = store.archive_run(parent.run_id)
+    reloaded_child = store.get(child.run_id)
+
+    assert archived.archived_at
+    assert archived.child_chat_ids == []
+    assert reloaded_child is not None
+    assert reloaded_child.parent_chat_id is None
+    assert reloaded_child.parent_run_id is None
+    assert reloaded_child.archived_at == ""
+    assert any(event.type == "chat_reparented" for event in store.events(child.run_id))
+
+
+def test_archive_run_promotes_child_project_threads_to_root(tmp_path) -> None:
+    index = CockpitThreadIndex(tmp_path / "cockpit-threads.json")
+    store = OrchestrationStore(str(tmp_path), thread_children_promoter=index.promote_children)
+    parent = store.create_run("Parent orchestrator")
+    thread = index.save(
+        CockpitThread(
+            thread_id="thread_child",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_child",
+            title="Child thread",
+            created_at="2026-07-05T09:00:00+00:00",
+            updated_at="2026-07-05T09:00:00+00:00",
+            created_by="neil",
+            parent_chat_id=parent.run_id,
+        )
+    )
+
+    store.archive_run(parent.run_id)
+
+    promoted = index.get("jarvis", thread.thread_id)
+    assert promoted is not None
+    assert promoted.parent_chat_id == ""
+
+
+def test_terminal_child_notifies_parent_chat(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    parent = store.create_run("Parent orchestrator")
+    child = store.create_run("Child work", parent_chat_id=parent.run_id)
+
+    store.set_phase(child.run_id, "completed", "done")
+    store.set_phase(child.run_id, "completed", "done")
+
+    notifications = [event for event in store.events(parent.run_id) if event.type == "child_terminal"]
+    assert len(notifications) == 1
+    assert notifications[0].data["child_chat_id"] == child.run_id
+    assert notifications[0].data["phase"] == "completed"
+
+
+def test_terminal_child_notifies_parent_project_thread(tmp_path) -> None:
+    index = CockpitThreadIndex(tmp_path / "cockpit-threads.json")
+    parent = index.save(
+        CockpitThread(
+            thread_id="thread_parent",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_parent",
+            title="Parent",
+            created_at="2026-07-05T09:00:00+00:00",
+            updated_at="2026-07-05T09:00:00+00:00",
+            created_by="neil",
+        )
+    )
+    index.append_turn(
+        parent,
+        user_peer_id="neil",
+        user_text="Spawn the worker",
+        assistant_peer_id="jarvis",
+        assistant_text="On it.",
+    )
+    store = OrchestrationStore(
+        str(tmp_path),
+        thread_child_terminal_notifier=index.append_child_terminal_system_message,
+    )
+    child = store.create_run("Child work", parent_chat_id="thread_parent")
+
+    store.set_phase(child.run_id, "completed", "done")
+    store.set_phase(child.run_id, "completed", "done")
+
+    stored = index.get_with_messages("jarvis", "thread_parent")
+    assert stored is not None
+    messages = stored.messages
+    assert [message["role"] for message in messages] == ["user", "assistant", "system"]
+    assert messages[-1]["type"] == "child_terminal"
+    assert messages[-1]["child_chat_id"] == child.run_id
+    assert messages[-1]["phase"] == "completed"
 
 
 def test_active_primary_owner_scopes_github_numbers_by_repo(tmp_path) -> None:
@@ -1582,6 +1676,47 @@ def test_orchestration_service_needs_human_for_start_without_repo(tmp_path, monk
     assert runs[0].status == "terminal"
     assert runs[0].jobs == []
     assert exc.value.run_id == runs[0].run_id
+
+
+def test_orchestration_service_preserves_parent_for_needs_human_without_repo(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                "ORCHESTRATION_LANDING_MODE=branch_only",
+            ]
+        )
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
+    cfg = load_config()
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    parent = store.create_run("Parent orchestrator")
+
+    class Source:
+        def next(self, *, repo="", filters=None):  # noqa: ANN001, ANN201
+            return _item(source="linear", id="HL-255", repo="", kind="ticket")
+
+    service = OrchestrationService(
+        cfg=cfg,
+        capabilities={"work.linear.read", "worker.job.start", "worker.session.create", "worker.session.turn", "forge.github.branch.push"},
+        source_factory=lambda _name, _cfg=None: Source(),
+    )
+
+    with pytest.raises(MissingWorkRepoError) as exc:
+        service.next_work(
+            WorkCommand("start_next_work", source="linear", start=True),
+            start=True,
+            parent_chat_id=parent.run_id,
+        )
+
+    child = OrchestrationStore(cfg.orchestration.workspace).get(exc.value.run_id)
+    reloaded_parent = OrchestrationStore(cfg.orchestration.workspace).get(parent.run_id)
+    assert child is not None
+    assert child.phase == "needs_human"
+    assert child.parent_chat_id == parent.run_id
+    assert reloaded_parent is not None
+    assert child.run_id in reloaded_parent.child_chat_ids
 
 
 def test_orchestration_service_uses_default_repo_for_repo_less_item(tmp_path, monkeypatch) -> None:  # noqa: ANN001

@@ -9,6 +9,7 @@ import json
 import pathlib
 import re
 import shutil
+from collections.abc import Callable
 
 from jarvis.ids import new_id, utc_now
 from jarvis.orchestration.models import (
@@ -60,7 +61,13 @@ class OrchestrationStore:
     so Jarvis can explain what happened even if later state changes.
     """
 
-    def __init__(self, root: str) -> None:
+    def __init__(
+        self,
+        root: str,
+        *,
+        thread_child_terminal_notifier: Callable[[str, OrchestrationRun], bool] | None = None,
+        thread_children_promoter: Callable[[str], object] | None = None,
+    ) -> None:
         self.root = pathlib.Path(root).expanduser()
         self.runs_dir = self.root / "runs"
         self.runs_dir.mkdir(parents=True, exist_ok=True)
@@ -69,6 +76,8 @@ class OrchestrationStore:
         self._session_refs_path = self.root / "session-refs.json"
         self._deleted_runs_path = self.root / "deleted-runs.json"
         self._deleted_sessions_path = self.root / "deleted-sessions.json"
+        self._thread_child_terminal_notifier = thread_child_terminal_notifier
+        self._thread_children_promoter = thread_children_promoter
 
     def run_dir(self, run_id: str) -> pathlib.Path:
         if not _RUN_ID.fullmatch(run_id):
@@ -91,8 +100,10 @@ class OrchestrationStore:
         *,
         work_items: list[WorkItem] | None = None,
         parent_run_id: str | None = None,
+        parent_chat_id: str | None = None,
     ) -> OrchestrationRun:
         items = work_items or []
+        parent_chat_id = parent_chat_id or parent_run_id
         with self._locked():
             if items:
                 owner = self._active_primary_owner_unlocked(items[0])
@@ -101,6 +112,7 @@ class OrchestrationStore:
             run = OrchestrationRun(
                 run_id=new_id("run"),
                 objective=objective,
+                parent_chat_id=parent_chat_id,
                 parent_run_id=parent_run_id,
                 work_items=[
                     WorkItemLink(item=item, role="primary" if i == 0 else "related")
@@ -109,10 +121,12 @@ class OrchestrationStore:
             )
             self.save(run)
             self.append_event(run.run_id, "run_created", f"Created run: {objective}")
-            if parent_run_id:
-                parent = self.get(parent_run_id)
+            if parent_chat_id:
+                parent = self.get(parent_chat_id)
                 if parent and run.run_id not in parent.child_run_ids:
                     parent.child_run_ids.append(run.run_id)
+                    if run.run_id not in parent.child_chat_ids:
+                        parent.child_chat_ids.append(run.run_id)
                     parent.updated_at = utc_now()
                     self.save(parent)
         return run
@@ -188,6 +202,8 @@ class OrchestrationStore:
             run.terminal_reason = ""
         self.save(run)
         self.append_event(run_id, "phase_changed", message or f"Phase changed to {phase}", {"phase": phase})
+        if run.status == "terminal":
+            self.notify_parent_child_terminal(run)
         return run
 
     def archive_run(self, run_id: str) -> OrchestrationRun:
@@ -195,11 +211,71 @@ class OrchestrationStore:
             run = self.get(run_id)
             if run is None:
                 raise KeyError(run_id)
+            self._promote_children_unlocked(run.run_id)
+            self._promote_thread_children(run.run_id)
             if not run.archived_at:
                 run.archived_at = utc_now()
+                run.child_chat_ids = []
+                run.child_run_ids = []
                 self.save(run)
                 self.append_event(run_id, "run_archived", "Run archived from cockpit views")
             return run
+
+    def promote_children(self, parent_chat_id: str) -> list[OrchestrationRun]:
+        with self._locked():
+            return self._promote_children_unlocked(parent_chat_id)
+
+    def rename_run(self, run_id: str, title: str) -> OrchestrationRun:
+        title = " ".join(title.split())
+        if not title:
+            raise ValueError("title is required")
+        with self._locked():
+            run = self.get(run_id)
+            if run is None:
+                raise KeyError(run_id)
+            if run.objective != title:
+                run.objective = title
+                self.save(run)
+                self.append_event(run_id, "run_renamed", f"Renamed run to {title}", {"title": title})
+            return run
+
+    def notify_parent_child_terminal(
+        self,
+        child: OrchestrationRun,
+        *,
+        thread_child_terminal_notifier: Callable[[str, OrchestrationRun], bool] | None = None,
+    ) -> None:
+        parent_chat_id = child.parent_chat_id or child.parent_run_id or ""
+        if not parent_chat_id:
+            return
+        parent = self.get(parent_chat_id)
+        if parent is None:
+            notifier = thread_child_terminal_notifier or self._thread_child_terminal_notifier
+            if notifier is not None:
+                with contextlib.suppress(Exception):
+                    notifier(parent_chat_id, child)
+            return
+        existing = {
+            (event.type, str(event.data.get("child_chat_id") or ""), str(event.data.get("phase") or ""))
+            for event in self.events(parent.run_id)
+            if isinstance(event.data, dict)
+        }
+        key = ("child_terminal", child.run_id, child.phase)
+        if key in existing:
+            return
+        self.append_event(
+            parent.run_id,
+            "child_terminal",
+            f"Child {child.run_id} reached {child.phase}",
+            {
+                "child_chat_id": child.run_id,
+                "child_run_id": child.run_id,
+                "title": child.objective,
+                "phase": child.phase,
+                "status": child.status,
+                "terminal_reason": child.terminal_reason,
+            },
+        )
 
     def archive_session(self, run_id: str, session_id: str, *, worker_id: str) -> OrchestrationRun:
         with self._locked():
@@ -239,6 +315,30 @@ class OrchestrationStore:
                         {"worker_id": worker_id, "session_id": session_id},
                     )
                 return run
+            return archived
+
+    def close_cockpit_session(self, worker_id: str, session_id: str) -> OrchestrationRun | dict[str, str]:
+        """Archive a session and detach the owning run from the active chat tree."""
+
+        with self._locked():
+            archived = self._archive_worker_session_unlocked(worker_id, session_id)
+            for run in self.list_runs():
+                session = next((x for x in run.sessions if x.worker_id == worker_id and x.session_id == session_id), None)
+                if session is None:
+                    continue
+                if not session.archived_at:
+                    session.archived_at = archived["archived_at"]
+                    self.append_event(
+                        run.run_id,
+                        "session_archived",
+                        f"Worker session {worker_id}/{session_id} archived from cockpit views",
+                        {"worker_id": worker_id, "session_id": session_id},
+                    )
+                self._detach_from_parent_unlocked(run)
+                self.save(run)
+                self._promote_children_unlocked(run.run_id)
+                self._promote_thread_children(run.run_id)
+                return self.get(run.run_id) or run
             return archived
 
     def unarchive_cockpit_session(self, worker_id: str, session_id: str) -> OrchestrationRun | dict[str, str]:
@@ -593,6 +693,45 @@ class OrchestrationStore:
                 if link.role == "primary" and _same_work_item(link.item, item):
                     return run
         return None
+
+    def _promote_children_unlocked(self, parent_chat_id: str) -> list[OrchestrationRun]:
+        promoted: list[OrchestrationRun] = []
+        for child in self.list_runs():
+            if child.parent_chat_id != parent_chat_id and child.parent_run_id != parent_chat_id:
+                continue
+            child.parent_chat_id = None
+            child.parent_run_id = None
+            self.save(child)
+            self.append_event(
+                child.run_id,
+                "chat_reparented",
+                "Parent chat was removed; chat promoted to root",
+                {"previous_parent_chat_id": parent_chat_id, "parent_chat_id": None},
+            )
+            promoted.append(child)
+        parent = self.get(parent_chat_id)
+        if parent is not None and (parent.child_chat_ids or parent.child_run_ids):
+            parent.child_chat_ids = []
+            parent.child_run_ids = []
+            self.save(parent)
+        return promoted
+
+    def _detach_from_parent_unlocked(self, run: OrchestrationRun) -> None:
+        parent_chat_id = run.parent_chat_id or run.parent_run_id or ""
+        if not parent_chat_id:
+            return
+        parent = self.get(parent_chat_id)
+        if parent is not None:
+            parent.child_chat_ids = [child_id for child_id in parent.child_chat_ids if child_id != run.run_id]
+            parent.child_run_ids = [child_id for child_id in parent.child_run_ids if child_id != run.run_id]
+            self.save(parent)
+        run.parent_chat_id = None
+        run.parent_run_id = None
+
+    def _promote_thread_children(self, parent_chat_id: str) -> None:
+        if self._thread_children_promoter is not None:
+            with contextlib.suppress(Exception):
+                self._thread_children_promoter(parent_chat_id)
 
     @contextlib.contextmanager
     def _locked(self):

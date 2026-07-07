@@ -30,7 +30,7 @@ from jarvis.capabilities import (
     WORKER_SESSION_TURN,
 )
 from jarvis.config import Config, insecure_bind
-from jarvis.connectors.cockpit import CockpitConnector, CockpitThread
+from jarvis.connectors.cockpit import CockpitConnector, CockpitThread, CockpitThreadIndex, THREAD_INDEX_FILENAME
 from jarvis.ids import new_id, utc_now
 from jarvis.mcp.status import (
     MCP_TOKENS_MANAGE_CAPABILITY,
@@ -194,7 +194,13 @@ class CockpitAppContext:
             raise CockpitError("unauthorized", "unauthorized", status=401)
 
     def service(self, *, manual_item: WorkItem | None = None) -> OrchestrationService:
-        return _service(self.cfg, self.source_factory, manual_item=manual_item)
+        return _service(
+            self.cfg,
+            self.source_factory,
+            manual_item=manual_item,
+            thread_child_terminal_notifier=_make_thread_child_terminal_notifier(self.cfg),
+            thread_children_promoter=_make_thread_children_promoter(self.cfg),
+        )
 
 
 @dataclass(frozen=True)
@@ -343,6 +349,17 @@ class SseSnapshotHub:
             worker_by_session = {link.session_id: link.worker_id for link in (run.sessions if run else [])}
             for sequence, event in enumerate(events[start:], start=start + 1):
                 data = event.data if isinstance(event.data, dict) else {}
+                if event.type == "child_terminal":
+                    frames.append(
+                        {
+                            "cursor": cursor,
+                            "occurred_at": occurred_at,
+                            "type": "run.event",
+                            "run_id": run_id,
+                            "payload": _project_run_event(event, sequence),
+                        }
+                    )
+                    continue
                 session_id = str(data.get("session_id") or "")
                 worker_id = worker_by_session.get(session_id, "")
                 # Only worker-originated SessionEvents carry an event_id;
@@ -442,7 +459,11 @@ def make_app(
         get=http_get or httpx.get,
         post=http_post or httpx.post,
         delete=http_delete or httpx.delete,
-        store=OrchestrationStore(cfg.orchestration.workspace),
+        store=OrchestrationStore(
+            cfg.orchestration.workspace,
+            thread_child_terminal_notifier=_make_thread_child_terminal_notifier(cfg),
+            thread_children_promoter=_make_thread_children_promoter(cfg),
+        ),
         idempotency=IdempotencyStore(cfg.orchestration.workspace),
         idempotency_locks={},
         idempotency_lock_refs={},
@@ -521,9 +542,13 @@ def make_app(
         web.post("/v1/projects/{project_id}/threads/{thread_id}/archive", writes.project_thread_archive),
         web.post("/v1/projects/{project_id}/threads/{thread_id}/unarchive", writes.project_thread_unarchive),
         web.delete("/v1/projects/{project_id}/threads/{thread_id}", writes.project_thread_delete),
+        web.post("/v1/projects/{project_id}/threads/{thread_id}/rename", writes.project_thread_rename),
         web.post("/v1/work/start", writes.work_start),
         web.post("/v1/work/resume", writes.work_resume),
         web.post("/v1/work/validate", writes.work_validate),
+        web.post("/v1/runs/{run_id}/rename", writes.run_rename),
+        web.post("/v1/sessions/{session_ref}/close", writes.session_close),
+        web.post("/v1/sessions/{session_ref}/rename", writes.session_rename),
     ])
     return app
 
@@ -550,7 +575,14 @@ class CockpitReadHandlers:
     async def catalog(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         defaults, engines, engine_supports = await asyncio.to_thread(_catalog_context, self.ctx.cfg)
-        return web.json_response(cockpit_catalog(start_defaults=defaults, engines=engines or None, engine_supports=engine_supports))
+        return web.json_response(
+            cockpit_catalog(
+                start_defaults=defaults,
+                engines=engines or None,
+                engine_supports=engine_supports,
+                orchestrator_model=self.ctx.cfg.orchestration.orchestrator_model,
+            )
+        )
 
     async def capabilities(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -1368,6 +1400,7 @@ class CockpitWriteHandlers:
                     project,
                     requester,
                     title=str(body.get("title") or ""),
+                    parent_chat_id=str(body.get("parent_chat_id") or ""),
                 )
             except UnsupportedMemoryOperation as exc:
                 raise CockpitError("memory_unavailable", str(exc), recoverable=True, status=503) from exc
@@ -1484,7 +1517,7 @@ class CockpitWriteHandlers:
     async def project_thread_rename(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
-        title = " ".join(str(body.get("title") or "").split())
+        title = " ".join(str(body.get("title") or body.get("name") or "").split())
         if not title:
             raise CockpitError("validation_failed", "title is required", recoverable=True, status=400)
         requester = _requester_or_404(request, self.ctx.cfg)
@@ -1546,6 +1579,7 @@ class CockpitWriteHandlers:
                     by=requester.memory_peer,
                     reason=str(body.get("reason") or ""),
                 )
+                await asyncio.to_thread(self.ctx.store.promote_children, thread_id)
             else:
                 thread = await asyncio.to_thread(connector.unarchive_thread, project, thread_id)
             if thread is None:
@@ -1642,6 +1676,9 @@ class CockpitWriteHandlers:
                 next_work = partial(service.next_work, command, start=True)
                 if attachments:
                     next_work = partial(next_work, attachments=attachments)
+                parent_chat_id = str(body.get("parent_chat_id") or "")
+                if parent_chat_id:
+                    next_work = partial(next_work, parent_chat_id=parent_chat_id)
                 result = await asyncio.to_thread(next_work)
             except (MissingAuthorityError, NoEligibleWorkerError, WorkAlreadyOwnedError, MissingWorkRepoError, WorkerDispatchError) as exc:
                 error = _service_error(exc)
@@ -1800,6 +1837,30 @@ class CockpitWriteHandlers:
             self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
         return web.json_response(response_body)
 
+    async def run_rename(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        body = await _json_body(request)
+        run_id = request.match_info["run_id"]
+        scope = f"runs/{run_id}/rename"
+        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
+            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
+            if cached is not None:
+                return web.json_response(cached)
+            _require_capability(self.ctx.cfg, "orchestration.runs.write")
+            try:
+                run = await asyncio.to_thread(
+                    self.ctx.store.rename_run,
+                    run_id,
+                    str(body.get("title") or body.get("name") or ""),
+                )
+            except KeyError as exc:
+                raise CockpitError("not_found", "run not found", status=404) from exc
+            except ValueError as exc:
+                raise CockpitError("validation_failed", str(exc), recoverable=True, status=400) from exc
+            response_body = _rename_run_packet(run)
+            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+        return web.json_response(response_body)
+
     async def session_archive(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
@@ -1841,6 +1902,58 @@ class CockpitWriteHandlers:
                 return web.json_response(cached)
             _require_capability(self.ctx.cfg, "orchestration.runs.write")
             response_body = await asyncio.to_thread(_delete_session_packet, self.ctx, ref)
+            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+        return web.json_response(response_body)
+
+    async def session_rename(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        body = await _json_body(request)
+        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
+        scope = f"sessions/{ref.worker_id}/{ref.session_id}/rename"
+        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
+            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
+            if cached is not None:
+                return web.json_response(cached)
+            _require_capability(self.ctx.cfg, "orchestration.runs.write")
+            run_id = await asyncio.to_thread(_session_run_id_from_store, self.ctx.store, ref)
+            if not run_id:
+                raise CockpitError("not_found", "session run not found", status=404)
+            try:
+                run = await asyncio.to_thread(
+                    self.ctx.store.rename_run,
+                    run_id,
+                    str(body.get("title") or body.get("name") or ""),
+                )
+            except ValueError as exc:
+                raise CockpitError("validation_failed", str(exc), recoverable=True, status=400) from exc
+            response_body = _rename_session_packet(run, ref)
+            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+        return web.json_response(response_body)
+
+    async def session_close(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        body = await _json_body(request)
+        ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
+        scope = f"sessions/{ref.worker_id}/{ref.session_id}/close"
+        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
+            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
+            if cached is not None:
+                return web.json_response(cached)
+            _require_capability(self.ctx.cfg, WORKER_SESSION_STOP)
+            _require_capability(self.ctx.cfg, "orchestration.runs.write")
+            proxied = _worker_control_body(body, WORKER_SESSION_STOP)
+            raw = await asyncio.to_thread(
+                _worker_post_json,
+                self.ctx.cfg,
+                ref.worker_id,
+                f"/sessions/{ref.session_id}/stop",
+                proxied,
+                post=self.ctx.post,
+            )
+            write_packet = await asyncio.to_thread(_session_write_packet, self.ctx.cfg, self.ctx.store, ref, raw, get=self.ctx.get)
+            cleanup = await asyncio.to_thread(_cleanup_child_session_worktree, self.ctx.cfg, self.ctx.store, ref, body, post=self.ctx.post)
+            archived = await asyncio.to_thread(_close_session, self.ctx.store, ref)
+            response_body = _close_session_packet(archived, ref, write_packet, cleanup)
             self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
         return web.json_response(response_body)
 
@@ -2105,13 +2218,26 @@ class _ManualWorkSource:
         return False
 
 
-def _service(cfg: Config, source_factory: Callable[[str, Any], WorkSource], *, manual_item: WorkItem | None = None) -> OrchestrationService:
+def _service(
+    cfg: Config,
+    source_factory: Callable[[str, Any], WorkSource],
+    *,
+    manual_item: WorkItem | None = None,
+    thread_child_terminal_notifier: Callable[[str, Any], bool] | None = None,
+    thread_children_promoter: Callable[[str], object] | None = None,
+) -> OrchestrationService:
     def factory(name: str, inner_cfg: Any = None) -> WorkSource:
         if name == "manual":
             return _ManualWorkSource(manual_item)
         return source_factory(name, inner_cfg)
 
-    return OrchestrationService(cfg=cfg, capabilities=resolve_capabilities(cfg.capabilities), source_factory=factory)
+    return OrchestrationService(
+        cfg=cfg,
+        capabilities=resolve_capabilities(cfg.capabilities),
+        source_factory=factory,
+        thread_child_terminal_notifier=thread_child_terminal_notifier,
+        thread_children_promoter=thread_children_promoter,
+    )
 
 
 def _command_from_body(body: dict[str, Any], *, start: bool) -> tuple[WorkCommand, WorkItem | None]:
@@ -2159,6 +2285,7 @@ def _started_work_packet(store: OrchestrationStore, result: StartedWork) -> dict
             "worker_id": session.worker_id,
             "session_id": session.session_id,
             "run_id": result.envelope.run_id,
+            "parent_chat_id": run.parent_chat_id if run else "",
             "title": result.item.title,
             "provider": session.provider,
             "engine": session.engine,
@@ -2247,6 +2374,7 @@ def _fallback_session_row(store: OrchestrationStore, ref: SessionRef, raw: dict[
                     "worker_id": link.worker_id,
                     "session_id": link.session_id,
                     "run_id": run.run_id,
+                    "parent_chat_id": run.parent_chat_id or "",
                     "title": run.objective,
                     "provider": str(session_raw.get("provider") or link.provider),
                     "engine": str(session_raw.get("engine") or link.engine),
@@ -2268,6 +2396,7 @@ def _fallback_session_row(store: OrchestrationStore, ref: SessionRef, raw: dict[
         "worker_id": ref.worker_id,
         "session_id": session_id,
         "run_id": str(session_raw.get("run_id") or ""),
+        "parent_chat_id": str(session_raw.get("parent_chat_id") or ""),
         "title": str(session_raw.get("title") or ""),
         "provider": str(session_raw.get("provider") or ""),
         "engine": str(session_raw.get("engine") or session_raw.get("provider") or ""),
@@ -2439,6 +2568,10 @@ def _archive_session(store: OrchestrationStore, ref: SessionRef):
     return store.archive_cockpit_session(ref.worker_id, ref.session_id)
 
 
+def _close_session(store: OrchestrationStore, ref: SessionRef):
+    return store.close_cockpit_session(ref.worker_id, ref.session_id)
+
+
 def _unarchive_session(store: OrchestrationStore, ref: SessionRef):
     try:
         return store.unarchive_cockpit_session(ref.worker_id, ref.session_id)
@@ -2465,6 +2598,34 @@ def _archive_run_packet(run) -> dict[str, Any]:  # noqa: ANN001
         "requests": [],
         "artifacts": [],
         "reclamation": reclamation,
+    }
+
+
+def _rename_run_packet(run) -> dict[str, Any]:  # noqa: ANN001
+    run_row = run_summary(run)
+    return {
+        "ok": True,
+        "cursor": snapshot_cursor({"run": run_row}),
+        "run": run_row,
+        "session": {},
+        "events": [],
+        "requests": [],
+        "artifacts": [],
+    }
+
+
+def _rename_session_packet(run, ref: SessionRef) -> dict[str, Any]:  # noqa: ANN001
+    session = next((item for item in run.sessions if item.worker_id == ref.worker_id and item.session_id == ref.session_id), None)
+    session_row = session_summary(_session_from_link(session, run)) if session is not None else {}
+    run_row = run_summary(run)
+    return {
+        "ok": True,
+        "cursor": snapshot_cursor({"run": run_row, "session": session_row}),
+        "run": run_row,
+        "session": session_row,
+        "events": [],
+        "requests": [],
+        "artifacts": [],
     }
 
 
@@ -2691,6 +2852,26 @@ def _unarchive_session_packet(run, ref: SessionRef) -> dict[str, Any]:  # noqa: 
         "events": [],
         "requests": [],
         "artifacts": [],
+    }
+
+
+def _close_session_packet(run, ref: SessionRef, write_packet: dict[str, Any], cleanup: dict[str, Any]) -> dict[str, Any]:  # noqa: ANN001
+    archived_packet = _archive_session_packet(run, ref)
+    return {
+        **archived_packet,
+        "events": write_packet.get("events", []),
+        "requests": write_packet.get("requests", []),
+        "artifacts": write_packet.get("artifacts", []),
+        "cleanup": cleanup,
+        "cursor": snapshot_cursor(
+            {
+                "run": archived_packet.get("run", {}),
+                "session": archived_packet.get("session", {}),
+                "events": write_packet.get("events", []),
+                "cleanup": cleanup,
+                "closed": True,
+            }
+        ),
     }
 
 
@@ -3186,10 +3367,22 @@ def _cockpit_connector(ctx: CockpitAppContext) -> CockpitConnector:
     return CockpitConnector(ctx.cfg)
 
 
+def _make_thread_child_terminal_notifier(cfg: Config) -> Callable[[str, Any], bool]:
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
+    return index.append_child_terminal_system_message
+
+
+def _make_thread_children_promoter(cfg: Config) -> Callable[[str], object]:
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
+    return index.promote_children
+
+
 def _thread_projection(thread: CockpitThread, ctx: CockpitAppContext | None = None) -> dict[str, Any]:
     status, ended_reason = _thread_status(thread, ctx)
     return {
         "thread_id": thread.thread_id,
+        "chat_id": thread.thread_id,
+        "parent_chat_id": thread.parent_chat_id,
         "project_id": thread.project_id,
         "session_id": thread.session_id,
         "title": thread.title,
@@ -3371,6 +3564,51 @@ def _finalize_session_run_if_terminal(store: OrchestrationStore, run_id: str) ->
         store.set_phase(run_id, "failed", "At least one worker session failed, stopped, or was interrupted")
 
 
+def _cleanup_child_session_worktree(
+    cfg: Config,
+    store: OrchestrationStore,
+    ref: SessionRef,
+    body: dict[str, Any],
+    *,
+    post: HttpPost,
+) -> dict[str, Any]:
+    """Narrow lifecycle hook for sibling lifecycle-cleanup work.
+
+    The cleanup branch owns inventory/GC. This hook only asks the worker that owns
+    the session to clean that session's worktree and records best-effort evidence.
+    """
+    run_id = _session_run_id_from_store(store, ref)
+    payload = {
+        "reason": str(body.get("reason") or "session closed"),
+        "metadata": {
+            "source": "cockpit.session.close",
+            "session_id": ref.session_id,
+            "run_id": run_id,
+            # TODO(feat/lifecycle-cleanup): replace this endpoint contract with
+            # the finalized worker worktree cleanup/prune interface.
+            "cleanup_contract": "session-worktree-v1",
+        },
+    }
+    try:
+        raw = _worker_post_json(cfg, ref.worker_id, f"/sessions/{ref.session_id}/cleanup", payload, post=post)
+    except Exception as exc:  # noqa: BLE001 - close/archive must not depend on cleanup availability
+        result = {"requested": True, "ok": False, "error": public_error_message(str(exc))}
+    else:
+        result = {
+            "requested": True,
+            "ok": bool(raw.get("ok", True)),
+            "cleaned": list(raw.get("cleaned") or []),
+        }
+    if run_id:
+        store.append_event(
+            run_id,
+            "session_cleanup_requested",
+            "Requested worker session worktree cleanup",
+            {"session_id": ref.session_id, "worker_id": ref.worker_id, "cleanup": result},
+        )
+    return result
+
+
 def _worker_control_body(body: dict[str, Any], required: str) -> dict[str, Any]:
     proxied = {key: value for key, value in body.items() if key not in {"allowed_actions", "execution_envelope"}}
     metadata = dict(proxied.get("metadata") or {}) if isinstance(proxied.get("metadata"), dict) else {}
@@ -3506,6 +3744,7 @@ def _worker_session_row(raw: dict[str, Any], worker_id: str) -> dict[str, Any]:
         "worker_id": worker_id,
         "session_id": session_id,
         "run_id": str(raw.get("run_id") or ""),
+        "parent_chat_id": str(raw.get("parent_chat_id") or ""),
         "title": str(raw.get("title") or ""),
         "provider": str(raw.get("provider") or ""),
         "engine": str(raw.get("engine") or raw.get("provider") or ""),

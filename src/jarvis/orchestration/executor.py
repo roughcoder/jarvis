@@ -531,9 +531,10 @@ def create_run_and_envelope(
     landing_mode: str = "draft_pr",
     engine: str = "",
     extra_allowed_actions: list[str] | None = None,
+    parent_chat_id: str = "",
 ) -> ExecutionEnvelope:
     objective = items[0].title if items else command.filters.get("text", command.operation)
-    run = store.create_run(str(objective), work_items=items)
+    run = store.create_run(str(objective), work_items=items, parent_chat_id=parent_chat_id or None)
     store.set_phase(run.run_id, "claimed", "Work item claimed locally by Jarvis")
     envelope = build_execution_envelope(
         run_id=run.run_id,

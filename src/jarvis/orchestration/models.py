@@ -210,6 +210,8 @@ class OrchestrationRun:
     objective: str
     phase: Phase = "created"
     status: str = "active"
+    parent_chat_id: str | None = None
+    child_chat_ids: list[str] = field(default_factory=list)
     parent_run_id: str | None = None
     child_run_ids: list[str] = field(default_factory=list)
     work_items: list[WorkItemLink] = field(default_factory=list)
@@ -228,6 +230,8 @@ class OrchestrationRun:
             objective=data.get("objective", ""),
             phase=data.get("phase", "created"),
             status=data.get("status", "active"),
+            parent_chat_id=data.get("parent_chat_id") or data.get("parent_run_id"),
+            child_chat_ids=list(data.get("child_chat_ids") or data.get("child_run_ids") or []),
             parent_run_id=data.get("parent_run_id"),
             child_run_ids=list(data.get("child_run_ids", [])),
             work_items=[WorkItemLink.from_dict(x) for x in data.get("work_items", [])],
@@ -246,6 +250,8 @@ class OrchestrationRun:
             "objective": self.objective,
             "phase": self.phase,
             "status": self.status,
+            "parent_chat_id": self.parent_chat_id,
+            "child_chat_ids": self.child_chat_ids,
             "parent_run_id": self.parent_run_id,
             "child_run_ids": self.child_run_ids,
             "work_items": [x.to_dict() for x in self.work_items],

@@ -9,9 +9,11 @@ Lane 1 transcript writes into the named Honcho session.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import tempfile
+import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -36,14 +38,19 @@ from jarvis.brain.session import BrainSession, TurnResult
 from jarvis.brain.tracing import Tracer
 from jarvis.config import Config
 from jarvis.ids import new_id, utc_now
+from jarvis.orchestration.models import WorkCommand, WorkItem
+from jarvis.orchestration.service import StartedWork, OrchestrationService
+from jarvis.orchestration.redaction import public_error_message
 from jarvis.tools import build_registry
 from jarvis.tools.background import make_background_tool
+from jarvis.tools.base import Tool
 from jarvis.users import load_users
 
 
 THREAD_INDEX_FILENAME = "cockpit-threads.json"
 THREAD_TRANSCRIPTS_DIRNAME = "cockpit-thread-transcripts"
 THREAD_HISTORY_LIMIT = 24
+_THREAD_INDEX_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -55,6 +62,7 @@ class CockpitThread:
     created_at: str
     updated_at: str
     created_by: str
+    parent_chat_id: str = ""
     archived_at: str = ""
     archived_by: str = ""
     archive_reason: str = ""
@@ -71,6 +79,7 @@ class CockpitThread:
             created_at=str(data.get("created_at") or ""),
             updated_at=str(data.get("updated_at") or ""),
             created_by=str(data.get("created_by") or ""),
+            parent_chat_id=str(data.get("parent_chat_id") or ""),
             archived_at=str(data.get("archived_at") or ""),
             archived_by=str(data.get("archived_by") or ""),
             archive_reason=str(data.get("archive_reason") or ""),
@@ -87,6 +96,7 @@ class CockpitThread:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "created_by": self.created_by,
+            "parent_chat_id": self.parent_chat_id,
             "archived_at": self.archived_at,
             "archived_by": self.archived_by,
             "archive_reason": self.archive_reason,
@@ -133,11 +143,12 @@ class CockpitThreadIndex:
         return replace(thread, messages=tuple(messages))
 
     def save(self, thread: CockpitThread) -> CockpitThread:
-        data = self._read()
-        threads = data.setdefault("threads", {})
-        threads[thread.thread_id] = thread.as_dict(include_messages=False)
-        _atomic_write_json(self.path, data)
-        return replace(thread, messages=())
+        with _THREAD_INDEX_LOCK:
+            data = self._read()
+            threads = data.setdefault("threads", {})
+            threads[thread.thread_id] = thread.as_dict(include_messages=False)
+            _atomic_write_json(self.path, data)
+            return replace(thread, messages=())
 
     def set_archived(
         self,
@@ -148,19 +159,22 @@ class CockpitThreadIndex:
         by: str = "",
         reason: str = "",
     ) -> CockpitThread | None:
-        thread = self.get(project_id, thread_id)
-        if thread is None:
-            return None
-        if archived and thread.archived_at:
-            return thread
-        archive_reason = reason.strip()[:500]
-        updated = replace(
-            thread,
-            archived_at=utc_now() if archived else "",
-            archived_by=by if archived else "",
-            archive_reason=archive_reason if archived else "",
-        )
-        return self.save(updated)
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            if archived and thread.archived_at:
+                return thread
+            if archived:
+                self.promote_children(thread.thread_id)
+            archive_reason = reason.strip()[:500]
+            updated = replace(
+                thread,
+                archived_at=utc_now() if archived else "",
+                archived_by=by if archived else "",
+                archive_reason=archive_reason if archived else "",
+            )
+            return self.save(updated)
 
     def delete(self, project_id: str, thread_id: str) -> tuple[CockpitThread | None, bool]:
         data = self._read()
@@ -188,6 +202,57 @@ class CockpitThreadIndex:
         if isinstance(tombstone, dict) and str(tombstone.get("project_id") or "") == project_id:
             return CockpitThread.from_dict(tombstone), False
         return None, False
+    def rename(self, project_id: str, thread_id: str, title: str) -> CockpitThread | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            clean_title = " ".join(title.split())
+            if not clean_title:
+                raise ValueError("title is required")
+            return self.save(replace(thread, title=clean_title, updated_at=utc_now()))
+
+    def promote_children(self, parent_chat_id: str) -> list[CockpitThread]:
+        with _THREAD_INDEX_LOCK:
+            promoted: list[CockpitThread] = []
+            for thread in self._threads().values():
+                if thread.parent_chat_id != parent_chat_id:
+                    continue
+                promoted.append(self.save(replace(thread, parent_chat_id="", updated_at=utc_now())))
+            return promoted
+
+    def append_child_terminal_system_message(self, parent_chat_id: str, child: Any) -> bool:
+        with _THREAD_INDEX_LOCK:
+            thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
+            if thread is None:
+                return False
+            messages = self._thread_messages(thread)
+            if any(
+                message.get("type") == "child_terminal"
+                and message.get("child_chat_id") == child.run_id
+                and message.get("phase") == child.phase
+                for message in messages
+            ):
+                return True
+            observed_at = utc_now()
+            reason = f": {child.terminal_reason}" if child.terminal_reason else ""
+            messages.append(
+                {
+                    "role": "system",
+                    "peer_id": "jarvis",
+                    "type": "child_terminal",
+                    "content": f"Child {child.objective} ({child.run_id}) reached {child.phase}{reason}.",
+                    "observed_at": observed_at,
+                    "child_chat_id": child.run_id,
+                    "child_run_id": child.run_id,
+                    "phase": child.phase,
+                    "status": child.status,
+                    "terminal_reason": child.terminal_reason,
+                }
+            )
+            updated = self.save(replace(thread, updated_at=observed_at))
+            self._write_thread_messages(updated, messages)
+            return True
 
     def append_turn(
         self,
@@ -198,38 +263,39 @@ class CockpitThreadIndex:
         assistant_peer_id: str,
         assistant_text: str,
     ) -> CockpitThread:
-        observed_at = utc_now()
-        stored = self.get(thread.project_id, thread.thread_id)
-        archive_source = stored or thread
-        messages = [
-            *self._thread_messages(archive_source, seed_messages=thread.messages),
-            {
-                "role": "user",
-                "peer_id": user_peer_id,
-                "content": user_text,
-                "observed_at": observed_at,
-            },
-            {
-                "role": "assistant",
-                "peer_id": assistant_peer_id,
-                "content": assistant_text,
-                "observed_at": observed_at,
-            },
-        ]
-        updated = self.save(
-            replace(
-                thread,
-                title=thread.title or _thread_title(user_text),
-                updated_at=observed_at,
-                archived_at=archive_source.archived_at,
-                archived_by=archive_source.archived_by,
-                archive_reason=archive_source.archive_reason,
-                last_turn_at=observed_at,
-                messages=(),
+        with _THREAD_INDEX_LOCK:
+            observed_at = utc_now()
+            stored = self.get(thread.project_id, thread.thread_id)
+            archive_source = stored or thread
+            messages = [
+                *self._thread_messages(archive_source, seed_messages=thread.messages),
+                {
+                    "role": "user",
+                    "peer_id": user_peer_id,
+                    "content": user_text,
+                    "observed_at": observed_at,
+                },
+                {
+                    "role": "assistant",
+                    "peer_id": assistant_peer_id,
+                    "content": assistant_text,
+                    "observed_at": observed_at,
+                },
+            ]
+            updated = self.save(
+                replace(
+                    thread,
+                    title=thread.title or _thread_title(user_text),
+                    updated_at=observed_at,
+                    archived_at=archive_source.archived_at,
+                    archived_by=archive_source.archived_by,
+                    archive_reason=archive_source.archive_reason,
+                    last_turn_at=observed_at,
+                    messages=(),
+                )
             )
-        )
-        self._write_thread_messages(updated, messages)
-        return replace(updated, messages=tuple(messages))
+            self._write_thread_messages(updated, messages)
+            return replace(updated, messages=tuple(messages))
 
     def _threads(self, *, include_messages: bool = False) -> dict[str, CockpitThread]:
         return {
@@ -420,6 +486,7 @@ class CockpitConnector:
         requester: RequestContext,
         *,
         title: str = "",
+        parent_chat_id: str = "",
     ) -> CockpitThread:
         thread_id = new_id("thread")
         session_id = orchestrator_session_id(project.id, thread_id)
@@ -432,6 +499,7 @@ class CockpitConnector:
             created_at=now,
             updated_at=now,
             created_by=requester.memory_peer,
+            parent_chat_id=parent_chat_id.strip(),
         )
         peers = _thread_peers(self._cfg, project, requester)
         await asyncio.to_thread(
@@ -443,6 +511,7 @@ class CockpitConnector:
                 "project_id": project.id,
                 "thread_id": thread_id,
                 "created_by": requester.memory_peer,
+                "parent_chat_id": parent_chat_id.strip(),
                 "created_at": now,
             },
         )
@@ -471,6 +540,7 @@ class CockpitConnector:
             requester,
             project=project,
             memory=view,
+            thread=thread,
         )
         trace = self._tracer.turn(
             room=self._cfg.gateway.room,
@@ -512,6 +582,7 @@ class CockpitConnector:
         *,
         project: ProjectEntry,
         memory: MemoryBackend,
+        thread: CockpitThread | None = None,
     ) -> BrainSession:
         ctx = _cockpit_project_context(requester)
         contexts = ContextStore(lambda _ctx: None)  # type: ignore[arg-type]
@@ -550,18 +621,21 @@ class CockpitConnector:
             contexts=contexts,
         ):
             tools.register(tool)
+        if thread is not None:
+            tools.register(_spawn_child_work_tool(self._cfg, project, thread))
         if self._cfg.background.enabled:
             async def notify_background(_text: str, _identity: str, _device_id: str) -> None:
                 return None
 
             runner = BackgroundRunner(
                 self._cfg.background,
-                session_factory=lambda inner_ctx: self._make_session(inner_ctx, project=project, memory=memory),
+                session_factory=lambda inner_ctx: self._make_session(inner_ctx, project=project, memory=memory, thread=thread),
                 notify=notify_background,
             )
             tools.register(make_background_tool(runner))
+        session_cfg = self._session_config()
         session = BrainSession(
-            self._cfg,
+            session_cfg,
             ctx,
             gateway=self._turn_gateway(),
             tts=self._tts,
@@ -573,6 +647,18 @@ class CockpitConnector:
         )
         session.load_soul()
         return session
+
+    def _session_config(self) -> Config:
+        model = self._cfg.orchestration.orchestrator_model.strip()
+        if not model or model == self._cfg.gateway.strong_model:
+            return self._cfg
+        # This is a shallow top-level copy on purpose: project orchestrator turns
+        # start on gateway.strong_model for cockpit text channels. The gateway
+        # config has no generic "model" route; fast/voice stay shared so cheap
+        # helpers and discovery projections keep their normal routing semantics.
+        cfg = copy.copy(self._cfg)
+        cfg.gateway = self._cfg.gateway.model_copy(update={"strong_model": model})
+        return cfg
 
     def _turn_gateway(self) -> Any:
         if self._gateway is None:
@@ -669,6 +755,91 @@ def _project_context(memory: MemoryBackend, project: ProjectEntry, thread: Cockp
     return "\n\n".join(parts)
 
 
+def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitThread) -> Tool:
+    class ManualSource:
+        def __init__(self, item: WorkItem) -> None:
+            self.item = item
+
+        def list(self, *, repo: str = "", filters: dict | None = None, limit: int = 10) -> list[WorkItem]:
+            return [self.item]
+
+        def next(self, *, repo: str = "", filters: dict | None = None) -> WorkItem:
+            return self.item
+
+    async def spawn(ctx: RequestContext, args: dict[str, Any]) -> str:
+        task = str(args.get("task") or args.get("prompt") or "").strip()
+        title = str(args.get("title") or args.get("name") or task).strip()
+        if not task:
+            return "error: task is required"
+        repo = str(args.get("repo") or _project_default_repo(project) or cfg.orchestration.default_repo).strip()
+        item = WorkItem(
+            source="manual",
+            id=new_id("manual"),
+            title=title or "Child work session",
+            body=task,
+            repo=repo,
+            kind="manual",
+        )
+        command = WorkCommand(
+            operation="start_next_work",
+            source="manual",
+            target_worker_id=str(args.get("worker_id") or ""),
+            target_engine_id=str(args.get("engine") or ""),
+            start=True,
+        )
+        service = OrchestrationService(
+            cfg=cfg,
+            capabilities=set(ctx.capabilities),
+            source_factory=lambda _name, _cfg=None: ManualSource(item),
+            thread_child_terminal_notifier=CockpitThreadIndex(
+                Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME
+            ).append_child_terminal_system_message,
+            thread_children_promoter=CockpitThreadIndex(
+                Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME
+            ).promote_children,
+        )
+        try:
+            result = await asyncio.to_thread(service.next_work, command, start=True, parent_chat_id=thread.thread_id)
+        except Exception as exc:  # noqa: BLE001 - tool output must stay concise and non-crashing
+            return f"error: could not spawn child work session ({public_error_message(str(exc))})"
+        if not isinstance(result, StartedWork):
+            return "error: no child work session was spawned"
+        return (
+            f"Spawned child chat {result.envelope.run_id} under {thread.thread_id}. "
+            f"Worker session {result.session.session_id} is {result.session.status}."
+        )
+
+    return Tool(
+        "spawn_child_work_session",
+        "Spawn a child Jarvis work session under this orchestrator chat.",
+        {
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "The work instruction for the child agent."},
+                "title": {"type": "string", "description": "Short child chat title."},
+                "repo": {"type": "string", "description": "Repository name such as roughcoder/jarvis."},
+                "worker_id": {"type": "string", "description": "Optional target worker id."},
+                "engine": {"type": "string", "description": "Optional worker engine route, e.g. codex or claude."},
+            },
+            "required": ["task"],
+        },
+        "worker.session.create",
+        spawn,
+        announce=True,
+        timeout_s=cfg.worker.request_timeout_s + 5,
+    )
+
+
+def _project_default_repo(project: ProjectEntry) -> str:
+    for repo in project.repos:
+        if repo.default and repo.remote:
+            return repo.remote
+    for repo in project.repos:
+        if repo.remote:
+            return repo.remote
+    return ""
+
+
 def _safe_project_representation(memory: MemoryBackend, peer_id: str) -> str:
     cached = ""
     try:
@@ -736,16 +907,21 @@ def _thread_title(text: str) -> str:
 
 
 def _normalized_messages(messages: Any) -> list[dict[str, str]]:
-    return [
-        {
+    normalized: list[dict[str, str]] = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        message = {
             "role": str(item.get("role") or ""),
             "peer_id": str(item.get("peer_id") or ""),
             "content": str(item.get("content") or ""),
             "observed_at": str(item.get("observed_at") or ""),
         }
-        for item in messages
-        if isinstance(item, dict)
-    ]
+        for key in ("type", "child_chat_id", "child_run_id", "phase", "status", "terminal_reason"):
+            if key in item:
+                message[key] = str(item.get(key) or "")
+        normalized.append(message)
+    return normalized
 
 
 def _safe_path_segment(value: str) -> str:

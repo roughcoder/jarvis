@@ -46,13 +46,14 @@ SESSION_REF_SIGNING_CONTEXT = b"jarvis-cockpit-session-ref-v1"
 SESSION_REF_SIGNATURE_BYTES = 12
 CURSOR_PREFIX = "evt_"
 MAX_PAGE_LIMIT = 500
-RUN_SUPPORTED_CONTROLS = ["archive"]
+RUN_SUPPORTED_CONTROLS = ["archive", "rename"]
 SESSION_CONTROL_ACTIONS = {
     "turn": WORKER_SESSION_TURN,
     "input": WORKER_SESSION_INPUT,
     "approval": WORKER_SESSION_APPROVE,
     "interrupt": WORKER_SESSION_INTERRUPT,
     "stop": WORKER_SESSION_STOP,
+    "close": WORKER_SESSION_STOP,
     "checkpoint_restore": WORKER_SESSION_RESTORE,
 }
 DEFAULT_SESSION_ALLOWED_ACTIONS = [WORKER_SESSION_TURN, WORKER_SESSION_INTERRUPT, WORKER_SESSION_STOP]
@@ -118,6 +119,9 @@ BLOCKED_PHASES = {"blocked", "stalled", "needs_human"}
 PUBLIC_EVENT_DATA_KEYS = {
     "branch",
     "checkpoint_id",
+    "child_chat_id",
+    "child_run_id",
+    "cleanup",
     "command",
     "commit_sha",
     "content",
@@ -130,6 +134,7 @@ PUBLIC_EVENT_DATA_KEYS = {
     "message_id",
     "options",
     "payload",
+    "phase",
     "provider",
     "question",
     "questions",
@@ -138,6 +143,7 @@ PUBLIC_EVENT_DATA_KEYS = {
     "run_id",
     "status",
     "summary",
+    "terminal_reason",
     "text",
     "title",
     "turn_id",
@@ -247,6 +253,7 @@ def cockpit_catalog(
     start_defaults: dict[str, Any] | None = None,
     engines: list[str] | None = None,
     engine_supports: dict[str, dict[str, bool]] | None = None,
+    orchestrator_model: str = "",
 ) -> dict[str, Any]:
     defaults = {
         "source": "manual",
@@ -277,6 +284,10 @@ def cockpit_catalog(
             "landing_modes": list(LANDING_MODES),
             "required_fields": {key: list(value) for key, value in START_REQUIRED_FIELDS.items()},
             "defaults": defaults,
+        },
+        "orchestrator": {
+            "session_type": "project_orchestrator",
+            "model_route": orchestrator_model,
         },
         "capabilities": [
             {"capability": "code.edit", "display_name": "Edit code", "maps_to": [WORKER_SESSION_CREATE, WORKER_SESSION_TURN]},
@@ -790,6 +801,9 @@ def run_summary(
         "authority": "jarvis",
         "supported_controls": RUN_SUPPORTED_CONTROLS,
         "run_id": run.run_id,
+        "chat_id": run.run_id,
+        "parent_chat_id": run.parent_chat_id,
+        "child_chat_ids": list(run.child_chat_ids or run.child_run_ids),
         "title": _title(run.objective),
         "objective": _redact(run.objective),
         "status": run.status,
@@ -876,6 +890,8 @@ def session_summary(
         # Explicitly null, never "": worker-local sessions can legitimately
         # exist without a run and clients model the field as nullable.
         "run_id": str(session.get("run_id") or "") or None,
+        "chat_id": str(session.get("run_id") or ""),
+        "parent_chat_id": session.get("parent_chat_id") or "",
         "title": _redact(str(session.get("title") or "")),
         "provider": session.get("provider", ""),
         "engine": session.get("engine", ""),
@@ -1129,6 +1145,7 @@ def _session_from_link(link: WorkerSessionLink, run: OrchestrationRun) -> dict[s
         "session_id": link.session_id,
         "run_id": run.run_id,
         "title": run.objective,
+        "parent_chat_id": run.parent_chat_id or "",
         "provider": link.provider,
         "engine": link.engine,
         "status": link.status,
@@ -1152,6 +1169,7 @@ def _session_from_worker(raw: dict[str, Any], worker_id: str, *, run: Orchestrat
         "session_id": session_id,
         "run_id": str(raw.get("run_id") or (run.run_id if run else "")),
         "title": str(raw.get("title") or (run.objective if run else "")),
+        "parent_chat_id": str(raw.get("parent_chat_id") or (run.parent_chat_id if run else "") or ""),
         "provider": str(raw.get("provider") or ""),
         "engine": str(raw.get("engine") or raw.get("provider") or ""),
         "status": str(raw.get("status") or ""),
@@ -1196,7 +1214,7 @@ def _allowed_actions_from_worker_session(raw: dict[str, Any]) -> list[str]:
 def _session_supported_controls(session: dict[str, Any]) -> list[str]:
     allowed_actions = set(session.get("allowed_actions") or DEFAULT_SESSION_ALLOWED_ACTIONS)
     controls = [control for control, action in SESSION_CONTROL_ACTIONS.items() if action in allowed_actions]
-    controls.extend(["archive", "unarchive"])
+    controls.extend(["archive", "unarchive", "rename"])
     return controls
 
 

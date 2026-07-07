@@ -305,6 +305,7 @@ POST /v1/projects/{id}/threads/{tid}/turns
 POST /v1/projects/{id}/threads/{tid}/archive
 POST /v1/projects/{id}/threads/{tid}/unarchive
 DELETE /v1/projects/{id}/threads/{tid}
+POST /v1/projects/{id}/threads/{tid}/rename
 ```
 
 Projects are read from the Jarvis registry, not Honcho. The cockpit never talks
@@ -729,6 +730,8 @@ for the project. Archived threads are hidden by default; pass
   "threads": [
     {
       "thread_id": "thread_...",
+      "chat_id": "thread_...",
+      "parent_chat_id": "",
       "project_id": "jarvis",
       "session_id": "project:jarvis:orchestrator:thread_...",
       "title": "Planning",
@@ -814,6 +817,7 @@ the locally recorded turn history for rendering resumed conversations:
 `POST /v1/projects/{id}/threads` creates the Honcho session through Jarvis's
 memory backend and sets session membership before any messages are written. The
 session includes the project peer, the requester peer, and `jarvis`.
+Include `parent_chat_id` to nest the new thread under another Jarvis chat.
 
 Thread open response:
 
@@ -978,6 +982,7 @@ GET /v1/runs/{run_id}/events?after=<cursor>&limit=100
 GET /v1/runs/{run_id}/artifacts?after=<cursor>&limit=100
 POST /v1/runs/{run_id}/archive
 DELETE /v1/runs/{run_id}
+POST /v1/runs/{run_id}/rename
 ```
 
 ### Sessions
@@ -1009,6 +1014,8 @@ POST /v1/sessions/{session_ref}/interrupt
 POST /v1/sessions/{session_ref}/stop
 POST /v1/sessions/{session_ref}/archive
 POST /v1/sessions/{session_ref}/unarchive
+POST /v1/sessions/{session_ref}/close
+POST /v1/sessions/{session_ref}/rename
 POST /v1/sessions/{session_ref}/checkpoints/restore
 ```
 
@@ -1760,12 +1767,14 @@ POST /v1/projects/jarvis/archive
 
 `POST /v1/work/start` is a high-level operator intent. Jarvis parses/selects
 work, creates or claims a run, chooses worker and engine, dispatches sessions,
-and validates authority.
+and validates authority. Include `parent_chat_id` to spawn the work session as a
+child of an existing thread or run; the created run and session projections echo
+that parent immediately.
 
 The start/resume reconciliation packet always includes the created run and the
-dispatched session summary — including `session.session_ref` — so the cockpit
-can promote an optimistic draft to the real session immediately instead of
-waiting for polling reconciliation.
+dispatched session summary — including `session.session_ref` and any
+`parent_chat_id` — so the cockpit can promote an optimistic draft to the real
+session immediately instead of waiting for polling reconciliation.
 
 `POST /v1/work/resume` is a high-level resume intent. Jarvis chooses the best
 resumable session for the selected run.
@@ -1924,6 +1933,19 @@ session state and prune owned worktrees. Delete responses include
 `reclamation.bytes`; repeated deletes return `deleted: false` from a local
 tombstone, while never-known ids return `404 not_found`. See
 [`COCKPIT_LIFECYCLE.md`](COCKPIT_LIFECYCLE.md) for the full cleanup contract.
+Archiving a parent chat promotes immediate children to root by clearing their
+`parent_chat_id`; children are never cascade-deleted or orphaned. When a child
+run reaches a terminal phase, Jarvis appends `child_terminal` to the parent run
+events and emits it over SSE as `run.event`.
+
+`POST /v1/sessions/{session_ref}/close` is the autonomous child-close route. It
+stops the worker session, requests best-effort worktree cleanup through the
+narrow worker cleanup hook, then archives the session.
+
+`POST /v1/runs/{run_id}/rename`,
+`POST /v1/sessions/{session_ref}/rename`, and
+`POST /v1/projects/{id}/threads/{tid}/rename` accept `title` and update the
+Jarvis-owned chat title.
 
 `POST /v1/sessions/{session_ref}/checkpoints/restore` uses `checkpoint_id`.
 Checkpoint IDs are durable and stable within a session. Clients must not restore

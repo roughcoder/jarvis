@@ -115,6 +115,7 @@ def test_connector_opens_honcho_thread_session_before_messages(tmp_path, monkeyp
                 "project_id": "jarvis",
                 "thread_id": thread.thread_id,
                 "created_by": "neil",
+                "parent_chat_id": "",
                 "created_at": thread.created_at,
             },
         }
@@ -218,6 +219,40 @@ def test_thread_index_archive_round_trip_and_filtering(tmp_path) -> None:
     assert restored.archived_by == ""
     assert restored.archive_reason == ""
     assert {thread.thread_id for thread in index.list("jarvis")} == {active.thread_id, archived.thread_id}
+
+
+def test_thread_index_archive_promotes_child_threads(tmp_path) -> None:
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    parent = index.save(
+        CockpitThread(
+            thread_id="thread_parent",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_parent",
+            title="Parent",
+            created_at="2026-07-05T09:00:00+00:00",
+            updated_at="2026-07-05T09:00:00+00:00",
+            created_by="neil",
+        )
+    )
+    child = index.save(
+        CockpitThread(
+            thread_id="thread_child",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_child",
+            title="Child",
+            created_at="2026-07-05T09:01:00+00:00",
+            updated_at="2026-07-05T09:01:00+00:00",
+            created_by="neil",
+            parent_chat_id=parent.thread_id,
+        )
+    )
+
+    index.set_archived("jarvis", parent.thread_id, archived=True, by="neil")
+
+    promoted = index.get("jarvis", child.thread_id)
+    assert promoted is not None
+    assert promoted.parent_chat_id == ""
+    assert promoted.archived_at == ""
 
 
 def test_thread_index_append_turn_preserves_mid_turn_archive_fields(tmp_path) -> None:
