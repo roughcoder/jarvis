@@ -1906,55 +1906,54 @@ class CockpitWriteHandlers:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
-        scope = _principal_scoped(request, self.ctx.cfg, f"sessions/{ref.worker_id}/{ref.session_id}/archive")
-        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
-            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
-            if cached is not None:
-                return web.json_response(cached)
+        requester = _cockpit_requester_context(request, self.ctx.cfg)
+        scope = f"sessions/{ref.worker_id}/{ref.session_id}/archive"
+
+        async def produce() -> dict[str, Any]:
             _require_capability(self.ctx.cfg, "orchestration.runs.write")
             run = await asyncio.to_thread(_archive_session, self.ctx.store, ref)
-            response_body = _archive_session_packet(run, ref)
-            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+            return _archive_session_packet(run, ref)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def session_unarchive(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
-        scope = _principal_scoped(request, self.ctx.cfg, f"sessions/{ref.worker_id}/{ref.session_id}/unarchive")
-        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
-            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
-            if cached is not None:
-                return web.json_response(cached)
+        requester = _cockpit_requester_context(request, self.ctx.cfg)
+        scope = f"sessions/{ref.worker_id}/{ref.session_id}/unarchive"
+
+        async def produce() -> dict[str, Any]:
             _require_capability(self.ctx.cfg, "orchestration.runs.write")
             run = await asyncio.to_thread(_unarchive_session, self.ctx.store, ref)
-            response_body = _unarchive_session_packet(run, ref)
-            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+            return _unarchive_session_packet(run, ref)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def session_delete(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _optional_json_body(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
-        scope = _principal_scoped(request, self.ctx.cfg, f"sessions/{ref.worker_id}/{ref.session_id}/delete")
-        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
-            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
-            if cached is not None:
-                return web.json_response(cached)
+        requester = _cockpit_requester_context(request, self.ctx.cfg)
+        scope = f"sessions/{ref.worker_id}/{ref.session_id}/delete"
+
+        async def produce() -> dict[str, Any]:
             _require_capability(self.ctx.cfg, "orchestration.runs.write")
-            response_body = await asyncio.to_thread(_delete_session_packet, self.ctx, ref)
-            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+            return await asyncio.to_thread(_delete_session_packet, self.ctx, ref)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def session_rename(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
-        scope = _principal_scoped(request, self.ctx.cfg, f"sessions/{ref.worker_id}/{ref.session_id}/rename")
-        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
-            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
-            if cached is not None:
-                return web.json_response(cached)
+        requester = _cockpit_requester_context(request, self.ctx.cfg)
+        scope = f"sessions/{ref.worker_id}/{ref.session_id}/rename"
+
+        async def produce() -> dict[str, Any]:
             _require_capability(self.ctx.cfg, "orchestration.runs.write")
             run_id = await asyncio.to_thread(_session_run_id_from_store, self.ctx.store, ref)
             if not run_id:
@@ -1967,19 +1966,19 @@ class CockpitWriteHandlers:
                 )
             except ValueError as exc:
                 raise CockpitError("validation_failed", str(exc), recoverable=True, status=400) from exc
-            response_body = _rename_session_packet(run, ref)
-            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+            return _rename_session_packet(run, ref)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def session_close(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
         ref = await asyncio.to_thread(_resolve_session_ref, self.ctx.store, request.match_info["session_ref"])
-        scope = _principal_scoped(request, self.ctx.cfg, f"sessions/{ref.worker_id}/{ref.session_id}/close")
-        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
-            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
-            if cached is not None:
-                return web.json_response(cached)
+        requester = _cockpit_requester_context(request, self.ctx.cfg)
+        scope = f"sessions/{ref.worker_id}/{ref.session_id}/close"
+
+        async def produce() -> dict[str, Any]:
             _require_capability(self.ctx.cfg, WORKER_SESSION_STOP)
             _require_capability(self.ctx.cfg, "orchestration.runs.write")
             proxied = _worker_control_body(body, WORKER_SESSION_STOP)
@@ -1994,8 +1993,9 @@ class CockpitWriteHandlers:
             write_packet = await asyncio.to_thread(_session_write_packet, self.ctx.cfg, self.ctx.store, ref, raw, get=self.ctx.get)
             cleanup = await asyncio.to_thread(_cleanup_child_session_worktree, self.ctx.cfg, self.ctx.store, ref, body, post=self.ctx.post)
             archived = await asyncio.to_thread(_close_session, self.ctx.store, ref)
-            response_body = _close_session_packet(archived, ref, write_packet, cleanup)
-            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+            return _close_session_packet(archived, ref, write_packet, cleanup)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce, requester=requester)
         return web.json_response(response_body)
 
     async def session_write(self, request: web.Request) -> web.Response:
@@ -2007,18 +2007,18 @@ class CockpitWriteHandlers:
             attachments = _validate_attachments(body, self.ctx.cfg.orchestration)
             if attachments:
                 body["attachments"] = attachments
-        scope = _principal_scoped(request, self.ctx.cfg, f"sessions/{ref.worker_id}/{ref.session_id}/{action}")
-        async with _idempotency_scope(self.ctx, scope, str(body.get("idempotency_key") or "")):
-            cached = self.ctx.idempotency.get(scope, str(body.get("idempotency_key") or ""), body)
-            if cached is not None:
-                return web.json_response(cached)
+        requester = _cockpit_requester_context(request, self.ctx.cfg)
+        scope = f"sessions/{ref.worker_id}/{ref.session_id}/{action}"
+
+        async def produce() -> dict[str, Any]:
             required = _required_session_action(action)
             _require_capability(self.ctx.cfg, required)
             proxied = _worker_control_body(body, required)
             path = f"/sessions/{ref.session_id}/{'checkpoints/restore' if action == 'restore_checkpoint' else action}"
             raw = await asyncio.to_thread(_worker_post_json, self.ctx.cfg, ref.worker_id, path, proxied, post=self.ctx.post)
-            response_body = await asyncio.to_thread(_session_write_packet, self.ctx.cfg, self.ctx.store, ref, raw, get=self.ctx.get)
-            self.ctx.idempotency.save(scope, str(body.get("idempotency_key") or ""), body, response_body)
+            return await asyncio.to_thread(_session_write_packet, self.ctx.cfg, self.ctx.store, ref, raw, get=self.ctx.get)
+
+        response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce, requester=requester)
         return web.json_response(response_body)
 
 
@@ -2546,22 +2546,6 @@ async def _idempotent_write_body(
 
 def _idempotency_principal(requester: RequestContext) -> str:
     return "\0".join((requester.scope, requester.identity, requester.memory_peer, requester.channel))
-
-
-def _principal_scoped(request: web.Request, cfg: Config, scope: str) -> str:
-    """Fold the caller's principal into an idempotency scope.
-
-    Mirrors what _idempotent_write_body() does for the scope-based handlers.
-    The hand-rolled write handlers below (run_delete, run_rename,
-    session_archive/unarchive/rename/close/delete) build their idempotency
-    scope from the resource id alone, so two DIFFERENT principals hitting the
-    same resource+action with the same Idempotency-Key would replay each
-    other's cached destructive result. Scoping on the caller closes that gap.
-    """
-    requester = _cockpit_requester_context(request, cfg)
-    if requester is None:
-        return scope
-    return f"{scope}/principal/{_idempotency_principal(requester)}"
 
 
 def _reject_attachments(body: dict[str, Any]) -> None:
