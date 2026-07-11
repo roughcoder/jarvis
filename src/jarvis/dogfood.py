@@ -26,7 +26,7 @@ from urllib.parse import urlparse
 ROLES = ("brain", "api", "intercom", "worker", "whatsapp")
 ROLE_EXTRAS = {
     "brain": ("gateway", "tts", "stt", "vad", "wake", "memory", "mcp"),
-    "api": ("cockpit",),
+    "api": ("gateway", "cockpit"),
     "intercom": ("stt", "vad", "wake"),
     "worker": ("worker", "browser"),
     "whatsapp": (),
