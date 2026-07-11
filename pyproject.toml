@@ -1,6 +1,6 @@
 [project]
 name = "jarvis"
-version = "0.22.2"
+version = "0.23.0"
 description = "Jarvis — all-local voice assistant (Phase 1)"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
