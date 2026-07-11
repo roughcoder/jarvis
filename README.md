@@ -115,6 +115,8 @@ Per-step extras install as each build step is reached, e.g.
   readiness test is its entry gate.
 - **[docs/FLEET.md](docs/FLEET.md)** — iMac / laptop / Pi service deployment,
   status contract, and update shape.
+- **[docs/DOGFOOD.md](docs/DOGFOOD.md)** — unreleased review-ring deployment,
+  rollback, live two-model PR-review acceptance, and the PR/release gate.
 - **[docs/VOICE_MODES.md](docs/VOICE_MODES.md)** — default vs stay mode, exit
   behavior, and temporary identity lifetime for voice conversations.
 - **[docs/SWIFT_TOOLBAR_SPEC.md](docs/SWIFT_TOOLBAR_SPEC.md)** — handoff spec for
