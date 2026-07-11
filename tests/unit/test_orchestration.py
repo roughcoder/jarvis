@@ -498,11 +498,12 @@ def test_worker_registry_counts_running_sessions_for_capacity() -> None:
 
 def test_worker_registry_default_profile_uses_host_display_name(monkeypatch) -> None:  # noqa: ANN001
     monkeypatch.setattr("jarvis.orchestration.workers.socket.gethostname", lambda: "brain-host.local")
-    reg = WorkerRegistry(WorkerConfig(_env_file=None))
+    reg = WorkerRegistry(WorkerConfig(_env_file=None, max_concurrent_jobs=3))
     profile = reg.profiles()[0]
 
     assert profile.worker_id == "local-worker"
     assert profile.display_name == "brain-host worker"
+    assert profile.max_concurrent_jobs == 3
 
 
 def test_worker_registry_accepts_list_profile_file(tmp_path) -> None:

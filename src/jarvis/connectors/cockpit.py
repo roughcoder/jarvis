@@ -46,7 +46,6 @@ from jarvis.brain.facade import (
     UnsupportedMemoryOperation,
     make_memory_tools,
     make_project_tools,
-    resolve_capabilities,
 )
 from jarvis.config import Config
 from jarvis.ids import new_id, utc_now
@@ -68,6 +67,7 @@ THREAD_INDEX_FILENAME = "cockpit-threads.json"
 THREAD_TRANSCRIPTS_DIRNAME = "cockpit-thread-transcripts"
 THREAD_HISTORY_LIMIT = 24
 CHILD_WATCH_LEASE_S = 300
+CHILD_WORK_LANDING_MODES = {"none", "branch_only", "draft_pr", "ready_pr", "confirm_before_pr"}
 _THREAD_INDEX_LOCK = threading.RLock()
 _WORK_SESSION_OFFER = (
     "I can't do that from this project conversation because it has no workspace, "
@@ -305,7 +305,13 @@ class CockpitThreadIndex:
             self._write_thread_messages(updated, messages)
             return True
 
-    def register_child_watch(self, thread: CockpitThread, child_ids: list[str]) -> str:
+    def register_child_watch(
+        self,
+        thread: CockpitThread,
+        child_ids: list[str],
+        *,
+        requester: RequestContext,
+    ) -> str:
         with _THREAD_INDEX_LOCK:
             stored = self.get(thread.project_id, thread.thread_id) or thread
             messages = self._thread_messages(stored)
@@ -319,6 +325,15 @@ class CockpitThreadIndex:
                         "type": "child_watch",
                         "watch_id": watch_id,
                         "child_chat_ids": normalized,
+                        "requester": {
+                            "device_id": requester.device_id,
+                            "identity": requester.identity,
+                            "scope": requester.scope,
+                            "capabilities": sorted(requester.capabilities),
+                            "channel": requester.channel,
+                            "confidence": requester.confidence,
+                            "peer": requester.peer,
+                        },
                         "phase": "waiting",
                         "content": f"Watching {len(normalized)} child work session(s) for completion.",
                         "observed_at": utc_now(),
@@ -1317,13 +1332,17 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
             provider_instance_id=provider_instance_id,
             start=True,
         )
+        try:
+            child_cfg = _child_work_config(cfg, args)
+        except ValueError as exc:
+            return f"error: {exc}"
         service = OrchestrationService(
-            cfg=cfg,
+            cfg=child_cfg,
             capabilities=set(ctx.capabilities),
             source_factory=lambda _name, _cfg=None: ManualSource(item),
-            thread_child_terminal_notifier=make_child_terminal_notifier(cfg),
+            thread_child_terminal_notifier=make_child_terminal_notifier(child_cfg),
             thread_children_promoter=CockpitThreadIndex(
-                Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME
+                Path(child_cfg.orchestration.workspace) / THREAD_INDEX_FILENAME
             ).promote_children,
         )
         try:
@@ -1353,6 +1372,11 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
                 },
                 "engine": {"type": "string", "description": "Optional worker engine route, e.g. codex or claude."},
                 "model": {"type": "string", "description": "Optional explicit provider model id."},
+                "landing_mode": {
+                    "type": "string",
+                    "enum": sorted(CHILD_WORK_LANDING_MODES),
+                    "description": "Child delivery policy. Defaults to none so review and analysis children stay read-only.",
+                },
             },
             "required": ["task"],
         },
@@ -1361,6 +1385,15 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
         announce=True,
         timeout_s=cfg.worker.request_timeout_s + 5,
     )
+
+
+def _child_work_config(cfg: Config, args: dict[str, Any]) -> Config:
+    landing_mode = str(args.get("landing_mode") or "none").strip()
+    if landing_mode not in CHILD_WORK_LANDING_MODES:
+        raise ValueError(f"unsupported child landing_mode: {landing_mode}")
+    child_cfg = copy.deepcopy(cfg)
+    child_cfg.orchestration.landing_mode = landing_mode
+    return child_cfg
 
 
 def _read_child_work_result_tool(cfg: Config, project: ProjectEntry, thread: CockpitThread) -> Tool:
@@ -1447,13 +1480,24 @@ def _read_child_work_result_tool(cfg: Config, project: ProjectEntry, thread: Coc
 
 
 def _watch_child_work_sessions_tool(cfg: Config, project: ProjectEntry, thread: CockpitThread) -> Tool:
-    async def watch(_ctx: RequestContext, args: dict[str, Any]) -> str:
+    async def watch(ctx: RequestContext, args: dict[str, Any]) -> str:
         raw_ids = args.get("child_chat_ids")
         if not isinstance(raw_ids, list):
             return "error: child_chat_ids must be an array"
         child_ids = [str(item).strip() for item in raw_ids if str(item).strip()]
         if not child_ids:
             return "error: at least one child_chat_id is required"
+        child_ids = list(dict.fromkeys(child_ids))
+        raw_expected_count = args.get("expected_count")
+        if raw_expected_count is not None:
+            try:
+                expected_count = int(raw_expected_count)
+            except (TypeError, ValueError):
+                return "error: expected_count must be a positive integer"
+            if expected_count < 1:
+                return "error: expected_count must be a positive integer"
+            if len(child_ids) != expected_count:
+                return f"error: expected {expected_count} distinct child_chat_ids, received {len(child_ids)}"
         store = OrchestrationStore(cfg.orchestration.workspace)
         for child_id in child_ids:
             child = await asyncio.to_thread(store.get, child_id)
@@ -1466,7 +1510,7 @@ def _watch_child_work_sessions_tool(cfg: Config, project: ProjectEntry, thread: 
                 return f"error: child work session {child_id} does not belong to this orchestrator chat"
         watch_id = await asyncio.to_thread(CockpitThreadIndex(
             Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME
-        ).register_child_watch, thread, child_ids)
+        ).register_child_watch, thread, child_ids, requester=ctx)
         await asyncio.to_thread(_start_ready_child_watch, cfg, thread.thread_id)
         return json.dumps(
             {"watch_id": watch_id, "child_chat_ids": sorted(set(child_ids)), "registered": True},
@@ -1483,7 +1527,12 @@ def _watch_child_work_sessions_tool(cfg: Config, project: ProjectEntry, thread: 
                     "type": "array",
                     "items": {"type": "string"},
                     "minItems": 1,
-                }
+                },
+                "expected_count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional exact number of distinct child sessions required before registering the watch.",
+                },
             },
             "required": ["child_chat_ids"],
         },
@@ -1537,18 +1586,22 @@ def _continue_child_watch(cfg: Config, parent_chat_id: str, watch: dict[str, Any
         project = registry.get_project(thread.project_id)
         if project is None:
             raise RuntimeError("parent orchestrator project no longer exists")
-        users = load_users(cfg.capabilities.users_dir)
-        user = users.get(thread.created_by)
-        capabilities = set(resolve_capabilities(cfg.capabilities))
-        if user is not None:
-            capabilities.update(user.capabilities)
+        requester_snapshot = watch.get("requester")
+        if not isinstance(requester_snapshot, dict):
+            raise RuntimeError("child watch is missing its requester authority snapshot")
+        capabilities = frozenset(
+            str(item)
+            for item in requester_snapshot.get("capabilities") or []
+            if str(item).strip()
+        )
         requester = RequestContext(
-            device_id=cfg.capabilities.device_id,
-            identity=thread.created_by,
-            scope=user.scope if user is not None else "personal",
-            capabilities=frozenset(capabilities),
-            channel="cockpit",
-            peer=user.peer if user is not None else thread.created_by,
+            device_id=str(requester_snapshot.get("device_id") or ""),
+            identity=str(requester_snapshot.get("identity") or ""),
+            scope=str(requester_snapshot.get("scope") or "personal"),
+            capabilities=capabilities,
+            channel=str(requester_snapshot.get("channel") or "cockpit"),
+            confidence=str(requester_snapshot.get("confidence") or "strong"),
+            peer=str(requester_snapshot.get("peer") or ""),
         )
         child_ids = [str(item) for item in watch.get("child_chat_ids") or []]
         instruction = (
@@ -1950,6 +2003,19 @@ def _normalized_messages(messages: Any) -> list[dict[str, Any]]:
                 message[key] = str(item.get(key) or "")
         if isinstance(item.get("child_chat_ids"), list):
             message["child_chat_ids"] = [str(value) for value in item["child_chat_ids"] if str(value)]
+        requester = item.get("requester")
+        if isinstance(requester, dict):
+            message["requester"] = {
+                "device_id": str(requester.get("device_id") or ""),
+                "identity": str(requester.get("identity") or ""),
+                "scope": str(requester.get("scope") or "personal"),
+                "capabilities": sorted(
+                    {str(value) for value in requester.get("capabilities") or [] if str(value).strip()}
+                ),
+                "channel": str(requester.get("channel") or "cockpit"),
+                "confidence": str(requester.get("confidence") or "strong"),
+                "peer": str(requester.get("peer") or ""),
+            }
         event = item.get("event")
         if isinstance(event, dict):
             message["event"] = dict(event)

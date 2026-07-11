@@ -218,6 +218,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
     browser_holder: dict = {}
     diagnostics_state: dict[str, Any] = {"value": None, "expires_at": 0.0, "task": None}
     worktree_inventory_state: dict[str, Any] = {"value": None, "expires_at": 0.0, "task": None}
+    github_review_locks: dict[str, asyncio.Lock] = {}
 
     async def browser_dispatch(action: str, args: dict) -> web.Response:
         if not browser_cfg.enabled:
@@ -419,25 +420,28 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                         sort_keys=True,
                     ).encode("utf-8")
                 ).hexdigest()
-                cached = _github_review_idempotency_get(workspace, idempotency_key, fingerprint)
-                if cached is not None:
-                    return web.json_response({"ok": True, "review": cached, "replayed": True})
-                result = await asyncio.to_thread(
-                    publish_github_pr_review,
-                    repo=str(args.get("repo") or ""),
-                    pull_number=int(args.get("pull_number") or 0),
-                    commit_id=str(args.get("commit_id") or ""),
-                    summary=str(args.get("summary") or ""),
-                    comments=[dict(item) for item in args.get("comments") or [] if isinstance(item, dict)],
-                )
-                review = {
-                    "review_id": result.review_id,
-                    "url": result.url,
-                    "comments": result.comments,
-                    "skipped_comments": result.skipped_comments,
-                }
-                _github_review_idempotency_put(workspace, idempotency_key, fingerprint, review)
-                return web.json_response({"ok": True, "review": review, "replayed": False})
+                lock_key = str(_github_review_idempotency_path(workspace, idempotency_key))
+                lock = github_review_locks.setdefault(lock_key, asyncio.Lock())
+                async with lock:
+                    cached = _github_review_idempotency_get(workspace, idempotency_key, fingerprint)
+                    if cached is not None:
+                        return web.json_response({"ok": True, "review": cached, "replayed": True})
+                    result = await asyncio.to_thread(
+                        publish_github_pr_review,
+                        repo=str(args.get("repo") or ""),
+                        pull_number=int(args.get("pull_number") or 0),
+                        commit_id=str(args.get("commit_id") or ""),
+                        summary=str(args.get("summary") or ""),
+                        comments=[dict(item) for item in args.get("comments") or [] if isinstance(item, dict)],
+                    )
+                    review = {
+                        "review_id": result.review_id,
+                        "url": result.url,
+                        "comments": result.comments,
+                        "skipped_comments": result.skipped_comments,
+                    }
+                    _github_review_idempotency_put(workspace, idempotency_key, fingerprint, review)
+                    return web.json_response({"ok": True, "review": review, "replayed": False})
             except (RuntimeError, TypeError, ValueError) as exc:
                 return web.json_response({"ok": False, "error": str(exc)}, status=400)
         if action == "cleanup":

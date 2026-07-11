@@ -45,8 +45,14 @@ Project orchestrator threads can compose this lifecycle through general tools:
 1. `spawn_child_work_session` creates a child with independent `engine`,
    provider `model`, provider-instance provenance, and optional fleet
    `worker_id`. Provider instance and worker identity are deliberately separate.
+   Child sessions default to landing mode `none`, so a read-only workflow does
+   not inherit an unrelated global branch/PR landing policy. A caller may opt in
+   to a supported landing mode explicitly.
 2. `watch_child_work_sessions` durably registers the complete expected child-id
-   set and returns immediately. It does not hold an HTTP request or poll.
+   set and returns immediately. Callers may supply `expected_count` to reject a
+   partial set before registration. The watch persists the initiating request's
+   identity and capability set; its automatic continuation cannot regain broader
+   authority. It does not hold an HTTP request or poll.
 3. When every watched child is terminal, Jarvis leases one automatic parent
    continuation. Duplicate terminal notifications cannot schedule another
    continuation; an abandoned lease can be recovered by a later notification.
@@ -64,7 +70,9 @@ write to an eligible worker with a freshly authenticated GitHub identity and
 access to the project repository. The brain never reads or copies the worker's
 GitHub credential.
 
-The worker requires a stable idempotency key and the reviewed head SHA. Before
+The worker requires a stable idempotency key and the reviewed head SHA. Calls
+with the same key are serialized before the preflight/write boundary, so
+concurrent retries cannot create duplicate reviews. Before
 posting it re-reads the current head and diff, validates each line anchor,
 formats titles as `[P1]`, `[P2]`, or `[P3]`, and emits GitHub `suggestion`
 blocks only on applicable right-side lines. Invalid anchors become review-level
