@@ -396,6 +396,19 @@ def render_service(
     env_file = str(Path(cwd) / ".env")
     args = ROLE_COMMANDS[role]
     if target == "launchd":
+        resource_limits = ""
+        if role == "api":
+            resource_limits = """  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>4096</integer>
+  </dict>
+  <key>HardResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>8192</integer>
+  </dict>
+"""
         arg_xml = "\n".join(
             f"    <string>{_xml_escape(a)}</string>" for a in [bin_path, *args]
         )
@@ -416,7 +429,7 @@ def render_service(
   <true/>
   <key>KeepAlive</key>
   <true/>
-  <key>EnvironmentVariables</key>
+{resource_limits}  <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
@@ -432,6 +445,7 @@ def render_service(
 """
     if target == "systemd":
         command = " ".join([_shell_quote(bin_path), *map(_shell_quote, args)])
+        resource_limits = "LimitNOFILE=4096\n" if role == "api" else ""
         return f"""[Unit]
 Description=Jarvis {role}
 After=network-online.target sound.target
@@ -443,7 +457,7 @@ WorkingDirectory={cwd}
 ExecStart={command}
 Restart=always
 RestartSec=3
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
+{resource_limits}Environment=PATH=/usr/local/bin:/usr/bin:/bin
 Environment=JARVIS_ENV_FILE={_systemd_escape(env_file)}
 
 [Install]

@@ -151,6 +151,34 @@ def test_render_launchd_service_supports_cockpit_api() -> None:
     assert "com.jarvis.api" in text
     assert "<string>api</string>" in text
     assert "<string>/Users/example/.jarvis/.env</string>" in text
+    assert "<key>SoftResourceLimits</key>" in text
+    assert "<key>HardResourceLimits</key>" in text
+    assert text.count("<key>NumberOfFiles</key>") == 2
+    assert "<integer>4096</integer>" in text
+    assert "<integer>8192</integer>" in text
+
+
+def test_render_systemd_service_limits_cockpit_api_file_descriptors() -> None:
+    text = render_service(
+        "api",
+        platform_name="systemd",
+        jarvis_bin="/usr/local/bin/jarvis",
+        workdir="/opt/jarvis",
+    )
+
+    assert "LimitNOFILE=4096" in text
+
+
+@pytest.mark.parametrize("role", ["brain", "intercom", "worker", "whatsapp"])
+@pytest.mark.parametrize("platform_name", ["launchd", "systemd"])
+def test_render_service_keeps_api_resource_limits_role_scoped(
+    role: str,
+    platform_name: str,
+) -> None:
+    text = render_service(role, platform_name=platform_name)
+
+    assert "NumberOfFiles" not in text
+    assert "LimitNOFILE" not in text
 
 
 def test_render_systemd_service_for_pi_intercom() -> None:
