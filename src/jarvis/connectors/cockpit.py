@@ -2137,6 +2137,11 @@ def _publish_github_pr_review_tool(cfg: Config, project: ProjectEntry) -> Tool:
                                 "minimum": 1,
                                 "description": "1-based line number in the file at commit_id, not a gh diff output position.",
                             },
+                            "line_kind": {
+                                "type": "string",
+                                "enum": ["FILE", "GLOBAL_DIFF_POSITION"],
+                                "description": "Declare FILE after verifying the 1-based file line. Use GLOBAL_DIFF_POSITION only for an ordinal gh pr diff output line.",
+                            },
                             "side": {
                                 "type": "string",
                                 "enum": ["LEFT", "RIGHT"],
@@ -2147,7 +2152,7 @@ def _publish_github_pr_review_tool(cfg: Config, project: ProjectEntry) -> Tool:
                             "body": {"type": "string"},
                             "suggestion": {"type": "string", "description": "Optional exact replacement for a GitHub suggestion block."},
                         },
-                        "required": ["path", "line", "severity", "title", "body"],
+                        "required": ["path", "line", "line_kind", "severity", "title", "body"],
                     },
                 },
             },

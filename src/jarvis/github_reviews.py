@@ -252,7 +252,16 @@ def _resolve_review_comment_line(
     anchors: dict[str, dict[str, set[int]]],
     global_diff_lines: dict[tuple[str, int, str], int],
 ) -> dict[str, Any]:
+    line_kind = str(comment.get("line_kind") or "").upper()
+    if line_kind == "FILE":
+        return comment
     normalized = _normalize_global_diff_line(comment, global_diff_lines)
+    if line_kind == "GLOBAL_DIFF_POSITION":
+        if normalized is None:
+            raise ValueError("global gh diff output position does not map to the declared path and side")
+        return normalized
+    if line_kind:
+        raise ValueError("comment line_kind must be FILE or GLOBAL_DIFF_POSITION")
     if normalized is None or normalized.get("line") == comment.get("line"):
         return comment
     if _comment_anchor_exists(comment, anchors):
