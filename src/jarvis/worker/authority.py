@@ -20,6 +20,7 @@ REAL_SESSION_PROVIDERS = {"codex", "claude"}
 class WorkerSessionAuthority:
     allowed_actions: list[str]
     landing: dict[str, Any] = field(default_factory=dict)
+    trusted_mcp_servers: list[str] = field(default_factory=list)
 
     @classmethod
     def from_metadata(
@@ -42,7 +43,11 @@ class WorkerSessionAuthority:
         if require_turn and WORKER_SESSION_TURN not in allowed:
             raise RuntimeError(f"worker session missing required authority: {WORKER_SESSION_TURN}")
         landing = landing_source or {}
-        authority = cls(allowed_actions=allowed, landing=dict(landing) if isinstance(landing, dict) else {})
+        authority = cls(
+            allowed_actions=allowed,
+            landing=dict(landing) if isinstance(landing, dict) else {},
+            trusted_mcp_servers=_string_list(metadata.get("trusted_mcp_servers")),
+        )
         authority.validate(provider)
         return authority
 
@@ -100,7 +105,10 @@ class WorkerSessionAuthority:
 
     def claude_tool_denial(self, tool_name: str) -> str:
         name = str(tool_name or "").strip()
-        if self.codex_sandbox == "read-only" and not _claude_tool_is_read_only(name):
+        if self.codex_sandbox == "read-only" and not _claude_tool_is_read_only(
+            name,
+            trusted_mcp_servers=self.trusted_mcp_servers,
+        ):
             return f"worker session is read-only; refusing Claude tool {name or '<unknown>'}"
         if self.codex_sandbox != "read-only" and not self.can_resolve_approval:
             return f"worker session lacks {WORKER_SESSION_APPROVE}; refusing Claude tool {name or '<unknown>'}"
@@ -121,10 +129,10 @@ def _string_list(value: Any) -> list[str]:
     return [str(item) for item in value if str(item)]
 
 
-def _claude_tool_is_read_only(tool_name: str) -> bool:
+def _claude_tool_is_read_only(tool_name: str, *, trusted_mcp_servers: list[str] | None = None) -> bool:
     name = tool_name.strip()
     if not name:
         return False
     if name.startswith("mcp__"):
-        return False
+        return any(name.startswith(f"mcp__{server}__") for server in trusted_mcp_servers or [])
     return name in {"AskUserQuestion", "Glob", "Grep", "Read", "WebFetch", "WebSearch"}

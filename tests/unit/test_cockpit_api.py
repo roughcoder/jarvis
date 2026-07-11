@@ -37,6 +37,7 @@ from jarvis.orchestration.cockpit import make_session_ref  # noqa: E402
 from jarvis.mcp.status import mcp_status_path  # noqa: E402
 from jarvis.mcp_server.tokens import MCPTokenStore  # noqa: E402
 from jarvis.orchestration.models import Artifact, ExecutionEnvelope, WorkItem, WorkerJobLink, WorkerProfile, WorkerSessionLink  # noqa: E402
+from jarvis.orchestration.orchestrator_grants import mint_orchestrator_grant  # noqa: E402
 from jarvis.orchestration.oauth import OAuthTokenValidator, OAuthValidationError  # noqa: E402
 from jarvis.orchestration.service import StartedWork  # noqa: E402
 from jarvis.orchestration.store import OrchestrationStore  # noqa: E402
@@ -7141,6 +7142,36 @@ def test_cockpit_thread_turn_attachments_reach_gateway_without_persisting_payloa
     assert memory.messages[0]["content"] == "Here is the bug\n[image attached: bug.png (image/png)]"
 
 
+def test_cockpit_opens_explicit_code_agent_orchestrator_thread(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    connector = CockpitConnector(cfg, memory=memory, gateway=FakeGateway([]), tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = await client.post(
+            f"{base}/v1/projects/neil-shared/threads",
+            json={
+                "title": "Review",
+                "chat_type": "orchestrator",
+                "engine": "codex",
+                "model": "gpt-5.5",
+                "worker_id": "brain-worker",
+            },
+        )
+
+        assert opened.status_code == 200
+        thread = opened.json()["thread"]
+        assert thread["chat_type"] == "orchestrator"
+        assert thread["engine"] == "codex"
+        assert thread["model"] == "gpt-5.5"
+        assert thread["worker_id"] == "brain-worker"
+        assert thread["host"] == ""
+
+    asyncio.run(_with_server(cfg, calls))
+
+
 def test_cockpit_thread_projection_carries_engine_model_status(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)
@@ -7468,6 +7499,77 @@ def test_read_child_work_result_is_parent_project_scoped_and_bounded(tmp_path, m
     assert result["final_result"] == "[P1] Preserve the transition"
     assert result["engine"] == "codex"
     assert result["model"] == "gpt-5.5"
+
+
+def test_scoped_orchestrator_grant_executes_only_for_its_parent_thread(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        token="brain-secret",
+        caps="orchestration.runs.read",
+        identity="neil",
+    )
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    parent = CockpitThread(
+        thread_id="thread_parent",
+        project_id=project.id,
+        session_id="project:neil-shared:orchestrator:thread_parent",
+        title="Review pull request",
+        created_at="2026-07-11T10:00:00Z",
+        updated_at="2026-07-11T10:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        engine="codex",
+        model="gpt-5.5",
+    )
+    CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json").save(parent)
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    child = store.create_run(
+        "Codex review",
+        parent_chat_id=parent.thread_id,
+        project_id=project.id,
+        engine="codex",
+        model="gpt-5.5",
+    )
+    store.append_event(
+        child.run_id,
+        "assistant.message",
+        "",
+        {"time": "2026-07-11T10:01:00Z", "data": {"text": "[P2] Preserve the transition"}},
+    )
+    store.set_phase(child.run_id, "completed", "done")
+    requester = RequestContext(
+        device_id="cockpit",
+        identity="neil",
+        scope="personal",
+        capabilities=frozenset({"orchestration.runs.read"}),
+    )
+    grant = mint_orchestrator_grant(
+        cfg.orchestration,
+        project_id=project.id,
+        thread_id=parent.thread_id,
+        requester=requester,
+    )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        result = await client.post(
+            f"{base}/v1/orchestrator-tools/{project.id}/{parent.thread_id}/read_child_work_result",
+            json={"child_chat_id": child.run_id},
+            headers={"Authorization": f"Bearer {grant}"},
+        )
+        wrong_parent = await client.post(
+            f"{base}/v1/orchestrator-tools/{project.id}/thread_other/read_child_work_result",
+            json={"child_chat_id": child.run_id},
+            headers={"Authorization": f"Bearer {grant}"},
+        )
+
+        assert result.status_code == 200
+        assert json.loads(result.json()["result"])["final_result"] == "[P2] Preserve the transition"
+        assert wrong_parent.status_code == 403
+
+    asyncio.run(_with_server(cfg, calls))
 
 
 def test_child_work_config_defaults_to_read_only_landing(tmp_path, monkeypatch) -> None:  # noqa: ANN001

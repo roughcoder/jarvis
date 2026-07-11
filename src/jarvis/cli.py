@@ -1750,6 +1750,17 @@ def _cmd_mcp_serve(args: argparse.Namespace) -> int:
     return _cmd_mcp_serve_run(args)
 
 
+def _cmd_orchestrator_mcp(args: argparse.Namespace) -> int:
+    from jarvis.worker.orchestrator_mcp import run_orchestrator_mcp
+
+    run_orchestrator_mcp(
+        api_url=str(args.api_url),
+        project_id=str(args.project_id),
+        thread_id=str(args.thread_id),
+    )
+    return 0
+
+
 def _cmd_mcp_serve_add_token(args: argparse.Namespace) -> int:
     from jarvis.mcp_server.tokens import MCPTokenStore
     from jarvis.users import load_users
@@ -2648,6 +2659,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_mcp_serve_add.set_defaults(func=_cmd_mcp_serve, mcp_serve_action="add-token")
     p_mcp_serve_list.set_defaults(func=_cmd_mcp_serve, mcp_serve_action="list-tokens")
     p_mcp_serve_revoke.set_defaults(func=_cmd_mcp_serve, mcp_serve_action="revoke-token")
+
+    p_orchestrator_mcp = sub.add_parser(
+        "orchestrator-mcp",
+        help=argparse.SUPPRESS,
+    )
+    p_orchestrator_mcp.add_argument("--api-url", required=True)
+    p_orchestrator_mcp.add_argument("--project-id", required=True)
+    p_orchestrator_mcp.add_argument("--thread-id", required=True)
+    p_orchestrator_mcp.set_defaults(func=_cmd_orchestrator_mcp)
 
     p_jobs = sub.add_parser("jobs", help="List the worker's recent jobs + results")
     p_jobs.add_argument("-n", type=int, default=20, help="How many recent jobs")

@@ -13,6 +13,12 @@ from typing import Any
 
 from jarvis.config import WorkerConfig
 from jarvis.worker.authority import WorkerSessionAuthority
+from jarvis.worker.orchestrator_runtime import (
+    ORCHESTRATOR_ALLOWED_TOOLS,
+    ORCHESTRATOR_INSTRUCTIONS,
+    ORCHESTRATOR_MCP_SERVER_NAME,
+    orchestrator_mcp_server,
+)
 from jarvis.worker.providers.base import ProviderTurn
 from jarvis.worker.sessions import SessionEvent, SessionManager, WorkerSession
 from jarvis.worker.workspaces import is_worker_owned_path_for_config
@@ -208,6 +214,7 @@ class _ClaudeSessionRuntime:
         worker_cfg: WorkerConfig,
         authority: WorkerSessionAuthority,
         claude_session_id: str,
+        bootstrap_turn: ProviderTurn,
     ) -> None:
         self.session_id = session.session_id
         self.sessions = sessions
@@ -216,6 +223,7 @@ class _ClaudeSessionRuntime:
         self.claude_session_id = claude_session_id
         self.cwd = _session_cwd(session, worker_cfg)
         self.model = str(session.metadata.get("model") or "")
+        self.orchestrator_mcp = orchestrator_mcp_server(bootstrap_turn)
         self.resume = bool(str(session.metadata.get("claude_session_started") or "").strip())
         self._queue: queue.Queue[_QueuedTurn | _StopRuntime] = queue.Queue()
         self._pending_lock = threading.RLock()
@@ -290,7 +298,7 @@ class _ClaudeSessionRuntime:
     async def _amain(self) -> None:
         self._loop = asyncio.get_running_loop()
         sdk = _load_sdk()
-        options = sdk.ClaudeAgentOptions(
+        option_kwargs: dict[str, Any] = dict(
             cwd=self.cwd,
             model=self.model or None,
             permission_mode=self.authority.claude_permission_mode,
@@ -303,6 +311,18 @@ class _ClaudeSessionRuntime:
             can_use_tool=self._can_use_tool,
             stderr=self._record_stderr,
         )
+        if self.orchestrator_mcp is not None:
+            option_kwargs.update(
+                mcp_servers={ORCHESTRATOR_MCP_SERVER_NAME: self.orchestrator_mcp},
+                strict_mcp_config=True,
+                allowed_tools=list(ORCHESTRATOR_ALLOWED_TOOLS),
+                system_prompt={
+                    "type": "preset",
+                    "preset": "claude_code",
+                    "append": ORCHESTRATOR_INSTRUCTIONS,
+                },
+            )
+        options = sdk.ClaudeAgentOptions(**option_kwargs)
         client = sdk.ClaudeSDKClient(options=options)
         self._client = client
         try:
@@ -626,6 +646,7 @@ def _runtime_for_session(
             worker_cfg=worker_cfg,
             authority=authority,
             claude_session_id=claude_session_id,
+            bootstrap_turn=turn,
         )
         _RUNTIMES[session.session_id] = runtime
         runtime.enqueue(turn)

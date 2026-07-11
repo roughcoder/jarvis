@@ -11,6 +11,11 @@ from typing import Any, Callable
 
 from jarvis.config import WorkerConfig
 from jarvis.worker.authority import WorkerSessionAuthority
+from jarvis.worker.orchestrator_runtime import (
+    ORCHESTRATOR_INSTRUCTIONS,
+    ORCHESTRATOR_MCP_SERVER_NAME,
+    orchestrator_mcp_server,
+)
 from jarvis.worker.providers.base import ProviderTurn
 from jarvis.worker.sessions import SessionEvent, SessionManager, WorkerSession
 from jarvis.worker.workspaces import is_worker_owned_path_for_config
@@ -265,6 +270,7 @@ def _run_codex_turn(
         session = sessions.get(session_id) or session
         thread_id = str(session.metadata.get("codex_thread_id") or "").strip()
         model = str(session.metadata.get("model") or "").strip()
+        orchestrator_overrides = _orchestrator_thread_overrides(turn)
         if thread_id:
             rpc_id += 1
             thread_response = _send_request(
@@ -277,6 +283,7 @@ def _run_codex_turn(
                     "approvalPolicy": authority.codex_approval_policy,
                     "sandbox": authority.codex_sandbox,
                     **({"model": model} if model else {}),
+                    **orchestrator_overrides,
                 },
                 session_id=session_id,
                 turn=turn,
@@ -295,6 +302,7 @@ def _run_codex_turn(
                     "approvalPolicy": authority.codex_approval_policy,
                     "sandbox": authority.codex_sandbox,
                     **({"model": model} if model else {}),
+                    **orchestrator_overrides,
                 },
                 session_id=session_id,
                 turn=turn,
@@ -411,6 +419,24 @@ def _send_request(
         line_queue=line_queue,
         timeout_s=timeout_s,
     )
+
+
+def _orchestrator_thread_overrides(turn: ProviderTurn) -> dict[str, Any]:
+    server = orchestrator_mcp_server(turn)
+    if server is None:
+        return {}
+    return {
+        "config": {
+            "mcp_servers": {
+                ORCHESTRATOR_MCP_SERVER_NAME: {
+                    key: value
+                    for key, value in server.items()
+                    if key != "type"
+                }
+            }
+        },
+        "developerInstructions": ORCHESTRATOR_INSTRUCTIONS,
+    }
 
 
 def _send_notification(process: subprocess.Popen[str], method: str, params: dict[str, Any] | None = None) -> None:

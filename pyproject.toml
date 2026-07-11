@@ -45,6 +45,7 @@ memory = []
 # intercom (it talks to the brain over HTTP; nothing imports it). Phase 3c.
 worker = [
     "aiohttp>=3.9",
+    "mcp>=1.2",
 ]
 worker-claude = [
     "claude-agent-sdk>=0.2.110,<0.3",

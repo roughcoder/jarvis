@@ -25,6 +25,9 @@ class ProviderTurn:
     # Image attachments: [{kind, mime_type, name, data_url}]. Full payloads are
     # request-scoped only; session events must carry summaries, never base64.
     attachments: list[dict[str, Any]] = field(default_factory=list)
+    # Secrets and provider bootstrap configuration are request-scoped. They are
+    # deliberately excluded from durable session metadata and events.
+    runtime_context: dict[str, Any] = field(default_factory=dict)
 
 
 class ProviderAdapter(Protocol):

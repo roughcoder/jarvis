@@ -1,10 +1,4 @@
-"""Cockpit project-thread connector.
-
-The Cockpit API is an HTTP/SSE boundary peer, but the turn itself still uses the
-shared BrainSession text core. This module owns the glue: project-scoped thread
-metadata, live project context assembly, BrainSession construction, and explicit
-Lane 1 transcript writes into the named Honcho session.
-"""
+"""Cockpit project-thread connector for Jarvis and code-agent conversations."""
 
 from __future__ import annotations
 
@@ -54,13 +48,21 @@ from jarvis.orchestration.models import WorkCommand, WorkItem
 from jarvis.orchestration.store import OrchestrationStore
 from jarvis.orchestration.service import StartedWork, OrchestrationService
 from jarvis.orchestration.redaction import public_error_message
+from jarvis.orchestration.orchestrator_grants import mint_orchestrator_grant, orchestrator_api_base_url
 from jarvis.orchestration.workers import WorkerRegistry, worker_token_value
+from jarvis.runtime import ToolRegistry
 from jarvis.tools import build_registry
 from jarvis.tools.background import make_background_tool
 from jarvis.tools.base import Tool
 from jarvis.text import slugify
 from jarvis.users import load_users
-from jarvis.worker_session_contract import EVENT_TOOL_CALL, EVENT_TOOL_RESULT
+from jarvis.worker_session_contract import (
+    EVENT_ASSISTANT_MESSAGE,
+    EVENT_TOOL_CALL,
+    EVENT_TOOL_RESULT,
+    EVENT_TURN_COMPLETED,
+    EVENT_TURN_FAILED,
+)
 
 
 THREAD_INDEX_FILENAME = "cockpit-threads.json"
@@ -104,6 +106,10 @@ class CockpitThread:
     created_at: str
     updated_at: str
     created_by: str
+    chat_type: str = "assistant"
+    engine: str = "jarvis"
+    model: str = ""
+    worker_id: str = ""
     parent_chat_id: str = ""
     archived_at: str = ""
     archived_by: str = ""
@@ -122,6 +128,10 @@ class CockpitThread:
             created_at=str(data.get("created_at") or ""),
             updated_at=str(data.get("updated_at") or ""),
             created_by=str(data.get("created_by") or ""),
+            chat_type=str(data.get("chat_type") or "assistant"),
+            engine=str(data.get("engine") or "jarvis"),
+            model=str(data.get("model") or ""),
+            worker_id=str(data.get("worker_id") or ""),
             parent_chat_id=str(data.get("parent_chat_id") or ""),
             archived_at=str(data.get("archived_at") or ""),
             archived_by=str(data.get("archived_by") or ""),
@@ -140,6 +150,10 @@ class CockpitThread:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "created_by": self.created_by,
+            "chat_type": self.chat_type,
+            "engine": self.engine,
+            "model": self.model,
+            "worker_id": self.worker_id,
             "parent_chat_id": self.parent_chat_id,
             "archived_at": self.archived_at,
             "archived_by": self.archived_by,
@@ -697,7 +711,19 @@ class CockpitConnector:
         *,
         title: str = "",
         parent_chat_id: str = "",
+        chat_type: str = "assistant",
+        engine: str = "",
+        model: str = "",
+        worker_id: str = "",
     ) -> CockpitThread:
+        chat_type = str(chat_type or "assistant").strip().lower()
+        if chat_type not in {"assistant", "orchestrator"}:
+            raise ValueError(f"unsupported chat_type: {chat_type}")
+        resolved_engine = str(engine or ("jarvis" if chat_type == "assistant" else "codex")).strip().lower()
+        if chat_type == "orchestrator" and resolved_engine not in {"codex", "claude"}:
+            raise ValueError("orchestrator engine must be codex or claude")
+        if chat_type == "assistant":
+            resolved_engine = "jarvis"
         thread_id = new_id("thread")
         session_id = orchestrator_session_id(project.id, thread_id)
         now = utc_now()
@@ -709,6 +735,10 @@ class CockpitConnector:
             created_at=now,
             updated_at=now,
             created_by=requester.memory_peer,
+            chat_type=chat_type,
+            engine=resolved_engine,
+            model=str(model or "").strip(),
+            worker_id=str(worker_id or "").strip(),
             parent_chat_id=parent_chat_id.strip(),
         )
         peers = _thread_peers(self._cfg, project, requester)
@@ -718,6 +748,9 @@ class CockpitConnector:
             peers=peers,
             metadata={
                 "kind": "cockpit_orchestrator",
+                "chat_type": chat_type,
+                "engine": resolved_engine,
+                "model": str(model or "").strip(),
                 "project_id": project.id,
                 "thread_id": thread_id,
                 "created_by": requester.memory_peer,
@@ -744,6 +777,15 @@ class CockpitConnector:
         context_thread = self._index.get_with_messages(project.id, thread.thread_id, limit=THREAD_HISTORY_LIMIT) or thread
         explicit_workspace_request = workspace_request is not None
         workspace_request = dict(workspace_request or {})
+        if context_thread.chat_type == "orchestrator":
+            reply, updated = await self._orchestrator_turn(
+                project,
+                context_thread,
+                requester,
+                _text_with_attachment_markers(text, attachments),
+                progress=progress,
+            )
+            return reply, updated, ()
         if context_thread.workspace or explicit_workspace_request:
             reply, updated = await self._workspace_turn(
                 project,
@@ -877,6 +919,221 @@ class CockpitConnector:
             assistant_peer_id=self._cfg.memory.assistant_peer_id,
         )
         return reply, updated
+
+    async def _orchestrator_turn(
+        self,
+        project: ProjectEntry,
+        thread: CockpitThread,
+        requester: RequestContext,
+        text: str,
+        *,
+        progress: Callable[[dict[str, Any]], Any] | None,
+    ) -> tuple[str, CockpitThread]:
+        thread = await self._ensure_orchestrator_session(project, thread, requester, progress=progress)
+        worker_id = str(thread.workspace.get("worker_id") or "")
+        session_id = str(thread.workspace.get("session_id") or "")
+        if not worker_id or not session_id:
+            raise RuntimeError("orchestrator conversation has no worker session")
+        context = _project_context(self._memory, project, thread)
+        prompt = (
+            "Authoritative Jarvis project context for this turn:\n"
+            f"{context}\n\nCurrent orchestration instruction:\n{text}"
+        )
+        resume = bool(thread.workspace.get("provider_started"))
+        grant = mint_orchestrator_grant(
+            self._cfg.orchestration,
+            project_id=project.id,
+            thread_id=thread.thread_id,
+            requester=requester,
+        )
+        turn_id = new_id("turn")
+        response = await asyncio.to_thread(
+            self._post_worker_json,
+            worker_id,
+            f"/sessions/{session_id}/turns",
+            {
+                "turn_id": turn_id,
+                "prompt": prompt,
+                "metadata": {
+                    "surface": "cockpit_orchestrator",
+                    "project_id": project.id,
+                    "thread_id": thread.thread_id,
+                    "resume_session": resume,
+                    "allowed_actions": [WORKER_SESSION_TURN],
+                },
+                "runtime_context": {
+                    "orchestrator_mcp": {
+                        "api_url": orchestrator_api_base_url(self._cfg.orchestration),
+                        "project_id": project.id,
+                        "thread_id": thread.thread_id,
+                        "grant": grant,
+                    }
+                },
+                "idempotency_key": f"orchestrator-turn:{thread.thread_id}:{turn_id}",
+            },
+        )
+        if response.get("ok") is False:
+            raise RuntimeError(str(response.get("error") or "worker rejected orchestrator turn"))
+        thread = self._index.save(
+            replace(
+                thread,
+                workspace={
+                    **thread.workspace,
+                    "provider_started": True,
+                    "status": "running",
+                    "provision_phase": "running",
+                },
+            )
+        )
+        if progress is not None:
+            progress({"phase": "running", "thread_id": thread.thread_id, "workspace": workspace_public(thread.workspace)})
+        reply = await self._wait_for_orchestrator_turn(worker_id, session_id, turn_id)
+        try:
+            await asyncio.to_thread(
+                self._persist_turn,
+                thread.session_id,
+                requester.memory_peer,
+                requester.device_id,
+                text,
+                reply,
+            )
+        except Exception:
+            pass
+        completed = replace(
+            thread,
+            workspace={
+                **thread.workspace,
+                "status": "ready",
+                "provision_phase": "ready",
+            },
+        )
+        return reply, self._index.append_turn(
+            completed,
+            user_peer_id=requester.memory_peer,
+            user_text=text,
+            assistant_peer_id=self._cfg.memory.assistant_peer_id,
+            assistant_text=reply,
+        )
+
+    async def _ensure_orchestrator_session(
+        self,
+        project: ProjectEntry,
+        thread: CockpitThread,
+        requester: RequestContext,
+        *,
+        progress: Callable[[dict[str, Any]], Any] | None,
+    ) -> CockpitThread:
+        if thread.workspace.get("worker_id") and thread.workspace.get("session_id"):
+            return thread
+        if progress is not None:
+            progress({"phase": "resolving-access", "thread_id": thread.thread_id})
+        preferred = [thread.worker_id] if thread.worker_id else None
+        profile = self._registry().choose(preferred=preferred, engine=thread.engine)
+        if profile is None:
+            raise RuntimeError(f"no eligible {thread.engine} worker has capacity for the orchestrator")
+        conversation_id = _conversation_workspace_id(project, thread)
+        workspace_response = await asyncio.to_thread(
+            self._post_worker_json,
+            profile.worker_id,
+            "/conversation-workspaces",
+            {
+                "conversation_id": conversation_id,
+                "metadata": {
+                    "chat_type": "orchestrator",
+                    "project_id": project.id,
+                    "thread_id": thread.thread_id,
+                    "honcho_session_id": thread.session_id,
+                    "created_by": requester.memory_peer,
+                },
+            },
+        )
+        workspace = dict(workspace_response.get("workspace") or {})
+        cwd = str(workspace.get("root") or "")
+        if not cwd:
+            raise RuntimeError("worker did not create an orchestrator workspace")
+        session_id = f"orch_{slugify(thread.thread_id)}"
+        await asyncio.to_thread(
+            self._ensure_worker_session,
+            profile.worker_id,
+            session_id,
+            {
+                "session_id": session_id,
+                "run_id": thread.thread_id,
+                "provider": thread.engine,
+                "engine": thread.engine,
+                "cwd": cwd,
+                "title": thread.title or project.name,
+                "metadata": {
+                    "execution_envelope": {
+                        "run_id": thread.thread_id,
+                        "engine": thread.engine,
+                        "model": thread.model,
+                        "allowed_actions": [WORKER_SESSION_CREATE, WORKER_SESSION_TURN, WORKER_SESSION_STOP],
+                        "landing": {"mode": "review", "allow_merge": False},
+                    },
+                    "allowed_actions": [WORKER_SESSION_CREATE, WORKER_SESSION_TURN, WORKER_SESSION_STOP],
+                    "landing": {"mode": "review", "allow_merge": False},
+                    "model": thread.model,
+                    "trusted_mcp_servers": ["jarvis_orchestrator"],
+                    "chat_type": "orchestrator",
+                    "project_id": project.id,
+                    "thread_id": thread.thread_id,
+                    "honcho_session_id": thread.session_id,
+                },
+            },
+        )
+        return self._index.save(
+            replace(
+                thread,
+                worker_id=profile.worker_id,
+                workspace={
+                    **workspace,
+                    "worker_id": profile.worker_id,
+                    "session_id": session_id,
+                    "engine": thread.engine,
+                    "model": thread.model,
+                    "status": "ready",
+                    "provision_phase": "ready",
+                },
+            )
+        )
+
+    async def _wait_for_orchestrator_turn(self, worker_id: str, session_id: str, turn_id: str) -> str:
+        deadline = asyncio.get_running_loop().time() + max(1.0, float(self._cfg.worker.job_timeout_s))
+        assistant_messages: list[str] = []
+        while asyncio.get_running_loop().time() < deadline:
+            body = await asyncio.to_thread(
+                self._get_worker_json,
+                worker_id,
+                f"/sessions/{session_id}/events?limit=500",
+            )
+            terminal_error = ""
+            terminal = False
+            assistant_messages = []
+            for event in body.get("events") or []:
+                if not isinstance(event, dict):
+                    continue
+                data = event.get("data") if isinstance(event.get("data"), dict) else {}
+                if str(data.get("turn_id") or "") != turn_id:
+                    continue
+                event_type = str(event.get("type") or "")
+                if event_type == EVENT_ASSISTANT_MESSAGE:
+                    event_text = str(data.get("text") or "").strip()
+                    if event_text:
+                        assistant_messages.append(event_text)
+                elif event_type == EVENT_TURN_FAILED:
+                    terminal = True
+                    terminal_error = str(data.get("error") or "orchestrator turn failed")
+                elif event_type == EVENT_TURN_COMPLETED:
+                    terminal = True
+            if terminal_error:
+                raise RuntimeError(public_error_message(terminal_error))
+            if terminal:
+                if not assistant_messages:
+                    raise RuntimeError("orchestrator turn completed without an assistant result")
+                return assistant_messages[-1]
+            await asyncio.sleep(0.25)
+        raise TimeoutError("orchestrator turn timed out")
 
     async def _ensure_workspace(
         self,
@@ -1642,7 +1899,19 @@ def _continue_child_watch(cfg: Config, parent_chat_id: str, watch: dict[str, Any
         if continuation_instruction:
             instruction = f"{instruction}\n\nCompletion instruction from the original workflow:\n{continuation_instruction}"
         connector = CockpitConnector(cfg)
-        await connector.turn(project, thread, requester, instruction)
+        for attempt in range(120):
+            try:
+                await connector.turn(project, thread, requester, instruction)
+                break
+            except RuntimeError as exc:
+                message = str(exc).lower()
+                if attempt == 119 or not (
+                    "active turn" in message
+                    or "already has an active turn" in message
+                    or "does not accept new turns" in message
+                ):
+                    raise
+                await asyncio.sleep(0.25)
 
     try:
         asyncio.run(run())
@@ -1739,6 +2008,29 @@ def _publish_github_pr_review_tool(cfg: Config, project: ProjectEntry) -> Tool:
         publish,
         announce=True,
         timeout_s=30,
+    )
+
+
+async def execute_orchestrator_tool(
+    cfg: Config,
+    *,
+    project: ProjectEntry,
+    thread: CockpitThread,
+    requester: RequestContext,
+    tool_name: str,
+    args: dict[str, Any],
+) -> str:
+    """Execute one parent-thread tool after the API validates its scoped grant."""
+    tools = ToolRegistry()
+    tools.register(_spawn_child_work_tool(cfg, project, thread))
+    tools.register(_read_child_work_result_tool(cfg, project, thread))
+    tools.register(_watch_child_work_sessions_tool(cfg, project, thread))
+    tools.register(_publish_github_pr_review_tool(cfg, project))
+    return await tools.execute(
+        requester,
+        tool_name,
+        args,
+        timeout_s=max(float(cfg.tools.timeout_s), float(cfg.worker.request_timeout_s) + 5),
     )
 
 
