@@ -9,7 +9,7 @@ from typing import Any
 from jarvis.config import WorkerConfig
 from jarvis.ids import utc_now
 from jarvis.text import slugify
-from jarvis.worker.actions import clone_repo, fetch_repo, list_repos, resolve_repo, run_exec
+from jarvis.worker.actions import clone_repo, fetch_repo, list_repos, resolve_available_worktree_branch, resolve_repo, run_exec
 
 
 WORKSPACE_STATE_FILENAME = "workspace.json"
@@ -167,7 +167,7 @@ async def materialize_worktree(
             state["provision_phase"] = "creating-worktree"
             _write_state(path, state)
             repos_dir.mkdir(parents=True, exist_ok=True)
-            branch = f"{cfg.worktree_branch_prefix}/{workspace_id(conversation_id)}-{repo_key}"
+            requested_branch = f"{cfg.worktree_branch_prefix}/{workspace_id(conversation_id)}-{repo_key}"
             # Always fetch before branching, even when the caller passed an explicit
             # base_ref — without this, an explicit base_ref skipped _default_base_ref's
             # (conditional) fetch entirely and the worktree branched from a stale local
@@ -182,10 +182,20 @@ async def materialize_worktree(
                 # references this path, but the dir + git worktree registration +
                 # branch survived). Reconcile instead of getting stuck forever: drop
                 # the orphaned registration and fall through to recreate it cleanly.
+                orphan_branch = await run_exec(
+                    ["git", "-C", str(worktree), "branch", "--show-current"],
+                    None,
+                    cfg.shell_timeout_s,
+                )
                 await run_exec(["git", "-C", resolved, "worktree", "remove", "--force", str(worktree)], None, cfg.shell_timeout_s)
                 if worktree.exists():
                     shutil.rmtree(worktree, ignore_errors=True)
-                await run_exec(["git", "-C", resolved, "branch", "-D", branch], None, cfg.shell_timeout_s)
+                flattened_branch = requested_branch.replace("/", "-")
+                if orphan_branch == requested_branch or orphan_branch == flattened_branch or orphan_branch.startswith(
+                    f"{flattened_branch}-"
+                ):
+                    await run_exec(["git", "-C", resolved, "branch", "-D", orphan_branch], None, cfg.shell_timeout_s)
+            branch = await resolve_available_worktree_branch(resolved, requested_branch, cfg.shell_timeout_s)
             out = await run_exec(
                 ["git", "-C", resolved, "worktree", "add", "-b", branch, "--", str(worktree), base],
                 None,
