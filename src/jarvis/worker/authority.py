@@ -114,6 +114,12 @@ class WorkerSessionAuthority:
             return f"worker session lacks {WORKER_SESSION_APPROVE}; refusing Claude tool {name or '<unknown>'}"
         return ""
 
+    def claude_tool_is_preapproved(self, tool_name: str) -> bool:
+        return self.codex_sandbox == "read-only" and _claude_tool_is_read_only(
+            str(tool_name or ""),
+            trusted_mcp_servers=self.trusted_mcp_servers,
+        )
+
     @property
     def can_resolve_approval(self) -> bool:
         return WORKER_SESSION_APPROVE in self.allowed

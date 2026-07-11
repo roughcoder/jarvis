@@ -30,9 +30,17 @@ from jarvis.worker_session_contract import (
     SUCCESS_SESSION_STATUSES,
     TURN_RESUMABLE_SESSION_STATUSES,
     TURN_STARTABLE_SESSION_STATUSES,
+    WORKER_ERROR_SESSION_ACTIVE,
+    WORKER_ERROR_SESSION_TERMINAL,
     request_type as contract_request_type,
     resolved_request_type as contract_resolved_request_type,
 )
+
+
+class SessionTurnConflict(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(message)
 
 # Why a session ended, keyed by the terminal status a transition lands on.
 # "interrupted" defaults to a user-initiated interrupt; the daemon-restart
@@ -319,13 +327,17 @@ class SessionManager:
             if existing is not None:
                 return session, existing, False
             if session.status in (ACTIVE_SESSION_STATUSES - TURN_STARTABLE_SESSION_STATUSES):
-                raise RuntimeError(f"worker session {session.session_id} already has an active turn")
+                raise SessionTurnConflict(
+                    WORKER_ERROR_SESSION_ACTIVE,
+                    f"worker session {session.session_id} already has an active turn",
+                )
             resume = bool(dict(data.get("metadata") or {}).get("resume_session"))
             if session.status not in TURN_STARTABLE_SESSION_STATUSES and not (
                 resume and session.status in TURN_RESUMABLE_SESSION_STATUSES
             ):
-                raise RuntimeError(
-                    f"worker session {session.session_id} is {session.status} and does not accept new turns"
+                raise SessionTurnConflict(
+                    WORKER_ERROR_SESSION_TERMINAL,
+                    f"worker session {session.session_id} is {session.status} and does not accept new turns",
                 )
             event = SessionEvent.create(session.session_id, EVENT_TURN_STARTED, data)
             with self.events_path(session.session_id).open("a") as f:

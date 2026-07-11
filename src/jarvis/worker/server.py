@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import math
 import os
 import pathlib
 import subprocess
@@ -63,7 +64,7 @@ from jarvis.worker.actions import (
 )
 from jarvis.worker.jobs import JobManager, slugify
 from jarvis.worker.providers import ProviderTurn, provider_for
-from jarvis.worker.sessions import SessionManager, WorkerSession
+from jarvis.worker.sessions import SessionManager, SessionTurnConflict, WorkerSession
 from jarvis.worker.workspaces import (
     conversation_workspace_root,
     ensure_workspace,
@@ -752,6 +753,10 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 {"ok": False, "error": f"provider {session.provider!r} does not support turn attachments"},
                 status=400,
             )
+        try:
+            validated_runtime_context = _validate_runtime_context(body.get("runtime_context"))
+        except RuntimeError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
         running_event = None
         if session.metadata.get("provision_workspace") is True:
             running_event = sessions.append_event(
@@ -771,8 +776,11 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             turn_data["attachments"] = _attachment_summaries(attachments)
         try:
             session, started, reserved = sessions.reserve_turn(session.session_id, turn_data)
-        except RuntimeError as exc:
-            return web.json_response({"ok": False, "error": str(exc)}, status=409)
+        except SessionTurnConflict as exc:
+            return web.json_response(
+                {"ok": False, "error": str(exc), "code": exc.code},
+                status=409,
+            )
         if not reserved:
             return web.json_response(
                 {
@@ -790,7 +798,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             runtime_context = _prepare_runtime_context(
                 sessions,
                 session.session_id,
-                body.get("runtime_context"),
+                validated_runtime_context,
             )
             provider_events = adapter.start_turn(
                 session=session,
@@ -1450,6 +1458,40 @@ def _prepare_runtime_context(
     session_id: str,
     raw_context: object,
 ) -> dict[str, Any]:
+    validated = _validate_runtime_context(raw_context)
+    raw_mcp = validated.get("orchestrator_mcp")
+    if not isinstance(raw_mcp, dict):
+        return {}
+    grant = str(raw_mcp["grant"])
+    grant_file = sessions.session_dir(session_id) / ".orchestrator-grant"
+    temp_file = grant_file.with_name(f"{grant_file.name}.{uuid.uuid4().hex}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(temp_file, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(grant)
+        os.replace(temp_file, grant_file)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        with contextlib.suppress(FileNotFoundError):
+            temp_file.unlink()
+    return {
+        "orchestrator_mcp": {
+            "api_url": str(raw_mcp["api_url"]),
+            "project_id": str(raw_mcp["project_id"]),
+            "thread_id": str(raw_mcp["thread_id"]),
+            "grant_file": str(grant_file),
+            "timeout_s": float(raw_mcp["timeout_s"]),
+        }
+    }
+
+
+def _validate_runtime_context(raw_context: object) -> dict[str, Any]:
     if not isinstance(raw_context, dict):
         return {}
     raw_mcp = raw_context.get("orchestrator_mcp")
@@ -1459,19 +1501,23 @@ def _prepare_runtime_context(
     project_id = str(raw_mcp.get("project_id") or "").strip()
     thread_id = str(raw_mcp.get("thread_id") or "").strip()
     grant = str(raw_mcp.get("grant") or "").strip()
+    try:
+        timeout_s = float(raw_mcp.get("timeout_s") or 90.0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("orchestrator MCP timeout is invalid") from exc
     if not api_url or not project_id or not thread_id or not grant:
         raise RuntimeError("orchestrator MCP runtime context is incomplete")
     if len(grant) > 16_384:
         raise RuntimeError("orchestrator MCP grant is too large")
-    grant_file = sessions.session_dir(session_id) / ".orchestrator-grant"
-    grant_file.write_text(grant, encoding="utf-8")
-    grant_file.chmod(0o600)
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise RuntimeError("orchestrator MCP timeout is invalid")
     return {
         "orchestrator_mcp": {
             "api_url": api_url,
             "project_id": project_id,
             "thread_id": thread_id,
-            "grant_file": str(grant_file),
+            "grant": grant,
+            "timeout_s": timeout_s,
         }
     }
 

@@ -6,23 +6,22 @@ import base64
 import hashlib
 import hmac
 import json
+import os
+import secrets
+import stat
 import time
 from dataclasses import dataclass
+from pathlib import Path
+
 from jarvis.config import OrchestrationConfig
+from jarvis.orchestrator_tool_contract import ORCHESTRATOR_TOOL_NAME_SET
 from jarvis.runtime import RequestContext
 
 
 GRANT_TTL_SECONDS = 2 * 60 * 60
-ORCHESTRATOR_TOOL_NAMES = frozenset(
-    {
-        "publish_github_pr_review",
-        "read_child_work_result",
-        "spawn_child_work_session",
-        "watch_child_work_sessions",
-    }
-)
 _PREFIX = "jv_orch_"
 _SIGNING_CONTEXT = b"jarvis-orchestrator-tool-grant-v1"
+_SIGNING_KEY_FILENAME = ".orchestrator-grant-signing-key"
 
 
 class OrchestratorGrantError(ValueError):
@@ -60,7 +59,7 @@ def mint_orchestrator_grant(
             "confidence": requester.confidence,
             "peer": requester.peer,
         },
-        "tools": sorted(ORCHESTRATOR_TOOL_NAMES),
+        "tools": sorted(ORCHESTRATOR_TOOL_NAME_SET),
         "iat": current,
         "exp": current + GRANT_TTL_SECONDS,
     }
@@ -102,7 +101,7 @@ def resolve_orchestrator_grant(
     tools = frozenset(
         str(item)
         for item in payload.get("tools") or []
-        if str(item) in ORCHESTRATOR_TOOL_NAMES
+        if str(item) in ORCHESTRATOR_TOOL_NAME_SET
     )
     if not project_id or not thread_id or not tools:
         raise OrchestratorGrantError("invalid orchestrator grant")
@@ -118,7 +117,7 @@ def resolve_orchestrator_grant(
                 for item in requester.get("capabilities") or []
                 if str(item).strip()
             ),
-            channel="cockpit",
+            channel=str(requester.get("channel") or "cockpit"),
             confidence=str(requester.get("confidence") or "strong"),
             peer=str(requester.get("peer") or ""),
         ),
@@ -138,12 +137,55 @@ def orchestrator_api_base_url(cfg: OrchestrationConfig) -> str:
 
 
 def _signing_key(cfg: OrchestrationConfig) -> bytes:
-    secret = cfg.api_token.get_secret_value().strip()
+    secret = cfg.grant_signing_secret.get_secret_value().strip()
     if not secret:
-        raise OrchestratorGrantError(
-            "ORCHESTRATION_API_TOKEN is required to sign code-agent orchestrator tool grants"
-        )
+        secret = cfg.api_token.get_secret_value().strip()
+    if not secret:
+        secret = _persistent_local_signing_secret(cfg)
     return hmac.new(secret.encode("utf-8"), _SIGNING_CONTEXT, hashlib.sha256).digest()
+
+
+def _persistent_local_signing_secret(cfg: OrchestrationConfig) -> str:
+    root = Path(cfg.workspace).expanduser()
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / _SIGNING_KEY_FILENAME
+    temp_path = root / f"{_SIGNING_KEY_FILENAME}.{secrets.token_hex(8)}.tmp"
+    try:
+        fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as exc:
+        raise OrchestratorGrantError("unable to create orchestrator grant signing key") from exc
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(secrets.token_urlsafe(48))
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temp_path, path, follow_symlinks=False)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise OrchestratorGrantError("unable to install orchestrator grant signing key") from exc
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise OrchestratorGrantError("unable to read orchestrator grant signing key") from exc
+    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        file_stat = os.fstat(handle.fileno())
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise OrchestratorGrantError("orchestrator grant signing key is not a regular file")
+        os.fchmod(handle.fileno(), 0o600)
+        secret = handle.read().strip()
+    if not secret:
+        raise OrchestratorGrantError("orchestrator grant signing key is empty")
+    return secret
 
 
 def _sign(key: bytes, payload: bytes) -> str:

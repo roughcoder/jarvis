@@ -359,7 +359,14 @@ def test_codex_orchestrator_overrides_are_thread_scoped_and_secret_free() -> Non
 
     server = overrides["config"]["mcp_servers"]["jarvis_orchestrator"]
     assert server["command"]
-    assert server["args"][-4:] == ["--project-id", "project_a", "--thread-id", "thread_a"]
+    assert server["args"][-6:] == [
+        "--project-id",
+        "project_a",
+        "--thread-id",
+        "thread_a",
+        "--timeout-s",
+        "90.0",
+    ]
     assert server["env"] == {
         "JARVIS_ORCHESTRATOR_GRANT_FILE": "/private/session/.orchestrator-grant"
     }
@@ -404,7 +411,7 @@ def test_rejected_overlapping_turn_does_not_rotate_active_orchestrator_grant(
                     "provider": "fake",
                     "engine": "fake",
                     "cwd": _owned_worker_cwd(tmp_path, "orchestrator-grant-race"),
-                    "metadata": _authority_metadata("fake"),
+                    "metadata": _authority_metadata("fake", [WORKER_SESSION_STOP]),
                 },
                 headers=headers,
             )
@@ -451,7 +458,86 @@ def test_rejected_overlapping_turn_does_not_rotate_active_orchestrator_grant(
 
     assert first.status_code == 200
     assert second.status_code == 409
+    assert second.json()["code"] == "session_active"
     assert grant == "active-requester-grant"
+
+
+def test_invalid_orchestrator_runtime_context_does_not_fail_session(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, client):  # noqa: ANN001
+        created = (
+            await client.post(
+                base + "/sessions",
+                json={
+                    "provider": "fake",
+                    "engine": "fake",
+                    "cwd": _owned_worker_cwd(tmp_path, "invalid-orchestrator-context"),
+                    "metadata": _authority_metadata("fake"),
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        rejected = await client.post(
+            f"{base}/sessions/{session_id}/turns",
+            json={
+                "turn_id": "turn_invalid",
+                "prompt": "coordinate",
+                "metadata": _control_metadata(WORKER_SESSION_TURN),
+                "runtime_context": {"orchestrator_mcp": {"grant": "incomplete"}},
+            },
+            headers=headers,
+        )
+        session = (await client.get(f"{base}/sessions/{session_id}", headers=headers)).json()
+        events = (await client.get(f"{base}/sessions/{session_id}/events", headers=headers)).json()["events"]
+        return rejected, session, events
+
+    rejected, session, events = asyncio.run(_with_server(cfg, 8863, calls))
+
+    assert rejected.status_code == 400
+    assert session["status"] == "created"
+    assert not any(event["type"] == "turn.started" for event in events)
+
+
+def test_terminal_session_turn_conflict_has_structured_code(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, client):  # noqa: ANN001
+        created = (
+            await client.post(
+                base + "/sessions",
+                json={
+                    "provider": "fake",
+                    "engine": "fake",
+                    "cwd": _owned_worker_cwd(tmp_path, "terminal-turn-code"),
+                    "metadata": _authority_metadata("fake", [WORKER_SESSION_STOP]),
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        await client.post(
+            f"{base}/sessions/{session_id}/stop",
+            json={"allowed_actions": [WORKER_SESSION_STOP]},
+            headers=headers,
+        )
+        return await client.post(
+            f"{base}/sessions/{session_id}/turns",
+            json={
+                "turn_id": "turn_after_stop",
+                "prompt": "continue",
+                "metadata": _control_metadata(WORKER_SESSION_TURN),
+            },
+            headers=headers,
+        )
+
+    response = asyncio.run(_with_server(cfg, 8864, calls))
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "session_terminal"
 
 
 def test_worker_session_authority_maps_branch_only_to_workspace_write() -> None:
@@ -3313,6 +3399,10 @@ def test_claude_orchestrator_turn_receives_only_scoped_jarvis_mcp_tools(tmp_path
     _install_fake_claude_sdk(
         monkeypatch,
         [[[
+            _FakePermissionAsk(
+                "mcp__jarvis_orchestrator__spawn_child_work_session",
+                {"task": "review"},
+            ),
             _FakeAssistantMessage([_FakeTextBlock("watching")], session_id=native_id),
             _FakeResultMessage(session_id=native_id),
         ]]],
@@ -3377,6 +3467,8 @@ def test_claude_orchestrator_turn_receives_only_scoped_jarvis_mcp_tools(tmp_path
         "mcp__jarvis_orchestrator__publish_github_pr_review",
     ]
     assert "Jarvis project orchestrator" in options["system_prompt"]["append"]
+    assert isinstance(_FakeClaudeClient.instances[0].permission_results[0], _FakePermissionResultAllow)
+    assert not any(event.type == "approval.requested" for event in sessions.events(session.session_id))
 
 
 def test_daemon_github_review_action_is_authority_gated_and_idempotent(tmp_path, monkeypatch) -> None:  # noqa: ANN001

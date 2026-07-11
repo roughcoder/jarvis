@@ -1757,6 +1757,7 @@ def _cmd_orchestrator_mcp(args: argparse.Namespace) -> int:
         api_url=str(args.api_url),
         project_id=str(args.project_id),
         thread_id=str(args.thread_id),
+        timeout_s=float(args.timeout_s),
     )
     return 0
 
@@ -2667,6 +2668,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_orchestrator_mcp.add_argument("--api-url", required=True)
     p_orchestrator_mcp.add_argument("--project-id", required=True)
     p_orchestrator_mcp.add_argument("--thread-id", required=True)
+    p_orchestrator_mcp.add_argument("--timeout-s", type=float, default=90.0)
     p_orchestrator_mcp.set_defaults(func=_cmd_orchestrator_mcp)
 
     p_jobs = sub.add_parser("jobs", help="List the worker's recent jobs + results")

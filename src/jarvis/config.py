@@ -836,6 +836,7 @@ class OrchestrationConfig(_Base):
     api_port: int = 8790
     api_bind_host: str = ""
     api_token: SecretStr = SecretStr("")
+    grant_signing_secret: SecretStr = SecretStr("")
     api_allow_insecure: bool = False
     api_cors_origins: str = ""
     auth_mode: str = "hybrid"
@@ -1116,6 +1117,7 @@ class Config:
             "orchestration.api_port": self.orchestration.api_port,
             "orchestration.api_bind_host": self.orchestration.api_bind_host or "<auto>",
             "orchestration.api_token": mask(self.orchestration.api_token),
+            "orchestration.grant_signing_secret": mask(self.orchestration.grant_signing_secret),
             "orchestration.api_allow_insecure": self.orchestration.api_allow_insecure,
             "orchestration.api_cors_origins": self.orchestration.api_cors_origins or "<none>",
             "orchestration.auth_mode": self.orchestration.auth_mode,

@@ -8,11 +8,24 @@ from typing import Any
 
 import httpx
 
+from jarvis.orchestrator_tool_contract import (
+    PUBLISH_GITHUB_PR_REVIEW,
+    READ_CHILD_WORK_RESULT,
+    SPAWN_CHILD_WORK_SESSION,
+    WATCH_CHILD_WORK_SESSIONS,
+)
+
 
 _TOKEN_FILE_ENV = "JARVIS_ORCHESTRATOR_GRANT_FILE"
 
 
-def run_orchestrator_mcp(*, api_url: str, project_id: str, thread_id: str) -> None:
+def run_orchestrator_mcp(
+    *,
+    api_url: str,
+    project_id: str,
+    thread_id: str,
+    timeout_s: float = 90.0,
+) -> None:
     from mcp.server.fastmcp import FastMCP
 
     token_file = os.environ.get(_TOKEN_FILE_ENV, "").strip()
@@ -37,7 +50,7 @@ def run_orchestrator_mcp(*, api_url: str, project_id: str, thread_id: str) -> No
             raise RuntimeError("Jarvis orchestrator grant is unavailable") from exc
         if not token:
             raise RuntimeError("Jarvis orchestrator grant is unavailable")
-        async with httpx.AsyncClient(timeout=90) as client:
+        async with httpx.AsyncClient(timeout=timeout_s) as client:
             response = await client.post(
                 f"{base_url}/v1/orchestrator-tools/{project_id}/{thread_id}/{tool_name}",
                 json=args,
@@ -61,7 +74,7 @@ def run_orchestrator_mcp(*, api_url: str, project_id: str, thread_id: str) -> No
             )
         return str(body.get("result") or "")
 
-    @mcp.tool(name="spawn_child_work_session")
+    @mcp.tool(name=SPAWN_CHILD_WORK_SESSION)
     async def spawn_child_work_session(
         task: str,
         title: str = "",
@@ -73,7 +86,7 @@ def run_orchestrator_mcp(*, api_url: str, project_id: str, thread_id: str) -> No
         landing_mode: str = "none",
     ) -> str:
         return await call(
-            "spawn_child_work_session",
+            SPAWN_CHILD_WORK_SESSION,
             {
                 "task": task,
                 "title": title,
@@ -86,11 +99,11 @@ def run_orchestrator_mcp(*, api_url: str, project_id: str, thread_id: str) -> No
             },
         )
 
-    @mcp.tool(name="read_child_work_result")
+    @mcp.tool(name=READ_CHILD_WORK_RESULT)
     async def read_child_work_result(child_chat_id: str) -> str:
-        return await call("read_child_work_result", {"child_chat_id": child_chat_id})
+        return await call(READ_CHILD_WORK_RESULT, {"child_chat_id": child_chat_id})
 
-    @mcp.tool(name="watch_child_work_sessions")
+    @mcp.tool(name=WATCH_CHILD_WORK_SESSIONS)
     async def watch_child_work_sessions(
         child_chat_ids: list[str],
         expected_count: int = 0,
@@ -102,9 +115,9 @@ def run_orchestrator_mcp(*, api_url: str, project_id: str, thread_id: str) -> No
         }
         if expected_count:
             args["expected_count"] = expected_count
-        return await call("watch_child_work_sessions", args)
+        return await call(WATCH_CHILD_WORK_SESSIONS, args)
 
-    @mcp.tool(name="publish_github_pr_review")
+    @mcp.tool(name=PUBLISH_GITHUB_PR_REVIEW)
     async def publish_github_pr_review(
         repo: str,
         pull_number: int,
@@ -114,7 +127,7 @@ def run_orchestrator_mcp(*, api_url: str, project_id: str, thread_id: str) -> No
         comments: list[dict[str, Any]],
     ) -> str:
         return await call(
-            "publish_github_pr_review",
+            PUBLISH_GITHUB_PR_REVIEW,
             {
                 "repo": repo,
                 "pull_number": pull_number,

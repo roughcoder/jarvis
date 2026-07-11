@@ -42,7 +42,15 @@ from jarvis.brain.facade import (
     make_project_tools,
 )
 from jarvis.config import Config
+from jarvis.engines import worker_supports_engine
 from jarvis.ids import new_id, utc_now
+from jarvis.orchestrator_tool_contract import (
+    ORCHESTRATOR_TOOL_NAME_SET,
+    PUBLISH_GITHUB_PR_REVIEW,
+    READ_CHILD_WORK_RESULT,
+    SPAWN_CHILD_WORK_SESSION,
+    WATCH_CHILD_WORK_SESSIONS,
+)
 from jarvis.orchestration.cockpit import project_session_event
 from jarvis.orchestration.models import WorkCommand, WorkItem
 from jarvis.orchestration.store import OrchestrationStore
@@ -62,6 +70,9 @@ from jarvis.worker_session_contract import (
     EVENT_TOOL_RESULT,
     EVENT_TURN_COMPLETED,
     EVENT_TURN_FAILED,
+    FAILED_SESSION_STATUSES,
+    WORKER_ERROR_SESSION_ACTIVE,
+    WORKER_ERROR_SESSION_TERMINAL,
 )
 
 
@@ -89,12 +100,14 @@ _WORK_ACTION_CLAIM_RE = re.compile(
     r"[^.?!\n]{0,120}\b(?:code\s+review|review|repo|repository|codebase|pull\s+request|pr|tests?|test\s+suite|pytest|ruff|lint|typecheck)\b",
     re.IGNORECASE,
 )
-_WORK_ACTION_TOOL_NAMES = {
-    "publish_github_pr_review",
-    "read_child_work_result",
-    "spawn_child_work_session",
-    "watch_child_work_sessions",
-}
+_WORK_ACTION_TOOL_NAMES = ORCHESTRATOR_TOOL_NAME_SET
+
+
+class WorkerRequestError(RuntimeError):
+    def __init__(self, message: str, *, code: str = "", status_code: int = 0) -> None:
+        self.code = code
+        self.status_code = status_code
+        super().__init__(message)
 
 
 def _requester_authority_snapshot(requester: RequestContext) -> dict[str, Any]:
@@ -439,6 +452,18 @@ class CockpitThreadIndex:
                     message["claimed_at"] = utc_now()
                     self._write_thread_messages(thread, messages)
                     return
+
+    def child_watch_is_claimed(self, parent_chat_id: str, watch_id: str) -> bool:
+        with _THREAD_INDEX_LOCK:
+            thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
+            if thread is None:
+                return False
+            return any(
+                message.get("type") == "child_watch"
+                and message.get("watch_id") == watch_id
+                and message.get("phase") == "claimed"
+                for message in self._thread_messages(thread)
+            )
 
     def append_turn(
         self,
@@ -989,6 +1014,7 @@ class CockpitConnector:
                         "project_id": project.id,
                         "thread_id": thread.thread_id,
                         "grant": grant,
+                        "timeout_s": _orchestrator_mcp_timeout_s(self._cfg),
                     }
                 },
                 "idempotency_key": f"orchestrator-turn:{thread.thread_id}:{turn_id}",
@@ -1009,7 +1035,29 @@ class CockpitConnector:
         )
         if progress is not None:
             progress({"phase": "running", "thread_id": thread.thread_id, "workspace": workspace_public(thread.workspace)})
-        reply = await self._wait_for_orchestrator_turn(worker_id, session_id, turn_id)
+        try:
+            reply = await self._wait_for_orchestrator_turn(worker_id, session_id, turn_id)
+        except Exception:
+            failed = self._index.save(
+                replace(
+                    thread,
+                    updated_at=utc_now(),
+                    workspace={
+                        **thread.workspace,
+                        "status": "failed",
+                        "provision_phase": "failed",
+                    },
+                )
+            )
+            if progress is not None:
+                progress(
+                    {
+                        "phase": "failed",
+                        "thread_id": failed.thread_id,
+                        "workspace": workspace_public(failed.workspace),
+                    }
+                )
+            raise
         try:
             await asyncio.to_thread(
                 self._persist_turn,
@@ -1045,14 +1093,48 @@ class CockpitConnector:
         *,
         progress: Callable[[dict[str, Any]], Any] | None,
     ) -> CockpitThread:
-        if thread.workspace.get("worker_id") and thread.workspace.get("session_id"):
-            return thread
+        existing_worker_id = str(thread.workspace.get("worker_id") or "")
+        existing_session_id = str(thread.workspace.get("session_id") or "")
+        if existing_worker_id and existing_session_id:
+            session = await asyncio.to_thread(
+                self._get_worker_json,
+                existing_worker_id,
+                f"/sessions/{existing_session_id}",
+            )
+            if str(session.get("status") or "") not in FAILED_SESSION_STATUSES:
+                return thread
+            thread = self._index.save(
+                replace(
+                    thread,
+                    updated_at=utc_now(),
+                    workspace={
+                        **thread.workspace,
+                        "session_id": "",
+                        "provider_started": False,
+                        "status": "failed",
+                        "provision_phase": "failed",
+                        "session_generation": int(thread.workspace.get("session_generation") or 0) + 1,
+                    },
+                )
+            )
         if progress is not None:
             progress({"phase": "resolving-access", "thread_id": thread.thread_id})
         preferred = [thread.worker_id] if thread.worker_id else None
         profile = self._registry().choose(preferred=preferred, engine=thread.engine)
+        if thread.worker_id and (profile is None or profile.worker_id != thread.worker_id):
+            raise RuntimeError(
+                f"requested worker {thread.worker_id!r} is not eligible for {thread.engine} orchestrator"
+            )
         if profile is None:
             raise RuntimeError(f"no eligible {thread.engine} worker has capacity for the orchestrator")
+        if thread.worker_id and (
+            profile.status == "offline"
+            or not worker_supports_engine(profile.supported_engines, thread.engine)
+            or profile.current_jobs + 1 > profile.max_concurrent_jobs
+        ):
+            raise RuntimeError(
+                f"requested worker {thread.worker_id!r} is not eligible for {thread.engine} orchestrator"
+            )
         conversation_id = _conversation_workspace_id(project, thread)
         workspace_response = await asyncio.to_thread(
             self._post_worker_json,
@@ -1073,7 +1155,9 @@ class CockpitConnector:
         cwd = str(workspace.get("root") or "")
         if not cwd:
             raise RuntimeError("worker did not create an orchestrator workspace")
-        session_id = f"orch_{slugify(thread.thread_id)}"
+        generation = int(thread.workspace.get("session_generation") or 0)
+        suffix = f"_{generation}" if generation else ""
+        session_id = f"orch_{slugify(thread.thread_id)}{suffix}"
         await asyncio.to_thread(
             self._ensure_worker_session,
             profile.worker_id,
@@ -1109,9 +1193,11 @@ class CockpitConnector:
                 thread,
                 worker_id=profile.worker_id,
                 workspace={
+                    **thread.workspace,
                     **workspace,
                     "worker_id": profile.worker_id,
                     "session_id": session_id,
+                    "provider_started": False,
                     "engine": thread.engine,
                     "model": thread.model,
                     "status": "ready",
@@ -1348,7 +1434,18 @@ class CockpitConnector:
         )
         data = _json_response(response)
         if getattr(response, "status_code", 200) >= 400 or data.get("ok") is False:
-            raise RuntimeError(str(data.get("error") or getattr(response, "text", "") or "worker request failed"))
+            error = data.get("error")
+            if isinstance(error, dict):
+                message = str(error.get("message") or error.get("code") or "worker request failed")
+                code = str(error.get("code") or data.get("code") or "")
+            else:
+                message = str(error or getattr(response, "text", "") or "worker request failed")
+                code = str(data.get("code") or "")
+            raise WorkerRequestError(
+                message,
+                code=code,
+                status_code=int(getattr(response, "status_code", 0) or 0),
+            )
         return data
 
     def _get_worker_json(self, worker_id: str, path: str) -> dict[str, Any]:
@@ -1665,7 +1762,7 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
         )
 
     return Tool(
-        "spawn_child_work_session",
+        SPAWN_CHILD_WORK_SESSION,
         "Spawn a child Jarvis work session under this orchestrator chat.",
         {
             "type": "object",
@@ -1772,7 +1869,7 @@ def _read_child_work_result_tool(cfg: Config, project: ProjectEntry, thread: Coc
         )
 
     return Tool(
-        "read_child_work_result",
+        READ_CHILD_WORK_RESULT,
         "Read the bounded assistant transcript and final result of a child work session after it finishes.",
         {
             "type": "object",
@@ -1829,7 +1926,7 @@ def _watch_child_work_sessions_tool(cfg: Config, project: ProjectEntry, thread: 
         )
 
     return Tool(
-        "watch_child_work_sessions",
+        WATCH_CHILD_WORK_SESSIONS,
         "Register child work sessions for one event-driven parent continuation after all become terminal. Returns immediately.",
         {
             "type": "object",
@@ -1933,16 +2030,26 @@ def _continue_child_watch(cfg: Config, parent_chat_id: str, watch: dict[str, Any
         connector = CockpitConnector(cfg)
         deadline = asyncio.get_running_loop().time() + max(1.0, float(cfg.worker.job_timeout_s))
         while True:
+            if not index.child_watch_is_claimed(parent_chat_id, watch_id):
+                return
             try:
                 await connector.turn(project, thread, requester, instruction)
                 break
             except RuntimeError as exc:
                 message = str(exc).lower()
-                if not (
-                    "active turn" in message
-                    or "already has an active turn" in message
-                    or "does not accept new turns" in message
-                ) or asyncio.get_running_loop().time() >= deadline:
+                code = exc.code if isinstance(exc, WorkerRequestError) else ""
+                retryable = code in {
+                    WORKER_ERROR_SESSION_ACTIVE,
+                    WORKER_ERROR_SESSION_TERMINAL,
+                } or (
+                    not code
+                    and (
+                        "active turn" in message
+                        or "already has an active turn" in message
+                        or "does not accept new turns" in message
+                    )
+                )
+                if not retryable or asyncio.get_running_loop().time() >= deadline:
                     raise
                 index.renew_child_watch_claim(parent_chat_id, watch_id)
                 await asyncio.sleep(0.25)
@@ -2009,7 +2116,7 @@ def _publish_github_pr_review_tool(cfg: Config, project: ProjectEntry) -> Tool:
         )
 
     return Tool(
-        "publish_github_pr_review",
+        PUBLISH_GITHUB_PR_REVIEW,
         "Publish one structured GitHub pull-request review with line comments and optional suggestions.",
         {
             "type": "object",
@@ -2066,6 +2173,15 @@ async def execute_orchestrator_tool(
         args,
         timeout_s=max(float(cfg.tools.timeout_s), float(cfg.worker.request_timeout_s) + 5),
     )
+
+
+def _orchestrator_mcp_timeout_s(cfg: Config) -> float:
+    server_timeout = max(
+        float(cfg.tools.timeout_s),
+        float(cfg.worker.request_timeout_s) + 5.0,
+        30.0,
+    )
+    return server_timeout + 5.0
 
 
 def _project_has_repo(project: ProjectEntry, repo: str) -> bool:

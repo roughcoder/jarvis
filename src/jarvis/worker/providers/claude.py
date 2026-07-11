@@ -441,6 +441,8 @@ class _ClaudeSessionRuntime:
         denial = self.authority.claude_tool_denial(tool_name)
         if denial:
             return sdk.PermissionResultDeny(message=denial)
+        if self.authority.claude_tool_is_preapproved(tool_name):
+            return sdk.PermissionResultAllow(updated_input=tool_input)
         if not self.authority.can_resolve_approval:
             return sdk.PermissionResultDeny(message="worker session missing required authority: worker.session.approve")
         response = await self._await_control_request(

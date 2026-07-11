@@ -7227,6 +7227,162 @@ def test_orchestrator_turn_wait_pages_past_old_worker_events(tmp_path, monkeypat
     ]
 
 
+def test_orchestrator_poll_failure_preserves_session_for_reconciliation(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    thread = CockpitThread(
+        thread_id="thread_orchestrator_failure",
+        project_id=project.id,
+        session_id=orchestrator_session_id(project.id, "thread_orchestrator_failure"),
+        title="Review",
+        created_at="2026-07-11T10:00:00Z",
+        updated_at="2026-07-11T10:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        engine="codex",
+        worker_id="worker_a",
+        workspace={
+            "worker_id": "worker_a",
+            "session_id": "orch_thread_orchestrator_failure",
+            "provider_started": False,
+            "status": "ready",
+        },
+    )
+    connector.index.save(thread)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    posted: list[dict[str, Any]] = []
+
+    async def ensure(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        return thread
+
+    async def fail_wait(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("transient worker poll failed")
+
+    monkeypatch.setattr(connector, "_ensure_orchestrator_session", ensure)
+    def post(_worker_id: str, _path: str, body: dict[str, Any]) -> dict[str, Any]:
+        posted.append(body)
+        return {"ok": True}
+
+    monkeypatch.setattr(connector, "_post_worker_json", post)
+    monkeypatch.setattr(connector, "_wait_for_orchestrator_turn", fail_wait)
+
+    with pytest.raises(RuntimeError, match="transient worker poll failed"):
+        asyncio.run(connector._orchestrator_turn(project, thread, requester, "review", progress=None))  # noqa: SLF001
+
+    failed = connector.index.get(project.id, thread.thread_id)
+    assert failed is not None
+    assert failed.workspace["status"] == "failed"
+    assert failed.workspace["provision_phase"] == "failed"
+    assert failed.workspace["session_id"] == "orch_thread_orchestrator_failure"
+    assert failed.workspace["provider_started"] is True
+    assert "session_generation" not in failed.workspace
+    assert posted[0]["runtime_context"]["orchestrator_mcp"]["timeout_s"] > cfg.worker.request_timeout_s + 5
+
+
+def test_orchestrator_explicit_worker_does_not_fall_back(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    connector = CockpitConnector(cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None)
+    thread = CockpitThread(
+        thread_id="thread_strict_worker",
+        project_id=project.id,
+        session_id=orchestrator_session_id(project.id, "thread_strict_worker"),
+        title="Review",
+        created_at="2026-07-11T10:00:00Z",
+        updated_at="2026-07-11T10:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        engine="claude",
+        worker_id="requested-worker",
+    )
+    fallback = WorkerProfile(
+        worker_id="fallback-worker",
+        display_name="Fallback",
+        base_url="http://fallback.test",
+        status="online",
+        supported_engines=["claude"],
+        max_concurrent_jobs=2,
+    )
+    registry = type("Registry", (), {"choose": lambda *_args, **_kwargs: fallback})()
+    monkeypatch.setattr(connector, "_registry", lambda: registry)
+
+    with pytest.raises(RuntimeError, match="requested worker"):
+        asyncio.run(connector._ensure_orchestrator_session(project, thread, RequestContext("mac", "neil", "personal", frozenset()), progress=None))  # noqa: SLF001
+
+
+def test_failed_orchestrator_session_is_recreated_for_retry(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    connector = CockpitConnector(cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None)
+    thread = CockpitThread(
+        thread_id="thread_retry",
+        project_id=project.id,
+        session_id=orchestrator_session_id(project.id, "thread_retry"),
+        title="Review",
+        created_at="2026-07-11T10:00:00Z",
+        updated_at="2026-07-11T10:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        engine="codex",
+        worker_id="worker_a",
+        workspace={
+            "worker_id": "worker_a",
+            "session_id": "orch_thread_retry",
+            "provider_started": True,
+            "status": "running",
+        },
+    )
+    connector.index.save(thread)
+    profile = WorkerProfile(
+        worker_id="worker_a",
+        display_name="Worker A",
+        base_url="http://worker.test",
+        status="online",
+        supported_engines=["codex"],
+        max_concurrent_jobs=2,
+    )
+    registry = type("Registry", (), {"choose": lambda *_args, **_kwargs: profile})()
+    posts: list[str] = []
+
+    def post(_worker_id: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        posts.append(path)
+        if path == "/conversation-workspaces":
+            return {"ok": True, "workspace": {"root": str(tmp_path / "conversation")}}
+        assert path == "/sessions"
+        return {"ok": True, "session": {"session_id": body["session_id"]}}
+
+    monkeypatch.setattr(connector, "_registry", lambda: registry)
+    monkeypatch.setattr(connector, "_get_worker_json", lambda *_args, **_kwargs: {"status": "failed"})
+    monkeypatch.setattr(connector, "_post_worker_json", post)
+
+    retried = asyncio.run(
+        connector._ensure_orchestrator_session(  # noqa: SLF001
+            project,
+            thread,
+            RequestContext("mac", "neil", "personal", frozenset()),
+            progress=None,
+        )
+    )
+
+    assert posts == ["/conversation-workspaces", "/sessions"]
+    assert retried.workspace["session_id"] == "orch_thread-retry_1"
+    assert retried.workspace["provider_started"] is False
+    assert retried.workspace["status"] == "ready"
+
+
 def test_cockpit_thread_projection_carries_engine_model_status(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)
@@ -7618,6 +7774,42 @@ def test_child_watch_continuation_waits_beyond_old_fixed_retry_window(
 
     assert attempts == 121
     assert finished == [""]
+
+
+def test_child_watch_continuation_stops_after_claim_completes(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    parent = CockpitThread(
+        thread_id="thread_parent",
+        project_id="neil-shared",
+        session_id="project:neil-shared:orchestrator:thread_parent",
+        title="Review pull request",
+        created_at="2026-07-11T10:00:00Z",
+        updated_at="2026-07-11T10:00:00Z",
+        created_by="neil",
+    )
+    index.save(parent)
+    requester = RequestContext("mac", "neil", "personal", frozenset({"orchestration.runs.read"}), peer="neil")
+    index.register_child_watch(parent, ["run_a"], requester=requester)
+    watch = index.claim_ready_child_watch(parent.thread_id, {"run_a"})
+    assert watch is not None
+    attempts = 0
+
+    async def busy(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("worker session already has an active turn")
+
+    async def complete_during_sleep(_seconds: float) -> None:
+        index.finish_child_watch(parent.thread_id, str(watch["watch_id"]))
+
+    monkeypatch.setattr(CockpitConnector, "turn", busy)
+    monkeypatch.setattr("jarvis.connectors.cockpit.asyncio.sleep", complete_during_sleep)
+
+    _continue_child_watch(cfg, parent.thread_id, watch)
+
+    assert attempts == 1
 
 
 def test_read_child_work_result_is_parent_project_scoped_and_bounded(tmp_path, monkeypatch) -> None:  # noqa: ANN001
