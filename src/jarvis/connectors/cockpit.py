@@ -2132,8 +2132,16 @@ def _publish_github_pr_review_tool(cfg: Config, project: ProjectEntry) -> Tool:
                         "type": "object",
                         "properties": {
                             "path": {"type": "string"},
-                            "line": {"type": "integer", "minimum": 1},
-                            "side": {"type": "string", "enum": ["LEFT", "RIGHT"]},
+                            "line": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "1-based line number in the file at commit_id, not a gh diff output position.",
+                            },
+                            "side": {
+                                "type": "string",
+                                "enum": ["LEFT", "RIGHT"],
+                                "description": "RIGHT for the PR-head file line; LEFT for the base-file line.",
+                            },
                             "severity": {"type": "string", "enum": ["P1", "P2", "P3"]},
                             "title": {"type": "string"},
                             "body": {"type": "string"},
