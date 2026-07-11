@@ -433,6 +433,7 @@ def _orchestrator_thread_overrides(turn: ProviderTurn) -> dict[str, Any]:
                     for key, value in server.items()
                     if key != "type"
                 }
+                | {"default_tools_approval_mode": "approve"}
             }
         },
         "developerInstructions": ORCHESTRATOR_INSTRUCTIONS,
@@ -574,14 +575,40 @@ def _project_jsonrpc_message(
     if message.get("error"):
         sessions.append_event(session_id, EVENT_PROVIDER_ERROR, {**common, "error": message["error"]})
         return False
-    if method == "item/agentMessage/delta":
+    if method == "mcpServer/elicitation/request":
+        metadata = dict(params.get("_meta") or {})
+        requested_schema = params.get("requestedSchema")
+        empty_object_schema = requested_schema == {} or (
+            isinstance(requested_schema, dict)
+            and requested_schema.get("type") == "object"
+            and not requested_schema.get("properties")
+            and not requested_schema.get("required")
+        )
+        trusted_tool_approval = (
+            str(params.get("serverName") or "") == ORCHESTRATOR_MCP_SERVER_NAME
+            and str(params.get("mode") or "") == "form"
+            and metadata.get("codex_approval_kind") == "mcp_tool_call"
+            and empty_object_schema
+        )
+        _send_json(
+            process,
+            {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "result": {
+                    "action": "accept" if trusted_tool_approval else "cancel",
+                    "content": {} if trusted_tool_approval else None,
+                },
+            },
+        )
+    elif method == "item/agentMessage/delta":
         sessions.append_event(session_id, EVENT_ASSISTANT_DELTA, {**common, "text": str(params.get("delta") or "")})
     elif method == "item/completed":
         item = dict(params.get("item") or {})
         item_type = str(item.get("type") or "")
         if item_type == "agentMessage":
             sessions.append_event(session_id, EVENT_ASSISTANT_MESSAGE, {**common, "text": str(item.get("text") or "")})
-        elif item_type == "commandExecution":
+        elif item_type in {"commandExecution", "mcpToolCall"}:
             sessions.append_event(session_id, EVENT_TOOL_RESULT, {**common, "item": item})
     elif method == "item/started":
         item = dict(params.get("item") or {})

@@ -2241,6 +2241,27 @@ def _cmd_service(args: argparse.Namespace) -> int:
     return result.returncode
 
 
+def _cmd_dogfood(args: argparse.Namespace) -> int:
+    """Deploy, inspect, or roll back the private unreleased review ring."""
+    import json
+    import subprocess
+
+    from jarvis.dogfood import run_controller
+
+    try:
+        result = run_controller(
+            args.dogfood_action,
+            inventory_path=args.inventory,
+            commit=getattr(args, "commit", "HEAD"),
+            dry_run=args.dry_run,
+        )
+    except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
+        print(f"dogfood {args.dogfood_action} failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result.get("ok") else 1
+
+
 def _cmd_mic(args: argparse.Namespace) -> int:
     """Operator shortcut for this machine's intercom listener."""
     from jarvis.deploy import control_service
@@ -2979,6 +3000,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print install output without writing files",
     )
     p_service.set_defaults(func=_cmd_service)
+
+    p_dogfood = sub.add_parser(
+        "dogfood", help="Deploy/status/rollback an unreleased private review ring"
+    )
+    dogfood_sub = p_dogfood.add_subparsers(dest="dogfood_action", required=True)
+    for action in ("deploy", "status", "rollback"):
+        dogfood_parser = dogfood_sub.add_parser(action)
+        if action == "deploy":
+            dogfood_parser.add_argument("commit", nargs="?", default="HEAD")
+        dogfood_parser.add_argument(
+            "--inventory",
+            default="~/.jarvis/dogfood-fleet.json",
+            help="Private untracked review-ring inventory JSON",
+        )
+        dogfood_parser.add_argument("--dry-run", action="store_true")
+        dogfood_parser.set_defaults(func=_cmd_dogfood)
 
     p_pair = sub.add_parser("pair", help="Issue a per-device pairing token entry")
     p_pair.add_argument(

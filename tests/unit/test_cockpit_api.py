@@ -2016,9 +2016,12 @@ def test_cockpit_auth_and_bad_session_ref_errors(tmp_path, monkeypatch) -> None:
     cfg = _cfg(tmp_path, monkeypatch, token="secret")
 
     async def calls(base: str, client: httpx.AsyncClient) -> None:
+        runtime = await client.get(f"{base}/v1/runtime")
         unauthorized = await client.get(f"{base}/v1/health")
         bad_ref = await client.get(f"{base}/v1/sessions/not-a-ref", headers={"Authorization": "Bearer secret"})
 
+        assert runtime.status_code == 200
+        assert runtime.json()["runtime"]["channel"] == "production"
         assert unauthorized.status_code == 401
         assert unauthorized.json()["error"]["code"] == "unauthorized"
         assert bad_ref.status_code == 404
@@ -4290,6 +4293,7 @@ def test_cockpit_oauth_jwt_allows_health_and_snapshot(tmp_path, monkeypatch) -> 
         snapshot = await client.get(f"{base}/v1/cockpit/snapshot", headers=headers)
 
         assert health.status_code == 200
+        assert health.json()["runtime"]["channel"] == "production"
         assert snapshot.status_code == 200
         assert snapshot.json()["api_version"]
         assert fixture["calls"]["jwks"] == 1

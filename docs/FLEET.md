@@ -155,6 +155,8 @@ jarvis fleet-status --json --no-docker
 
 The JSON intentionally contains no tokens. It includes:
 
+- `runtime`: the running release version, deployment channel, and exact dogfood
+  git SHA when applicable.
 - `services`: launchd state for `com.jarvis.brain`, `com.jarvis.api`,
   `com.jarvis.intercom`, and `com.jarvis.worker`.
 - `brain`: bind address, auth configured, paired devices without secrets.
@@ -226,6 +228,79 @@ jarvis-pi logs
 ```
 
 The Pi remains a thin intercom: pairing token only, no provider credentials.
+
+## Unreleased Dogfood Ring
+
+Use the dogfood ring to test a committed runtime SHA against the live Cockpit
+and private network before opening a runtime PR or publishing a release. It is a
+small review-only ring: the Cockpit API/orchestrator worker host and the worker
+hosts selected for the review. It does not update room devices, Homebrew, tags,
+or GitHub releases.
+
+Keep the real inventory outside this public repository. The default path is
+`~/.jarvis/dogfood-fleet.json`; a placeholder-only shape is:
+
+```json
+{
+  "hosts": [
+    {
+      "name": "review-brain",
+      "ssh": "jarvis-review-host",
+      "roles": ["api", "worker"],
+      "workdir": "~/.jarvis",
+      "runtime_root": "~/.jarvis/dogfood",
+      "production_bin": "/opt/homebrew/bin/jarvis",
+      "uv_bin": "/opt/homebrew/bin/uv",
+      "python": "3.12",
+      "probes": [
+        {
+          "role": "api",
+          "url": "http://review-brain.private:8790/v1/runtime"
+        },
+        {
+          "role": "worker",
+          "url": "http://127.0.0.1:8780/health"
+        }
+      ]
+    },
+    {
+      "name": "review-laptop",
+      "local": true,
+      "roles": ["worker"],
+      "extras": ["worker-claude"],
+      "probes": [
+        {"role": "worker", "url": "http://127.0.0.1:8780/health"}
+      ]
+    }
+  ]
+}
+```
+
+From a clean implementation worktree, commit the candidate and run:
+
+```bash
+uv run jarvis dogfood deploy HEAD
+uv run jarvis dogfood status
+uv run jarvis dogfood rollback
+```
+
+`deploy` resolves one immutable commit, prepares it on every host, and activates
+only after every preparation succeeds. Services always point at a stable
+launcher. Activation switches that launcher atomically, records the prior
+target, reloads launchd when first binding the services, and checks each
+configured health endpoint for the selected channel and SHA. If activation
+fails partway through the ring, already-switched hosts are rolled back.
+
+`rollback` only switches the stable launcher to the recorded prior target and
+restarts the selected roles. It never reinstalls or changes Homebrew. Dogfood
+changes must avoid irreversible state migrations so this remains safe.
+
+The intended delivery loop is:
+
+1. Commit locally and deploy the SHA to the review ring.
+2. Run the two-model Cockpit PR review flow against both fixture PRs.
+3. Fix, commit, redeploy, and repeat until both flows pass consecutively.
+4. Open and review the runtime PR, merge it, then publish one normal release.
 
 ## Runtime Update Runbook
 
