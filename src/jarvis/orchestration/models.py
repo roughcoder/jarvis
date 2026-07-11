@@ -180,6 +180,8 @@ class ExecutionEnvelope:
     dispatch_id: str = field(default_factory=lambda: new_id("dispatch"))
     worker_id: str = "local-worker"
     engine: str = "codex"
+    model: str = ""
+    provider_instance_id: str = ""
     engine_strategy: str = "single"
     project_id: str = ""
     base_ref: str = "main"
@@ -218,6 +220,8 @@ class OrchestrationRun:
     child_run_ids: list[str] = field(default_factory=list)
     project_id: str = ""
     engine: str = ""
+    model: str = ""
+    provider_instance_id: str = ""
     work_items: list[WorkItemLink] = field(default_factory=list)
     jobs: list[WorkerJobLink] = field(default_factory=list)
     sessions: list[WorkerSessionLink] = field(default_factory=list)
@@ -240,6 +244,8 @@ class OrchestrationRun:
             child_run_ids=list(data.get("child_run_ids") or data.get("child_chat_ids") or []),
             project_id=data.get("project_id", ""),
             engine=data.get("engine", ""),
+            model=data.get("model", ""),
+            provider_instance_id=data.get("provider_instance_id", ""),
             work_items=[WorkItemLink.from_dict(x) for x in data.get("work_items", [])],
             jobs=[WorkerJobLink.from_dict(x) for x in data.get("jobs", [])],
             sessions=[WorkerSessionLink.from_dict(x) for x in data.get("sessions", [])],
@@ -262,6 +268,8 @@ class OrchestrationRun:
             "child_run_ids": self.child_run_ids,
             "project_id": self.project_id,
             "engine": self.engine,
+            "model": self.model,
+            "provider_instance_id": self.provider_instance_id,
             "work_items": [x.to_dict() for x in self.work_items],
             "jobs": [x.to_dict() for x in self.jobs],
             "sessions": [x.to_dict() for x in self.sessions],
@@ -304,6 +312,8 @@ class WorkCommand:
     autonomy: str = "read_only"
     target_worker_id: str = ""
     target_engine_id: str = ""
+    target_model_id: str = ""
+    provider_instance_id: str = ""
     engine_strategy: str = "single"
     start: bool = False
 

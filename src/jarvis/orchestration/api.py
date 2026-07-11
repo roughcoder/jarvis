@@ -41,6 +41,7 @@ from jarvis.connectors.cockpit import (
     CockpitThread,
     CockpitThreadIndex,
     THREAD_INDEX_FILENAME,
+    make_child_terminal_notifier,
     workspace_public,
 )
 from jarvis.ids import new_id, utc_now
@@ -3442,8 +3443,7 @@ def _cockpit_connector(ctx: CockpitAppContext) -> CockpitConnector:
 
 
 def _make_thread_child_terminal_notifier(cfg: Config) -> Callable[[str, Any], bool]:
-    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
-    return index.append_child_terminal_system_message
+    return make_child_terminal_notifier(cfg)
 
 
 def _make_thread_children_promoter(cfg: Config) -> Callable[[str], object]:

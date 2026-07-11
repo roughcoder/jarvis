@@ -109,6 +109,8 @@ class OrchestrationStore:
         parent_chat_id: str | None = None,
         project_id: str = "",
         engine: str = "",
+        model: str = "",
+        provider_instance_id: str = "",
     ) -> OrchestrationRun:
         items = work_items or []
         parent_chat_id = parent_chat_id or parent_run_id
@@ -125,6 +127,8 @@ class OrchestrationStore:
                 child_run_ids=[],
                 project_id=project_id,
                 engine=engine,
+                model=model,
+                provider_instance_id=provider_instance_id,
                 work_items=[
                     WorkItemLink(item=item, role="primary" if i == 0 else "related")
                     for i, item in enumerate(items)

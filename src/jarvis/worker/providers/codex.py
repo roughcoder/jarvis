@@ -264,6 +264,7 @@ def _run_codex_turn(
 
         session = sessions.get(session_id) or session
         thread_id = str(session.metadata.get("codex_thread_id") or "").strip()
+        model = str(session.metadata.get("model") or "").strip()
         if thread_id:
             rpc_id += 1
             thread_response = _send_request(
@@ -275,6 +276,7 @@ def _run_codex_turn(
                     "cwd": cwd,
                     "approvalPolicy": authority.codex_approval_policy,
                     "sandbox": authority.codex_sandbox,
+                    **({"model": model} if model else {}),
                 },
                 session_id=session_id,
                 turn=turn,
@@ -292,6 +294,7 @@ def _run_codex_turn(
                     "cwd": cwd,
                     "approvalPolicy": authority.codex_approval_policy,
                     "sandbox": authority.codex_sandbox,
+                    **({"model": model} if model else {}),
                 },
                 session_id=session_id,
                 turn=turn,

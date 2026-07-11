@@ -132,6 +132,7 @@ def start_worker_session(
                     "title": envelope.session_name or _job_name(envelope),
                     "metadata": {
                         "execution_envelope": envelope.to_dict(),
+                        "model": envelope.model,
                         "provision_workspace": bool(envelope.repo and not envelope.cwd and not envelope.resume_session),
                         "allowed_actions": envelope.allowed_actions,
                         "landing": envelope.landing.to_dict(),
@@ -567,6 +568,8 @@ def create_run_and_envelope(
         parent_chat_id=parent_chat_id or None,
         project_id=project_id,
         engine=selected_engine,
+        model=command.target_model_id,
+        provider_instance_id=command.provider_instance_id,
     )
     store.set_phase(run.run_id, "claimed", "Work item claimed locally by Jarvis")
     envelope = build_execution_envelope(

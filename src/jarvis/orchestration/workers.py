@@ -100,7 +100,7 @@ class WorkerRegistry:
             capabilities=["git", "python", "uv", "codex", "shell"],
             base_url=self.worker_cfg.base_url,
             token_set=bool(self.worker_cfg.token.get_secret_value()),
-            max_concurrent_jobs=1,
+            max_concurrent_jobs=max(1, self.worker_cfg.max_concurrent_jobs),
             agent=self.worker_cfg.agent,
             default_engine=self.worker_cfg.agent,
             supported_engines=engine_ids(self.worker_cfg.supported_engines, default_engine=self.worker_cfg.agent),

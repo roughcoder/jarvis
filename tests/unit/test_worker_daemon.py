@@ -22,6 +22,7 @@ from aiohttp import web  # noqa: E402
 
 from jarvis.capabilities import (  # noqa: E402
     FORGE_BRANCH_PUSH,
+    FORGE_PR_COMMENT,
     FORGE_PR_CREATE,
     WORKER_SESSION_APPROVE,
     WORKER_SESSION_CREATE,
@@ -32,6 +33,7 @@ from jarvis.capabilities import (  # noqa: E402
     WORKER_SESSION_TURN,
 )
 from jarvis.config import WorkerConfig  # noqa: E402
+from jarvis.github_reviews import GitHubReviewResult  # noqa: E402
 from jarvis.worker.server import make_app  # noqa: E402
 from jarvis.worker.authority import WorkerSessionAuthority  # noqa: E402
 from jarvis.worker.providers.codex import (  # noqa: E402
@@ -3109,7 +3111,7 @@ def test_daemon_claude_provider_projects_sdk_events_and_reuses_stream(tmp_path, 
                     "branch": "jarvis/claude-session",
                     "cwd": _owned_worker_cwd(tmp_path, "claude-projection"),
                     "title": "Claude stream-json projection",
-                    "metadata": _authority_metadata("claude"),
+                    "metadata": {**_authority_metadata("claude"), "model": "claude-opus-4-7"},
                 },
                 headers=headers,
             )
@@ -3177,9 +3179,94 @@ def test_daemon_claude_provider_projects_sdk_events_and_reuses_stream(tmp_path, 
     assert _FakeClaudeClient.instances[0].queries == ["reply with hello", "resume and reply again"]
     assert _FakeClaudeClient.instances[0].options.kwargs["session_id"]
     assert _FakeClaudeClient.instances[0].options.kwargs["resume"] is None
+    assert _FakeClaudeClient.instances[0].options.kwargs["model"] == "claude-opus-4-7"
     assert _FakeClaudeClient.instances[0].options.kwargs["system_prompt"] == {"type": "preset", "preset": "claude_code"}
     assert _FakeClaudeClient.instances[0].options.kwargs["setting_sources"] is None
     assert _FakeClaudeClient.instances[0].response_exhausted == 2
+
+
+def test_daemon_github_review_action_is_authority_gated_and_idempotent(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    calls: list[dict] = []
+
+    def publish(**kwargs):  # noqa: ANN003
+        calls.append(dict(kwargs))
+        return GitHubReviewResult(review_id=42, url="https://github.com/acme/widget/pull/7#review-42", comments=1)
+
+    monkeypatch.setattr("jarvis.worker.server.publish_github_pr_review", publish)
+    headers = {"Authorization": "Bearer tkn"}
+    args = {
+        "repo": "acme/widget",
+        "pull_number": 7,
+        "commit_id": "abc123",
+        "summary": "Joined review",
+        "comments": [{"path": "src/app.py", "line": 1, "severity": "P1", "title": "Fix", "body": "Body"}],
+        "idempotency_key": "review:acme/widget:7:abc123:joined",
+        "execution_envelope": {
+            "allowed_actions": [FORGE_PR_COMMENT],
+            "landing": {"mode": "review", "allow_merge": False},
+        },
+    }
+
+    async def requests(base, client):  # noqa: ANN001
+        first = await client.post(base + "/run", json={"action": "github_pr_review", "args": args}, headers=headers)
+        replay = await client.post(base + "/run", json={"action": "github_pr_review", "args": args}, headers=headers)
+        changed = await client.post(
+            base + "/run",
+            json={"action": "github_pr_review", "args": {**args, "summary": "Changed"}},
+            headers=headers,
+        )
+        return first, replay, changed
+
+    first, replay, changed = asyncio.run(_with_server(cfg, 8845, requests))
+
+    assert first.status_code == 200
+    assert first.json()["replayed"] is False
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    assert changed.status_code == 400
+    assert "different GitHub review" in changed.json()["error"]
+    assert len(calls) == 1
+
+
+def test_daemon_github_review_action_serializes_concurrent_idempotent_requests(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    import time
+
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    calls: list[dict] = []
+
+    def publish(**kwargs):  # noqa: ANN003
+        calls.append(dict(kwargs))
+        time.sleep(0.05)
+        return GitHubReviewResult(review_id=42, url="https://github.com/acme/widget/pull/7#review-42", comments=1)
+
+    monkeypatch.setattr("jarvis.worker.server.publish_github_pr_review", publish)
+    headers = {"Authorization": "Bearer tkn"}
+    args = {
+        "repo": "acme/widget",
+        "pull_number": 7,
+        "commit_id": "abc123",
+        "summary": "Joined review",
+        "comments": [{"path": "src/app.py", "line": 1, "severity": "P1", "title": "Fix", "body": "Body"}],
+        "idempotency_key": "review:acme/widget:7:abc123:joined",
+        "execution_envelope": {
+            "allowed_actions": [FORGE_PR_COMMENT],
+            "landing": {"mode": "review", "allow_merge": False},
+        },
+    }
+
+    async def requests(base, client):  # noqa: ANN001
+        return await asyncio.gather(
+            client.post(base + "/run", json={"action": "github_pr_review", "args": args}, headers=headers),
+            client.post(base + "/run", json={"action": "github_pr_review", "args": args}, headers=headers),
+        )
+
+    first, second = asyncio.run(_with_server(cfg, 8846, requests))
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert sorted([first.json()["replayed"], second.json()["replayed"]]) == [False, True]
+    assert len(calls) == 1
 
 
 def test_claude_provider_resumes_after_runtime_restart(tmp_path, monkeypatch) -> None:  # noqa: ANN001
