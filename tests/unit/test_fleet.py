@@ -30,6 +30,7 @@ def test_collect_fleet_status_shape_has_no_tokens(monkeypatch) -> None:
     data = asyncio.run(collect_fleet_status(cfg, include_docker=False))
 
     assert data["device_id"] == cfg.capabilities.device_id
+    assert data["runtime"]["channel"] == "production"
     assert "api" in data["services"]
     assert data["intercom"]["pairing"]["paired"] is True
     assert data["worker"]["probe"]["reachable"] is False

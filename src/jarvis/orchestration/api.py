@@ -53,6 +53,7 @@ from jarvis.mcp.status import (
     token_record_public,
 )
 from jarvis.mcp_server.tokens import MCPTokenError, MCPTokenStore
+from jarvis.runtime_info import runtime_info
 from jarvis.orchestration.cockpit import (
     API_VERSION,
     MAX_PAGE_LIMIT,
@@ -505,6 +506,7 @@ def make_app(
     app.cleanup_ctx.append(_sse_snapshot_hub_context)
     app.add_routes([
         web.get("/v1/auth/metadata", reads.auth_metadata),
+        web.get("/v1/runtime", reads.runtime),
         web.get("/v1/health", reads.health),
         web.get("/v1/capabilities", reads.capabilities),
         web.get("/v1/cockpit/catalog", reads.catalog),
@@ -583,6 +585,9 @@ class CockpitReadHandlers:
     async def auth_metadata(self, _request: web.Request) -> web.Response:
         return web.json_response(oauth_metadata(self.ctx.cfg.orchestration), headers={"Cache-Control": "no-store"})
 
+    async def runtime(self, _request: web.Request) -> web.Response:
+        return web.json_response({"ok": True, "runtime": runtime_info()}, headers={"Cache-Control": "no-store"})
+
     async def health(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         system = await asyncio.to_thread(system_info_cached)
@@ -591,6 +596,7 @@ class CockpitReadHandlers:
                 "ok": True,
                 "api_version": API_VERSION,
                 "schema_version": SCHEMA_VERSION,
+                "runtime": runtime_info(),
                 "system": project_worker_system(system),
             }
         )

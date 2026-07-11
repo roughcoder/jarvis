@@ -22,6 +22,7 @@ from jarvis import __version__
 from jarvis.config import Config
 from jarvis.intercom.hardware import IntercomHardware
 from jarvis.protocol.messages import Hello, Reject, Welcome, decode, encode
+from jarvis.runtime_info import runtime_info
 
 SERVICE_LABELS = {
     "brain": "com.jarvis.brain",
@@ -221,6 +222,7 @@ async def collect_fleet_status(
     brain_probe, worker_probe = await asyncio.gather(probe_brain(cfg), probe_worker(cfg))
     return {
         "version": __version__,
+        "runtime": runtime_info(),
         "device_id": cfg.capabilities.device_id,
         "platform": {
             "system": platform.system(),

@@ -74,6 +74,7 @@ from jarvis.worker.workspaces import (
     worker_owned_cwd,
 )
 from jarvis.system_info import system_info_cached
+from jarvis.runtime_info import runtime_info
 from jarvis.worker_session_contract import (
     CHECKPOINT_ID_KEY,
     ACTIVE_SESSION_STATUSES,
@@ -990,6 +991,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         inventory = await _cached_worktree_inventory()
         body = {
             "ok": True,
+            "runtime": runtime_info(),
             "agent": cfg.agent,
             "default_engine": normalize_engine_id(cfg.agent),
             "supported_engines": supported_engines,

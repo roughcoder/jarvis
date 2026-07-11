@@ -9,6 +9,7 @@ Skips if aiohttp (the `worker` extra) isn't installed.
 from __future__ import annotations
 
 import asyncio
+import json
 import pathlib
 import subprocess
 import threading
@@ -56,6 +57,7 @@ from jarvis.worker.sessions import WorkerSession  # noqa: E402
 from jarvis.worker.sessions import SessionManager  # noqa: E402
 from jarvis.worker_session_contract import (  # noqa: E402
     EVENT_APPROVAL_RESOLVED,
+    EVENT_TOOL_RESULT,
     EVENT_TURN_COMPLETED,
     REQUEST_KIND_APPROVAL,
     SESSION_COMPLETED,
@@ -370,6 +372,7 @@ def test_codex_orchestrator_overrides_are_thread_scoped_and_secret_free() -> Non
     assert server["env"] == {
         "JARVIS_ORCHESTRATOR_GRANT_FILE": "/private/session/.orchestrator-grant"
     }
+    assert server["default_tools_approval_mode"] == "approve"
     assert "scoped-grant" not in str(overrides)
     assert "Jarvis project orchestrator" in overrides["developerInstructions"]
 
@@ -659,6 +662,102 @@ def test_codex_server_request_resolved_clears_pending_request(tmp_path) -> None:
     resolved = [event for event in sessions.events(session.session_id) if event.type == EVENT_APPROVAL_RESOLVED]
     assert resolved[-1].data["request_id"] == "approval_rpc"
     assert resolved[-1].data["provider_resolved"] is True
+
+
+def test_codex_auto_accepts_only_trusted_orchestrator_mcp_elicitation(tmp_path) -> None:
+    class CaptureStdin:
+        def __init__(self) -> None:
+            self.payloads: list[str] = []
+
+        def write(self, payload: str) -> None:
+            self.payloads.append(payload)
+
+        def flush(self) -> None:
+            return None
+
+    class Process:
+        stdin = CaptureStdin()
+
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "codex",
+            "engine": "codex",
+            "metadata": _authority_metadata("codex"),
+        }
+    )
+    process = Process()
+    turn = ProviderTurn(turn_id="turn_1", prompt="x", idempotency_key="idem_1")
+
+    for rpc_id, params, expected_result in (
+        (
+            41,
+            {
+                "serverName": "jarvis_orchestrator",
+                "threadId": "thread_1",
+                "message": "Approve MCP tool call",
+                "mode": "form",
+                "requestedSchema": {"type": "object", "properties": {}},
+                "_meta": {"codex_approval_kind": "mcp_tool_call"},
+            },
+            {"action": "accept", "content": {}},
+        ),
+        (
+            42,
+            {"serverName": "untrusted_server", "mode": "url", "url": "https://example.test"},
+            {"action": "cancel", "content": None},
+        ),
+    ):
+        done = _project_jsonrpc_message(
+            process,  # type: ignore[arg-type]
+            {
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "method": "mcpServer/elicitation/request",
+                "params": params,
+            },
+            session_id=session.session_id,
+            turn=turn,
+            sessions=sessions,
+        )
+        assert done is False
+        assert json.loads(process.stdin.payloads[-1]) == {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "result": expected_result,
+        }
+
+
+def test_codex_projects_completed_mcp_tool_calls_as_tool_results(tmp_path) -> None:
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "codex",
+            "engine": "codex",
+            "metadata": _authority_metadata("codex"),
+        }
+    )
+    turn = ProviderTurn(turn_id="turn_1", prompt="x", idempotency_key="idem_1")
+    item = {
+        "type": "mcpToolCall",
+        "server": "jarvis_orchestrator",
+        "tool": "spawn_child_work_session",
+        "status": "failed",
+        "result": None,
+        "error": {"message": "worker unavailable"},
+    }
+
+    done = _project_jsonrpc_message(
+        object(),  # type: ignore[arg-type]
+        {"jsonrpc": "2.0", "method": "item/completed", "params": {"item": item}},
+        session_id=session.session_id,
+        turn=turn,
+        sessions=sessions,
+    )
+
+    assert done is False
+    results = [event for event in sessions.events(session.session_id) if event.type == EVENT_TOOL_RESULT]
+    assert results[-1].data["item"] == item
 
 
 def test_codex_restore_running_does_not_revive_terminal_turn(tmp_path) -> None:
@@ -1085,6 +1184,7 @@ def test_daemon_health_shell_and_auth(tmp_path) -> None:
 
     health, noauth, shell, bad, unknown = asyncio.run(_with_server(cfg, 8802, calls))
     assert health["ok"] is True
+    assert health["runtime"]["channel"] == "production"
     assert "system" not in health
     assert noauth == 401  # missing token
     assert bad == 401  # wrong token
