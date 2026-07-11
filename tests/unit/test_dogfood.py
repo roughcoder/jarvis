@@ -184,13 +184,12 @@ def test_activation_restores_previous_runtime_when_health_never_converges(tmp_pa
     assert not (root / "state.json").exists()
 
 
-def test_activation_restores_distinct_previous_target_when_service_configuration_fails(
+def test_activation_restores_original_previous_target_when_service_configuration_fails(
     tmp_path, monkeypatch
 ) -> None:  # noqa: ANN001
     host = _host(tmp_path)
     _host_prepare(host, sha=SHA, archive=str(_archive(tmp_path)))
     root = Path(host.runtime_root)
-    dogfood_target = str(root / "builds" / SHA / "bin" / "jarvis")
     monkeypatch.setattr(
         "jarvis.dogfood._configure_services",
         lambda *_args: (_ for _ in ()).throw(RuntimeError("install failed")),
@@ -201,7 +200,7 @@ def test_activation_restores_distinct_previous_target_when_service_configuration
         _host_activate(host, sha=SHA)
 
     assert os.readlink(root / "current") == host.production_bin
-    assert os.readlink(root / "previous") == dogfood_target
+    assert not (root / "previous").exists()
 
 
 def test_remote_invocation_uses_private_temporary_directory(tmp_path, monkeypatch) -> None:  # noqa: ANN001

@@ -408,6 +408,8 @@ def _host_prepare(host: DogfoodHost, *, sha: str, archive: str) -> dict[str, Any
 
 def _host_activate(host: DogfoodHost, *, sha: str) -> dict[str, Any]:
     root = Path(host.runtime_root).expanduser()
+    previous_link = root / "previous"
+    original_previous_target = _symlink_target(previous_link)
     transaction = _read_json(root / "transaction.json")
     if transaction.get("git_sha") != sha:
         raise RuntimeError("dogfood activation has no matching prepared transaction")
@@ -418,13 +420,13 @@ def _host_activate(host: DogfoodHost, *, sha: str) -> dict[str, Any]:
     previous_target = str(transaction.get("previous_target") or host.production_bin)
     state_path = root / "state.json"
     old_state = _read_json(state_path)
-    _atomic_symlink(previous_target, root / "previous")
+    _atomic_symlink(previous_target, previous_link)
     _atomic_symlink(target, root / "current")
     try:
         _configure_services(host, root)
     except Exception:
         _atomic_symlink(previous_target, root / "current")
-        _atomic_symlink(target, root / "previous")
+        _restore_optional_symlink(original_previous_target, previous_link)
         _restart_services(host, root, tolerate_failure=True)
         raise
     state = {
@@ -441,7 +443,7 @@ def _host_activate(host: DogfoodHost, *, sha: str) -> dict[str, Any]:
     status = _wait_for_status(host)
     if not status["ok"]:
         _atomic_symlink(previous_target, root / "current")
-        _atomic_symlink(target, root / "previous")
+        _restore_optional_symlink(original_previous_target, previous_link)
         if old_state:
             _write_json_atomic(state_path, old_state)
         else:
@@ -660,6 +662,13 @@ def _atomic_symlink(target: str, link: Path) -> None:
     temporary = link.parent / f".{link.name}.{uuid.uuid4().hex}.tmp"
     os.symlink(target, temporary)
     os.replace(temporary, link)
+
+
+def _restore_optional_symlink(target: str, link: Path) -> None:
+    if target:
+        _atomic_symlink(target, link)
+    else:
+        link.unlink(missing_ok=True)
 
 
 def _symlink_target(path: Path) -> str:
