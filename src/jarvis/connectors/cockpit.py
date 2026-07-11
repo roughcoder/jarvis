@@ -319,7 +319,15 @@ class CockpitThreadIndex:
             normalized = sorted(set(child_ids))
             continuation = str(continuation_instruction or "").strip()
             watch_id = hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()[:20]
-            if not any(message.get("type") == "child_watch" and message.get("watch_id") == watch_id for message in messages):
+            existing = next(
+                (
+                    message
+                    for message in messages
+                    if message.get("type") == "child_watch" and message.get("watch_id") == watch_id
+                ),
+                None,
+            )
+            if existing is None:
                 messages.append(
                     {
                         "role": "system",
@@ -342,6 +350,14 @@ class CockpitThreadIndex:
                         "observed_at": utc_now(),
                     }
                 )
+                self._write_thread_messages(stored, messages)
+            elif (
+                str(existing.get("phase") or "") == "waiting"
+                and continuation
+                and continuation != str(existing.get("continuation_instruction") or "")
+            ):
+                existing["continuation_instruction"] = continuation
+                existing["observed_at"] = utc_now()
                 self._write_thread_messages(stored, messages)
             return watch_id
 

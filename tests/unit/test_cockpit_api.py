@@ -7345,6 +7345,41 @@ def test_child_watch_tool_enforces_optional_expected_count(tmp_path, monkeypatch
     assert result == "error: expected 2 distinct child_chat_ids, received 1"
 
 
+def test_pending_child_watch_accepts_revised_completion_instruction(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    parent = CockpitThread(
+        thread_id="thread_parent",
+        project_id="neil-shared",
+        session_id="project:neil-shared:orchestrator:thread_parent",
+        title="Review pull request",
+        created_at="2026-07-11T10:00:00Z",
+        updated_at="2026-07-11T10:00:00Z",
+        created_by="neil",
+    )
+    index.save(parent)
+    requester = RequestContext(
+        device_id="local-mac",
+        identity="neil",
+        scope="personal",
+        capabilities=frozenset({"orchestration.runs.read"}),
+    )
+
+    first_watch_id = index.register_child_watch(parent, ["run_a", "run_b"], requester=requester)
+    second_watch_id = index.register_child_watch(
+        parent,
+        ["run_a", "run_b"],
+        requester=requester,
+        continuation_instruction="Publish the reconciled review.",
+    )
+    claimed = index.claim_ready_child_watch(parent.thread_id, {"run_a", "run_b"})
+
+    assert first_watch_id == second_watch_id
+    assert claimed is not None
+    assert claimed["continuation_instruction"] == "Publish the reconciled review."
+    assert claimed["requester"]["capabilities"] == ["orchestration.runs.read"]
+
+
 def test_child_watch_continuation_reuses_exact_requester_authority(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch)
     _seed_project_registry(cfg)
