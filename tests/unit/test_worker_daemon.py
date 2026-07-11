@@ -1455,6 +1455,53 @@ def test_materialize_worktree_fetches_before_branching_with_explicit_base_ref(tm
     assert fetch_calls == [str(repo)]
 
 
+def test_materialize_worktree_flattens_branch_when_prefix_ref_exists(tmp_path) -> None:
+    from jarvis.worker.workspaces import materialize_worktree
+
+    dev = tmp_path / "dev"
+    repo = _git_repo(dev, "jarvis")
+    subprocess.run(["git", "-C", str(repo), "branch", "jarvis"], check=True, capture_output=True)
+    cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "ws"), repo_root=str(dev), clone_missing=False)
+
+    result = asyncio.run(
+        materialize_worktree(
+            cfg=cfg,
+            root=tmp_path / "conversations",
+            conversation_id="thread_manual_123",
+            repo_ref="roughcoder/jarvis",
+            repo_name="docs-review",
+            base_ref="HEAD",
+        )
+    )
+
+    branch = result["worktrees"][0]["branch"]
+    assert result["status"] == "ready"
+    assert branch == "jarvis-thread-manual-123-docs-review"
+    assert subprocess.run(["git", "-C", str(repo), "branch", "--list", branch], capture_output=True, text=True).stdout.strip()
+
+
+def test_prepare_worktree_flattens_branch_when_prefix_ref_exists(tmp_path) -> None:
+    from jarvis.worker.actions import prepare_worktree
+
+    dev = tmp_path / "dev"
+    repo = _git_repo(dev, "jarvis")
+    subprocess.run(["git", "-C", str(repo), "branch", "jarvis"], check=True, capture_output=True)
+
+    cwd, branch, err = asyncio.run(
+        prepare_worktree(
+            str(repo),
+            str(tmp_path / "worker" / "worktrees"),
+            "manual-docs",
+            "jarvis",
+            10.0,
+        )
+    )
+
+    assert err is None
+    assert cwd is not None and pathlib.Path(cwd).exists()
+    assert branch is not None and branch.startswith("jarvis-manual-docs-")
+
+
 def test_provider_cwd_accepts_configured_conversation_workspace(tmp_path) -> None:
     root = tmp_path / "conversation-cache"
     cwd = root / "thread-alpha"

@@ -796,12 +796,43 @@ async def prepare_worktree(
         except OSError as exc:
             return None, None, f"error: could not copy non-git input into scratch ({exc})"
         return str(scratch), None, None
-    branch = f"{branch_prefix}/{slug}-{suffix}"
+    branch = await resolve_available_worktree_branch(repo_path, f"{branch_prefix}/{slug}-{suffix}", timeout_s)
     worktree = worktrees_root / f"{slug}-{suffix}"
     out = await run_exec(["git", "-C", str(repo_path), "worktree", "add", "-b", branch, str(worktree)], None, timeout_s)
     if not worktree.exists():
         return None, None, f"error: could not create worktree ({out})"
     return str(worktree), branch, None
+
+
+async def resolve_available_worktree_branch(repo: pathlib.Path | str, desired_branch: str, timeout_s: float) -> str:
+    """Return a local branch name Git can create for a worktree."""
+    repo_path = pathlib.Path(repo).expanduser().resolve()
+    if not await _branch_ref_conflicts(repo_path, desired_branch, timeout_s):
+        return desired_branch
+    flattened = desired_branch.replace("/", "-")
+    for suffix in range(0, 101):
+        candidate = flattened if suffix == 0 else f"{flattened}-{suffix}"
+        if not await _branch_ref_conflicts(repo_path, candidate, timeout_s):
+            return candidate
+    raise RuntimeError(f"could not find an available worktree branch for {desired_branch!r}")
+
+
+async def _branch_ref_conflicts(repo: pathlib.Path, branch: str, timeout_s: float) -> bool:
+    exact = await run_exec(["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], None, timeout_s)
+    if not exact.startswith("error:"):
+        return True
+    parts = branch.split("/")
+    for index in range(1, len(parts)):
+        prefix = "/".join(parts[:index])
+        out = await run_exec(["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{prefix}"], None, timeout_s)
+        if not out.startswith("error:"):
+            return True
+    descendants = await run_exec(
+        ["git", "-C", str(repo), "for-each-ref", "--format=%(refname:short)", f"refs/heads/{branch}/"],
+        None,
+        timeout_s,
+    )
+    return bool(descendants and descendants != "(no output)" and not descendants.startswith("error:"))
 
 
 def _is_under(path: pathlib.Path, roots: list[pathlib.Path]) -> bool:
