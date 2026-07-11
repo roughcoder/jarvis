@@ -311,11 +311,13 @@ class CockpitThreadIndex:
         child_ids: list[str],
         *,
         requester: RequestContext,
+        continuation_instruction: str = "",
     ) -> str:
         with _THREAD_INDEX_LOCK:
             stored = self.get(thread.project_id, thread.thread_id) or thread
             messages = self._thread_messages(stored)
             normalized = sorted(set(child_ids))
+            continuation = str(continuation_instruction or "").strip()
             watch_id = hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()[:20]
             if not any(message.get("type") == "child_watch" and message.get("watch_id") == watch_id for message in messages):
                 messages.append(
@@ -325,6 +327,7 @@ class CockpitThreadIndex:
                         "type": "child_watch",
                         "watch_id": watch_id,
                         "child_chat_ids": normalized,
+                        "continuation_instruction": continuation,
                         "requester": {
                             "device_id": requester.device_id,
                             "identity": requester.identity,
@@ -1498,6 +1501,9 @@ def _watch_child_work_sessions_tool(cfg: Config, project: ProjectEntry, thread: 
                 return "error: expected_count must be a positive integer"
             if len(child_ids) != expected_count:
                 return f"error: expected {expected_count} distinct child_chat_ids, received {len(child_ids)}"
+        continuation_instruction = str(args.get("continuation_instruction") or "").strip()
+        if len(continuation_instruction) > 12_000:
+            return "error: continuation_instruction must be 12000 characters or fewer"
         store = OrchestrationStore(cfg.orchestration.workspace)
         for child_id in child_ids:
             child = await asyncio.to_thread(store.get, child_id)
@@ -1510,7 +1516,7 @@ def _watch_child_work_sessions_tool(cfg: Config, project: ProjectEntry, thread: 
                 return f"error: child work session {child_id} does not belong to this orchestrator chat"
         watch_id = await asyncio.to_thread(CockpitThreadIndex(
             Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME
-        ).register_child_watch, thread, child_ids, requester=ctx)
+        ).register_child_watch, thread, child_ids, requester=ctx, continuation_instruction=continuation_instruction)
         await asyncio.to_thread(_start_ready_child_watch, cfg, thread.thread_id)
         return json.dumps(
             {"watch_id": watch_id, "child_chat_ids": sorted(set(child_ids)), "registered": True},
@@ -1532,6 +1538,11 @@ def _watch_child_work_sessions_tool(cfg: Config, project: ProjectEntry, thread: 
                     "type": "integer",
                     "minimum": 1,
                     "description": "Optional exact number of distinct child sessions required before registering the watch.",
+                },
+                "continuation_instruction": {
+                    "type": "string",
+                    "maxLength": 12000,
+                    "description": "Optional exact instruction for the automatically resumed parent turn after all children are terminal.",
                 },
             },
             "required": ["child_chat_ids"],
@@ -1611,6 +1622,9 @@ def _continue_child_watch(cfg: Config, parent_chat_id: str, watch: dict[str, Any
             "capability-gated external action, and report the outcome. Do not spawn replacement children unless "
             "a result explicitly failed and the original user request requires recovery."
         )
+        continuation_instruction = str(watch.get("continuation_instruction") or "").strip()
+        if continuation_instruction:
+            instruction = f"{instruction}\n\nCompletion instruction from the original workflow:\n{continuation_instruction}"
         connector = CockpitConnector(cfg)
         await connector.turn(project, thread, requester, instruction)
 
@@ -1995,6 +2009,7 @@ def _normalized_messages(messages: Any) -> list[dict[str, Any]]:
             "status",
             "terminal_reason",
             "watch_id",
+            "continuation_instruction",
             "claimed_at",
             "completed_at",
             "error",
