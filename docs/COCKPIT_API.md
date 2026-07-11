@@ -702,10 +702,9 @@ File retraction response:
 }
 ```
 
-#### Orchestrator Threads
+#### Project Threads
 
-An orchestrator thread is a long-lived Cockpit project chat backed by a Honcho
-session named:
+A project thread is a long-lived Cockpit chat backed by a Honcho session named:
 
 ```text
 project:<project-id>:orchestrator:<thread-id>
@@ -735,6 +734,7 @@ for the project. Archived threads are hidden by default; pass
       "project_id": "jarvis",
       "session_id": "project:jarvis:orchestrator:thread_...",
       "title": "Planning",
+      "chat_type": "assistant",
       "engine": "jarvis",
       "model": "fast",
       "worker_id": null,
@@ -780,16 +780,17 @@ only by labels.
 Thread enrichment fields (on list, detail, open, turn, archive, and rename
 responses alike):
 
-- `engine` is always `"jarvis"`: project threads are brain conversations, not
-  worker sessions. `thread.session_id` is the memory session id and never
-  matches a worker `session_id`/`session_ref` — do not join threads against
-  the snapshot sessions array.
-- `model` is the LLM gateway route the thread's turns use (a LiteLLM route
-  name such as `fast`, not a provider model id).
-- `worker_id` is `null` and `host` is the brain host: thread turns execute on
-  the brain while the thread is planning-only. Once a thread escalates to a
-  workspace, the nested `workspace.worker_id` and `workspace.session_id`
-  identify the worker provider session.
+- `chat_type` is `assistant` or `orchestrator`. Missing values on legacy rows
+  mean `assistant`.
+- Assistant threads use `engine: "jarvis"`, a LiteLLM route in `model`, a null
+  `worker_id`, and the brain `host`.
+- Orchestrator threads use `engine: "codex"` or `"claude"`, the provider model
+  id, and a fleet `worker_id`. Their `session_id` remains the Honcho memory
+  session; the provider session is `workspace.session_id`.
+- Code-agent orchestrators receive no repository checkout. Jarvis supplies
+  project memory plus a signed, short-lived, parent-thread-scoped MCP surface
+  for spawning, watching, reading, and publishing child review work. The grant
+  cannot access another project, parent thread, or tool.
 - `status` is `created` (no turns yet), `running` (a turn is in flight),
   `completed` (last turn finished), or `failed` (last turn errored; the live
   `running`/`failed` states are process-local and revert to the durable
@@ -844,6 +845,21 @@ the locally recorded turn history for rendering resumed conversations:
 memory backend and sets session membership before any messages are written. The
 session includes the project peer, the requester peer, and `jarvis`.
 Include `parent_chat_id` to nest the new thread under another Jarvis chat.
+The default body creates a Jarvis assistant. To create a code-agent
+orchestrator, send:
+
+```json
+{
+  "title": "Review pull request",
+  "chat_type": "orchestrator",
+  "engine": "codex",
+  "model": "gpt-5.5",
+  "worker_id": "brain-worker"
+}
+```
+
+`worker_id` is optional; Jarvis selects an online worker with the requested
+engine and one free session slot when it is omitted.
 
 Thread open response:
 

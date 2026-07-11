@@ -41,6 +41,7 @@ from jarvis.connectors.cockpit import (
     CockpitThread,
     CockpitThreadIndex,
     THREAD_INDEX_FILENAME,
+    execute_orchestrator_tool,
     make_child_terminal_notifier,
     workspace_public,
 )
@@ -104,6 +105,10 @@ from jarvis.brain.facade import (
 from jarvis.orchestration.authority import allowed
 from jarvis.orchestration.activity import ProjectActivityLog
 from jarvis.orchestration.intent import parse_work_command
+from jarvis.orchestration.orchestrator_grants import (
+    OrchestratorGrantError,
+    resolve_orchestrator_grant,
+)
 from jarvis.orchestration.models import WorkCommand, WorkItem
 from jarvis.orchestration.oauth import (
     OAuthTokenValidator,
@@ -509,6 +514,10 @@ def make_app(
         web.get("/v1/mcp/tools", reads.mcp_tools),
         web.get("/v1/mcp/tokens", reads.mcp_token_list),
         web.post("/v1/mcp/tokens", writes.mcp_token_issue),
+        web.post(
+            "/v1/orchestrator-tools/{project_id}/{thread_id}/{tool_name}",
+            writes.orchestrator_tool,
+        ),
         web.delete("/v1/mcp/tokens/{token_id}", writes.mcp_token_revoke),
         web.get("/v1/projects", reads.projects),
         web.post("/v1/projects", writes.project_create),
@@ -1415,9 +1424,15 @@ class CockpitWriteHandlers:
                     requester,
                     title=str(body.get("title") or ""),
                     parent_chat_id=str(body.get("parent_chat_id") or ""),
+                    chat_type=str(body.get("chat_type") or "assistant"),
+                    engine=str(body.get("engine") or ""),
+                    model=str(body.get("model") or ""),
+                    worker_id=str(body.get("worker_id") or ""),
                 )
             except UnsupportedMemoryOperation as exc:
                 raise CockpitError("memory_unavailable", str(exc), recoverable=True, status=503) from exc
+            except ValueError as exc:
+                raise CockpitError("validation_failed", public_error_message(str(exc)), recoverable=True, status=400) from exc
             except (TimeoutError, OSError, RuntimeError) as exc:
                 raise CockpitError("memory_unavailable", public_error_message(str(exc)), recoverable=True, status=503) from exc
             await _record_project_activity(
@@ -1432,6 +1447,49 @@ class CockpitWriteHandlers:
 
         response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
         return web.json_response(response_body)
+
+    async def orchestrator_tool(self, request: web.Request) -> web.Response:
+        header = request.headers.get("Authorization", "")
+        token = header[len("Bearer ") :] if header.startswith("Bearer ") else ""
+        try:
+            grant = resolve_orchestrator_grant(self.ctx.cfg.orchestration, token)
+        except OrchestratorGrantError as exc:
+            raise CockpitError("unauthorized", str(exc), status=401) from exc
+        project_id = str(request.match_info["project_id"])
+        thread_id = str(request.match_info["thread_id"])
+        tool_name = str(request.match_info["tool_name"])
+        if grant.project_id != project_id or grant.thread_id != thread_id or tool_name not in grant.tools:
+            raise CockpitError("forbidden", "orchestrator grant does not cover this tool", status=403)
+        registry = await asyncio.to_thread(_registry_store, self.ctx.cfg)
+        project = await asyncio.to_thread(
+            _visible_project_or_404,
+            registry,
+            project_id,
+            grant.requester,
+        )
+        if project is None:
+            raise CockpitError("not_found", "project not found", status=404)
+        connector = _cockpit_connector(self.ctx)
+        thread = await asyncio.to_thread(connector.index.get, project_id, thread_id)
+        if thread is None or thread.chat_type != "orchestrator":
+            raise CockpitError("not_found", "orchestrator thread not found", status=404)
+        if thread.archived_at:
+            raise CockpitError("thread_archived", "thread is archived", recoverable=True, status=409)
+        body = await _json_body(request)
+        try:
+            result = await execute_orchestrator_tool(
+                self.ctx.cfg,
+                project=project,
+                thread=thread,
+                requester=grant.requester,
+                tool_name=tool_name,
+                args=body,
+            )
+        except PermissionError as exc:
+            raise CockpitError("forbidden", public_error_message(str(exc)), status=403) from exc
+        except (RuntimeError, ValueError) as exc:
+            raise CockpitError("tool_failed", public_error_message(str(exc)), recoverable=True, status=400) from exc
+        return web.json_response({"ok": True, "result": result})
 
     async def project_thread_turn(self, request: web.Request) -> web.StreamResponse:
         await self.ctx.require_auth(request)
@@ -3465,15 +3523,11 @@ def _thread_projection(
         "project_id": thread.project_id,
         "session_id": thread.session_id,
         "title": thread.title,
-        # Project threads are brain conversations: the engine is Jarvis itself,
-        # the model is the LLM gateway route its turns use, and they execute on
-        # the brain host — worker_id stays null until a thread is linked to a
-        # worker session (orchestration chat tree). thread.session_id is the
-        # memory session id — it never matches a worker session.
-        "engine": "jarvis",
-        "model": _thread_model(ctx),
-        "worker_id": None,
-        "host": _BRAIN_HOSTNAME,
+        "chat_type": thread.chat_type,
+        "engine": thread.engine,
+        "model": thread.model or (_thread_model(ctx) if thread.engine == "jarvis" else ""),
+        "worker_id": thread.worker_id or None,
+        "host": _BRAIN_HOSTNAME if thread.engine == "jarvis" else "",
         "status": status,
         "ended_reason": ended_reason or None,
         "created_at": thread.created_at,

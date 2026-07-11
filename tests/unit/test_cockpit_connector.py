@@ -112,6 +112,9 @@ def test_connector_opens_honcho_thread_session_before_messages(tmp_path, monkeyp
             "messages_before_create": 0,
             "metadata": {
                 "kind": "cockpit_orchestrator",
+                "chat_type": "assistant",
+                "engine": "jarvis",
+                "model": "",
                 "project_id": "jarvis",
                 "thread_id": thread.thread_id,
                 "created_by": "neil",

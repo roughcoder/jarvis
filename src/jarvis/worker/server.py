@@ -765,6 +765,11 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             "metadata": dict(body.get("metadata") or {}),
             "idempotency_key": idempotency_key,
         }
+        runtime_context = _prepare_runtime_context(
+            sessions,
+            session.session_id,
+            body.get("runtime_context"),
+        )
         if attachments:
             # Events are durable and replayed to cockpits; keep them to
             # summaries and hand the base64 payloads only to the provider.
@@ -792,6 +797,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                     metadata=dict(body.get("metadata") or {}),
                     idempotency_key=idempotency_key,
                     attachments=attachments,
+                    runtime_context=runtime_context,
                 ),
                 sessions=sessions,
                 worker_cfg=cfg,
@@ -1434,6 +1440,37 @@ def _events_for_idempotency(
     if not key:
         return []
     return [event for event in sessions.events(session_id) if str(event.data.get("idempotency_key") or "") == key]
+
+
+def _prepare_runtime_context(
+    sessions: SessionManager,
+    session_id: str,
+    raw_context: object,
+) -> dict[str, Any]:
+    if not isinstance(raw_context, dict):
+        return {}
+    raw_mcp = raw_context.get("orchestrator_mcp")
+    if not isinstance(raw_mcp, dict):
+        return {}
+    api_url = str(raw_mcp.get("api_url") or "").strip()
+    project_id = str(raw_mcp.get("project_id") or "").strip()
+    thread_id = str(raw_mcp.get("thread_id") or "").strip()
+    grant = str(raw_mcp.get("grant") or "").strip()
+    if not api_url or not project_id or not thread_id or not grant:
+        raise RuntimeError("orchestrator MCP runtime context is incomplete")
+    if len(grant) > 16_384:
+        raise RuntimeError("orchestrator MCP grant is too large")
+    grant_file = sessions.session_dir(session_id) / ".orchestrator-grant"
+    grant_file.write_text(grant, encoding="utf-8")
+    grant_file.chmod(0o600)
+    return {
+        "orchestrator_mcp": {
+            "api_url": api_url,
+            "project_id": project_id,
+            "thread_id": thread_id,
+            "grant_file": str(grant_file),
+        }
+    }
 
 
 def _running_workspace_refs(items: list) -> set[str]:

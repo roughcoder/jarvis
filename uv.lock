@@ -566,6 +566,7 @@ wake = [
 ]
 worker = [
     { name = "aiohttp", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or sys_platform == 'darwin'" },
+    { name = "mcp", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or sys_platform == 'darwin'" },
 ]
 worker-claude = [
     { name = "claude-agent-sdk", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or sys_platform == 'darwin'" },
@@ -585,6 +586,7 @@ requires-dist = [
     { name = "faster-whisper", marker = "extra == 'stt'", specifier = ">=1.0" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.2" },
+    { name = "mcp", marker = "extra == 'worker'", specifier = ">=1.2" },
     { name = "nodriver", marker = "extra == 'browser'", specifier = ">=0.37" },
     { name = "numpy", marker = "extra == 'stt'", specifier = ">=1.26" },
     { name = "numpy", marker = "extra == 'tts'", specifier = ">=1.26" },

@@ -34,12 +34,13 @@ from jarvis.capabilities import (  # noqa: E402
 )
 from jarvis.config import WorkerConfig  # noqa: E402
 from jarvis.github_reviews import GitHubReviewResult  # noqa: E402
-from jarvis.worker.server import make_app  # noqa: E402
+from jarvis.worker.server import _prepare_runtime_context, make_app  # noqa: E402
 from jarvis.worker.authority import WorkerSessionAuthority  # noqa: E402
 from jarvis.worker.providers.codex import (  # noqa: E402
     _deliver_pending_request,
     _approval_result,
     _input_result,
+    _orchestrator_thread_overrides,
     _project_jsonrpc_message,
     _read_until_turn_done,
     _restore_running_if_waiting,
@@ -329,6 +330,64 @@ def test_worker_session_authority_maps_read_only_to_codex_read_only() -> None:
     assert authority.claude_tool_denial("Read") == ""
     assert authority.claude_tool_denial("Grep") == ""
     assert authority.claude_tool_denial("AskUserQuestion") == ""
+
+
+def test_worker_session_authority_allows_only_declared_mcp_server_in_read_only_mode() -> None:
+    session = _session_with_authority()
+    session.metadata["trusted_mcp_servers"] = ["jarvis_orchestrator"]
+    authority = WorkerSessionAuthority.from_session(session)
+
+    assert authority.claude_tool_denial("mcp__jarvis_orchestrator__spawn_child_work_session") == ""
+    assert authority.claude_tool_denial("mcp__github__create_issue")
+
+
+def test_codex_orchestrator_overrides_are_thread_scoped_and_secret_free() -> None:
+    overrides = _orchestrator_thread_overrides(
+        ProviderTurn(
+            turn_id="turn_orchestrator",
+            prompt="coordinate",
+            runtime_context={
+                "orchestrator_mcp": {
+                    "api_url": "http://brain.test:8790",
+                    "project_id": "project_a",
+                    "thread_id": "thread_a",
+                    "grant_file": "/private/session/.orchestrator-grant",
+                }
+            },
+        )
+    )
+
+    server = overrides["config"]["mcp_servers"]["jarvis_orchestrator"]
+    assert server["command"]
+    assert server["args"][-4:] == ["--project-id", "project_a", "--thread-id", "thread_a"]
+    assert server["env"] == {
+        "JARVIS_ORCHESTRATOR_GRANT_FILE": "/private/session/.orchestrator-grant"
+    }
+    assert "scoped-grant" not in str(overrides)
+    assert "Jarvis project orchestrator" in overrides["developerInstructions"]
+
+
+def test_orchestrator_grant_is_written_outside_durable_session_metadata(tmp_path) -> None:
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create({"session_id": "sess_orchestrator", "provider": "codex"})
+
+    context = _prepare_runtime_context(
+        sessions,
+        session.session_id,
+        {
+            "orchestrator_mcp": {
+                "api_url": "http://brain.test:8790",
+                "project_id": "project_a",
+                "thread_id": "thread_a",
+                "grant": "scoped-secret-grant",
+            }
+        },
+    )
+
+    grant_file = pathlib.Path(context["orchestrator_mcp"]["grant_file"])
+    assert grant_file.read_text() == "scoped-secret-grant"
+    assert grant_file.stat().st_mode & 0o777 == 0o600
+    assert "scoped-secret-grant" not in sessions.session_path(session.session_id).read_text()
 
 
 def test_worker_session_authority_maps_branch_only_to_workspace_write() -> None:
@@ -3183,6 +3242,77 @@ def test_daemon_claude_provider_projects_sdk_events_and_reuses_stream(tmp_path, 
     assert _FakeClaudeClient.instances[0].options.kwargs["system_prompt"] == {"type": "preset", "preset": "claude_code"}
     assert _FakeClaudeClient.instances[0].options.kwargs["setting_sources"] is None
     assert _FakeClaudeClient.instances[0].response_exhausted == 2
+
+
+def test_claude_orchestrator_turn_receives_only_scoped_jarvis_mcp_tools(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    native_id = "33333333-3333-4333-8333-333333333333"
+    _install_fake_claude_sdk(
+        monkeypatch,
+        [[[
+            _FakeAssistantMessage([_FakeTextBlock("watching")], session_id=native_id),
+            _FakeResultMessage(session_id=native_id),
+        ]]],
+    )
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "claude",
+            "engine": "claude",
+            "cwd": _owned_worker_cwd(tmp_path, "claude-orchestrator"),
+            "metadata": {
+                "execution_envelope": {
+                    "allowed_actions": [WORKER_SESSION_TURN],
+                    "landing": {"mode": "review", "allow_merge": False},
+                },
+                "trusted_mcp_servers": ["jarvis_orchestrator"],
+            },
+        }
+    )
+    grant_file = tmp_path / "grant"
+    grant_file.write_text("scoped-grant")
+
+    try:
+        claude.ClaudeProviderAdapter().start_turn(
+            session=session,
+            turn=ProviderTurn(
+                turn_id="turn_orchestrator",
+                prompt="coordinate",
+                runtime_context={
+                    "orchestrator_mcp": {
+                        "api_url": "http://brain.test:8790",
+                        "project_id": "project_a",
+                        "thread_id": "thread_a",
+                        "grant_file": str(grant_file),
+                    }
+                },
+            ),
+            sessions=sessions,
+            worker_cfg=WorkerConfig(
+                _env_file=None,
+                workspace=str(tmp_path / "worker"),
+                claude_bin="fake-claude",
+                job_timeout_s=5,
+            ),
+        )
+        for _ in range(100):
+            if any(event.type == "turn.completed" for event in sessions.events(session.session_id)):
+                break
+            time.sleep(0.02)
+    finally:
+        _stop_fake_claude_runtimes()
+
+    options = _FakeClaudeClient.instances[0].options.kwargs
+    assert list(options["mcp_servers"]) == ["jarvis_orchestrator"]
+    assert options["mcp_servers"]["jarvis_orchestrator"]["env"] == {
+        "JARVIS_ORCHESTRATOR_GRANT_FILE": str(grant_file)
+    }
+    assert options["allowed_tools"] == [
+        "mcp__jarvis_orchestrator__spawn_child_work_session",
+        "mcp__jarvis_orchestrator__read_child_work_result",
+        "mcp__jarvis_orchestrator__watch_child_work_sessions",
+        "mcp__jarvis_orchestrator__publish_github_pr_review",
+    ]
+    assert "Jarvis project orchestrator" in options["system_prompt"]["append"]
 
 
 def test_daemon_github_review_action_is_authority_gated_and_idempotent(tmp_path, monkeypatch) -> None:  # noqa: ANN001
