@@ -237,6 +237,10 @@ small review-only ring: the Cockpit API/orchestrator worker host and the worker
 hosts selected for the review. It does not update room devices, Homebrew, tags,
 or GitHub releases.
 
+The complete inner-loop procedure, two-model PR-review acceptance gate, rollback
+drill, and troubleshooting guide live in [DOGFOOD.md](DOGFOOD.md). This section
+is the short command and inventory reference.
+
 Keep the real inventory outside this public repository. The default path is
 `~/.jarvis/dogfood-fleet.json`; a placeholder-only shape is:
 
@@ -301,6 +305,9 @@ The intended delivery loop is:
 2. Run the two-model Cockpit PR review flow against both fixture PRs.
 3. Fix, commit, redeploy, and repeat until both flows pass consecutively.
 4. Open and review the runtime PR, merge it, then publish one normal release.
+
+Do not advance to step 4 until the checklist in [DOGFOOD.md](DOGFOOD.md) passes
+for both fixture PRs consecutively.
 
 ## Runtime Update Runbook
 
