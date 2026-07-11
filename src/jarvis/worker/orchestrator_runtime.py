@@ -5,17 +5,12 @@ from __future__ import annotations
 import sys
 from typing import Any
 
+from jarvis.orchestrator_tool_contract import ORCHESTRATOR_TOOL_NAMES
 from jarvis.worker.providers.base import ProviderTurn
 
 
 ORCHESTRATOR_MCP_SERVER_NAME = "jarvis_orchestrator"
 ORCHESTRATOR_MCP_TOOL_PREFIX = f"mcp__{ORCHESTRATOR_MCP_SERVER_NAME}__"
-ORCHESTRATOR_TOOL_NAMES = (
-    "spawn_child_work_session",
-    "read_child_work_result",
-    "watch_child_work_sessions",
-    "publish_github_pr_review",
-)
 ORCHESTRATOR_ALLOWED_TOOLS = [
     f"{ORCHESTRATOR_MCP_TOOL_PREFIX}{name}" for name in ORCHESTRATOR_TOOL_NAMES
 ]
@@ -36,6 +31,7 @@ def orchestrator_mcp_server(turn: ProviderTurn) -> dict[str, Any] | None:
     project_id = str(raw.get("project_id") or "").strip()
     thread_id = str(raw.get("thread_id") or "").strip()
     grant_file = str(raw.get("grant_file") or "").strip()
+    timeout_s = float(raw.get("timeout_s") or 90.0)
     if not api_url or not project_id or not thread_id or not grant_file:
         raise RuntimeError("orchestrator MCP runtime context is incomplete")
     return {
@@ -51,6 +47,8 @@ def orchestrator_mcp_server(turn: ProviderTurn) -> dict[str, Any] | None:
             project_id,
             "--thread-id",
             thread_id,
+            "--timeout-s",
+            str(timeout_s),
         ],
         "env": {"JARVIS_ORCHESTRATOR_GRANT_FILE": grant_file},
     }
