@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from urllib.error import HTTPError
 
 
 ROLES = ("brain", "api", "intercom", "worker", "whatsapp")
@@ -470,6 +471,7 @@ def _host_status(host: DogfoodHost) -> dict[str, Any]:
     current = _symlink_target(root / "current")
     previous = _symlink_target(root / "previous")
     issues: list[str] = []
+    selected_production = bool(current) and Path(current).resolve() == Path(host.production_bin).resolve()
     if not current or not Path(current).is_file():
         issues.append("active runtime target is missing")
     services: dict[str, Any] = {}
@@ -486,9 +488,14 @@ def _host_status(host: DogfoodHost) -> dict[str, Any]:
             issues.append(f"{role} service is not healthy")
     probes = [_probe(host, probe) for probe in host.probes]
     expected_sha = str(state.get("git_sha") or "")
-    expected_channel = str(state.get("channel") or "")
+    expected_channel = str(state.get("channel") or ("production" if selected_production else ""))
     for probe in probes:
         runtime = probe.get("runtime") if isinstance(probe, dict) else None
+        legacy_production_probe = selected_production and (
+            (probe.get("ok") and runtime is None) or probe.get("status") == 404
+        )
+        if legacy_production_probe:
+            continue
         if not probe.get("ok"):
             issues.append(f"{probe.get('role') or 'runtime'} probe failed")
         elif not isinstance(runtime, dict) or runtime.get("channel") != expected_channel or runtime.get("git_sha", "") != expected_sha:
@@ -595,6 +602,13 @@ def _probe(host: DogfoodHost, probe: dict[str, str]) -> dict[str, Any]:
     try:
         with urllib.request.urlopen(request, timeout=8) as response:
             payload = json.load(response)
+    except HTTPError as exc:
+        return {
+            "ok": False,
+            "role": probe.get("role"),
+            "status": exc.code,
+            "error": f"HTTP {exc.code}",
+        }
     except Exception as exc:  # noqa: BLE001 - status reports bounded probe failures
         return {"ok": False, "role": probe.get("role"), "error": str(exc)[:200]}
     return {"ok": bool(payload.get("ok")), "role": probe.get("role"), "runtime": payload.get("runtime")}

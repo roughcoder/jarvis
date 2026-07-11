@@ -11,6 +11,8 @@ import pytest
 
 from jarvis.dogfood import (
     DogfoodHost,
+    _atomic_symlink,
+    _ensure_stable_launcher,
     _host_activate,
     _host_prepare,
     _host_rollback,
@@ -198,3 +200,26 @@ def test_rollback_restores_current_runtime_when_previous_target_is_unhealthy(tmp
     state = json.loads((root / "state.json").read_text(encoding="utf-8"))
     assert state["channel"] == "dogfood"
     assert state["git_sha"] == SHA
+
+
+def test_status_accepts_legacy_identity_only_for_selected_production_target(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    base = _host(tmp_path)
+    host = DogfoodHost(
+        **{
+            **base.__dict__,
+            "probes": ({"role": "worker", "url": "http://127.0.0.1:8780/health"},),
+        }
+    )
+    root = Path(host.runtime_root)
+    _ensure_stable_launcher(root)
+    _atomic_symlink(host.production_bin, root / "current")
+    monkeypatch.setattr(
+        "jarvis.dogfood._probe",
+        lambda _host, _probe_config: {"ok": True, "role": "worker", "runtime": None},
+    )
+
+    status = _host_status(host)
+
+    assert status["ok"] is True
+    assert status["channel"] == "production"
+    assert status["git_sha"] == ""
