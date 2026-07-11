@@ -390,6 +390,70 @@ def test_orchestrator_grant_is_written_outside_durable_session_metadata(tmp_path
     assert "scoped-secret-grant" not in sessions.session_path(session.session_id).read_text()
 
 
+def test_rejected_overlapping_turn_does_not_rotate_active_orchestrator_grant(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, client):  # noqa: ANN001
+        created = (
+            await client.post(
+                base + "/sessions",
+                json={
+                    "provider": "fake",
+                    "engine": "fake",
+                    "cwd": _owned_worker_cwd(tmp_path, "orchestrator-grant-race"),
+                    "metadata": _authority_metadata("fake"),
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        first = await client.post(
+            f"{base}/sessions/{session_id}/turns",
+            json={
+                "turn_id": "turn_active",
+                "prompt": "request input",
+                "metadata": _control_metadata(WORKER_SESSION_TURN),
+                "runtime_context": {
+                    "orchestrator_mcp": {
+                        "api_url": "http://brain.test:8790",
+                        "project_id": "project_a",
+                        "thread_id": "thread_a",
+                        "grant": "active-requester-grant",
+                    }
+                },
+            },
+            headers=headers,
+        )
+        grant_file = pathlib.Path(cfg.workspace) / "sessions" / session_id / ".orchestrator-grant"
+        second = await client.post(
+            f"{base}/sessions/{session_id}/turns",
+            json={
+                "turn_id": "turn_rejected",
+                "prompt": "replace authority",
+                "metadata": _control_metadata(WORKER_SESSION_TURN),
+                "runtime_context": {
+                    "orchestrator_mcp": {
+                        "api_url": "http://brain.test:8790",
+                        "project_id": "project_a",
+                        "thread_id": "thread_a",
+                        "grant": "later-requester-grant",
+                    }
+                },
+            },
+            headers=headers,
+        )
+        return first, second, grant_file.read_text()
+
+    first, second, grant = asyncio.run(_with_server(cfg, 8862, calls))
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert grant == "active-requester-grant"
+
+
 def test_worker_session_authority_maps_branch_only_to_workspace_write() -> None:
     authority = WorkerSessionAuthority.from_session(
         _session_with_authority(

@@ -97,6 +97,18 @@ _WORK_ACTION_TOOL_NAMES = {
 }
 
 
+def _requester_authority_snapshot(requester: RequestContext) -> dict[str, Any]:
+    return {
+        "device_id": requester.device_id,
+        "identity": requester.identity,
+        "scope": requester.scope,
+        "capabilities": sorted(requester.capabilities),
+        "channel": requester.channel,
+        "confidence": requester.confidence,
+        "peer": requester.peer,
+    }
+
+
 @dataclass(frozen=True)
 class CockpitThread:
     thread_id: str
@@ -332,6 +344,7 @@ class CockpitThreadIndex:
             messages = self._thread_messages(stored)
             normalized = sorted(set(child_ids))
             continuation = str(continuation_instruction or "").strip()
+            requester_snapshot = _requester_authority_snapshot(requester)
             watch_id = hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()[:20]
             existing = next(
                 (
@@ -350,15 +363,7 @@ class CockpitThreadIndex:
                         "watch_id": watch_id,
                         "child_chat_ids": normalized,
                         "continuation_instruction": continuation,
-                        "requester": {
-                            "device_id": requester.device_id,
-                            "identity": requester.identity,
-                            "scope": requester.scope,
-                            "capabilities": sorted(requester.capabilities),
-                            "channel": requester.channel,
-                            "confidence": requester.confidence,
-                            "peer": requester.peer,
-                        },
+                        "requester": requester_snapshot,
                         "phase": "waiting",
                         "content": f"Watching {len(normalized)} child work session(s) for completion.",
                         "observed_at": utc_now(),
@@ -368,6 +373,7 @@ class CockpitThreadIndex:
             elif (
                 str(existing.get("phase") or "") == "waiting"
                 and continuation
+                and existing.get("requester") == requester_snapshot
                 and continuation != str(existing.get("continuation_instruction") or "")
             ):
                 existing["continuation_instruction"] = continuation
@@ -417,6 +423,22 @@ class CockpitThreadIndex:
                         message["error"] = public_error_message(error)
                     break
             self._write_thread_messages(thread, messages)
+
+    def renew_child_watch_claim(self, parent_chat_id: str, watch_id: str) -> None:
+        with _THREAD_INDEX_LOCK:
+            thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
+            if thread is None:
+                return
+            messages = self._thread_messages(thread)
+            for message in messages:
+                if (
+                    message.get("type") == "child_watch"
+                    and message.get("watch_id") == watch_id
+                    and message.get("phase") == "claimed"
+                ):
+                    message["claimed_at"] = utc_now()
+                    self._write_thread_messages(thread, messages)
+                    return
 
     def append_turn(
         self,
@@ -1101,16 +1123,20 @@ class CockpitConnector:
     async def _wait_for_orchestrator_turn(self, worker_id: str, session_id: str, turn_id: str) -> str:
         deadline = asyncio.get_running_loop().time() + max(1.0, float(self._cfg.worker.job_timeout_s))
         assistant_messages: list[str] = []
+        after_event_id = ""
         while asyncio.get_running_loop().time() < deadline:
+            event_path = f"/sessions/{session_id}/events?limit=500"
+            if after_event_id:
+                event_path = f"{event_path}&after={after_event_id}"
             body = await asyncio.to_thread(
                 self._get_worker_json,
                 worker_id,
-                f"/sessions/{session_id}/events?limit=500",
+                event_path,
             )
             terminal_error = ""
             terminal = False
-            assistant_messages = []
-            for event in body.get("events") or []:
+            events = body.get("events") or []
+            for event in events:
                 if not isinstance(event, dict):
                     continue
                 data = event.get("data") if isinstance(event.get("data"), dict) else {}
@@ -1126,12 +1152,18 @@ class CockpitConnector:
                     terminal_error = str(data.get("error") or "orchestrator turn failed")
                 elif event_type == EVENT_TURN_COMPLETED:
                     terminal = True
+            if events and isinstance(events[-1], dict):
+                latest_event_id = str(events[-1].get("event_id") or "")
+                if latest_event_id:
+                    after_event_id = latest_event_id
             if terminal_error:
                 raise RuntimeError(public_error_message(terminal_error))
             if terminal:
                 if not assistant_messages:
                     raise RuntimeError("orchestrator turn completed without an assistant result")
                 return assistant_messages[-1]
+            if len(events) >= 500 and after_event_id:
+                continue
             await asyncio.sleep(0.25)
         raise TimeoutError("orchestrator turn timed out")
 
@@ -1899,18 +1931,20 @@ def _continue_child_watch(cfg: Config, parent_chat_id: str, watch: dict[str, Any
         if continuation_instruction:
             instruction = f"{instruction}\n\nCompletion instruction from the original workflow:\n{continuation_instruction}"
         connector = CockpitConnector(cfg)
-        for attempt in range(120):
+        deadline = asyncio.get_running_loop().time() + max(1.0, float(cfg.worker.job_timeout_s))
+        while True:
             try:
                 await connector.turn(project, thread, requester, instruction)
                 break
             except RuntimeError as exc:
                 message = str(exc).lower()
-                if attempt == 119 or not (
+                if not (
                     "active turn" in message
                     or "already has an active turn" in message
                     or "does not accept new turns" in message
-                ):
+                ) or asyncio.get_running_loop().time() >= deadline:
                     raise
+                index.renew_child_watch_claim(parent_chat_id, watch_id)
                 await asyncio.sleep(0.25)
 
     try:

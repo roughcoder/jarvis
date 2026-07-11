@@ -765,11 +765,6 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             "metadata": dict(body.get("metadata") or {}),
             "idempotency_key": idempotency_key,
         }
-        runtime_context = _prepare_runtime_context(
-            sessions,
-            session.session_id,
-            body.get("runtime_context"),
-        )
         if attachments:
             # Events are durable and replayed to cockpits; keep them to
             # summaries and hand the base64 payloads only to the provider.
@@ -789,6 +784,14 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 }
             )
         try:
+            # Runtime context can rotate the grant file read by a live MCP
+            # bridge. Materialize it only after this turn owns the session so a
+            # rejected overlapping request cannot replace the active authority.
+            runtime_context = _prepare_runtime_context(
+                sessions,
+                session.session_id,
+                body.get("runtime_context"),
+            )
             provider_events = adapter.start_turn(
                 session=session,
                 turn=ProviderTurn(
