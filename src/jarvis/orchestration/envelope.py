@@ -40,6 +40,8 @@ def build_execution_envelope(
         prompt=prompt,
         worker_id=worker_id or command.target_worker_id or "local-worker",
         engine=engine,
+        model=command.target_model_id,
+        provider_instance_id=command.provider_instance_id,
         engine_strategy=engine_strategy,
         project_id=project_id,
         branch_name=branch,

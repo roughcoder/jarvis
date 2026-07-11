@@ -21,7 +21,14 @@ from aiohttp import web  # noqa: E402
 from jarvis.brain.capabilities import RequestContext, can_query_memory_peer  # noqa: E402
 from jarvis.brain.memory_client import ConclusionRecord, MemoryMessage, RepresentationRecord, SessionPeer  # noqa: E402
 from jarvis.brain.memory_outbox import CurationOutbox  # noqa: E402
-from jarvis.connectors.cockpit import CockpitConnector, CockpitThread, orchestrator_session_id  # noqa: E402
+from jarvis.connectors.cockpit import (  # noqa: E402
+    CockpitConnector,
+    CockpitThread,
+    CockpitThreadIndex,
+    _read_child_work_result_tool,
+    _start_ready_child_watch,
+    orchestrator_session_id,
+)
 from jarvis.config import Config, MCPServerSpec, WorkerConfig  # noqa: E402
 import jarvis.orchestration.api as cockpit_api_module  # noqa: E402
 from jarvis.orchestration.api import CockpitAppContext, IdempotencyStore, SseSnapshotHub, _command_from_body, _idempotency_scope, make_app, serve  # noqa: E402
@@ -32,6 +39,7 @@ from jarvis.orchestration.models import Artifact, ExecutionEnvelope, WorkItem, W
 from jarvis.orchestration.oauth import OAuthTokenValidator, OAuthValidationError  # noqa: E402
 from jarvis.orchestration.service import StartedWork  # noqa: E402
 from jarvis.orchestration.store import OrchestrationStore  # noqa: E402
+from jarvis.brain.registry import RegistryStore  # noqa: E402
 
 
 class Response:
@@ -7217,3 +7225,104 @@ def test_cockpit_unarchive_session_rejected_while_run_archived(tmp_path, monkeyp
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=_fake_get(run_id)))
+
+
+def test_child_watch_claims_exactly_once_after_every_expected_child_is_terminal(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    thread = CockpitThread(
+        thread_id="thread_parent",
+        project_id="neil-shared",
+        session_id="project:neil-shared:orchestrator:thread_parent",
+        title="Review pull request",
+        created_at="2026-07-11T10:00:00Z",
+        updated_at="2026-07-11T10:00:00Z",
+        created_by="neil",
+    )
+    index.save(thread)
+    watch_id = index.register_child_watch(thread, ["run_a", "run_b"])
+
+    assert index.claim_ready_child_watch(thread.thread_id, {"run_a"}) is None
+    claimed = index.claim_ready_child_watch(thread.thread_id, {"run_a", "run_b"})
+    assert claimed is not None
+    assert claimed["watch_id"] == watch_id
+    assert index.claim_ready_child_watch(thread.thread_id, {"run_a", "run_b"}) is None
+
+
+def test_read_child_work_result_is_parent_project_scoped_and_bounded(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    parent = CockpitThread(
+        thread_id="thread_parent",
+        project_id=project.id,
+        session_id="project:neil-shared:orchestrator:thread_parent",
+        title="Review pull request",
+        created_at="2026-07-11T10:00:00Z",
+        updated_at="2026-07-11T10:00:00Z",
+        created_by="neil",
+    )
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    child = store.create_run(
+        "Codex review",
+        parent_chat_id=parent.thread_id,
+        project_id=project.id,
+        engine="codex",
+        model="gpt-5.5",
+    )
+    store.append_event(
+        child.run_id,
+        "assistant.message",
+        "",
+        {"time": "2026-07-11T10:01:00Z", "data": {"text": "[P1] Preserve the transition"}},
+    )
+    store.set_phase(child.run_id, "completed", "done")
+    tool = _read_child_work_result_tool(cfg, project, parent)
+    requester = RequestContext(
+        device_id="local-mac",
+        identity="neil",
+        scope="personal",
+        capabilities=frozenset({"orchestration.runs.read"}),
+    )
+
+    result = json.loads(asyncio.run(tool.handler(requester, {"child_chat_id": child.run_id})))
+
+    assert result["ready"] is True
+    assert result["final_result"] == "[P1] Preserve the transition"
+    assert result["engine"] == "codex"
+    assert result["model"] == "gpt-5.5"
+
+
+def test_duplicate_child_terminal_notifications_schedule_one_parent_continuation(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    parent = CockpitThread(
+        thread_id="thread_parent",
+        project_id="neil-shared",
+        session_id="project:neil-shared:orchestrator:thread_parent",
+        title="Review pull request",
+        created_at="2026-07-11T10:00:00Z",
+        updated_at="2026-07-11T10:00:00Z",
+        created_by="neil",
+    )
+    index.save(parent)
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    child = store.create_run("Review", parent_chat_id=parent.thread_id, project_id=parent.project_id)
+    store.set_phase(child.run_id, "completed", "done")
+    index.register_child_watch(parent, [child.run_id])
+    started: list[str] = []
+
+    class FakeThread:
+        def __init__(self, *, target, args, name, daemon):  # noqa: ANN001
+            started.append(name)
+
+        def start(self) -> None:
+            return None
+
+    monkeypatch.setattr("jarvis.connectors.cockpit.threading.Thread", FakeThread)
+
+    _start_ready_child_watch(cfg, parent.thread_id)
+    _start_ready_child_watch(cfg, parent.thread_id)
+
+    assert len(started) == 1

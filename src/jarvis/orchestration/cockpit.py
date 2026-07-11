@@ -815,6 +815,8 @@ def run_summary(
         "phase": run.phase,
         "project_id": run.project_id or None,
         "engine": engine,
+        "model": run.model or None,
+        "provider_instance_id": run.provider_instance_id or None,
         "repo": repo,
         "branch": branch,
         "session_count": len(visible_sessions),

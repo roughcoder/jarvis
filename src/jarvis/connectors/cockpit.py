@@ -18,12 +18,13 @@ import tempfile
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from jarvis.capabilities import WORKER_SESSION_CREATE, WORKER_SESSION_STOP, WORKER_SESSION_TURN
+from jarvis.capabilities import FORGE_PR_COMMENT, WORKER_SESSION_CREATE, WORKER_SESSION_STOP, WORKER_SESSION_TURN
 from jarvis.brain.facade import (
     PROJECT_THREAD_TOOL_SURFACE_CONTRACT,
     ActiveProject,
@@ -45,11 +46,13 @@ from jarvis.brain.facade import (
     UnsupportedMemoryOperation,
     make_memory_tools,
     make_project_tools,
+    resolve_capabilities,
 )
 from jarvis.config import Config
 from jarvis.ids import new_id, utc_now
 from jarvis.orchestration.cockpit import project_session_event
 from jarvis.orchestration.models import WorkCommand, WorkItem
+from jarvis.orchestration.store import OrchestrationStore
 from jarvis.orchestration.service import StartedWork, OrchestrationService
 from jarvis.orchestration.redaction import public_error_message
 from jarvis.orchestration.workers import WorkerRegistry, worker_token_value
@@ -64,6 +67,7 @@ from jarvis.worker_session_contract import EVENT_TOOL_CALL, EVENT_TOOL_RESULT
 THREAD_INDEX_FILENAME = "cockpit-threads.json"
 THREAD_TRANSCRIPTS_DIRNAME = "cockpit-thread-transcripts"
 THREAD_HISTORY_LIMIT = 24
+CHILD_WATCH_LEASE_S = 300
 _THREAD_INDEX_LOCK = threading.RLock()
 _WORK_SESSION_OFFER = (
     "I can't do that from this project conversation because it has no workspace, "
@@ -83,7 +87,12 @@ _WORK_ACTION_CLAIM_RE = re.compile(
     r"[^.?!\n]{0,120}\b(?:code\s+review|review|repo|repository|codebase|pull\s+request|pr|tests?|test\s+suite|pytest|ruff|lint|typecheck)\b",
     re.IGNORECASE,
 )
-_WORK_ACTION_TOOL_NAMES = {"spawn_child_work_session"}
+_WORK_ACTION_TOOL_NAMES = {
+    "publish_github_pr_review",
+    "read_child_work_result",
+    "spawn_child_work_session",
+    "watch_child_work_sessions",
+}
 
 
 @dataclass(frozen=True)
@@ -295,6 +304,71 @@ class CockpitThreadIndex:
             updated = self.save(replace(thread, updated_at=observed_at))
             self._write_thread_messages(updated, messages)
             return True
+
+    def register_child_watch(self, thread: CockpitThread, child_ids: list[str]) -> str:
+        with _THREAD_INDEX_LOCK:
+            stored = self.get(thread.project_id, thread.thread_id) or thread
+            messages = self._thread_messages(stored)
+            normalized = sorted(set(child_ids))
+            watch_id = hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()[:20]
+            if not any(message.get("type") == "child_watch" and message.get("watch_id") == watch_id for message in messages):
+                messages.append(
+                    {
+                        "role": "system",
+                        "peer_id": "jarvis",
+                        "type": "child_watch",
+                        "watch_id": watch_id,
+                        "child_chat_ids": normalized,
+                        "phase": "waiting",
+                        "content": f"Watching {len(normalized)} child work session(s) for completion.",
+                        "observed_at": utc_now(),
+                    }
+                )
+                self._write_thread_messages(stored, messages)
+            return watch_id
+
+    def claim_ready_child_watch(self, parent_chat_id: str, terminal_child_ids: set[str]) -> dict[str, Any] | None:
+        with _THREAD_INDEX_LOCK:
+            thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
+            if thread is None:
+                return None
+            messages = self._thread_messages(thread)
+            claimed: dict[str, Any] | None = None
+            for message in messages:
+                expected = {str(item) for item in message.get("child_chat_ids") or []}
+                phase = str(message.get("phase") or "")
+                lease_expired = phase == "claimed" and _timestamp_before(
+                    str(message.get("claimed_at") or ""),
+                    datetime.now(UTC) - timedelta(seconds=CHILD_WATCH_LEASE_S),
+                )
+                if (
+                    message.get("type") == "child_watch"
+                    and (phase == "waiting" or lease_expired)
+                    and expected
+                    and expected <= terminal_child_ids
+                ):
+                    message["phase"] = "claimed"
+                    message["claimed_at"] = utc_now()
+                    claimed = dict(message)
+                    break
+            if claimed is not None:
+                self._write_thread_messages(thread, messages)
+            return claimed
+
+    def finish_child_watch(self, parent_chat_id: str, watch_id: str, *, error: str = "") -> None:
+        with _THREAD_INDEX_LOCK:
+            thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
+            if thread is None:
+                return
+            messages = self._thread_messages(thread)
+            for message in messages:
+                if message.get("type") == "child_watch" and message.get("watch_id") == watch_id:
+                    message["phase"] = "failed" if error else "completed"
+                    message["completed_at"] = utc_now()
+                    if error:
+                        message["error"] = public_error_message(error)
+                    break
+            self._write_thread_messages(thread, messages)
 
     def append_turn(
         self,
@@ -1013,6 +1087,9 @@ class CockpitConnector:
             tools.register(tool)
         if thread is not None:
             tools.register(_spawn_child_work_tool(self._cfg, project, thread))
+            tools.register(_read_child_work_result_tool(self._cfg, project, thread))
+            tools.register(_publish_github_pr_review_tool(self._cfg, project))
+            tools.register(_watch_child_work_sessions_tool(self._cfg, project, thread))
         if self._cfg.background.enabled:
             async def notify_background(_text: str, _identity: str, _device_id: str) -> None:
                 return None
@@ -1228,20 +1305,23 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
             repo=repo,
             kind="manual",
         )
+        worker_id = str(args.get("worker_id") or "").strip()
+        provider_instance_id = str(args.get("provider_instance_id") or "").strip()
         command = WorkCommand(
             operation="start_next_work",
             source="manual",
-            target_worker_id=str(args.get("worker_id") or ""),
+            filters={"project_id": project.id},
+            target_worker_id=worker_id,
             target_engine_id=str(args.get("engine") or ""),
+            target_model_id=str(args.get("model") or ""),
+            provider_instance_id=provider_instance_id,
             start=True,
         )
         service = OrchestrationService(
             cfg=cfg,
             capabilities=set(ctx.capabilities),
             source_factory=lambda _name, _cfg=None: ManualSource(item),
-            thread_child_terminal_notifier=CockpitThreadIndex(
-                Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME
-            ).append_child_terminal_system_message,
+            thread_child_terminal_notifier=make_child_terminal_notifier(cfg),
             thread_children_promoter=CockpitThreadIndex(
                 Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME
             ).promote_children,
@@ -1267,7 +1347,12 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
                 "title": {"type": "string", "description": "Short child chat title."},
                 "repo": {"type": "string", "description": "Repository name such as roughcoder/jarvis."},
                 "worker_id": {"type": "string", "description": "Optional target worker id."},
+                "provider_instance_id": {
+                    "type": "string",
+                    "description": "Optional explicit cockpit provider instance id, preserved independently of fleet worker routing.",
+                },
                 "engine": {"type": "string", "description": "Optional worker engine route, e.g. codex or claude."},
+                "model": {"type": "string", "description": "Optional explicit provider model id."},
             },
             "required": ["task"],
         },
@@ -1276,6 +1361,336 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
         announce=True,
         timeout_s=cfg.worker.request_timeout_s + 5,
     )
+
+
+def _read_child_work_result_tool(cfg: Config, project: ProjectEntry, thread: CockpitThread) -> Tool:
+    async def read_result(_ctx: RequestContext, args: dict[str, Any]) -> str:
+        child_id = str(args.get("child_chat_id") or args.get("child_run_id") or "").strip()
+        if not child_id:
+            return "error: child_chat_id is required"
+        store = OrchestrationStore(cfg.orchestration.workspace)
+        child = await asyncio.to_thread(store.get, child_id)
+        if child is None:
+            return "error: no such child work session"
+        if child.parent_chat_id != thread.thread_id and child.parent_run_id != thread.thread_id:
+            return "error: child work session does not belong to this orchestrator chat"
+        if child.project_id != project.id:
+            return "error: child work session does not belong to this project"
+        if child.status != "terminal":
+            return json.dumps(
+                {
+                    "child_chat_id": child.run_id,
+                    "phase": child.phase,
+                    "status": child.status,
+                    "ready": False,
+                },
+                sort_keys=True,
+            )
+        events = await asyncio.to_thread(store.events, child.run_id)
+        messages: list[dict[str, str]] = []
+        for event in events:
+            if event.type != "assistant.message" or not isinstance(event.data, dict):
+                continue
+            data = event.data.get("data") if isinstance(event.data.get("data"), dict) else {}
+            text = str(data.get("text") or "").strip()
+            if not text:
+                continue
+            messages.append(
+                {
+                    "text": text[:12_000],
+                    "time": str(event.data.get("time") or event.time or ""),
+                }
+            )
+        messages = messages[-8:]
+        if not messages:
+            return json.dumps(
+                {
+                    "child_chat_id": child.run_id,
+                    "phase": child.phase,
+                    "status": child.status,
+                    "ready": False,
+                    "error": "child work session finished without an assistant result",
+                },
+                sort_keys=True,
+            )
+        return json.dumps(
+            {
+                "child_chat_id": child.run_id,
+                "title": child.objective,
+                "phase": child.phase,
+                "status": child.status,
+                "ready": True,
+                "terminal_reason": child.terminal_reason,
+                "engine": child.engine,
+                "model": child.model,
+                "provider_instance_id": child.provider_instance_id,
+                "final_result": messages[-1]["text"] if messages else "",
+                "assistant_messages": messages,
+            },
+            sort_keys=True,
+        )
+
+    return Tool(
+        "read_child_work_result",
+        "Read the bounded assistant transcript and final result of a child work session after it finishes.",
+        {
+            "type": "object",
+            "properties": {
+                "child_chat_id": {"type": "string", "description": "Child chat/run id returned by spawn_child_work_session."},
+            },
+            "required": ["child_chat_id"],
+        },
+        "orchestration.runs.read",
+        read_result,
+        timeout_s=5,
+    )
+
+
+def _watch_child_work_sessions_tool(cfg: Config, project: ProjectEntry, thread: CockpitThread) -> Tool:
+    async def watch(_ctx: RequestContext, args: dict[str, Any]) -> str:
+        raw_ids = args.get("child_chat_ids")
+        if not isinstance(raw_ids, list):
+            return "error: child_chat_ids must be an array"
+        child_ids = [str(item).strip() for item in raw_ids if str(item).strip()]
+        if not child_ids:
+            return "error: at least one child_chat_id is required"
+        store = OrchestrationStore(cfg.orchestration.workspace)
+        for child_id in child_ids:
+            child = await asyncio.to_thread(store.get, child_id)
+            if child is None:
+                return f"error: no such child work session {child_id}"
+            if (
+                child.project_id != project.id
+                or (child.parent_chat_id != thread.thread_id and child.parent_run_id != thread.thread_id)
+            ):
+                return f"error: child work session {child_id} does not belong to this orchestrator chat"
+        watch_id = await asyncio.to_thread(CockpitThreadIndex(
+            Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME
+        ).register_child_watch, thread, child_ids)
+        await asyncio.to_thread(_start_ready_child_watch, cfg, thread.thread_id)
+        return json.dumps(
+            {"watch_id": watch_id, "child_chat_ids": sorted(set(child_ids)), "registered": True},
+            sort_keys=True,
+        )
+
+    return Tool(
+        "watch_child_work_sessions",
+        "Register child work sessions for one event-driven parent continuation after all become terminal. Returns immediately.",
+        {
+            "type": "object",
+            "properties": {
+                "child_chat_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                }
+            },
+            "required": ["child_chat_ids"],
+        },
+        "orchestration.runs.read",
+        watch,
+        timeout_s=5,
+    )
+
+
+def make_child_terminal_notifier(cfg: Config) -> Callable[[str, Any], bool]:
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
+
+    def notify(parent_chat_id: str, child: Any) -> bool:
+        appended = index.append_child_terminal_system_message(parent_chat_id, child)
+        _start_ready_child_watch(cfg, parent_chat_id)
+        return appended
+
+    return notify
+
+
+def _start_ready_child_watch(cfg: Config, parent_chat_id: str) -> None:
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    terminal_ids = {
+        run.run_id
+        for run in store.list_runs()
+        if (run.parent_chat_id == parent_chat_id or run.parent_run_id == parent_chat_id)
+        and run.status == "terminal"
+    }
+    watch = index.claim_ready_child_watch(parent_chat_id, terminal_ids)
+    if watch is None:
+        return
+    thread = threading.Thread(
+        target=_continue_child_watch,
+        args=(cfg, parent_chat_id, watch),
+        name=f"jarvis-child-watch-{watch['watch_id']}",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _continue_child_watch(cfg: Config, parent_chat_id: str, watch: dict[str, Any]) -> None:
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
+    watch_id = str(watch.get("watch_id") or "")
+
+    async def run() -> None:
+        thread = next((item for item in index._threads().values() if item.thread_id == parent_chat_id), None)  # noqa: SLF001
+        if thread is None:
+            raise RuntimeError("parent orchestrator chat no longer exists")
+        registry = RegistryStore(cfg.registry.path)
+        project = registry.get_project(thread.project_id)
+        if project is None:
+            raise RuntimeError("parent orchestrator project no longer exists")
+        users = load_users(cfg.capabilities.users_dir)
+        user = users.get(thread.created_by)
+        capabilities = set(resolve_capabilities(cfg.capabilities))
+        if user is not None:
+            capabilities.update(user.capabilities)
+        requester = RequestContext(
+            device_id=cfg.capabilities.device_id,
+            identity=thread.created_by,
+            scope=user.scope if user is not None else "personal",
+            capabilities=frozenset(capabilities),
+            channel="cockpit",
+            peer=user.peer if user is not None else thread.created_by,
+        )
+        child_ids = [str(item) for item in watch.get("child_chat_ids") or []]
+        instruction = (
+            "Automatic orchestration continuation: all watched child work sessions are terminal. "
+            f"Read each result with read_child_work_result for these child_chat_ids: {', '.join(child_ids)}. "
+            "Then continue the original workflow: combine and deduplicate the results, perform any requested "
+            "capability-gated external action, and report the outcome. Do not spawn replacement children unless "
+            "a result explicitly failed and the original user request requires recovery."
+        )
+        connector = CockpitConnector(cfg)
+        await connector.turn(project, thread, requester, instruction)
+
+    try:
+        asyncio.run(run())
+    except Exception as exc:  # noqa: BLE001 - failure is durable and visible on the parent thread
+        index.finish_child_watch(parent_chat_id, watch_id, error=str(exc))
+    else:
+        index.finish_child_watch(parent_chat_id, watch_id)
+
+
+def _publish_github_pr_review_tool(cfg: Config, project: ProjectEntry) -> Tool:
+    async def publish(ctx: RequestContext, args: dict[str, Any]) -> str:
+        repo = str(args.get("repo") or "").strip()
+        if not _project_has_repo(project, repo):
+            return "error: repo is not registered to this project"
+        comments = args.get("comments")
+        if not isinstance(comments, list):
+            return "error: comments must be an array"
+        try:
+            worker = await asyncio.to_thread(_github_review_worker, cfg, project, repo)
+            token = worker_token_value(worker.token_env) if worker.token_env else ""
+            if not token and worker.worker_id == "local-worker":
+                token = cfg.worker.token.get_secret_value()
+            response = await asyncio.to_thread(
+                httpx.post,
+                f"{worker.base_url}/run",
+                json={
+                    "action": "github_pr_review",
+                    "args": {
+                        "repo": repo,
+                        "pull_number": int(args.get("pull_number") or 0),
+                        "commit_id": str(args.get("commit_id") or ""),
+                        "summary": str(args.get("summary") or ""),
+                        "comments": [dict(item) for item in comments if isinstance(item, dict)],
+                        "idempotency_key": str(args.get("idempotency_key") or ""),
+                        "execution_envelope": {
+                            "allowed_actions": sorted(ctx.capabilities),
+                            "landing": {"mode": "review", "allow_merge": False},
+                        },
+                    },
+                },
+                headers={"Authorization": f"Bearer {token}"} if token else {},
+                timeout=30,
+            )
+            payload = response.json()
+            if response.status_code >= 400 or not payload.get("ok"):
+                raise RuntimeError(str(payload.get("error") or response.text or "worker rejected GitHub review"))
+        except Exception as exc:  # noqa: BLE001 - external write errors become bounded tool output
+            return f"error: could not publish GitHub review ({public_error_message(str(exc))})"
+        result = payload.get("review") if isinstance(payload.get("review"), dict) else {}
+        return json.dumps(
+            {
+                "published": True,
+                "review_id": int(result.get("review_id") or 0),
+                "url": str(result.get("url") or ""),
+                "comments": int(result.get("comments") or 0),
+                "skipped_comments": int(result.get("skipped_comments") or 0),
+                "replayed": bool(payload.get("replayed")),
+                "worker_id": worker.worker_id,
+            },
+            sort_keys=True,
+        )
+
+    return Tool(
+        "publish_github_pr_review",
+        "Publish one structured GitHub pull-request review with line comments and optional suggestions.",
+        {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "GitHub repository in owner/name form; must belong to this project."},
+                "pull_number": {"type": "integer", "minimum": 1},
+                "commit_id": {"type": "string", "description": "Optional reviewed head commit SHA."},
+                "summary": {"type": "string", "description": "Required review-level summary or findings that cannot be placed inline."},
+                "idempotency_key": {"type": "string", "description": "Stable unique key for this reviewed commit and joined result."},
+                "comments": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "line": {"type": "integer", "minimum": 1},
+                            "side": {"type": "string", "enum": ["LEFT", "RIGHT"]},
+                            "severity": {"type": "string", "enum": ["P1", "P2", "P3"]},
+                            "title": {"type": "string"},
+                            "body": {"type": "string"},
+                            "suggestion": {"type": "string", "description": "Optional exact replacement for a GitHub suggestion block."},
+                        },
+                        "required": ["path", "line", "severity", "title", "body"],
+                    },
+                },
+            },
+            "required": ["repo", "pull_number", "commit_id", "summary", "idempotency_key", "comments"],
+        },
+        FORGE_PR_COMMENT,
+        publish,
+        announce=True,
+        timeout_s=30,
+    )
+
+
+def _project_has_repo(project: ProjectEntry, repo: str) -> bool:
+    normalized = repo.removesuffix(".git").rstrip("/")
+    return any(
+        candidate == normalized or candidate.endswith(f"/{normalized}")
+        for entry in project.repos
+        for candidate in (
+            entry.remote.removesuffix(".git").rstrip("/"),
+            entry.name.removesuffix(".git").rstrip("/"),
+        )
+    )
+
+
+def _github_review_worker(cfg: Config, project: ProjectEntry, repo: str):  # noqa: ANN202 - WorkerProfile inferred across boundary
+    registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path)
+    profiles = registry.with_repo_access(registry.profiles(probe=True), repo)
+    for worker in profiles:
+        access = next(
+            (
+                item
+                for item in worker.repo_access
+                if str(item.get("repo") or "").removesuffix(".git") == repo.removesuffix(".git")
+            ),
+            {},
+        )
+        if (
+            worker.status == "online"
+            and worker.base_url
+            and access.get("accessible") is True
+            and worker.git_identity.get("authenticated") is True
+        ):
+            return worker
+    raise RuntimeError(f"no authenticated worker can publish reviews for a repository in project {project.id}")
 
 
 def _project_default_repo(project: ProjectEntry) -> str:
@@ -1498,6 +1913,16 @@ def _thread_title(text: str) -> str:
     return title if len(title) <= 72 else title[:71] + "..."
 
 
+def _timestamp_before(value: str, threshold: datetime) -> bool:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed < threshold
+
+
 def _normalized_messages(messages: Any) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for item in messages:
@@ -1509,9 +1934,22 @@ def _normalized_messages(messages: Any) -> list[dict[str, Any]]:
             "content": str(item.get("content") or ""),
             "observed_at": str(item.get("observed_at") or ""),
         }
-        for key in ("type", "child_chat_id", "child_run_id", "phase", "status", "terminal_reason"):
+        for key in (
+            "type",
+            "child_chat_id",
+            "child_run_id",
+            "phase",
+            "status",
+            "terminal_reason",
+            "watch_id",
+            "claimed_at",
+            "completed_at",
+            "error",
+        ):
             if key in item:
                 message[key] = str(item.get(key) or "")
+        if isinstance(item.get("child_chat_ids"), list):
+            message["child_chat_ids"] = [str(value) for value in item["child_chat_ids"] if str(value)]
         event = item.get("event")
         if isinstance(event, dict):
             message["event"] = dict(event)

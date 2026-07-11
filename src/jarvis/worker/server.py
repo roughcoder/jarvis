@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import os
 import pathlib
 import subprocess
@@ -27,6 +29,7 @@ from typing import Any
 from aiohttp import web
 
 from jarvis.capabilities import (
+    FORGE_PR_COMMENT,
     WORKER_SESSION_APPROVE,
     WORKER_SESSION_INPUT,
     WORKER_SESSION_INTERRUPT,
@@ -35,6 +38,7 @@ from jarvis.capabilities import (
     WORKER_SESSION_TURN,
 )
 from jarvis.config import WorkerConfig
+from jarvis.github_reviews import publish_github_pr_review
 from jarvis.engines import engine_ids, normalize_engine_id, worker_supports_engine
 from jarvis.worker.authority import WorkerSessionAuthority
 from jarvis.worker.actions import (
@@ -400,6 +404,42 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 ttl_s=cfg.repo_access_ttl_s,
             )
             return web.json_response({"ok": True, "access": access})
+        if action == "github_pr_review":
+            try:
+                authority = WorkerSessionAuthority.from_metadata(
+                    {"execution_envelope": args.get("execution_envelope")}
+                )
+                authority.require(FORGE_PR_COMMENT)
+                idempotency_key = str(args.get("idempotency_key") or "").strip()
+                if not idempotency_key:
+                    raise ValueError("idempotency_key is required")
+                fingerprint = hashlib.sha256(
+                    json.dumps(
+                        {key: value for key, value in args.items() if key != "execution_envelope"},
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest()
+                cached = _github_review_idempotency_get(workspace, idempotency_key, fingerprint)
+                if cached is not None:
+                    return web.json_response({"ok": True, "review": cached, "replayed": True})
+                result = await asyncio.to_thread(
+                    publish_github_pr_review,
+                    repo=str(args.get("repo") or ""),
+                    pull_number=int(args.get("pull_number") or 0),
+                    commit_id=str(args.get("commit_id") or ""),
+                    summary=str(args.get("summary") or ""),
+                    comments=[dict(item) for item in args.get("comments") or [] if isinstance(item, dict)],
+                )
+                review = {
+                    "review_id": result.review_id,
+                    "url": result.url,
+                    "comments": result.comments,
+                    "skipped_comments": result.skipped_comments,
+                }
+                _github_review_idempotency_put(workspace, idempotency_key, fingerprint, review)
+                return web.json_response({"ok": True, "review": review, "replayed": False})
+            except (RuntimeError, TypeError, ValueError) as exc:
+                return web.json_response({"ok": False, "error": str(exc)}, status=400)
         if action == "cleanup":
             ref = (args.get("job") or "").strip()
             finished = {"done", "error", "interrupted"}
@@ -1032,6 +1072,43 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         web.get("/health", health),
     ])
     return app
+
+
+def _github_review_idempotency_path(workspace: pathlib.Path, key: str) -> pathlib.Path:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    root = workspace / "github-review-idempotency"
+    root.mkdir(parents=True, exist_ok=True)
+    return root / f"{digest}.json"
+
+
+def _github_review_idempotency_get(
+    workspace: pathlib.Path,
+    key: str,
+    fingerprint: str,
+) -> dict[str, Any] | None:
+    path = _github_review_idempotency_path(workspace, key)
+    if not path.exists():
+        return None
+    try:
+        stored = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("stored GitHub review idempotency record is unreadable") from exc
+    if str(stored.get("fingerprint") or "") != fingerprint:
+        raise ValueError("idempotency_key was already used for a different GitHub review")
+    review = stored.get("review")
+    return dict(review) if isinstance(review, dict) else None
+
+
+def _github_review_idempotency_put(
+    workspace: pathlib.Path,
+    key: str,
+    fingerprint: str,
+    review: dict[str, Any],
+) -> None:
+    path = _github_review_idempotency_path(workspace, key)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"fingerprint": fingerprint, "review": review}, sort_keys=True))
+    temporary.replace(path)
 
 
 async def _append_session_control_event(

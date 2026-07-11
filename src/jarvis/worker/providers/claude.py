@@ -215,6 +215,7 @@ class _ClaudeSessionRuntime:
         self.authority = authority
         self.claude_session_id = claude_session_id
         self.cwd = _session_cwd(session, worker_cfg)
+        self.model = str(session.metadata.get("model") or "")
         self.resume = bool(str(session.metadata.get("claude_session_started") or "").strip())
         self._queue: queue.Queue[_QueuedTurn | _StopRuntime] = queue.Queue()
         self._pending_lock = threading.RLock()
@@ -291,6 +292,7 @@ class _ClaudeSessionRuntime:
         sdk = _load_sdk()
         options = sdk.ClaudeAgentOptions(
             cwd=self.cwd,
+            model=self.model or None,
             permission_mode=self.authority.claude_permission_mode,
             session_id=None if self.resume else self.claude_session_id,
             resume=self.claude_session_id if self.resume else None,
