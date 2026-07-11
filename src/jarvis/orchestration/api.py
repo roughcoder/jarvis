@@ -4009,7 +4009,7 @@ async def serve(cfg: Config) -> int:
         )
         return 1
     app = make_app(cfg)
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app, keepalive_timeout=15)
     await runner.setup()
     site = web.TCPSite(runner, bind, cfg.orchestration.api_port)
     await site.start()

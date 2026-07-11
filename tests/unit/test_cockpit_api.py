@@ -4776,6 +4776,48 @@ def test_cockpit_api_refuses_unsafe_bind_with_nonzero_status(tmp_path, monkeypat
     assert asyncio.run(serve(cfg)) == 1
 
 
+def test_cockpit_api_bounds_idle_keepalive_connections(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    runner_options: dict[str, Any] = {}
+
+    class FakeRunner:
+        def __init__(self, _app: object, **kwargs: Any) -> None:
+            runner_options.update(kwargs)
+
+        async def setup(self) -> None:
+            pass
+
+        async def cleanup(self) -> None:
+            pass
+
+    class FakeSite:
+        def __init__(self, _runner: FakeRunner, _bind: str, _port: int) -> None:
+            pass
+
+        async def start(self) -> None:
+            pass
+
+    class FakeEvent:
+        def set(self) -> None:
+            pass
+
+        async def wait(self) -> None:
+            pass
+
+    class FakeLoop:
+        def add_signal_handler(self, _signal: object, _callback: object) -> None:
+            pass
+
+    monkeypatch.setattr(cockpit_api_module, "make_app", lambda _cfg: object())
+    monkeypatch.setattr(cockpit_api_module.web, "AppRunner", FakeRunner)
+    monkeypatch.setattr(cockpit_api_module.web, "TCPSite", FakeSite)
+    monkeypatch.setattr(cockpit_api_module.asyncio, "Event", FakeEvent)
+    monkeypatch.setattr(cockpit_api_module.asyncio, "get_running_loop", FakeLoop)
+
+    assert asyncio.run(serve(cfg)) == 0
+    assert runner_options == {"keepalive_timeout": 15}
+
+
 def test_cockpit_session_write_proxy_and_idempotency(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, caps="worker.session.turn")
     _store, run_id = _seed_run(cfg)
