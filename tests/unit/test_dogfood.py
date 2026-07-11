@@ -17,6 +17,8 @@ from jarvis.dogfood import (
     _host_prepare,
     _host_rollback,
     _host_status,
+    _invoke_host,
+    _probe,
     load_inventory,
 )
 
@@ -180,6 +182,86 @@ def test_activation_restores_previous_runtime_when_health_never_converges(tmp_pa
     root = Path(host.runtime_root)
     assert os.readlink(root / "current") == host.production_bin
     assert not (root / "state.json").exists()
+
+
+def test_activation_restores_distinct_previous_target_when_service_configuration_fails(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    host = _host(tmp_path)
+    _host_prepare(host, sha=SHA, archive=str(_archive(tmp_path)))
+    root = Path(host.runtime_root)
+    dogfood_target = str(root / "builds" / SHA / "bin" / "jarvis")
+    monkeypatch.setattr(
+        "jarvis.dogfood._configure_services",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("install failed")),
+    )
+    monkeypatch.setattr("jarvis.dogfood._restart_services", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="install failed"):
+        _host_activate(host, sha=SHA)
+
+    assert os.readlink(root / "current") == host.production_bin
+    assert os.readlink(root / "previous") == dogfood_target
+
+
+def test_remote_invocation_uses_private_temporary_directory(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    host = DogfoodHost(
+        **{
+            **_host(tmp_path).__dict__,
+            "local": False,
+            "ssh": "review-host",
+        }
+    )
+    archive = tmp_path / "archive.tar.gz"
+    archive.write_bytes(b"archive")
+    calls: list[list[str]] = []
+
+    def run(argv, **_kwargs):  # noqa: ANN001
+        calls.append(list(argv))
+        if list(argv[:2]) == ["ssh", "review-host"] and "mktemp -d" in argv[-1]:
+            return subprocess.CompletedProcess(argv, 0, "/tmp/jarvis-dogfood.A1b2C3\n", "")
+        if list(argv[:2]) == ["ssh", "review-host"] and "_host-prepare" in argv[-1]:
+            return subprocess.CompletedProcess(argv, 0, '{"ok": true}', "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr("jarvis.dogfood.subprocess.run", run)
+
+    result = _invoke_host(host, "_host-prepare", sha=SHA, archive=archive)
+
+    assert result["ok"] is True
+    scp_targets = [call[-1] for call in calls if call[0] == "scp"]
+    assert scp_targets == [
+        "review-host:/tmp/jarvis-dogfood.A1b2C3/helper.py",
+        "review-host:/tmp/jarvis-dogfood.A1b2C3/archive.tar.gz",
+    ]
+    assert any(call[:2] == ["ssh", "review-host"] and "rm -rf --" in call[-1] for call in calls)
+
+
+def test_authenticated_probe_does_not_follow_redirects(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    host = _host(tmp_path)
+    Path(host.workdir, ".env").write_text("WORKER_TOKEN=secret\n", encoding="utf-8")
+    opened: list[object] = []
+
+    class Opener:
+        def open(self, request, *, timeout):  # noqa: ANN001
+            opened.append((request, timeout))
+            raise __import__("urllib.error").error.HTTPError(
+                request.full_url, 302, "Found", {}, None
+            )
+
+    monkeypatch.setattr("jarvis.dogfood.urllib.request.build_opener", lambda *_handlers: Opener())
+
+    result = _probe(
+        host,
+        {
+            "role": "worker",
+            "url": "http://127.0.0.1:8780/health",
+            "token_env": "WORKER_TOKEN",
+        },
+    )
+
+    assert opened
+    assert result == {"ok": False, "role": "worker", "status": 302, "error": "HTTP 302"}
 
 
 def test_rollback_restores_current_runtime_when_previous_target_is_unhealthy(tmp_path, monkeypatch) -> None:  # noqa: ANN001

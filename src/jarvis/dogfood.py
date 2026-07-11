@@ -38,6 +38,12 @@ KNOWN_EXTRAS = frozenset(
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 REVIEW_RING_ROLES = frozenset({"api", "worker"})
 PROBE_TOKEN_ENVS = frozenset({"ORCHESTRATION_API_TOKEN", "WORKER_TOKEN"})
+REMOTE_TEMP_RE = re.compile(r"/tmp/jarvis-dogfood\.[A-Za-z0-9]+")
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ANN201
+        return None
 
 
 @dataclass(frozen=True)
@@ -259,36 +265,56 @@ def _invoke_host(
     check: bool = True,
 ) -> dict[str, Any]:
     helper = Path(__file__).resolve()
-    remote_helper = f"/tmp/jarvis-dogfood-helper-{os.getpid()}.py"
-    remote_archive = f"/tmp/jarvis-dogfood-{sha}.tar.gz" if archive else ""
     if dry_run:
         return {"ok": True, "host": host.name, "action": action.removeprefix("_host-"), "dry_run": True}
     if host.ssh:
-        subprocess.run(["scp", "-q", str(helper), f"{host.ssh}:{remote_helper}"], check=True)
-        if archive is not None:
-            subprocess.run(["scp", "-q", str(archive), f"{host.ssh}:{remote_archive}"], check=True)
-        argv = [
-            host.uv_bin,
-            "run",
-            "--no-project",
-            "--python",
-            host.python,
-            "python",
-            remote_helper,
-            action,
-            "--host-json",
-            _encoded_host(host),
-        ]
-        if sha:
-            argv.extend(["--sha", sha])
-        if remote_archive:
-            argv.extend(["--archive", remote_archive])
-        result = subprocess.run(
-            ["ssh", host.ssh, shlex.join(argv)],
+        allocated = subprocess.run(
+            ["ssh", host.ssh, "umask 077 && mktemp -d /tmp/jarvis-dogfood.XXXXXXXXXX"],
             capture_output=True,
             text=True,
             check=False,
         )
+        remote_root = allocated.stdout.strip()
+        if allocated.returncode != 0 or REMOTE_TEMP_RE.fullmatch(remote_root) is None:
+            raise RuntimeError(
+                f"dogfood could not allocate a private temporary directory on {host.name}: "
+                f"{(allocated.stderr or allocated.stdout).strip()}"
+            )
+        remote_helper = f"{remote_root}/helper.py"
+        remote_archive = f"{remote_root}/archive.tar.gz" if archive else ""
+        try:
+            subprocess.run(["scp", "-q", str(helper), f"{host.ssh}:{remote_helper}"], check=True)
+            if archive is not None:
+                subprocess.run(["scp", "-q", str(archive), f"{host.ssh}:{remote_archive}"], check=True)
+            argv = [
+                host.uv_bin,
+                "run",
+                "--no-project",
+                "--python",
+                host.python,
+                "python",
+                remote_helper,
+                action,
+                "--host-json",
+                _encoded_host(host),
+            ]
+            if sha:
+                argv.extend(["--sha", sha])
+            if remote_archive:
+                argv.extend(["--archive", remote_archive])
+            result = subprocess.run(
+                ["ssh", host.ssh, shlex.join(argv)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        finally:
+            subprocess.run(
+                ["ssh", host.ssh, f"rm -rf -- {shlex.quote(remote_root)}"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
     else:
         argv = [sys.executable, str(helper), action, "--host-json", _encoded_host(host)]
         if sha:
@@ -398,6 +424,7 @@ def _host_activate(host: DogfoodHost, *, sha: str) -> dict[str, Any]:
         _configure_services(host, root)
     except Exception:
         _atomic_symlink(previous_target, root / "current")
+        _atomic_symlink(target, root / "previous")
         _restart_services(host, root, tolerate_failure=True)
         raise
     state = {
@@ -600,7 +627,8 @@ def _probe(host: DogfoodHost, probe: dict[str, str]) -> dict[str, Any]:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(probe["url"], headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=8) as response:
+        opener = urllib.request.build_opener(_NoRedirectHandler())
+        with opener.open(request, timeout=8) as response:
             payload = json.load(response)
     except HTTPError as exc:
         return {
