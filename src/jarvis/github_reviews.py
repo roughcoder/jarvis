@@ -56,33 +56,26 @@ def publish_github_pr_review(
     skipped: list[str] = []
     invalid_count = 0
     duplicate_count = 0
-    global_diff_lines: dict[tuple[str, int, str], int] | None = None
+    global_diff_lines = (
+        _global_diff_line_map(_gh_text(run, ["gh", "pr", "diff", str(pull_number), "--repo", repo]))
+        if comments
+        else {}
+    )
     for comment in comments:
         try:
-            rendered = _review_comment(comment, anchors=anchors)
+            candidate = _resolve_review_comment_line(
+                comment,
+                anchors=anchors,
+                global_diff_lines=global_diff_lines,
+            )
+            rendered = _review_comment(candidate, anchors=anchors)
         except ValueError as exc:
-            if "is not in the current pull request diff" in str(exc):
-                if global_diff_lines is None:
-                    global_diff_lines = _global_diff_line_map(
-                        _gh_text(run, ["gh", "pr", "diff", str(pull_number), "--repo", repo])
-                    )
-                normalized = _normalize_global_diff_line(comment, global_diff_lines)
-                if normalized is not None:
-                    try:
-                        rendered = _review_comment(normalized, anchors=anchors)
-                    except ValueError:
-                        rendered = None
-                else:
-                    rendered = None
-            else:
-                rendered = None
-            if rendered is None:
-                invalid_count += 1
-                skipped.append(
-                    f"[{str(comment.get('severity') or 'P3').upper()}] "
-                    f"{str(comment.get('title') or 'Finding')}: {exc}"
-                )
-                continue
+            invalid_count += 1
+            skipped.append(
+                f"[{str(comment.get('severity') or 'P3').upper()}] "
+                f"{str(comment.get('title') or 'Finding')}: {exc}"
+            )
+            continue
         key = (rendered["path"], rendered["line"], rendered["side"], rendered["body"])
         if key in existing_keys:
             duplicate_count += 1
@@ -251,6 +244,35 @@ def _normalize_global_diff_line(
         return None
     line = global_diff_lines.get((path, position, side))
     return {**comment, "line": line} if line is not None else None
+
+
+def _resolve_review_comment_line(
+    comment: dict[str, Any],
+    *,
+    anchors: dict[str, dict[str, set[int]]],
+    global_diff_lines: dict[tuple[str, int, str], int],
+) -> dict[str, Any]:
+    normalized = _normalize_global_diff_line(comment, global_diff_lines)
+    if normalized is None or normalized.get("line") == comment.get("line"):
+        return comment
+    if _comment_anchor_exists(comment, anchors):
+        raise ValueError(
+            "comment line is ambiguous between a valid file line and a different gh diff output position"
+        )
+    return normalized
+
+
+def _comment_anchor_exists(
+    comment: dict[str, Any],
+    anchors: dict[str, dict[str, set[int]]],
+) -> bool:
+    path = str(comment.get("path") or "").strip()
+    side = str(comment.get("side") or "RIGHT").upper()
+    try:
+        line = int(comment.get("line") or 0)
+    except (TypeError, ValueError):
+        return False
+    return side in {"LEFT", "RIGHT"} and path in anchors and line in anchors[path][side]
 
 
 def _review_comment(comment: dict[str, Any], *, anchors: dict[str, dict[str, set[int]]]) -> dict[str, Any]:

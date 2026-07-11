@@ -152,6 +152,63 @@ def test_publish_github_pr_review_normalizes_global_diff_output_line_to_file_lin
     assert payload["comments"][0]["line"] == 101
 
 
+def test_publish_github_pr_review_rejects_ambiguous_global_and_file_line() -> None:
+    calls: list[tuple[list[str], str]] = []
+
+    def run(argv, **kwargs):  # noqa: ANN001
+        calls.append((list(argv), str(kwargs.get("input") or "")))
+        endpoint = next((str(item) for item in argv if str(item).startswith("repos/")), "")
+        if endpoint.endswith("/pulls/7"):
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"head": {"sha": "abc123"}}), "")
+        if endpoint.endswith("/files"):
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps(
+                    [[{"filename": "src/app.py", "patch": "@@ -6 +6 @@\n-old-six\n+new-six\n@@ -100,2 +100,3 @@\n old\n+new\n tail"}]]
+                ),
+                "",
+            )
+        if endpoint.endswith("/comments"):
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[:3] == ["gh", "pr", "diff"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -100,2 +100,3 @@\n old\n+new\n tail\n",
+                "",
+            )
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            json.dumps({"id": 102, "html_url": "https://example.test/review/102"}),
+            "",
+        )
+
+    result = publish_github_pr_review(
+        repo="acme/widget",
+        pull_number=7,
+        commit_id="abc123",
+        summary="Summary",
+        comments=[
+            {
+                "path": "src/app.py",
+                "line": 6,
+                "side": "RIGHT",
+                "severity": "P2",
+                "title": "Ambiguous line",
+                "body": "Six is both a valid file line and a global diff position.",
+            }
+        ],
+        runner=run,
+    )
+
+    payload = json.loads(calls[-1][1])
+    assert result.comments == 0
+    assert result.skipped_comments == 1
+    assert payload["comments"] == []
+
+
 def test_publish_github_pr_review_suppresses_equivalent_existing_inline_comment() -> None:
     posted = False
     body = "[P2] Keep the guard\n\nRemoving this guard reopens the race."
@@ -175,6 +232,8 @@ def test_publish_github_pr_review_suppresses_equivalent_existing_inline_comment(
                 json.dumps([[{"path": "src/app.py", "line": 1, "side": "RIGHT", "body": body}]]),
                 "",
             )
+        if argv[:3] == ["gh", "pr", "diff"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
         posted = True
         return subprocess.CompletedProcess(argv, 0, "{}", "")
 
