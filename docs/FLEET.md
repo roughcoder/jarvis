@@ -394,12 +394,12 @@ JARVIS_ENV_FILE=~/.jarvis/.env jarvis fleet-status --json --no-docker
 Room Pis:
 
 ```bash
-ssh alice@<tailscale-ip> 'sudo jarvis-pi update && jarvis-pi status && jarvis-pi doctor'
+ssh alice@<private-ip> 'sudo jarvis-pi update && jarvis-pi status && jarvis-pi doctor'
 ```
 
-If a Pi is offline in Tailscale, do not continue the Pi step from the brain Mac.
-Ask for a physical power/network check, then retry SSH when Tailscale reports the
-host online.
+If a Pi is offline on the private network, do not continue the Pi step from the
+brain Mac. Ask for a physical power/network check, then retry SSH when the host
+is reachable again.
 
 Pi screens are optional hardware. The SunFounder Pironman 5 Pro Max screen is a
 4.3-inch 800x480 MIPI DSI touch display. Keep `INTERCOM_DEVICE_PI_PANEL=auto`
@@ -462,17 +462,17 @@ ctl.!default {
 }
 ```
 
-When the brain is reached over Tailscale, harden the Pi systemd unit so Jarvis
-does not start before the tailnet route to the brain exists. The important parts
+When the brain is reached over a private network, harden the Pi systemd unit so
+Jarvis does not start before the route to the brain exists. The important parts
 are:
 
 ```ini
 [Unit]
-After=network-online.target tailscaled.service sound.target
-Wants=network-online.target tailscaled.service
+After=network-online.target sound.target
+Wants=network-online.target
 
 [Service]
-ExecStartPre=/bin/sh -c 'for i in $(seq 1 120); do /usr/bin/nc -z -w 2 <brain-tailscale-ip> 8700 && exit 0; sleep 2; done; echo "Jarvis brain not reachable" >&2; exit 1'
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 120); do /usr/bin/nc -z -w 2 <brain-private-ip> 8700 && exit 0; sleep 2; done; echo "Jarvis brain not reachable" >&2; exit 1'
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
