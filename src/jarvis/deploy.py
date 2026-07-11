@@ -33,7 +33,7 @@ ROLE_COMMANDS = {
 }
 ROLE_EXTRAS = {
     "brain": ["gateway", "tts", "stt", "vad", "wake", "memory", "mcp"],
-    "api": ["cockpit"],
+    "api": ["gateway", "cockpit"],
     "intercom": ["stt", "vad", "wake"],
     "worker": ["worker", "browser"],
     "whatsapp": [],

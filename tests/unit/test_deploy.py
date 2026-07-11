@@ -24,6 +24,7 @@ from jarvis.deploy import (
 
 def test_role_extras_are_ordered_and_deduplicated() -> None:
     assert role_extras({"api", "worker", "intercom", "whatsapp"}) == [
+        "gateway",
         "cockpit",
         "stt",
         "vad",
