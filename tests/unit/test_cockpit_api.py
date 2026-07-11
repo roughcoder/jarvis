@@ -7172,6 +7172,61 @@ def test_cockpit_opens_explicit_code_agent_orchestrator_thread(tmp_path, monkeyp
     asyncio.run(_with_server(cfg, calls))
 
 
+def test_orchestrator_turn_wait_pages_past_old_worker_events(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    requests: list[str] = []
+    old_events = [
+        {
+            "event_id": f"event_{index}",
+            "type": "assistant.delta",
+            "data": {"turn_id": "turn_old", "text": "old"},
+        }
+        for index in range(500)
+    ]
+
+    def get_events(_worker_id: str, path: str) -> dict:
+        requests.append(path)
+        if "after=event_499" in path:
+            return {
+                "events": [
+                    {
+                        "event_id": "event_500",
+                        "type": "assistant.message",
+                        "data": {"turn_id": "turn_current", "text": "review complete"},
+                    },
+                    {
+                        "event_id": "event_501",
+                        "type": "turn.completed",
+                        "data": {"turn_id": "turn_current"},
+                    },
+                ]
+            }
+        return {"events": old_events}
+
+    monkeypatch.setattr(connector, "_get_worker_json", get_events)
+
+    result = asyncio.run(
+        connector._wait_for_orchestrator_turn(  # noqa: SLF001
+            "worker_a",
+            "session_a",
+            "turn_current",
+        )
+    )
+
+    assert result == "review complete"
+    assert requests == [
+        "/sessions/session_a/events?limit=500",
+        "/sessions/session_a/events?limit=500&after=event_499",
+    ]
+
+
 def test_cockpit_thread_projection_carries_engine_model_status(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)
@@ -7411,6 +7466,57 @@ def test_pending_child_watch_accepts_revised_completion_instruction(tmp_path, mo
     assert claimed["requester"]["capabilities"] == ["orchestration.runs.read"]
 
 
+def test_pending_child_watch_rejects_instruction_update_from_different_requester(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    parent = CockpitThread(
+        thread_id="thread_parent",
+        project_id="neil-shared",
+        session_id="project:neil-shared:orchestrator:thread_parent",
+        title="Review pull request",
+        created_at="2026-07-11T10:00:00Z",
+        updated_at="2026-07-11T10:00:00Z",
+        created_by="neil",
+    )
+    index.save(parent)
+    privileged = RequestContext(
+        device_id="local-mac",
+        identity="neil",
+        scope="personal",
+        capabilities=frozenset({"orchestration.runs.read", "forge.github.pr.comment"}),
+    )
+    read_only = RequestContext(
+        device_id="shared-browser",
+        identity="guest",
+        scope="household",
+        capabilities=frozenset({"orchestration.runs.read"}),
+    )
+
+    index.register_child_watch(
+        parent,
+        ["run_a", "run_b"],
+        requester=privileged,
+        continuation_instruction="Read and summarize the results.",
+    )
+    index.register_child_watch(
+        parent,
+        ["run_a", "run_b"],
+        requester=read_only,
+        continuation_instruction="Publish the review using the stored authority.",
+    )
+    claimed = index.claim_ready_child_watch(parent.thread_id, {"run_a", "run_b"})
+
+    assert claimed is not None
+    assert claimed["continuation_instruction"] == "Read and summarize the results."
+    assert claimed["requester"]["identity"] == "neil"
+    assert claimed["requester"]["capabilities"] == [
+        "forge.github.pr.comment",
+        "orchestration.runs.read",
+    ]
+
+
 def test_child_watch_continuation_reuses_exact_requester_authority(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch)
     _seed_project_registry(cfg)
@@ -7454,6 +7560,64 @@ def test_child_watch_continuation_reuses_exact_requester_authority(tmp_path, mon
     assert continued[0][0].identity == "neil"
     assert continued[0][0].capabilities == requester.capabilities
     assert "MUST publish one GitHub review before the resumed turn ends." in continued[0][1]
+
+
+def test_child_watch_continuation_waits_beyond_old_fixed_retry_window(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    parent = CockpitThread(
+        thread_id="thread_parent",
+        project_id="neil-shared",
+        session_id="project:neil-shared:orchestrator:thread_parent",
+        title="Review pull request",
+        created_at="2026-07-11T10:00:00Z",
+        updated_at="2026-07-11T10:00:00Z",
+        created_by="neil",
+    )
+    index.save(parent)
+    requester = RequestContext(
+        device_id="local-mac",
+        identity="neil",
+        scope="personal",
+        capabilities=frozenset({"orchestration.runs.read"}),
+        peer="neil",
+    )
+    index.register_child_watch(parent, ["run_a", "run_b"], requester=requester)
+    watch = index.claim_ready_child_watch(parent.thread_id, {"run_a", "run_b"})
+    assert watch is not None
+    attempts = 0
+    finished: list[str] = []
+    original_finish = CockpitThreadIndex.finish_child_watch
+
+    async def turn(_self, _project, _thread, _requester, _instruction):  # noqa: ANN001
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 120:
+            raise RuntimeError("worker session already has an active turn")
+        return "done", parent, []
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    def finish(self, parent_id: str, watch_id: str, *, error: str = "") -> None:  # noqa: ANN001
+        finished.append(error)
+        original_finish(self, parent_id, watch_id, error=error)
+
+    monkeypatch.setattr(CockpitConnector, "turn", turn)
+    monkeypatch.setattr("jarvis.connectors.cockpit.asyncio.sleep", no_sleep)
+    monkeypatch.setattr(CockpitThreadIndex, "finish_child_watch", finish)
+
+    _continue_child_watch(
+        cfg,
+        parent.thread_id,
+        watch,
+    )
+
+    assert attempts == 121
+    assert finished == [""]
 
 
 def test_read_child_work_result_is_parent_project_scoped_and_bounded(tmp_path, monkeypatch) -> None:  # noqa: ANN001
