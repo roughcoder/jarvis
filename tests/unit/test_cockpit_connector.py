@@ -451,6 +451,45 @@ def test_thread_index_appends_jsonl_and_round_trips_messages(tmp_path) -> None:
     assert index.get_with_messages("jarvis", thread.thread_id) == updated
 
 
+def test_thread_index_persists_seed_messages_when_creating_a_transcript(tmp_path) -> None:
+    index_path = tmp_path / "threads.json"
+    index = CockpitThreadIndex(index_path)
+    thread = CockpitThread(
+        thread_id="thread_seeded",
+        project_id="jarvis",
+        session_id="project:jarvis:orchestrator:thread_seeded",
+        title="Seeded",
+        created_at="2026-07-05T08:00:00+00:00",
+        updated_at="2026-07-05T08:00:00+00:00",
+        created_by="neil",
+        messages=(
+            {
+                "role": "user",
+                "peer_id": "neil",
+                "content": "seed question",
+                "observed_at": "2026-07-05T08:01:00+00:00",
+            },
+        ),
+    )
+
+    index.append_turn(
+        thread,
+        user_peer_id="neil",
+        user_text="next question",
+        assistant_peer_id="jarvis",
+        assistant_text="next answer",
+    )
+
+    reloaded = CockpitThreadIndex(index_path).get_with_messages("jarvis", thread.thread_id)
+
+    assert reloaded is not None
+    assert [message["content"] for message in reloaded.messages] == [
+        "seed question",
+        "next question",
+        "next answer",
+    ]
+
+
 def test_thread_index_migrates_legacy_json_transcript_once_after_interruption(tmp_path) -> None:
     index = CockpitThreadIndex(tmp_path / "threads.json")
     thread = index.save(
@@ -618,3 +657,59 @@ def test_thread_index_appends_different_threads_without_global_transcript_serial
         "thread_two question",
         "thread_two answer",
     ]
+
+
+def test_thread_index_delete_waits_for_append_before_reclaiming_transcript(tmp_path, monkeypatch) -> None:
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    thread = index.save(
+        CockpitThread(
+            thread_id="thread_delete_race",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_delete_race",
+            title="Delete race",
+            created_at="2026-07-05T08:00:00+00:00",
+            updated_at="2026-07-05T08:00:00+00:00",
+            created_by="neil",
+        )
+    )
+    original_append = index._append_thread_messages
+    append_started = threading.Event()
+    allow_append = threading.Event()
+    deleted = threading.Event()
+
+    def hold_append(*args, **kwargs):  # noqa: ANN002, ANN003
+        append_started.set()
+        assert allow_append.wait(timeout=2)
+        return original_append(*args, **kwargs)
+
+    monkeypatch.setattr(index, "_append_thread_messages", hold_append)
+
+    append_worker = threading.Thread(
+        target=index.append_turn,
+        args=(thread,),
+        kwargs={
+            "user_peer_id": "neil",
+            "user_text": "question",
+            "assistant_peer_id": "jarvis",
+            "assistant_text": "answer",
+        },
+    )
+
+    def delete() -> None:
+        index.delete("jarvis", thread.thread_id)
+        deleted.set()
+
+    delete_worker = threading.Thread(target=delete)
+    append_worker.start()
+    assert append_started.wait(timeout=2)
+    delete_worker.start()
+    assert not deleted.wait(timeout=0.1)
+    allow_append.set()
+    append_worker.join(timeout=2)
+    delete_worker.join(timeout=2)
+
+    assert not append_worker.is_alive()
+    assert not delete_worker.is_alive()
+    assert deleted.is_set()
+    assert index.get("jarvis", thread.thread_id) is None
+    assert not index._transcript_path("jarvis", thread.thread_id).exists()

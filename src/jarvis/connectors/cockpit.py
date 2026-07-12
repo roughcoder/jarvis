@@ -274,41 +274,42 @@ class CockpitThreadIndex:
             return self.save(updated)
 
     def delete(self, project_id: str, thread_id: str) -> tuple[CockpitThread | None, bool]:
-        # Hold the same lock as every other mutator: an unlocked read-modify-write
-        # here can race a concurrent append_turn/save and resurrect a just-deleted
-        # thread (its transcript already unlinked) or clobber a concurrent
-        # rename/promotion.
-        with _THREAD_INDEX_LOCK:
-            data = self._read()
-            threads = data.setdefault("threads", {})
-            deleted = data.setdefault("deleted_threads", {})
-            raw = threads.pop(thread_id, None)
-            if isinstance(raw, dict) and str(raw.get("project_id") or "") == project_id:
-                thread = CockpitThread.from_dict(raw)
-                # Messages may live in the transcript file, inline, or the legacy key;
-                # count them all for the reclamation summary, then reclaim the file.
-                messages = self._thread_messages(thread)
-                deleted[thread_id] = {
-                    **thread.as_dict(include_messages=False),
-                    "deleted_at": utc_now(),
-                }
-                _atomic_write_json(self.path, data)
-                for transcript_path in (
-                    self._transcript_path(project_id, thread_id),
-                    self._legacy_transcript_path(project_id, thread_id),
-                    self._legacy_transcript_path(project_id, thread_id).with_suffix(".json.bak"),
-                ):
-                    try:
-                        transcript_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                return replace(thread, messages=tuple(messages)), True
-            if raw is not None:
-                threads[thread_id] = raw
-            tombstone = deleted.get(thread_id)
-            if isinstance(tombstone, dict) and str(tombstone.get("project_id") or "") == project_id:
-                return CockpitThread.from_dict(tombstone), False
-            return None, False
+        # Transcript writers take the per-thread lock before the index lock.
+        # Keep that order here so a deletion cannot interleave with an append
+        # after the index update but before the transcript write.
+        with self._transcript_lock(project_id, thread_id):
+            with _THREAD_INDEX_LOCK:
+                data = self._read()
+                threads = data.setdefault("threads", {})
+                deleted = data.setdefault("deleted_threads", {})
+                raw = threads.pop(thread_id, None)
+                if isinstance(raw, dict) and str(raw.get("project_id") or "") == project_id:
+                    thread = CockpitThread.from_dict(raw)
+                    # Messages may live in the transcript file, inline, or the legacy key;
+                    # count them all for the reclamation summary, then reclaim the file.
+                    messages = self._thread_messages(thread)
+                    deleted[thread_id] = {
+                        **thread.as_dict(include_messages=False),
+                        "deleted_at": utc_now(),
+                    }
+                    _atomic_write_json(self.path, data)
+                    for transcript_path in (
+                        self._transcript_path(project_id, thread_id),
+                        self._legacy_transcript_path(project_id, thread_id),
+                        self._legacy_transcript_path(project_id, thread_id).with_suffix(".json.bak"),
+                    ):
+                        try:
+                            transcript_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        self._transcript_cache_pop(transcript_path)
+                    return replace(thread, messages=tuple(messages)), True
+                if raw is not None:
+                    threads[thread_id] = raw
+                tombstone = deleted.get(thread_id)
+                if isinstance(tombstone, dict) and str(tombstone.get("project_id") or "") == project_id:
+                    return CockpitThread.from_dict(tombstone), False
+                return None, False
     def rename(self, project_id: str, thread_id: str, title: str) -> CockpitThread | None:
         with _THREAD_INDEX_LOCK:
             thread = self.get(project_id, thread_id)
@@ -611,11 +612,13 @@ class CockpitThreadIndex:
         path = self._transcript_path(thread.project_id, thread.thread_id)
         with self._transcript_lock(thread.project_id, thread.thread_id):
             existing = self._cached_jsonl_messages(path)
+            seed_records: list[dict[str, Any]] = []
             if existing is None:
                 if path.exists():
                     existing = self._read_jsonl_messages(path)
                 else:
-                    existing = [dict(message) for message in seed_messages]
+                    seed_records = _normalized_messages(seed_messages)
+                    existing = [dict(message) for message in seed_records]
             cached_entry = self._transcript_cache_entry(path)
             # A crashed/external writer can leave bytes without a line ending.
             # Terminate that unusable record before appending so our first JSON
@@ -627,6 +630,8 @@ class CockpitThreadIndex:
                 with path.open("a", encoding="utf-8") as handle:
                     if needs_separator:
                         handle.write("\n")
+                    for message in seed_records:
+                        handle.write(json.dumps(message, sort_keys=True) + "\n")
                     for message in appended:
                         handle.write(json.dumps(message, sort_keys=True) + "\n")
                 if needs_separator:
