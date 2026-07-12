@@ -41,6 +41,7 @@ from jarvis.connectors.cockpit import (
     CockpitThread,
     CockpitThreadIndex,
     THREAD_INDEX_FILENAME,
+    _schedule_cold_task_drain,
     execute_orchestrator_tool,
     make_child_terminal_notifier,
     workspace_public,
@@ -1529,6 +1530,32 @@ class CockpitWriteHandlers:
         )
         state_key = (project.id, thread.thread_id)
         self.ctx.thread_turn_states[state_key] = ("running", "")
+        cold_sessions = []
+
+        async def progress(update: dict[str, Any]) -> None:
+            if update.get("type") != "text.delta":
+                return
+            delta = str(update.get("delta") or "")
+            if not delta:
+                return
+            await _write_sse(
+                response,
+                "thread.delta",
+                cursor,
+                _sse_envelope(
+                    cursor,
+                    "thread.delta",
+                    {
+                        "project_id": project.id,
+                        "thread_id": thread.thread_id,
+                        "delta": delta,
+                    },
+                ),
+            )
+
+        def defer_cold_tasks(session) -> None:  # noqa: ANN001 - BrainSession stays behind the facade.
+            cold_sessions.append(session)
+
         try:
             reply, updated, events = await connector.turn(
                 project,
@@ -1537,6 +1564,8 @@ class CockpitWriteHandlers:
                 text,
                 attachments=attachments or None,
                 workspace_request=dict(body["workspace"]) if isinstance(body.get("workspace"), dict) else None,
+                progress=progress,
+                cold_task_sink=defer_cold_tasks,
             )
         except (UnsupportedMemoryOperation, TimeoutError, OSError, RuntimeError) as exc:
             self.ctx.thread_turn_states[state_key] = ("failed", "engine_error")
@@ -1592,6 +1621,8 @@ class CockpitWriteHandlers:
             await _try_write_thread_event(response, cursor, event)
         await _write_sse(response, "thread.reply", cursor, _sse_envelope(cursor, "thread.reply", payload))
         await _write_sse(response, "thread.turn.done", cursor, _sse_envelope(cursor, "thread.turn.done", payload))
+        for session in cold_sessions:
+            _schedule_cold_task_drain(session)
         await response.write_eof()
         return response
 
