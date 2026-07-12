@@ -18,6 +18,19 @@ from jarvis.orchestration.models import WorkerProfile
 
 _PROFILE_CACHE_TTL_S = 2.0
 _PROFILE_CACHE: dict[str, tuple[int, float, list[dict[str, Any]]]] = {}
+# The orchestration API makes many small worker reads while assembling cockpit
+# projections.  Keep one process-local client so those reads reuse connections
+# instead of paying a TCP/TLS setup cost for every row.  Callers can still
+# inject a request callable for tests or a request-scoped transport.
+_WORKER_HTTP_CLIENT = httpx.Client()
+
+
+def worker_http_get(*args: Any, **kwargs: Any) -> httpx.Response:
+    return _WORKER_HTTP_CLIENT.get(*args, **kwargs)
+
+
+def worker_http_post(*args: Any, **kwargs: Any) -> httpx.Response:
+    return _WORKER_HTTP_CLIENT.post(*args, **kwargs)
 
 
 class WorkerRegistry:
@@ -31,8 +44,8 @@ class WorkerRegistry:
     ) -> None:
         self.worker_cfg = worker_cfg
         self.profiles_path = pathlib.Path(profiles_path).expanduser() if profiles_path else None
-        self._http_get = http_get or httpx.get
-        self._http_post = http_post or httpx.post
+        self._http_get = http_get or worker_http_get
+        self._http_post = http_post or worker_http_post
 
     def profiles(self, *, probe: bool = False) -> list[WorkerProfile]:
         profiles = self._load_profiles()

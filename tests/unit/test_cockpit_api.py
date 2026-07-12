@@ -1926,6 +1926,7 @@ def test_cockpit_sse_hub_survives_snapshot_refresh_exception(tmp_path, monkeypat
         await hub.start()
         try:
             subscription = await hub.subscribe("none")
+            ctx.store.bump_generation()
             event = await asyncio.wait_for(subscription.queue.get(), timeout=1)
             assert event is not None
             assert event["body"] == {"cursor": "evt_recovered"}
@@ -1971,6 +1972,7 @@ def test_cockpit_sse_hub_throttles_repeated_refresh_exception_logs(tmp_path, mon
         await hub.start()
         try:
             await hub.subscribe("none")
+            ctx.store.bump_generation()
             await asyncio.sleep(0.35)
         finally:
             await hub.stop()
@@ -1981,6 +1983,138 @@ def test_cockpit_sse_hub_throttles_repeated_refresh_exception_logs(tmp_path, mon
 
     assert calls["count"] >= 3
     assert logs == ["cockpit SSE snapshot refresh failed"]
+
+
+def test_cockpit_sse_hub_skips_snapshot_recompute_when_generation_is_unchanged(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    cfg.orchestration.sse_refresh_interval_s = 0.05
+    calls = {"count": 0}
+
+    def snapshot(_ctx, _mode):  # noqa: ANN001
+        calls["count"] += 1
+        return {"cursor": "evt_stable", "runs": []}
+
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_snapshot", snapshot)
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: Response({}),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+
+    async def run_hub() -> None:
+        hub = SseSnapshotHub(ctx)
+        await hub.start()
+        try:
+            await hub.subscribe("none")
+            await asyncio.sleep(0.2)
+        finally:
+            await hub.stop()
+
+    import asyncio
+
+    asyncio.run(run_hub())
+    assert calls["count"] == 1
+
+
+def test_cockpit_sse_hub_forces_refresh_for_external_store_write(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    cfg.orchestration.sse_refresh_interval_s = 0.05
+    cfg.orchestration.sse_forced_refresh_ticks = 3
+    store, run_id = _seed_run(cfg)
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: Response({}),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=store,
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+
+    async def run_hub() -> dict[str, Any]:
+        hub = SseSnapshotHub(ctx)
+        await hub.start()
+        try:
+            subscription = await hub.subscribe("none")
+            generation = store.generation
+            external = store.get(run_id)
+            assert external is not None
+            external.phase = "verifying"
+            # Deliberately bypass the Store API: a future external writer does
+            # not advance the in-process generation signal.
+            store.run_path(run_id).write_text(json.dumps(external.to_dict(), indent=2, sort_keys=True))
+            assert store.generation == generation
+            event = await asyncio.wait_for(subscription.queue.get(), timeout=1)
+            assert event is not None
+            return event["body"]
+        finally:
+            await hub.stop()
+
+    import asyncio
+
+    body = asyncio.run(run_hub())
+    assert body["runs"][0]["phase"] == "verifying"
+
+
+def test_cockpit_sse_hub_backs_off_failed_worker_syncs(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.api import _HubWorkerSync
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    cfg.orchestration.sse_sync_backoff_ticks = 5
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("worker offline")),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+    hub = SseSnapshotHub(ctx)
+    hub._tick = 1  # noqa: SLF001 - unit-test the hub's tick-local backoff contract
+    sync = _HubWorkerSync(hub)
+    profile = sync.profiles[0]
+
+    with pytest.raises(OSError, match="worker offline"):
+        sync.get(f"{profile.base_url}/sessions")
+
+    assert hub._worker_backoff_until[profile.worker_id] == 6  # noqa: SLF001
+    hub._tick = 5  # noqa: SLF001
+    assert sync.should_sync(profile) is False
+    hub._tick = 6  # noqa: SLF001
+    assert sync.should_sync(profile) is True
+
+
+def test_cockpit_snapshot_serializes_cursor_projection_once(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration import cockpit as cockpit_module
+    from jarvis.orchestration.cockpit import cockpit_snapshot
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    store, _run_id = _seed_run(cfg)
+    original_cursor = cockpit_module.snapshot_cursor
+    projections = []
+
+    def recording_cursor(projection):  # noqa: ANN001, ANN202
+        projections.append(projection)
+        return original_cursor(projection)
+
+    monkeypatch.setattr(cockpit_module, "snapshot_cursor", recording_cursor)
+    cockpit_snapshot(
+        store=store,
+        worker_cfg=cfg.worker,
+        workers_path=cfg.orchestration.workers_path,
+        sync_mode="none",
+    )
+
+    assert len(projections) == 1
+    assert isinstance(projections[0], str)
 
 
 def test_cockpit_health_includes_brain_system_projection(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -6684,6 +6818,68 @@ def test_supervisor_sync_persists_session_events_once(tmp_path, monkeypatch) -> 
     assert [event.data["event_id"] for event in persisted] == ["ev_1", "ev_2"]
     assert persisted[1].type == "assistant.delta"
     assert persisted[1].data["data"]["delta"] == "hi"
+
+
+def test_supervisor_sync_honors_hub_timeout_and_worker_skip(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.supervisor import sync_run_sessions
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    item = WorkItem(source="manual", id="manual_sync_timeout", title="Sync timeout", repo="roughcoder/jarvis")
+    run = store.create_run("Sync timeout", work_items=[item])
+    store.link_session(run.run_id, WorkerSessionLink(worker_id="macbook-worker", session_id="sess_timeout", status="running"))
+    calls: list[float] = []
+
+    def get(url: str, **kwargs) -> Response:  # noqa: ANN001
+        calls.append(kwargs["timeout"])
+        if url.endswith("/sessions/sess_timeout"):
+            return Response({"session_id": "sess_timeout", "status": "running"})
+        if url.endswith("/sessions/sess_timeout/events"):
+            return Response({"events": []})
+        raise AssertionError(url)
+
+    skipped = sync_run_sessions(
+        store,
+        worker_cfg=cfg.worker,
+        workers_path=cfg.orchestration.workers_path,
+        run_id=run.run_id,
+        get=get,
+        timeout_s=4.0,
+        should_sync_worker=lambda _profile: False,
+    )
+    assert skipped.errors == []
+    assert calls == []
+
+    sync_run_sessions(
+        store,
+        worker_cfg=cfg.worker,
+        workers_path=cfg.orchestration.workers_path,
+        run_id=run.run_id,
+        get=get,
+        timeout_s=4.0,
+    )
+    assert calls == [4.0, 4.0]
+
+
+def test_cockpit_snapshot_uses_precomputed_sync_state(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.cockpit import cockpit_snapshot
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    store, _run_id = _seed_run(cfg)
+
+    def fail_sync(**_kwargs):  # noqa: ANN001, ANN202
+        raise AssertionError("precomputed sync must bypass sync_state")
+
+    monkeypatch.setattr("jarvis.orchestration.cockpit.sync_state", fail_sync)
+    snapshot = cockpit_snapshot(
+        store=store,
+        worker_cfg=cfg.worker,
+        workers_path=cfg.orchestration.workers_path,
+        sync_mode="fast",
+        sync={"mode": "none", "status": "stale", "synced_at": "", "errors": []},
+    )
+
+    assert snapshot["sync"]["status"] == "stale"
 
 
 def test_cockpit_snapshot_fast_includes_requests_and_checkpoints(tmp_path, monkeypatch) -> None:  # noqa: ANN001

@@ -9,6 +9,7 @@ import json
 import pathlib
 import re
 import shutil
+from collections import OrderedDict
 from collections.abc import Callable
 
 from jarvis.ids import new_id, utc_now
@@ -28,6 +29,11 @@ _RUN_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 _SESSION_REF_PREFIX = "sessref_"
 _SESSION_REF_SIGNING_CONTEXT = b"jarvis-cockpit-session-ref-v1"
 _SESSION_REF_SIGNATURE_BYTES = 12
+_STORE_CACHE_MAX_RUNS = 500
+# In-process only: the cockpit API is currently the store's single writer.
+# Cross-process writers must either notify this generation or rely on the SSE
+# hub's periodic forced refresh to make their changes visible.
+_STORE_GENERATIONS: dict[pathlib.Path, int] = {}
 
 
 class ActiveWorkItemError(RuntimeError):
@@ -69,6 +75,8 @@ class OrchestrationStore:
         thread_children_promoter: Callable[[str], object] | None = None,
     ) -> None:
         self.root = pathlib.Path(root).expanduser()
+        self._generation_key = self.root.resolve()
+        _STORE_GENERATIONS.setdefault(self._generation_key, 0)
         self.runs_dir = self.root / "runs"
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self._lock_path = self.root / ".lock"
@@ -84,6 +92,28 @@ class OrchestrationStore:
         # tombstone on every tick even though deleted-sessions.json only
         # changes on an explicit delete.
         self._deleted_session_refs_cache: tuple[int | None, set[str]] | None = None
+        # The SSE hub reads these files every refresh while a cockpit client is
+        # connected. Keep parsed values here and use file metadata to pick up
+        # writes made by other processes.
+        self._run_cache: OrderedDict[pathlib.Path, tuple[int, int, OrchestrationRun]] = OrderedDict()
+        self._events_cache: OrderedDict[pathlib.Path, tuple[int, int, int, int, int, list[RunEvent]]] = OrderedDict()
+
+    @property
+    def generation(self) -> int:
+        """Monotonic in-process signal for cockpit snapshot invalidation.
+
+        This assumes the cockpit API process is the single writer. File caches
+        remain correct for other writers, while the hub's forced refresh bounds
+        how long an external write can remain unseen by SSE clients.
+        """
+
+        return _STORE_GENERATIONS[self._generation_key]
+
+    def bump_generation(self) -> int:
+        """Record a store-visible change made outside the normal write helpers."""
+
+        _STORE_GENERATIONS[self._generation_key] = self.generation + 1
+        return self.generation
 
     def run_dir(self, run_id: str) -> pathlib.Path:
         if not _RUN_ID.fullmatch(run_id):
@@ -150,7 +180,10 @@ class OrchestrationStore:
         run.updated_at = utc_now()
         d = self.run_dir(run.run_id)
         d.mkdir(parents=True, exist_ok=True)
-        self.run_path(run.run_id).write_text(json.dumps(run.to_dict(), indent=2, sort_keys=True))
+        path = self.run_path(run.run_id)
+        path.write_text(json.dumps(run.to_dict(), indent=2, sort_keys=True))
+        self._run_cache.pop(path, None)
+        self.bump_generation()
 
     def get(self, run_id: str) -> OrchestrationRun | None:
         try:
@@ -167,11 +200,24 @@ class OrchestrationStore:
 
     def list_runs(self) -> list[OrchestrationRun]:
         runs: list[OrchestrationRun] = []
+        seen: set[pathlib.Path] = set()
         for p in sorted(self.runs_dir.glob("*/run.json")):
             try:
-                runs.append(OrchestrationRun.from_dict(json.loads(p.read_text())))
+                stat = p.stat()
+                cached = self._run_cache.get(p)
+                if cached is not None and cached[:2] == (stat.st_size, stat.st_mtime_ns):
+                    run = cached[2]
+                    self._run_cache.move_to_end(p)
+                else:
+                    run = OrchestrationRun.from_dict(json.loads(p.read_text()))
+                    self._cache_run(p, stat.st_size, stat.st_mtime_ns, run)
+                runs.append(OrchestrationRun.from_dict(run.to_dict()))
+                seen.add(p)
             except (json.JSONDecodeError, OSError, KeyError):
                 continue
+        for path in tuple(self._run_cache):
+            if path not in seen:
+                self._run_cache.pop(path, None)
         return sorted(runs, key=lambda r: r.updated_at)
 
     def append_event(
@@ -183,8 +229,11 @@ class OrchestrationStore:
     ) -> RunEvent:
         self.run_dir(run_id).mkdir(parents=True, exist_ok=True)
         event = RunEvent(type=event_type, run_id=run_id, message=message, data=data or {})
-        with self.events_path(run_id).open("a") as f:
+        path = self.events_path(run_id)
+        with path.open("a") as f:
             f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
+        self._events_cache.pop(path, None)
+        self.bump_generation()
         return event
 
     def events(self, run_id: str) -> list[RunEvent]:
@@ -192,17 +241,42 @@ class OrchestrationStore:
             p = self.events_path(run_id)
         except ValueError:
             return []
-        if not p.exists():
+        try:
+            stat = p.stat()
+        except OSError:
+            self._events_cache.pop(p, None)
             return []
-        events: list[RunEvent] = []
-        for line in p.read_text().splitlines():
-            if not line.strip():
-                continue
+        cached = self._events_cache.get(p)
+        fingerprint = (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
+        if cached is not None and cached[:4] == fingerprint:
+            self._events_cache.move_to_end(p)
+            return list(cached[5])
+
+        if (
+            cached is not None
+            and cached[2:4] == (stat.st_dev, stat.st_ino)
+            and stat.st_size > cached[0]
+            and stat.st_size >= cached[4]
+        ):
+            events = list(cached[5])
+            offset = cached[4]
             try:
-                events.append(RunEvent.from_dict(json.loads(line)))
-            except json.JSONDecodeError:
-                continue
-        return events
+                with p.open("rb") as f:
+                    f.seek(offset)
+                    offset = self._append_event_lines(f.read(), events, offset)
+            except OSError:
+                return list(events)
+        else:
+            events = []
+            offset = 0
+            try:
+                with p.open("rb") as f:
+                    offset = self._append_event_lines(f.read(), events, offset)
+            except OSError:
+                return []
+
+        self._cache_events(p, stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino, offset, events)
+        return list(events)
 
     def set_phase(self, run_id: str, phase: str, message: str = "") -> OrchestrationRun:
         run = self.get(run_id)
@@ -446,7 +520,7 @@ class OrchestrationStore:
                 changed = True
             if not changed:
                 return
-            _atomic_write_json(self._session_refs_path, list(index.values()))
+            self._write_index(self._session_refs_path, list(index.values()))
 
     def session_ref_index(self) -> dict[str, dict[str, str]]:
         if not self._session_refs_path.exists():
@@ -664,6 +738,9 @@ class OrchestrationStore:
             records = 1 + len(run.sessions) + len(run.jobs) + len(run.artifacts)
             directory = self.run_dir(run.run_id)
             shutil.rmtree(directory, ignore_errors=True)
+            self._run_cache.pop(self.run_path(run.run_id), None)
+            self._events_cache.pop(self.events_path(run.run_id), None)
+            self.bump_generation()
             self._record_deleted_run_unlocked(run.run_id)
             self._record_sessions_deleted_unlocked(run.sessions)
             return {"deleted": True, "run_id": run.run_id, "records": records, "events": events}
@@ -693,7 +770,7 @@ class OrchestrationStore:
             archived = self.archived_worker_sessions()
             if archived.pop(f"{worker_id}\0{session_id}", None) is not None:
                 records += 1
-                _atomic_write_json(self._archived_sessions_path, list(archived.values()))
+                self._write_index(self._archived_sessions_path, list(archived.values()))
             self._record_deleted_session_unlocked(worker_id, session_id)
             return {"deleted": True, "worker_id": worker_id, "session_id": session_id, "records": records, "events": 0}
 
@@ -784,6 +861,48 @@ class OrchestrationStore:
             with contextlib.suppress(Exception):
                 self._thread_children_promoter(parent_chat_id)
 
+    def _cache_run(self, path: pathlib.Path, size: int, mtime_ns: int, run: OrchestrationRun) -> None:
+        self._run_cache[path] = (size, mtime_ns, run)
+        self._run_cache.move_to_end(path)
+        while len(self._run_cache) > _STORE_CACHE_MAX_RUNS:
+            self._run_cache.popitem(last=False)
+
+    def _cache_events(
+        self,
+        path: pathlib.Path,
+        size: int,
+        mtime_ns: int,
+        device: int,
+        inode: int,
+        offset: int,
+        events: list[RunEvent],
+    ) -> None:
+        self._events_cache[path] = (size, mtime_ns, device, inode, offset, events)
+        self._events_cache.move_to_end(path)
+        while len(self._events_cache) > _STORE_CACHE_MAX_RUNS:
+            self._events_cache.popitem(last=False)
+
+    @staticmethod
+    def _append_event_lines(data: bytes, events: list[RunEvent], offset: int) -> int:
+        """Parse complete JSONL records and return the next safe byte offset."""
+
+        for raw_line in data.splitlines(keepends=True):
+            if not raw_line.endswith((b"\n", b"\r")):
+                break
+            offset += len(raw_line)
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                events.append(RunEvent.from_dict(json.loads(line)))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+        return offset
+
+    def _write_index(self, path: pathlib.Path, data: object) -> None:
+        _atomic_write_json(path, data)
+        self.bump_generation()
+
     @contextlib.contextmanager
     def _locked(self):
         self.root.mkdir(parents=True, exist_ok=True)
@@ -802,14 +921,14 @@ class OrchestrationStore:
             return existing
         item = {"worker_id": worker_id, "session_id": session_id, "archived_at": utc_now()}
         archived[key] = item
-        _atomic_write_json(self._archived_sessions_path, list(archived.values()))
+        self._write_index(self._archived_sessions_path, list(archived.values()))
         return item
 
     def _unarchive_worker_session_unlocked(self, worker_id: str, session_id: str) -> bool:
         archived = self.archived_worker_sessions()
         if archived.pop(f"{worker_id}\0{session_id}", None) is None:
             return False
-        _atomic_write_json(self._archived_sessions_path, list(archived.values()))
+        self._write_index(self._archived_sessions_path, list(archived.values()))
         return True
     def _deleted_records(self, path: pathlib.Path) -> dict[str, dict[str, str]]:
         if not path.exists():
@@ -832,7 +951,7 @@ class OrchestrationStore:
     def _record_deleted_run_unlocked(self, run_id: str) -> None:
         records = self._deleted_records(self._deleted_runs_path)
         records[run_id] = {"key": run_id, "run_id": run_id, "deleted_at": utc_now()}
-        _atomic_write_json(self._deleted_runs_path, list(records.values()))
+        self._write_index(self._deleted_runs_path, list(records.values()))
 
     def _record_sessions_deleted_unlocked(self, sessions: list[WorkerSessionLink]) -> None:
         """Record session-refs + tombstones for every session on a deleted run.
@@ -866,7 +985,7 @@ class OrchestrationStore:
             }
             refs_changed = True
         if refs_changed:
-            _atomic_write_json(self._session_refs_path, list(refs.values()))
+            self._write_index(self._session_refs_path, list(refs.values()))
 
         deleted = self._deleted_records(self._deleted_sessions_path)
         deleted_at = utc_now()
@@ -878,7 +997,7 @@ class OrchestrationStore:
                 "session_id": session.session_id,
                 "deleted_at": deleted_at,
             }
-        _atomic_write_json(self._deleted_sessions_path, list(deleted.values()))
+        self._write_index(self._deleted_sessions_path, list(deleted.values()))
 
     def _record_session_ref_unlocked(self, worker_id: str, session_id: str) -> None:
         records = self.session_ref_index()
@@ -896,7 +1015,7 @@ class OrchestrationStore:
             "session_id": session_id,
             "updated_at": utc_now(),
         }
-        _atomic_write_json(self._session_refs_path, list(records.values()))
+        self._write_index(self._session_refs_path, list(records.values()))
 
     def _record_deleted_session_unlocked(self, worker_id: str, session_id: str) -> None:
         records = self._deleted_records(self._deleted_sessions_path)
@@ -907,7 +1026,7 @@ class OrchestrationStore:
             "session_id": session_id,
             "deleted_at": utc_now(),
         }
-        _atomic_write_json(self._deleted_sessions_path, list(records.values()))
+        self._write_index(self._deleted_sessions_path, list(records.values()))
 
 
 def _same_work_item(left: WorkItem, right: WorkItem) -> bool:

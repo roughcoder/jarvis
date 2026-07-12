@@ -8,9 +8,8 @@ import pathlib
 import re
 import time
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
-
-import httpx
 
 from jarvis.capabilities import (
     FORGE_BRANCH_PUSH,
@@ -34,7 +33,7 @@ from jarvis.orchestration.redaction import redact as _redact
 from jarvis.orchestration.reports import build_run_report
 from jarvis.orchestration.store import OrchestrationStore
 from jarvis.orchestration.supervisor import SyncSummary, sync_run_jobs, sync_run_sessions
-from jarvis.orchestration.workers import WorkerRegistry, worker_token_value
+from jarvis.orchestration.workers import WorkerRegistry, worker_http_get, worker_token_value
 from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES
 
 API_VERSION = "v1"
@@ -311,16 +310,29 @@ def cockpit_snapshot(
     worker_cfg: WorkerConfig,
     workers_path: str,
     sync_mode: str = "none",
-    http_get: Any = httpx.get,
+    http_get: Any = worker_http_get,
     default_repo: str = "",
+    sync_timeout_s: float | None = None,
+    should_sync_worker: Callable[[WorkerProfile], bool] | None = None,
+    sync: dict[str, Any] | None = None,
+    worker_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    sync = sync_state(store=store, worker_cfg=worker_cfg, workers_path=workers_path, sync_mode=sync_mode, http_get=http_get)
+    if sync is None:
+        sync = sync_state(
+            store=store,
+            worker_cfg=worker_cfg,
+            workers_path=workers_path,
+            sync_mode=sync_mode,
+            http_get=http_get,
+            timeout_s=sync_timeout_s,
+            should_sync_worker=should_sync_worker,
+        )
     all_runs = store.list_runs()
     archived_run_ids = {run.run_id for run in all_runs if run.archived_at}
     archived_session_refs = archived_session_refs_for_store(store, all_runs) | deleted_session_refs_for_store(store)
     runs = [run for run in all_runs if not run.archived_at]
     include_worker_state = sync["mode"] in {"fast", "probe"}
-    workers = worker_profiles(
+    workers = list(worker_state.get("workers") or []) if worker_state is not None else worker_profiles(
         worker_cfg=worker_cfg,
         workers_path=workers_path,
         probe=sync["mode"] == "probe",
@@ -328,26 +340,48 @@ def cockpit_snapshot(
         default_repo=default_repo,
     )
     worker_by_id = {worker["worker_id"]: worker for worker in workers}
-    sessions = aggregate_sessions(
-        runs=runs,
-        worker_cfg=worker_cfg,
-        workers_path=workers_path,
-        http_get=http_get,
-        worker_by_id=worker_by_id,
-        include_worker_state=include_worker_state,
-        archived_run_ids=archived_run_ids,
-        archived_session_refs=archived_session_refs,
+    sessions = (
+        dict(worker_state.get("sessions") or {})
+        if worker_state is not None
+        else aggregate_sessions(
+            runs=runs,
+            worker_cfg=worker_cfg,
+            workers_path=workers_path,
+            http_get=http_get,
+            worker_by_id=worker_by_id,
+            include_worker_state=include_worker_state,
+            archived_run_ids=archived_run_ids,
+            archived_session_refs=archived_session_refs,
+            timeout_s=sync_timeout_s,
+            should_sync_worker=should_sync_worker,
+        )
     )
     store.record_session_refs(_session_ref_index_rows(sessions.values()))
-    requests = aggregate_requests(worker_cfg=worker_cfg, workers_path=workers_path, http_get=http_get) if include_worker_state else []
+    requests = list(worker_state.get("requests") or []) if worker_state is not None else (
+        aggregate_requests(
+            worker_cfg=worker_cfg,
+            workers_path=workers_path,
+            http_get=http_get,
+            timeout_s=sync_timeout_s,
+            should_sync_worker=should_sync_worker,
+        )
+        if include_worker_state else []
+    )
     # Workers keep reporting pending requests for locally-archived runs and
     # sessions; keep the top-level array consistent with the visible rows: a
     # request is shown only while its session is.
     requests = [request for request in requests if str(request.get("session_ref") or "") in sessions]
-    checkpoints = (
-        aggregate_checkpoints(runs=runs, sessions=sessions, worker_cfg=worker_cfg, workers_path=workers_path, http_get=http_get)
-        if include_worker_state
-        else []
+    checkpoints = list(worker_state.get("checkpoints") or []) if worker_state is not None else (
+        aggregate_checkpoints(
+            runs=runs,
+            sessions=sessions,
+            worker_cfg=worker_cfg,
+            workers_path=workers_path,
+            http_get=http_get,
+            timeout_s=sync_timeout_s,
+            should_sync_worker=should_sync_worker,
+        )
+        if include_worker_state else []
     )
     artifacts = artifact_summaries(runs)
     run_rows = [run_summary(run, requests=requests, artifacts=artifacts) for run in runs]
@@ -355,20 +389,20 @@ def cockpit_snapshot(
         session_summary(session, requests=requests, checkpoints=checkpoints)
         for session in sorted(sessions.values(), key=lambda x: str(x.get("updated_at") or ""))
     ]
+    cursor_projection = {
+        "sync": {"mode": sync["mode"], "status": sync["status"], "errors": sync["errors"]},
+        "runs": run_rows,
+        "sessions": session_rows,
+        "workers": [_cursor_worker(worker) for worker in workers],
+        "artifacts": artifacts,
+        "requests": requests,
+        "checkpoints": checkpoints,
+    }
+    cursor_json = json.dumps(cursor_projection, sort_keys=True, separators=(",", ":"))
     return {
         "api_version": API_VERSION,
         "schema_version": SCHEMA_VERSION,
-        "cursor": snapshot_cursor(
-            {
-                "sync": {"mode": sync["mode"], "status": sync["status"], "errors": sync["errors"]},
-                "runs": run_rows,
-                "sessions": session_rows,
-                "workers": [_cursor_worker(worker) for worker in workers],
-                "artifacts": artifacts,
-                "requests": requests,
-                "checkpoints": checkpoints,
-            }
-        ),
+        "cursor": snapshot_cursor(cursor_json),
         "generated_at": utc_now(),
         "sync": sync,
         "runs": run_rows,
@@ -386,13 +420,29 @@ def sync_state(
     worker_cfg: WorkerConfig,
     workers_path: str,
     sync_mode: str,
-    http_get: Any = httpx.get,
+    http_get: Any = worker_http_get,
+    timeout_s: float | None = None,
+    should_sync_worker: Callable[[WorkerProfile], bool] | None = None,
 ) -> dict[str, Any]:
     mode = sync_mode if sync_mode in {"none", "fast", "probe"} else "none"
     if mode == "none":
         return {"mode": mode, "status": "stale", "synced_at": "", "errors": []}
-    job_summary = sync_run_jobs(store, worker_cfg=worker_cfg, workers_path=workers_path, get=http_get)
-    session_summary_result = sync_run_sessions(store, worker_cfg=worker_cfg, workers_path=workers_path, get=http_get)
+    job_summary = sync_run_jobs(
+        store,
+        worker_cfg=worker_cfg,
+        workers_path=workers_path,
+        get=http_get,
+        timeout_s=timeout_s,
+        should_sync_worker=should_sync_worker,
+    )
+    session_summary_result = sync_run_sessions(
+        store,
+        worker_cfg=worker_cfg,
+        workers_path=workers_path,
+        get=http_get,
+        timeout_s=timeout_s,
+        should_sync_worker=should_sync_worker,
+    )
     summary = _merge_sync(job_summary, session_summary_result)
     return {
         "mode": mode,
@@ -407,7 +457,7 @@ def worker_profiles(
     worker_cfg: WorkerConfig,
     workers_path: str,
     probe: bool = False,
-    http_get: Any = httpx.get,
+    http_get: Any = worker_http_get,
     default_repo: str = "",
 ) -> list[dict[str, Any]]:
     registry = WorkerRegistry(worker_cfg, profiles_path=workers_path, http_get=http_get)
@@ -625,11 +675,13 @@ def aggregate_sessions(
     runs: list[OrchestrationRun],
     worker_cfg: WorkerConfig,
     workers_path: str,
-    http_get: Any = httpx.get,
+    http_get: Any = worker_http_get,
     worker_by_id: dict[str, dict[str, Any]] | None = None,
     include_worker_state: bool = True,
     archived_run_ids: set[str] | None = None,
     archived_session_refs: set[str] | None = None,
+    timeout_s: float | None = None,
+    should_sync_worker: Callable[[WorkerProfile], bool] | None = None,
 ) -> dict[str, dict[str, Any]]:
     sessions: dict[str, dict[str, Any]] = {}
     worker_by_id = worker_by_id or {}
@@ -647,14 +699,17 @@ def aggregate_sessions(
     if not include_worker_state:
         return sessions
     registry = WorkerRegistry(worker_cfg, profiles_path=workers_path)
+    timeout = worker_cfg.request_timeout_s if timeout_s is None else timeout_s
     for profile in registry.profiles(probe=False):
         projected_worker = worker_by_id.get(profile.worker_id, {})
         effective_status = str(projected_worker.get("status") or profile.status)
         if effective_status == "offline":
             continue
+        if should_sync_worker is not None and not should_sync_worker(profile):
+            continue
         headers = worker_headers(worker_cfg, profile)
         try:
-            response = http_get(f"{profile.base_url}/sessions", headers=headers, timeout=worker_cfg.request_timeout_s)
+            response = http_get(f"{profile.base_url}/sessions", headers=headers, timeout=timeout)
             if getattr(response, "status_code", 200) >= 400:
                 continue
             for raw in response.json().get("sessions", []):
@@ -679,13 +734,23 @@ def aggregate_sessions(
     return sessions
 
 
-def aggregate_requests(*, worker_cfg: WorkerConfig, workers_path: str, http_get: Any = httpx.get) -> list[dict[str, Any]]:
+def aggregate_requests(
+    *,
+    worker_cfg: WorkerConfig,
+    workers_path: str,
+    http_get: Any = worker_http_get,
+    timeout_s: float | None = None,
+    should_sync_worker: Callable[[WorkerProfile], bool] | None = None,
+) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     registry = WorkerRegistry(worker_cfg, profiles_path=workers_path)
+    timeout = worker_cfg.request_timeout_s if timeout_s is None else timeout_s
     for profile in registry.profiles(probe=False):
+        if should_sync_worker is not None and not should_sync_worker(profile):
+            continue
         headers = worker_headers(worker_cfg, profile)
         try:
-            response = http_get(f"{profile.base_url}/sessions/requests", headers=headers, timeout=worker_cfg.request_timeout_s)
+            response = http_get(f"{profile.base_url}/sessions/requests", headers=headers, timeout=timeout)
             if getattr(response, "status_code", 200) >= 400:
                 continue
             for raw in response.json().get("requests", []):
@@ -702,10 +767,13 @@ def aggregate_checkpoints(
     sessions: dict[str, dict[str, Any]] | None = None,
     worker_cfg: WorkerConfig,
     workers_path: str,
-    http_get: Any = httpx.get,
+    http_get: Any = worker_http_get,
+    timeout_s: float | None = None,
+    should_sync_worker: Callable[[WorkerProfile], bool] | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     registry = WorkerRegistry(worker_cfg, profiles_path=workers_path)
+    timeout = worker_cfg.request_timeout_s if timeout_s is None else timeout_s
     rows: dict[str, dict[str, Any]] = {}
     for run in runs:
         for link in run.sessions:
@@ -723,8 +791,10 @@ def aggregate_checkpoints(
         profile = registry.get(worker_id, probe=False)
         if profile is None:
             continue
+        if should_sync_worker is not None and not should_sync_worker(profile):
+            continue
         headers = worker_headers(worker_cfg, profile)
-        bulk = _worker_bulk_checkpoints(profile.base_url, headers, worker_cfg.request_timeout_s, http_get)
+        bulk = _worker_bulk_checkpoints(profile.base_url, headers, timeout, http_get)
         if bulk is not None:
             row_by_session = {str(row.get("session_id") or ""): row for row in worker_rows}
             for raw in bulk:
@@ -741,7 +811,7 @@ def aggregate_checkpoints(
                 response = http_get(
                     f"{profile.base_url}/sessions/{session_id}/checkpoints",
                     headers=headers,
-                    timeout=worker_cfg.request_timeout_s,
+                    timeout=timeout,
                 )
                 if getattr(response, "status_code", 200) >= 400:
                     continue
@@ -1126,8 +1196,13 @@ def worker_headers(worker_cfg: WorkerConfig, profile: WorkerProfile) -> dict[str
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
-def snapshot_cursor(public_projection: dict[str, Any]) -> str:
-    digest = hashlib.sha256(json.dumps(public_projection, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+def snapshot_cursor(public_projection: dict[str, Any] | str) -> str:
+    serialized = (
+        public_projection
+        if isinstance(public_projection, str)
+        else json.dumps(public_projection, sort_keys=True, separators=(",", ":"))
+    )
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
     return f"{CURSOR_PREFIX}{digest}"
 
 
