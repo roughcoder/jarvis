@@ -482,6 +482,23 @@ class CockpitThreadIndex:
                 existing["continuation_instruction"] = continuation
                 existing["observed_at"] = utc_now()
                 self._append_thread_messages(stored, [existing])
+            pending_watch_ids = {
+                str(item)
+                for item in stored.workspace.get("pending_child_watch_ids") or []
+                if str(item).strip()
+            }
+            if watch_id not in pending_watch_ids:
+                pending_watch_ids.add(watch_id)
+                self.save(
+                    replace(
+                        stored,
+                        workspace={
+                            **stored.workspace,
+                            "pending_child_watch_ids": sorted(pending_watch_ids),
+                        },
+                        updated_at=utc_now(),
+                    )
+                )
             return watch_id
 
     def claim_ready_child_watch(self, parent_chat_id: str, terminal_child_ids: set[str]) -> dict[str, Any] | None:
@@ -531,6 +548,17 @@ class CockpitThreadIndex:
                     if error:
                         message["error"] = public_error_message(error)
                     self._append_thread_messages(thread, [message])
+                    pending_watch_ids = {
+                        str(item)
+                        for item in thread.workspace.get("pending_child_watch_ids") or []
+                        if str(item).strip() and str(item) != watch_id
+                    }
+                    workspace = {**thread.workspace}
+                    if pending_watch_ids:
+                        workspace["pending_child_watch_ids"] = sorted(pending_watch_ids)
+                    else:
+                        workspace.pop("pending_child_watch_ids", None)
+                    self.save(replace(thread, workspace=workspace, updated_at=utc_now()))
                     break
 
     def renew_child_watch_claim(self, parent_chat_id: str, watch_id: str) -> None:
@@ -583,6 +611,7 @@ class CockpitThreadIndex:
             if stored is None and self._is_deleted(thread.project_id, thread.thread_id):
                 raise KeyError(thread.thread_id)
             archive_source = stored or thread
+            workspace_source = stored or thread
             appended = [
                 {
                     "role": "user",
@@ -608,6 +637,7 @@ class CockpitThreadIndex:
                     archive_reason=archive_source.archive_reason,
                     last_turn_at=observed_at,
                     messages=(),
+                    workspace={**workspace_source.workspace, **thread.workspace},
                 )
             )
             messages = self._append_thread_messages(updated, appended, seed_messages=thread.messages)

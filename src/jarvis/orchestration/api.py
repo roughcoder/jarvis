@@ -4043,6 +4043,8 @@ def _thread_status(thread: CockpitThread, ctx: CockpitAppContext | None) -> tupl
     live = ctx.thread_turn_states.get((thread.project_id, thread.thread_id)) if ctx is not None else None
     if live is not None:
         return live
+    if thread.workspace.get("pending_child_watch_ids"):
+        return "running", ""
     if thread.last_turn_at or thread.messages:
         return "completed", "completed"
     return "created", ""

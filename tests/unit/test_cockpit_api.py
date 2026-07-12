@@ -7971,6 +7971,21 @@ def test_child_watch_claims_exactly_once_after_every_expected_child_is_terminal(
         continuation_instruction="Publish the reconciled review before reporting success.",
     )
 
+    waiting_parent = index.get(thread.project_id, thread.thread_id)
+    assert waiting_parent is not None
+    assert waiting_parent.workspace["pending_child_watch_ids"] == [watch_id]
+    assert cockpit_api_module._thread_status(waiting_parent, None) == ("running", "")
+
+    appended_parent = index.append_turn(
+        thread,
+        user_peer_id="neil",
+        user_text="Start the review",
+        assistant_peer_id="jarvis",
+        assistant_text="Watching both reviewers.",
+    )
+    assert appended_parent.workspace["pending_child_watch_ids"] == [watch_id]
+    assert cockpit_api_module._thread_status(appended_parent, None) == ("running", "")
+
     assert index.claim_ready_child_watch(thread.thread_id, {"run_a"}) is None
     claimed = index.claim_ready_child_watch(thread.thread_id, {"run_a", "run_b"})
     assert claimed is not None
@@ -7979,6 +7994,12 @@ def test_child_watch_claims_exactly_once_after_every_expected_child_is_terminal(
     assert claimed["requester"]["capabilities"] == ["orchestration.runs.read"]
     assert claimed["continuation_instruction"] == "Publish the reconciled review before reporting success."
     assert index.claim_ready_child_watch(thread.thread_id, {"run_a", "run_b"}) is None
+
+    index.finish_child_watch(thread.thread_id, watch_id)
+    completed_parent = index.get(thread.project_id, thread.thread_id)
+    assert completed_parent is not None
+    assert "pending_child_watch_ids" not in completed_parent.workspace
+    assert cockpit_api_module._thread_status(completed_parent, None) == ("completed", "completed")
 
 
 def test_child_watch_tool_enforces_optional_expected_count(tmp_path, monkeypatch) -> None:  # noqa: ANN001
