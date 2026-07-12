@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import pathlib
 import re
+import threading
 import time
 from dataclasses import dataclass
 from collections.abc import Callable
@@ -38,6 +40,11 @@ from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES
 API_VERSION = "v1"
 SCHEMA_VERSION = 1
 IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
+BULK_CHECKPOINT_WARNING_INTERVAL_S = 60.0
+
+logger = logging.getLogger(__name__)
+_bulk_checkpoint_warning_lock = threading.Lock()
+_bulk_checkpoint_next_warning_at: dict[tuple[str, str], float] = {}
 
 CURSOR_PREFIX = "evt_"
 MAX_PAGE_LIMIT = 500
@@ -787,7 +794,7 @@ def aggregate_checkpoints(
         if should_sync_worker is not None and not should_sync_worker(profile):
             continue
         headers = worker_headers(worker_cfg, profile)
-        bulk = _worker_bulk_checkpoints(profile.base_url, headers, timeout, http_get)
+        bulk = _worker_bulk_checkpoints(worker_id, profile.base_url, headers, timeout, http_get)
         if bulk is not None:
             row_by_session = {str(row.get("session_id") or ""): row for row in worker_rows}
             for raw in bulk:
@@ -816,29 +823,71 @@ def aggregate_checkpoints(
     return results
 
 
-def _worker_bulk_checkpoints(base_url: str, headers: dict[str, str], timeout: float, http_get: Any) -> list[dict[str, Any]] | None:
+def _worker_bulk_checkpoints(
+    worker_id: str,
+    base_url: str,
+    headers: dict[str, str],
+    timeout: float,
+    http_get: Any,
+) -> list[dict[str, Any]] | None:
     try:
         response = http_get(
             f"{base_url}/sessions/checkpoints",
             headers=headers,
             timeout=timeout,
         )
-        status_code = getattr(response, "status_code", 200)
-        if status_code in {404, 405}:
-            return None
-        if status_code >= 400:
-            return []
-        raw_items = response.json().get("checkpoints", [])
     except AssertionError:
         raise
-    except Exception:  # noqa: BLE001 - workers may not support the bulk endpoint yet
+    except Exception as exc:  # noqa: BLE001 - worker failures must degrade the snapshot safely
         # A transport failure says nothing about endpoint compatibility. Avoid
         # multiplying one unavailable worker into a request per historical
         # session; legacy fallback is reserved for an explicit 404/405 above.
+        _warn_bulk_checkpoint_failure(worker_id, "transport_error", error=exc)
         return []
-    if not isinstance(raw_items, list):
+    status_code = getattr(response, "status_code", 200)
+    if status_code in {404, 405}:
         return None
-    return [dict(item) for item in raw_items if isinstance(item, dict)]
+    if status_code >= 400:
+        _warn_bulk_checkpoint_failure(worker_id, "http_error", status_code=status_code)
+        return []
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001 - malformed worker JSON is a bounded partial result
+        _warn_bulk_checkpoint_failure(worker_id, "invalid_payload")
+        return []
+    if not isinstance(payload, dict):
+        _warn_bulk_checkpoint_failure(worker_id, "invalid_payload")
+        return []
+    raw_items = payload.get("checkpoints", [])
+    if not isinstance(raw_items, list) or any(not isinstance(item, dict) for item in raw_items):
+        _warn_bulk_checkpoint_failure(worker_id, "invalid_payload")
+        return []
+    return [dict(item) for item in raw_items]
+
+
+def _warn_bulk_checkpoint_failure(
+    worker_id: str,
+    failure_kind: str,
+    *,
+    status_code: int = 0,
+    error: Exception | None = None,
+) -> None:
+    now = time.monotonic()
+    key = (worker_id, failure_kind)
+    with _bulk_checkpoint_warning_lock:
+        if now < _bulk_checkpoint_next_warning_at.get(key, 0.0):
+            return
+        _bulk_checkpoint_next_warning_at[key] = now + BULK_CHECKPOINT_WARNING_INTERVAL_S
+    logger.warning(
+        "worker bulk checkpoints unavailable; returning partial checkpoint state",
+        extra={
+            "event": "worker_bulk_checkpoints_unavailable",
+            "worker_id": worker_id,
+            "failure_kind": failure_kind,
+            "status_code": status_code,
+            "error_type": type(error).__name__ if error is not None else "",
+        },
+    )
 
 
 def run_summary(

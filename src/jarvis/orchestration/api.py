@@ -4081,11 +4081,15 @@ def _thread_operational_state(thread: CockpitThread, ctx: CockpitAppContext | No
 
 def _thread_status(thread: CockpitThread, ctx: CockpitAppContext | None) -> tuple[str, str]:
     """Return the legacy v1 turn-derived status contract."""
-    operational_state, diagnostic_reason = _thread_operational_state(thread, ctx)
-    if operational_state in {"starting", "working", "waiting_on_children", "waiting_on_user", "joining"}:
-        return "running", ""
-    if operational_state in {"degraded", "blocked"}:
-        return "failed", diagnostic_reason or "engine_error"
+    live = ctx.thread_turn_states.get((thread.project_id, thread.thread_id)) if ctx is not None else None
+    if live is not None:
+        state, reason = live
+        if state in {"created", "running", "completed", "failed"}:
+            return state, reason
+        if state in {"starting", "working", "waiting_for_children", "waiting_for_input", "joining"}:
+            return "running", ""
+        if state in {"degraded", "blocked"}:
+            return "failed", reason or "engine_error"
     legacy = (
         getattr(ctx, "thread_turn_legacy_states", {}).get((thread.project_id, thread.thread_id))
         if ctx is not None

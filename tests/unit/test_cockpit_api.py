@@ -34,6 +34,7 @@ from jarvis.connectors.cockpit import (  # noqa: E402
 )
 from jarvis.config import Config, MCPServerSpec, WorkerConfig  # noqa: E402
 import jarvis.orchestration.api as cockpit_api_module  # noqa: E402
+import jarvis.orchestration.cockpit as cockpit_module  # noqa: E402
 from jarvis.orchestration.api import CockpitAppContext, IdempotencyStore, SseSnapshotHub, _command_from_body, _idempotency_scope, make_app, serve  # noqa: E402
 from jarvis.orchestration.cockpit import make_session_ref  # noqa: E402
 from jarvis.mcp.status import mcp_status_path  # noqa: E402
@@ -5755,7 +5756,10 @@ def test_cockpit_checkpoint_aggregation_uses_worker_bulk_endpoint(tmp_path, monk
     asyncio.run(_with_server(cfg, calls, http_get=get))
 
 
-def test_cockpit_checkpoint_aggregation_does_not_fan_out_after_bulk_timeout(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+@pytest.mark.parametrize("bulk_failure", ["timeout", "http_503", "invalid_payload"])
+def test_cockpit_checkpoint_aggregation_does_not_fan_out_after_bulk_failure(  # noqa: ANN001
+    tmp_path, monkeypatch, bulk_failure
+) -> None:
     cfg = _cfg(tmp_path, monkeypatch)
     calls_seen: list[str] = []
 
@@ -5783,7 +5787,11 @@ def test_cockpit_checkpoint_aggregation_does_not_fan_out_after_bulk_timeout(tmp_
         if url.endswith("/sessions/requests"):
             return Response({"requests": []})
         if url.endswith("/sessions/checkpoints"):
-            raise TimeoutError("worker checkpoint endpoint timed out")
+            if bulk_failure == "timeout":
+                raise TimeoutError("worker checkpoint endpoint timed out")
+            if bulk_failure == "http_503":
+                return Response({}, status_code=503)
+            return Response({"checkpoints": {}})
         if "/sessions/sess_" in url and url.endswith("/checkpoints"):
             raise AssertionError("bulk transport failure must not fan out per historical session")
         raise AssertionError(url)
@@ -5799,6 +5807,74 @@ def test_cockpit_checkpoint_aggregation_does_not_fan_out_after_bulk_timeout(tmp_
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_kind", "expected_status", "expected_error_type"),
+    [
+        ("timeout", "transport_error", 0, "TimeoutError"),
+        ("http_503", "http_error", 503, ""),
+        ("invalid_json", "invalid_payload", 0, ""),
+        ("non_object", "invalid_payload", 0, ""),
+        ("wrong_container", "invalid_payload", 0, ""),
+        ("invalid_entry", "invalid_payload", 0, ""),
+    ],
+)
+def test_worker_bulk_checkpoint_failure_diagnostics_are_bounded_and_redacted(  # noqa: ANN001
+    monkeypatch, caplog, scenario, expected_kind, expected_status, expected_error_type
+) -> None:
+    cockpit_module._bulk_checkpoint_next_warning_at.clear()  # noqa: SLF001
+    times = iter([0.0, 1.0, 61.0])
+    monkeypatch.setattr(cockpit_module.time, "monotonic", lambda: next(times))
+
+    def failed_get(*_args, **_kwargs):  # noqa: ANN001
+        if scenario == "timeout":
+            raise TimeoutError("secret-worker.example checkpoint request timed out")
+        if scenario == "http_503":
+            return Response({}, status_code=503)
+        if scenario == "invalid_json":
+            return TextResponse("not-json", status_code=200)
+        if scenario == "non_object":
+            return Response([])  # type: ignore[arg-type]
+        if scenario == "wrong_container":
+            return Response({"checkpoints": {}})
+        return Response({"checkpoints": [{"checkpoint_id": "ok"}, "invalid"]})  # type: ignore[list-item]
+
+    with caplog.at_level("WARNING", logger=cockpit_module.__name__):
+        results = [
+            cockpit_module._worker_bulk_checkpoints(  # noqa: SLF001
+                "worker-safe-id", "https://private-worker.example", {"Authorization": "secret"}, 1.0, failed_get
+            )
+            for _ in range(3)
+        ]
+
+    records = [record for record in caplog.records if record.message.startswith("worker bulk checkpoints unavailable")]
+    assert results == [[], [], []]
+    assert len(records) == 2
+    assert all(record.event == "worker_bulk_checkpoints_unavailable" for record in records)
+    assert all(record.worker_id == "worker-safe-id" for record in records)
+    assert all(record.failure_kind == expected_kind for record in records)
+    assert all(record.status_code == expected_status for record in records)
+    assert all(record.error_type == expected_error_type for record in records)
+    assert all("private-worker.example" not in record.message for record in records)
+    assert all("Authorization" not in record.message for record in records)
+
+
+@pytest.mark.parametrize("status_code", [404, 405])
+def test_worker_bulk_checkpoint_compatibility_fallback_is_explicit_and_silent(status_code, caplog) -> None:  # noqa: ANN001
+    cockpit_module._bulk_checkpoint_next_warning_at.clear()  # noqa: SLF001
+
+    with caplog.at_level("WARNING", logger=cockpit_module.__name__):
+        result = cockpit_module._worker_bulk_checkpoints(  # noqa: SLF001
+            "worker-safe-id",
+            "https://private-worker.example",
+            {},
+            1.0,
+            lambda *_args, **_kwargs: Response({}, status_code=status_code),
+        )
+
+    assert result is None
+    assert not [record for record in caplog.records if record.message.startswith("worker bulk checkpoints unavailable")]
 
 
 def test_cockpit_session_detail_returns_not_found_for_stale_worker_only_ref(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -7994,11 +8070,18 @@ def test_cockpit_thread_projection_separates_legacy_failure_from_operational_sta
     assert failed["status"] == "failed"
     assert failed["ended_reason"] == "engine_error"
 
+    workspace_failed = replace(thread, workspace={"status": "failed"})
+    ctx.thread_turn_legacy_states.clear()
+    workspace_projection = cockpit_api_module._thread_projection(workspace_failed, ctx)  # noqa: SLF001
+    assert workspace_projection["operational_state"] == "degraded"
+    assert workspace_projection["diagnostic_reason"] == "engine_error"
+    assert workspace_projection["status"] == "completed"
+    assert workspace_projection["ended_reason"] == "completed"
+
     ctx.thread_turn_states[state_key] = ("working", "")
     assert cockpit_api_module._thread_status(thread, ctx) == ("running", "")  # noqa: SLF001
 
     ctx.thread_turn_states.pop(state_key)
-    ctx.thread_turn_legacy_states.pop(state_key)
     assert cockpit_api_module._thread_status(thread, ctx) == ("completed", "completed")  # noqa: SLF001
 
 
