@@ -2770,6 +2770,7 @@ def _normalized_messages(messages: Any) -> list[dict[str, Any]]:
             "type",
             "child_chat_id",
             "child_run_id",
+            "title",
             "phase",
             "status",
             "terminal_reason",
