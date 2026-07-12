@@ -4,13 +4,17 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
-
 from jarvis.config import WorkerConfig
 from jarvis.orchestration.models import OrchestrationRun
 from jarvis.orchestration.store import OrchestrationStore
 from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, FAILED_SESSION_STATUSES, SUCCESS_SESSION_STATUSES
-from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry, local_worker_display_name, worker_token_value
+from jarvis.orchestration.workers import (
+    WorkerProfile,
+    WorkerRegistry,
+    local_worker_display_name,
+    worker_http_get,
+    worker_token_value,
+)
 
 TERMINAL_JOB_STATUSES = {"done", "error", "interrupted"}
 
@@ -48,10 +52,13 @@ def sync_run_jobs(
     workers_path: str = "",
     run_id: str = "",
     get: Callable[..., Any] | None = None,
+    timeout_s: float | None = None,
+    should_sync_worker: Callable[[WorkerProfile], bool] | None = None,
 ) -> SyncSummary:
     """Refresh run graph job state from worker daemon job records."""
 
-    http_get = get or httpx.get
+    http_get = get or worker_http_get
+    timeout = worker_cfg.request_timeout_s if timeout_s is None else timeout_s
     registry = WorkerRegistry(worker_cfg, profiles_path=workers_path)
     runs = _runs_to_sync(store, run_id)
     summary = SyncSummary(errors=[])
@@ -64,12 +71,14 @@ def sync_run_jobs(
                 _record_sync_error(store, run.run_id, link.job_id, f"worker {link.worker_id!r} is not configured")
                 summary.errors.append(f"{run.run_id}:{link.job_id}: worker not configured")
                 continue
+            if should_sync_worker is not None and not should_sync_worker(profile):
+                continue
             headers = _headers_for_worker(worker_cfg, profile)
             try:
                 response = http_get(
                     f"{profile.base_url}/jobs/{link.job_id}",
                     headers=headers,
-                    timeout=worker_cfg.request_timeout_s,
+                    timeout=timeout,
                 )
                 status_code = getattr(response, "status_code", 200)
                 if status_code >= 400:
@@ -112,10 +121,13 @@ def sync_run_sessions(
     workers_path: str = "",
     run_id: str = "",
     get: Callable[..., Any] | None = None,
+    timeout_s: float | None = None,
+    should_sync_worker: Callable[[WorkerProfile], bool] | None = None,
 ) -> SyncSummary:
     """Refresh run graph session state from worker daemon session records."""
 
-    http_get = get or httpx.get
+    http_get = get or worker_http_get
+    timeout = worker_cfg.request_timeout_s if timeout_s is None else timeout_s
     registry = WorkerRegistry(worker_cfg, profiles_path=workers_path)
     runs = _session_runs_to_sync(store, run_id)
     summary = SyncSummary(errors=[])
@@ -130,12 +142,14 @@ def sync_run_sessions(
                 _record_sync_error(store, run.run_id, link.session_id, f"worker {link.worker_id!r} is not configured")
                 summary.errors.append(f"{run.run_id}:{link.session_id}: worker not configured")
                 continue
+            if should_sync_worker is not None and not should_sync_worker(profile):
+                continue
             headers = _headers_for_worker(worker_cfg, profile)
             try:
                 response = http_get(
                     f"{profile.base_url}/sessions/{link.session_id}",
                     headers=headers,
-                    timeout=worker_cfg.request_timeout_s,
+                    timeout=timeout,
                 )
                 status_code = getattr(response, "status_code", 200)
                 if status_code >= 400:
@@ -145,7 +159,7 @@ def sync_run_sessions(
                     f"{profile.base_url}/sessions/{link.session_id}/events",
                     headers=headers,
                     params={"after": link.last_event_id} if link.last_event_id else {},
-                    timeout=worker_cfg.request_timeout_s,
+                    timeout=timeout,
                 )
                 event_status = getattr(events_response, "status_code", 200)
                 if event_status >= 400:
@@ -250,6 +264,7 @@ def persist_session_events(store: OrchestrationStore, run_id: str, session_id: s
         for event in store.events(run_id)
         if isinstance(event.data, dict) and event.data.get("event_id")
     }
+    persisted = False
     for raw in events:
         event_id = str(raw.get("event_id") or "")
         if event_id and event_id in existing:
@@ -268,8 +283,14 @@ def persist_session_events(store: OrchestrationStore, run_id: str, session_id: s
                 "data": dict(data),
             },
         )
+        persisted = True
         if event_id:
             existing.add(event_id)
+    if persisted:
+        # append_event already updates the local generation. Keep this explicit
+        # at the sync boundary too: future batched persistence must still wake
+        # the SSE hub when it writes worker-originated events.
+        store.bump_generation()
 
 
 def _record_sync_error(store: OrchestrationStore, run_id: str, job_id: str, error: str) -> None:

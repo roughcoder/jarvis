@@ -850,6 +850,10 @@ class OrchestrationConfig(_Base):
     oauth_jwks_min_refresh_s: float = 30.0
     sse_refresh_interval_s: float = 1.0
     sse_heartbeat_interval_s: float = 15.0
+    # Worker pulls made by the SSE hub must not inherit the interactive
+    # request budget: an unreachable worker should not delay every tick.
+    sse_sync_timeout_s: float = 4.0
+    sse_sync_backoff_ticks: int = 5
     turn_attachment_max_count: int = 4
     turn_attachment_max_bytes: int = 5 * 1024 * 1024
 
@@ -1135,6 +1139,8 @@ class Config:
             ),
             "orchestration.sse_refresh_interval_s": self.orchestration.sse_refresh_interval_s,
             "orchestration.sse_heartbeat_interval_s": self.orchestration.sse_heartbeat_interval_s,
+            "orchestration.sse_sync_timeout_s": self.orchestration.sse_sync_timeout_s,
+            "orchestration.sse_sync_backoff_ticks": self.orchestration.sse_sync_backoff_ticks,
             "linear.api_key": mask(self.linear.api_key),
         }
 
