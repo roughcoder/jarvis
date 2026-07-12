@@ -96,6 +96,23 @@ class WorkerSessionAuthority:
         return "workspace-write"
 
     @property
+    def codex_turn_sandbox_policy(self) -> dict[str, Any] | None:
+        """Keep review sessions read-only without cutting them off from remote sources.
+
+        Codex's legacy ``sandbox: "read-only"`` thread setting also defaults
+        network access to false. Review agents still need read-only access to
+        GitHub (for example, ``gh pr view`` and ``gh pr diff``), so override the
+        turn with the structured policy supported by the app-server protocol.
+
+        Workspace-write sessions retain their existing thread policy here. A
+        structured workspace-write policy also needs an explicit writable-root
+        contract, which is separate from this read-only review correction.
+        """
+        if self.codex_sandbox == "read-only":
+            return {"type": "readOnly", "networkAccess": True}
+        return None
+
+    @property
     def claude_permission_mode(self) -> str:
         if self.codex_sandbox == "read-only":
             return "plan"

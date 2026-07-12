@@ -324,6 +324,7 @@ def test_worker_session_authority_maps_read_only_to_codex_read_only() -> None:
     authority = WorkerSessionAuthority.from_session(_session_with_authority())
 
     assert authority.codex_sandbox == "read-only"
+    assert authority.codex_turn_sandbox_policy == {"type": "readOnly", "networkAccess": True}
     assert authority.codex_approval_policy == "never"
     assert authority.claude_permission_mode == "plan"
     assert authority.claude_tool_denial("Bash")
@@ -553,6 +554,7 @@ def test_worker_session_authority_maps_branch_only_to_workspace_write() -> None:
     )
 
     assert authority.codex_sandbox == "workspace-write"
+    assert authority.codex_turn_sandbox_policy is None
     assert authority.codex_approval_policy == "never"
     assert authority.claude_permission_mode == "dontAsk"
 
@@ -2822,10 +2824,13 @@ def test_daemon_checkpoint_restore_returns_unsupported_without_provider_handler(
 
 def test_daemon_codex_provider_projects_app_server_events(tmp_path) -> None:
     agent = tmp_path / "fake-codex"
+    request_log = tmp_path / "codex-requests.jsonl"
     agent.write_text(
         """#!/usr/bin/env python3
 import json
 import sys
+
+REQUEST_LOG = __REQUEST_LOG__
 
 
 def emit(payload):
@@ -2836,6 +2841,8 @@ for line in sys.stdin:
     if not line.strip():
         continue
     payload = json.loads(line)
+    with open(REQUEST_LOG, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload) + "\\n")
     method = payload.get("method")
     request_id = payload.get("id")
     if method == "initialize":
@@ -2867,7 +2874,7 @@ for line in sys.stdin:
             "method": "turn/completed",
             "params": {"turn": {"id": "turn_fake", "status": "completed"}},
         })
-"""
+""".replace("__REQUEST_LOG__", repr(str(request_log)))
     )
     agent.chmod(0o755)
     cfg = WorkerConfig(
@@ -2878,6 +2885,13 @@ for line in sys.stdin:
         job_timeout_s=5,
     )
     headers = {"Authorization": "Bearer tkn"}
+    read_only_metadata = _authority_metadata("codex")
+    read_only_actions = ["worker.session.create", "worker.session.turn"]
+    read_only_landing = {"mode": "none", "allow_merge": False}
+    read_only_metadata["execution_envelope"]["allowed_actions"] = read_only_actions
+    read_only_metadata["execution_envelope"]["landing"] = read_only_landing
+    read_only_metadata["allowed_actions"] = read_only_actions
+    read_only_metadata["landing"] = read_only_landing
 
     async def calls(base, c):  # noqa: ANN001
         created = (
@@ -2891,7 +2905,7 @@ for line in sys.stdin:
                     "branch": "jarvis/codex-session",
                     "cwd": _owned_worker_cwd(tmp_path, "codex-projection"),
                     "title": "Codex app-server projection",
-                    "metadata": _authority_metadata("codex"),
+                    "metadata": read_only_metadata,
                 },
                 headers=headers,
             )
@@ -2931,6 +2945,9 @@ for line in sys.stdin:
     assert fetched["status"] == "completed"
     assert fetched["metadata"]["codex_thread_id"] == "thread_fake"
     assert fetched["metadata"]["provider_session_id"] == "session_fake"
+    requests = [json.loads(line) for line in request_log.read_text().splitlines()]
+    turn_start = next(request for request in requests if request.get("method") == "turn/start")
+    assert turn_start["params"]["sandboxPolicy"] == {"type": "readOnly", "networkAccess": True}
 
 
 def test_codex_turn_completed_does_not_overwrite_cancelled_session(tmp_path) -> None:

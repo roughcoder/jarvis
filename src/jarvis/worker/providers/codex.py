@@ -354,6 +354,7 @@ def _codex_run_turn_and_wait(
     """Start the turn on the resolved thread, then block reading app-server
     events until the turn completes (or times out)."""
     rpc_id += 1
+    turn_sandbox_policy = authority.codex_turn_sandbox_policy
     _send_json(
         process,
         {
@@ -364,6 +365,7 @@ def _codex_run_turn_and_wait(
                 "threadId": thread_id,
                 "cwd": cwd,
                 "approvalPolicy": authority.codex_approval_policy,
+                **({"sandboxPolicy": turn_sandbox_policy} if turn_sandbox_policy else {}),
                 "input": _turn_input(turn),
             },
         },
