@@ -8,6 +8,11 @@ sequence. This is the one copy: write to a sibling tempfile in the same
 directory, fsync the file, `os.replace` it into place, then best-effort
 fsync the containing directory so the rename itself is durable.
 
+Byte-level contract: the document is always terminated with a single
+trailing newline. Callers that previously wrote without the newline or the
+fsync inherited both on consolidation — a deliberate hardening, relevant
+only to anything diffing exact bytes.
+
 This is a dependency-free leaf (stdlib only, mirroring `jarvis/redaction.py`)
 so both the brain tier and orchestration/connectors tier can import it
 without crossing the brain/orchestration facade boundary.

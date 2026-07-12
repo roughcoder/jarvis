@@ -220,6 +220,3 @@ def _snapshot_stale(snapshot: dict[str, Any] | None) -> bool:
         generated = generated.replace(tzinfo=timezone.utc)
     age_s = (datetime.now(timezone.utc) - generated.astimezone(timezone.utc)).total_seconds()
     return age_s > MCP_STATUS_STALE_AFTER_S
-
-
-
