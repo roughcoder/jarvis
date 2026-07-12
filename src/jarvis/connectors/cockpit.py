@@ -882,7 +882,7 @@ class CockpitConnector:
             if inspect.isawaitable(emitted):
                 await emitted
         else:
-            _schedule_cold_task_drain(session)
+            schedule_cold_task_drain(session)
         if self._tracer is not None:
             self._tracer.emit(trace)
         reply = result.reply or reply
@@ -2434,7 +2434,7 @@ async def _drain_cold_tasks(session: BrainSession) -> None:
             )
 
 
-def _schedule_cold_task_drain(session: BrainSession) -> None:
+def schedule_cold_task_drain(session: BrainSession) -> None:
     task = asyncio.create_task(_drain_cold_tasks(session))
 
     def report_failure(completed: asyncio.Task) -> None:

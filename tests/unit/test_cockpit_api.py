@@ -2686,6 +2686,58 @@ def test_cockpit_thread_turn_emits_deltas_before_final_reply(tmp_path, monkeypat
     asyncio.run(_with_server(cfg, calls))
 
 
+def test_cockpit_thread_turn_finishes_after_delta_client_disconnect(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    class StreamingGateway(FakeGateway):
+        async def stream_with_tools(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            model: str | None = None,
+            tools: list[dict[str, Any]] | None = None,
+            usage_out: dict[str, Any] | None = None,
+            tool_calls_out: list[dict[str, Any]] | None = None,
+        ):
+            self.messages.append(messages)
+            self.tools.append(tools)
+            for delta in self.scripted[self.calls]:
+                yield delta
+            self.calls += 1
+
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    gateway = StreamingGateway([["First reply segment. ", "Second reply segment."]])
+    connector = CockpitConnector(cfg, memory=FakeProjectMemory(), gateway=gateway, tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+    original_write_sse = cockpit_api_module._write_sse
+    scheduled = []
+
+    async def disconnected_delta(response, event, cursor, data):  # noqa: ANN001
+        if event == "thread.delta":
+            raise ConnectionResetError("client disconnected")
+        await original_write_sse(response, event, cursor, data)
+
+    monkeypatch.setattr(cockpit_api_module, "_write_sse", disconnected_delta)
+    monkeypatch.setattr(cockpit_api_module, "schedule_cold_task_drain", scheduled.append)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={})
+        thread = opened.json()["thread"]
+        response = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "Stream the response."},
+        )
+        detail = await client.get(f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}")
+
+        assert response.status_code == 200
+        assert detail.json()["thread"]["messages"][-1]["content"] == "First reply segment. Second reply segment."
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+    assert len(scheduled) == 1
+
+
 def test_cockpit_thread_turn_streams_tool_events_and_persists_detail_messages(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(
         tmp_path,
