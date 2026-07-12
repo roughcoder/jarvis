@@ -2634,6 +2634,58 @@ def test_cockpit_thread_turn_streams_reply_and_writes_lane1_attribution(tmp_path
     assert "Project-thread capability contract" in system_prompt
 
 
+def test_cockpit_thread_turn_emits_deltas_before_final_reply(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    class StreamingGateway(FakeGateway):
+        async def stream_with_tools(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            model: str | None = None,
+            tools: list[dict[str, Any]] | None = None,
+            usage_out: dict[str, Any] | None = None,
+            tool_calls_out: list[dict[str, Any]] | None = None,
+        ):
+            self.messages.append(messages)
+            self.tools.append(tools)
+            for delta in self.scripted[self.calls]:
+                yield delta
+            self.calls += 1
+
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    gateway = StreamingGateway([["First reply segment. ", "Second reply segment."]])
+    connector = CockpitConnector(cfg, memory=FakeProjectMemory(), gateway=gateway, tts=None, tracer=None)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={})
+        thread = opened.json()["thread"]
+        response = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "Stream the response."},
+        )
+        events = _sse_events(response.text)
+        names = [event["_event"] for event in events]
+        deltas = [event["payload"]["delta"] for event in events if event["_event"] == "thread.delta"]
+        legacy = [event for event in events if event["_event"] in {"thread.reply", "thread.turn.done"}]
+
+        assert response.status_code == 200
+        assert names == [
+            "thread.turn.started",
+            "thread.delta",
+            "thread.delta",
+            "thread.reply",
+            "thread.turn.done",
+        ]
+        assert "".join(deltas) == "First reply segment. Second reply segment."
+        assert legacy[0]["payload"]["reply"] == "".join(deltas)
+        assert legacy[1]["payload"]["reply"] == "".join(deltas)
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
 def test_cockpit_thread_turn_streams_tool_events_and_persists_detail_messages(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(
         tmp_path,
