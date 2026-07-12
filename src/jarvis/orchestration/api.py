@@ -393,7 +393,7 @@ class SseSnapshotHub:
                             worker_sync,
                             dirty,
                         )
-                        worker_state = await asyncio.to_thread(_hub_store_worker_state, self.ctx)
+                        worker_state = await asyncio.to_thread(_hub_worker_state, self.ctx, mode, worker_sync)
                     else:
                         sync = (
                             await asyncio.to_thread(
@@ -3285,29 +3285,6 @@ def _hub_sync_dirty(
         "synced_at": utc_now(),
         "errors": [public_error_message(error) for error in errors],
     }
-
-
-def _hub_store_worker_state(ctx: CockpitAppContext) -> dict[str, Any]:
-    """Project store-backed state after a targeted sync without worker fan-out."""
-    all_runs = ctx.store.list_runs()
-    archived_run_ids = {run.run_id for run in all_runs if run.archived_at}
-    archived_session_refs = archived_session_refs_for_store(ctx.store, all_runs) | deleted_session_refs_for_store(ctx.store)
-    runs = [run for run in all_runs if not run.archived_at]
-    workers = worker_profiles(
-        worker_cfg=ctx.cfg.worker,
-        workers_path=ctx.cfg.orchestration.workers_path,
-        default_repo=ctx.cfg.orchestration.default_repo,
-    )
-    sessions = aggregate_sessions(
-        runs=runs,
-        worker_cfg=ctx.cfg.worker,
-        workers_path=ctx.cfg.orchestration.workers_path,
-        worker_by_id={worker["worker_id"]: worker for worker in workers},
-        include_worker_state=False,
-        archived_run_ids=archived_run_ids,
-        archived_session_refs=archived_session_refs,
-    )
-    return {"workers": workers, "sessions": sessions, "requests": [], "checkpoints": []}
 
 
 def _hub_worker_state(ctx: CockpitAppContext, mode: str, worker_sync: _HubWorkerSync) -> dict[str, Any]:

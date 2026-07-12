@@ -2105,12 +2105,17 @@ def test_cockpit_sse_hub_notify_wakes_early_and_targets_the_dirty_run(tmp_path, 
 
     def sync_sessions(*_args, run_id: str = "", **_kwargs) -> SyncSummary:  # noqa: ANN001
         targeted.append(run_id)
+        if run_id:
+            run = store.get(run_id)
+            assert run is not None
+            run.phase = "verifying"
+            store.save(run)
         return SyncSummary(errors=[])
 
     monkeypatch.setattr(cockpit_api_module, "sync_run_sessions", sync_sessions)
     ctx = CockpitAppContext(
         cfg=cfg,
-        get=lambda *_args, **_kwargs: Response({}),
+        get=_fake_get(run_id),
         post=lambda *_args, **_kwargs: Response({}),
         store=store,
         idempotency=IdempotencyStore(cfg.orchestration.workspace),
@@ -2123,14 +2128,16 @@ def test_cockpit_sse_hub_notify_wakes_early_and_targets_the_dirty_run(tmp_path, 
         hub = SseSnapshotHub(ctx)
         await hub.start()
         try:
-            await hub.subscribe("fast")
+            subscription = await hub.subscribe("fast")
+            expected = subscription.snapshot
             targeted.clear()  # Ignore the subscription's ordinary initial snapshot sync.
             hub.notify(worker_id="macbook-worker", session_id="sess_123")
-            for _ in range(50):
-                if targeted:
-                    break
-                await asyncio.sleep(0.01)
+            event = await asyncio.wait_for(subscription.queue.get(), timeout=1)
             assert targeted == [run_id]
+            assert event is not None
+            assert event["body"]["sessions"] == expected["sessions"]
+            assert event["body"]["requests"] == expected["requests"]
+            assert event["body"]["checkpoints"] == expected["checkpoints"]
         finally:
             await hub.stop()
 
