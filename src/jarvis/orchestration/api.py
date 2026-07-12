@@ -164,6 +164,11 @@ class CockpitAppContext:
     # describe an active attempt, but it never owns or terminates the durable
     # conversation. A restart safely returns open conversations to idle.
     thread_turn_states: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+    # Legacy v1 status remains turn-terminal until the next turn starts, while
+    # the durable conversation operational state returns to idle immediately.
+    # Kept separate so compatibility state cannot make the conversation itself
+    # look terminal or degraded.
+    thread_turn_legacy_states: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
     delete: HttpDelete = httpx.delete
 
     async def require_auth(self, request: web.Request) -> None:
@@ -1792,6 +1797,7 @@ class CockpitWriteHandlers:
                     recoverable=True,
                 )
             finally:
+                self.ctx.thread_turn_legacy_states[state_key] = ("failed", "engine_error")
                 self.ctx.thread_turn_states.pop(state_key, None)
         except Exception as exc:  # noqa: BLE001 - preserve SSE contract after prepare.
             self.ctx.thread_turn_states[state_key] = ("degraded", "engine_error")
@@ -1806,8 +1812,10 @@ class CockpitWriteHandlers:
                     recoverable=False,
                 )
             finally:
+                self.ctx.thread_turn_legacy_states[state_key] = ("failed", "engine_error")
                 self.ctx.thread_turn_states.pop(state_key, None)
         self.ctx.thread_turn_states.pop(state_key, None)
+        self.ctx.thread_turn_legacy_states.pop(state_key, None)
         payload = {
             "project_id": project.id,
             "thread": _thread_projection(updated, self.ctx, include_messages=True),
@@ -4078,6 +4086,13 @@ def _thread_status(thread: CockpitThread, ctx: CockpitAppContext | None) -> tupl
         return "running", ""
     if operational_state in {"degraded", "blocked"}:
         return "failed", diagnostic_reason or "engine_error"
+    legacy = (
+        getattr(ctx, "thread_turn_legacy_states", {}).get((thread.project_id, thread.thread_id))
+        if ctx is not None
+        else None
+    )
+    if legacy is not None:
+        return legacy
     if thread.last_turn_at or thread.messages:
         return "completed", "completed"
     return "created", ""

@@ -7954,7 +7954,10 @@ def test_cockpit_thread_projection_clears_transient_degraded_state() -> None:
         last_turn_at="2026-07-12T12:01:00+00:00",
     )
     state_key = (thread.project_id, thread.thread_id)
-    ctx = SimpleNamespace(thread_turn_states={state_key: ("degraded", "engine_error")})
+    ctx = SimpleNamespace(
+        thread_turn_states={state_key: ("degraded", "engine_error")},
+        thread_turn_legacy_states={},
+    )
 
     assert cockpit_api_module._thread_operational_state(thread, ctx) == ("degraded", "engine_error")  # noqa: SLF001
     ctx.thread_turn_states.pop(state_key)
@@ -7966,7 +7969,42 @@ def test_cockpit_thread_projection_clears_transient_degraded_state() -> None:
     assert projection["ended_reason"] == "completed"
 
 
-def test_cockpit_thread_turn_error_does_not_leave_conversation_degraded(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+def test_cockpit_thread_projection_separates_legacy_failure_from_operational_state() -> None:
+    thread = CockpitThread(
+        thread_id="thread_retryable",
+        project_id="jarvis",
+        session_id="project:jarvis:orchestrator:thread_retryable",
+        title="Retryable conversation",
+        created_at="2026-07-12T12:00:00+00:00",
+        updated_at="2026-07-12T12:01:00+00:00",
+        created_by="operator",
+        engine="codex",
+        model="gpt-5.5",
+        last_turn_at="2026-07-12T12:01:00+00:00",
+    )
+    state_key = (thread.project_id, thread.thread_id)
+    ctx = SimpleNamespace(
+        thread_turn_states={},
+        thread_turn_legacy_states={state_key: ("failed", "engine_error")},
+    )
+
+    failed = cockpit_api_module._thread_projection(thread, ctx)  # noqa: SLF001
+    assert failed["operational_state"] == "idle"
+    assert failed["diagnostic_reason"] is None
+    assert failed["status"] == "failed"
+    assert failed["ended_reason"] == "engine_error"
+
+    ctx.thread_turn_states[state_key] = ("working", "")
+    assert cockpit_api_module._thread_status(thread, ctx) == ("running", "")  # noqa: SLF001
+
+    ctx.thread_turn_states.pop(state_key)
+    ctx.thread_turn_legacy_states.pop(state_key)
+    assert cockpit_api_module._thread_status(thread, ctx) == ("completed", "completed")  # noqa: SLF001
+
+
+def test_cockpit_thread_turn_error_preserves_legacy_failure_without_degrading_conversation(  # noqa: ANN001
+    tmp_path, monkeypatch
+) -> None:
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)
     connector = CockpitConnector(
@@ -7996,8 +8034,8 @@ def test_cockpit_thread_turn_error_does_not_leave_conversation_degraded(tmp_path
     assert any(event["_event"] == "thread.turn.error" for event in result["events"])
     assert result["thread"]["operational_state"] == "idle"
     assert result["thread"]["diagnostic_reason"] is None
-    assert result["thread"]["status"] == "created"
-    assert result["thread"]["ended_reason"] is None
+    assert result["thread"]["status"] == "failed"
+    assert result["thread"]["ended_reason"] == "engine_error"
 
 
 def test_cockpit_thread_rename_persists_and_records_activity(tmp_path, monkeypatch) -> None:  # noqa: ANN001
