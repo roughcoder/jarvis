@@ -728,6 +728,7 @@ for the project. Archived threads are hidden by default; pass
   "project_id": "jarvis",
   "threads": [
     {
+      "conversation_id": "thread_...",
       "thread_id": "thread_...",
       "chat_id": "thread_...",
       "parent_chat_id": "",
@@ -739,8 +740,12 @@ for the project. Archived threads are hidden by default; pass
       "model": "fast",
       "worker_id": null,
       "host": "mac-mini.local",
-      "status": "created",
+      "lifecycle": "open",
+      "operational_state": "idle",
+      "status": "idle",
       "ended_reason": null,
+      "diagnostic_reason": null,
+      "last_turn_at": null,
       "created_at": "2026-07-05T09:00:00+00:00",
       "updated_at": "2026-07-05T09:00:00+00:00",
       "created_by": "neil",
@@ -780,8 +785,24 @@ only by labels.
 Thread enrichment fields (on list, detail, open, turn, archive, and rename
 responses alike):
 
+- `conversation_id` is the stable durable conversation identity. During the v1
+  compatibility window it is identical to `thread_id`; clients should prefer
+  `conversation_id` when present and keep existing deep links keyed by the same
+  value.
+- `lifecycle` is `open` or `archived`. A conversation does not become terminal
+  when its turn, worker, or provider session finishes.
+- `operational_state` is the current conversation projection. This increment
+  emits `idle`, `working`, `degraded`, or `archived`; later compatible releases
+  may add the documented waiting/starting/joining states.
+- `status` is a v1 compatibility alias of `operational_state`. Open conversations
+  return to `idle` after every successful turn instead of becoming `completed`.
+- `ended_reason` is retained as null for v1 decoder compatibility. Turn/provider
+  terminal reasons belong to their own execution records. `diagnostic_reason`
+  may explain a temporary degraded state without ending the conversation.
+- `last_turn_at` records the latest durable turn timestamp when present.
 - `chat_type` is `assistant` or `orchestrator`. Missing values on legacy rows
-  mean `assistant`.
+  mean `assistant`. This is a legacy execution hint during migration, not a
+  conversation lifecycle or durable product type.
 - Assistant threads use `engine: "jarvis"`, a LiteLLM route in `model`, a null
   `worker_id`, and the brain `host`.
 - Orchestrator threads use `engine: "codex"` or `"claude"`, the provider model
@@ -791,12 +812,6 @@ responses alike):
   project memory plus a signed, short-lived, parent-thread-scoped MCP surface
   for spawning, watching, reading, and publishing child review work. The grant
   cannot access another project, parent thread, or tool.
-- `status` is `created` (no turns yet), `running` (a turn is in flight),
-  `completed` (last turn finished), or `failed` (last turn errored; the live
-  `running`/`failed` states are process-local and revert to the durable
-  `created`/`completed` derivation after a brain restart).
-- `ended_reason` uses the session taxonomy: `null` while created/running,
-  `completed` after a normal turn, `engine_error` after a failed one.
 
 `GET /v1/projects/{id}/threads/{tid}` returns one active or archived thread plus
 the locally recorded turn history for rendering resumed conversations:
@@ -807,6 +822,7 @@ the locally recorded turn history for rendering resumed conversations:
   "schema_version": 1,
   "project_id": "jarvis",
   "thread": {
+    "conversation_id": "thread_...",
     "thread_id": "thread_...",
     "project_id": "jarvis",
     "session_id": "project:jarvis:orchestrator:thread_...",
@@ -815,8 +831,11 @@ the locally recorded turn history for rendering resumed conversations:
     "model": "fast",
     "worker_id": null,
     "host": "mac-mini.local",
-    "status": "completed",
-    "ended_reason": "completed",
+    "lifecycle": "open",
+    "operational_state": "idle",
+    "status": "idle",
+    "ended_reason": null,
+    "last_turn_at": "2026-07-06T10:00:00+00:00",
     "created_at": "2026-07-05T09:00:00+00:00",
     "updated_at": "2026-07-06T10:00:00+00:00",
     "created_by": "neil",

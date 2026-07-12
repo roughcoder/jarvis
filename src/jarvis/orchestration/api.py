@@ -159,10 +159,10 @@ class CockpitAppContext:
     idempotency_lock_refs: dict[str, int]
     source_factory: Callable[[str, Any], WorkSource]
     oauth_validator: OAuthTokenValidator | None = None
-    # Live project-thread turn state, keyed (project_id, thread_id). Values are
-    # (status, ended_reason). Process-local by design: thread turns only run
-    # through this API, and a restart safely reverts rows to the durable
-    # created/completed derivation.
+    # Live project-conversation operational state, keyed (project_id, thread_id).
+    # Values are (operational_state, diagnostic_reason). Process-local state may
+    # describe an active attempt, but it never owns or terminates the durable
+    # conversation. A restart safely returns open conversations to idle.
     thread_turn_states: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
     delete: HttpDelete = httpx.delete
 
@@ -1734,7 +1734,7 @@ class CockpitWriteHandlers:
             ),
         )
         state_key = (project.id, thread.thread_id)
-        self.ctx.thread_turn_states[state_key] = ("running", "")
+        self.ctx.thread_turn_states[state_key] = ("working", "")
         cold_sessions = []
         client_gone = False
 
@@ -1780,7 +1780,7 @@ class CockpitWriteHandlers:
                 cold_task_sink=defer_cold_tasks,
             )
         except (UnsupportedMemoryOperation, TimeoutError, OSError, RuntimeError) as exc:
-            self.ctx.thread_turn_states[state_key] = ("failed", "engine_error")
+            self.ctx.thread_turn_states[state_key] = ("degraded", "engine_error")
             return await _write_thread_turn_error(
                 response,
                 cursor,
@@ -1791,7 +1791,7 @@ class CockpitWriteHandlers:
                 recoverable=True,
             )
         except Exception as exc:  # noqa: BLE001 - preserve SSE contract after prepare.
-            self.ctx.thread_turn_states[state_key] = ("failed", "engine_error")
+            self.ctx.thread_turn_states[state_key] = ("degraded", "engine_error")
             return await _write_thread_turn_error(
                 response,
                 cursor,
@@ -3990,8 +3990,10 @@ def _thread_projection(
     *,
     include_messages: bool = False,
 ) -> dict[str, Any]:
-    status, ended_reason = _thread_status(thread, ctx)
+    operational_state, diagnostic_reason = _thread_status(thread, ctx)
+    lifecycle = "archived" if thread.archived_at else "open"
     data = {
+        "conversation_id": thread.thread_id,
         "thread_id": thread.thread_id,
         "chat_id": thread.thread_id,
         "parent_chat_id": thread.parent_chat_id,
@@ -4003,14 +4005,22 @@ def _thread_projection(
         "model": thread.model or (_thread_model(ctx) if thread.engine == "jarvis" else ""),
         "worker_id": thread.worker_id or None,
         "host": _BRAIN_HOSTNAME if thread.engine == "jarvis" else "",
-        "status": status,
-        "ended_reason": ended_reason or None,
+        "lifecycle": lifecycle,
+        "operational_state": operational_state,
+        # Compatibility alias for v1 clients. This now describes the durable
+        # conversation's operational state, never a terminal provider/turn.
+        "status": operational_state,
+        # Retained for old clients only. Turn/session terminal reasons belong on
+        # their own records; a durable conversation does not have an end reason.
+        "ended_reason": None,
+        "diagnostic_reason": diagnostic_reason or None,
         "created_at": thread.created_at,
         "updated_at": thread.updated_at,
         "created_by": thread.created_by,
         "archived_at": thread.archived_at,
         "archived_by": thread.archived_by,
         "archive_reason": thread.archive_reason,
+        "last_turn_at": thread.last_turn_at or None,
     }
     if thread.workspace:
         data["workspace"] = workspace_public(thread.workspace)
@@ -4040,12 +4050,18 @@ def _thread_model(ctx: CockpitAppContext | None) -> str:
 
 
 def _thread_status(thread: CockpitThread, ctx: CockpitAppContext | None) -> tuple[str, str]:
+    if thread.archived_at:
+        return "archived", ""
     live = ctx.thread_turn_states.get((thread.project_id, thread.thread_id)) if ctx is not None else None
     if live is not None:
-        return live
-    if thread.last_turn_at or thread.messages:
-        return "completed", "completed"
-    return "created", ""
+        status, reason = live
+        return {
+            "created": "starting",
+            "running": "working",
+            "completed": "idle",
+            "failed": "degraded",
+        }.get(status, status), reason
+    return "idle", ""
 
 
 def _thread_detail_projection(thread: CockpitThread, ctx: CockpitAppContext | None = None) -> dict[str, Any]:

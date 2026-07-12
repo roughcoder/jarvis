@@ -6,8 +6,10 @@ import json
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -3607,7 +3609,11 @@ def test_cockpit_thread_workspace_failure_marks_workspace_failed(tmp_path, monke
     errors = [event for event in result["events"] if event["_event"] == "thread.turn.error"]
     assert errors
     thread = result["detail"]["thread"]
-    assert thread["status"] == "failed"
+    assert thread["lifecycle"] == "open"
+    assert thread["operational_state"] == "degraded"
+    assert thread["status"] == "degraded"
+    assert thread["diagnostic_reason"] == "engine_error"
+    assert thread["ended_reason"] is None
     assert thread["workspace"]["status"] == "failed"
     assert thread["workspace"]["provision_phase"] == "failed"
 
@@ -7816,7 +7822,7 @@ def test_failed_orchestrator_session_is_recreated_for_retry(tmp_path, monkeypatc
     assert retried.workspace["status"] == "ready"
 
 
-def test_cockpit_thread_projection_carries_engine_model_status(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+def test_cockpit_thread_projection_keeps_conversation_open_after_turn(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)
     memory = FakeProjectMemory()
@@ -7831,7 +7837,10 @@ def test_cockpit_thread_projection_carries_engine_model_status(tmp_path, monkeyp
         assert opened["model"] == str(cfg.gateway.voice_model or cfg.gateway.fast_model)
         assert opened["worker_id"] is None
         assert opened["host"]
-        assert opened["status"] == "created"
+        assert opened["conversation_id"] == opened["thread_id"]
+        assert opened["lifecycle"] == "open"
+        assert opened["operational_state"] == "idle"
+        assert opened["status"] == "idle"
         assert opened["ended_reason"] is None
 
         turn = await client.post(
@@ -7842,16 +7851,45 @@ def test_cockpit_thread_projection_carries_engine_model_status(tmp_path, monkeyp
         listed = (await client.get(f"{base}/v1/projects/neil-shared/threads")).json()["threads"]
         detail = (await client.get(f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}")).json()["thread"]
 
-        assert done["payload"]["thread"]["status"] == "completed"
-        assert done["payload"]["thread"]["ended_reason"] == "completed"
+        assert done["payload"]["thread"]["lifecycle"] == "open"
+        assert done["payload"]["thread"]["operational_state"] == "idle"
+        assert done["payload"]["thread"]["status"] == "idle"
+        assert done["payload"]["thread"]["ended_reason"] is None
         assert listed[0]["engine"] == "jarvis"
-        assert listed[0]["status"] == "completed"
-        assert detail["status"] == "completed"
-        assert detail["ended_reason"] == "completed"
+        assert listed[0]["status"] == "idle"
+        assert detail["status"] == "idle"
+        assert detail["ended_reason"] is None
 
     import asyncio
 
     asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_thread_operational_state_is_non_terminal() -> None:
+    thread = CockpitThread(
+        thread_id="thread_durable",
+        project_id="jarvis",
+        session_id="project:jarvis:orchestrator:thread_durable",
+        title="Durable conversation",
+        created_at="2026-07-12T12:00:00+00:00",
+        updated_at="2026-07-12T12:00:00+00:00",
+        created_by="operator",
+    )
+
+    assert cockpit_api_module._thread_status(thread, None) == ("idle", "")  # noqa: SLF001
+    archived = replace(thread, archived_at="2026-07-12T13:00:00+00:00")
+    assert cockpit_api_module._thread_status(archived, None) == ("archived", "")  # noqa: SLF001
+
+    for legacy, expected in (
+        ("created", "starting"),
+        ("running", "working"),
+        ("completed", "idle"),
+        ("failed", "degraded"),
+    ):
+        ctx = SimpleNamespace(
+            thread_turn_states={(thread.project_id, thread.thread_id): (legacy, "")}
+        )
+        assert cockpit_api_module._thread_status(thread, ctx) == (expected, "")  # noqa: SLF001
 
 
 def test_cockpit_thread_rename_persists_and_records_activity(tmp_path, monkeypatch) -> None:  # noqa: ANN001
