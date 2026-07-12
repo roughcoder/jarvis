@@ -6888,6 +6888,73 @@ def test_cockpit_session_event_type_aliases_are_normalized() -> None:
     assert canonical_event_type("") == ""
 
 
+def test_cockpit_projects_public_canonical_tool_envelope_and_correlation() -> None:
+    from jarvis.orchestration.cockpit import project_session_event
+
+    event = project_session_event(
+        {
+            "event_id": "ev_tool_1",
+            "session_id": "sess_1",
+            "type": "tool.call",
+            "time": "2026-07-01T11:00:00Z",
+            "data": {
+                "turn_id": "turn_1",
+                "provider": "codex",
+                "tool_call_id": "call_1",
+                "message_id": "call_1",
+                "tool_name": "spawn_child_work_session",
+                "server_name": "jarvis_orchestrator",
+                "title": "jarvis_orchestrator · spawn_child_work_session",
+                "item_type": "mcp_tool_call",
+                "status": "in_progress",
+                "input": {"title": "Review PR"},
+                "item": {
+                    "id": "call_1",
+                    "type": "mcpToolCall",
+                    "private_token": "must-not-leak",
+                },
+            },
+        },
+        worker_id="macbook-worker",
+        run_id="run_1",
+        sequence=1,
+    )
+
+    assert event["message_id"] == "call_1"
+    assert event["data"] == {
+        "turn_id": "turn_1",
+        "provider": "codex",
+        "tool_call_id": "call_1",
+        "message_id": "call_1",
+        "tool_name": "spawn_child_work_session",
+        "server_name": "jarvis_orchestrator",
+        "title": "jarvis_orchestrator · spawn_child_work_session",
+        "item_type": "mcp_tool_call",
+        "status": "in_progress",
+        "input": {"title": "Review PR"},
+        "item": {"id": "call_1", "type": "mcpToolCall"},
+    }
+
+
+def test_cockpit_correlates_legacy_nested_tool_result_ids() -> None:
+    from jarvis.orchestration.cockpit import project_session_event
+
+    event = project_session_event(
+        {
+            "event_id": "ev_tool_result_1",
+            "session_id": "sess_1",
+            "type": "tool.result",
+            "time": "2026-07-01T11:00:00Z",
+            "data": {"turn_id": "turn_1", "item": {"tool_use_id": "call_legacy", "content": "ok"}},
+        },
+        worker_id="macbook-worker",
+        run_id="run_1",
+        sequence=2,
+    )
+
+    assert event["message_id"] == "call_legacy"
+
+
 def test_cockpit_sse_snapshot_delta_events(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     from jarvis.orchestration.api import _snapshot_delta_events
 

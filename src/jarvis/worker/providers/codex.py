@@ -16,6 +16,10 @@ from jarvis.worker.orchestrator_runtime import (
     orchestrator_mcp_server,
 )
 from jarvis.worker.providers._common import (
+    canonical_tool_item_type,
+    tool_event_data,
+)
+from jarvis.worker.providers._common import (
     control_request_id as _control_request_id,
 )
 from jarvis.worker.providers._common import (
@@ -699,13 +703,12 @@ def _project_jsonrpc_message(
         item_type = str(item.get("type") or "")
         if item_type == "agentMessage":
             sessions.append_event(session_id, EVENT_ASSISTANT_MESSAGE, {**common, "text": str(item.get("text") or "")})
-        elif item_type in {"commandExecution", "mcpToolCall"}:
-            sessions.append_event(session_id, EVENT_TOOL_RESULT, {**common, "item": item})
+        elif canonical_tool_item_type(item):
+            sessions.append_event(session_id, EVENT_TOOL_RESULT, {**common, **tool_event_data(item, phase="result")})
     elif method == "item/started":
         item = dict(params.get("item") or {})
-        item_type = str(item.get("type") or "")
-        if item_type and item_type not in {"userMessage", "reasoning"}:
-            sessions.append_event(session_id, EVENT_TOOL_CALL, {**common, "item": item})
+        if canonical_tool_item_type(item):
+            sessions.append_event(session_id, EVENT_TOOL_CALL, {**common, **tool_event_data(item, phase="call")})
     elif method == "item/commandExecution/requestApproval":
         request_id = _message_request_id(message, params)
         _track_pending_request(

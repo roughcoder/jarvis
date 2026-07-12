@@ -21,6 +21,76 @@ PROVIDER_LOG_EVENT_LIMIT = 20
 # Truncate provider log text to this many characters before storing.
 PROVIDER_LOG_TEXT_LIMIT = 1000
 
+_CANONICAL_TOOL_ITEM_TYPES = {
+    "commandExecution": "command_execution",
+    "command_execution": "command_execution",
+    "fileChange": "file_change",
+    "file_change": "file_change",
+    "mcpToolCall": "mcp_tool_call",
+    "mcp_tool_call": "mcp_tool_call",
+    "dynamicToolCall": "dynamic_tool_call",
+    "dynamic_tool_call": "dynamic_tool_call",
+    "collabAgentToolCall": "collab_agent_tool_call",
+    "collab_agent_tool_call": "collab_agent_tool_call",
+    "webSearch": "web_search",
+    "web_search": "web_search",
+    "imageView": "image_view",
+    "image_view": "image_view",
+    "tool_use": "dynamic_tool_call",
+    "server_tool_use": "mcp_tool_call",
+    "tool_result": "dynamic_tool_call",
+    "advisor_tool_result": "dynamic_tool_call",
+}
+
+
+def canonical_tool_item_type(item: dict[str, Any]) -> str:
+    return _CANONICAL_TOOL_ITEM_TYPES.get(str(item.get("type") or ""), "")
+
+
+def tool_event_data(item: dict[str, Any], *, phase: str) -> dict[str, Any]:
+    """Return the provider-neutral public envelope for one tool lifecycle event."""
+    tool_call_id = str(
+        item.get("tool_call_id")
+        or item.get("toolCallId")
+        or item.get("id")
+        or item.get("tool_use_id")
+        or item.get("toolUseId")
+        or ""
+    ).strip()
+    tool_name = str(item.get("name") or item.get("tool") or "").strip()
+    server_name = str(item.get("server") or item.get("server_name") or item.get("serverName") or "").strip()
+    title = " · ".join(part for part in (server_name, tool_name) if part)
+    is_failure = bool(item.get("is_error") or item.get("error")) or str(item.get("status") or "").lower() in {
+        "cancelled",
+        "declined",
+        "error",
+        "failed",
+    }
+    status = "in_progress" if phase == "call" else "failed" if is_failure else "completed"
+    data: dict[str, Any] = {
+        "item": item,
+        "item_type": canonical_tool_item_type(item) or "dynamic_tool_call",
+        "status": status,
+    }
+    if tool_call_id:
+        data["tool_call_id"] = tool_call_id
+        data["message_id"] = tool_call_id
+    if tool_name:
+        data["tool_name"] = tool_name
+    if server_name:
+        data["server_name"] = server_name
+    if title:
+        data["title"] = title
+    tool_input = item.get("input", item.get("arguments"))
+    if tool_input not in (None, "", [], {}):
+        data["input"] = tool_input
+    tool_output = item.get("output", item.get("result", item.get("content")))
+    if tool_output not in (None, "", [], {}):
+        data["output"] = tool_output
+    if item.get("error") not in (None, "", [], {}):
+        data["error"] = item["error"]
+    return data
+
 
 def session_cwd(session: WorkerSession, worker_cfg: WorkerConfig, *, provider: str) -> str:
     candidates = [

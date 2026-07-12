@@ -58,6 +58,7 @@ from jarvis.worker.sessions import SessionManager  # noqa: E402
 from jarvis.worker.notify import WorkerChangeNotifier  # noqa: E402
 from jarvis.worker_session_contract import (  # noqa: E402
     EVENT_APPROVAL_RESOLVED,
+    EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
     EVENT_TURN_COMPLETED,
     REQUEST_KIND_APPROVAL,
@@ -761,6 +762,70 @@ def test_codex_projects_completed_mcp_tool_calls_as_tool_results(tmp_path) -> No
     assert done is False
     results = [event for event in sessions.events(session.session_id) if event.type == EVENT_TOOL_RESULT]
     assert results[-1].data["item"] == item
+
+
+@pytest.mark.parametrize(
+    ("provider_type", "canonical_type"),
+    [
+        ("commandExecution", "command_execution"),
+        ("fileChange", "file_change"),
+        ("mcpToolCall", "mcp_tool_call"),
+        ("dynamicToolCall", "dynamic_tool_call"),
+        ("collabAgentToolCall", "collab_agent_tool_call"),
+        ("webSearch", "web_search"),
+        ("imageView", "image_view"),
+    ],
+)
+def test_codex_projects_symmetric_canonical_tool_lifecycles(
+    tmp_path,
+    provider_type: str,
+    canonical_type: str,
+) -> None:
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "codex",
+            "engine": "codex",
+            "metadata": _authority_metadata("codex"),
+        }
+    )
+    turn = ProviderTurn(turn_id="turn_1", prompt="x", idempotency_key="idem_1")
+    started_item = {
+        "id": "call_1",
+        "type": provider_type,
+        "server": "jarvis_orchestrator",
+        "tool": "spawn_child_work_session",
+        "input": {"title": "Review PR"},
+    }
+    completed_item = {
+        **started_item,
+        "status": "completed",
+        "result": {"session_ref": "sessref_child"},
+    }
+
+    for method, item in (("item/started", started_item), ("item/completed", completed_item)):
+        done = _project_jsonrpc_message(
+            object(),  # type: ignore[arg-type]
+            {"jsonrpc": "2.0", "method": method, "params": {"item": item}},
+            session_id=session.session_id,
+            turn=turn,
+            sessions=sessions,
+        )
+        assert done is False
+
+    tool_events = [
+        event
+        for event in sessions.events(session.session_id)
+        if event.type in {EVENT_TOOL_CALL, EVENT_TOOL_RESULT}
+    ]
+    assert [event.type for event in tool_events] == [EVENT_TOOL_CALL, EVENT_TOOL_RESULT]
+    assert [event.data["status"] for event in tool_events] == ["in_progress", "completed"]
+    assert all(event.data["tool_call_id"] == "call_1" for event in tool_events)
+    assert all(event.data["message_id"] == "call_1" for event in tool_events)
+    assert all(event.data["item_type"] == canonical_type for event in tool_events)
+    assert all(event.data["tool_name"] == "spawn_child_work_session" for event in tool_events)
+    assert tool_events[0].data["input"] == {"title": "Review PR"}
+    assert tool_events[1].data["output"] == {"session_ref": "sessref_child"}
 
 
 def test_codex_restore_running_does_not_revive_terminal_turn(tmp_path) -> None:
@@ -3669,6 +3734,16 @@ def test_daemon_claude_provider_projects_sdk_events_and_reuses_stream(tmp_path, 
     assert "assistant.message" in event_types
     assert "tool.call" in event_types
     assert "tool.result" in event_types
+    tool_call = next(event for event in events if event["type"] == "tool.call")
+    tool_result = next(event for event in events if event["type"] == "tool.result")
+    assert tool_call["data"]["tool_call_id"] == "tool_1"
+    assert tool_call["data"]["message_id"] == "tool_1"
+    assert tool_call["data"]["tool_name"] == "Read"
+    assert tool_call["data"]["item_type"] == "dynamic_tool_call"
+    assert tool_call["data"]["status"] == "in_progress"
+    assert tool_result["data"]["tool_call_id"] == "tool_1"
+    assert tool_result["data"]["message_id"] == "tool_1"
+    assert tool_result["data"]["status"] == "completed"
     assert event_types.count("turn.completed") == 2
     assert [event["data"]["resume"] for event in process_events] == [False]
     assert process_events[0]["data"]["turn_id"] == first["turn_id"]
