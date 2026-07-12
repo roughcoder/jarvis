@@ -2483,6 +2483,40 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
     assert checkpoints_after_restore["checkpoints"][0]["restored"] is True
 
 
+def test_daemon_session_read_endpoints_offload_file_reads(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """Session event/request projection must not perform disk reads on aiohttp's loop."""
+    from jarvis.worker import server as worker_server
+
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, client):  # noqa: ANN001
+        created = (
+            await client.post(
+                base + "/sessions",
+                json={"provider": "fake", "engine": "fake", "metadata": _authority_metadata("fake")},
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        offloaded: list[str] = []
+
+        async def recording_to_thread(func, /, *args, **kwargs):  # noqa: ANN001
+            offloaded.append(func.__name__)
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(worker_server.asyncio, "to_thread", recording_to_thread)
+        events = await client.get(f"{base}/sessions/{session_id}/events", headers=headers)
+        requests = await client.get(f"{base}/sessions/{session_id}/requests", headers=headers)
+        all_requests = await client.get(base + "/sessions/requests", headers=headers)
+        return events, requests, all_requests, offloaded
+
+    events, requests, all_requests, offloaded = asyncio.run(_with_server(cfg, 8897, calls))
+
+    assert events.status_code == requests.status_code == all_requests.status_code == 200
+    assert offloaded == ["get", "events", "get", "pending_requests", "pending_requests"]
+
+
 def test_daemon_checkpoint_restore_requires_envelope_authority(tmp_path) -> None:
     cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
     headers = {"Authorization": "Bearer tkn"}
@@ -3073,10 +3107,12 @@ def test_codex_turn_timeout_pauses_while_request_pending(tmp_path, monkeypatch) 
         rpc_id="approval_rpc",
     )
     calls = 0
+    read_timeouts: list[float] = []
 
     def fake_read_message(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
         nonlocal calls
         calls += 1
+        read_timeouts.append(_kwargs["timeout"])
         if calls < 3:
             return None
         codex._forget_pending_request(session.session_id, "approval_rpc", process=process)  # type: ignore[arg-type]
@@ -3094,6 +3130,7 @@ def test_codex_turn_timeout_pauses_while_request_pending(tmp_path, monkeypatch) 
     )
 
     assert calls == 3
+    assert read_timeouts == [0.1, 0.1, 0.1]
     assert sessions.get(session.session_id).status == "completed"  # type: ignore[union-attr]
 
 

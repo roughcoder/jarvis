@@ -501,7 +501,7 @@ def _read_until_turn_done(
         message = _read_message(
             process,
             line_queue=line_queue,
-            timeout=0.5,
+            timeout=0.1,
             session_id=session_id,
             turn=turn,
             sessions=sessions,
