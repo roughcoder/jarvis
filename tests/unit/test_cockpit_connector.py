@@ -174,6 +174,62 @@ def test_connector_adds_turn_author_to_thread_session_before_messages(tmp_path, 
     assert message_write["messages"][0]["metadata"]["device_id"] == "riley-laptop"
 
 
+def test_connector_returns_before_cold_task_finishes_and_logs_failures(tmp_path, monkeypatch, caplog) -> None:  # noqa: ANN001
+    class DeferredSession:
+        def __init__(self, gate: asyncio.Event, *, fail: bool = False) -> None:
+            self._gate = gate
+            self._fail = fail
+            self._tasks: set[asyncio.Task] = set()
+
+        @property
+        def pending_cold_tasks(self) -> tuple[asyncio.Task, ...]:
+            return tuple(self._tasks)
+
+        async def respond_text(self, _text, _trace, result, *, attachments=None, on_text=None):  # noqa: ANN001
+            result.raw = "Ready."
+            return result.raw
+
+        def finalize(self, _text, result, _trace) -> None:  # noqa: ANN001
+            result.reply = result.raw
+
+            async def cold() -> None:
+                await self._gate.wait()
+                if self._fail:
+                    raise RuntimeError("cold task failed")
+
+            task = asyncio.create_task(cold())
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def verify() -> None:
+        cfg = _cfg(tmp_path, monkeypatch)
+        memory = FakeMemory()
+        connector = CockpitConnector(cfg, memory=memory, gateway=object(), tts=None, tracer=None)
+        project = ProjectEntry(id="jarvis", name="Jarvis", owner="neil", members=("neil",), visibility="private")
+        requester = RequestContext("dev", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+        thread = await connector.open_thread(project, requester, title="Planning")
+        gate = asyncio.Event()
+        session = DeferredSession(gate, fail=True)
+        monkeypatch.setattr(connector, "_make_session", lambda *_args, **_kwargs: session)
+
+        reply, _updated, _events = await asyncio.wait_for(
+            connector.turn(project, thread, requester, "Please answer."), timeout=0.1
+        )
+
+        assert reply == "Ready."
+        assert session.pending_cold_tasks
+        gate.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    import asyncio
+
+    with caplog.at_level("ERROR", logger="jarvis.connectors.cockpit"):
+        asyncio.run(verify())
+
+    assert "cockpit cold task failed" in caplog.text
+
+
 def test_thread_index_archive_round_trip_and_filtering(tmp_path) -> None:
     index = CockpitThreadIndex(tmp_path / "threads.json")
     active = index.save(

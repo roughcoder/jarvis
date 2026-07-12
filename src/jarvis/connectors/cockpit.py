@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import inspect
 import json
+import logging
 import os
 import re
 import tempfile
@@ -82,6 +84,7 @@ THREAD_HISTORY_LIMIT = 24
 CHILD_WATCH_LEASE_S = 300
 CHILD_WORK_LANDING_MODES = {"none", "branch_only", "draft_pr", "ready_pr", "confirm_before_pr"}
 _THREAD_INDEX_LOCK = threading.RLock()
+logger = logging.getLogger(__name__)
 _WORK_SESSION_OFFER = (
     "I can't do that from this project conversation because it has no workspace, "
     "repo checkout, test runner, or code-review tool attached. Dispatch it through "
@@ -817,6 +820,7 @@ class CockpitConnector:
         attachments: list[dict[str, Any]] | None = None,
         workspace_request: dict[str, Any] | None = None,
         progress: Callable[[dict[str, Any]], Any] | None = None,
+        cold_task_sink: Callable[[BrainSession], Any] | None = None,
     ) -> tuple[str, CockpitThread, tuple[dict[str, Any], ...]]:
         text = text.strip()
         if not text:
@@ -862,13 +866,23 @@ class CockpitConnector:
             device_id=requester.device_id,
         )
         result = TurnResult()
-        reply = await session.respond_text(text, trace, result, attachments=attachments)
+        async def on_text(delta: str) -> None:
+            await _emit_progress(progress, {"type": "text.delta", "delta": delta})
+
+        reply = await session.respond_text(
+            text, trace, result, attachments=attachments, on_text=on_text if progress is not None else None
+        )
         events = _safe_thread_tool_events(thread.session_id, result.tool_messages)
         guarded_reply = _guard_project_thread_reply(result.raw or reply, events)
         if guarded_reply != (result.raw or reply):
             result.raw = guarded_reply
         session.finalize(text, result, trace)
-        await _drain_cold_tasks(session)
+        if cold_task_sink is not None:
+            emitted = cold_task_sink(session)
+            if inspect.isawaitable(emitted):
+                await emitted
+        else:
+            schedule_cold_task_drain(session)
         if self._tracer is not None:
             self._tracer.emit(trace)
         reply = result.reply or reply
@@ -911,15 +925,13 @@ class CockpitConnector:
         workspace_request: dict[str, Any],
         progress: Callable[[dict[str, Any]], Any] | None,
     ) -> tuple[str, CockpitThread]:
-        if progress is not None:
-            progress({"phase": "resolving-access", "thread_id": thread.thread_id})
+        await _emit_progress(progress, {"phase": "resolving-access", "thread_id": thread.thread_id})
         thread = await self._ensure_workspace(project, thread, requester, workspace_request=workspace_request, progress=progress)
         worker_id = str(thread.workspace.get("worker_id") or "")
         session_id = str(thread.workspace.get("session_id") or "")
         if not worker_id or not session_id:
             raise RuntimeError("conversation workspace has no worker session")
-        if progress is not None:
-            progress({"phase": "running", "thread_id": thread.thread_id, "workspace": workspace_public(thread.workspace)})
+        await _emit_progress(progress, {"phase": "running", "thread_id": thread.thread_id, "workspace": workspace_public(thread.workspace)})
         turn = await asyncio.to_thread(
             self._post_worker_json,
             worker_id,
@@ -1033,8 +1045,7 @@ class CockpitConnector:
                 },
             )
         )
-        if progress is not None:
-            progress({"phase": "running", "thread_id": thread.thread_id, "workspace": workspace_public(thread.workspace)})
+        await _emit_progress(progress, {"phase": "running", "thread_id": thread.thread_id, "workspace": workspace_public(thread.workspace)})
         try:
             reply = await self._wait_for_orchestrator_turn(worker_id, session_id, turn_id)
         except Exception:
@@ -1049,14 +1060,14 @@ class CockpitConnector:
                     },
                 )
             )
-            if progress is not None:
-                progress(
-                    {
-                        "phase": "failed",
-                        "thread_id": failed.thread_id,
-                        "workspace": workspace_public(failed.workspace),
-                    }
-                )
+            await _emit_progress(
+                progress,
+                {
+                    "phase": "failed",
+                    "thread_id": failed.thread_id,
+                    "workspace": workspace_public(failed.workspace),
+                },
+            )
             raise
         try:
             await asyncio.to_thread(
@@ -1117,8 +1128,7 @@ class CockpitConnector:
                     },
                 )
             )
-        if progress is not None:
-            progress({"phase": "resolving-access", "thread_id": thread.thread_id})
+        await _emit_progress(progress, {"phase": "resolving-access", "thread_id": thread.thread_id})
         preferred = [thread.worker_id] if thread.worker_id else None
         profile = self._registry().choose(preferred=preferred, engine=thread.engine)
         if thread.worker_id and (profile is None or profile.worker_id != thread.worker_id):
@@ -1330,8 +1340,7 @@ class CockpitConnector:
                         },
                     )
                 )
-                if progress is not None:
-                    progress({"phase": "cloning", "thread_id": thread.thread_id, "repo": repo.get("name") or repo.get("repo")})
+                await _emit_progress(progress, {"phase": "cloning", "thread_id": thread.thread_id, "repo": repo.get("name") or repo.get("repo")})
                 thread = self._index.save(
                     replace(
                         thread,
@@ -1342,8 +1351,7 @@ class CockpitConnector:
                         },
                     )
                 )
-                if progress is not None:
-                    progress({"phase": "creating-worktree", "thread_id": thread.thread_id, "repo": repo.get("name") or repo.get("repo")})
+                await _emit_progress(progress, {"phase": "creating-worktree", "thread_id": thread.thread_id, "repo": repo.get("name") or repo.get("repo")})
                 materialized = await asyncio.to_thread(
                     self._post_worker_json,
                     worker_id,
@@ -2417,7 +2425,38 @@ async def _drain_cold_tasks(session: BrainSession) -> None:
     tasks = tuple(task for task in session.pending_cold_tasks if not task.done())
     if not tasks:
         return
-    await asyncio.gather(*tasks, return_exceptions=True)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            logger.error(
+                "cockpit cold task failed",
+                exc_info=(type(result), result, result.__traceback__),
+            )
+
+
+def schedule_cold_task_drain(session: BrainSession) -> None:
+    task = asyncio.create_task(_drain_cold_tasks(session))
+
+    def report_failure(completed: asyncio.Task) -> None:
+        try:
+            completed.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("cockpit cold task drain failed")
+
+    task.add_done_callback(report_failure)
+
+
+async def _emit_progress(
+    progress: Callable[[dict[str, Any]], Any] | None,
+    payload: dict[str, Any],
+) -> None:
+    if progress is None:
+        return
+    emitted = progress(payload)
+    if inspect.isawaitable(emitted):
+        await emitted
 
 
 def _text_with_attachment_markers(text: str, attachments: list[dict[str, Any]] | None) -> str:

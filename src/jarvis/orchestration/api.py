@@ -43,6 +43,7 @@ from jarvis.connectors.cockpit import (
     THREAD_INDEX_FILENAME,
     execute_orchestrator_tool,
     make_child_terminal_notifier,
+    schedule_cold_task_drain,
     workspace_public,
 )
 from jarvis.ids import new_id, utc_now
@@ -1529,6 +1530,39 @@ class CockpitWriteHandlers:
         )
         state_key = (project.id, thread.thread_id)
         self.ctx.thread_turn_states[state_key] = ("running", "")
+        cold_sessions = []
+        client_gone = False
+
+        async def progress(update: dict[str, Any]) -> None:
+            nonlocal client_gone
+            if client_gone:
+                return
+            if update.get("type") != "text.delta":
+                return
+            delta = str(update.get("delta") or "")
+            if not delta:
+                return
+            try:
+                await _write_sse(
+                    response,
+                    "thread.delta",
+                    cursor,
+                    _sse_envelope(
+                        cursor,
+                        "thread.delta",
+                        {
+                            "project_id": project.id,
+                            "thread_id": thread.thread_id,
+                            "delta": delta,
+                        },
+                    ),
+                )
+            except (ConnectionResetError, OSError):
+                client_gone = True
+
+        def defer_cold_tasks(session) -> None:  # noqa: ANN001 - BrainSession stays behind the facade.
+            cold_sessions.append(session)
+
         try:
             reply, updated, events = await connector.turn(
                 project,
@@ -1537,6 +1571,8 @@ class CockpitWriteHandlers:
                 text,
                 attachments=attachments or None,
                 workspace_request=dict(body["workspace"]) if isinstance(body.get("workspace"), dict) else None,
+                progress=progress,
+                cold_task_sink=defer_cold_tasks,
             )
         except (UnsupportedMemoryOperation, TimeoutError, OSError, RuntimeError) as exc:
             self.ctx.thread_turn_states[state_key] = ("failed", "engine_error")
@@ -1588,11 +1624,18 @@ class CockpitWriteHandlers:
             "thread": _thread_projection(updated, self.ctx, include_messages=True),
             "reply": reply,
         }
-        for event in events:
-            await _try_write_thread_event(response, cursor, event)
-        await _write_sse(response, "thread.reply", cursor, _sse_envelope(cursor, "thread.reply", payload))
-        await _write_sse(response, "thread.turn.done", cursor, _sse_envelope(cursor, "thread.turn.done", payload))
-        await response.write_eof()
+        try:
+            if not client_gone:
+                for event in events:
+                    await _try_write_thread_event(response, cursor, event)
+                await _write_sse(response, "thread.reply", cursor, _sse_envelope(cursor, "thread.reply", payload))
+                await _write_sse(response, "thread.turn.done", cursor, _sse_envelope(cursor, "thread.turn.done", payload))
+                await response.write_eof()
+        except (ConnectionResetError, OSError):
+            client_gone = True
+        finally:
+            for session in cold_sessions:
+                schedule_cold_task_drain(session)
         return response
 
     async def project_thread_rename(self, request: web.Request) -> web.Response:

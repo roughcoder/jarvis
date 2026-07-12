@@ -488,7 +488,15 @@ class BrainSession:
                 self._active_project_refresh_peers(),
             )
 
-    async def respond_text(self, user_text: str, trace, result: TurnResult, *, attachments: list[dict] | None = None) -> str:  # noqa: ANN001
+    async def respond_text(
+        self,
+        user_text: str,
+        trace,
+        result: TurnResult,
+        *,
+        attachments: list[dict] | None = None,
+        on_text: Callable[[str], Awaitable[None] | None] | None = None,
+    ) -> str:  # noqa: ANN001
         """Text-only turn: the SAME think core as respond() but it returns the reply
         text and plays NO audio (a text client wants ReplyText only). Reuses the tool
         loop, so tools work in text mode — the harness can drive the browser, etc.
@@ -524,9 +532,11 @@ class BrainSession:
             user_message,
         ]
         tool_schemas = await self._offer_tools(user_text)
-        if tool_schemas:
+        if tool_schemas or on_text is not None:
             # Drain the tool loop's PCM (earcons / vision) — a text client never plays it.
-            async for _pcm in self._run_tool_loop(messages, model, trace, tool_schemas, result):
+            async for _pcm in self._run_tool_loop(
+                messages, model, trace, tool_schemas, result, on_text=on_text
+            ):
                 pass
         else:
             if trace is not None:
@@ -904,7 +914,8 @@ class BrainSession:
                 return
 
     async def _run_tool_loop(  # noqa: ANN001
-        self, messages, model, trace, tool_schemas, result, *, speak: bool = False
+        self, messages, model, trace, tool_schemas, result, *, speak: bool = False,
+        on_text: Callable[[str], Awaitable[None] | None] | None = None,
     ):
         """Tool-aware completion: let the model call gated tools, feed results
         back, repeat until it answers. Sets `result.raw` to the text spoken so far
@@ -927,6 +938,7 @@ class BrainSession:
         steering: str | None = None
         pumps: deque = deque()  # in-flight sentence TTS pumps
         tts_meta: dict = {"first": None, "bytes": 0, "chars": 0, "t0": None}
+        emitted_text_segments = 0
 
         def _stage_text(sent: str) -> str:
             nonlocal steering
@@ -942,6 +954,16 @@ class BrainSession:
             result.raw = " ".join(spoken)
 
         async def emit(sent: str):  # yields PCM for one completed sentence
+            nonlocal emitted_text_segments
+            if on_text is not None:
+                text = self._clean_reply(sent)
+                if text:
+                    if emitted_text_segments:
+                        text = f" {text}"
+                    emitted = on_text(text)
+                    if emitted is not None:
+                        await emitted
+                    emitted_text_segments += 1
             if not (speak and self._tts is not None):
                 mark_spoken(sent)  # text turn: the reply IS the text
                 return
@@ -1051,6 +1073,12 @@ class BrainSession:
                             # Text turn: delivery is atomic (no audio), so the
                             # full reply is exactly what the user receives.
                             result.raw = content
+                            if on_text is not None:
+                                text = self._clean_reply(content)
+                                if text:
+                                    emitted = on_text(text)
+                                    if emitted is not None:
+                                        await emitted
                     elif not spoken and not pumps:
                         result.raw = content  # e.g. an all-whitespace stream
                     self._record_tts(trace, tts_meta, t0, first_tok)
