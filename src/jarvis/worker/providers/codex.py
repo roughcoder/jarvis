@@ -211,16 +211,10 @@ def _turn_input(turn: ProviderTurn) -> list[dict[str, Any]]:
 
 def _spawn_codex_app_server(
     session_id: str,
-    session: WorkerSession,
     worker_cfg: WorkerConfig,
     cwd: str,
-    sessions: SessionManager,
-) -> subprocess.Popen[str] | None:
-    """Start the codex app-server subprocess and track it for interrupt/cancel.
-
-    Returns None (after terminating the just-spawned process) if the session
-    was cancelled while spawning.
-    """
+) -> subprocess.Popen[str]:
+    """Start the codex app-server subprocess and track it for interrupt/cancel."""
     process = subprocess.Popen(
         [worker_cfg.codex_bin, "app-server", "--stdio"],
         cwd=cwd,
@@ -231,9 +225,6 @@ def _spawn_codex_app_server(
         bufsize=1,
     )
     _track_provider_process(session_id, process)
-    if _session_cancelled(sessions, session_id):
-        _terminate_provider_process(session)
-        return None
     return process
 
 
@@ -419,8 +410,11 @@ def _run_codex_turn(
         cwd = _session_cwd(session, worker_cfg)
         if _session_cancelled(sessions, session_id):
             return
-        process = _spawn_codex_app_server(session_id, session, worker_cfg, cwd, sessions)
-        if process is None:
+        # The cancel check stays out here: `process` must be assigned before an
+        # early return so the finally block still untracks and reaps it.
+        process = _spawn_codex_app_server(session_id, worker_cfg, cwd)
+        if _session_cancelled(sessions, session_id):
+            _terminate_provider_process(session)
             return
         line_queue = _start_line_readers(process)
         sessions.update_metadata(

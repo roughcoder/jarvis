@@ -5206,3 +5206,48 @@ def test_cli_linear_missing_api_key_prints_friendly_error(tmp_path, monkeypatch,
     assert "Linear work source is not configured" in out
     assert "LINEAR_API_KEY" in out
     assert "Traceback" not in out
+
+
+def _session_row_kwargs() -> dict:
+    return {
+        "session_ref": "sessref_abc",
+        "worker_id": "local-worker",
+        "session_id": "sess-1",
+        "run_id": "run-1",
+        "project_id": "proj-1",
+        "title": "Fix the flaky test",
+        "parent_chat_id": "",
+        "provider": "codex",
+        "engine": "codex",
+        "status": "running",
+        "ended_reason": "",
+        "repo": "roughcoder/jarvis",
+        "branch": "main",
+        "cwd": "/tmp/wt",
+        "latest_event_cursor": "42",
+        "created_at": "2026-07-12T00:00:00Z",
+        "updated_at": "2026-07-12T00:01:00Z",
+        "allowed_actions": ["worker.session.stop"],
+    }
+
+
+def test_build_session_row_includes_archived_at_by_default() -> None:
+    from jarvis.orchestration.cockpit import build_session_row
+
+    row = build_session_row(**_session_row_kwargs(), archived_at="2026-07-12T01:00:00Z")
+
+    assert row["archived_at"] == "2026-07-12T01:00:00Z"
+    assert row["session_ref"] == "sessref_abc"
+    assert row["allowed_actions"] == ["worker.session.stop"]
+
+
+def test_build_session_row_omits_archived_at_for_worker_rows() -> None:
+    # include_archived_at=False mirrors api._worker_session_row(), which never
+    # reports a cockpit-side archive state on worker turn responses.
+    from jarvis.orchestration.cockpit import build_session_row
+
+    row = build_session_row(**_session_row_kwargs(), include_archived_at=False)
+
+    assert "archived_at" not in row
+    with_archived = build_session_row(**_session_row_kwargs())
+    assert set(with_archived) - set(row) == {"archived_at"}
