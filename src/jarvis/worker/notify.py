@@ -18,7 +18,6 @@ import httpx
 logger = logging.getLogger(__name__)
 
 NotifyPost = Callable[[str, dict, dict], Awaitable[object]]
-_MAX_PENDING_CHANGES = 128
 
 
 @dataclass(frozen=True)
@@ -56,11 +55,15 @@ class WorkerChangeNotifier:
         url: str,
         token: str,
         worker_id: str,
+        max_pending_changes: int = 128,
+        delivery_timeout_s: float = 2.0,
         post: NotifyPost | None = None,
     ) -> None:
         self.url = url.rstrip("/")
         self.token = token
         self.worker_id = worker_id
+        self.max_pending_changes = max(1, int(max_pending_changes))
+        self.delivery_timeout_s = max(0.01, float(delivery_timeout_s))
         self._post = post or _post_notify
         self._loop: asyncio.AbstractEventLoop | None = None
         self._pending: dict[str, WorkerChange] = {}
@@ -93,7 +96,7 @@ class WorkerChangeNotifier:
             loop = self._loop
         if loop is None or loop.is_closed():
             with self._lock:
-                if change.key in self._pre_start or len(self._pre_start) < _MAX_PENDING_CHANGES:
+                if change.key in self._pre_start or len(self._pre_start) < self.max_pending_changes:
                     self._pre_start[change.key] = change
                 else:
                     logger.debug("dropping worker change notification: pending queue is full")
@@ -102,7 +105,11 @@ class WorkerChangeNotifier:
 
     def _enqueue_on_loop(self, change: WorkerChange) -> None:
         key = change.key
-        if key not in self._pending and key not in self._tasks and len(self._pending) + len(self._tasks) >= _MAX_PENDING_CHANGES:
+        if (
+            key not in self._pending
+            and key not in self._tasks
+            and len(self._pending) + len(self._tasks) >= self.max_pending_changes
+        ):
             logger.debug("dropping worker change notification: pending queue is full")
             return
         self._pending[key] = change
@@ -119,7 +126,7 @@ class WorkerChangeNotifier:
                             change.body(),
                             {"Authorization": f"Bearer {self.token}"},
                         ),
-                        timeout=2.0,
+                        timeout=self.delivery_timeout_s,
                     )
                     if getattr(response, "status_code", 200) >= 400:
                         logger.debug("worker change notification rejected: status=%s", getattr(response, "status_code", 0))
@@ -142,5 +149,5 @@ class WorkerChangeNotifier:
 
 
 async def _post_notify(url: str, body: dict, headers: dict) -> httpx.Response:
-    async with httpx.AsyncClient(timeout=2.0) as client:
+    async with httpx.AsyncClient() as client:
         return await client.post(url, json=body, headers=headers)

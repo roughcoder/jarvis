@@ -177,6 +177,18 @@ def test_events_reads_appended_tail_and_rereads_after_truncate_or_rotation(tmp_p
     assert [event.type for event in store.events(run.run_id)] == ["rotated"]
 
 
+def test_events_cache_returns_independent_event_data(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Independent event cache")
+    store.append_event(run.run_id, "details", data={"nested": {"value": "original"}})
+
+    first = store.events(run.run_id)
+    first[-1].data["nested"]["value"] = "caller mutation"
+    second = store.events(run.run_id)
+
+    assert second[-1].data == {"nested": {"value": "original"}}
+
+
 def test_session_ref_index_skips_unchanged_mapping_writes(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     store = OrchestrationStore(str(tmp_path))
     writes = []

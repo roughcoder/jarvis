@@ -213,6 +213,8 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         url=cfg.notify_url,
         token=cfg.token.get_secret_value(),
         worker_id=cfg.worker_id,
+        max_pending_changes=cfg.notify_max_pending_changes,
+        delivery_timeout_s=cfg.notify_delivery_timeout_s,
     )
     jobs = JobManager(
         store_dir=str(workspace / "jobs"),

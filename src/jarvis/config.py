@@ -14,7 +14,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from pydantic import BaseModel, SecretStr, computed_field
+from pydantic import AliasChoices, BaseModel, Field, SecretStr, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -482,14 +482,24 @@ class WorkerConfig(_Base):
     the worker. The brain reaches it at host:port; the daemon binds bind_host
     (default = host)."""
 
-    model_config = SettingsConfigDict(env_prefix="WORKER_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="WORKER_",
+        env_file=".env",
+        extra="ignore",
+        populate_by_name=True,
+    )
 
     host: str = "localhost"          # where the brain reaches the worker
     port: int = 8780
     bind_host: str = ""              # daemon bind addr; empty => host
     token: SecretStr = SecretStr("")  # shared pairing token
-    worker_id: str = "local-worker"  # matches this worker's orchestration registry profile
+    worker_id: str = Field(
+        default="local-worker",
+        validation_alias=AliasChoices("WORKER_ID", "WORKER_WORKER_ID"),
+    )  # matches this worker's orchestration registry profile
     notify_url: str = ""             # orchestration API base URL; empty disables change push
+    notify_max_pending_changes: int = 128
+    notify_delivery_timeout_s: float = 2.0
     allow_insecure: bool = False     # permit a no-token, non-loopback bind (else refuse to start)
     workspace: str = "~/.jarvis/worker"  # default cwd for actions/jobs
     max_concurrent_jobs: int = 2  # advertised orchestration capacity for the synthesized local profile
@@ -856,6 +866,7 @@ class OrchestrationConfig(_Base):
     # request budget: an unreachable worker should not delay every tick.
     sse_sync_timeout_s: float = 4.0
     sse_sync_backoff_ticks: int = 5
+    sse_notify_min_interval_s: float = 0.1
     # Safety valve for a future writer outside this API process. Generation is
     # process-local, so periodically re-read file metadata and project anew.
     sse_forced_refresh_ticks: int = 30
@@ -1064,6 +1075,8 @@ class Config:
             "worker.token": mask(self.worker.token),
             "worker.worker_id": self.worker.worker_id,
             "worker.notify_url": self.worker.notify_url or "<disabled>",
+            "worker.notify_max_pending_changes": self.worker.notify_max_pending_changes,
+            "worker.notify_delivery_timeout_s": self.worker.notify_delivery_timeout_s,
             "worker.agent": self.worker.agent,
             "worker.supported_engines": self.worker.supported_engines or "<default agent only>",
             "worker.workspace": self.worker.workspace,
@@ -1148,6 +1161,7 @@ class Config:
             "orchestration.sse_heartbeat_interval_s": self.orchestration.sse_heartbeat_interval_s,
             "orchestration.sse_sync_timeout_s": self.orchestration.sse_sync_timeout_s,
             "orchestration.sse_sync_backoff_ticks": self.orchestration.sse_sync_backoff_ticks,
+            "orchestration.sse_notify_min_interval_s": self.orchestration.sse_notify_min_interval_s,
             "orchestration.sse_forced_refresh_ticks": self.orchestration.sse_forced_refresh_ticks,
             "linear.api_key": mask(self.linear.api_key),
         }

@@ -289,6 +289,7 @@ class SseSnapshotHub:
         self._subscribers: dict[int, SseSubscription] = {}
         self._snapshots: dict[str, dict[str, Any]] = {}
         self._snapshot_stamps: dict[str, tuple[int, frozenset[str], str]] = {}
+        self._worker_states: dict[str, dict[str, Any]] = {}
         self._event_counts: dict[str, dict[str, int]] = {}
         self._worker_backoff_until: dict[str, int] = {}
         self._tick = 0
@@ -377,7 +378,11 @@ class SseSnapshotHub:
                 delay = self._next_notify_sync_at - now
                 if delay > 0:
                     await asyncio.sleep(delay)
-                self._next_notify_sync_at = asyncio.get_running_loop().time() + 0.1
+                notify_interval = max(
+                    0.0,
+                    float(self.ctx.cfg.orchestration.sse_notify_min_interval_s),
+                )
+                self._next_notify_sync_at = asyncio.get_running_loop().time() + notify_interval
                 self._wake.clear()
                 dirty = self._take_dirty()
             try:
@@ -385,15 +390,28 @@ class SseSnapshotHub:
                 for mode in modes:
                     self._tick += 1
                     worker_sync = _HubWorkerSync(self) if mode != "none" else None
+                    run_snapshot = None
                     if worker_sync is not None and dirty:
+                        dirty_run_snapshot = await asyncio.to_thread(self.ctx.store.list_runs)
                         sync = await asyncio.to_thread(
                             _hub_sync_dirty,
                             self.ctx,
                             mode,
                             worker_sync,
                             dirty,
+                            dirty_run_snapshot,
                         )
-                        worker_state = await asyncio.to_thread(_hub_worker_state, self.ctx, mode, worker_sync)
+                        run_snapshot = await asyncio.to_thread(self.ctx.store.list_runs)
+                        dirty_worker_ids = {worker_id for worker_id, _session_id, _job_id in dirty}
+                        worker_state = await asyncio.to_thread(
+                            _hub_worker_state,
+                            self.ctx,
+                            mode,
+                            worker_sync,
+                            run_snapshot,
+                            dirty_worker_ids if mode in self._worker_states else None,
+                            self._worker_states.get(mode),
+                        )
                     else:
                         sync = (
                             await asyncio.to_thread(
@@ -405,11 +423,21 @@ class SseSnapshotHub:
                             if worker_sync is not None
                             else None
                         )
+                        if worker_sync is not None:
+                            run_snapshot = await asyncio.to_thread(self.ctx.store.list_runs)
                         worker_state = (
-                            await asyncio.to_thread(_hub_worker_state, self.ctx, mode, worker_sync)
+                            await asyncio.to_thread(
+                                _hub_worker_state,
+                                self.ctx,
+                                mode,
+                                worker_sync,
+                                run_snapshot,
+                            )
                             if worker_sync is not None
                             else None
                         )
+                    if worker_state is not None:
+                        self._worker_states[mode] = worker_state
                     stamp = self._snapshot_stamp(worker_sync, worker_state)
                     force_refresh = self._tick % max(1, int(self.ctx.cfg.orchestration.sse_forced_refresh_ticks)) == 0
                     if not force_refresh and self._snapshot_stamps.get(mode) == stamp:
@@ -426,10 +454,11 @@ class SseSnapshotHub:
                             should_sync_worker=worker_sync.should_sync,
                             http_get=worker_sync.get,
                             worker_state=worker_state,
+                            all_runs=run_snapshot,
                         )
                     previous = self._snapshots.get(mode)
                     self._snapshots[mode] = body
-                    self._snapshot_stamps[mode] = self._snapshot_stamp(worker_sync, worker_state)
+                    self._snapshot_stamps[mode] = stamp
                     baselined = mode in self._event_counts
                     if not baselined:
                         # First tick for this mode: baseline the per-run event
@@ -3232,12 +3261,13 @@ def _hub_sync_dirty(
     mode: str,
     worker_sync: _HubWorkerSync,
     dirty: set[tuple[str, str, str]],
+    runs: list[Any] | None = None,
 ) -> dict[str, Any]:
     """Apply worker push hints without rediscovering every worker's state."""
     session_runs: set[str] = set()
     job_runs: set[str] = set()
     worker_ids = {worker_id for worker_id, _session_id, _job_id in dirty}
-    for run in ctx.store.list_runs():
+    for run in runs if runs is not None else ctx.store.list_runs():
         if run.archived_at:
             continue
         for worker_id, session_id, job_id in dirty:
@@ -3287,24 +3317,45 @@ def _hub_sync_dirty(
     }
 
 
-def _hub_worker_state(ctx: CockpitAppContext, mode: str, worker_sync: _HubWorkerSync) -> dict[str, Any]:
+def _hub_worker_state(
+    ctx: CockpitAppContext,
+    mode: str,
+    worker_sync: _HubWorkerSync,
+    all_runs: list[Any] | None = None,
+    worker_ids: set[str] | None = None,
+    previous: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Fetch only the live worker portion used to decide if a projection changed.
 
     Run/event files are intentionally absent here: store generation makes their
     changes visible without reconstructing the rest of the cockpit snapshot.
     """
 
-    all_runs = ctx.store.list_runs()
+    all_runs = all_runs if all_runs is not None else ctx.store.list_runs()
     archived_run_ids = {run.run_id for run in all_runs if run.archived_at}
     archived_session_refs = archived_session_refs_for_store(ctx.store, all_runs) | deleted_session_refs_for_store(ctx.store)
     runs = [run for run in all_runs if not run.archived_at]
-    workers = worker_profiles(
-        worker_cfg=ctx.cfg.worker,
-        workers_path=ctx.cfg.orchestration.workers_path,
-        probe=mode == "probe",
+    registry = WorkerRegistry(
+        ctx.cfg.worker,
+        profiles_path=ctx.cfg.orchestration.workers_path,
         http_get=worker_sync.get,
-        default_repo=ctx.cfg.orchestration.default_repo,
     )
+    profiles = registry.profiles(probe=False)
+    if mode == "probe":
+        profiles = [
+            registry.get(profile.worker_id, probe=True) or profile
+            if (worker_ids is None or profile.worker_id in worker_ids) and worker_sync.should_sync(profile)
+            else profile
+            for profile in profiles
+        ]
+    workers = [
+        project_worker_profile(profile, default_repo=ctx.cfg.orchestration.default_repo)
+        for profile in profiles
+    ]
+
+    def should_sync(profile: Any) -> bool:
+        return (worker_ids is None or profile.worker_id in worker_ids) and worker_sync.should_sync(profile)
+
     sessions = aggregate_sessions(
         runs=runs,
         worker_cfg=ctx.cfg.worker,
@@ -3315,14 +3366,14 @@ def _hub_worker_state(ctx: CockpitAppContext, mode: str, worker_sync: _HubWorker
         archived_run_ids=archived_run_ids,
         archived_session_refs=archived_session_refs,
         timeout_s=float(ctx.cfg.orchestration.sse_sync_timeout_s),
-        should_sync_worker=worker_sync.should_sync,
+        should_sync_worker=should_sync,
     )
     requests = aggregate_requests(
         worker_cfg=ctx.cfg.worker,
         workers_path=ctx.cfg.orchestration.workers_path,
         http_get=worker_sync.get,
         timeout_s=float(ctx.cfg.orchestration.sse_sync_timeout_s),
-        should_sync_worker=worker_sync.should_sync,
+        should_sync_worker=should_sync,
     )
     requests = [request for request in requests if str(request.get("session_ref") or "") in sessions]
     checkpoints = aggregate_checkpoints(
@@ -3332,13 +3383,54 @@ def _hub_worker_state(ctx: CockpitAppContext, mode: str, worker_sync: _HubWorker
         workers_path=ctx.cfg.orchestration.workers_path,
         http_get=worker_sync.get,
         timeout_s=float(ctx.cfg.orchestration.sse_sync_timeout_s),
-        should_sync_worker=worker_sync.should_sync,
+        should_sync_worker=should_sync,
     )
-    return {
+    current = {
         "workers": workers,
         "sessions": sessions,
         "requests": requests,
         "checkpoints": checkpoints,
+    }
+    if worker_ids is None or previous is None:
+        return current
+    return _merge_dirty_worker_state(previous, current, worker_ids)
+
+
+def _merge_dirty_worker_state(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+    worker_ids: set[str],
+) -> dict[str, Any]:
+    """Replace cached live rows only for workers named by a push hint."""
+
+    def merged_rows(name: str) -> list[dict[str, Any]]:
+        old_rows = [
+            row
+            for row in previous.get(name) or []
+            if str(row.get("worker_id") or "") not in worker_ids
+        ]
+        new_rows = [
+            row
+            for row in current.get(name) or []
+            if str(row.get("worker_id") or "") in worker_ids
+        ]
+        return [*old_rows, *new_rows]
+
+    old_sessions = {
+        ref: row
+        for ref, row in (previous.get("sessions") or {}).items()
+        if str(row.get("worker_id") or "") not in worker_ids
+    }
+    new_sessions = {
+        ref: row
+        for ref, row in (current.get("sessions") or {}).items()
+        if str(row.get("worker_id") or "") in worker_ids
+    }
+    return {
+        "workers": merged_rows("workers"),
+        "sessions": {**old_sessions, **new_sessions},
+        "requests": merged_rows("requests"),
+        "checkpoints": merged_rows("checkpoints"),
     }
 
 
@@ -3356,6 +3448,7 @@ def _cockpit_snapshot(
     should_sync_worker: Callable[[Any], bool] | None = None,
     http_get: HttpGet | None = None,
     worker_state: dict[str, Any] | None = None,
+    all_runs: list[Any] | None = None,
 ) -> dict[str, Any]:
     return cockpit_snapshot(
         store=ctx.store,
@@ -3368,6 +3461,7 @@ def _cockpit_snapshot(
         sync_timeout_s=sync_timeout_s,
         should_sync_worker=should_sync_worker,
         worker_state=worker_state,
+        all_runs=all_runs,
     )
 
 

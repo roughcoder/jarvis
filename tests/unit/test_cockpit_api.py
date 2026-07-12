@@ -2095,6 +2095,62 @@ def test_cockpit_sse_hub_backs_off_failed_worker_syncs(tmp_path, monkeypatch) ->
     assert sync.should_sync(profile) is True
 
 
+def test_cockpit_sse_probe_respects_worker_backoff_before_profile_probe(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.api import _HubWorkerSync, _hub_worker_state
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("backed-off worker was polled")),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+    hub = SseSnapshotHub(ctx)
+    hub._tick = 2  # noqa: SLF001
+    hub._worker_backoff_until["macbook-worker"] = 9  # noqa: SLF001
+
+    state = _hub_worker_state(ctx, "probe", _HubWorkerSync(hub), [])
+
+    assert state["workers"][0]["worker_id"] == "macbook-worker"
+
+
+def test_cockpit_dirty_worker_state_preserves_cached_other_workers() -> None:
+    from jarvis.orchestration.api import _merge_dirty_worker_state
+
+    previous = {
+        "workers": [{"worker_id": "dirty", "status": "online"}, {"worker_id": "steady", "status": "online"}],
+        "sessions": {
+            "dirty-old": {"worker_id": "dirty", "status": "running"},
+            "steady-session": {"worker_id": "steady", "status": "running"},
+        },
+        "requests": [{"worker_id": "steady", "request_id": "keep"}],
+        "checkpoints": [{"worker_id": "steady", "checkpoint_id": "keep"}],
+    }
+    current = {
+        "workers": [{"worker_id": "dirty", "status": "busy"}, {"worker_id": "steady", "status": "unknown"}],
+        "sessions": {"dirty-new": {"worker_id": "dirty", "status": "completed"}},
+        "requests": [{"worker_id": "dirty", "request_id": "new"}],
+        "checkpoints": [],
+    }
+
+    merged = _merge_dirty_worker_state(previous, current, {"dirty"})
+
+    assert merged["workers"] == [
+        {"worker_id": "steady", "status": "online"},
+        {"worker_id": "dirty", "status": "busy"},
+    ]
+    assert set(merged["sessions"]) == {"steady-session", "dirty-new"}
+    assert merged["requests"] == [
+        {"worker_id": "steady", "request_id": "keep"},
+        {"worker_id": "dirty", "request_id": "new"},
+    ]
+    assert merged["checkpoints"] == [{"worker_id": "steady", "checkpoint_id": "keep"}]
+
+
 def test_cockpit_sse_hub_notify_wakes_early_and_targets_the_dirty_run(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     from jarvis.orchestration.supervisor import SyncSummary
 

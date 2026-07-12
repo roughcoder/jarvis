@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import contextlib
 import fcntl
 import hashlib
@@ -9,10 +10,12 @@ import json
 import pathlib
 import re
 import shutil
+import threading
 from collections import OrderedDict
 from collections.abc import Callable
 
 from jarvis.ids import new_id, utc_now
+from jarvis.jsonl_cache import JsonlCacheEntry, read_jsonl_projection
 from jarvis.orchestration.models import (
     Artifact,
     OrchestrationRun,
@@ -96,7 +99,8 @@ class OrchestrationStore:
         # connected. Keep parsed values here and use file metadata to pick up
         # writes made by other processes.
         self._run_cache: OrderedDict[pathlib.Path, tuple[int, int, OrchestrationRun]] = OrderedDict()
-        self._events_cache: OrderedDict[pathlib.Path, tuple[int, int, int, int, int, list[RunEvent]]] = OrderedDict()
+        self._events_cache: OrderedDict[pathlib.Path, JsonlCacheEntry[RunEvent]] = OrderedDict()
+        self._cache_lock = threading.Lock()
 
     @property
     def generation(self) -> int:
@@ -182,7 +186,8 @@ class OrchestrationStore:
         d.mkdir(parents=True, exist_ok=True)
         path = self.run_path(run.run_id)
         path.write_text(json.dumps(run.to_dict(), indent=2, sort_keys=True))
-        self._run_cache.pop(path, None)
+        with self._cache_lock:
+            self._run_cache.pop(path, None)
         self.bump_generation()
 
     def get(self, run_id: str) -> OrchestrationRun | None:
@@ -204,20 +209,24 @@ class OrchestrationStore:
         for p in sorted(self.runs_dir.glob("*/run.json")):
             try:
                 stat = p.stat()
-                cached = self._run_cache.get(p)
-                if cached is not None and cached[:2] == (stat.st_size, stat.st_mtime_ns):
-                    run = cached[2]
-                    self._run_cache.move_to_end(p)
-                else:
+                with self._cache_lock:
+                    cached = self._run_cache.get(p)
+                    if cached is not None and cached[:2] == (stat.st_size, stat.st_mtime_ns):
+                        run = cached[2]
+                        self._run_cache.move_to_end(p)
+                    else:
+                        run = None
+                if run is None:
                     run = OrchestrationRun.from_dict(json.loads(p.read_text()))
                     self._cache_run(p, stat.st_size, stat.st_mtime_ns, run)
-                runs.append(OrchestrationRun.from_dict(run.to_dict()))
+                runs.append(copy.deepcopy(run))
                 seen.add(p)
             except (json.JSONDecodeError, OSError, KeyError):
                 continue
-        for path in tuple(self._run_cache):
-            if path not in seen:
-                self._run_cache.pop(path, None)
+        with self._cache_lock:
+            for path in tuple(self._run_cache):
+                if path not in seen:
+                    self._run_cache.pop(path, None)
         return sorted(runs, key=lambda r: r.updated_at)
 
     def append_event(
@@ -232,7 +241,8 @@ class OrchestrationStore:
         path = self.events_path(run_id)
         with path.open("a") as f:
             f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
-        self._events_cache.pop(path, None)
+        with self._cache_lock:
+            self._events_cache.pop(path, None)
         self.bump_generation()
         return event
 
@@ -244,39 +254,25 @@ class OrchestrationStore:
         try:
             stat = p.stat()
         except OSError:
-            self._events_cache.pop(p, None)
+            with self._cache_lock:
+                self._events_cache.pop(p, None)
             return []
-        cached = self._events_cache.get(p)
-        fingerprint = (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
-        if cached is not None and cached[:4] == fingerprint:
-            self._events_cache.move_to_end(p)
-            return list(cached[5])
-
-        if (
-            cached is not None
-            and cached[2:4] == (stat.st_dev, stat.st_ino)
-            and stat.st_size > cached[0]
-            and stat.st_size >= cached[4]
-        ):
-            events = list(cached[5])
-            offset = cached[4]
-            try:
-                with p.open("rb") as f:
-                    f.seek(offset)
-                    offset = self._append_event_lines(f.read(), events, offset)
-            except OSError:
-                return list(events)
-        else:
-            events = []
-            offset = 0
-            try:
-                with p.open("rb") as f:
-                    offset = self._append_event_lines(f.read(), events, offset)
-            except OSError:
-                return []
-
-        self._cache_events(p, stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino, offset, events)
-        return list(events)
+        with self._cache_lock:
+            cached = self._events_cache.get(p)
+            if cached is not None:
+                self._events_cache.move_to_end(p)
+        try:
+            fingerprint, offset, events = read_jsonl_projection(
+                p,
+                stat,
+                cached,
+                clone=copy.deepcopy,
+                merge=self._merge_event_record,
+            )
+        except OSError:
+            return []
+        self._cache_events(p, *fingerprint, offset, events)
+        return copy.deepcopy(events)
 
     def set_phase(self, run_id: str, phase: str, message: str = "") -> OrchestrationRun:
         run = self.get(run_id)
@@ -738,8 +734,9 @@ class OrchestrationStore:
             records = 1 + len(run.sessions) + len(run.jobs) + len(run.artifacts)
             directory = self.run_dir(run.run_id)
             shutil.rmtree(directory, ignore_errors=True)
-            self._run_cache.pop(self.run_path(run.run_id), None)
-            self._events_cache.pop(self.events_path(run.run_id), None)
+            with self._cache_lock:
+                self._run_cache.pop(self.run_path(run.run_id), None)
+                self._events_cache.pop(self.events_path(run.run_id), None)
             self.bump_generation()
             self._record_deleted_run_unlocked(run.run_id)
             self._record_sessions_deleted_unlocked(run.sessions)
@@ -862,10 +859,11 @@ class OrchestrationStore:
                 self._thread_children_promoter(parent_chat_id)
 
     def _cache_run(self, path: pathlib.Path, size: int, mtime_ns: int, run: OrchestrationRun) -> None:
-        self._run_cache[path] = (size, mtime_ns, run)
-        self._run_cache.move_to_end(path)
-        while len(self._run_cache) > _STORE_CACHE_MAX_RUNS:
-            self._run_cache.popitem(last=False)
+        with self._cache_lock:
+            self._run_cache[path] = (size, mtime_ns, run)
+            self._run_cache.move_to_end(path)
+            while len(self._run_cache) > _STORE_CACHE_MAX_RUNS:
+                self._run_cache.popitem(last=False)
 
     def _cache_events(
         self,
@@ -877,27 +875,16 @@ class OrchestrationStore:
         offset: int,
         events: list[RunEvent],
     ) -> None:
-        self._events_cache[path] = (size, mtime_ns, device, inode, offset, events)
-        self._events_cache.move_to_end(path)
-        while len(self._events_cache) > _STORE_CACHE_MAX_RUNS:
-            self._events_cache.popitem(last=False)
+        with self._cache_lock:
+            self._events_cache[path] = (size, mtime_ns, device, inode, offset, copy.deepcopy(events))
+            self._events_cache.move_to_end(path)
+            while len(self._events_cache) > _STORE_CACHE_MAX_RUNS:
+                self._events_cache.popitem(last=False)
 
     @staticmethod
-    def _append_event_lines(data: bytes, events: list[RunEvent], offset: int) -> int:
-        """Parse complete JSONL records and return the next safe byte offset."""
-
-        for raw_line in data.splitlines(keepends=True):
-            if not raw_line.endswith((b"\n", b"\r")):
-                break
-            offset += len(raw_line)
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                events.append(RunEvent.from_dict(json.loads(line)))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-        return offset
+    def _merge_event_record(events: list[RunEvent], record: object) -> None:
+        if isinstance(record, dict):
+            events.append(RunEvent.from_dict(record))
 
     def _write_index(self, path: pathlib.Path, data: object) -> None:
         _atomic_write_json(path, data)

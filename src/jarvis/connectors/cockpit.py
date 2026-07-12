@@ -47,6 +47,7 @@ from jarvis.brain.facade import (
 from jarvis.config import Config
 from jarvis.engines import worker_supports_engine
 from jarvis.ids import new_id, utc_now
+from jarvis.jsonl_cache import JsonlCacheEntry, read_jsonl_projection
 from jarvis.orchestrator_tool_contract import (
     ORCHESTRATOR_TOOL_NAME_SET,
     PUBLISH_GITHUB_PR_REVIEW,
@@ -206,7 +207,7 @@ class CockpitThreadIndex:
         # (size, mtime_ns, device, inode, safe_offset, messages). The offset
         # stops before a partial final line so a concurrent writer cannot make a
         # reader cache an incomplete JSON record.
-        self._transcript_cache: OrderedDict[Path, tuple[int, int, int, int, int, list[dict[str, Any]]]] = OrderedDict()
+        self._transcript_cache: OrderedDict[Path, JsonlCacheEntry[dict[str, Any]]] = OrderedDict()
         self._transcript_cache_lock = threading.Lock()
 
     def list(self, project_id: str, *, include_archived: bool = False) -> list[CockpitThread]:
@@ -334,6 +335,9 @@ class CockpitThreadIndex:
         if thread is None:
             return False
         with self._transcript_lock(thread.project_id, thread.thread_id):
+            thread = self.get(thread.project_id, thread.thread_id)
+            if thread is None:
+                return False
             messages = self._thread_messages(thread)
             if any(
                 message.get("type") == "child_terminal"
@@ -370,13 +374,15 @@ class CockpitThreadIndex:
         requester: RequestContext,
         continuation_instruction: str = "",
     ) -> str:
-        stored = self.get(thread.project_id, thread.thread_id) or thread
-        with self._transcript_lock(stored.project_id, stored.thread_id):
+        normalized = sorted(set(child_ids))
+        watch_id = hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()[:20]
+        with self._transcript_lock(thread.project_id, thread.thread_id):
+            stored = self.get(thread.project_id, thread.thread_id)
+            if stored is None:
+                return watch_id
             messages = self._thread_messages(stored)
-            normalized = sorted(set(child_ids))
             continuation = str(continuation_instruction or "").strip()
             requester_snapshot = _requester_authority_snapshot(requester)
-            watch_id = hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()[:20]
             existing = next(
                 (
                     message
@@ -417,6 +423,9 @@ class CockpitThreadIndex:
         if thread is None:
             return None
         with self._transcript_lock(thread.project_id, thread.thread_id):
+            thread = self.get(thread.project_id, thread.thread_id)
+            if thread is None:
+                return None
             messages = self._thread_messages(thread)
             claimed: dict[str, Any] | None = None
             for message in messages:
@@ -445,6 +454,9 @@ class CockpitThreadIndex:
         if thread is None:
             return
         with self._transcript_lock(thread.project_id, thread.thread_id):
+            thread = self.get(thread.project_id, thread.thread_id)
+            if thread is None:
+                return
             messages = self._thread_messages(thread)
             for message in messages:
                 if message.get("type") == "child_watch" and message.get("watch_id") == watch_id:
@@ -460,6 +472,9 @@ class CockpitThreadIndex:
         if thread is None:
             return
         with self._transcript_lock(thread.project_id, thread.thread_id):
+            thread = self.get(thread.project_id, thread.thread_id)
+            if thread is None:
+                return
             messages = self._thread_messages(thread)
             for message in messages:
                 if (
@@ -476,6 +491,9 @@ class CockpitThreadIndex:
         if thread is None:
             return False
         with self._transcript_lock(thread.project_id, thread.thread_id):
+            thread = self.get(thread.project_id, thread.thread_id)
+            if thread is None:
+                return False
             return any(
                 message.get("type") == "child_watch"
                 and message.get("watch_id") == watch_id
@@ -496,6 +514,8 @@ class CockpitThreadIndex:
         with self._transcript_lock(thread.project_id, thread.thread_id):
             observed_at = utc_now()
             stored = self.get(thread.project_id, thread.thread_id)
+            if stored is None and self._is_deleted(thread.project_id, thread.thread_id):
+                raise KeyError(thread.thread_id)
             archive_source = stored or thread
             appended = [
                 {
@@ -538,6 +558,8 @@ class CockpitThreadIndex:
         with self._transcript_lock(thread.project_id, thread.thread_id):
             observed_at = utc_now()
             stored = self.get(thread.project_id, thread.thread_id)
+            if stored is None and self._is_deleted(thread.project_id, thread.thread_id):
+                raise KeyError(thread.thread_id)
             archive_source = stored or thread
             appended = [
                 {
@@ -574,6 +596,10 @@ class CockpitThreadIndex:
             for thread_id, raw in self._read().get("threads", {}).items()
             if isinstance(raw, dict)
         }
+
+    def _is_deleted(self, project_id: str, thread_id: str) -> bool:
+        raw = self._read().get("deleted_threads", {}).get(thread_id)
+        return isinstance(raw, dict) and str(raw.get("project_id") or "") == project_id
 
     def _thread_messages(
         self,
@@ -661,34 +687,17 @@ class CockpitThreadIndex:
         except OSError:
             self._transcript_cache_pop(path)
             return []
-        cached = self._cached_jsonl_messages(path, stat=stat)
-        if cached is not None:
-            return cached
-
         cached_entry = self._transcript_cache_entry(path)
-        fingerprint = (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
-        if (
-            cached_entry is not None
-            and cached_entry[2:4] == fingerprint[2:]
-            and stat.st_size > cached_entry[0]
-            and stat.st_size >= cached_entry[4]
-        ):
-            messages = [dict(message) for message in cached_entry[5]]
-            offset = cached_entry[4]
-            try:
-                with path.open("rb") as handle:
-                    handle.seek(offset)
-                    offset = self._append_jsonl_messages(handle.read(), messages, offset)
-            except OSError:
-                return messages
-        else:
-            messages = []
-            offset = 0
-            try:
-                with path.open("rb") as handle:
-                    offset = self._append_jsonl_messages(handle.read(), messages, offset)
-            except OSError:
-                return []
+        try:
+            fingerprint, offset, messages = read_jsonl_projection(
+                path,
+                stat,
+                cached_entry,
+                clone=dict,
+                merge=self._merge_jsonl_message,
+            )
+        except OSError:
+            return []
         self._cache_thread_messages(path, *fingerprint, offset, messages)
         return [dict(message) for message in messages]
 
@@ -780,24 +789,10 @@ class CockpitThreadIndex:
                 self._transcript_cache.popitem(last=False)
 
     @staticmethod
-    def _append_jsonl_messages(data: bytes, messages: list[dict[str, Any]], offset: int) -> int:
-        """Parse complete JSONL records and return the next safe byte offset."""
-
-        for raw_line in data.splitlines(keepends=True):
-            if not raw_line.endswith((b"\n", b"\r")):
-                break
-            offset += len(raw_line)
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                parsed = json.loads(line)
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if isinstance(parsed, dict):
-                for message in _normalized_messages([parsed]):
-                    _merge_thread_message(messages, message)
-        return offset
+    def _merge_jsonl_message(messages: list[dict[str, Any]], record: object) -> None:
+        if isinstance(record, dict):
+            for message in _normalized_messages([record]):
+                _merge_thread_message(messages, message)
 
     def _transcript_path(self, project_id: str, thread_id: str) -> Path:
         return self.transcripts_dir / _safe_path_segment(project_id) / f"{_safe_path_segment(thread_id)}.jsonl"

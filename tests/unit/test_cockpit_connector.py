@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -711,5 +712,82 @@ def test_thread_index_delete_waits_for_append_before_reclaiming_transcript(tmp_p
     assert not append_worker.is_alive()
     assert not delete_worker.is_alive()
     assert deleted.is_set()
+    assert index.get("jarvis", thread.thread_id) is None
+    assert not index._transcript_path("jarvis", thread.thread_id).exists()
+
+
+def test_thread_index_rejects_stale_turn_after_thread_deletion(tmp_path) -> None:
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    thread = index.save(
+        CockpitThread(
+            thread_id="thread_deleted_turn",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_deleted_turn",
+            title="Deleted turn",
+            created_at="2026-07-05T08:00:00+00:00",
+            updated_at="2026-07-05T08:00:00+00:00",
+            created_by="neil",
+        )
+    )
+    index.delete("jarvis", thread.thread_id)
+
+    with pytest.raises(KeyError, match=thread.thread_id):
+        index.append_turn(
+            thread,
+            user_peer_id="neil",
+            user_text="late question",
+            assistant_peer_id="jarvis",
+            assistant_text="late answer",
+        )
+    with pytest.raises(KeyError, match=thread.thread_id):
+        index.append_pending_turn(
+            thread,
+            user_peer_id="neil",
+            user_text="late pending question",
+            assistant_peer_id="jarvis",
+        )
+
+    assert index.get("jarvis", thread.thread_id) is None
+    assert not index._transcript_path("jarvis", thread.thread_id).exists()
+
+
+def test_thread_index_revalidates_stale_child_notification_after_deletion(tmp_path, monkeypatch) -> None:
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    thread = index.save(
+        CockpitThread(
+            thread_id="thread_deleted_child",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_deleted_child",
+            title="Deleted child",
+            created_at="2026-07-05T08:00:00+00:00",
+            updated_at="2026-07-05T08:00:00+00:00",
+            created_by="neil",
+        )
+    )
+    index.delete("jarvis", thread.thread_id)
+    original_threads = index._threads
+    reads = 0
+
+    def stale_then_current(**kwargs):  # noqa: ANN003
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return {thread.thread_id: thread}
+        return original_threads(**kwargs)
+
+    monkeypatch.setattr(index, "_threads", stale_then_current)
+    child = SimpleNamespace(
+        run_id="run_child",
+        objective="Child task",
+        phase="completed",
+        status="terminal",
+        terminal_reason="done",
+    )
+
+    assert index.append_child_terminal_system_message(thread.thread_id, child) is False
+    assert index.claim_ready_child_watch(thread.thread_id, {child.run_id}) is None
+    index.finish_child_watch(thread.thread_id, "watch")
+    index.renew_child_watch_claim(thread.thread_id, "watch")
+
     assert index.get("jarvis", thread.thread_id) is None
     assert not index._transcript_path("jarvis", thread.thread_id).exists()

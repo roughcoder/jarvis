@@ -983,6 +983,38 @@ def test_worker_change_notification_is_disabled_when_url_is_empty(tmp_path) -> N
     asyncio.run(run())
 
 
+def test_worker_change_notifier_bounds_prestart_queue_and_delivery_time() -> None:
+    async def run() -> None:
+        cancelled = asyncio.Event()
+        calls: list[str] = []
+
+        async def post(_url: str, body: dict, _headers: dict) -> object:
+            calls.append(str(body.get("session_id") or ""))
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        notifier = WorkerChangeNotifier(
+            url="http://brain.test",
+            token="worker-token",
+            worker_id="local-worker",
+            max_pending_changes=1,
+            delivery_timeout_s=0.02,
+            post=post,
+        )
+        notifier.enqueue(kind="session_event", session_id="sess_first")
+        notifier.enqueue(kind="session_event", session_id="sess_dropped")
+        await notifier.start()
+        try:
+            await asyncio.wait_for(cancelled.wait(), timeout=1)
+            assert calls == ["sess_first"]
+        finally:
+            await notifier.aclose()
+
+    asyncio.run(run())
+
+
 def test_session_manager_strips_provider_owned_metadata_on_create(tmp_path) -> None:
     sessions = SessionManager(str(tmp_path / "sessions"))
 

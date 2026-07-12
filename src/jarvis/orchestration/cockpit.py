@@ -316,6 +316,7 @@ def cockpit_snapshot(
     should_sync_worker: Callable[[WorkerProfile], bool] | None = None,
     sync: dict[str, Any] | None = None,
     worker_state: dict[str, Any] | None = None,
+    all_runs: list[OrchestrationRun] | None = None,
 ) -> dict[str, Any]:
     if sync is None:
         sync = sync_state(
@@ -327,7 +328,7 @@ def cockpit_snapshot(
             timeout_s=sync_timeout_s,
             should_sync_worker=should_sync_worker,
         )
-    all_runs = store.list_runs()
+    all_runs = all_runs if all_runs is not None else store.list_runs()
     archived_run_ids = {run.run_id for run in all_runs if run.archived_at}
     archived_session_refs = archived_session_refs_for_store(store, all_runs) | deleted_session_refs_for_store(store)
     runs = [run for run in all_runs if not run.archived_at]
