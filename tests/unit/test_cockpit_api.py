@@ -3611,9 +3611,9 @@ def test_cockpit_thread_workspace_failure_marks_workspace_failed(tmp_path, monke
     thread = result["detail"]["thread"]
     assert thread["lifecycle"] == "open"
     assert thread["operational_state"] == "degraded"
-    assert thread["status"] == "degraded"
+    assert thread["status"] == "failed"
     assert thread["diagnostic_reason"] == "engine_error"
-    assert thread["ended_reason"] is None
+    assert thread["ended_reason"] == "engine_error"
     assert thread["workspace"]["status"] == "failed"
     assert thread["workspace"]["provision_phase"] == "failed"
 
@@ -7840,7 +7840,7 @@ def test_cockpit_thread_projection_keeps_conversation_open_after_turn(tmp_path, 
         assert opened["conversation_id"] == opened["thread_id"]
         assert opened["lifecycle"] == "open"
         assert opened["operational_state"] == "idle"
-        assert opened["status"] == "idle"
+        assert opened["status"] == "created"
         assert opened["ended_reason"] is None
 
         turn = await client.post(
@@ -7853,12 +7853,12 @@ def test_cockpit_thread_projection_keeps_conversation_open_after_turn(tmp_path, 
 
         assert done["payload"]["thread"]["lifecycle"] == "open"
         assert done["payload"]["thread"]["operational_state"] == "idle"
-        assert done["payload"]["thread"]["status"] == "idle"
-        assert done["payload"]["thread"]["ended_reason"] is None
+        assert done["payload"]["thread"]["status"] == "completed"
+        assert done["payload"]["thread"]["ended_reason"] == "completed"
         assert listed[0]["engine"] == "jarvis"
-        assert listed[0]["status"] == "idle"
-        assert detail["status"] == "idle"
-        assert detail["ended_reason"] is None
+        assert listed[0]["status"] == "completed"
+        assert detail["status"] == "completed"
+        assert detail["ended_reason"] == "completed"
 
     import asyncio
 
@@ -7876,9 +7876,11 @@ def test_cockpit_thread_operational_state_is_non_terminal() -> None:
         created_by="operator",
     )
 
-    assert cockpit_api_module._thread_status(thread, None) == ("idle", "")  # noqa: SLF001
+    assert cockpit_api_module._thread_operational_state(thread, None) == ("idle", "")  # noqa: SLF001
+    assert cockpit_api_module._thread_status(thread, None) == ("created", "")  # noqa: SLF001
     archived = replace(thread, archived_at="2026-07-12T13:00:00+00:00")
-    assert cockpit_api_module._thread_status(archived, None) == ("archived", "")  # noqa: SLF001
+    assert cockpit_api_module._thread_operational_state(archived, None) == ("archived", "")  # noqa: SLF001
+    assert cockpit_api_module._thread_status(archived, None) == ("created", "")  # noqa: SLF001
 
     for legacy, expected in (
         ("created", "starting"),
@@ -7889,7 +7891,67 @@ def test_cockpit_thread_operational_state_is_non_terminal() -> None:
         ctx = SimpleNamespace(
             thread_turn_states={(thread.project_id, thread.thread_id): (legacy, "")}
         )
-        assert cockpit_api_module._thread_status(thread, ctx) == (expected, "")  # noqa: SLF001
+        assert cockpit_api_module._thread_operational_state(thread, ctx) == (expected, "")  # noqa: SLF001
+
+
+def test_cockpit_thread_projection_clears_transient_degraded_state() -> None:
+    thread = CockpitThread(
+        thread_id="thread_recovered",
+        project_id="jarvis",
+        session_id="project:jarvis:orchestrator:thread_recovered",
+        title="Recovered conversation",
+        created_at="2026-07-12T12:00:00+00:00",
+        updated_at="2026-07-12T12:00:00+00:00",
+        created_by="operator",
+        engine="codex",
+        model="gpt-5.5",
+        last_turn_at="2026-07-12T12:01:00+00:00",
+    )
+    state_key = (thread.project_id, thread.thread_id)
+    ctx = SimpleNamespace(thread_turn_states={state_key: ("degraded", "engine_error")})
+
+    assert cockpit_api_module._thread_operational_state(thread, ctx) == ("degraded", "engine_error")  # noqa: SLF001
+    ctx.thread_turn_states.pop(state_key)
+
+    projection = cockpit_api_module._thread_projection(thread, ctx)  # noqa: SLF001
+    assert projection["operational_state"] == "idle"
+    assert projection["diagnostic_reason"] is None
+    assert projection["status"] == "completed"
+    assert projection["ended_reason"] == "completed"
+
+
+def test_cockpit_thread_turn_error_does_not_leave_conversation_degraded(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        opened = (await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Retryable"})).json()[
+            "thread"
+        ]
+        failed = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}/turns",
+            json={"text": "Try once"},
+        )
+        detail = (await client.get(f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}"))
+        return {"events": _sse_events(failed.text), "thread": detail.json()["thread"]}
+
+    import asyncio
+
+    result = asyncio.run(_with_server(cfg, calls))
+
+    assert any(event["_event"] == "thread.turn.error" for event in result["events"])
+    assert result["thread"]["operational_state"] == "idle"
+    assert result["thread"]["diagnostic_reason"] is None
+    assert result["thread"]["status"] == "created"
+    assert result["thread"]["ended_reason"] is None
 
 
 def test_cockpit_thread_rename_persists_and_records_activity(tmp_path, monkeypatch) -> None:  # noqa: ANN001

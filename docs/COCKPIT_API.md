@@ -794,11 +794,11 @@ responses alike):
 - `operational_state` is the current conversation projection. This increment
   emits `idle`, `working`, `degraded`, or `archived`; later compatible releases
   may add the documented waiting/starting/joining states.
-- `status` is a v1 compatibility alias of `operational_state`. Open conversations
-  return to `idle` after every successful turn instead of becoming `completed`.
-- `ended_reason` is retained as null for v1 decoder compatibility. Turn/provider
-  terminal reasons belong to their own execution records. `diagnostic_reason`
-  may explain a temporary degraded state without ending the conversation.
+- `status` and `ended_reason` preserve the original v1 turn-derived contract:
+  `created`, `running`, `completed`, or `failed`. New clients must use `lifecycle`
+  and `operational_state` for the durable conversation itself.
+- `diagnostic_reason` may explain a temporary degraded operational state without
+  ending the conversation.
 - `last_turn_at` records the latest durable turn timestamp when present.
 - `chat_type` is `assistant` or `orchestrator`. Missing values on legacy rows
   mean `assistant`. This is a legacy execution hint during migration, not a
