@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
 
 from jarvis import __version__ as JARVIS_VERSION
-from jarvis.brain.voice_modes import DEFAULT_MODE, STAY_MODE
+from jarvis.protocol.voice_modes import DEFAULT_MODE, STAY_MODE, normalize_and_validate_mode
 
 
 DEFAULT_SLEEP_AFTER_S = 90.0
@@ -1411,8 +1411,7 @@ def _escape_html(value: str) -> str:
 
 
 def _valid_voice_mode(value: str | None) -> str:
-    mode = (value or "").strip().lower().replace("-", "_")
-    return mode if mode in VOICE_MODES else ""
+    return normalize_and_validate_mode(value, VOICE_MODES)
 
 
 def _voice_mode_or_default(value: str | None) -> str:

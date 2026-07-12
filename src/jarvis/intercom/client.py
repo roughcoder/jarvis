@@ -25,7 +25,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import websockets
-from jarvis.brain.voice_modes import DEFAULT_MODE, STAY_MODE, normalize_mode
 from jarvis.config import Config
 from jarvis.device_diagnostics import (
     check_tcp_port,
@@ -64,6 +63,7 @@ from jarvis.protocol.messages import (
     encode_uplink_audio_binary,
     encode,
 )
+from jarvis.protocol.voice_modes import DEFAULT_MODE, STAY_MODE, normalize_mode
 
 FRAME_SAMPLES = 512
 
@@ -90,25 +90,51 @@ def _new_reply_state(voice_mode: str) -> dict:
     }
 
 
-def _is_passive_proactive_state(state: dict | None) -> bool:
-    """Default proactive ReplyEnd metadata should not close an active conversation."""
+def _is_passive_proactive(
+    *,
+    ended: bool | None,
+    continue_listening: bool | None,
+    voice_mode: str | None,
+    close_reason: str | None,
+    allowed_modes: frozenset[str],
+) -> bool:
+    """Core rule: a passive proactive default has ended=False, continue_listening=False,
+    an allowed voice mode, and no close reason."""
     return bool(
-        state
-        and state.get("ended") is False
-        and state.get("continue_listening") is False
-        and state.get("voice_mode") in {DEFAULT_MODE, STAY_MODE}
-        and not state.get("close_reason")
+        ended is False
+        and continue_listening is False
+        and voice_mode in allowed_modes
+        and not close_reason
+    )
+
+
+def _is_passive_proactive_state(state: dict | None) -> bool:
+    """Default proactive ReplyEnd metadata should not close an active conversation.
+
+    Deliberately allows {default, stay} here (dict path), unlike the message path below.
+    """
+    if not state:
+        return False
+    return _is_passive_proactive(
+        ended=state.get("ended"),
+        continue_listening=state.get("continue_listening"),
+        voice_mode=state.get("voice_mode"),
+        close_reason=state.get("close_reason"),
+        allowed_modes=frozenset({DEFAULT_MODE, STAY_MODE}),
     )
 
 
 def _is_passive_proactive_end(turn_id: str, msg: ReplyEnd) -> bool:
-    """Passive proactive ReplyEnd defaults should not overwrite selected voice mode."""
-    return (
-        turn_id.startswith("pa-")
-        and msg.ended is False
-        and msg.continue_listening is False
-        and msg.voice_mode == DEFAULT_MODE
-        and not msg.close_reason
+    """Passive proactive ReplyEnd defaults should not overwrite selected voice mode.
+
+    Deliberately allows only {default} here (message path), unlike the dict path above.
+    """
+    return turn_id.startswith("pa-") and _is_passive_proactive(
+        ended=msg.ended,
+        continue_listening=msg.continue_listening,
+        voice_mode=msg.voice_mode,
+        close_reason=msg.close_reason,
+        allowed_modes=frozenset({DEFAULT_MODE}),
     )
 
 

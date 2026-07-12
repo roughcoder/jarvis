@@ -13,7 +13,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from jarvis.deploy import ROLES
+from jarvis.deploy import ROLES, dotenv_quote
 from jarvis.users import parse_front_matter, read_facts, remember_fact
 
 
@@ -279,13 +279,13 @@ def _write_dotenv(path: Path, updates: dict[str, str]) -> None:
         stripped = line.lstrip()
         key = stripped.split("=", 1)[0].strip() if "=" in stripped and not stripped.startswith("#") else ""
         if key in remaining:
-            out.append(f"{key}={_quote(remaining.pop(key))}\n")
+            out.append(f"{key}={dotenv_quote(remaining.pop(key))}\n")
         else:
             out.append(line)
     if out and not out[-1].endswith(("\n", "\r")):
         out[-1] += "\n"
     for key in sorted(remaining):
-        out.append(f"{key}={_quote(remaining[key])}\n")
+        out.append(f"{key}={dotenv_quote(remaining[key])}\n")
     path.write_text("".join(out), encoding="utf-8")
     path.chmod(0o600)
 
@@ -420,5 +420,3 @@ def _unquote(value: str) -> str:
     return value.replace('\\"', '"').replace("\\\\", "\\")
 
 
-def _quote(value: str) -> str:
-    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'

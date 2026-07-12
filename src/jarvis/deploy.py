@@ -163,11 +163,11 @@ def upsert_brain_device_entry(
     devices.append(entry)
 
     serialized = json.dumps(devices, separators=(",", ":"))
-    updated_line = f"BRAIN_DEVICES={_dotenv_quote(serialized)}\n"
+    updated_line = f"BRAIN_DEVICES={dotenv_quote(serialized)}\n"
     updated = _replace_dotenv_key(lines, "BRAIN_DEVICES", updated_line)
     if brain_bind_host:
         updated = _replace_dotenv_key(
-            updated, "BRAIN_HOST", f"BRAIN_HOST={_dotenv_quote(brain_bind_host)}\n"
+            updated, "BRAIN_HOST", f"BRAIN_HOST={dotenv_quote(brain_bind_host)}\n"
         )
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -315,7 +315,7 @@ def render_mac_config_command(
     }
     managed_keys = "|".join(env_values)
     managed_block = "\n".join(
-        f"{key}={_dotenv_quote(value)}" for key, value in env_values.items()
+        f"{key}={dotenv_quote(value)}" for key, value in env_values.items()
     )
     return "\n".join(
         [
@@ -908,7 +908,7 @@ def _double_quote_escape(value: str) -> str:
 # systemd unit values and dotenv values share the same double-quote escaping;
 # keep them as one implementation so a quoting fix can't land on only one.
 _systemd_escape = _double_quote_escape
-_dotenv_quote = _double_quote_escape
+dotenv_quote = _double_quote_escape
 
 
 def _shell_quote(value: str) -> str:

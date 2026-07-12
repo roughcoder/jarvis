@@ -6,7 +6,6 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable
 
 from jarvis.config import WorkerConfig
@@ -16,11 +15,21 @@ from jarvis.worker.orchestrator_runtime import (
     ORCHESTRATOR_MCP_SERVER_NAME,
     orchestrator_mcp_server,
 )
+from jarvis.worker.providers._common import (
+    control_request_id as _control_request_id,
+)
+from jarvis.worker.providers._common import (
+    record_provider_log as _record_provider_log_impl,
+)
+from jarvis.worker.providers._common import (
+    session_cancelled as _session_cancelled,
+)
+from jarvis.worker.providers._common import (
+    session_cwd as _session_cwd_impl,
+)
 from jarvis.worker.providers.base import ProviderTurn
 from jarvis.worker.sessions import SessionEvent, SessionManager, WorkerSession
-from jarvis.worker.workspaces import is_worker_owned_path_for_config
 from jarvis.worker_session_contract import (
-    CANCELLED_SESSION_STATUSES,
     EVENT_APPROVAL_REQUESTED,
     EVENT_APPROVAL_RESOLVED,
     EVENT_ARTIFACT_UPDATED,
@@ -30,7 +39,6 @@ from jarvis.worker_session_contract import (
     EVENT_INPUT_REQUESTED,
     EVENT_PLAN_UPDATED,
     EVENT_PROVIDER_ERROR,
-    EVENT_PROVIDER_LOG,
     EVENT_PROVIDER_PROCESS_STARTED,
     EVENT_PROVIDER_STARTED,
     EVENT_PROVIDER_THREAD_READY,
@@ -201,6 +209,198 @@ def _turn_input(turn: ProviderTurn) -> list[dict[str, Any]]:
     return items
 
 
+def _spawn_codex_app_server(
+    session_id: str,
+    session: WorkerSession,
+    worker_cfg: WorkerConfig,
+    cwd: str,
+    sessions: SessionManager,
+) -> subprocess.Popen[str] | None:
+    """Start the codex app-server subprocess and track it for interrupt/cancel.
+
+    Returns None (after terminating the just-spawned process) if the session
+    was cancelled while spawning.
+    """
+    process = subprocess.Popen(
+        [worker_cfg.codex_bin, "app-server", "--stdio"],
+        cwd=cwd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    _track_provider_process(session_id, process)
+    if _session_cancelled(sessions, session_id):
+        _terminate_provider_process(session)
+        return None
+    return process
+
+
+def _codex_initialize(
+    process: subprocess.Popen[str],
+    rpc_id: int,
+    *,
+    session_id: str,
+    turn: ProviderTurn,
+    sessions: SessionManager,
+    line_queue: queue.Queue[tuple[str, str]],
+) -> int:
+    """Send the app-server `initialize`/`initialized` handshake; returns the
+    updated rpc_id counter."""
+    rpc_id += 1
+    init = _send_request(
+        process,
+        rpc_id,
+        "initialize",
+        {
+            "clientInfo": {"name": "jarvis-worker", "version": "0.0.0"},
+            "capabilities": {"experimentalApi": True},
+        },
+        session_id=session_id,
+        turn=turn,
+        sessions=sessions,
+        line_queue=line_queue,
+        timeout_s=30,
+    )
+    if "error" in init:
+        raise RuntimeError(init["error"].get("message") or "codex initialize failed")
+    _send_notification(process, "initialized")
+    return rpc_id
+
+
+def _codex_start_or_resume_thread(
+    process: subprocess.Popen[str],
+    rpc_id: int,
+    *,
+    session_id: str,
+    session: WorkerSession,
+    sessions: SessionManager,
+    turn: ProviderTurn,
+    authority: WorkerSessionAuthority,
+    cwd: str,
+    line_queue: queue.Queue[tuple[str, str]],
+) -> tuple[int, str]:
+    """Resume the codex thread if one exists on the session, else start a new
+    one. Returns the updated rpc_id counter and the resolved thread id."""
+    session = sessions.get(session_id) or session
+    thread_id = str(session.metadata.get("codex_thread_id") or "").strip()
+    model = str(session.metadata.get("model") or "").strip()
+    orchestrator_overrides = _orchestrator_thread_overrides(turn)
+    if thread_id:
+        rpc_id += 1
+        thread_response = _send_request(
+            process,
+            rpc_id,
+            "thread/resume",
+            {
+                "threadId": thread_id,
+                "cwd": cwd,
+                "approvalPolicy": authority.codex_approval_policy,
+                "sandbox": authority.codex_sandbox,
+                **({"model": model} if model else {}),
+                **orchestrator_overrides,
+            },
+            session_id=session_id,
+            turn=turn,
+            sessions=sessions,
+            line_queue=line_queue,
+            timeout_s=30,
+        )
+    else:
+        rpc_id += 1
+        thread_response = _send_request(
+            process,
+            rpc_id,
+            "thread/start",
+            {
+                "cwd": cwd,
+                "approvalPolicy": authority.codex_approval_policy,
+                "sandbox": authority.codex_sandbox,
+                **({"model": model} if model else {}),
+                **orchestrator_overrides,
+            },
+            session_id=session_id,
+            turn=turn,
+            sessions=sessions,
+            line_queue=line_queue,
+            timeout_s=30,
+        )
+    if "error" in thread_response:
+        raise RuntimeError(thread_response["error"].get("message") or "codex thread start/resume failed")
+    thread = dict(thread_response.get("result", {}).get("thread") or {})
+    thread_id = str(thread.get("id") or thread_id)
+    if thread_id:
+        sessions.update_metadata(
+            session_id,
+            {
+                "codex_thread_id": thread_id,
+                "codex_thread_path": str(thread.get("path") or ""),
+                "provider_session_id": str(thread.get("sessionId") or thread_id),
+            },
+        )
+        sessions.append_event(
+            session_id,
+            EVENT_PROVIDER_THREAD_READY,
+            {"turn_id": turn.turn_id, "provider": "codex", "thread_id": thread_id},
+        )
+    return rpc_id, thread_id
+
+
+def _codex_run_turn_and_wait(
+    process: subprocess.Popen[str],
+    rpc_id: int,
+    *,
+    session_id: str,
+    turn: ProviderTurn,
+    sessions: SessionManager,
+    line_queue: queue.Queue[tuple[str, str]],
+    authority: WorkerSessionAuthority,
+    cwd: str,
+    thread_id: str,
+    worker_cfg: WorkerConfig,
+) -> None:
+    """Start the turn on the resolved thread, then block reading app-server
+    events until the turn completes (or times out)."""
+    rpc_id += 1
+    _send_json(
+        process,
+        {
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "method": "turn/start",
+            "params": {
+                "threadId": thread_id,
+                "cwd": cwd,
+                "approvalPolicy": authority.codex_approval_policy,
+                "input": _turn_input(turn),
+            },
+        },
+    )
+    turn_started = _read_until_response(
+        process,
+        rpc_id,
+        session_id=session_id,
+        turn=turn,
+        sessions=sessions,
+        line_queue=line_queue,
+        timeout_s=30,
+    )
+    if "error" in turn_started:
+        raise RuntimeError(turn_started["error"].get("message") or "codex turn start failed")
+    provider_turn_id = str(turn_started.get("result", {}).get("turn", {}).get("id") or "")
+    if provider_turn_id:
+        sessions.update_metadata(session_id, {"provider_turn_id": provider_turn_id})
+    _read_until_turn_done(
+        process,
+        session_id=session_id,
+        turn=turn,
+        sessions=sessions,
+        line_queue=line_queue,
+        timeout_s=max(1.0, float(worker_cfg.job_timeout_s)),
+    )
+
+
 def _run_codex_turn(
     session_id: str,
     turn: ProviderTurn,
@@ -210,7 +410,6 @@ def _run_codex_turn(
 ) -> None:
     process: subprocess.Popen[str] | None = None
     line_queue: queue.Queue[tuple[str, str]] | None = None
-    rpc_id = 0
     try:
         session = sessions.get(session_id)
         if session is None:
@@ -220,18 +419,8 @@ def _run_codex_turn(
         cwd = _session_cwd(session, worker_cfg)
         if _session_cancelled(sessions, session_id):
             return
-        process = subprocess.Popen(
-            [worker_cfg.codex_bin, "app-server", "--stdio"],
-            cwd=cwd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-        _track_provider_process(session_id, process)
-        if _session_cancelled(sessions, session_id):
-            _terminate_provider_process(session)
+        process = _spawn_codex_app_server(session_id, session, worker_cfg, cwd, sessions)
+        if process is None:
             return
         line_queue = _start_line_readers(process)
         sessions.update_metadata(
@@ -248,123 +437,29 @@ def _run_codex_turn(
             {"turn_id": turn.turn_id, "provider": "codex", "pid": process.pid, "cwd": cwd},
         )
 
-        rpc_id += 1
-        init = _send_request(
+        rpc_id = _codex_initialize(process, 0, session_id=session_id, turn=turn, sessions=sessions, line_queue=line_queue)
+        rpc_id, thread_id = _codex_start_or_resume_thread(
             process,
             rpc_id,
-            "initialize",
-            {
-                "clientInfo": {"name": "jarvis-worker", "version": "0.0.0"},
-                "capabilities": {"experimentalApi": True},
-            },
             session_id=session_id,
-            turn=turn,
+            session=session,
             sessions=sessions,
+            turn=turn,
+            authority=authority,
+            cwd=cwd,
             line_queue=line_queue,
-            timeout_s=30,
         )
-        if "error" in init:
-            raise RuntimeError(init["error"].get("message") or "codex initialize failed")
-        _send_notification(process, "initialized")
-
-        session = sessions.get(session_id) or session
-        thread_id = str(session.metadata.get("codex_thread_id") or "").strip()
-        model = str(session.metadata.get("model") or "").strip()
-        orchestrator_overrides = _orchestrator_thread_overrides(turn)
-        if thread_id:
-            rpc_id += 1
-            thread_response = _send_request(
-                process,
-                rpc_id,
-                "thread/resume",
-                {
-                    "threadId": thread_id,
-                    "cwd": cwd,
-                    "approvalPolicy": authority.codex_approval_policy,
-                    "sandbox": authority.codex_sandbox,
-                    **({"model": model} if model else {}),
-                    **orchestrator_overrides,
-                },
-                session_id=session_id,
-                turn=turn,
-                sessions=sessions,
-                line_queue=line_queue,
-                timeout_s=30,
-            )
-        else:
-            rpc_id += 1
-            thread_response = _send_request(
-                process,
-                rpc_id,
-                "thread/start",
-                {
-                    "cwd": cwd,
-                    "approvalPolicy": authority.codex_approval_policy,
-                    "sandbox": authority.codex_sandbox,
-                    **({"model": model} if model else {}),
-                    **orchestrator_overrides,
-                },
-                session_id=session_id,
-                turn=turn,
-                sessions=sessions,
-                line_queue=line_queue,
-                timeout_s=30,
-            )
-        if "error" in thread_response:
-            raise RuntimeError(thread_response["error"].get("message") or "codex thread start/resume failed")
-        thread = dict(thread_response.get("result", {}).get("thread") or {})
-        thread_id = str(thread.get("id") or thread_id)
-        if thread_id:
-            sessions.update_metadata(
-                session_id,
-                {
-                    "codex_thread_id": thread_id,
-                    "codex_thread_path": str(thread.get("path") or ""),
-                    "provider_session_id": str(thread.get("sessionId") or thread_id),
-                },
-            )
-            sessions.append_event(
-                session_id,
-                EVENT_PROVIDER_THREAD_READY,
-                {"turn_id": turn.turn_id, "provider": "codex", "thread_id": thread_id},
-            )
-
-        rpc_id += 1
-        _send_json(
-            process,
-            {
-                "jsonrpc": "2.0",
-                "id": rpc_id,
-                "method": "turn/start",
-                "params": {
-                    "threadId": thread_id,
-                    "cwd": cwd,
-                    "approvalPolicy": authority.codex_approval_policy,
-                    "input": _turn_input(turn),
-                },
-            },
-        )
-        turn_started = _read_until_response(
+        _codex_run_turn_and_wait(
             process,
             rpc_id,
             session_id=session_id,
             turn=turn,
             sessions=sessions,
             line_queue=line_queue,
-            timeout_s=30,
-        )
-        if "error" in turn_started:
-            raise RuntimeError(turn_started["error"].get("message") or "codex turn start failed")
-        provider_turn_id = str(turn_started.get("result", {}).get("turn", {}).get("id") or "")
-        if provider_turn_id:
-            sessions.update_metadata(session_id, {"provider_turn_id": provider_turn_id})
-        _read_until_turn_done(
-            process,
-            session_id=session_id,
-            turn=turn,
-            sessions=sessions,
-            line_queue=line_queue,
-            timeout_s=max(1.0, float(worker_cfg.job_timeout_s)),
+            authority=authority,
+            cwd=cwd,
+            thread_id=thread_id,
+            worker_cfg=worker_cfg,
         )
     except Exception as exc:  # noqa: BLE001 - provider failures must become session events
         if _session_cancelled(sessions, session_id):
@@ -688,13 +783,6 @@ def _message_request_id(message: dict[str, Any], params: dict[str, Any]) -> str:
     return str(params.get("requestId") or params.get("request_id") or params.get("id") or message.get("id") or "").strip()
 
 
-def _control_request_id(request: dict[str, Any]) -> str:
-    request_id = str(request.get("request_id") or request.get("id") or "").strip()
-    if not request_id:
-        raise RuntimeError("request_id is required")
-    return request_id
-
-
 def _track_pending_request(
     session_id: str,
     request_id: str,
@@ -828,52 +916,11 @@ def _input_answer_payload(value: Any) -> dict[str, list[str]]:
 
 
 def _record_provider_log(session_id: str, turn: ProviderTurn, sessions: SessionManager, text: str) -> None:
-    if not text:
-        return
-    recent = [
-        event
-        for event in sessions.events(session_id)
-        if event.type == EVENT_PROVIDER_LOG and event.data.get("turn_id") == turn.turn_id
-    ]
-    if len(recent) >= 20:
-        return
-    sessions.append_event(
-        session_id,
-        EVENT_PROVIDER_LOG,
-        {
-            "turn_id": turn.turn_id,
-            "idempotency_key": turn.idempotency_key,
-            "provider": "codex",
-            "text": text[:1000],
-        },
-    )
+    _record_provider_log_impl(session_id, turn, sessions, text, provider="codex")
 
 
 def _session_cwd(session: WorkerSession, worker_cfg: WorkerConfig) -> str:
-    candidates = [
-        session.cwd,
-        str(session.metadata.get("provider_cwd") or ""),
-        str(session.metadata.get("cwd") or ""),
-    ]
-    rejected: list[str] = []
-    for candidate in candidates:
-        if not candidate:
-            continue
-        path = Path(candidate).expanduser().resolve(strict=False)
-        if not is_worker_owned_path_for_config(path, worker_cfg):
-            rejected.append(str(path))
-            continue
-        if path.is_dir():
-            return str(path)
-        rejected.append(str(path))
-    if rejected:
-        raise RuntimeError(f"worker session cwd is not a valid worker-owned directory: {', '.join(rejected)}")
-    raise RuntimeError("worker session cwd is required for codex provider turns")
-
-
-def _session_cancelled(sessions: SessionManager, session_id: str) -> bool:
-    session = sessions.get(session_id)
-    return session is not None and session.status in CANCELLED_SESSION_STATUSES
+    return _session_cwd_impl(session, worker_cfg, provider="codex")
 
 
 def _terminate_provider_process(session: WorkerSession) -> None:

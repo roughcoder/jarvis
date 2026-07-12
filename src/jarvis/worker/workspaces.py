@@ -119,6 +119,71 @@ def _ensure_workspace_unlocked(
     return public_workspace_state(state)
 
 
+async def _resolve_and_prepare_repo(
+    cfg: WorkerConfig,
+    path: pathlib.Path,
+    state: dict[str, Any],
+    repos_dir: pathlib.Path,
+    repo_ref: str,
+    base_ref: str,
+) -> tuple[str, str]:
+    """Resolve the source repo (cloning it if missing and configured to), then
+    fetch it and pick a base ref for the new worktree branch. Persists each
+    provision-phase transition on `state` as it goes."""
+    state["provision_phase"] = "resolving-access"
+    state["status"] = "provisioning"
+    _write_state(path, state)
+    resolved = resolve_repo(repo_ref, cfg.repo_root)
+    if resolved is None and cfg.clone_missing and cfg.repo_root:
+        state["provision_phase"] = "cloning"
+        _write_state(path, state)
+        resolved, clone_err = await clone_repo(repo_ref, cfg.repo_root, cfg.clone_timeout_s)
+        if resolved is None:
+            raise ValueError(clone_err or f"couldn't clone {repo_ref!r}")
+    if resolved is None:
+        avail = list_repos(cfg.repo_root)
+        hint = f" I can see: {', '.join(avail)}." if avail else ""
+        raise ValueError(f"couldn't find a repo called {repo_ref!r}.{hint}")
+
+    state["provision_phase"] = "creating-worktree"
+    _write_state(path, state)
+    repos_dir.mkdir(parents=True, exist_ok=True)
+    # Always fetch before branching, even when the caller passed an explicit
+    # base_ref — without this, an explicit base_ref skipped _default_base_ref's
+    # (conditional) fetch entirely and the worktree branched from a stale local
+    # base. Best-effort: a failed fetch is a warning elsewhere in the codebase
+    # (see actions.fetch_repo's docstring), not a reason to refuse provisioning.
+    await fetch_repo(resolved, cfg.shell_timeout_s)
+    base = _safe_base_ref(base_ref.strip() or await _default_base_ref(resolved, cfg.shell_timeout_s))
+    return resolved, base
+
+
+async def _reconcile_orphaned_worktree(
+    cfg: WorkerConfig,
+    resolved: str,
+    worktree: pathlib.Path,
+    requested_branch: str,
+) -> None:
+    """`worktree` exists on disk but no state row references it — the orphan left
+    by a daemon crash between `git worktree add` and _write_state (no state row
+    references this path, but the dir + git worktree registration + branch
+    survived). Reconcile instead of getting stuck forever: drop the orphaned
+    registration so the caller can fall through and recreate it cleanly."""
+    orphan_branch = await run_exec(
+        ["git", "-C", str(worktree), "branch", "--show-current"],
+        None,
+        cfg.shell_timeout_s,
+    )
+    await run_exec(["git", "-C", resolved, "worktree", "remove", "--force", str(worktree)], None, cfg.shell_timeout_s)
+    if worktree.exists():
+        shutil.rmtree(worktree, ignore_errors=True)
+    flattened_branch = requested_branch.replace("/", "-")
+    if orphan_branch == requested_branch or orphan_branch == flattened_branch or orphan_branch.startswith(
+        f"{flattened_branch}-"
+    ):
+        await run_exec(["git", "-C", resolved, "branch", "-D", orphan_branch], None, cfg.shell_timeout_s)
+
+
 async def materialize_worktree(
     *,
     cfg: WorkerConfig,
@@ -149,52 +214,12 @@ async def materialize_worktree(
                 _write_state(path, state)
                 return public_workspace_state(state)
 
-            state["provision_phase"] = "resolving-access"
-            state["status"] = "provisioning"
-            _write_state(path, state)
-            resolved = resolve_repo(repo_ref, cfg.repo_root)
-            if resolved is None and cfg.clone_missing and cfg.repo_root:
-                state["provision_phase"] = "cloning"
-                _write_state(path, state)
-                resolved, clone_err = await clone_repo(repo_ref, cfg.repo_root, cfg.clone_timeout_s)
-                if resolved is None:
-                    raise ValueError(clone_err or f"couldn't clone {repo_ref!r}")
-            if resolved is None:
-                avail = list_repos(cfg.repo_root)
-                hint = f" I can see: {', '.join(avail)}." if avail else ""
-                raise ValueError(f"couldn't find a repo called {repo_ref!r}.{hint}")
-
-            state["provision_phase"] = "creating-worktree"
-            _write_state(path, state)
-            repos_dir.mkdir(parents=True, exist_ok=True)
             requested_branch = f"{cfg.worktree_branch_prefix}/{workspace_id(conversation_id)}-{repo_key}"
-            # Always fetch before branching, even when the caller passed an explicit
-            # base_ref — without this, an explicit base_ref skipped _default_base_ref's
-            # (conditional) fetch entirely and the worktree branched from a stale local
-            # base. Best-effort: a failed fetch is a warning elsewhere in the codebase
-            # (see actions.fetch_repo's docstring), not a reason to refuse provisioning.
-            await fetch_repo(resolved, cfg.shell_timeout_s)
-            base = _safe_base_ref(base_ref.strip() or await _default_base_ref(resolved, cfg.shell_timeout_s))
+            resolved, base = await _resolve_and_prepare_repo(cfg, path, state, repos_dir, repo_ref, base_ref)
             if worktree.exists():
                 # `existing` (looked up above) was None or not a live dir, so this is
-                # not a real name conflict — it's the orphan left by a daemon crash
-                # between `git worktree add` below and _write_state (no state row
-                # references this path, but the dir + git worktree registration +
-                # branch survived). Reconcile instead of getting stuck forever: drop
-                # the orphaned registration and fall through to recreate it cleanly.
-                orphan_branch = await run_exec(
-                    ["git", "-C", str(worktree), "branch", "--show-current"],
-                    None,
-                    cfg.shell_timeout_s,
-                )
-                await run_exec(["git", "-C", resolved, "worktree", "remove", "--force", str(worktree)], None, cfg.shell_timeout_s)
-                if worktree.exists():
-                    shutil.rmtree(worktree, ignore_errors=True)
-                flattened_branch = requested_branch.replace("/", "-")
-                if orphan_branch == requested_branch or orphan_branch == flattened_branch or orphan_branch.startswith(
-                    f"{flattened_branch}-"
-                ):
-                    await run_exec(["git", "-C", resolved, "branch", "-D", orphan_branch], None, cfg.shell_timeout_s)
+                # not a real name conflict.
+                await _reconcile_orphaned_worktree(cfg, resolved, worktree, requested_branch)
             branch = await resolve_available_worktree_branch(resolved, requested_branch, cfg.shell_timeout_s)
             out = await run_exec(
                 ["git", "-C", resolved, "worktree", "add", "-b", branch, "--", str(worktree), base],

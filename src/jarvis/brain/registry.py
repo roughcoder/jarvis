@@ -9,14 +9,14 @@ visibility; the visibility tier controls the default audience.
 from __future__ import annotations
 
 import json
-import os
 import re
-import tempfile
 from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from pathlib import Path
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal
+
+from jarvis.brain._storage import atomic_write_json
 
 if TYPE_CHECKING:
     from jarvis.brain.memory_client import MemoryBackend
@@ -354,7 +354,7 @@ class RegistryStore:
         self._validate_contact_identifiers()
 
     def save(self) -> None:
-        _atomic_write_json(self.path, self.as_dict())
+        atomic_write_json(self.path, self.as_dict())
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -747,27 +747,3 @@ def _normalize_phone(value: str) -> str:
     return f"{prefix}{digits}" if digits else ""
 
 
-def _atomic_write_json(path: Path, data: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        tmp = Path(handle.name)
-        json.dump(data, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
-    try:
-        dir_fd = os.open(path.parent, os.O_DIRECTORY)
-    except OSError:
-        return
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)

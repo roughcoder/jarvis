@@ -66,6 +66,7 @@ from jarvis.orchestration.cockpit import (
     aggregate_sessions,
     archived_session_refs_for_store,
     artifact_summaries,
+    build_session_row,
     canonical_event_type,
     cockpit_catalog,
     cockpit_snapshot,
@@ -104,7 +105,7 @@ from jarvis.brain.facade import (
     resolve_capabilities,
 )
 from jarvis.orchestration.authority import allowed
-from jarvis.orchestration.activity import ProjectActivityLog
+from jarvis.orchestration.activity import ProjectActivityLog, StaleCursorError
 from jarvis.orchestration.intent import parse_work_command
 from jarvis.orchestration.orchestrator_grants import (
     OrchestratorGrantError,
@@ -819,13 +820,16 @@ class CockpitReadHandlers:
             activity_project_id = route_project_id
         else:
             activity_project_id = project.id
-        activity, next_cursor = await asyncio.to_thread(
-            _project_activity_log(self.ctx).list,
-            activity_project_id,
-            limit=_limit(request),
-            cursor=str(request.query.get("cursor") or ""),
-            activity_type=str(request.query.get("type") or ""),
-        )
+        try:
+            activity, next_cursor = await asyncio.to_thread(
+                _project_activity_log(self.ctx).list,
+                activity_project_id,
+                limit=_limit(request),
+                cursor=str(request.query.get("cursor") or ""),
+                activity_type=str(request.query.get("type") or ""),
+            )
+        except StaleCursorError as exc:
+            raise CockpitError("stale_cursor", str(exc), recoverable=True, status=400) from exc
         return web.json_response(
             {
                 "api_version": API_VERSION,
@@ -1546,48 +1550,26 @@ class CockpitWriteHandlers:
             )
         except (UnsupportedMemoryOperation, TimeoutError, OSError, RuntimeError) as exc:
             self.ctx.thread_turn_states[state_key] = ("failed", "engine_error")
-            await _write_sse(
+            return await _write_thread_turn_error(
                 response,
-                "thread.turn.error",
                 cursor,
-                _sse_envelope(
-                    cursor,
-                    "thread.turn.error",
-                    {
-                        "project_id": project.id,
-                        "thread_id": thread.thread_id,
-                        "error": {
-                            "code": "memory_unavailable",
-                            "message": public_error_message(str(exc)),
-                            "recoverable": True,
-                        },
-                    },
-                ),
+                project_id=project.id,
+                thread_id=thread.thread_id,
+                code="memory_unavailable",
+                message=public_error_message(str(exc)),
+                recoverable=True,
             )
-            await response.write_eof()
-            return response
         except Exception as exc:  # noqa: BLE001 - preserve SSE contract after prepare.
             self.ctx.thread_turn_states[state_key] = ("failed", "engine_error")
-            await _write_sse(
+            return await _write_thread_turn_error(
                 response,
-                "thread.turn.error",
                 cursor,
-                _sse_envelope(
-                    cursor,
-                    "thread.turn.error",
-                    {
-                        "project_id": project.id,
-                        "thread_id": thread.thread_id,
-                        "error": {
-                            "code": "internal_error",
-                            "message": public_error_message(str(exc)),
-                            "recoverable": False,
-                        },
-                    },
-                ),
+                project_id=project.id,
+                thread_id=thread.thread_id,
+                code="internal_error",
+                message=public_error_message(str(exc)),
+                recoverable=False,
             )
-            await response.write_eof()
-            return response
         self.ctx.thread_turn_states.pop(state_key, None)
         payload = {
             "project_id": project.id,
@@ -2220,6 +2202,43 @@ def _sse_envelope(cursor: str, event_type: str, payload: dict[str, Any]) -> dict
     return {"cursor": cursor, "occurred_at": utc_now(), "type": event_type, "payload": payload}
 
 
+async def _write_thread_turn_error(
+    response: web.StreamResponse,
+    cursor: str,
+    *,
+    project_id: str,
+    thread_id: str,
+    code: str,
+    message: str,
+    recoverable: bool,
+) -> web.StreamResponse:
+    """Emit the `thread.turn.error` SSE frame and close the stream.
+
+    Shared by project_thread_turn()'s two exception handlers, which only
+    differ in the error code/message/recoverable flag.
+    """
+    await _write_sse(
+        response,
+        "thread.turn.error",
+        cursor,
+        _sse_envelope(
+            cursor,
+            "thread.turn.error",
+            {
+                "project_id": project_id,
+                "thread_id": thread_id,
+                "error": {
+                    "code": code,
+                    "message": message,
+                    "recoverable": recoverable,
+                },
+            },
+        ),
+    )
+    await response.write_eof()
+    return response
+
+
 _SNAPSHOT_DELTA_SPECS = (
     ("runs", "run_id", "run.updated"),
     ("sessions", "session_ref", "session.updated"),
@@ -2486,50 +2505,50 @@ def _fallback_session_row(store: OrchestrationStore, ref: SessionRef, raw: dict[
     for run in store.list_runs():
         for link in run.sessions:
             if link.worker_id == ref.worker_id and link.session_id == ref.session_id:
-                return {
-                    "session_ref": make_session_ref(link.worker_id, link.session_id),
-                    "worker_id": link.worker_id,
-                    "session_id": link.session_id,
-                    "run_id": run.run_id,
-                    "parent_chat_id": run.parent_chat_id or "",
-                    "project_id": link.project_id or run.project_id,
-                    "title": run.objective,
-                    "provider": str(session_raw.get("provider") or link.provider),
-                    "engine": str(session_raw.get("engine") or link.engine),
-                    "status": str(session_raw.get("status") or link.status),
-                    "ended_reason": _ended_reason_from_worker_session(session_raw) or link.ended_reason,
-                    "repo": next((item.item.repo for item in run.work_items if item.item.repo), ""),
-                    "branch": str(session_raw.get("branch") or link.branch),
-                    "cwd": str(session_raw.get("cwd") or link.cwd),
-                    "latest_event_cursor": str(session_raw.get("last_event_id") or link.last_event_id),
-                    "created_at": run.created_at,
-                    "updated_at": run.updated_at,
-                    "archived_at": link.archived_at,
-                    "allowed_actions": list(link.allowed_actions),
-                }
+                return build_session_row(
+                    session_ref=make_session_ref(link.worker_id, link.session_id),
+                    worker_id=link.worker_id,
+                    session_id=link.session_id,
+                    run_id=run.run_id,
+                    parent_chat_id=run.parent_chat_id or "",
+                    project_id=link.project_id or run.project_id,
+                    title=run.objective,
+                    provider=str(session_raw.get("provider") or link.provider),
+                    engine=str(session_raw.get("engine") or link.engine),
+                    status=str(session_raw.get("status") or link.status),
+                    ended_reason=_ended_reason_from_worker_session(session_raw) or link.ended_reason,
+                    repo=next((item.item.repo for item in run.work_items if item.item.repo), ""),
+                    branch=str(session_raw.get("branch") or link.branch),
+                    cwd=str(session_raw.get("cwd") or link.cwd),
+                    latest_event_cursor=str(session_raw.get("last_event_id") or link.last_event_id),
+                    created_at=run.created_at,
+                    updated_at=run.updated_at,
+                    archived_at=link.archived_at,
+                    allowed_actions=list(link.allowed_actions),
+                )
     session_id = str(session_raw.get("session_id") or ref.session_id)
     archived = store.archived_worker_sessions().get(f"{ref.worker_id}\0{session_id}", {})
-    return {
-        "session_ref": make_session_ref(ref.worker_id, session_id),
-        "worker_id": ref.worker_id,
-        "session_id": session_id,
-        "run_id": str(session_raw.get("run_id") or ""),
-        "parent_chat_id": str(session_raw.get("parent_chat_id") or ""),
-        "project_id": str(session_raw.get("project_id") or ""),
-        "title": str(session_raw.get("title") or ""),
-        "provider": str(session_raw.get("provider") or ""),
-        "engine": str(session_raw.get("engine") or session_raw.get("provider") or ""),
-        "status": str(session_raw.get("status") or ""),
-        "ended_reason": _ended_reason_from_worker_session(session_raw),
-        "repo": str(session_raw.get("repo") or ""),
-        "branch": str(session_raw.get("branch") or ""),
-        "cwd": str(session_raw.get("cwd") or ""),
-        "latest_event_cursor": str(session_raw.get("last_event_id") or ""),
-        "created_at": str(session_raw.get("created_at") or ""),
-        "updated_at": str(session_raw.get("updated_at") or ""),
-        "archived_at": archived.get("archived_at") or "",
-        "allowed_actions": _allowed_actions_from_worker_session(session_raw),
-    }
+    return build_session_row(
+        session_ref=make_session_ref(ref.worker_id, session_id),
+        worker_id=ref.worker_id,
+        session_id=session_id,
+        run_id=str(session_raw.get("run_id") or ""),
+        parent_chat_id=str(session_raw.get("parent_chat_id") or ""),
+        project_id=str(session_raw.get("project_id") or ""),
+        title=str(session_raw.get("title") or ""),
+        provider=str(session_raw.get("provider") or ""),
+        engine=str(session_raw.get("engine") or session_raw.get("provider") or ""),
+        status=str(session_raw.get("status") or ""),
+        ended_reason=_ended_reason_from_worker_session(session_raw),
+        repo=str(session_raw.get("repo") or ""),
+        branch=str(session_raw.get("branch") or ""),
+        cwd=str(session_raw.get("cwd") or ""),
+        latest_event_cursor=str(session_raw.get("last_event_id") or ""),
+        created_at=str(session_raw.get("created_at") or ""),
+        updated_at=str(session_raw.get("updated_at") or ""),
+        archived_at=archived.get("archived_at") or "",
+        allowed_actions=_allowed_actions_from_worker_session(session_raw),
+    )
 
 
 def _has_stored_session_projection(store: OrchestrationStore, ref: SessionRef) -> bool:
@@ -3903,26 +3922,27 @@ def _worker_delete_json(cfg: Config, worker_id: str, path: str, *, delete: HttpD
 
 def _worker_session_row(raw: dict[str, Any], worker_id: str) -> dict[str, Any]:
     session_id = str(raw.get("session_id") or "")
-    return {
-        "session_ref": make_session_ref(worker_id, session_id),
-        "worker_id": worker_id,
-        "session_id": session_id,
-        "run_id": str(raw.get("run_id") or ""),
-        "parent_chat_id": str(raw.get("parent_chat_id") or ""),
-        "project_id": str(raw.get("project_id") or ""),
-        "title": str(raw.get("title") or ""),
-        "provider": str(raw.get("provider") or ""),
-        "engine": str(raw.get("engine") or raw.get("provider") or ""),
-        "status": str(raw.get("status") or ""),
-        "ended_reason": _ended_reason_from_worker_session(raw),
-        "repo": str(raw.get("repo") or ""),
-        "branch": str(raw.get("branch") or ""),
-        "cwd": str(raw.get("cwd") or ""),
-        "latest_event_cursor": "",
-        "created_at": str(raw.get("created_at") or ""),
-        "updated_at": str(raw.get("updated_at") or ""),
-        "allowed_actions": _allowed_actions_from_worker_session(raw),
-    }
+    return build_session_row(
+        session_ref=make_session_ref(worker_id, session_id),
+        worker_id=worker_id,
+        session_id=session_id,
+        run_id=str(raw.get("run_id") or ""),
+        parent_chat_id=str(raw.get("parent_chat_id") or ""),
+        project_id=str(raw.get("project_id") or ""),
+        title=str(raw.get("title") or ""),
+        provider=str(raw.get("provider") or ""),
+        engine=str(raw.get("engine") or raw.get("provider") or ""),
+        status=str(raw.get("status") or ""),
+        ended_reason=_ended_reason_from_worker_session(raw),
+        repo=str(raw.get("repo") or ""),
+        branch=str(raw.get("branch") or ""),
+        cwd=str(raw.get("cwd") or ""),
+        latest_event_cursor="",
+        created_at=str(raw.get("created_at") or ""),
+        updated_at=str(raw.get("updated_at") or ""),
+        allowed_actions=_allowed_actions_from_worker_session(raw),
+        include_archived_at=False,
+    )
 
 
 def _overlay_session_row(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:

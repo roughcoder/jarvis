@@ -15,11 +15,13 @@ from jarvis.brain.conversation_policy import (
     normalize_utterance,
     only_filler_remains,
 )
-
-
-DEFAULT_MODE = "default"
-STAY_MODE = "stay"
-KNOWN_MODES = frozenset({DEFAULT_MODE, STAY_MODE})
+from jarvis.protocol.voice_modes import (
+    DEFAULT_MODE as DEFAULT_MODE,
+    KNOWN_MODES as KNOWN_MODES,
+    STAY_MODE as STAY_MODE,
+    normalize_and_validate_mode as normalize_and_validate_mode,
+    normalize_mode as normalize_mode,
+)
 
 
 @dataclass(frozen=True)
@@ -148,11 +150,6 @@ class VoiceStateTransition:
     policy_decision: str = ""
     marker_seen: bool = False
     assistant_asked_followup: bool = False
-
-
-def normalize_mode(mode: str | None) -> str:
-    mode = (mode or DEFAULT_MODE).strip().lower().replace("-", "_")
-    return mode if mode in KNOWN_MODES else DEFAULT_MODE
 
 
 def strip_voice_controls(text: str) -> str:
