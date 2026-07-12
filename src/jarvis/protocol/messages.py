@@ -250,33 +250,15 @@ def decode(data: str | bytes) -> Message:
     return _ADAPTER.validate_json(data)
 
 
-def encode_reply_audio_binary(turn_id: str, pcm: bytes) -> bytes:
-    """Serialise reply PCM as a binary WebSocket frame."""
+def _encode_binary(frame_type: int, turn_id: str, sample_rate: int, pcm: bytes) -> bytes:
+    """Shared binary WebSocket frame encoder for reply/uplink audio."""
     turn = turn_id.encode("utf-8")
     if len(turn) > 65535:
         raise ValueError("turn_id is too long for a binary audio frame")
     return (
         _BINARY_HEADER.pack(
             _BINARY_MAGIC,
-            _BINARY_TYPE_REPLY_AUDIO,
-            0,  # flags reserved
-            len(turn),
-            0,  # reply audio sample rate is implicit from config
-        )
-        + turn
-        + pcm
-    )
-
-
-def encode_uplink_audio_binary(turn_id: str, sample_rate: int, pcm: bytes) -> bytes:
-    """Serialise captured mic PCM as a binary WebSocket frame."""
-    turn = turn_id.encode("utf-8")
-    if len(turn) > 65535:
-        raise ValueError("turn_id is too long for a binary audio frame")
-    return (
-        _BINARY_HEADER.pack(
-            _BINARY_MAGIC,
-            _BINARY_TYPE_UPLINK_AUDIO,
+            frame_type,
             0,  # flags reserved
             len(turn),
             sample_rate,
@@ -284,6 +266,21 @@ def encode_uplink_audio_binary(turn_id: str, sample_rate: int, pcm: bytes) -> by
         + turn
         + pcm
     )
+
+
+def encode_reply_audio_binary(turn_id: str, pcm: bytes) -> bytes:
+    """Serialise reply PCM as a binary WebSocket frame."""
+    return _encode_binary(
+        _BINARY_TYPE_REPLY_AUDIO,
+        turn_id,
+        0,  # reply audio sample rate is implicit from config
+        pcm,
+    )
+
+
+def encode_uplink_audio_binary(turn_id: str, sample_rate: int, pcm: bytes) -> bytes:
+    """Serialise captured mic PCM as a binary WebSocket frame."""
+    return _encode_binary(_BINARY_TYPE_UPLINK_AUDIO, turn_id, sample_rate, pcm)
 
 
 def decode_binary_audio(data: bytes) -> BinaryAudio | None:

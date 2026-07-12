@@ -28,11 +28,11 @@ from jarvis.brain.memory_client.interface import (
     SessionPeer,
     SessionRecord,
 )
+from jarvis.brain.memory_client.prompts import _MEMORY_QUERY, _SESSION_ID, _turn_metadata
 from jarvis.brain.memory_client.sidecar import ConclusionMetadataSidecar
 from jarvis.config import MemoryConfig
 
 
-_SESSION_ID = "voice"
 _CONCLUSION_LEVELS = {"explicit", "deductive", "inductive", "contradiction"}
 # Shape proven end-to-end by deploy/honcho-v3/validate.py (step 1). Verify
 # against the dev stack before cutover whether workspace-level env defaults
@@ -46,20 +46,6 @@ _SESSION_CONFIGURATION = {
     "reasoning": {"enabled": True},
     "dream": {"enabled": True},
 }
-_MEMORY_QUERY = (
-    "Summarise everything important you know about the user — their name, "
-    "preferences, and any facts or ongoing context — in a few concise sentences. "
-    "If you know nothing about them yet, reply with an empty string."
-)
-
-
-def _turn_metadata(*, channel: str, device_id: str | None) -> dict[str, str]:
-    metadata = {"channel": (channel or "voice").strip() or "voice"}
-    if device_id:
-        metadata["device_id"] = device_id
-    return metadata
-
-
 class HonchoV3MemoryClient:
     def __init__(self, cfg: MemoryConfig, *, transport: httpx.BaseTransport | None = None) -> None:
         self._cfg = cfg

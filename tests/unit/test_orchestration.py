@@ -109,13 +109,13 @@ def test_run_graph_persists_run_and_events(tmp_path) -> None:
 def test_session_ref_index_skips_unchanged_mapping_writes(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     store = OrchestrationStore(str(tmp_path))
     writes = []
-    real_write = store_module._atomic_write_json  # noqa: SLF001
+    real_write = store_module.atomic_write_json
 
     def write_json(path, data):  # noqa: ANN001
         writes.append(list(data))
         real_write(path, data)
 
-    monkeypatch.setattr(store_module, "_atomic_write_json", write_json)
+    monkeypatch.setattr(store_module, "atomic_write_json", write_json)
     row = {"session_ref": "sessref_123", "worker_id": "worker-a", "session_id": "sess_1"}
 
     store.record_session_refs([row])
@@ -146,13 +146,13 @@ def test_delete_run_batches_session_index_rewrites(tmp_path, monkeypatch) -> Non
         )
 
     writes: list[str] = []
-    real_write = store_module._atomic_write_json  # noqa: SLF001
+    real_write = store_module.atomic_write_json
 
     def write_json(path, data):  # noqa: ANN001
         writes.append(path.name)
         real_write(path, data)
 
-    monkeypatch.setattr(store_module, "_atomic_write_json", write_json)
+    monkeypatch.setattr(store_module, "atomic_write_json", write_json)
 
     result = store.delete_run(run.run_id)
 

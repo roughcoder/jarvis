@@ -21,11 +21,14 @@ from jarvis.orchestration.models import (
     WorkerJobLink,
     WorkerSessionLink,
 )
+from jarvis.storage import atomic_write_json
 from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES
 
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9_-]+$")
-_SESSION_REF_PREFIX = "sessref_"
+# Canonical session-ref HMAC scheme (see make_session_ref below).
+# cockpit.make_session_ref() delegates here.
+SESSION_REF_PREFIX = "sessref_"
 _SESSION_REF_SIGNING_CONTEXT = b"jarvis-cockpit-session-ref-v1"
 _SESSION_REF_SIGNATURE_BYTES = 12
 
@@ -446,7 +449,7 @@ class OrchestrationStore:
                 changed = True
             if not changed:
                 return
-            _atomic_write_json(self._session_refs_path, list(index.values()))
+            atomic_write_json(self._session_refs_path, list(index.values()))
 
     def session_ref_index(self) -> dict[str, dict[str, str]]:
         if not self._session_refs_path.exists():
@@ -499,7 +502,7 @@ class OrchestrationStore:
         if cached is not None and cached[0] == mtime:
             return cached[1]
         refs = {
-            _make_session_ref(str(item.get("worker_id") or ""), str(item.get("session_id") or ""))
+            make_session_ref(str(item.get("worker_id") or ""), str(item.get("session_id") or ""))
             for item in self.deleted_worker_sessions().values()
             if item.get("worker_id") and item.get("session_id")
         }
@@ -534,14 +537,7 @@ class OrchestrationStore:
         if existing is None:
             run.sessions.append(session)
         else:
-            existing.status = session.status
-            existing.provider = session.provider
-            existing.engine = session.engine
-            existing.project_id = session.project_id or existing.project_id
-            existing.branch = session.branch
-            existing.cwd = session.cwd
-            existing.last_event_id = session.last_event_id
-            existing.allowed_actions = list(session.allowed_actions)
+            _merge_session_link(existing, session)
         if run.phase in {"created", "claimed", "provisioned", "completed", "done", "failed", "blocked"}:
             run.phase = "running"
             run.status = "active"
@@ -566,14 +562,7 @@ class OrchestrationStore:
             if existing is None:
                 run.sessions.append(session)
             else:
-                existing.status = session.status
-                existing.provider = session.provider
-                existing.engine = session.engine
-                existing.project_id = session.project_id or existing.project_id
-                existing.branch = session.branch
-                existing.cwd = session.cwd
-                existing.last_event_id = session.last_event_id
-                existing.allowed_actions = list(session.allowed_actions)
+                _merge_session_link(existing, session)
             run.phase = "running"
             run.status = "active"
             run.terminal_reason = ""
@@ -693,7 +682,7 @@ class OrchestrationStore:
             archived = self.archived_worker_sessions()
             if archived.pop(f"{worker_id}\0{session_id}", None) is not None:
                 records += 1
-                _atomic_write_json(self._archived_sessions_path, list(archived.values()))
+                atomic_write_json(self._archived_sessions_path, list(archived.values()))
             self._record_deleted_session_unlocked(worker_id, session_id)
             return {"deleted": True, "worker_id": worker_id, "session_id": session_id, "records": records, "events": 0}
 
@@ -802,14 +791,14 @@ class OrchestrationStore:
             return existing
         item = {"worker_id": worker_id, "session_id": session_id, "archived_at": utc_now()}
         archived[key] = item
-        _atomic_write_json(self._archived_sessions_path, list(archived.values()))
+        atomic_write_json(self._archived_sessions_path, list(archived.values()))
         return item
 
     def _unarchive_worker_session_unlocked(self, worker_id: str, session_id: str) -> bool:
         archived = self.archived_worker_sessions()
         if archived.pop(f"{worker_id}\0{session_id}", None) is None:
             return False
-        _atomic_write_json(self._archived_sessions_path, list(archived.values()))
+        atomic_write_json(self._archived_sessions_path, list(archived.values()))
         return True
     def _deleted_records(self, path: pathlib.Path) -> dict[str, dict[str, str]]:
         if not path.exists():
@@ -832,7 +821,7 @@ class OrchestrationStore:
     def _record_deleted_run_unlocked(self, run_id: str) -> None:
         records = self._deleted_records(self._deleted_runs_path)
         records[run_id] = {"key": run_id, "run_id": run_id, "deleted_at": utc_now()}
-        _atomic_write_json(self._deleted_runs_path, list(records.values()))
+        atomic_write_json(self._deleted_runs_path, list(records.values()))
 
     def _record_sessions_deleted_unlocked(self, sessions: list[WorkerSessionLink]) -> None:
         """Record session-refs + tombstones for every session on a deleted run.
@@ -850,7 +839,7 @@ class OrchestrationStore:
         refs_changed = False
         updated_at = utc_now()
         for session in sessions:
-            session_ref = _make_session_ref(session.worker_id, session.session_id)
+            session_ref = make_session_ref(session.worker_id, session.session_id)
             existing = refs.get(session_ref)
             if (
                 existing is not None
@@ -866,7 +855,7 @@ class OrchestrationStore:
             }
             refs_changed = True
         if refs_changed:
-            _atomic_write_json(self._session_refs_path, list(refs.values()))
+            atomic_write_json(self._session_refs_path, list(refs.values()))
 
         deleted = self._deleted_records(self._deleted_sessions_path)
         deleted_at = utc_now()
@@ -878,11 +867,11 @@ class OrchestrationStore:
                 "session_id": session.session_id,
                 "deleted_at": deleted_at,
             }
-        _atomic_write_json(self._deleted_sessions_path, list(deleted.values()))
+        atomic_write_json(self._deleted_sessions_path, list(deleted.values()))
 
     def _record_session_ref_unlocked(self, worker_id: str, session_id: str) -> None:
         records = self.session_ref_index()
-        session_ref = _make_session_ref(worker_id, session_id)
+        session_ref = make_session_ref(worker_id, session_id)
         existing = records.get(session_ref)
         if (
             existing is not None
@@ -896,7 +885,7 @@ class OrchestrationStore:
             "session_id": session_id,
             "updated_at": utc_now(),
         }
-        _atomic_write_json(self._session_refs_path, list(records.values()))
+        atomic_write_json(self._session_refs_path, list(records.values()))
 
     def _record_deleted_session_unlocked(self, worker_id: str, session_id: str) -> None:
         records = self._deleted_records(self._deleted_sessions_path)
@@ -907,7 +896,24 @@ class OrchestrationStore:
             "session_id": session_id,
             "deleted_at": utc_now(),
         }
-        _atomic_write_json(self._deleted_sessions_path, list(records.values()))
+        atomic_write_json(self._deleted_sessions_path, list(records.values()))
+
+
+def _merge_session_link(existing: WorkerSessionLink, session: WorkerSessionLink) -> None:
+    """Apply an updated session link's fields onto an already-linked one.
+
+    Shared by link_session() and reserve_session_if_idle(), which both need
+    to merge a freshly dispatched/reserved WorkerSessionLink into the one
+    already recorded on the run.
+    """
+    existing.status = session.status
+    existing.provider = session.provider
+    existing.engine = session.engine
+    existing.project_id = session.project_id or existing.project_id
+    existing.branch = session.branch
+    existing.cwd = session.cwd
+    existing.last_event_id = session.last_event_id
+    existing.allowed_actions = list(session.allowed_actions)
 
 
 def _same_work_item(left: WorkItem, right: WorkItem) -> bool:
@@ -920,15 +926,9 @@ def _same_work_item(left: WorkItem, right: WorkItem) -> bool:
     return left_id == right_id
 
 
-def _atomic_write_json(path: pathlib.Path, data: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(f"{path.suffix}.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-    tmp.replace(path)
-
-
-def _make_session_ref(worker_id: str, session_id: str) -> str:
+def make_session_ref(worker_id: str, session_id: str) -> str:
+    # Canonical session-ref HMAC scheme; cockpit.make_session_ref() delegates here.
     raw = f"{worker_id}\0{session_id}".encode("utf-8")
     digest = hmac.new(_SESSION_REF_SIGNING_CONTEXT, _SESSION_REF_SIGNING_CONTEXT + b"\0" + raw, hashlib.sha256).digest()
     token = base64.urlsafe_b64encode(digest[:_SESSION_REF_SIGNATURE_BYTES]).decode("ascii").rstrip("=")
-    return f"{_SESSION_REF_PREFIX}{token}"
+    return f"{SESSION_REF_PREFIX}{token}"

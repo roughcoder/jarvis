@@ -23,9 +23,9 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
 
-from jarvis.brain.voice_modes import DEFAULT_MODE, KNOWN_MODES
 from jarvis.config import IntercomDeviceConfig
 from jarvis.intercom.hardware import IntercomHardware, _enabled
+from jarvis.protocol.voice_modes import DEFAULT_MODE, KNOWN_MODES, normalize_and_validate_mode
 
 PanelMode = Literal["eyes", "status", "camera", "debug"]
 _GEOMETRY_RE = re.compile(r"^(?P<name>\S+) connected(?: primary)? (?P<w>\d+)x(?P<h>\d+)\+(?P<x>\d+)\+(?P<y>\d+)")
@@ -695,5 +695,4 @@ class CompositePanel:
 
 
 def _valid_voice_mode(value: str | None) -> str:
-    mode = (value or "").strip().lower().replace("-", "_")
-    return mode if mode in KNOWN_MODES else ""
+    return normalize_and_validate_mode(value, KNOWN_MODES)

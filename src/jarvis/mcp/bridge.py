@@ -26,8 +26,8 @@ from typing import Any
 
 from jarvis.config import MCPConfig, MCPServerSpec
 from jarvis.ids import utc_now
-from jarvis.orchestration.redaction import public_error_message
 from jarvis.mcp.client import MCPClient, MCPToolSpec
+from jarvis.redaction import public_error_message
 
 _NAME_OK = re.compile(r"[^a-zA-Z0-9_-]")
 _SHARED = "house"  # stdio servers connect once under this principal

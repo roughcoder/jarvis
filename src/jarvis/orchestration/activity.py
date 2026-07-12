@@ -16,6 +16,15 @@ _PROJECT_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 MAX_ACTIVITY_SCAN_LINES = 5000
 
 
+class StaleCursorError(RuntimeError):
+    """Raised when a project activity pagination cursor is unknown/expired.
+
+    Call sites translate this to cockpit.CockpitError("stale_cursor", ...) —
+    kept as a plain store-level exception here so activity.py doesn't import
+    upward from cockpit.py.
+    """
+
+
 class ProjectActivityLog:
     """Append-only per-project activity log for cockpit project writes."""
 
@@ -65,13 +74,8 @@ class ProjectActivityLog:
                     events = events[idx + 1 :]
                     break
             else:
-                from jarvis.orchestration.cockpit import CockpitError
-
-                raise CockpitError(
-                    "stale_cursor",
-                    "unknown pagination cursor; clear the cursor and refetch from the first page",
-                    recoverable=True,
-                    status=400,
+                raise StaleCursorError(
+                    "unknown pagination cursor; clear the cursor and refetch from the first page"
                 )
         page = events[:limit]
         next_cursor = str(page[-1].get("id") or "") if len(events) > limit and page else ""

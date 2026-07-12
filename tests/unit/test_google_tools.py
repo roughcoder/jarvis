@@ -40,6 +40,31 @@ def _binding(kind: str, *grants: str) -> AccountBinding:
     )
 
 
+def _stub_gogcli(
+    monkeypatch,  # noqa: ANN001
+    *,
+    stdout: bytes = b"ok",
+    returncode: int = 0,
+) -> list[tuple[str, ...]]:
+    """Patch gogcli discovery + subprocess exec; return the captured argv list."""
+    calls: list[tuple[str, ...]] = []
+    proc_returncode = returncode
+
+    class FakeProc:
+        returncode = proc_returncode
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return stdout, b""
+
+    async def fake_exec(*argv, stdout=None, stderr=None):  # noqa: ANN001
+        calls.append(tuple(argv))
+        return FakeProc()
+
+    monkeypatch.setattr("jarvis.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
+    monkeypatch.setattr("jarvis.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    return calls
+
+
 def test_google_tools_registered_and_gated() -> None:
     reg = build_registry(ToolsConfig(_env_file=None), google=GoogleConfig(_env_file=None))
     # deny-by-default: no email/calendar caps => no account tools
@@ -56,15 +81,7 @@ def test_google_tools_registered_and_gated() -> None:
 
 
 def test_google_tools_load_house_bindings_from_account_store(tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    calls: list[tuple[str, ...]] = []
-
-    class FakeProc:
-        async def communicate(self) -> tuple[bytes, bytes]:
-            return b"sent", b""
-
-    async def fake_exec(*argv, stdout=None, stderr=None):  # noqa: ANN001
-        calls.append(tuple(argv))
-        return FakeProc()
+    calls = _stub_gogcli(monkeypatch, stdout=b"sent")
 
     store = tmp_path / ".accounts" / HOUSE
     store.mkdir(parents=True)
@@ -76,8 +93,6 @@ def test_google_tools_load_house_bindings_from_account_store(tmp_path, monkeypat
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr("jarvis.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
-    monkeypatch.setattr("jarvis.account_adapters.asyncio.create_subprocess_exec", fake_exec)
     reg = build_registry(
         ToolsConfig(_env_file=None),
         google=GoogleConfig(_env_file=None, gogcli_bin="gog"),
@@ -154,20 +169,7 @@ def test_upcoming_events_validates_days() -> None:
 
 
 def test_gog_invocation_is_noninteractive_and_allowlisted(monkeypatch) -> None:  # noqa: ANN001
-    calls: list[tuple[str, ...]] = []
-
-    class FakeProc:
-        returncode = 0
-
-        async def communicate(self) -> tuple[bytes, bytes]:
-            return b"ok", b""
-
-    async def fake_exec(*argv, stdout=None, stderr=None):  # noqa: ANN001
-        calls.append(tuple(argv))
-        return FakeProc()
-
-    monkeypatch.setattr("jarvis.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
-    monkeypatch.setattr("jarvis.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    calls = _stub_gogcli(monkeypatch)
     tools = {t.name: t for t in make_google_tools(GoogleConfig(_env_file=None, gogcli_bin="gog"))}
 
     out = asyncio.run(tools["upcoming_events"].handler(_ctx("calendar.read"), {"days": 2}))
@@ -188,20 +190,7 @@ def test_gog_invocation_is_noninteractive_and_allowlisted(monkeypatch) -> None: 
 
 
 def test_gog_invocation_uses_bound_calendar_id(monkeypatch) -> None:  # noqa: ANN001
-    calls: list[tuple[str, ...]] = []
-
-    class FakeProc:
-        returncode = 0
-
-        async def communicate(self) -> tuple[bytes, bytes]:
-            return b"ok", b""
-
-    async def fake_exec(*argv, stdout=None, stderr=None):  # noqa: ANN001
-        calls.append(tuple(argv))
-        return FakeProc()
-
-    monkeypatch.setattr("jarvis.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
-    monkeypatch.setattr("jarvis.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    calls = _stub_gogcli(monkeypatch)
     binding = AccountBinding(
         name="school-calendar",
         principal=HOUSE,
@@ -240,20 +229,7 @@ def test_gog_invocation_uses_bound_calendar_id(monkeypatch) -> None:  # noqa: AN
 
 
 def test_gog_invocation_selects_account_from_credential_ref(monkeypatch) -> None:  # noqa: ANN001
-    calls: list[tuple[str, ...]] = []
-
-    class FakeProc:
-        returncode = 0
-
-        async def communicate(self) -> tuple[bytes, bytes]:
-            return b"ok", b""
-
-    async def fake_exec(*argv, stdout=None, stderr=None):  # noqa: ANN001
-        calls.append(tuple(argv))
-        return FakeProc()
-
-    monkeypatch.setattr("jarvis.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
-    monkeypatch.setattr("jarvis.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    calls = _stub_gogcli(monkeypatch)
     binding = AccountBinding(
         name="school-email",
         principal=HOUSE,
@@ -326,18 +302,7 @@ def test_tools_route_through_account_policy_before_adapter() -> None:
 
 
 def test_send_email_requires_confirmation_before_gogcli(monkeypatch) -> None:  # noqa: ANN001
-    calls: list[tuple[str, ...]] = []
-
-    class FakeProc:
-        async def communicate(self) -> tuple[bytes, bytes]:
-            return b"sent", b""
-
-    async def fake_exec(*argv, stdout=None, stderr=None):  # noqa: ANN001
-        calls.append(tuple(argv))
-        return FakeProc()
-
-    monkeypatch.setattr("jarvis.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
-    monkeypatch.setattr("jarvis.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    calls = _stub_gogcli(monkeypatch, stdout=b"sent")
     tools = {t.name: t for t in make_google_tools(GoogleConfig(_env_file=None, gogcli_bin="gog"))}
 
     out = asyncio.run(
@@ -352,18 +317,7 @@ def test_send_email_requires_confirmation_before_gogcli(monkeypatch) -> None:  #
 
 
 def test_send_email_passes_household_recipient_policy_to_gogcli(monkeypatch) -> None:  # noqa: ANN001
-    calls: list[tuple[str, ...]] = []
-
-    class FakeProc:
-        async def communicate(self) -> tuple[bytes, bytes]:
-            return b"sent", b""
-
-    async def fake_exec(*argv, stdout=None, stderr=None):  # noqa: ANN001
-        calls.append(tuple(argv))
-        return FakeProc()
-
-    monkeypatch.setattr("jarvis.account_adapters.shutil.which", lambda _bin: "/usr/bin/gog")
-    monkeypatch.setattr("jarvis.account_adapters.asyncio.create_subprocess_exec", fake_exec)
+    calls = _stub_gogcli(monkeypatch, stdout=b"sent")
     binding = AccountBinding(
         name="house-email",
         principal=HOUSE,

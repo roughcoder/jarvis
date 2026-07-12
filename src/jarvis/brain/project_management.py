@@ -14,11 +14,9 @@ import ipaddress
 import json
 import logging
 import mimetypes
-import os
 import re
 import socket
 import ssl
-import tempfile
 import urllib.parse
 import urllib.request
 import uuid
@@ -29,6 +27,7 @@ from typing import Any
 
 import websockets
 
+from jarvis.brain._storage import atomic_write_json
 from jarvis.brain.capabilities import (
     RequestContext,
     can_admin_project,
@@ -820,17 +819,9 @@ def _load_manifest(cfg: Config) -> dict[str, Any]:
 
 
 def _save_manifest(cfg: Config, data: dict[str, Any]) -> None:
-    path = _manifest_path(cfg)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, sort_keys=True)
-            f.write("\n")
-        os.replace(tmp_name, path)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+    # Shared helper also fsyncs the containing directory, hardening durability
+    # beyond what this hand-rolled version did.
+    atomic_write_json(_manifest_path(cfg), data)
 
 
 def _manifest_entries(cfg: Config, project_id: str) -> list[dict[str, Any]]:

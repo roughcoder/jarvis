@@ -259,6 +259,210 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             return True  # no token configured => open (dev/local)
         return request.headers.get("Authorization", "") == f"Bearer {token}"
 
+    async def _action_shell(args: dict, cwd: str) -> web.Response:
+        out = await run_shell(
+            args.get("command", ""), cwd, cfg.shell_timeout_s, env=_shell_env(cfg) or None
+        )
+        return web.json_response({"ok": True, "output": out})
+
+    async def _action_applescript(args: dict) -> web.Response:
+        out = await run_applescript(args.get("script", ""), cfg.shell_timeout_s)
+        return web.json_response({"ok": True, "output": out})
+
+    async def _action_screenshot(args: dict) -> web.Response:
+        shots = str(workspace / "screenshots")
+        out = await take_screenshot(shots, args.get("name"), cfg.shell_timeout_s)
+        return web.json_response({"ok": True, "output": out})
+
+    async def _action_code(args: dict) -> web.Response:
+        policy_error = _code_policy_error(args)
+        if policy_error:
+            return web.json_response({"ok": False, "error": policy_error}, status=403)
+        agent = normalize_engine_id(args.get("agent") or cfg.agent)
+        supported_engines = engine_ids(cfg.supported_engines, default_engine=cfg.agent)
+        if not worker_supports_engine(supported_engines, agent):
+            return web.json_response({"ok": False, "error": f"worker does not support engine {agent!r}"}, status=400)
+        session_id = str(args.get("session_id") or "").strip()
+        session_name = str(args.get("session_name") or args.get("name") or "").strip()
+        resume_session = bool(args.get("resume_session"))
+        try:
+            argv = code_argv(
+                agent,
+                cfg.codex_bin,
+                cfg.claude_bin,
+                args.get("prompt", ""),
+                session_id=session_id,
+                session_name=session_name,
+                resume_session=resume_session,
+            )
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        label = args.get("prompt", "")[:80] or agent
+        slug = slugify(args.get("name") or args.get("prompt") or "job")
+        branch = None
+        resolved = ""
+        cleanup_owned = True
+        provisioning: list[dict[str, Any]] = []
+        if args.get("cwd") and resume_session:
+            if not session_id:
+                return web.json_response({"ok": False, "error": "resume cwd requires session_id"}, status=400)
+            job_cwd, err = _resume_cwd(str(args["cwd"]), workspace, conversation_root)
+            if err:
+                return web.json_response({"ok": False, "error": err}, status=400)
+            branch = str(args.get("branch") or "") or None
+            resolved = str(args.get("repo") or "")
+            cleanup_owned = False
+        elif args.get("repo"):
+            # Resolve the repo name to a real path (clone it if missing) before
+            # isolating it on a fresh worktree branch — never the user's checkout.
+            def collect(phase: str, status: str = "started", **data: Any) -> None:
+                provisioning.append({"phase": phase, "status": status, **data})
+
+            resolved, job_cwd, branch, err = await _provision_worktree(
+                str(args["repo"]),
+                cfg,
+                workspace,
+                slug,
+                progress=collect,
+            )
+            if err:
+                status = 404 if err.startswith("couldn't find") else 400
+                return web.json_response(
+                    {"ok": False, "error": err, "provisioning": provisioning},
+                    status=status,
+                )
+        else:
+            # No repo: an isolated per-job scratch dir.
+            job_cwd = str(workspace / "runs" / f"{slug}-{uuid.uuid4().hex[:6]}")
+            pathlib.Path(job_cwd).mkdir(parents=True, exist_ok=True)
+        job = jobs.start(
+            "code",
+            label,
+            run_exec(argv, job_cwd, cfg.job_timeout_s),
+            name=args.get("name", ""),
+            engine=agent,
+            cwd=job_cwd,
+            branch=branch,
+            repo=resolved or "",
+            session_id=session_id or None,
+            session_name=session_name,
+            cleanup_owned=cleanup_owned,
+        )
+        return web.json_response(
+            {
+                "ok": True,
+                "job_id": job.id,
+                "name": job.name,
+                "branch": branch,
+                "cwd": job.cwd,
+                "status": "running",
+                "engine": job.engine,
+                "session_id": job.session_id or "",
+                "session_name": job.session_name,
+                "provisioning": provisioning if args.get("repo") else [],
+            }
+        )
+
+    async def _action_peekaboo(args: dict) -> web.Response:
+        argv = args.get("argv") or []
+        if cfg.verbose:
+            print(f"[worker]   peekaboo {' '.join(map(str, argv))}")
+        # the agent is multi-step → its own (longer) budget; atomic calls stay fast.
+        timeout = cfg.peekaboo_agent_timeout_s if argv[:1] == ["agent"] else cfg.shell_timeout_s
+        out = await run_peekaboo(
+            cfg.peekaboo_bin, argv, timeout, env=_peekaboo_env(cfg) or None
+        )
+        if cfg.verbose:
+            print(f"[worker]   ← {out}")  # FULL output (not truncated like the brain log)
+        return web.json_response({"ok": True, "output": out})
+
+    async def _action_capture() -> web.Response:
+        b64, err = await capture_screen_jpeg_b64(cfg.shell_timeout_s)
+        if err:
+            return web.json_response({"ok": False, "error": err})
+        return web.json_response({"ok": True, "image_b64": b64})
+
+    async def _action_repo_access(args: dict) -> web.Response:
+        repo = str(args.get("repo") or "").strip()
+        if not repo:
+            return web.json_response({"ok": False, "error": "repo is required"}, status=400)
+        access = await asyncio.to_thread(
+            probe_repo_access,
+            repo,
+            timeout_s=cfg.repo_access_probe_timeout_s,
+            ttl_s=cfg.repo_access_ttl_s,
+        )
+        return web.json_response({"ok": True, "access": access})
+
+    async def _action_github_pr_review(args: dict) -> web.Response:
+        try:
+            authority = WorkerSessionAuthority.from_metadata(
+                {"execution_envelope": args.get("execution_envelope")}
+            )
+            authority.require(FORGE_PR_COMMENT)
+            idempotency_key = str(args.get("idempotency_key") or "").strip()
+            if not idempotency_key:
+                raise ValueError("idempotency_key is required")
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    {key: value for key, value in args.items() if key != "execution_envelope"},
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            lock_key = str(_github_review_idempotency_path(workspace, idempotency_key))
+            lock = github_review_locks.setdefault(lock_key, asyncio.Lock())
+            async with lock:
+                cached = _github_review_idempotency_get(workspace, idempotency_key, fingerprint)
+                if cached is not None:
+                    return web.json_response({"ok": True, "review": cached, "replayed": True})
+                result = await asyncio.to_thread(
+                    publish_github_pr_review,
+                    repo=str(args.get("repo") or ""),
+                    pull_number=int(args.get("pull_number") or 0),
+                    commit_id=str(args.get("commit_id") or ""),
+                    summary=str(args.get("summary") or ""),
+                    comments=[dict(item) for item in args.get("comments") or [] if isinstance(item, dict)],
+                )
+                review = {
+                    "review_id": result.review_id,
+                    "url": result.url,
+                    "comments": result.comments,
+                    "skipped_comments": result.skipped_comments,
+                }
+                _github_review_idempotency_put(workspace, idempotency_key, fingerprint, review)
+                return web.json_response({"ok": True, "review": review, "replayed": False})
+        except (RuntimeError, TypeError, ValueError) as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+
+    async def _action_cleanup(args: dict) -> web.Response:
+        ref = (args.get("job") or "").strip()
+        finished = {"done", "error", "interrupted"}
+        if ref in ("", "finished", "all", "done"):
+            targets = [j for j in jobs.recent(1000) if j.status in finished]
+        else:
+            j = jobs.get(ref) or jobs.find(ref)
+            if j is None:
+                return web.json_response({"ok": False, "error": f"no job {ref!r}"}, status=404)
+            if j.status not in finished:
+                return web.json_response({"ok": False, "error": f"job {j.name!r} is still running"})
+            targets = [j]
+        in_use = _running_workspace_refs(jobs.recent(1000))
+        cleaned = []
+        for j in targets:
+            if j.cleanup_owned and _workspace_in_use(j, in_use):
+                continue
+            if j.cleanup_owned:
+                await cleanup_job(
+                    j.repo,
+                    j.cwd,
+                    j.branch,
+                    cfg.shell_timeout_s,
+                    owned_roots=[str(workspace / "runs"), str(workspace / "worktrees")],
+                )
+            jobs.remove(j.id)
+            cleaned.append(j.name)
+        return web.json_response({"ok": True, "cleaned": cleaned})
+
     async def run(request: web.Request) -> web.Response:
         if not authorised(request):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -273,206 +477,29 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             print(f"[worker] → {action}  {_summarize(args)}")
 
         if action == "shell":
-            out = await run_shell(
-                args.get("command", ""), cwd, cfg.shell_timeout_s, env=_shell_env(cfg) or None
-            )
-            return web.json_response({"ok": True, "output": out})
+            return await _action_shell(args, cwd)
         if action == "applescript":
-            out = await run_applescript(args.get("script", ""), cfg.shell_timeout_s)
-            return web.json_response({"ok": True, "output": out})
+            return await _action_applescript(args)
         if action == "screenshot":
-            shots = str(workspace / "screenshots")
-            out = await take_screenshot(shots, args.get("name"), cfg.shell_timeout_s)
-            return web.json_response({"ok": True, "output": out})
+            return await _action_screenshot(args)
         if action == "code":
-            policy_error = _code_policy_error(args)
-            if policy_error:
-                return web.json_response({"ok": False, "error": policy_error}, status=403)
-            agent = normalize_engine_id(args.get("agent") or cfg.agent)
-            supported_engines = engine_ids(cfg.supported_engines, default_engine=cfg.agent)
-            if not worker_supports_engine(supported_engines, agent):
-                return web.json_response({"ok": False, "error": f"worker does not support engine {agent!r}"}, status=400)
-            session_id = str(args.get("session_id") or "").strip()
-            session_name = str(args.get("session_name") or args.get("name") or "").strip()
-            resume_session = bool(args.get("resume_session"))
-            try:
-                argv = code_argv(
-                    agent,
-                    cfg.codex_bin,
-                    cfg.claude_bin,
-                    args.get("prompt", ""),
-                    session_id=session_id,
-                    session_name=session_name,
-                    resume_session=resume_session,
-                )
-            except ValueError as exc:
-                return web.json_response({"ok": False, "error": str(exc)}, status=400)
-            label = args.get("prompt", "")[:80] or agent
-            slug = slugify(args.get("name") or args.get("prompt") or "job")
-            branch = None
-            resolved = ""
-            cleanup_owned = True
-            provisioning: list[dict[str, Any]] = []
-            if args.get("cwd") and resume_session:
-                if not session_id:
-                    return web.json_response({"ok": False, "error": "resume cwd requires session_id"}, status=400)
-                job_cwd, err = _resume_cwd(str(args["cwd"]), workspace, conversation_root)
-                if err:
-                    return web.json_response({"ok": False, "error": err}, status=400)
-                branch = str(args.get("branch") or "") or None
-                resolved = str(args.get("repo") or "")
-                cleanup_owned = False
-            elif args.get("repo"):
-                # Resolve the repo name to a real path (clone it if missing) before
-                # isolating it on a fresh worktree branch — never the user's checkout.
-                def collect(phase: str, status: str = "started", **data: Any) -> None:
-                    provisioning.append({"phase": phase, "status": status, **data})
-
-                resolved, job_cwd, branch, err = await _provision_worktree(
-                    str(args["repo"]),
-                    cfg,
-                    workspace,
-                    slug,
-                    progress=collect,
-                )
-                if err:
-                    status = 404 if err.startswith("couldn't find") else 400
-                    return web.json_response(
-                        {"ok": False, "error": err, "provisioning": provisioning},
-                        status=status,
-                    )
-            else:
-                # No repo: an isolated per-job scratch dir.
-                job_cwd = str(workspace / "runs" / f"{slug}-{uuid.uuid4().hex[:6]}")
-                pathlib.Path(job_cwd).mkdir(parents=True, exist_ok=True)
-            job = jobs.start(
-                "code",
-                label,
-                run_exec(argv, job_cwd, cfg.job_timeout_s),
-                name=args.get("name", ""),
-                engine=agent,
-                cwd=job_cwd,
-                branch=branch,
-                repo=resolved or "",
-                session_id=session_id or None,
-                session_name=session_name,
-                cleanup_owned=cleanup_owned,
-            )
-            return web.json_response(
-                {
-                    "ok": True,
-                    "job_id": job.id,
-                    "name": job.name,
-                    "branch": branch,
-                    "cwd": job.cwd,
-                    "status": "running",
-                    "engine": job.engine,
-                    "session_id": job.session_id or "",
-                    "session_name": job.session_name,
-                    "provisioning": provisioning if args.get("repo") else [],
-                }
-            )
+            return await _action_code(args)
         if action == "peekaboo":
-            argv = args.get("argv") or []
-            if cfg.verbose:
-                print(f"[worker]   peekaboo {' '.join(map(str, argv))}")
-            # the agent is multi-step → its own (longer) budget; atomic calls stay fast.
-            timeout = cfg.peekaboo_agent_timeout_s if argv[:1] == ["agent"] else cfg.shell_timeout_s
-            out = await run_peekaboo(
-                cfg.peekaboo_bin, argv, timeout, env=_peekaboo_env(cfg) or None
-            )
-            if cfg.verbose:
-                print(f"[worker]   ← {out}")  # FULL output (not truncated like the brain log)
-            return web.json_response({"ok": True, "output": out})
+            return await _action_peekaboo(args)
         if action == "gui_doctor":
             return web.json_response({"ok": True, **gui_doctor(cfg.peekaboo_bin)})
         if action == "capture":
-            b64, err = await capture_screen_jpeg_b64(cfg.shell_timeout_s)
-            if err:
-                return web.json_response({"ok": False, "error": err})
-            return web.json_response({"ok": True, "image_b64": b64})
+            return await _action_capture()
         if action and action.startswith("browser"):
             return await browser_dispatch(action, args)
         if action == "list_repos":
             return web.json_response({"ok": True, "repos": list_repos(cfg.repo_root)})
         if action == "repo_access":
-            repo = str(args.get("repo") or "").strip()
-            if not repo:
-                return web.json_response({"ok": False, "error": "repo is required"}, status=400)
-            access = await asyncio.to_thread(
-                probe_repo_access,
-                repo,
-                timeout_s=cfg.repo_access_probe_timeout_s,
-                ttl_s=cfg.repo_access_ttl_s,
-            )
-            return web.json_response({"ok": True, "access": access})
+            return await _action_repo_access(args)
         if action == "github_pr_review":
-            try:
-                authority = WorkerSessionAuthority.from_metadata(
-                    {"execution_envelope": args.get("execution_envelope")}
-                )
-                authority.require(FORGE_PR_COMMENT)
-                idempotency_key = str(args.get("idempotency_key") or "").strip()
-                if not idempotency_key:
-                    raise ValueError("idempotency_key is required")
-                fingerprint = hashlib.sha256(
-                    json.dumps(
-                        {key: value for key, value in args.items() if key != "execution_envelope"},
-                        sort_keys=True,
-                    ).encode("utf-8")
-                ).hexdigest()
-                lock_key = str(_github_review_idempotency_path(workspace, idempotency_key))
-                lock = github_review_locks.setdefault(lock_key, asyncio.Lock())
-                async with lock:
-                    cached = _github_review_idempotency_get(workspace, idempotency_key, fingerprint)
-                    if cached is not None:
-                        return web.json_response({"ok": True, "review": cached, "replayed": True})
-                    result = await asyncio.to_thread(
-                        publish_github_pr_review,
-                        repo=str(args.get("repo") or ""),
-                        pull_number=int(args.get("pull_number") or 0),
-                        commit_id=str(args.get("commit_id") or ""),
-                        summary=str(args.get("summary") or ""),
-                        comments=[dict(item) for item in args.get("comments") or [] if isinstance(item, dict)],
-                    )
-                    review = {
-                        "review_id": result.review_id,
-                        "url": result.url,
-                        "comments": result.comments,
-                        "skipped_comments": result.skipped_comments,
-                    }
-                    _github_review_idempotency_put(workspace, idempotency_key, fingerprint, review)
-                    return web.json_response({"ok": True, "review": review, "replayed": False})
-            except (RuntimeError, TypeError, ValueError) as exc:
-                return web.json_response({"ok": False, "error": str(exc)}, status=400)
+            return await _action_github_pr_review(args)
         if action == "cleanup":
-            ref = (args.get("job") or "").strip()
-            finished = {"done", "error", "interrupted"}
-            if ref in ("", "finished", "all", "done"):
-                targets = [j for j in jobs.recent(1000) if j.status in finished]
-            else:
-                j = jobs.get(ref) or jobs.find(ref)
-                if j is None:
-                    return web.json_response({"ok": False, "error": f"no job {ref!r}"}, status=404)
-                if j.status not in finished:
-                    return web.json_response({"ok": False, "error": f"job {j.name!r} is still running"})
-                targets = [j]
-            in_use = _running_workspace_refs(jobs.recent(1000))
-            cleaned = []
-            for j in targets:
-                if j.cleanup_owned and _workspace_in_use(j, in_use):
-                    continue
-                if j.cleanup_owned:
-                    await cleanup_job(
-                        j.repo,
-                        j.cwd,
-                        j.branch,
-                        cfg.shell_timeout_s,
-                        owned_roots=[str(workspace / "runs"), str(workspace / "worktrees")],
-                    )
-                jobs.remove(j.id)
-                cleaned.append(j.name)
-            return web.json_response({"ok": True, "cleaned": cleaned})
+            return await _action_cleanup(args)
         return web.json_response({"error": f"unknown action {action!r}"}, status=400)
 
     def _code_policy_error(args: dict) -> str:
@@ -710,23 +737,30 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         event = handler(session=session, request=request_data, sessions=sessions)
         return web.json_response({"ok": True, "event": event.to_dict()})
 
-    async def start_session_turn(request: web.Request) -> web.Response:
+    async def _reserve_session_turn(request: web.Request) -> tuple[web.Response | None, dict[str, Any] | None]:
+        """Validate the request and reserve a turn slot on the session.
+
+        Returns `(response, None)` when the request is already answered (an
+        error, or an idempotent replay of a prior turn). Returns `(None, ctx)`
+        once a turn slot has been freshly reserved, with `ctx` carrying
+        everything the provider-invocation phase needs.
+        """
         if not authorised(request):
-            return web.json_response({"error": "unauthorized"}, status=401)
+            return web.json_response({"error": "unauthorized"}, status=401), None
         session_id = request.match_info["id"]
         session = sessions.get(session_id)
         if session is None:
-            return web.json_response({"error": "no such session"}, status=404)
+            return web.json_response({"error": "no such session"}, status=404), None
         try:
             body = await request.json()
         except Exception:
-            return web.json_response({"error": "bad json"}, status=400)
+            return web.json_response({"error": "bad json"}, status=400), None
         authority_error = _require_session_control_authority(session, WORKER_SESSION_TURN, body)
         if authority_error is not None:
-            return authority_error
+            return authority_error, None
         cwd_error = _session_cwd_error(session, workspace, conversation_root)
         if cwd_error:
-            return web.json_response({"ok": False, "error": cwd_error}, status=400)
+            return web.json_response({"ok": False, "error": cwd_error}, status=400), None
         turn_id = _clean_request_id(body.get("turn_id") or uuid.uuid4().hex, "turn")
         idempotency_key = str(body.get("idempotency_key") or "").strip()
         existing_events = _events_for_idempotency(sessions, session.session_id, idempotency_key)
@@ -740,23 +774,23 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                     "events": [event.to_dict() for event in existing_events],
                     "idempotent": True,
                 }
-            )
+            ), None
         try:
             adapter = provider_for(session.provider)
         except ValueError as exc:
-            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+            return web.json_response({"ok": False, "error": str(exc)}, status=400), None
         attachments = _turn_attachments(body)
         if attachments is None:
-            return web.json_response({"ok": False, "error": "attachments must be an array of objects"}, status=400)
+            return web.json_response({"ok": False, "error": "attachments must be an array of objects"}, status=400), None
         if attachments and not adapter.capabilities().get("attachments"):
             return web.json_response(
                 {"ok": False, "error": f"provider {session.provider!r} does not support turn attachments"},
                 status=400,
-            )
+            ), None
         try:
             validated_runtime_context = _validate_runtime_context(body.get("runtime_context"))
         except RuntimeError as exc:
-            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+            return web.json_response({"ok": False, "error": str(exc)}, status=400), None
         running_event = None
         if session.metadata.get("provision_workspace") is True:
             running_event = sessions.append_event(
@@ -780,7 +814,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             return web.json_response(
                 {"ok": False, "error": str(exc), "code": exc.code},
                 status=409,
-            )
+            ), None
         if not reserved:
             return web.json_response(
                 {
@@ -790,7 +824,77 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                     "events": [*([running_event.to_dict()] if running_event else []), started.to_dict()],
                     "idempotent": True,
                 }
-            )
+            ), None
+        return None, {
+            "session": session,
+            "body": body,
+            "turn_id": turn_id,
+            "idempotency_key": idempotency_key,
+            "attachments": attachments,
+            "adapter": adapter,
+            "validated_runtime_context": validated_runtime_context,
+            "running_event": running_event,
+            "started": started,
+        }
+
+    def _session_turn_failure_response(
+        session: WorkerSession,
+        turn_id: str,
+        idempotency_key: str,
+        running_event: Any,
+        started: Any,
+        exc: RuntimeError,
+    ) -> web.Response:
+        sessions.update_status(session.session_id, SESSION_FAILED)
+        failed = sessions.append_event(
+            session.session_id,
+            EVENT_TURN_FAILED,
+            {"turn_id": turn_id, "idempotency_key": idempotency_key, "error": str(exc)},
+        )
+        return web.json_response(
+            {
+                "ok": False,
+                "error": str(exc),
+                "session": sessions.get(session.session_id).to_dict(),  # type: ignore[union-attr]
+                "turn_id": turn_id,
+                "events": [
+                    *([running_event.to_dict()] if running_event else []),
+                    started.to_dict(),
+                    failed.to_dict(),
+                ],
+            },
+            status=400,
+        )
+
+    def _session_turn_success_response(
+        session: WorkerSession,
+        turn_id: str,
+        running_event: Any,
+        started: Any,
+        provider_events: list[Any],
+    ) -> web.Response:
+        return web.json_response(
+            {
+                "ok": True,
+                "session": sessions.get(session.session_id).to_dict(),  # type: ignore[union-attr]
+                "turn_id": turn_id,
+                "events": [
+                    *([running_event.to_dict()] if running_event else []),
+                    started.to_dict(),
+                    *[event.to_dict() for event in provider_events],
+                ],
+            }
+        )
+
+    async def _run_reserved_session_turn(ctx: dict[str, Any]) -> web.Response:
+        session = ctx["session"]
+        body = ctx["body"]
+        turn_id = ctx["turn_id"]
+        idempotency_key = ctx["idempotency_key"]
+        attachments = ctx["attachments"]
+        adapter = ctx["adapter"]
+        running_event = ctx["running_event"]
+        started = ctx["started"]
         try:
             # Runtime context can rotate the grant file read by a live MCP
             # bridge. Materialize it only after this turn owns the session so a
@@ -798,7 +902,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             runtime_context = _prepare_runtime_context(
                 sessions,
                 session.session_id,
-                validated_runtime_context,
+                ctx["validated_runtime_context"],
             )
             provider_events = adapter.start_turn(
                 session=session,
@@ -814,38 +918,14 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 worker_cfg=cfg,
             )
         except RuntimeError as exc:
-            sessions.update_status(session.session_id, SESSION_FAILED)
-            failed = sessions.append_event(
-                session.session_id,
-                EVENT_TURN_FAILED,
-                {"turn_id": turn_id, "idempotency_key": idempotency_key, "error": str(exc)},
-            )
-            return web.json_response(
-                {
-                    "ok": False,
-                    "error": str(exc),
-                    "session": sessions.get(session.session_id).to_dict(),  # type: ignore[union-attr]
-                    "turn_id": turn_id,
-                    "events": [
-                        *([running_event.to_dict()] if running_event else []),
-                        started.to_dict(),
-                        failed.to_dict(),
-                    ],
-                },
-                status=400,
-            )
-        return web.json_response(
-            {
-                "ok": True,
-                "session": sessions.get(session.session_id).to_dict(),  # type: ignore[union-attr]
-                "turn_id": turn_id,
-                "events": [
-                    *([running_event.to_dict()] if running_event else []),
-                    started.to_dict(),
-                    *[event.to_dict() for event in provider_events],
-                ],
-            }
-        )
+            return _session_turn_failure_response(session, turn_id, idempotency_key, running_event, started, exc)
+        return _session_turn_success_response(session, turn_id, running_event, started, provider_events)
+
+    async def start_session_turn(request: web.Request) -> web.Response:
+        response, ctx = await _reserve_session_turn(request)
+        if response is not None:
+            return response
+        return await _run_reserved_session_turn(ctx)  # type: ignore[arg-type]
 
     async def session_input(request: web.Request) -> web.Response:
         if not authorised(request):

@@ -6,9 +6,7 @@ import asyncio
 import copy
 import hashlib
 import json
-import os
 import re
-import tempfile
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -59,6 +57,7 @@ from jarvis.orchestration.redaction import public_error_message
 from jarvis.orchestration.orchestrator_grants import mint_orchestrator_grant, orchestrator_api_base_url
 from jarvis.orchestration.workers import WorkerRegistry, worker_token_value
 from jarvis.runtime import ToolRegistry
+from jarvis.storage import atomic_write_json
 from jarvis.tools import build_registry
 from jarvis.tools.background import make_background_tool
 from jarvis.tools.base import Tool
@@ -110,7 +109,7 @@ class WorkerRequestError(RuntimeError):
         super().__init__(message)
 
 
-def _requester_authority_snapshot(requester: RequestContext) -> dict[str, Any]:
+def _snapshot_from_context(requester: RequestContext) -> dict[str, Any]:
     return {
         "device_id": requester.device_id,
         "identity": requester.identity,
@@ -120,6 +119,71 @@ def _requester_authority_snapshot(requester: RequestContext) -> dict[str, Any]:
         "confidence": requester.confidence,
         "peer": requester.peer,
     }
+
+
+def _context_from_snapshot(snapshot: dict[str, Any]) -> RequestContext:
+    capabilities = frozenset(
+        str(item)
+        for item in snapshot.get("capabilities") or []
+        if str(item).strip()
+    )
+    return RequestContext(
+        device_id=str(snapshot.get("device_id") or ""),
+        identity=str(snapshot.get("identity") or ""),
+        scope=str(snapshot.get("scope") or "personal"),
+        capabilities=capabilities,
+        channel=str(snapshot.get("channel") or "cockpit"),
+        confidence=str(snapshot.get("confidence") or "strong"),
+        peer=str(snapshot.get("peer") or ""),
+    )
+
+
+def persist_turn_messages(
+    memory: MemoryBackend,
+    session_id: str,
+    requester_peer_id: str,
+    device_id: str | None,
+    user_text: str,
+    assistant_text: str | None = None,
+    *,
+    assistant_peer_id: str = "",
+    channel: str = "cockpit",
+    extra_user_metadata: dict[str, Any] | None = None,
+) -> None:
+    """Create-or-reuse a memory session and persist a turn's message pair.
+
+    Shared by every cockpit/MCP surface that writes user (and optionally
+    assistant) turns into memory, so the session/metadata shape stays in sync
+    across call sites.
+    """
+    memory.create_session(
+        session_id,
+        peers=[SessionPeer(peer_id=requester_peer_id, observe_me=True, observe_others=True)],
+    )
+    user_metadata: dict[str, Any] = {"channel": channel, "role": "user", "observed_at": utc_now()}
+    if extra_user_metadata:
+        user_metadata.update(extra_user_metadata)
+    if device_id:
+        user_metadata["device_id"] = device_id
+    messages = [
+        MemoryMessage(
+            peer_id=requester_peer_id,
+            content=user_text,
+            metadata=user_metadata,
+        ),
+    ]
+    if assistant_text is not None:
+        assistant_metadata: dict[str, Any] = {"channel": channel, "role": "assistant", "observed_at": utc_now()}
+        if device_id:
+            assistant_metadata["device_id"] = device_id
+        messages.append(
+            MemoryMessage(
+                peer_id=assistant_peer_id,
+                content=assistant_text,
+                metadata=assistant_metadata,
+            )
+        )
+    memory.create_messages(session_id, messages)
 
 
 @dataclass(frozen=True)
@@ -232,7 +296,7 @@ class CockpitThreadIndex:
             data = self._read()
             threads = data.setdefault("threads", {})
             threads[thread.thread_id] = thread.as_dict(include_messages=False)
-            _atomic_write_json(self.path, data)
+            atomic_write_json(self.path, data)
             return replace(thread, messages=())
 
     def set_archived(
@@ -280,7 +344,7 @@ class CockpitThreadIndex:
                     **thread.as_dict(include_messages=False),
                     "deleted_at": utc_now(),
                 }
-                _atomic_write_json(self.path, data)
+                atomic_write_json(self.path, data)
                 try:
                     self._transcript_path(project_id, thread_id).unlink(missing_ok=True)
                 except OSError:
@@ -357,7 +421,7 @@ class CockpitThreadIndex:
             messages = self._thread_messages(stored)
             normalized = sorted(set(child_ids))
             continuation = str(continuation_instruction or "").strip()
-            requester_snapshot = _requester_authority_snapshot(requester)
+            requester_snapshot = _snapshot_from_context(requester)
             watch_id = hashlib.sha256("\n".join(normalized).encode("utf-8")).hexdigest()[:20]
             existing = next(
                 (
@@ -587,7 +651,7 @@ class CockpitThreadIndex:
         return _normalized_messages(data.get("messages") or ())
 
     def _write_thread_messages(self, thread: CockpitThread, messages: list[dict[str, Any]]) -> None:
-        _atomic_write_json(
+        atomic_write_json(
             self._transcript_path(thread.project_id, thread.thread_id),
             {
                 "version": 1,
@@ -615,7 +679,7 @@ class CockpitThreadIndex:
             data["deleted_threads"] = {}
         data.setdefault("version", 1)
         if self._migrate_legacy_messages(data):
-            _atomic_write_json(self.path, data)
+            atomic_write_json(self.path, data)
         return data
 
     def _migrate_legacy_messages(self, data: dict[str, Any]) -> bool:
@@ -629,7 +693,7 @@ class CockpitThreadIndex:
             if messages and project_id:
                 path = self._transcript_path(project_id, str(thread_id))
                 if not path.exists():
-                    _atomic_write_json(
+                    atomic_write_json(
                         path,
                         {
                             "version": 1,
@@ -1253,6 +1317,56 @@ class CockpitConnector:
             await asyncio.sleep(0.25)
         raise TimeoutError("orchestrator turn timed out")
 
+    def _mark_phase(
+        self,
+        thread: CockpitThread,
+        *,
+        phase: str,
+        status: str = "provisioning",
+        extra: dict[str, Any] | None = None,
+    ) -> CockpitThread:
+        """Stamp `provision_phase`/`status` onto a thread's workspace and persist it."""
+        workspace = {**thread.workspace, "provision_phase": phase, "status": status}
+        if extra:
+            workspace.update(extra)
+        return self._index.save(replace(thread, workspace=workspace))
+
+    async def _provision_repo_worktrees(
+        self,
+        thread: CockpitThread,
+        project: ProjectEntry,
+        workspace_request: dict[str, Any],
+        worker_id: str,
+        conversation_id: str,
+        workspace_state: dict[str, Any],
+        progress: Callable[[dict[str, Any]], Any] | None,
+    ) -> tuple[CockpitThread, dict[str, Any]]:
+        repos = _workspace_repos(project, workspace_request)
+        for repo in repos:
+            thread = self._mark_phase(thread, phase="cloning")
+            if progress is not None:
+                progress({"phase": "cloning", "thread_id": thread.thread_id, "repo": repo.get("name") or repo.get("repo")})
+            thread = self._mark_phase(thread, phase="creating-worktree")
+            if progress is not None:
+                progress({"phase": "creating-worktree", "thread_id": thread.thread_id, "repo": repo.get("name") or repo.get("repo")})
+            materialized = await asyncio.to_thread(
+                self._post_worker_json,
+                worker_id,
+                f"/conversation-workspaces/{conversation_id}/worktrees",
+                repo,
+            )
+            workspace_state = dict(materialized.get("workspace") or workspace_state)
+            thread = self._index.save(
+                replace(
+                    thread,
+                    workspace={
+                        **thread.workspace,
+                        **workspace_state,
+                    },
+                )
+            )
+        return thread, workspace_state
+
     async def _ensure_workspace(
         self,
         project: ProjectEntry,
@@ -1281,17 +1395,10 @@ class CockpitConnector:
                 raise RuntimeError("no eligible worker found for conversation workspace")
             worker_id = profile.worker_id
             conversation_id = _conversation_workspace_id(project, thread)
-            thread = self._index.save(
-                replace(
-                    thread,
-                    workspace={
-                        **state,
-                        "worker_id": worker_id,
-                        "workspace_id": conversation_id,
-                        "provision_phase": "resolving-access",
-                        "status": "provisioning",
-                    },
-                )
+            thread = self._mark_phase(
+                thread,
+                phase="resolving-access",
+                extra={"worker_id": worker_id, "workspace_id": conversation_id},
             )
             workspace = await asyncio.to_thread(
                 self._post_worker_json,
@@ -1318,48 +1425,15 @@ class CockpitConnector:
                     },
                 )
             )
-            repos = _workspace_repos(project, workspace_request)
-            for repo in repos:
-                thread = self._index.save(
-                    replace(
-                        thread,
-                        workspace={
-                            **thread.workspace,
-                            "provision_phase": "cloning",
-                            "status": "provisioning",
-                        },
-                    )
-                )
-                if progress is not None:
-                    progress({"phase": "cloning", "thread_id": thread.thread_id, "repo": repo.get("name") or repo.get("repo")})
-                thread = self._index.save(
-                    replace(
-                        thread,
-                        workspace={
-                            **thread.workspace,
-                            "provision_phase": "creating-worktree",
-                            "status": "provisioning",
-                        },
-                    )
-                )
-                if progress is not None:
-                    progress({"phase": "creating-worktree", "thread_id": thread.thread_id, "repo": repo.get("name") or repo.get("repo")})
-                materialized = await asyncio.to_thread(
-                    self._post_worker_json,
-                    worker_id,
-                    f"/conversation-workspaces/{conversation_id}/worktrees",
-                    repo,
-                )
-                workspace_state = dict(materialized.get("workspace") or workspace_state)
-                thread = self._index.save(
-                    replace(
-                        thread,
-                        workspace={
-                            **thread.workspace,
-                            **workspace_state,
-                        },
-                    )
-                )
+            thread, workspace_state = await self._provision_repo_worktrees(
+                thread,
+                project,
+                workspace_request,
+                worker_id,
+                conversation_id,
+                workspace_state,
+                progress,
+            )
             session_id = str(state.get("session_id") or f"conv_{slugify(thread.thread_id)}")
             engine = str(workspace_request.get("engine") or profile.default_engine or profile.agent or self._cfg.worker.agent)
             await asyncio.to_thread(
@@ -1401,16 +1475,11 @@ class CockpitConnector:
             )
             return self._index.save(updated)
         except Exception:
-            self._index.save(
-                replace(
-                    thread,
-                    workspace={
-                        **thread.workspace,
-                        "status": "failed",
-                        "provision_phase": "failed",
-                        "updated_at": utc_now(),
-                    },
-                )
+            self._mark_phase(
+                thread,
+                phase="failed",
+                status="failed",
+                extra={"updated_at": utc_now()},
             )
             raise
 
@@ -1561,29 +1630,14 @@ class CockpitConnector:
         user_text: str,
         assistant_text: str,
     ) -> None:
-        self._memory.create_session(
+        persist_turn_messages(
+            self._memory,
             session_id,
-            peers=[SessionPeer(peer_id=requester_peer_id, observe_me=True, observe_others=True)],
-        )
-        user_metadata = {"channel": "cockpit", "role": "user", "observed_at": utc_now()}
-        assistant_metadata = {"channel": "cockpit", "role": "assistant", "observed_at": utc_now()}
-        if device_id:
-            user_metadata["device_id"] = device_id
-            assistant_metadata["device_id"] = device_id
-        self._memory.create_messages(
-            session_id,
-            [
-                MemoryMessage(
-                    peer_id=requester_peer_id,
-                    content=user_text,
-                    metadata=user_metadata,
-                ),
-                MemoryMessage(
-                    peer_id=self._cfg.memory.assistant_peer_id,
-                    content=assistant_text,
-                    metadata=assistant_metadata,
-                ),
-            ],
+            requester_peer_id,
+            device_id,
+            user_text,
+            assistant_text,
+            assistant_peer_id=self._cfg.memory.assistant_peer_id,
         )
 
     def _persist_user_turn(
@@ -1593,22 +1647,13 @@ class CockpitConnector:
         device_id: str | None,
         user_text: str,
     ) -> None:
-        self._memory.create_session(
+        persist_turn_messages(
+            self._memory,
             session_id,
-            peers=[SessionPeer(peer_id=requester_peer_id, observe_me=True, observe_others=True)],
-        )
-        user_metadata = {"channel": "cockpit", "role": "user", "observed_at": utc_now(), "workspace_turn": True}
-        if device_id:
-            user_metadata["device_id"] = device_id
-        self._memory.create_messages(
-            session_id,
-            [
-                MemoryMessage(
-                    peer_id=requester_peer_id,
-                    content=user_text,
-                    metadata=user_metadata,
-                ),
-            ],
+            requester_peer_id,
+            device_id,
+            user_text,
+            extra_user_metadata={"workspace_turn": True},
         )
 
 
@@ -2002,20 +2047,7 @@ def _continue_child_watch(cfg: Config, parent_chat_id: str, watch: dict[str, Any
         requester_snapshot = watch.get("requester")
         if not isinstance(requester_snapshot, dict):
             raise RuntimeError("child watch is missing its requester authority snapshot")
-        capabilities = frozenset(
-            str(item)
-            for item in requester_snapshot.get("capabilities") or []
-            if str(item).strip()
-        )
-        requester = RequestContext(
-            device_id=str(requester_snapshot.get("device_id") or ""),
-            identity=str(requester_snapshot.get("identity") or ""),
-            scope=str(requester_snapshot.get("scope") or "personal"),
-            capabilities=capabilities,
-            channel=str(requester_snapshot.get("channel") or "cockpit"),
-            confidence=str(requester_snapshot.get("confidence") or "strong"),
-            peer=str(requester_snapshot.get("peer") or ""),
-        )
+        requester = _context_from_snapshot(requester_snapshot)
         child_ids = [str(item) for item in watch.get("child_chat_ids") or []]
         instruction = (
             "Automatic orchestration continuation: all watched child work sessions are terminal. "
@@ -2478,17 +2510,7 @@ def _normalized_messages(messages: Any) -> list[dict[str, Any]]:
             message["child_chat_ids"] = [str(value) for value in item["child_chat_ids"] if str(value)]
         requester = item.get("requester")
         if isinstance(requester, dict):
-            message["requester"] = {
-                "device_id": str(requester.get("device_id") or ""),
-                "identity": str(requester.get("identity") or ""),
-                "scope": str(requester.get("scope") or "personal"),
-                "capabilities": sorted(
-                    {str(value) for value in requester.get("capabilities") or [] if str(value).strip()}
-                ),
-                "channel": str(requester.get("channel") or "cockpit"),
-                "confidence": str(requester.get("confidence") or "strong"),
-                "peer": str(requester.get("peer") or ""),
-            }
+            message["requester"] = _snapshot_from_context(_context_from_snapshot(requester))
         event = item.get("event")
         if isinstance(event, dict):
             message["event"] = dict(event)
@@ -2499,19 +2521,6 @@ def _normalized_messages(messages: Any) -> list[dict[str, Any]]:
 def _safe_path_segment(value: str) -> str:
     segment = "".join(char if char.isalnum() or char in {"-", "_", "."} else "_" for char in value)
     return segment or "unknown"
-
-
-def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
 
 
 def _workspace_is_ready(thread: CockpitThread) -> bool:
