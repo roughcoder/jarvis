@@ -111,6 +111,18 @@ def test_boundary_peers_import_nothing_from_brain() -> None:
     assert offenders == []
 
 
+def test_mcp_does_not_import_orchestration() -> None:
+    """jarvis.orchestration imports jarvis.mcp.status; mcp/ importing back into
+    orchestration/ would recreate that package cycle. Shared leaf helpers (e.g.
+    redaction) live in jarvis.redaction, not jarvis.orchestration."""
+    offenders = [
+        f"{rel}: {module}"
+        for rel, module in _imports_under(SRC / "mcp")
+        if module == "jarvis.orchestration" or module.startswith("jarvis.orchestration.")
+    ]
+    assert offenders == []
+
+
 def test_moved_account_modules_are_updated_everywhere() -> None:
     stale_files = [
         path

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import base64
 import hashlib
-import hmac
 import json
 import pathlib
 import re
@@ -31,18 +29,16 @@ from jarvis.orchestration.redaction import public_error_message
 from jarvis.orchestration.redaction import public_url as _public_url
 from jarvis.orchestration.redaction import redact as _redact
 from jarvis.orchestration.reports import build_run_report
-from jarvis.orchestration.store import OrchestrationStore
+from jarvis.orchestration.store import SESSION_REF_PREFIX, OrchestrationStore
+from jarvis.orchestration.store import make_session_ref as _store_make_session_ref
 from jarvis.orchestration.supervisor import SyncSummary, sync_run_jobs, sync_run_sessions
-from jarvis.orchestration.workers import WorkerRegistry, worker_http_get, worker_token_value
+from jarvis.orchestration.workers import WorkerRegistry, worker_auth_headers, worker_http_get
 from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES
 
 API_VERSION = "v1"
 SCHEMA_VERSION = 1
 IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 
-SESSION_REF_PREFIX = "sessref_"
-SESSION_REF_SIGNING_CONTEXT = b"jarvis-cockpit-session-ref-v1"
-SESSION_REF_SIGNATURE_BYTES = 12
 CURSOR_PREFIX = "evt_"
 MAX_PAGE_LIMIT = 500
 RUN_SUPPORTED_CONTROLS = ["archive", "rename"]
@@ -227,19 +223,15 @@ class IdempotencyStore:
 
 
 def make_session_ref(worker_id: str, session_id: str) -> str:
-    raw = f"{worker_id}\0{session_id}".encode("utf-8")
-    return f"{SESSION_REF_PREFIX}{_session_ref_digest(raw)}"
+    # The canonical digest/constants live in store.make_session_ref(); this
+    # delegates so the scheme has one home.
+    return _store_make_session_ref(worker_id, session_id)
 
 
 def valid_session_ref(value: str) -> bool:
     text = str(value or "")
     token = text[len(SESSION_REF_PREFIX):] if text.startswith(SESSION_REF_PREFIX) else ""
     return bool(token) and all(ch.isalnum() or ch in {"_", "-"} for ch in token)
-
-
-def _session_ref_digest(raw: bytes) -> str:
-    digest = hmac.new(SESSION_REF_SIGNING_CONTEXT, SESSION_REF_SIGNING_CONTEXT + b"\0" + raw, hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(digest[:SESSION_REF_SIGNATURE_BYTES]).decode("ascii").rstrip("=")
 
 
 CATALOG_ENGINE_LABELS = {
@@ -1191,10 +1183,7 @@ def paged(items: list[dict[str, Any]], *, after: str = "", limit: int = 100) -> 
 
 
 def worker_headers(worker_cfg: WorkerConfig, profile: WorkerProfile) -> dict[str, str]:
-    token = worker_token_value(profile.token_env) if profile.token_env else ""
-    if not token and profile.worker_id == "local-worker":
-        token = worker_cfg.token.get_secret_value()
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    return worker_auth_headers(worker_cfg, profile)
 
 
 def snapshot_cursor(public_projection: dict[str, Any] | str) -> str:
@@ -1226,53 +1215,110 @@ def cwd_label(cwd: str) -> str:
     return pathlib.Path(cwd).name or "workspace"
 
 
-def _session_from_link(link: WorkerSessionLink, run: OrchestrationRun) -> dict[str, Any]:
-    return {
-        "session_ref": make_session_ref(link.worker_id, link.session_id),
-        "worker_id": link.worker_id,
-        "session_id": link.session_id,
-        "run_id": run.run_id,
-        "project_id": link.project_id or run.project_id,
-        "title": run.objective,
-        "parent_chat_id": run.parent_chat_id or "",
-        "provider": link.provider,
-        "engine": link.engine,
-        "status": link.status,
-        "ended_reason": link.ended_reason,
-        "repo": _run_repo(run),
-        "branch": link.branch,
-        "cwd": link.cwd,
-        "latest_event_cursor": link.last_event_id,
-        "created_at": run.created_at,
-        "updated_at": run.updated_at,
-        "archived_at": link.archived_at,
-        "allowed_actions": list(link.allowed_actions),
+def build_session_row(
+    *,
+    session_ref: str,
+    worker_id: str,
+    session_id: str,
+    run_id: str,
+    project_id: str,
+    title: str,
+    parent_chat_id: str,
+    provider: str,
+    engine: str,
+    status: str,
+    ended_reason: str,
+    repo: str,
+    branch: str,
+    cwd: str,
+    latest_event_cursor: str,
+    created_at: str,
+    updated_at: str,
+    allowed_actions: list[str],
+    archived_at: str | None = None,
+    include_archived_at: bool = True,
+) -> dict[str, Any]:
+    """One shared shape for the ~18-key cockpit session row.
+
+    Every call site (run-linked sessions, worker-reported sessions, the
+    fallback projection, and the worker-only turn/write response) computes its
+    own field values and passes them through here so the row shape can't drift
+    between them. `include_archived_at=False` matches _worker_session_row()
+    in api.py, which never reports that field (worker turn responses don't
+    carry a cockpit-side archive state).
+    """
+    row = {
+        "session_ref": session_ref,
+        "worker_id": worker_id,
+        "session_id": session_id,
+        "run_id": run_id,
+        "project_id": project_id,
+        "title": title,
+        "parent_chat_id": parent_chat_id,
+        "provider": provider,
+        "engine": engine,
+        "status": status,
+        "ended_reason": ended_reason,
+        "repo": repo,
+        "branch": branch,
+        "cwd": cwd,
+        "latest_event_cursor": latest_event_cursor,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "allowed_actions": allowed_actions,
     }
+    if include_archived_at:
+        row["archived_at"] = archived_at or ""
+    return row
+
+
+def _session_from_link(link: WorkerSessionLink, run: OrchestrationRun) -> dict[str, Any]:
+    return build_session_row(
+        session_ref=make_session_ref(link.worker_id, link.session_id),
+        worker_id=link.worker_id,
+        session_id=link.session_id,
+        run_id=run.run_id,
+        project_id=link.project_id or run.project_id,
+        title=run.objective,
+        parent_chat_id=run.parent_chat_id or "",
+        provider=link.provider,
+        engine=link.engine,
+        status=link.status,
+        ended_reason=link.ended_reason,
+        repo=_run_repo(run),
+        branch=link.branch,
+        cwd=link.cwd,
+        latest_event_cursor=link.last_event_id,
+        created_at=run.created_at,
+        updated_at=run.updated_at,
+        archived_at=link.archived_at,
+        allowed_actions=list(link.allowed_actions),
+    )
 
 
 def _session_from_worker(raw: dict[str, Any], worker_id: str, *, run: OrchestrationRun | None) -> dict[str, Any]:
     session_id = str(raw.get("session_id") or "")
-    return {
-        "session_ref": make_session_ref(worker_id, session_id),
-        "worker_id": worker_id,
-        "session_id": session_id,
-        "run_id": str(raw.get("run_id") or (run.run_id if run else "")),
-        "project_id": str(raw.get("project_id") or (run.project_id if run else "")),
-        "title": str(raw.get("title") or (run.objective if run else "")),
-        "parent_chat_id": str(raw.get("parent_chat_id") or (run.parent_chat_id if run else "") or ""),
-        "provider": str(raw.get("provider") or ""),
-        "engine": str(raw.get("engine") or raw.get("provider") or ""),
-        "status": str(raw.get("status") or ""),
-        "ended_reason": _ended_reason_from_worker_session(raw),
-        "repo": str(raw.get("repo") or (_run_repo(run) if run else "")),
-        "branch": str(raw.get("branch") or ""),
-        "cwd": str(raw.get("cwd") or ""),
-        "latest_event_cursor": str(raw.get("last_event_id") or ""),
-        "created_at": str(raw.get("created_at") or (run.created_at if run else "")),
-        "updated_at": str(raw.get("updated_at") or (run.updated_at if run else "")),
-        "archived_at": "",
-        "allowed_actions": _allowed_actions_from_worker_session(raw),
-    }
+    return build_session_row(
+        session_ref=make_session_ref(worker_id, session_id),
+        worker_id=worker_id,
+        session_id=session_id,
+        run_id=str(raw.get("run_id") or (run.run_id if run else "")),
+        project_id=str(raw.get("project_id") or (run.project_id if run else "")),
+        title=str(raw.get("title") or (run.objective if run else "")),
+        parent_chat_id=str(raw.get("parent_chat_id") or (run.parent_chat_id if run else "") or ""),
+        provider=str(raw.get("provider") or ""),
+        engine=str(raw.get("engine") or raw.get("provider") or ""),
+        status=str(raw.get("status") or ""),
+        ended_reason=_ended_reason_from_worker_session(raw),
+        repo=str(raw.get("repo") or (_run_repo(run) if run else "")),
+        branch=str(raw.get("branch") or ""),
+        cwd=str(raw.get("cwd") or ""),
+        latest_event_cursor=str(raw.get("last_event_id") or ""),
+        created_at=str(raw.get("created_at") or (run.created_at if run else "")),
+        updated_at=str(raw.get("updated_at") or (run.updated_at if run else "")),
+        archived_at="",
+        allowed_actions=_allowed_actions_from_worker_session(raw),
+    )
 
 
 def _ended_reason_from_worker_session(raw: dict[str, Any]) -> str:

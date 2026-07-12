@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,7 +17,8 @@ from jarvis.oauth import (
     oauth_endpoint_urls_are_secure,
     protected_resource_metadata_url,
 )
-from jarvis.orchestration.redaction import public_error_message
+from jarvis.redaction import public_error_message
+from jarvis.storage import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +36,7 @@ def publish_mcp_status_snapshot(cfg: Config, bridge: MCPBridge) -> None:
     try:
         snapshot = bridge.status()
         snapshot["generated_at"] = utc_now()
-        _atomic_write_json(mcp_status_path(cfg), snapshot)
+        atomic_write_json(mcp_status_path(cfg), snapshot)
     except Exception as exc:  # noqa: BLE001 - status visibility must not break brain startup
         logger.warning("mcp status snapshot write failed: %s", public_error_message(str(exc)))
 
@@ -221,18 +220,3 @@ def _snapshot_stale(snapshot: dict[str, Any] | None) -> bool:
         generated = generated.replace(tzinfo=timezone.utc)
     age_s = (datetime.now(timezone.utc) - generated.astimezone(timezone.utc)).total_seconds()
     return age_s > MCP_STATUS_STALE_AFTER_S
-
-
-def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)

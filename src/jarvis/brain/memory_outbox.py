@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from jarvis.brain._storage import atomic_write_json
 from jarvis.brain.memory_client import MemoryBackend
 
 
@@ -98,7 +99,7 @@ class RetractionIndex:
             "updated_at": now,
         }
         peer_rows[key] = row
-        _atomic_write_json(self.path, data)
+        atomic_write_json(self.path, data)
         self._cache_data(data)
         return _retraction_from_json(row)
 
@@ -124,7 +125,7 @@ class RetractionIndex:
             data.get("peers", {}).pop(observed_id, None)
         if not data.get("peers"):
             data.pop("peers", None)
-        _atomic_write_json(self.path, data)
+        atomic_write_json(self.path, data)
         self._cache_data(data)
         return removed
 
@@ -561,22 +562,3 @@ def _replace_entry(entry: OutboxEntry, **changes: Any) -> OutboxEntry:
     data = _entry_to_json(entry)
     data.update(changes)
     return _entry_from_json(data)
-
-
-def _atomic_write_json(path: Path, data: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
-    try:
-        dir_fd = os.open(path.parent, os.O_DIRECTORY)
-    except OSError:
-        return
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)

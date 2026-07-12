@@ -273,10 +273,7 @@ class WorkerRegistry:
         return worker_token_value(name)
 
     def _headers(self, profile: WorkerProfile) -> dict[str, str]:
-        token = self._token_env_value(profile.token_env) if profile.token_env else ""
-        if not token and profile.worker_id == "local-worker":
-            token = self.worker_cfg.token.get_secret_value()
-        return {"Authorization": f"Bearer {token}"} if token else {}
+        return worker_auth_headers(self.worker_cfg, profile)
 
 
 def local_worker_display_name() -> str:
@@ -297,6 +294,27 @@ def worker_token_value(name: str) -> str:
 
 def _jarvis_env_path() -> pathlib.Path:
     return pathlib.Path(os.environ.get("JARVIS_ENV_FILE") or ".env").expanduser()
+
+
+def worker_auth_headers(worker_cfg: WorkerConfig, worker: WorkerProfile | None) -> dict[str, str]:
+    """Bearer auth header for a worker, falling back to the local-worker token."""
+    token = worker_token_value(worker.token_env) if worker and worker.token_env else ""
+    if not token and (worker is None or worker.worker_id == "local-worker"):
+        token = worker_cfg.token.get_secret_value()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def resolve_worker_endpoint(worker_cfg: WorkerConfig, worker: WorkerProfile | None) -> tuple[str, dict[str, str]]:
+    """Base URL + auth headers for dispatching to `worker`, or the local worker."""
+    if worker is None:
+        base_url = worker_cfg.base_url
+    elif worker.base_url:
+        base_url = worker.base_url
+    elif worker.worker_id == "local-worker":
+        base_url = worker_cfg.base_url
+    else:
+        raise RuntimeError(f"worker {worker.worker_id} has no base_url; refusing to route to local worker")
+    return base_url, worker_auth_headers(worker_cfg, worker)
 
 
 def _required_engines(engines: list[str]) -> list[str]:
@@ -414,7 +432,7 @@ def _safe_mount(raw: Any) -> str | None:
 def _repo_access_row(profile: WorkerProfile, repo: str) -> dict[str, Any] | None:
     for row in profile.repo_access:
         candidate = str(row.get("repo") or "")
-        if _repo_ref_matches_access_row(repo, candidate):
+        if repo_ref_matches_access_row(repo, candidate):
             return row
     return None
 
@@ -430,7 +448,7 @@ def _should_probe_repo_access(repo_ref: str) -> bool:
     return text.count("/") == 1
 
 
-def _repo_ref_matches_access_row(requested: str, candidate: str) -> bool:
+def repo_ref_matches_access_row(requested: str, candidate: str) -> bool:
     if not candidate:
         return False
     if _is_owner_name_ref(requested):

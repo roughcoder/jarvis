@@ -12,7 +12,7 @@ from jarvis.orchestration.envelope import build_execution_envelope
 from jarvis.orchestration.models import ExecutionEnvelope, WorkCommand, WorkItem, WorkerJobLink, WorkerSessionLink
 from jarvis.orchestration.store import OrchestrationStore
 from jarvis.orchestration.supervisor import persist_session_events
-from jarvis.orchestration.workers import WorkerProfile, worker_token_value
+from jarvis.orchestration.workers import WorkerProfile, resolve_worker_endpoint
 from jarvis.worker_session_contract import SESSION_RUNNING, SESSION_STOPPED
 
 
@@ -25,20 +25,7 @@ def start_worker_job(
     post: Callable[..., Any] | None = None,
 ) -> WorkerJobLink:
     post = post or httpx.post
-    if worker is None:
-        base_url = worker_cfg.base_url
-    elif worker.base_url:
-        base_url = worker.base_url
-    elif worker.worker_id == "local-worker":
-        base_url = worker_cfg.base_url
-    else:
-        raise RuntimeError(f"worker {worker.worker_id} has no base_url; refusing to route to local worker")
-    headers = {}
-    token = worker_token_value(worker.token_env) if worker and worker.token_env else ""
-    if not token and (worker is None or worker.worker_id == "local-worker"):
-        token = worker_cfg.token.get_secret_value()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    base_url, headers = resolve_worker_endpoint(worker_cfg, worker)
     args = {
         "agent": envelope.engine,
         "prompt": envelope.prompt,
@@ -89,6 +76,91 @@ def start_worker_job(
     return link
 
 
+def _acquire_worker_session(
+    envelope: ExecutionEnvelope,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    worker_cfg: WorkerConfig,
+    store: OrchestrationStore | None,
+    post: Callable[..., Any],
+    get: Callable[..., Any],
+    created_session_ids: set[str] | None,
+) -> tuple[dict[str, Any], bool]:
+    """Resume, reuse, or create the worker session for this dispatch.
+
+    Returns the session dict plus whether THIS call created it (so the caller
+    knows whether to roll it back on a rejected first turn).
+    """
+    created_by_dispatch = False
+    if envelope.resume_session and envelope.session_id:
+        session = {
+            "session_id": envelope.session_id,
+            "status": SESSION_RUNNING,
+            "provider": envelope.engine,
+            "engine": envelope.engine,
+            "branch": envelope.branch_name,
+            "cwd": envelope.cwd,
+        }
+        return session, created_by_dispatch
+    session_id = _worker_session_id(envelope)
+    existing = _linked_session(store, envelope.run_id, envelope.worker_id, session_id)
+    if existing is not None:
+        return existing, created_by_dispatch
+    create_response = post(
+        f"{base_url}/sessions",
+        json={
+            "session_id": session_id,
+            "run_id": envelope.run_id,
+            "provider": envelope.engine,
+            "engine": envelope.engine,
+            "repo": envelope.repo,
+            "branch": envelope.branch_name,
+            "cwd": envelope.cwd,
+            "title": envelope.session_name or _job_name(envelope),
+            "metadata": {
+                "execution_envelope": envelope.to_dict(),
+                "model": envelope.model,
+                "provision_workspace": bool(envelope.repo and not envelope.cwd and not envelope.resume_session),
+                "allowed_actions": envelope.allowed_actions,
+                "landing": envelope.landing.to_dict(),
+                "verification": envelope.verification.to_dict(),
+            },
+        },
+        headers=headers,
+        timeout=worker_cfg.request_timeout_s,
+    )
+    create_body = _json_body(create_response)
+    if _duplicate_session_response(create_response, create_body):
+        session = _fetch_existing_session(
+            session_id,
+            base_url=base_url,
+            headers=headers,
+            timeout=worker_cfg.request_timeout_s,
+            get=get,
+        )
+        create_body = {"event": None}
+    else:
+        status_code = getattr(create_response, "status_code", 200)
+        if store is not None and isinstance(create_body.get("session"), dict) and (
+            status_code >= 400 or create_body.get("ok") is False
+        ):
+            _persist_create_response_events(store, envelope, create_body)
+        _raise_worker_error(create_response, create_body)
+        if not create_body.get("ok"):
+            raise RuntimeError(create_body.get("error") or "worker rejected session")
+        session = create_body["session"]
+        created_by_dispatch = True
+        if created_session_ids is not None:
+            created_session_ids.add(str(session.get("session_id") or session_id))
+    if store is not None:
+        if _create_response_events(create_body):
+            _persist_create_response_events(store, envelope, create_body)
+        else:
+            store.link_session(envelope.run_id, _session_link_from_body(envelope, session, create_body.get("event")))
+    return session, created_by_dispatch
+
+
 def start_worker_session(
     envelope: ExecutionEnvelope,
     *,
@@ -103,73 +175,16 @@ def start_worker_session(
     post = post or httpx.post
     get = get or httpx.get
     base_url, headers = _worker_endpoint(worker_cfg, worker)
-    created_by_dispatch = False
-    if envelope.resume_session and envelope.session_id:
-        session = {
-            "session_id": envelope.session_id,
-            "status": SESSION_RUNNING,
-            "provider": envelope.engine,
-            "engine": envelope.engine,
-            "branch": envelope.branch_name,
-            "cwd": envelope.cwd,
-        }
-    else:
-        session_id = _worker_session_id(envelope)
-        existing = _linked_session(store, envelope.run_id, envelope.worker_id, session_id)
-        if existing is not None:
-            session = existing
-        else:
-            create_response = post(
-                f"{base_url}/sessions",
-                json={
-                    "session_id": session_id,
-                    "run_id": envelope.run_id,
-                    "provider": envelope.engine,
-                    "engine": envelope.engine,
-                    "repo": envelope.repo,
-                    "branch": envelope.branch_name,
-                    "cwd": envelope.cwd,
-                    "title": envelope.session_name or _job_name(envelope),
-                    "metadata": {
-                        "execution_envelope": envelope.to_dict(),
-                        "model": envelope.model,
-                        "provision_workspace": bool(envelope.repo and not envelope.cwd and not envelope.resume_session),
-                        "allowed_actions": envelope.allowed_actions,
-                        "landing": envelope.landing.to_dict(),
-                        "verification": envelope.verification.to_dict(),
-                    },
-                },
-                headers=headers,
-                timeout=worker_cfg.request_timeout_s,
-            )
-            create_body = _json_body(create_response)
-            if _duplicate_session_response(create_response, create_body):
-                session = _fetch_existing_session(
-                    session_id,
-                    base_url=base_url,
-                    headers=headers,
-                    timeout=worker_cfg.request_timeout_s,
-                    get=get,
-                )
-                create_body = {"event": None}
-            else:
-                status_code = getattr(create_response, "status_code", 200)
-                if store is not None and isinstance(create_body.get("session"), dict) and (
-                    status_code >= 400 or create_body.get("ok") is False
-                ):
-                    _persist_create_response_events(store, envelope, create_body)
-                _raise_worker_error(create_response, create_body)
-                if not create_body.get("ok"):
-                    raise RuntimeError(create_body.get("error") or "worker rejected session")
-                session = create_body["session"]
-                created_by_dispatch = True
-                if created_session_ids is not None:
-                    created_session_ids.add(str(session.get("session_id") or session_id))
-            if store is not None:
-                if _create_response_events(create_body):
-                    _persist_create_response_events(store, envelope, create_body)
-                else:
-                    store.link_session(envelope.run_id, _session_link_from_body(envelope, session, create_body.get("event")))
+    session, created_by_dispatch = _acquire_worker_session(
+        envelope,
+        base_url=base_url,
+        headers=headers,
+        worker_cfg=worker_cfg,
+        store=store,
+        post=post,
+        get=get,
+        created_session_ids=created_session_ids,
+    )
     turn_id = _turn_id(envelope)
     idempotency_key = _turn_idempotency_key(envelope)
     turn_body: dict[str, Any] = {
@@ -515,19 +530,7 @@ def _worker_session_id(envelope: ExecutionEnvelope) -> str:
 
 
 def _worker_endpoint(worker_cfg: WorkerConfig, worker: WorkerProfile | None) -> tuple[str, dict[str, str]]:
-    if worker is None:
-        base_url = worker_cfg.base_url
-    elif worker.base_url:
-        base_url = worker.base_url
-    elif worker.worker_id == "local-worker":
-        base_url = worker_cfg.base_url
-    else:
-        raise RuntimeError(f"worker {worker.worker_id} has no base_url; refusing to route to local worker")
-    token = worker_token_value(worker.token_env) if worker and worker.token_env else ""
-    if not token and (worker is None or worker.worker_id == "local-worker"):
-        token = worker_cfg.token.get_secret_value()
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    return base_url, headers
+    return resolve_worker_endpoint(worker_cfg, worker)
 
 
 def _json_body(response: Any) -> dict[str, Any]:

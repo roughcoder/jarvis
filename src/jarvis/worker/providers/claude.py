@@ -7,7 +7,6 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field, is_dataclass
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,18 +18,27 @@ from jarvis.worker.orchestrator_runtime import (
     ORCHESTRATOR_MCP_SERVER_NAME,
     orchestrator_mcp_server,
 )
+from jarvis.worker.providers._common import (
+    control_request_id as _control_request_id,
+)
+from jarvis.worker.providers._common import (
+    record_provider_log as _record_provider_log_impl,
+)
+from jarvis.worker.providers._common import (
+    session_cancelled as _session_cancelled,
+)
+from jarvis.worker.providers._common import (
+    session_cwd as _session_cwd_impl,
+)
 from jarvis.worker.providers.base import ProviderTurn
 from jarvis.worker.sessions import SessionEvent, SessionManager, WorkerSession
-from jarvis.worker.workspaces import is_worker_owned_path_for_config
 from jarvis.worker_session_contract import (
-    CANCELLED_SESSION_STATUSES,
     EVENT_APPROVAL_REQUESTED,
     EVENT_APPROVAL_RESOLVED,
     EVENT_ASSISTANT_MESSAGE,
     EVENT_INPUT_RECEIVED,
     EVENT_INPUT_REQUESTED,
     EVENT_PROVIDER_EVENT,
-    EVENT_PROVIDER_LOG,
     EVENT_PROVIDER_PROCESS_STARTED,
     EVENT_PROVIDER_SESSION_READY,
     EVENT_PROVIDER_STARTED,
@@ -907,52 +915,11 @@ def _record_provider_session_id(sessions: SessionManager, session_id: str, provi
 
 
 def _record_provider_log(session_id: str, turn: ProviderTurn, sessions: SessionManager, text: str) -> None:
-    if not text:
-        return
-    recent = [
-        event
-        for event in sessions.events(session_id)
-        if event.type == EVENT_PROVIDER_LOG and event.data.get("turn_id") == turn.turn_id
-    ]
-    if len(recent) >= 20:
-        return
-    sessions.append_event(
-        session_id,
-        EVENT_PROVIDER_LOG,
-        {
-            "turn_id": turn.turn_id,
-            "idempotency_key": turn.idempotency_key,
-            "provider": "claude",
-            "text": text[:1000],
-        },
-    )
+    _record_provider_log_impl(session_id, turn, sessions, text, provider="claude")
 
 
 def _session_cwd(session: WorkerSession, worker_cfg: WorkerConfig) -> str:
-    candidates = [
-        session.cwd,
-        str(session.metadata.get("provider_cwd") or ""),
-        str(session.metadata.get("cwd") or ""),
-    ]
-    rejected: list[str] = []
-    for candidate in candidates:
-        if not candidate:
-            continue
-        path = Path(candidate).expanduser().resolve(strict=False)
-        if not is_worker_owned_path_for_config(path, worker_cfg):
-            rejected.append(str(path))
-            continue
-        if path.is_dir():
-            return str(path)
-        rejected.append(str(path))
-    if rejected:
-        raise RuntimeError(f"worker session cwd is not a valid worker-owned directory: {', '.join(rejected)}")
-    raise RuntimeError("worker session cwd is required for claude provider turns")
-
-
-def _session_cancelled(sessions: SessionManager, session_id: str) -> bool:
-    session = sessions.get(session_id)
-    return session is not None and session.status in CANCELLED_SESSION_STATUSES
+    return _session_cwd_impl(session, worker_cfg, provider="claude")
 
 
 def _claude_session_id(session: WorkerSession) -> str:
@@ -964,13 +931,6 @@ def _claude_session_id(session: WorkerSession) -> str:
     if value:
         return value
     return str(uuid.uuid4())
-
-
-def _control_request_id(request: dict[str, Any]) -> str:
-    request_id = str(request.get("request_id") or request.get("id") or "").strip()
-    if not request_id:
-        raise RuntimeError("request_id is required")
-    return request_id
 
 
 def _approval_allowed(request: dict[str, Any]) -> bool:
@@ -1016,29 +976,11 @@ def _restore_running_if_waiting(
     waiting_status: str,
     has_pending_requests: Any,
 ) -> None:
-    session = sessions.get(session_id)
-    if session is None or session.status != waiting_status:
-        return
-    terminal_status = _terminal_status_from_events(sessions, session_id)
-    if terminal_status is not None:
-        sessions.update_status(session_id, terminal_status)
-        return
-    if not has_pending_requests():
-        sessions.update_status(session_id, SESSION_RUNNING)
-
-
-def _terminal_status_from_events(sessions: SessionManager, session_id: str) -> str | None:
-    status_by_event = {
-        EVENT_SESSION_INTERRUPTED: SESSION_INTERRUPTED,
-        EVENT_SESSION_STOPPED: SESSION_STOPPED,
-        EVENT_TURN_COMPLETED: SESSION_COMPLETED,
-        EVENT_TURN_FAILED: SESSION_FAILED,
-    }
-    for event in reversed(sessions.events(session_id)):
-        status = status_by_event.get(event.type)
-        if status is not None:
-            return status
-    return None
+    sessions.restore_running_if_waiting(
+        session_id,
+        waiting_status,
+        has_pending_requests=has_pending_requests(),
+    )
 
 
 def _terminate_provider_process(session: WorkerSession) -> None:

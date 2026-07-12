@@ -16,7 +16,7 @@ from jarvis.brain.capabilities import (
 )
 from jarvis.brain.contexts import ActiveProject, ContextStore
 from jarvis.brain.identity import Resolution
-from jarvis.brain.memory_client import MemoryBackend, MemoryMessage, SessionPeer
+from jarvis.brain.memory_client import MemoryBackend
 from jarvis.brain.memory_outbox import CurationOutbox
 from jarvis.brain.memory_tools import make_memory_tools
 from jarvis.brain.project_management import BrainProjectClient, ProjectOperationError
@@ -30,8 +30,8 @@ from jarvis.connectors.cockpit import (
     CockpitThread,
     _drain_cold_tasks,
     _project_context,
+    persist_turn_messages,
 )
-from jarvis.ids import utc_now
 from jarvis.runtime import CapabilityError, ToolRegistry
 from jarvis.tools import build_registry
 from jarvis.users import User, load_users
@@ -689,27 +689,13 @@ class MCPCockpitConnector(CockpitConnector):
         assistant_text: str,
         channel: str,
     ) -> None:
-        self._memory.create_session(
+        persist_turn_messages(
+            self._memory,
             session_id,
-            peers=[SessionPeer(peer_id=requester_peer_id, observe_me=True, observe_others=True)],
-        )
-        user_metadata = {"channel": channel, "role": "user", "observed_at": utc_now()}
-        assistant_metadata = {"channel": channel, "role": "assistant", "observed_at": utc_now()}
-        if device_id:
-            user_metadata["device_id"] = device_id
-            assistant_metadata["device_id"] = device_id
-        self._memory.create_messages(
-            session_id,
-            [
-                MemoryMessage(
-                    peer_id=requester_peer_id,
-                    content=user_text,
-                    metadata=user_metadata,
-                ),
-                MemoryMessage(
-                    peer_id=self._cfg.memory.assistant_peer_id,
-                    content=assistant_text,
-                    metadata=assistant_metadata,
-                ),
-            ],
+            requester_peer_id,
+            device_id,
+            user_text,
+            assistant_text,
+            assistant_peer_id=self._cfg.memory.assistant_peer_id,
+            channel=channel,
         )

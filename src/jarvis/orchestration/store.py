@@ -25,11 +25,14 @@ from jarvis.orchestration.models import (
     WorkerJobLink,
     WorkerSessionLink,
 )
+from jarvis.storage import atomic_write_json
 from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES
 
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9_-]+$")
-_SESSION_REF_PREFIX = "sessref_"
+# Canonical session-ref HMAC scheme (see make_session_ref below).
+# cockpit.make_session_ref() delegates here.
+SESSION_REF_PREFIX = "sessref_"
 _SESSION_REF_SIGNING_CONTEXT = b"jarvis-cockpit-session-ref-v1"
 _SESSION_REF_SIGNATURE_BYTES = 12
 _STORE_CACHE_MAX_RUNS = 500
@@ -569,7 +572,7 @@ class OrchestrationStore:
         if cached is not None and cached[0] == mtime:
             return cached[1]
         refs = {
-            _make_session_ref(str(item.get("worker_id") or ""), str(item.get("session_id") or ""))
+            make_session_ref(str(item.get("worker_id") or ""), str(item.get("session_id") or ""))
             for item in self.deleted_worker_sessions().values()
             if item.get("worker_id") and item.get("session_id")
         }
@@ -604,14 +607,7 @@ class OrchestrationStore:
         if existing is None:
             run.sessions.append(session)
         else:
-            existing.status = session.status
-            existing.provider = session.provider
-            existing.engine = session.engine
-            existing.project_id = session.project_id or existing.project_id
-            existing.branch = session.branch
-            existing.cwd = session.cwd
-            existing.last_event_id = session.last_event_id
-            existing.allowed_actions = list(session.allowed_actions)
+            _merge_session_link(existing, session)
         if run.phase in {"created", "claimed", "provisioned", "completed", "done", "failed", "blocked"}:
             run.phase = "running"
             run.status = "active"
@@ -636,14 +632,7 @@ class OrchestrationStore:
             if existing is None:
                 run.sessions.append(session)
             else:
-                existing.status = session.status
-                existing.provider = session.provider
-                existing.engine = session.engine
-                existing.project_id = session.project_id or existing.project_id
-                existing.branch = session.branch
-                existing.cwd = session.cwd
-                existing.last_event_id = session.last_event_id
-                existing.allowed_actions = list(session.allowed_actions)
+                _merge_session_link(existing, session)
             run.phase = "running"
             run.status = "active"
             run.terminal_reason = ""
@@ -887,7 +876,7 @@ class OrchestrationStore:
             events.append(RunEvent.from_dict(record))
 
     def _write_index(self, path: pathlib.Path, data: object) -> None:
-        _atomic_write_json(path, data)
+        atomic_write_json(path, data)
         self.bump_generation()
 
     @contextlib.contextmanager
@@ -956,7 +945,7 @@ class OrchestrationStore:
         refs_changed = False
         updated_at = utc_now()
         for session in sessions:
-            session_ref = _make_session_ref(session.worker_id, session.session_id)
+            session_ref = make_session_ref(session.worker_id, session.session_id)
             existing = refs.get(session_ref)
             if (
                 existing is not None
@@ -988,7 +977,7 @@ class OrchestrationStore:
 
     def _record_session_ref_unlocked(self, worker_id: str, session_id: str) -> None:
         records = self.session_ref_index()
-        session_ref = _make_session_ref(worker_id, session_id)
+        session_ref = make_session_ref(worker_id, session_id)
         existing = records.get(session_ref)
         if (
             existing is not None
@@ -1016,6 +1005,19 @@ class OrchestrationStore:
         self._write_index(self._deleted_sessions_path, list(records.values()))
 
 
+def _merge_session_link(existing: WorkerSessionLink, session: WorkerSessionLink) -> None:
+    """Apply an updated session link's fields onto an already-linked one."""
+
+    existing.status = session.status
+    existing.provider = session.provider
+    existing.engine = session.engine
+    existing.project_id = session.project_id or existing.project_id
+    existing.branch = session.branch
+    existing.cwd = session.cwd
+    existing.last_event_id = session.last_event_id
+    existing.allowed_actions = list(session.allowed_actions)
+
+
 def _same_work_item(left: WorkItem, right: WorkItem) -> bool:
     if left.source != right.source:
         return False
@@ -1026,15 +1028,9 @@ def _same_work_item(left: WorkItem, right: WorkItem) -> bool:
     return left_id == right_id
 
 
-def _atomic_write_json(path: pathlib.Path, data: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(f"{path.suffix}.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-    tmp.replace(path)
-
-
-def _make_session_ref(worker_id: str, session_id: str) -> str:
+def make_session_ref(worker_id: str, session_id: str) -> str:
+    # Canonical session-ref HMAC scheme; cockpit.make_session_ref() delegates here.
     raw = f"{worker_id}\0{session_id}".encode("utf-8")
     digest = hmac.new(_SESSION_REF_SIGNING_CONTEXT, _SESSION_REF_SIGNING_CONTEXT + b"\0" + raw, hashlib.sha256).digest()
     token = base64.urlsafe_b64encode(digest[:_SESSION_REF_SIGNATURE_BYTES]).decode("ascii").rstrip("=")
-    return f"{_SESSION_REF_PREFIX}{token}"
+    return f"{SESSION_REF_PREFIX}{token}"

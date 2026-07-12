@@ -46,7 +46,7 @@ def test_pi_installer_dry_run_models_intercom_install() -> None:
     assert "rsync" in result.stdout
     assert "alsa-utils" in result.stdout
     assert "+ env UV_INSTALL_DIR=/usr/local/bin sh -c" in result.stdout
-    assert "+ curl -fsSL https://github.com/roughcoder/jarvis/archive/v0.1.21.tar.gz -o /tmp/jarvis-pi-test/jarvis.tar.gz" in result.stdout
+    assert "+ curl -fsSL https://github.com/roughcoder/jarvis/archive/v0.24.0.tar.gz -o /tmp/jarvis-pi-test/jarvis.tar.gz" in result.stdout
     assert "+ mkdir -p /opt/jarvis-test" in result.stdout
     assert "+ tar -xzf /tmp/jarvis-pi-test/jarvis.tar.gz --strip-components=1 -C /opt/jarvis-test" in result.stdout
     assert "+ cd /opt/jarvis-test" in result.stdout

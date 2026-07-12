@@ -18,10 +18,10 @@ create/list/query/delete round-trips arbitrary metadata in the API schema.
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from pathlib import Path
 from typing import Any
+
+from jarvis.brain._storage import atomic_write_json
 
 
 _PENDING_KEY = "__pending_by_content_hash__"
@@ -39,7 +39,7 @@ class ConclusionMetadataSidecar:
         workspace_data = data.setdefault(workspace, {})
         workspace_data[conclusion_id] = dict(metadata)
         _delete_pending(workspace_data, metadata.get("content_hash"))
-        _atomic_write_json(self._path, data)
+        atomic_write_json(self._path, data)
 
     def put_pending(
         self,
@@ -62,7 +62,7 @@ class ConclusionMetadataSidecar:
             "content": content,
             "metadata": dict(metadata),
         }
-        _atomic_write_json(self._path, data)
+        atomic_write_json(self._path, data)
 
     def materialize_pending(
         self,
@@ -91,7 +91,7 @@ class ConclusionMetadataSidecar:
                 pending.pop(content_hash, None)
                 if not pending:
                     workspace_data.pop(_PENDING_KEY, None)
-                _atomic_write_json(self._path, data)
+                atomic_write_json(self._path, data)
                 return metadata
         return {}
 
@@ -103,7 +103,7 @@ class ConclusionMetadataSidecar:
         workspace_data.pop(conclusion_id, None)
         if not workspace_data:
             data.pop(workspace, None)
-        _atomic_write_json(self._path, data)
+        atomic_write_json(self._path, data)
 
     def reconcile(self, workspace: str, existing_ids: set[str]) -> None:
         data = self._read()
@@ -121,7 +121,7 @@ class ConclusionMetadataSidecar:
             data[workspace] = pruned
         else:
             data.pop(workspace, None)
-        _atomic_write_json(self._path, data)
+        atomic_write_json(self._path, data)
 
     def _read(self) -> dict[str, dict[str, dict[str, Any]]]:
         if not self._path.exists():
@@ -144,29 +144,3 @@ def _delete_pending(workspace_data: dict[str, Any], content_hash: Any) -> None:
     pending.pop(str(content_hash), None)
     if not pending:
         workspace_data.pop(_PENDING_KEY, None)
-
-
-def _atomic_write_json(path: Path, data: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as handle:
-        tmp = Path(handle.name)
-        json.dump(data, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
-    try:
-        dir_fd = os.open(path.parent, os.O_DIRECTORY)
-    except OSError:
-        return
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)

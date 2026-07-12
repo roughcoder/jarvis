@@ -155,6 +155,8 @@ jarvis fleet-status --json --no-docker
 
 The JSON intentionally contains no tokens. It includes:
 
+- `runtime`: the running release version, deployment channel, and exact dogfood
+  git SHA when applicable.
 - `services`: launchd state for `com.jarvis.brain`, `com.jarvis.api`,
   `com.jarvis.intercom`, and `com.jarvis.worker`.
 - `brain`: bind address, auth configured, paired devices without secrets.
@@ -226,6 +228,86 @@ jarvis-pi logs
 ```
 
 The Pi remains a thin intercom: pairing token only, no provider credentials.
+
+## Unreleased Dogfood Ring
+
+Use the dogfood ring to test a committed runtime SHA against the live Cockpit
+and private network before opening a runtime PR or publishing a release. It is a
+small review-only ring: the Cockpit API/orchestrator worker host and the worker
+hosts selected for the review. It does not update room devices, Homebrew, tags,
+or GitHub releases.
+
+The complete inner-loop procedure, two-model PR-review acceptance gate, rollback
+drill, and troubleshooting guide live in [DOGFOOD.md](DOGFOOD.md). This section
+is the short command and inventory reference.
+
+Keep the real inventory outside this public repository. The default path is
+`~/.jarvis/dogfood-fleet.json`; a placeholder-only shape is:
+
+```json
+{
+  "hosts": [
+    {
+      "name": "review-brain",
+      "ssh": "jarvis-review-host",
+      "roles": ["api", "worker"],
+      "workdir": "~/.jarvis",
+      "runtime_root": "~/.jarvis/dogfood",
+      "production_bin": "/opt/homebrew/bin/jarvis",
+      "uv_bin": "/opt/homebrew/bin/uv",
+      "python": "3.12",
+      "probes": [
+        {
+          "role": "api",
+          "url": "http://review-brain.private:8790/v1/runtime"
+        },
+        {
+          "role": "worker",
+          "url": "http://127.0.0.1:8780/health"
+        }
+      ]
+    },
+    {
+      "name": "review-laptop",
+      "local": true,
+      "roles": ["worker"],
+      "extras": ["worker-claude"],
+      "probes": [
+        {"role": "worker", "url": "http://127.0.0.1:8780/health"}
+      ]
+    }
+  ]
+}
+```
+
+From a clean implementation worktree, commit the candidate and run:
+
+```bash
+uv run jarvis dogfood deploy HEAD
+uv run jarvis dogfood status
+uv run jarvis dogfood rollback
+```
+
+`deploy` resolves one immutable commit, prepares it on every host, and activates
+only after every preparation succeeds. Services always point at a stable
+launcher. Activation switches that launcher atomically, records the prior
+target, reloads launchd when first binding the services, and checks each
+configured health endpoint for the selected channel and SHA. If activation
+fails partway through the ring, already-switched hosts are rolled back.
+
+`rollback` only switches the stable launcher to the recorded prior target and
+restarts the selected roles. It never reinstalls or changes Homebrew. Dogfood
+changes must avoid irreversible state migrations so this remains safe.
+
+The intended delivery loop is:
+
+1. Commit locally and deploy the SHA to the review ring.
+2. Run the two-model Cockpit PR review flow against both fixture PRs.
+3. Fix, commit, redeploy, and repeat until both flows pass consecutively.
+4. Open and review the runtime PR, merge it, then publish one normal release.
+
+Do not advance to step 4 until the checklist in [DOGFOOD.md](DOGFOOD.md) passes
+for both fixture PRs consecutively.
 
 ## Runtime Update Runbook
 
@@ -319,12 +401,12 @@ JARVIS_ENV_FILE=~/.jarvis/.env jarvis fleet-status --json --no-docker
 Room Pis:
 
 ```bash
-ssh alice@<tailscale-ip> 'sudo jarvis-pi update && jarvis-pi status && jarvis-pi doctor'
+ssh alice@<private-ip> 'sudo jarvis-pi update && jarvis-pi status && jarvis-pi doctor'
 ```
 
-If a Pi is offline in Tailscale, do not continue the Pi step from the brain Mac.
-Ask for a physical power/network check, then retry SSH when Tailscale reports the
-host online.
+If a Pi is offline on the private network, do not continue the Pi step from the
+brain Mac. Ask for a physical power/network check, then retry SSH when the host
+is reachable again.
 
 Pi screens are optional hardware. The SunFounder Pironman 5 Pro Max screen is a
 4.3-inch 800x480 MIPI DSI touch display. Keep `INTERCOM_DEVICE_PI_PANEL=auto`
@@ -387,17 +469,17 @@ ctl.!default {
 }
 ```
 
-When the brain is reached over Tailscale, harden the Pi systemd unit so Jarvis
-does not start before the tailnet route to the brain exists. The important parts
+When the brain is reached over a private network, harden the Pi systemd unit so
+Jarvis does not start before the route to the brain exists. The important parts
 are:
 
 ```ini
 [Unit]
-After=network-online.target tailscaled.service sound.target
-Wants=network-online.target tailscaled.service
+After=network-online.target sound.target
+Wants=network-online.target
 
 [Service]
-ExecStartPre=/bin/sh -c 'for i in $(seq 1 120); do /usr/bin/nc -z -w 2 <brain-tailscale-ip> 8700 && exit 0; sleep 2; done; echo "Jarvis brain not reachable" >&2; exit 1'
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 120); do /usr/bin/nc -z -w 2 <brain-private-ip> 8700 && exit 0; sleep 2; done; echo "Jarvis brain not reachable" >&2; exit 1'
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1

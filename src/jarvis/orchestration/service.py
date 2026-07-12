@@ -14,7 +14,11 @@ from jarvis.orchestration.redaction import public_error_message, redact as _reda
 from jarvis.orchestration.sources import WorkSource
 from jarvis.orchestration.store import ActiveWorkerSessionError, ActiveWorkItemError, OrchestrationStore
 from jarvis.orchestration.supervisor import sync_run_sessions
-from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry
+from jarvis.orchestration.workers import (
+    WorkerProfile,
+    WorkerRegistry,
+    repo_ref_matches_access_row,
+)
 from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, SESSION_RUNNING, TURN_RESUMABLE_SESSION_STATUSES
 
 
@@ -648,7 +652,7 @@ def _repo_access_summary(worker: WorkerProfile, repo: str) -> dict[str, Any] | N
         return None
     for row in worker.repo_access:
         candidate = str(row.get("repo") or "")
-        if _repo_ref_matches_access_row(repo, candidate):
+        if repo_ref_matches_access_row(repo, candidate):
             return {
                 "repo": candidate or repo,
                 "accessible": bool(row.get("accessible")),
@@ -658,20 +662,6 @@ def _repo_access_summary(worker: WorkerProfile, repo: str) -> dict[str, Any] | N
                 "cached": bool(row.get("cached")),
             }
     return None
-
-
-def _repo_ref_matches_access_row(requested: str, candidate: str) -> bool:
-    if not candidate:
-        return False
-    if _is_owner_name_ref(requested):
-        return candidate == requested
-    repo_name = requested.rsplit("/", 1)[-1]
-    return candidate in {requested, repo_name} or candidate.rsplit("/", 1)[-1] == repo_name
-
-
-def _is_owner_name_ref(value: str) -> bool:
-    text = str(value or "").strip()
-    return text.count("/") == 1 and not text.startswith(("http://", "https://", "git@"))
 
 
 def _selection_warnings(rows: list[dict[str, Any]], command: WorkCommand) -> list[dict[str, str]]:

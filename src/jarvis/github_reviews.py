@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -55,12 +56,25 @@ def publish_github_pr_review(
     skipped: list[str] = []
     invalid_count = 0
     duplicate_count = 0
+    global_diff_lines = (
+        _global_diff_line_map(_gh_text(run, ["gh", "pr", "diff", str(pull_number), "--repo", repo]))
+        if comments
+        else {}
+    )
     for comment in comments:
         try:
-            rendered = _review_comment(comment, anchors=anchors)
+            candidate = _resolve_review_comment_line(
+                comment,
+                anchors=anchors,
+                global_diff_lines=global_diff_lines,
+            )
+            rendered = _review_comment(candidate, anchors=anchors)
         except ValueError as exc:
             invalid_count += 1
-            skipped.append(f"[{str(comment.get('severity') or 'P3').upper()}] {str(comment.get('title') or 'Finding')}: {exc}")
+            skipped.append(
+                f"[{str(comment.get('severity') or 'P3').upper()}] "
+                f"{str(comment.get('title') or 'Finding')}: {exc}"
+            )
             continue
         key = (rendered["path"], rendered["line"], rendered["side"], rendered["body"])
         if key in existing_keys:
@@ -107,6 +121,13 @@ def _gh_json(run: Runner, argv: list[str]) -> Any:
         return json.loads(result.stdout or "{}")
     except json.JSONDecodeError as exc:
         raise RuntimeError("GitHub preflight returned invalid JSON") from exc
+
+
+def _gh_text(run: Runner, argv: list[str]) -> str:
+    result = run(argv, text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "GitHub diff preflight failed")
+    return result.stdout
 
 
 def _review_anchors(raw: Any) -> dict[str, dict[str, set[int]]]:
@@ -158,6 +179,109 @@ def _patch_anchors(patch: str) -> dict[str, set[int]]:
             old_line += 1
             new_line += 1
     return result
+
+
+def _global_diff_line_map(diff: str) -> dict[tuple[str, int, str], int]:
+    result: dict[tuple[str, int, str], int] = {}
+    old_path = new_path = ""
+    old_line = new_line = 0
+    for position, row in enumerate(diff.splitlines(), start=1):
+        if row.startswith("diff --git "):
+            old_path = new_path = ""
+            old_line = new_line = 0
+            continue
+        if row.startswith("--- "):
+            old_path = _diff_path(row[4:], "a/")
+            continue
+        if row.startswith("+++ "):
+            new_path = _diff_path(row[4:], "b/")
+            continue
+        match = _HUNK_RE.match(row)
+        if match:
+            old_line, new_line = int(match.group(1)), int(match.group(3))
+            continue
+        if not old_line and not new_line:
+            continue
+        if row.startswith("\\"):
+            continue
+        if row.startswith("+") and not row.startswith("+++"):
+            if new_path:
+                result[(new_path, position, "RIGHT")] = new_line
+            new_line += 1
+        elif row.startswith("-") and not row.startswith("---"):
+            if old_path:
+                result[(old_path, position, "LEFT")] = old_line
+            old_line += 1
+        else:
+            if old_path:
+                result[(old_path, position, "LEFT")] = old_line
+            if new_path:
+                result[(new_path, position, "RIGHT")] = new_line
+            old_line += 1
+            new_line += 1
+    return result
+
+
+def _diff_path(value: str, prefix: str) -> str:
+    if value == "/dev/null":
+        return ""
+    try:
+        parsed = shlex.split(value)[0]
+    except (IndexError, ValueError):
+        parsed = value.strip()
+    return parsed.removeprefix(prefix)
+
+
+def _normalize_global_diff_line(
+    comment: dict[str, Any],
+    global_diff_lines: dict[tuple[str, int, str], int],
+) -> dict[str, Any] | None:
+    path = str(comment.get("path") or "").strip()
+    side = str(comment.get("side") or "RIGHT").upper()
+    try:
+        position = int(comment.get("line") or 0)
+    except (TypeError, ValueError):
+        return None
+    line = global_diff_lines.get((path, position, side))
+    return {**comment, "line": line} if line is not None else None
+
+
+def _resolve_review_comment_line(
+    comment: dict[str, Any],
+    *,
+    anchors: dict[str, dict[str, set[int]]],
+    global_diff_lines: dict[tuple[str, int, str], int],
+) -> dict[str, Any]:
+    line_kind = str(comment.get("line_kind") or "").upper()
+    if line_kind == "FILE":
+        return comment
+    normalized = _normalize_global_diff_line(comment, global_diff_lines)
+    if line_kind == "GLOBAL_DIFF_POSITION":
+        if normalized is None:
+            raise ValueError("global gh diff output position does not map to the declared path and side")
+        return normalized
+    if line_kind:
+        raise ValueError("comment line_kind must be FILE or GLOBAL_DIFF_POSITION")
+    if normalized is None or normalized.get("line") == comment.get("line"):
+        return comment
+    if _comment_anchor_exists(comment, anchors):
+        raise ValueError(
+            "comment line is ambiguous between a valid file line and a different gh diff output position"
+        )
+    return normalized
+
+
+def _comment_anchor_exists(
+    comment: dict[str, Any],
+    anchors: dict[str, dict[str, set[int]]],
+) -> bool:
+    path = str(comment.get("path") or "").strip()
+    side = str(comment.get("side") or "RIGHT").upper()
+    try:
+        line = int(comment.get("line") or 0)
+    except (TypeError, ValueError):
+        return False
+    return side in {"LEFT", "RIGHT"} and path in anchors and line in anchors[path][side]
 
 
 def _review_comment(comment: dict[str, Any], *, anchors: dict[str, dict[str, set[int]]]) -> dict[str, Any]:
