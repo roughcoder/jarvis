@@ -5755,6 +5755,52 @@ def test_cockpit_checkpoint_aggregation_uses_worker_bulk_endpoint(tmp_path, monk
     asyncio.run(_with_server(cfg, calls, http_get=get))
 
 
+def test_cockpit_checkpoint_aggregation_does_not_fan_out_after_bulk_timeout(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    calls_seen: list[str] = []
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        calls_seen.append(url)
+        if url.endswith("/health"):
+            return Response({"ok": True, "agent": "codex", "supported_engines": ["codex"]})
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions"):
+            return Response(
+                {
+                    "sessions": [
+                        {
+                            "session_id": f"sess_{index}",
+                            "provider": "codex",
+                            "engine": "codex",
+                            "status": "completed",
+                            "title": f"Historical session {index}",
+                        }
+                        for index in range(20)
+                    ]
+                }
+            )
+        if url.endswith("/sessions/requests"):
+            return Response({"requests": []})
+        if url.endswith("/sessions/checkpoints"):
+            raise TimeoutError("worker checkpoint endpoint timed out")
+        if "/sessions/sess_" in url and url.endswith("/checkpoints"):
+            raise AssertionError("bulk transport failure must not fan out per historical session")
+        raise AssertionError(url)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})
+
+        assert response.status_code == 200
+        assert len(response.json()["sessions"]) == 20
+        assert sum(url.endswith("/sessions/checkpoints") for url in calls_seen) == 1
+        assert not any("/sessions/sess_" in url and url.endswith("/checkpoints") for url in calls_seen)
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
 def test_cockpit_session_detail_returns_not_found_for_stale_worker_only_ref(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch)
     ref = make_session_ref("macbook-worker", "sess_worker_only")

@@ -823,13 +823,19 @@ def _worker_bulk_checkpoints(base_url: str, headers: dict[str, str], timeout: fl
             headers=headers,
             timeout=timeout,
         )
-        if getattr(response, "status_code", 200) >= 400:
+        status_code = getattr(response, "status_code", 200)
+        if status_code in {404, 405}:
             return None
+        if status_code >= 400:
+            return []
         raw_items = response.json().get("checkpoints", [])
     except AssertionError:
         raise
     except Exception:  # noqa: BLE001 - workers may not support the bulk endpoint yet
-        return None
+        # A transport failure says nothing about endpoint compatibility. Avoid
+        # multiplying one unavailable worker into a request per historical
+        # session; legacy fallback is reserved for an explicit 404/405 above.
+        return []
     if not isinstance(raw_items, list):
         return None
     return [dict(item) for item in raw_items if isinstance(item, dict)]
