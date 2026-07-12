@@ -488,6 +488,8 @@ class WorkerConfig(_Base):
     port: int = 8780
     bind_host: str = ""              # daemon bind addr; empty => host
     token: SecretStr = SecretStr("")  # shared pairing token
+    worker_id: str = "local-worker"  # matches this worker's orchestration registry profile
+    notify_url: str = ""             # orchestration API base URL; empty disables change push
     allow_insecure: bool = False     # permit a no-token, non-loopback bind (else refuse to start)
     workspace: str = "~/.jarvis/worker"  # default cwd for actions/jobs
     max_concurrent_jobs: int = 2  # advertised orchestration capacity for the synthesized local profile
@@ -1060,6 +1062,8 @@ class Config:
             "intercom_device.pi_panel_url": self.intercom_device.pi_panel_url or "<disabled>",
             "worker.base_url": self.worker.base_url,
             "worker.token": mask(self.worker.token),
+            "worker.worker_id": self.worker.worker_id,
+            "worker.notify_url": self.worker.notify_url or "<disabled>",
             "worker.agent": self.worker.agent,
             "worker.supported_engines": self.worker.supported_engines or "<default agent only>",
             "worker.workspace": self.worker.workspace,

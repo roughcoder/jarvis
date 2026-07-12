@@ -54,6 +54,7 @@ from jarvis.worker.providers.claude import _claude_session_id  # noqa: E402
 from jarvis.worker.providers.base import ProviderTurn  # noqa: E402
 from jarvis.worker.sessions import WorkerSession  # noqa: E402
 from jarvis.worker.sessions import SessionManager  # noqa: E402
+from jarvis.worker.notify import WorkerChangeNotifier  # noqa: E402
 from jarvis.worker_session_contract import (  # noqa: E402
     EVENT_APPROVAL_RESOLVED,
     EVENT_TURN_COMPLETED,
@@ -876,6 +877,110 @@ def test_session_manager_serializes_concurrent_session_writes(tmp_path) -> None:
     assert fetched.status == "running"
     assert fetched.metadata["k39"] == "39"
     assert len([event for event in sessions.events(session.session_id) if event.type == "provider.log"]) == 40
+
+
+def test_worker_change_notifier_coalesces_bursts_per_session() -> None:
+    async def run() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls: list[dict] = []
+        active = 0
+        max_active = 0
+
+        async def post(_url: str, body: dict, _headers: dict) -> object:
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            calls.append(body)
+            if len(calls) == 1:
+                started.set()
+                await release.wait()
+            active -= 1
+            return type("Response", (), {"status_code": 200})()
+
+        notifier = WorkerChangeNotifier(
+            url="http://brain.test",
+            token="worker-token",
+            worker_id="local-worker",
+            post=post,
+        )
+        await notifier.start()
+        try:
+            notifier.enqueue(kind="session_event", session_id="sess_burst")
+            await asyncio.wait_for(started.wait(), timeout=1)
+            for _ in range(20):
+                notifier.enqueue(kind="session_event", session_id="sess_burst")
+            release.set()
+            for _ in range(100):
+                if len(calls) == 2:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(calls) == 2
+            assert max_active == 1
+            assert all(call["session_id"] == "sess_burst" for call in calls)
+        finally:
+            await notifier.aclose()
+
+    asyncio.run(run())
+
+
+def test_worker_change_notification_failure_does_not_affect_append_event(tmp_path) -> None:
+    async def run() -> None:
+        async def fail(_url: str, _body: dict, _headers: dict) -> object:
+            raise httpx.ConnectError("brain unavailable")
+
+        notifier = WorkerChangeNotifier(
+            url="http://brain.test",
+            token="worker-token",
+            worker_id="local-worker",
+            post=fail,
+        )
+        await notifier.start()
+        try:
+            sessions = SessionManager(
+                str(tmp_path / "sessions"),
+                on_change=lambda session_id, kind: notifier.enqueue(kind=kind, session_id=session_id),
+            )
+            session, _ = sessions.create({"provider": "fake", "engine": "fake"})
+            event = sessions.append_event(session.session_id, "provider.log", {"line": "still durable"})
+            assert event in sessions.events(session.session_id)
+            await asyncio.sleep(0.05)
+        finally:
+            await notifier.aclose()
+
+    asyncio.run(run())
+
+
+def test_worker_change_notification_is_disabled_when_url_is_empty(tmp_path) -> None:
+    async def run() -> None:
+        calls = 0
+
+        async def post(_url: str, _body: dict, _headers: dict) -> object:
+            nonlocal calls
+            calls += 1
+            return type("Response", (), {"status_code": 200})()
+
+        notifier = WorkerChangeNotifier(
+            url="",
+            token="worker-token",
+            worker_id="local-worker",
+            post=post,
+        )
+        await notifier.start()
+        try:
+            sessions = SessionManager(
+                str(tmp_path / "sessions"),
+                on_change=lambda session_id, kind: notifier.enqueue(kind=kind, session_id=session_id),
+            )
+            session, _ = sessions.create({"provider": "fake", "engine": "fake"})
+            sessions.append_event(session.session_id, "provider.log", {"line": "local only"})
+            await asyncio.sleep(0)
+            assert calls == 0
+            assert len(sessions.events(session.session_id)) == 2
+        finally:
+            await notifier.aclose()
+
+    asyncio.run(run())
 
 
 def test_session_manager_strips_provider_owned_metadata_on_create(tmp_path) -> None:

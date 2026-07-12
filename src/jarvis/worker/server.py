@@ -63,6 +63,7 @@ from jarvis.worker.actions import (
     worktree_inventory,
 )
 from jarvis.worker.jobs import JobManager, slugify
+from jarvis.worker.notify import WorkerChangeNotifier
 from jarvis.worker.providers import ProviderTurn, provider_for
 from jarvis.worker.sessions import SessionManager, SessionTurnConflict, WorkerSession
 from jarvis.worker.workspaces import (
@@ -208,8 +209,19 @@ def make_app(cfg: WorkerConfig) -> web.Application:
     conversation_root = conversation_workspace_root(cfg, workspace)
     conversation_root.mkdir(parents=True, exist_ok=True)
     # Persist jobs to disk under the workspace so they survive a daemon restart.
-    jobs = JobManager(store_dir=str(workspace / "jobs"))
-    sessions = SessionManager(store_dir=str(workspace / "sessions"))
+    notifier = WorkerChangeNotifier(
+        url=cfg.notify_url,
+        token=cfg.token.get_secret_value(),
+        worker_id=cfg.worker_id,
+    )
+    jobs = JobManager(
+        store_dir=str(workspace / "jobs"),
+        on_change=lambda job, kind: notifier.enqueue(kind=kind, job_id=job.id),
+    )
+    sessions = SessionManager(
+        store_dir=str(workspace / "sessions"),
+        on_change=lambda session_id, kind: notifier.enqueue(kind=kind, session_id=session_id),
+    )
 
     # Browser lane: one lazily-created BrowserHost per process (own config slice, read
     # from env like the worker's). nodriver is imported only on first use.
@@ -1066,6 +1078,14 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 await task
 
     app = web.Application(client_max_size=max(1024 * 1024, int(cfg.max_request_bytes)))
+    async def notifier_context(_app: web.Application):  # noqa: ANN202
+        await notifier.start()
+        try:
+            yield
+        finally:
+            await notifier.aclose()
+
+    app.cleanup_ctx.append(notifier_context)
     app["browser_holder"] = browser_holder  # for clean shutdown in serve()
     app["browser_cfg"] = browser_cfg
     app.on_cleanup.append(_cleanup_diagnostics)

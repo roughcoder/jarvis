@@ -132,7 +132,7 @@ from jarvis.orchestration.service import (
 )
 from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource, WorkSource
 from jarvis.orchestration.store import OrchestrationStore, RunArchivedError
-from jarvis.orchestration.supervisor import final_session_phase
+from jarvis.orchestration.supervisor import final_session_phase, sync_run_jobs, sync_run_sessions
 from jarvis.orchestration.workers import WorkerRegistry, worker_http_get
 from jarvis.system_info import system_info_cached
 from jarvis.users import HOUSE
@@ -296,6 +296,9 @@ class SseSnapshotHub:
         self._next_id = 0
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
+        self._wake = asyncio.Event()
+        self._dirty: set[tuple[str, str, str]] = set()
+        self._next_notify_sync_at = 0.0
         self._next_refresh_error_log_at = 0.0
 
     async def start(self) -> None:
@@ -309,6 +312,16 @@ class SseSnapshotHub:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
+
+    def notify(self, *, worker_id: str, session_id: str = "", job_id: str = "") -> None:
+        """Record a cheap hint from an authenticated worker and wake the hub."""
+        self._dirty.add((worker_id, session_id, job_id))
+        self._wake.set()
+
+    def _take_dirty(self) -> set[tuple[str, str, str]]:
+        dirty = self._dirty
+        self._dirty = set()
+        return dirty
 
     async def subscribe(self, mode: str) -> SseSubscription:
         snapshot = await self._snapshot(mode)
@@ -351,27 +364,52 @@ class SseSnapshotHub:
         heartbeat_interval = max(1.0, float(self.ctx.cfg.orchestration.sse_heartbeat_interval_s))
         heartbeat_at = asyncio.get_running_loop().time() + heartbeat_interval
         while not self._stopping.is_set():
-            await asyncio.sleep(refresh_interval)
+            woke_for_notify = False
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=refresh_interval)
+                woke_for_notify = True
+            except TimeoutError:
+                pass
+            self._wake.clear()
+            dirty: set[tuple[str, str, str]] = set()
+            if woke_for_notify:
+                now = asyncio.get_running_loop().time()
+                delay = self._next_notify_sync_at - now
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                self._next_notify_sync_at = asyncio.get_running_loop().time() + 0.1
+                self._wake.clear()
+                dirty = self._take_dirty()
             try:
                 modes = await self._active_modes()
                 for mode in modes:
                     self._tick += 1
                     worker_sync = _HubWorkerSync(self) if mode != "none" else None
-                    sync = (
-                        await asyncio.to_thread(
-                            _hub_sync_state,
+                    if worker_sync is not None and dirty:
+                        sync = await asyncio.to_thread(
+                            _hub_sync_dirty,
                             self.ctx,
                             mode,
                             worker_sync,
+                            dirty,
                         )
-                        if worker_sync is not None
-                        else None
-                    )
-                    worker_state = (
-                        await asyncio.to_thread(_hub_worker_state, self.ctx, mode, worker_sync)
-                        if worker_sync is not None
-                        else None
-                    )
+                        worker_state = await asyncio.to_thread(_hub_worker_state, self.ctx, mode, worker_sync)
+                    else:
+                        sync = (
+                            await asyncio.to_thread(
+                                _hub_sync_state,
+                                self.ctx,
+                                mode,
+                                worker_sync,
+                            )
+                            if worker_sync is not None
+                            else None
+                        )
+                        worker_state = (
+                            await asyncio.to_thread(_hub_worker_state, self.ctx, mode, worker_sync)
+                            if worker_sync is not None
+                            else None
+                        )
                     stamp = self._snapshot_stamp(worker_sync, worker_state)
                     force_refresh = self._tick % max(1, int(self.ctx.cfg.orchestration.sse_forced_refresh_ticks)) == 0
                     if not force_refresh and self._snapshot_stamps.get(mode) == stamp:
@@ -604,6 +642,33 @@ def make_app(
     hub = SseSnapshotHub(ctx)
     app[SSE_SNAPSHOT_HUB_KEY] = hub
     app.cleanup_ctx.append(_sse_snapshot_hub_context)
+
+    async def worker_notify(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            raise CockpitError("bad_request", "invalid JSON body", status=400) from None
+        if not isinstance(body, dict):
+            raise CockpitError("bad_request", "notification body must be an object", status=400)
+        worker_id = str(body.get("worker_id") or "").strip()
+        session_id = str(body.get("session_id") or "").strip()
+        job_id = str(body.get("job_id") or "").strip()
+        kind = str(body.get("kind") or "").strip()
+        if not worker_id or not kind or not (session_id or job_id):
+            raise CockpitError("bad_request", "worker_id, kind, and session_id or job_id are required", status=400)
+        if len(kind) > 128 or len(session_id) > 256 or len(job_id) > 256:
+            raise CockpitError("bad_request", "notification fields are too long", status=400)
+        header = request.headers.get("Authorization", "")
+        token = header.removeprefix("Bearer ") if header.startswith("Bearer ") else ""
+        registry = WorkerRegistry(ctx.cfg.worker, profiles_path=ctx.cfg.orchestration.workers_path)
+        profile = await asyncio.to_thread(registry.authenticate_token, token)
+        if profile is None:
+            raise CockpitError("unauthorized", "unauthorized", status=401)
+        if profile.worker_id != worker_id:
+            raise CockpitError("forbidden", "worker identity does not match token", status=403)
+        hub.notify(worker_id=worker_id, session_id=session_id, job_id=job_id)
+        return web.json_response({"ok": True, "accepted": True})
+
     app.add_routes([
         web.get("/v1/auth/metadata", reads.auth_metadata),
         web.get("/v1/health", reads.health),
@@ -611,6 +676,7 @@ def make_app(
         web.get("/v1/cockpit/catalog", reads.catalog),
         web.get("/v1/cockpit/snapshot", reads.snapshot),
         web.get("/v1/cockpit/events", sse.events),
+        web.post("/v1/worker/notify", worker_notify),
         web.get("/v1/mcp/status", reads.mcp_status),
         web.get("/v1/mcp/tools", reads.mcp_tools),
         web.get("/v1/mcp/tokens", reads.mcp_token_list),
@@ -3159,6 +3225,66 @@ def _hub_sync_state(ctx: CockpitAppContext, mode: str, worker_sync: _HubWorkerSy
         timeout_s=float(ctx.cfg.orchestration.sse_sync_timeout_s),
         should_sync_worker=worker_sync.should_sync,
     )
+
+
+def _hub_sync_dirty(
+    ctx: CockpitAppContext,
+    mode: str,
+    worker_sync: _HubWorkerSync,
+    dirty: set[tuple[str, str, str]],
+) -> dict[str, Any]:
+    """Apply worker push hints without rediscovering every worker's state."""
+    session_runs: set[str] = set()
+    job_runs: set[str] = set()
+    worker_ids = {worker_id for worker_id, _session_id, _job_id in dirty}
+    for run in ctx.store.list_runs():
+        if run.archived_at:
+            continue
+        for worker_id, session_id, job_id in dirty:
+            if session_id and any(
+                link.worker_id == worker_id and link.session_id == session_id for link in run.sessions
+            ):
+                session_runs.add(run.run_id)
+            if job_id and any(link.worker_id == worker_id and link.job_id == job_id for link in run.jobs):
+                job_runs.add(run.run_id)
+
+    errors: list[str] = []
+
+    def should_sync(profile: Any) -> bool:
+        return profile.worker_id in worker_ids and worker_sync.should_sync(profile)
+
+    for run_id in sorted(session_runs):
+        errors.extend(
+            sync_run_sessions(
+                ctx.store,
+                worker_cfg=ctx.cfg.worker,
+                workers_path=ctx.cfg.orchestration.workers_path,
+                run_id=run_id,
+                get=worker_sync.get,
+                timeout_s=float(ctx.cfg.orchestration.sse_sync_timeout_s),
+                should_sync_worker=should_sync,
+            ).errors
+            or []
+        )
+    for run_id in sorted(job_runs):
+        errors.extend(
+            sync_run_jobs(
+                ctx.store,
+                worker_cfg=ctx.cfg.worker,
+                workers_path=ctx.cfg.orchestration.workers_path,
+                run_id=run_id,
+                get=worker_sync.get,
+                timeout_s=float(ctx.cfg.orchestration.sse_sync_timeout_s),
+                should_sync_worker=should_sync,
+            ).errors
+            or []
+        )
+    return {
+        "mode": mode,
+        "status": "fresh" if not errors else "partial",
+        "synced_at": utc_now(),
+        "errors": [public_error_message(error) for error in errors],
+    }
 
 
 def _hub_worker_state(ctx: CockpitAppContext, mode: str, worker_sync: _HubWorkerSync) -> dict[str, Any]:
