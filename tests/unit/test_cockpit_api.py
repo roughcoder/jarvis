@@ -343,6 +343,7 @@ def _cfg(
     mcp_serve_oauth_issuer: str = "",
     mcp_serve_oauth_jwks_url: str = "",
     mcp_serve_oauth_required_scopes: str = "",
+    worker_token: str = "",
 ) -> Config:
     env = tmp_path / ".env"
     workspace = tmp_path / "orchestration"
@@ -384,6 +385,7 @@ def _cfg(
                 f"MCP_SERVE_OAUTH_REQUIRED_SCOPES={mcp_serve_oauth_required_scopes}",
                 "WORKER_HOST=worker.test",
                 "WORKER_PORT=8780",
+                f"MACBOOK_WORKER_TOKEN={worker_token}",
                 "WORKER_SUPPORTED_ENGINES=codex,claude",
             ]
         )
@@ -398,6 +400,7 @@ def _cfg(
                         "worker_id": "macbook-worker",
                         "display_name": "MacBook Pro",
                         "base_url": "http://worker.test",
+                        "token_env": "MACBOOK_WORKER_TOKEN" if worker_token else "",
                         "capabilities": ["git", "shell", "browser", "codex"],
                         "max_concurrent_jobs": 4,
                         "current_jobs": 1,
@@ -2092,6 +2095,50 @@ def test_cockpit_sse_hub_backs_off_failed_worker_syncs(tmp_path, monkeypatch) ->
     assert sync.should_sync(profile) is True
 
 
+def test_cockpit_sse_hub_notify_wakes_early_and_targets_the_dirty_run(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.supervisor import SyncSummary
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    cfg.orchestration.sse_refresh_interval_s = 5.0
+    store, run_id = _seed_run(cfg)
+    targeted: list[str] = []
+
+    def sync_sessions(*_args, run_id: str = "", **_kwargs) -> SyncSummary:  # noqa: ANN001
+        targeted.append(run_id)
+        return SyncSummary(errors=[])
+
+    monkeypatch.setattr(cockpit_api_module, "sync_run_sessions", sync_sessions)
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: Response({}),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=store,
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+
+    async def run_hub() -> None:
+        hub = SseSnapshotHub(ctx)
+        await hub.start()
+        try:
+            await hub.subscribe("fast")
+            targeted.clear()  # Ignore the subscription's ordinary initial snapshot sync.
+            hub.notify(worker_id="macbook-worker", session_id="sess_123")
+            for _ in range(50):
+                if targeted:
+                    break
+                await asyncio.sleep(0.01)
+            assert targeted == [run_id]
+        finally:
+            await hub.stop()
+
+    import asyncio
+
+    asyncio.run(run_hub())
+
+
 def test_cockpit_snapshot_serializes_cursor_projection_once(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     from jarvis.orchestration import cockpit as cockpit_module
     from jarvis.orchestration.cockpit import cockpit_snapshot
@@ -2157,6 +2204,25 @@ def test_cockpit_auth_and_bad_session_ref_errors(tmp_path, monkeypatch) -> None:
         assert unauthorized.json()["error"]["code"] == "unauthorized"
         assert bad_ref.status_code == 404
         assert bad_ref.json()["error"]["code"] == "not_found"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls))
+
+
+def test_worker_notify_accepts_only_the_configured_worker_token(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, worker_token="worker-secret")
+    _store, _run_id = _seed_run(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        body = {"worker_id": "macbook-worker", "session_id": "sess_123", "kind": "session_event"}
+        valid = await client.post(f"{base}/v1/worker/notify", json=body, headers={"Authorization": "Bearer worker-secret"})
+        unknown = await client.post(f"{base}/v1/worker/notify", json=body, headers={"Authorization": "Bearer unknown"})
+
+        assert valid.status_code == 200
+        assert valid.json() == {"ok": True, "accepted": True}
+        assert unknown.status_code == 401
+        assert unknown.json()["error"]["code"] == "unauthorized"
 
     import asyncio
 

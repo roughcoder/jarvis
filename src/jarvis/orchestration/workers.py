@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import pathlib
@@ -60,6 +61,16 @@ class WorkerRegistry:
         if not worker_id:
             return profiles[0] if profiles else None
         return next((p for p in profiles if p.worker_id == worker_id), None)
+
+    def authenticate_token(self, token: str) -> WorkerProfile | None:
+        """Return the configured worker that owns a presented notify token."""
+        if not token:
+            return None
+        for profile in self.profiles(probe=False):
+            expected = self._headers(profile).get("Authorization", "").removeprefix("Bearer ")
+            if expected and hmac.compare_digest(token, expected):
+                return profile
+        return None
 
     def with_repo_access(self, profiles: list[WorkerProfile], repo: str) -> list[WorkerProfile]:
         if not repo or not _should_probe_repo_access(repo):
