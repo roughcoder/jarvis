@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -420,3 +421,295 @@ def test_thread_index_migrates_legacy_embedded_messages_to_transcript_file(tmp_p
     assert detail is not None
     assert [message["content"] for message in detail.messages] == ["legacy question"]
     assert "messages" not in compacted["threads"]["thread_legacy"]
+
+
+def test_thread_index_appends_jsonl_and_round_trips_messages(tmp_path) -> None:
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    thread = index.save(
+        CockpitThread(
+            thread_id="thread_jsonl",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_jsonl",
+            title="JSONL",
+            created_at="2026-07-05T08:00:00+00:00",
+            updated_at="2026-07-05T08:00:00+00:00",
+            created_by="neil",
+        )
+    )
+
+    updated = index.append_turn(
+        thread,
+        user_peer_id="neil",
+        user_text="question",
+        assistant_peer_id="jarvis",
+        assistant_text="answer",
+    )
+    path = index._transcript_path("jarvis", thread.thread_id)
+
+    assert path.suffix == ".jsonl"
+    assert [json.loads(line)["content"] for line in path.read_text().splitlines()] == ["question", "answer"]
+    assert index.get_with_messages("jarvis", thread.thread_id) == updated
+
+
+def test_thread_index_persists_seed_messages_when_creating_a_transcript(tmp_path) -> None:
+    index_path = tmp_path / "threads.json"
+    index = CockpitThreadIndex(index_path)
+    thread = CockpitThread(
+        thread_id="thread_seeded",
+        project_id="jarvis",
+        session_id="project:jarvis:orchestrator:thread_seeded",
+        title="Seeded",
+        created_at="2026-07-05T08:00:00+00:00",
+        updated_at="2026-07-05T08:00:00+00:00",
+        created_by="neil",
+        messages=(
+            {
+                "role": "user",
+                "peer_id": "neil",
+                "content": "seed question",
+                "observed_at": "2026-07-05T08:01:00+00:00",
+            },
+        ),
+    )
+
+    index.append_turn(
+        thread,
+        user_peer_id="neil",
+        user_text="next question",
+        assistant_peer_id="jarvis",
+        assistant_text="next answer",
+    )
+
+    reloaded = CockpitThreadIndex(index_path).get_with_messages("jarvis", thread.thread_id)
+
+    assert reloaded is not None
+    assert [message["content"] for message in reloaded.messages] == [
+        "seed question",
+        "next question",
+        "next answer",
+    ]
+
+
+def test_thread_index_migrates_legacy_json_transcript_once_after_interruption(tmp_path) -> None:
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    thread = index.save(
+        CockpitThread(
+            thread_id="thread_legacy_file",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_legacy_file",
+            title="Legacy file",
+            created_at="2026-07-05T08:00:00+00:00",
+            updated_at="2026-07-05T08:00:00+00:00",
+            created_by="neil",
+        )
+    )
+    legacy_path = index._legacy_transcript_path(thread.project_id, thread.thread_id)
+    legacy_path.parent.mkdir(parents=True)
+    legacy_payload = {
+        "version": 1,
+        "project_id": thread.project_id,
+        "thread_id": thread.thread_id,
+        "messages": [
+            {
+                "role": "user",
+                "peer_id": "neil",
+                "content": "legacy question",
+                "observed_at": "2026-07-05T08:01:00+00:00",
+            }
+        ],
+    }
+    legacy_path.write_text(json.dumps(legacy_payload))
+
+    migrated = index.get_with_messages(thread.project_id, thread.thread_id)
+    jsonl_path = index._transcript_path(thread.project_id, thread.thread_id)
+
+    assert migrated is not None
+    assert [message["content"] for message in migrated.messages] == ["legacy question"]
+    assert not legacy_path.exists()
+    assert legacy_path.with_suffix(".json.bak").read_text() == json.dumps(legacy_payload)
+
+    # Simulate a process interruption after the JSONL atomic rename but before
+    # the original file was moved aside. The retry must not duplicate records.
+    legacy_path.write_text(json.dumps(legacy_payload))
+    retried = CockpitThreadIndex(tmp_path / "threads.json").get_with_messages(thread.project_id, thread.thread_id)
+
+    assert retried is not None
+    assert [message["content"] for message in retried.messages] == ["legacy question"]
+    assert not legacy_path.exists()
+    assert len(jsonl_path.read_text().splitlines()) == 1
+
+
+def test_thread_index_cache_tail_reads_external_append_and_ignores_corrupt_trailing_line(tmp_path) -> None:
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    thread = index.save(
+        CockpitThread(
+            thread_id="thread_tail",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_tail",
+            title="Tail",
+            created_at="2026-07-05T08:00:00+00:00",
+            updated_at="2026-07-05T08:00:00+00:00",
+            created_by="neil",
+        )
+    )
+    index.append_turn(
+        thread,
+        user_peer_id="neil",
+        user_text="first",
+        assistant_peer_id="jarvis",
+        assistant_text="first reply",
+    )
+    assert index.get_with_messages("jarvis", thread.thread_id) is not None  # Warm the cache.
+    path = index._transcript_path("jarvis", thread.thread_id)
+    with path.open("ab") as handle:
+        handle.write(
+            json.dumps(
+                {
+                    "role": "user",
+                    "peer_id": "neil",
+                    "content": "external append",
+                    "observed_at": "2026-07-05T08:02:00+00:00",
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\nnot-json\n{\"role\": \"user\""
+        )
+
+    detail = index.get_with_messages("jarvis", thread.thread_id)
+
+    assert detail is not None
+    assert [message["content"] for message in detail.messages] == ["first", "first reply", "external append"]
+    recovered = index.append_turn(
+        detail,
+        user_peer_id="neil",
+        user_text="after partial",
+        assistant_peer_id="jarvis",
+        assistant_text="recovered",
+    )
+    assert [message["content"] for message in recovered.messages] == [
+        "first",
+        "first reply",
+        "external append",
+        "after partial",
+        "recovered",
+    ]
+
+
+def test_thread_index_appends_different_threads_without_global_transcript_serialization(tmp_path, monkeypatch) -> None:
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    first = index.save(
+        CockpitThread(
+            thread_id="thread_one",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_one",
+            title="One",
+            created_at="2026-07-05T08:00:00+00:00",
+            updated_at="2026-07-05T08:00:00+00:00",
+            created_by="neil",
+        )
+    )
+    second = index.save(
+        CockpitThread(
+            thread_id="thread_two",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_two",
+            title="Two",
+            created_at="2026-07-05T08:00:00+00:00",
+            updated_at="2026-07-05T08:00:00+00:00",
+            created_by="neil",
+        )
+    )
+    original_append = index._append_thread_messages
+    barrier = threading.Barrier(2)
+
+    def append_after_both_threads_arrive(*args, **kwargs):  # noqa: ANN002, ANN003
+        barrier.wait(timeout=2)
+        return original_append(*args, **kwargs)
+
+    monkeypatch.setattr(index, "_append_thread_messages", append_after_both_threads_arrive)
+    failures: list[BaseException] = []
+
+    def append(thread: CockpitThread) -> None:
+        try:
+            index.append_turn(
+                thread,
+                user_peer_id="neil",
+                user_text=f"{thread.thread_id} question",
+                assistant_peer_id="jarvis",
+                assistant_text=f"{thread.thread_id} answer",
+            )
+        except BaseException as exc:  # noqa: BLE001 - report thread failures to the test.
+            failures.append(exc)
+
+    workers = [threading.Thread(target=append, args=(thread,)) for thread in (first, second)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=3)
+
+    assert not failures
+    assert not any(worker.is_alive() for worker in workers)
+    assert [message["content"] for message in index.get_with_messages("jarvis", first.thread_id).messages] == [
+        "thread_one question",
+        "thread_one answer",
+    ]
+    assert [message["content"] for message in index.get_with_messages("jarvis", second.thread_id).messages] == [
+        "thread_two question",
+        "thread_two answer",
+    ]
+
+
+def test_thread_index_delete_waits_for_append_before_reclaiming_transcript(tmp_path, monkeypatch) -> None:
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    thread = index.save(
+        CockpitThread(
+            thread_id="thread_delete_race",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_delete_race",
+            title="Delete race",
+            created_at="2026-07-05T08:00:00+00:00",
+            updated_at="2026-07-05T08:00:00+00:00",
+            created_by="neil",
+        )
+    )
+    original_append = index._append_thread_messages
+    append_started = threading.Event()
+    allow_append = threading.Event()
+    deleted = threading.Event()
+
+    def hold_append(*args, **kwargs):  # noqa: ANN002, ANN003
+        append_started.set()
+        assert allow_append.wait(timeout=2)
+        return original_append(*args, **kwargs)
+
+    monkeypatch.setattr(index, "_append_thread_messages", hold_append)
+
+    append_worker = threading.Thread(
+        target=index.append_turn,
+        args=(thread,),
+        kwargs={
+            "user_peer_id": "neil",
+            "user_text": "question",
+            "assistant_peer_id": "jarvis",
+            "assistant_text": "answer",
+        },
+    )
+
+    def delete() -> None:
+        index.delete("jarvis", thread.thread_id)
+        deleted.set()
+
+    delete_worker = threading.Thread(target=delete)
+    append_worker.start()
+    assert append_started.wait(timeout=2)
+    delete_worker.start()
+    assert not deleted.wait(timeout=0.1)
+    allow_append.set()
+    append_worker.join(timeout=2)
+    delete_worker.join(timeout=2)
+
+    assert not append_worker.is_alive()
+    assert not delete_worker.is_alive()
+    assert deleted.is_set()
+    assert index.get("jarvis", thread.thread_id) is None
+    assert not index._transcript_path("jarvis", thread.thread_id).exists()

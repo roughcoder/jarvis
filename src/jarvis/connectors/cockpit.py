@@ -12,6 +12,7 @@ import os
 import re
 import tempfile
 import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -84,6 +85,9 @@ THREAD_HISTORY_LIMIT = 24
 CHILD_WATCH_LEASE_S = 300
 CHILD_WORK_LANDING_MODES = {"none", "branch_only", "draft_pr", "ready_pr", "confirm_before_pr"}
 _THREAD_INDEX_LOCK = threading.RLock()
+_THREAD_TRANSCRIPT_LOCKS_LOCK = threading.Lock()
+_THREAD_TRANSCRIPT_LOCKS: dict[Path, threading.RLock] = {}
+_THREAD_TRANSCRIPT_CACHE_MAX = 500
 logger = logging.getLogger(__name__)
 _WORK_SESSION_OFFER = (
     "I can't do that from this project conversation because it has no workspace, "
@@ -199,6 +203,11 @@ class CockpitThreadIndex:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser()
         self.transcripts_dir = self.path.parent / THREAD_TRANSCRIPTS_DIRNAME
+        # (size, mtime_ns, device, inode, safe_offset, messages). The offset
+        # stops before a partial final line so a concurrent writer cannot make a
+        # reader cache an incomplete JSON record.
+        self._transcript_cache: OrderedDict[Path, tuple[int, int, int, int, int, list[dict[str, Any]]]] = OrderedDict()
+        self._transcript_cache_lock = threading.Lock()
 
     def list(self, project_id: str, *, include_archived: bool = False) -> list[CockpitThread]:
         return sorted(
@@ -265,36 +274,42 @@ class CockpitThreadIndex:
             return self.save(updated)
 
     def delete(self, project_id: str, thread_id: str) -> tuple[CockpitThread | None, bool]:
-        # Hold the same lock as every other mutator: an unlocked read-modify-write
-        # here can race a concurrent append_turn/save and resurrect a just-deleted
-        # thread (its transcript already unlinked) or clobber a concurrent
-        # rename/promotion.
-        with _THREAD_INDEX_LOCK:
-            data = self._read()
-            threads = data.setdefault("threads", {})
-            deleted = data.setdefault("deleted_threads", {})
-            raw = threads.pop(thread_id, None)
-            if isinstance(raw, dict) and str(raw.get("project_id") or "") == project_id:
-                thread = CockpitThread.from_dict(raw)
-                # Messages may live in the transcript file, inline, or the legacy key;
-                # count them all for the reclamation summary, then reclaim the file.
-                messages = self._thread_messages(thread)
-                deleted[thread_id] = {
-                    **thread.as_dict(include_messages=False),
-                    "deleted_at": utc_now(),
-                }
-                _atomic_write_json(self.path, data)
-                try:
-                    self._transcript_path(project_id, thread_id).unlink(missing_ok=True)
-                except OSError:
-                    pass
-                return replace(thread, messages=tuple(messages)), True
-            if raw is not None:
-                threads[thread_id] = raw
-            tombstone = deleted.get(thread_id)
-            if isinstance(tombstone, dict) and str(tombstone.get("project_id") or "") == project_id:
-                return CockpitThread.from_dict(tombstone), False
-            return None, False
+        # Transcript writers take the per-thread lock before the index lock.
+        # Keep that order here so a deletion cannot interleave with an append
+        # after the index update but before the transcript write.
+        with self._transcript_lock(project_id, thread_id):
+            with _THREAD_INDEX_LOCK:
+                data = self._read()
+                threads = data.setdefault("threads", {})
+                deleted = data.setdefault("deleted_threads", {})
+                raw = threads.pop(thread_id, None)
+                if isinstance(raw, dict) and str(raw.get("project_id") or "") == project_id:
+                    thread = CockpitThread.from_dict(raw)
+                    # Messages may live in the transcript file, inline, or the legacy key;
+                    # count them all for the reclamation summary, then reclaim the file.
+                    messages = self._thread_messages(thread)
+                    deleted[thread_id] = {
+                        **thread.as_dict(include_messages=False),
+                        "deleted_at": utc_now(),
+                    }
+                    _atomic_write_json(self.path, data)
+                    for transcript_path in (
+                        self._transcript_path(project_id, thread_id),
+                        self._legacy_transcript_path(project_id, thread_id),
+                        self._legacy_transcript_path(project_id, thread_id).with_suffix(".json.bak"),
+                    ):
+                        try:
+                            transcript_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        self._transcript_cache_pop(transcript_path)
+                    return replace(thread, messages=tuple(messages)), True
+                if raw is not None:
+                    threads[thread_id] = raw
+                tombstone = deleted.get(thread_id)
+                if isinstance(tombstone, dict) and str(tombstone.get("project_id") or "") == project_id:
+                    return CockpitThread.from_dict(tombstone), False
+                return None, False
     def rename(self, project_id: str, thread_id: str, title: str) -> CockpitThread | None:
         with _THREAD_INDEX_LOCK:
             thread = self.get(project_id, thread_id)
@@ -315,10 +330,10 @@ class CockpitThreadIndex:
             return promoted
 
     def append_child_terminal_system_message(self, parent_chat_id: str, child: Any) -> bool:
-        with _THREAD_INDEX_LOCK:
-            thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
-            if thread is None:
-                return False
+        thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
+        if thread is None:
+            return False
+        with self._transcript_lock(thread.project_id, thread.thread_id):
             messages = self._thread_messages(thread)
             if any(
                 message.get("type") == "child_terminal"
@@ -344,7 +359,7 @@ class CockpitThreadIndex:
                 }
             )
             updated = self.save(replace(thread, updated_at=observed_at))
-            self._write_thread_messages(updated, messages)
+            self._append_thread_messages(updated, [messages[-1]])
             return True
 
     def register_child_watch(
@@ -355,8 +370,8 @@ class CockpitThreadIndex:
         requester: RequestContext,
         continuation_instruction: str = "",
     ) -> str:
-        with _THREAD_INDEX_LOCK:
-            stored = self.get(thread.project_id, thread.thread_id) or thread
+        stored = self.get(thread.project_id, thread.thread_id) or thread
+        with self._transcript_lock(stored.project_id, stored.thread_id):
             messages = self._thread_messages(stored)
             normalized = sorted(set(child_ids))
             continuation = str(continuation_instruction or "").strip()
@@ -385,7 +400,7 @@ class CockpitThreadIndex:
                         "observed_at": utc_now(),
                     }
                 )
-                self._write_thread_messages(stored, messages)
+                self._append_thread_messages(stored, [messages[-1]])
             elif (
                 str(existing.get("phase") or "") == "waiting"
                 and continuation
@@ -394,14 +409,14 @@ class CockpitThreadIndex:
             ):
                 existing["continuation_instruction"] = continuation
                 existing["observed_at"] = utc_now()
-                self._write_thread_messages(stored, messages)
+                self._append_thread_messages(stored, [existing])
             return watch_id
 
     def claim_ready_child_watch(self, parent_chat_id: str, terminal_child_ids: set[str]) -> dict[str, Any] | None:
-        with _THREAD_INDEX_LOCK:
-            thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
-            if thread is None:
-                return None
+        thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
+        if thread is None:
+            return None
+        with self._transcript_lock(thread.project_id, thread.thread_id):
             messages = self._thread_messages(thread)
             claimed: dict[str, Any] | None = None
             for message in messages:
@@ -422,14 +437,14 @@ class CockpitThreadIndex:
                     claimed = dict(message)
                     break
             if claimed is not None:
-                self._write_thread_messages(thread, messages)
+                self._append_thread_messages(thread, [claimed])
             return claimed
 
     def finish_child_watch(self, parent_chat_id: str, watch_id: str, *, error: str = "") -> None:
-        with _THREAD_INDEX_LOCK:
-            thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
-            if thread is None:
-                return
+        thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
+        if thread is None:
+            return
+        with self._transcript_lock(thread.project_id, thread.thread_id):
             messages = self._thread_messages(thread)
             for message in messages:
                 if message.get("type") == "child_watch" and message.get("watch_id") == watch_id:
@@ -437,14 +452,14 @@ class CockpitThreadIndex:
                     message["completed_at"] = utc_now()
                     if error:
                         message["error"] = public_error_message(error)
+                    self._append_thread_messages(thread, [message])
                     break
-            self._write_thread_messages(thread, messages)
 
     def renew_child_watch_claim(self, parent_chat_id: str, watch_id: str) -> None:
-        with _THREAD_INDEX_LOCK:
-            thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
-            if thread is None:
-                return
+        thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
+        if thread is None:
+            return
+        with self._transcript_lock(thread.project_id, thread.thread_id):
             messages = self._thread_messages(thread)
             for message in messages:
                 if (
@@ -453,14 +468,14 @@ class CockpitThreadIndex:
                     and message.get("phase") == "claimed"
                 ):
                     message["claimed_at"] = utc_now()
-                    self._write_thread_messages(thread, messages)
+                    self._append_thread_messages(thread, [message])
                     return
 
     def child_watch_is_claimed(self, parent_chat_id: str, watch_id: str) -> bool:
-        with _THREAD_INDEX_LOCK:
-            thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
-            if thread is None:
-                return False
+        thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
+        if thread is None:
+            return False
+        with self._transcript_lock(thread.project_id, thread.thread_id):
             return any(
                 message.get("type") == "child_watch"
                 and message.get("watch_id") == watch_id
@@ -478,12 +493,11 @@ class CockpitThreadIndex:
         assistant_text: str,
         events: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
     ) -> CockpitThread:
-        with _THREAD_INDEX_LOCK:
+        with self._transcript_lock(thread.project_id, thread.thread_id):
             observed_at = utc_now()
             stored = self.get(thread.project_id, thread.thread_id)
             archive_source = stored or thread
-            messages = [
-                *self._thread_messages(archive_source, seed_messages=thread.messages),
+            appended = [
                 {
                     "role": "user",
                     "peer_id": user_peer_id,
@@ -510,7 +524,7 @@ class CockpitThreadIndex:
                     messages=(),
                 )
             )
-            self._write_thread_messages(updated, messages)
+            messages = self._append_thread_messages(updated, appended, seed_messages=thread.messages)
             return replace(updated, messages=tuple(messages))
 
     def append_pending_turn(
@@ -521,38 +535,38 @@ class CockpitThreadIndex:
         user_text: str,
         assistant_peer_id: str,
     ) -> CockpitThread:
-        observed_at = utc_now()
-        stored = self.get(thread.project_id, thread.thread_id)
-        archive_source = stored or thread
-        messages = [
-            *self._thread_messages(archive_source, seed_messages=thread.messages),
-            {
-                "role": "user",
-                "peer_id": user_peer_id,
-                "content": user_text,
-                "observed_at": observed_at,
-            },
-            {
-                "role": "assistant",
-                "peer_id": assistant_peer_id,
-                "content": "[workspace turn pending]",
-                "observed_at": observed_at,
-            },
-        ]
-        updated = self.save(
-            replace(
-                thread,
-                title=thread.title or _thread_title(user_text),
-                updated_at=observed_at,
-                archived_at=archive_source.archived_at,
-                archived_by=archive_source.archived_by,
-                archive_reason=archive_source.archive_reason,
-                last_turn_at=observed_at,
-                messages=(),
+        with self._transcript_lock(thread.project_id, thread.thread_id):
+            observed_at = utc_now()
+            stored = self.get(thread.project_id, thread.thread_id)
+            archive_source = stored or thread
+            appended = [
+                {
+                    "role": "user",
+                    "peer_id": user_peer_id,
+                    "content": user_text,
+                    "observed_at": observed_at,
+                },
+                {
+                    "role": "assistant",
+                    "peer_id": assistant_peer_id,
+                    "content": "[workspace turn pending]",
+                    "observed_at": observed_at,
+                },
+            ]
+            updated = self.save(
+                replace(
+                    thread,
+                    title=thread.title or _thread_title(user_text),
+                    updated_at=observed_at,
+                    archived_at=archive_source.archived_at,
+                    archived_by=archive_source.archived_by,
+                    archive_reason=archive_source.archive_reason,
+                    last_turn_at=observed_at,
+                    messages=(),
+                )
             )
-        )
-        self._write_thread_messages(updated, messages)
-        return replace(updated, messages=tuple(messages))
+            messages = self._append_thread_messages(updated, appended, seed_messages=thread.messages)
+            return replace(updated, messages=tuple(messages))
 
     def _threads(self, *, include_messages: bool = False) -> dict[str, CockpitThread]:
         return {
@@ -579,28 +593,216 @@ class CockpitThreadIndex:
 
     def _read_thread_messages(self, thread: CockpitThread) -> list[dict[str, Any]]:
         path = self._transcript_path(thread.project_id, thread.thread_id)
-        if not path.exists():
+        with self._transcript_lock(thread.project_id, thread.thread_id):
+            legacy_path = self._legacy_transcript_path(thread.project_id, thread.thread_id)
+            if legacy_path.exists():
+                if not self._migrate_legacy_transcript(legacy_path, path):
+                    return self._read_legacy_thread_messages(legacy_path)
+            return self._read_jsonl_messages(path)
+
+    def _append_thread_messages(
+        self,
+        thread: CockpitThread,
+        messages: list[dict[str, Any]],
+        *,
+        seed_messages: tuple[dict[str, Any], ...] = (),
+    ) -> list[dict[str, Any]]:
+        """Append complete records and retain a full projection for the caller."""
+
+        path = self._transcript_path(thread.project_id, thread.thread_id)
+        with self._transcript_lock(thread.project_id, thread.thread_id):
+            existing = self._cached_jsonl_messages(path)
+            seed_records: list[dict[str, Any]] = []
+            if existing is None:
+                if path.exists():
+                    existing = self._read_jsonl_messages(path)
+                else:
+                    seed_records = _normalized_messages(seed_messages)
+                    existing = [dict(message) for message in seed_records]
+            cached_entry = self._transcript_cache_entry(path)
+            # A crashed/external writer can leave bytes without a line ending.
+            # Terminate that unusable record before appending so our first JSON
+            # record never becomes part of an invalid trailing line.
+            needs_separator = cached_entry is not None and cached_entry[4] < cached_entry[0]
+            appended = _normalized_messages(messages)
+            if appended:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as handle:
+                    if needs_separator:
+                        handle.write("\n")
+                    for message in seed_records:
+                        handle.write(json.dumps(message, sort_keys=True) + "\n")
+                    for message in appended:
+                        handle.write(json.dumps(message, sort_keys=True) + "\n")
+                if needs_separator:
+                    self._transcript_cache_pop(path)
+                    return self._read_jsonl_messages(path)
+                for message in appended:
+                    _merge_thread_message(existing, message)
+                try:
+                    stat = path.stat()
+                except OSError:
+                    self._transcript_cache_pop(path)
+                else:
+                    self._cache_thread_messages(
+                        path,
+                        stat.st_size,
+                        stat.st_mtime_ns,
+                        stat.st_dev,
+                        stat.st_ino,
+                        stat.st_size,
+                        existing,
+                    )
+            return [dict(message) for message in existing]
+
+    def _read_jsonl_messages(self, path: Path) -> list[dict[str, Any]]:
+        try:
+            stat = path.stat()
+        except OSError:
+            self._transcript_cache_pop(path)
             return []
+        cached = self._cached_jsonl_messages(path, stat=stat)
+        if cached is not None:
+            return cached
+
+        cached_entry = self._transcript_cache_entry(path)
+        fingerprint = (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino)
+        if (
+            cached_entry is not None
+            and cached_entry[2:4] == fingerprint[2:]
+            and stat.st_size > cached_entry[0]
+            and stat.st_size >= cached_entry[4]
+        ):
+            messages = [dict(message) for message in cached_entry[5]]
+            offset = cached_entry[4]
+            try:
+                with path.open("rb") as handle:
+                    handle.seek(offset)
+                    offset = self._append_jsonl_messages(handle.read(), messages, offset)
+            except OSError:
+                return messages
+        else:
+            messages = []
+            offset = 0
+            try:
+                with path.open("rb") as handle:
+                    offset = self._append_jsonl_messages(handle.read(), messages, offset)
+            except OSError:
+                return []
+        self._cache_thread_messages(path, *fingerprint, offset, messages)
+        return [dict(message) for message in messages]
+
+    def _migrate_legacy_transcript(self, legacy_path: Path, path: Path) -> bool:
+        """Convert the old single-JSON transcript once, retaining a recoverable copy."""
+
+        if path.exists():
+            self._finish_legacy_transcript_migration(legacy_path)
+            return True
+        try:
+            data = json.loads(legacy_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        try:
+            _atomic_write_jsonl(path, _normalized_messages(data.get("messages") or ()))
+        except OSError:
+            return False
+        self._transcript_cache_pop(path)
+        self._finish_legacy_transcript_migration(legacy_path)
+        return True
+
+    @staticmethod
+    def _read_legacy_thread_messages(path: Path) -> list[dict[str, Any]]:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return []
-        if not isinstance(data, dict):
-            return []
-        return _normalized_messages(data.get("messages") or ())
+        return _normalized_messages(data.get("messages") or ()) if isinstance(data, dict) else []
 
-    def _write_thread_messages(self, thread: CockpitThread, messages: list[dict[str, Any]]) -> None:
-        _atomic_write_json(
-            self._transcript_path(thread.project_id, thread.thread_id),
-            {
-                "version": 1,
-                "project_id": thread.project_id,
-                "thread_id": thread.thread_id,
-                "messages": messages,
-            },
-        )
+    @staticmethod
+    def _finish_legacy_transcript_migration(legacy_path: Path) -> None:
+        if not legacy_path.exists():
+            return
+        backup_path = legacy_path.with_suffix(legacy_path.suffix + ".bak")
+        try:
+            if backup_path.exists():
+                legacy_path.unlink()
+            else:
+                os.replace(legacy_path, backup_path)
+        except OSError:
+            pass
+
+    def _transcript_lock(self, project_id: str, thread_id: str) -> threading.RLock:
+        path = self._transcript_path(project_id, thread_id)
+        with _THREAD_TRANSCRIPT_LOCKS_LOCK:
+            return _THREAD_TRANSCRIPT_LOCKS.setdefault(path, threading.RLock())
+
+    def _cached_jsonl_messages(self, path: Path, *, stat: os.stat_result | None = None) -> list[dict[str, Any]] | None:
+        cached = self._transcript_cache_entry(path)
+        if cached is None:
+            return None
+        if stat is None:
+            try:
+                stat = path.stat()
+            except OSError:
+                self._transcript_cache_pop(path)
+                return None
+        if cached[:4] != (stat.st_size, stat.st_mtime_ns, stat.st_dev, stat.st_ino):
+            return None
+        return [dict(message) for message in cached[5]]
+
+    def _transcript_cache_entry(self, path: Path) -> tuple[int, int, int, int, int, list[dict[str, Any]]] | None:
+        with self._transcript_cache_lock:
+            cached = self._transcript_cache.get(path)
+            if cached is not None:
+                self._transcript_cache.move_to_end(path)
+            return cached
+
+    def _transcript_cache_pop(self, path: Path) -> None:
+        with self._transcript_cache_lock:
+            self._transcript_cache.pop(path, None)
+
+    def _cache_thread_messages(
+        self,
+        path: Path,
+        size: int,
+        mtime_ns: int,
+        device: int,
+        inode: int,
+        offset: int,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        with self._transcript_cache_lock:
+            self._transcript_cache[path] = (size, mtime_ns, device, inode, offset, list(messages))
+            self._transcript_cache.move_to_end(path)
+            while len(self._transcript_cache) > _THREAD_TRANSCRIPT_CACHE_MAX:
+                self._transcript_cache.popitem(last=False)
+
+    @staticmethod
+    def _append_jsonl_messages(data: bytes, messages: list[dict[str, Any]], offset: int) -> int:
+        """Parse complete JSONL records and return the next safe byte offset."""
+
+        for raw_line in data.splitlines(keepends=True):
+            if not raw_line.endswith((b"\n", b"\r")):
+                break
+            offset += len(raw_line)
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(parsed, dict):
+                for message in _normalized_messages([parsed]):
+                    _merge_thread_message(messages, message)
+        return offset
 
     def _transcript_path(self, project_id: str, thread_id: str) -> Path:
+        return self.transcripts_dir / _safe_path_segment(project_id) / f"{_safe_path_segment(thread_id)}.jsonl"
+
+    def _legacy_transcript_path(self, project_id: str, thread_id: str) -> Path:
         return self.transcripts_dir / _safe_path_segment(project_id) / f"{_safe_path_segment(thread_id)}.json"
 
     def _read(self) -> dict[str, Any]:
@@ -632,15 +834,7 @@ class CockpitThreadIndex:
             if messages and project_id:
                 path = self._transcript_path(project_id, str(thread_id))
                 if not path.exists():
-                    _atomic_write_json(
-                        path,
-                        {
-                            "version": 1,
-                            "project_id": project_id,
-                            "thread_id": str(thread_id),
-                            "messages": messages,
-                        },
-                    )
+                    _atomic_write_jsonl(path, messages)
             raw.pop("messages", None)
             changed = True
         return changed
@@ -2535,6 +2729,17 @@ def _normalized_messages(messages: Any) -> list[dict[str, Any]]:
     return normalized
 
 
+def _merge_thread_message(messages: list[dict[str, Any]], message: dict[str, Any]) -> None:
+    """Apply append-only child-watch state records without changing projections."""
+
+    if message.get("type") == "child_watch" and message.get("watch_id"):
+        for index, existing in enumerate(messages):
+            if existing.get("type") == "child_watch" and existing.get("watch_id") == message["watch_id"]:
+                messages[index] = message
+                return
+    messages.append(message)
+
+
 def _safe_path_segment(value: str) -> str:
     segment = "".join(char if char.isalnum() or char in {"-", "_", "."} else "_" for char in value)
     return segment or "unknown"
@@ -2547,6 +2752,19 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(data, handle, indent=2, sort_keys=True)
             handle.write("\n")
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _atomic_write_jsonl(path: Path, messages: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            for message in _normalized_messages(messages):
+                handle.write(json.dumps(message, sort_keys=True) + "\n")
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
