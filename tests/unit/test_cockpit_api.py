@@ -2021,6 +2021,47 @@ def test_cockpit_sse_hub_skips_snapshot_recompute_when_generation_is_unchanged(t
     assert calls["count"] == 1
 
 
+def test_cockpit_sse_hub_forces_refresh_for_external_store_write(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    cfg.orchestration.sse_refresh_interval_s = 0.05
+    cfg.orchestration.sse_forced_refresh_ticks = 3
+    store, run_id = _seed_run(cfg)
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: Response({}),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=store,
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+
+    async def run_hub() -> dict[str, Any]:
+        hub = SseSnapshotHub(ctx)
+        await hub.start()
+        try:
+            subscription = await hub.subscribe("none")
+            generation = store.generation
+            external = store.get(run_id)
+            assert external is not None
+            external.phase = "verifying"
+            # Deliberately bypass the Store API: a future external writer does
+            # not advance the in-process generation signal.
+            store.run_path(run_id).write_text(json.dumps(external.to_dict(), indent=2, sort_keys=True))
+            assert store.generation == generation
+            event = await asyncio.wait_for(subscription.queue.get(), timeout=1)
+            assert event is not None
+            return event["body"]
+        finally:
+            await hub.stop()
+
+    import asyncio
+
+    body = asyncio.run(run_hub())
+    assert body["runs"][0]["phase"] == "verifying"
+
+
 def test_cockpit_sse_hub_backs_off_failed_worker_syncs(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     from jarvis.orchestration.api import _HubWorkerSync
 

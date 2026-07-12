@@ -30,6 +30,9 @@ _SESSION_REF_PREFIX = "sessref_"
 _SESSION_REF_SIGNING_CONTEXT = b"jarvis-cockpit-session-ref-v1"
 _SESSION_REF_SIGNATURE_BYTES = 12
 _STORE_CACHE_MAX_RUNS = 500
+# In-process only: the cockpit API is currently the store's single writer.
+# Cross-process writers must either notify this generation or rely on the SSE
+# hub's periodic forced refresh to make their changes visible.
 _STORE_GENERATIONS: dict[pathlib.Path, int] = {}
 
 
@@ -97,7 +100,12 @@ class OrchestrationStore:
 
     @property
     def generation(self) -> int:
-        """Monotonic in-process signal for cockpit snapshot invalidation."""
+        """Monotonic in-process signal for cockpit snapshot invalidation.
+
+        This assumes the cockpit API process is the single writer. File caches
+        remain correct for other writers, while the hub's forced refresh bounds
+        how long an external write can remain unseen by SSE clients.
+        """
 
         return _STORE_GENERATIONS[self._generation_key]
 

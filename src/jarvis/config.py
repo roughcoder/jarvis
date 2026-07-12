@@ -854,6 +854,9 @@ class OrchestrationConfig(_Base):
     # request budget: an unreachable worker should not delay every tick.
     sse_sync_timeout_s: float = 4.0
     sse_sync_backoff_ticks: int = 5
+    # Safety valve for a future writer outside this API process. Generation is
+    # process-local, so periodically re-read file metadata and project anew.
+    sse_forced_refresh_ticks: int = 30
     turn_attachment_max_count: int = 4
     turn_attachment_max_bytes: int = 5 * 1024 * 1024
 
@@ -1141,6 +1144,7 @@ class Config:
             "orchestration.sse_heartbeat_interval_s": self.orchestration.sse_heartbeat_interval_s,
             "orchestration.sse_sync_timeout_s": self.orchestration.sse_sync_timeout_s,
             "orchestration.sse_sync_backoff_ticks": self.orchestration.sse_sync_backoff_ticks,
+            "orchestration.sse_forced_refresh_ticks": self.orchestration.sse_forced_refresh_ticks,
             "linear.api_key": mask(self.linear.api_key),
         }
 

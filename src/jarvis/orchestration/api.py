@@ -373,7 +373,8 @@ class SseSnapshotHub:
                         else None
                     )
                     stamp = self._snapshot_stamp(worker_sync, worker_state)
-                    if self._snapshot_stamps.get(mode) == stamp:
+                    force_refresh = self._tick % max(1, int(self.ctx.cfg.orchestration.sse_forced_refresh_ticks)) == 0
+                    if not force_refresh and self._snapshot_stamps.get(mode) == stamp:
                         continue
                     if worker_sync is None:
                         body = await asyncio.to_thread(_cockpit_snapshot, self.ctx, mode)
