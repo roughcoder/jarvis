@@ -418,5 +418,3 @@ def _unquote(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         value = value[1:-1]
     return value.replace('\\"', '"').replace("\\\\", "\\")
-
-

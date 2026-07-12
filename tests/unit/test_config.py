@@ -138,6 +138,14 @@ def test_worker_workspace_defaults_outside_repo() -> None:
     assert WorkerConfig(_env_file=None).workspace == "~/.jarvis/worker"
 
 
+def test_worker_id_uses_documented_env_name(monkeypatch) -> None:
+    _clean(monkeypatch, "WORKER_ID", "WORKER_WORKER_ID")
+    monkeypatch.setenv("WORKER_ID", "kitchen-worker")
+
+    assert WorkerConfig(_env_file=None).worker_id == "kitchen-worker"
+    assert WorkerConfig(_env_file=None, worker_id="explicit-worker").worker_id == "explicit-worker"
+
+
 def test_brain_websocket_limit_allows_long_utterances() -> None:
     assert BrainConfig(_env_file=None).websocket_max_size == 8 * 1024 * 1024
 

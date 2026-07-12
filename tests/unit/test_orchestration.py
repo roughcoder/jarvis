@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from jarvis.orchestration.models import (
     Artifact,
     ExecutionEnvelope,
     LandingPolicy,
+    RunEvent,
     WorkCommand,
     WorkItem,
     WorkerJobLink,
@@ -104,6 +106,87 @@ def test_run_graph_persists_run_and_events(tmp_path) -> None:
     assert reloaded.phase == "running"
     assert reloaded.work_items[0].item.id == "#1"
     assert [e.type for e in store.events(run.run_id)] == ["run_created", "phase_changed"]
+
+
+def test_store_generation_advances_for_run_event_index_and_directory_writes(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+
+    assert store.generation == 0
+    run = store.create_run("Track changes")
+    created_generation = store.generation
+    assert created_generation >= 2  # run.json + events.jsonl
+
+    store.record_session_refs([{"session_ref": "sessref_123", "worker_id": "worker-a", "session_id": "sess_1"}])
+    assert store.generation > created_generation
+
+    before_delete = store.generation
+    assert store.delete_run(run.run_id)["deleted"] is True
+    assert store.generation > before_delete
+
+
+def test_list_runs_reuses_metadata_cache_and_returns_independent_runs(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Cacheable run")
+    path = store.run_path(run.run_id)
+    reads = 0
+    original_read_text = Path.read_text
+
+    def read_text(self, *args, **kwargs):  # noqa: ANN001
+        nonlocal reads
+        if self == path:
+            reads += 1
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    first = store.list_runs()
+    first[0].objective = "caller mutation"
+    second = store.list_runs()
+
+    assert reads == 1
+    assert second[0].objective == "Cacheable run"
+
+    raw = json.loads(original_read_text(path))
+    raw["objective"] = "External write"
+    path.write_text(json.dumps(raw))
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
+
+    assert store.list_runs()[0].objective == "External write"
+    assert reads == 2
+
+
+def test_events_reads_appended_tail_and_rereads_after_truncate_or_rotation(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Event tail")
+    path = store.events_path(run.run_id)
+
+    assert [event.type for event in store.events(run.run_id)] == ["run_created"]
+    appended = RunEvent(type="external_append", run_id=run.run_id, message="from another process")
+    with path.open("a") as f:
+        f.write(json.dumps(appended.to_dict()) + "\n")
+    assert [event.type for event in store.events(run.run_id)] == ["run_created", "external_append"]
+
+    truncated = RunEvent(type="truncated", run_id=run.run_id)
+    path.write_text(json.dumps(truncated.to_dict()) + "\n")
+    assert [event.type for event in store.events(run.run_id)] == ["truncated"]
+
+    rotated = RunEvent(type="rotated", run_id=run.run_id)
+    replacement = path.with_suffix(".replacement")
+    replacement.write_text(json.dumps(rotated.to_dict()) + "\n")
+    replacement.replace(path)
+    assert [event.type for event in store.events(run.run_id)] == ["rotated"]
+
+
+def test_events_cache_returns_independent_event_data(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Independent event cache")
+    store.append_event(run.run_id, "details", data={"nested": {"value": "original"}})
+
+    first = store.events(run.run_id)
+    first[-1].data["nested"]["value"] = "caller mutation"
+    second = store.events(run.run_id)
+
+    assert second[-1].data == {"nested": {"value": "original"}}
 
 
 def test_session_ref_index_skips_unchanged_mapping_writes(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -1390,7 +1473,10 @@ def test_orchestration_repo_access_cache_matches_owner_name_exactly(tmp_path, mo
             },
         )
 
-    monkeypatch.setattr("jarvis.orchestration.workers.httpx.post", repo_access_probe)
+    class FakeWorkerHttpClient:
+        post = staticmethod(repo_access_probe)
+
+    monkeypatch.setattr("jarvis.orchestration.workers._WORKER_HTTP_CLIENT", FakeWorkerHttpClient())
     cfg = load_config()
     service = OrchestrationService(
         cfg=cfg,
@@ -4527,7 +4613,10 @@ def test_cli_runs_sync_refreshes_legacy_job_links(tmp_path, monkeypatch, capsys)
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("JARVIS_ENV_FILE", str(env_file))
-    monkeypatch.setattr("jarvis.orchestration.supervisor.httpx.get", fake_get)
+    class FakeWorkerHttpClient:
+        get = staticmethod(fake_get)
+
+    monkeypatch.setattr("jarvis.orchestration.workers._WORKER_HTTP_CLIENT", FakeWorkerHttpClient())
 
     assert main(["runs", "--sync", "--json"]) == 0
 

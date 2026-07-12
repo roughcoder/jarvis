@@ -144,4 +144,3 @@ def _delete_pending(workspace_data: dict[str, Any], content_hash: Any) -> None:
     pending.pop(str(content_hash), None)
     if not pending:
         workspace_data.pop(_PENDING_KEY, None)
-

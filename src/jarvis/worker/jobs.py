@@ -16,7 +16,7 @@ import pathlib
 import re
 import time
 import uuid
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 
 from jarvis.text import slugify
@@ -49,10 +49,16 @@ class Job:
 
 
 class JobManager:
-    def __init__(self, store_dir: str | None = None) -> None:
+    def __init__(
+        self,
+        store_dir: str | None = None,
+        *,
+        on_change: Callable[[Job, str], None] | None = None,
+    ) -> None:
         self._jobs: dict[str, Job] = {}
         self._tasks: set[asyncio.Task] = set()
         self._store = pathlib.Path(store_dir) if store_dir else None
+        self._on_change = on_change
         if self._store is not None:
             self._store.mkdir(parents=True, exist_ok=True)
             self._load()
@@ -83,6 +89,8 @@ class JobManager:
             )
             if job.status == "running":  # the daemon died mid-job
                 job.status = "interrupted"
+                self._persist(job)
+                self._changed(job, "job_status")
             self._jobs[job.id] = job
 
     def _path(self, job: Job) -> pathlib.Path | None:
@@ -128,6 +136,7 @@ class JobManager:
         )
         self._jobs[job.id] = job
         self._persist(job)
+        self._changed(job, "job_status")
         task = asyncio.create_task(self._run(job, coro))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -146,6 +155,15 @@ class JobManager:
             if m and not job.session_id:
                 job.session_id = m.group(1)
             self._persist(job)
+            self._changed(job, "job_status")
+
+    def _changed(self, job: Job, kind: str) -> None:
+        if self._on_change is None:
+            return
+        try:
+            self._on_change(job, kind)
+        except Exception:  # noqa: BLE001 - change hints must never affect a worker job
+            pass
 
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)

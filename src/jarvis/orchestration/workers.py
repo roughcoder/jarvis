@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import pathlib
@@ -18,6 +19,19 @@ from jarvis.orchestration.models import WorkerProfile
 
 _PROFILE_CACHE_TTL_S = 2.0
 _PROFILE_CACHE: dict[str, tuple[int, float, list[dict[str, Any]]]] = {}
+# The orchestration API makes many small worker reads while assembling cockpit
+# projections.  Keep one process-local client so those reads reuse connections
+# instead of paying a TCP/TLS setup cost for every row.  Callers can still
+# inject a request callable for tests or a request-scoped transport.
+_WORKER_HTTP_CLIENT = httpx.Client()
+
+
+def worker_http_get(*args: Any, **kwargs: Any) -> httpx.Response:
+    return _WORKER_HTTP_CLIENT.get(*args, **kwargs)
+
+
+def worker_http_post(*args: Any, **kwargs: Any) -> httpx.Response:
+    return _WORKER_HTTP_CLIENT.post(*args, **kwargs)
 
 
 class WorkerRegistry:
@@ -31,8 +45,8 @@ class WorkerRegistry:
     ) -> None:
         self.worker_cfg = worker_cfg
         self.profiles_path = pathlib.Path(profiles_path).expanduser() if profiles_path else None
-        self._http_get = http_get or httpx.get
-        self._http_post = http_post or httpx.post
+        self._http_get = http_get or worker_http_get
+        self._http_post = http_post or worker_http_post
 
     def profiles(self, *, probe: bool = False) -> list[WorkerProfile]:
         profiles = self._load_profiles()
@@ -47,6 +61,16 @@ class WorkerRegistry:
         if not worker_id:
             return profiles[0] if profiles else None
         return next((p for p in profiles if p.worker_id == worker_id), None)
+
+    def authenticate_token(self, token: str) -> WorkerProfile | None:
+        """Return the configured worker that owns a presented notify token."""
+        if not token:
+            return None
+        for profile in self.profiles(probe=False):
+            expected = self._headers(profile).get("Authorization", "").removeprefix("Bearer ")
+            if expected and hmac.compare_digest(token, expected):
+                return profile
+        return None
 
     def with_repo_access(self, profiles: list[WorkerProfile], repo: str) -> list[WorkerProfile]:
         if not repo or not _should_probe_repo_access(repo):

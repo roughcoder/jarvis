@@ -745,5 +745,3 @@ def _normalize_phone(value: str) -> str:
     prefix = "+" if value.startswith("+") else ""
     digits = re.sub(r"\D+", "", value)
     return f"{prefix}{digits}" if digits else ""
-
-

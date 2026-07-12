@@ -63,6 +63,7 @@ from jarvis.worker.actions import (
     worktree_inventory,
 )
 from jarvis.worker.jobs import JobManager, slugify
+from jarvis.worker.notify import WorkerChangeNotifier
 from jarvis.worker.providers import ProviderTurn, provider_for
 from jarvis.worker.sessions import SessionManager, SessionTurnConflict, WorkerSession
 from jarvis.worker.workspaces import (
@@ -209,8 +210,21 @@ def make_app(cfg: WorkerConfig) -> web.Application:
     conversation_root = conversation_workspace_root(cfg, workspace)
     conversation_root.mkdir(parents=True, exist_ok=True)
     # Persist jobs to disk under the workspace so they survive a daemon restart.
-    jobs = JobManager(store_dir=str(workspace / "jobs"))
-    sessions = SessionManager(store_dir=str(workspace / "sessions"))
+    notifier = WorkerChangeNotifier(
+        url=cfg.notify_url,
+        token=cfg.token.get_secret_value(),
+        worker_id=cfg.worker_id,
+        max_pending_changes=cfg.notify_max_pending_changes,
+        delivery_timeout_s=cfg.notify_delivery_timeout_s,
+    )
+    jobs = JobManager(
+        store_dir=str(workspace / "jobs"),
+        on_change=lambda job, kind: notifier.enqueue(kind=kind, job_id=job.id),
+    )
+    sessions = SessionManager(
+        store_dir=str(workspace / "sessions"),
+        on_change=lambda session_id, kind: notifier.enqueue(kind=kind, session_id=session_id),
+    )
 
     # Browser lane: one lazily-created BrowserHost per process (own config slice, read
     # from env like the worker's). nodriver is imported only on first use.
@@ -601,18 +615,20 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         if not authorised(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         session_id = request.match_info["id"]
-        if sessions.get(session_id) is None:
+        if await asyncio.to_thread(sessions.get, session_id) is None:
             return web.json_response({"error": "no such session"}, status=404)
         limit = _query_limit(request.query.get("limit"))
+        events = await asyncio.to_thread(
+            sessions.events,
+            session_id,
+            after=str(request.query.get("after") or ""),
+            limit=limit,
+        )
         return web.json_response(
             {
                 "events": [
                     event.to_dict()
-                    for event in sessions.events(
-                        session_id,
-                        after=str(request.query.get("after") or ""),
-                        limit=limit,
-                    )
+                    for event in events
                 ]
             }
         )
@@ -621,14 +637,16 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         if not authorised(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         session_id = request.match_info["id"]
-        if sessions.get(session_id) is None:
+        if await asyncio.to_thread(sessions.get, session_id) is None:
             return web.json_response({"error": "no such session"}, status=404)
-        return web.json_response({"requests": sessions.pending_requests(session_id)})
+        requests = await asyncio.to_thread(sessions.pending_requests, session_id)
+        return web.json_response({"requests": requests})
 
     async def list_session_requests(request: web.Request) -> web.Response:
         if not authorised(request):
             return web.json_response({"error": "unauthorized"}, status=401)
-        return web.json_response({"requests": sessions.pending_requests()})
+        requests = await asyncio.to_thread(sessions.pending_requests)
+        return web.json_response({"requests": requests})
 
     async def get_session_checkpoints(request: web.Request) -> web.Response:
         if not authorised(request):
@@ -1144,6 +1162,14 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 await task
 
     app = web.Application(client_max_size=max(1024 * 1024, int(cfg.max_request_bytes)))
+    async def notifier_context(_app: web.Application):  # noqa: ANN202
+        await notifier.start()
+        try:
+            yield
+        finally:
+            await notifier.aclose()
+
+    app.cleanup_ctx.append(notifier_context)
     app["browser_holder"] = browser_holder  # for clean shutdown in serve()
     app["browser_cfg"] = browser_cfg
     app.on_cleanup.append(_cleanup_diagnostics)

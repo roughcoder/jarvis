@@ -55,6 +55,7 @@ from jarvis.worker.providers.claude import _claude_session_id  # noqa: E402
 from jarvis.worker.providers.base import ProviderTurn  # noqa: E402
 from jarvis.worker.sessions import WorkerSession  # noqa: E402
 from jarvis.worker.sessions import SessionManager  # noqa: E402
+from jarvis.worker.notify import WorkerChangeNotifier  # noqa: E402
 from jarvis.worker_session_contract import (  # noqa: E402
     EVENT_APPROVAL_RESOLVED,
     EVENT_TOOL_RESULT,
@@ -975,6 +976,142 @@ def test_session_manager_serializes_concurrent_session_writes(tmp_path) -> None:
     assert fetched.status == "running"
     assert fetched.metadata["k39"] == "39"
     assert len([event for event in sessions.events(session.session_id) if event.type == "provider.log"]) == 40
+
+
+def test_worker_change_notifier_coalesces_bursts_per_session() -> None:
+    async def run() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls: list[dict] = []
+        active = 0
+        max_active = 0
+
+        async def post(_url: str, body: dict, _headers: dict) -> object:
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            calls.append(body)
+            if len(calls) == 1:
+                started.set()
+                await release.wait()
+            active -= 1
+            return type("Response", (), {"status_code": 200})()
+
+        notifier = WorkerChangeNotifier(
+            url="http://brain.test",
+            token="worker-token",
+            worker_id="local-worker",
+            post=post,
+        )
+        await notifier.start()
+        try:
+            notifier.enqueue(kind="session_event", session_id="sess_burst")
+            await asyncio.wait_for(started.wait(), timeout=1)
+            for _ in range(20):
+                notifier.enqueue(kind="session_event", session_id="sess_burst")
+            release.set()
+            for _ in range(100):
+                if len(calls) == 2:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(calls) == 2
+            assert max_active == 1
+            assert all(call["session_id"] == "sess_burst" for call in calls)
+        finally:
+            await notifier.aclose()
+
+    asyncio.run(run())
+
+
+def test_worker_change_notification_failure_does_not_affect_append_event(tmp_path) -> None:
+    async def run() -> None:
+        async def fail(_url: str, _body: dict, _headers: dict) -> object:
+            raise httpx.ConnectError("brain unavailable")
+
+        notifier = WorkerChangeNotifier(
+            url="http://brain.test",
+            token="worker-token",
+            worker_id="local-worker",
+            post=fail,
+        )
+        await notifier.start()
+        try:
+            sessions = SessionManager(
+                str(tmp_path / "sessions"),
+                on_change=lambda session_id, kind: notifier.enqueue(kind=kind, session_id=session_id),
+            )
+            session, _ = sessions.create({"provider": "fake", "engine": "fake"})
+            event = sessions.append_event(session.session_id, "provider.log", {"line": "still durable"})
+            assert event in sessions.events(session.session_id)
+            await asyncio.sleep(0.05)
+        finally:
+            await notifier.aclose()
+
+    asyncio.run(run())
+
+
+def test_worker_change_notification_is_disabled_when_url_is_empty(tmp_path) -> None:
+    async def run() -> None:
+        calls = 0
+
+        async def post(_url: str, _body: dict, _headers: dict) -> object:
+            nonlocal calls
+            calls += 1
+            return type("Response", (), {"status_code": 200})()
+
+        notifier = WorkerChangeNotifier(
+            url="",
+            token="worker-token",
+            worker_id="local-worker",
+            post=post,
+        )
+        await notifier.start()
+        try:
+            sessions = SessionManager(
+                str(tmp_path / "sessions"),
+                on_change=lambda session_id, kind: notifier.enqueue(kind=kind, session_id=session_id),
+            )
+            session, _ = sessions.create({"provider": "fake", "engine": "fake"})
+            sessions.append_event(session.session_id, "provider.log", {"line": "local only"})
+            await asyncio.sleep(0)
+            assert calls == 0
+            assert len(sessions.events(session.session_id)) == 2
+        finally:
+            await notifier.aclose()
+
+    asyncio.run(run())
+
+
+def test_worker_change_notifier_bounds_prestart_queue_and_delivery_time() -> None:
+    async def run() -> None:
+        cancelled = asyncio.Event()
+        calls: list[str] = []
+
+        async def post(_url: str, body: dict, _headers: dict) -> object:
+            calls.append(str(body.get("session_id") or ""))
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        notifier = WorkerChangeNotifier(
+            url="http://brain.test",
+            token="worker-token",
+            worker_id="local-worker",
+            max_pending_changes=1,
+            delivery_timeout_s=0.02,
+            post=post,
+        )
+        notifier.enqueue(kind="session_event", session_id="sess_first")
+        notifier.enqueue(kind="session_event", session_id="sess_dropped")
+        await notifier.start()
+        try:
+            await asyncio.wait_for(cancelled.wait(), timeout=1)
+            assert calls == ["sess_first"]
+        finally:
+            await notifier.aclose()
+
+    asyncio.run(run())
 
 
 def test_session_manager_strips_provider_owned_metadata_on_create(tmp_path) -> None:
@@ -2583,6 +2720,40 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
     assert checkpoints_after_restore["checkpoints"][0]["restored"] is True
 
 
+def test_daemon_session_read_endpoints_offload_file_reads(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """Session event/request projection must not perform disk reads on aiohttp's loop."""
+    from jarvis.worker import server as worker_server
+
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, client):  # noqa: ANN001
+        created = (
+            await client.post(
+                base + "/sessions",
+                json={"provider": "fake", "engine": "fake", "metadata": _authority_metadata("fake")},
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        offloaded: list[str] = []
+
+        async def recording_to_thread(func, /, *args, **kwargs):  # noqa: ANN001
+            offloaded.append(func.__name__)
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(worker_server.asyncio, "to_thread", recording_to_thread)
+        events = await client.get(f"{base}/sessions/{session_id}/events", headers=headers)
+        requests = await client.get(f"{base}/sessions/{session_id}/requests", headers=headers)
+        all_requests = await client.get(base + "/sessions/requests", headers=headers)
+        return events, requests, all_requests, offloaded
+
+    events, requests, all_requests, offloaded = asyncio.run(_with_server(cfg, 8897, calls))
+
+    assert events.status_code == requests.status_code == all_requests.status_code == 200
+    assert offloaded == ["get", "events", "get", "pending_requests", "pending_requests"]
+
+
 def test_daemon_checkpoint_restore_requires_envelope_authority(tmp_path) -> None:
     cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
     headers = {"Authorization": "Bearer tkn"}
@@ -3173,10 +3344,12 @@ def test_codex_turn_timeout_pauses_while_request_pending(tmp_path, monkeypatch) 
         rpc_id="approval_rpc",
     )
     calls = 0
+    read_timeouts: list[float] = []
 
     def fake_read_message(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
         nonlocal calls
         calls += 1
+        read_timeouts.append(_kwargs["timeout"])
         if calls < 3:
             return None
         codex._forget_pending_request(session.session_id, "approval_rpc", process=process)  # type: ignore[arg-type]
@@ -3194,6 +3367,7 @@ def test_codex_turn_timeout_pauses_while_request_pending(tmp_path, monkeypatch) 
     )
 
     assert calls == 3
+    assert read_timeouts == [0.1, 0.1, 0.1]
     assert sessions.get(session.session_id).status == "completed"  # type: ignore[union-attr]
 
 

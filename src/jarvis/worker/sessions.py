@@ -4,6 +4,7 @@ import json
 import pathlib
 import shutil
 import threading
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -137,10 +138,11 @@ class WorkerSession:
 
 
 class SessionManager:
-    def __init__(self, store_dir: str) -> None:
+    def __init__(self, store_dir: str, *, on_change: Callable[[str, str], None] | None = None) -> None:
         self.root = pathlib.Path(store_dir).expanduser()
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._on_change = on_change
         self._interrupt_stale_active_sessions()
 
     def create(self, data: dict[str, Any]) -> tuple[WorkerSession, SessionEvent]:
@@ -212,7 +214,8 @@ class SessionManager:
             _apply_ended_reason(session, status, override=ended_reason)
             session.updated_at = utc_now()
             self.save(session)
-            return session
+        self._changed(session_id, "session_status")
+        return session
 
     def update_metadata(self, session_id: str, metadata: dict[str, Any]) -> WorkerSession:
         with self._lock:
@@ -270,7 +273,8 @@ class SessionManager:
                 f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
             session.updated_at = event.time
             self.save(session)
-            return event
+        self._changed(session_id, "session_event")
+        return event
 
     def append_event_with_status(
         self,
@@ -291,15 +295,18 @@ class SessionManager:
             session.updated_at = utc_now()
             self.save(session)
             if existing is not None:
-                return existing
-            event = SessionEvent.create(session.session_id, event_type, data)
-            with self.events_path(session.session_id).open("a") as f:
-                f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
-            session.updated_at = event.time
-            self.save(session)
-            return event
+                event = existing
+            else:
+                event = SessionEvent.create(session.session_id, event_type, data)
+                with self.events_path(session.session_id).open("a") as f:
+                    f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
+                session.updated_at = event.time
+                self.save(session)
+        self._changed(session_id, "session_event")
+        return event
 
     def restore_running_if_waiting(self, session_id: str, waiting_status: str, *, has_pending_requests: bool) -> WorkerSession | None:
+        changed = False
         with self._lock:
             session = self.get(session_id)
             if session is None or session.status != waiting_status:
@@ -310,13 +317,16 @@ class SessionManager:
                 _apply_ended_reason(session, terminal_status)
                 session.updated_at = utc_now()
                 self.save(session)
-                return session
-            if not has_pending_requests:
+                changed = True
+            elif not has_pending_requests:
                 session.status = SESSION_RUNNING
                 _apply_ended_reason(session, SESSION_RUNNING)
                 session.updated_at = utc_now()
                 self.save(session)
-            return session
+                changed = True
+        if changed:
+            self._changed(session_id, "session_status")
+        return session
 
     def reserve_turn(self, session_id: str, data: dict[str, Any]) -> tuple[WorkerSession, SessionEvent, bool]:
         with self._lock:
@@ -346,9 +356,19 @@ class SessionManager:
             _apply_ended_reason(session, SESSION_RUNNING)
             session.updated_at = event.time
             self.save(session)
-            return session, event, True
+        self._changed(session_id, "session_event")
+        return session, event, True
+
+    def _changed(self, session_id: str, kind: str) -> None:
+        if self._on_change is None:
+            return
+        try:
+            self._on_change(session_id, kind)
+        except Exception:  # noqa: BLE001 - change hints must never affect a worker session
+            pass
 
     def _interrupt_stale_active_sessions(self) -> None:
+        changed: list[str] = []
         with self._lock:
             for path in sorted(self.root.glob("*/session.json")):
                 try:
@@ -368,6 +388,9 @@ class SessionManager:
                 self.save(session)
                 with self.events_path(session.session_id).open("a") as f:
                     f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
+                changed.append(session.session_id)
+        for session_id in changed:
+            self._changed(session_id, "session_event")
 
     def _terminal_status_from_events(self, session_id: str) -> str | None:
         status_by_event = {

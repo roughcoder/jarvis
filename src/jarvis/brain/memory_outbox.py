@@ -562,5 +562,3 @@ def _replace_entry(entry: OutboxEntry, **changes: Any) -> OutboxEntry:
     data = _entry_to_json(entry)
     data.update(changes)
     return _entry_from_json(data)
-
-
