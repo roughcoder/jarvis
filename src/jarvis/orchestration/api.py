@@ -40,6 +40,7 @@ from jarvis.connectors.cockpit import (
     CockpitConnector,
     CockpitThread,
     CockpitThreadIndex,
+    ProviderTurnError,
     THREAD_INDEX_FILENAME,
     execute_orchestrator_tool,
     make_child_terminal_notifier,
@@ -1767,6 +1768,14 @@ class CockpitWriteHandlers:
         if thread.archived_at:
             raise CockpitError("thread_archived", "thread is archived", recoverable=True, status=409)
         workspace_request = dict(body["workspace"]) if isinstance(body.get("workspace"), dict) else None
+        requested_engine = str((workspace_request or {}).get("engine") or "").strip().lower()
+        if requested_engine and thread.chat_type == "orchestrator" and requested_engine not in {"codex", "claude"}:
+            raise CockpitError(
+                "validation_failed",
+                "orchestrator engine must be codex or claude",
+                recoverable=True,
+                status=400,
+            )
         if idempotency_key:
             try:
                 receipt = await asyncio.to_thread(
@@ -2015,7 +2024,7 @@ class CockpitWriteHandlers:
                     cursor,
                     project_id=project.id,
                     thread_id=thread.thread_id,
-                    code="memory_unavailable",
+                    code="engine_error" if isinstance(exc, ProviderTurnError) else "memory_unavailable",
                     message=public_error_message(str(exc)),
                     recoverable=True,
                 )

@@ -86,8 +86,15 @@ from jarvis.worker_session_contract import (
     FAILED_SESSION_STATUSES,
     WORKER_ERROR_SESSION_ACTIVE,
     WORKER_ERROR_SESSION_TERMINAL,
+    turn_failure_message,
 )
 
+
+class ProviderTurnError(RuntimeError):
+    """A provider/worker turn reached a terminal failure the operator must see."""
+
+
+ORCHESTRATOR_ENGINES = {"codex", "claude"}
 
 THREAD_INDEX_FILENAME = "cockpit-threads.json"
 THREAD_TRANSCRIPTS_DIRNAME = "cockpit-thread-transcripts"
@@ -1660,6 +1667,9 @@ class CockpitConnector:
         explicit_workspace_request = workspace_request is not None
         workspace_request = dict(workspace_request or {})
         if context_thread.chat_type == "orchestrator":
+            requested_engine = str(workspace_request.get("engine") or "").strip().lower()
+            if requested_engine:
+                context_thread = self._apply_orchestrator_engine(project, context_thread, requested_engine)
             reply, updated = await self._orchestrator_turn(
                 project,
                 context_thread,
@@ -1973,6 +1983,36 @@ class CockpitConnector:
             idempotency_key=idempotency_key,
         )
 
+    def _apply_orchestrator_engine(
+        self,
+        project: ProjectEntry,
+        thread: CockpitThread,
+        engine: str,
+    ) -> CockpitThread:
+        """Route the reserved turn to `engine`, replacing any previous provider session.
+
+        Turn reservation upstream guarantees no other execution is in flight, so
+        dropping the session is replay-safe: history lives on the thread and the
+        orchestrator prompt rebuilds project context every turn.
+        """
+        if engine not in ORCHESTRATOR_ENGINES:
+            raise ValueError("orchestrator engine must be codex or claude")
+        if engine == thread.engine:
+            return thread
+        return self._index.save(
+            replace(
+                thread,
+                engine=engine,
+                updated_at=utc_now(),
+                workspace={
+                    **thread.workspace,
+                    "session_id": "",
+                    "provider_started": False,
+                    "session_generation": int(thread.workspace.get("session_generation") or 0) + 1,
+                },
+            )
+        )
+
     async def _ensure_orchestrator_session(
         self,
         project: ProjectEntry,
@@ -2122,7 +2162,7 @@ class CockpitConnector:
                         assistant_messages.append(event_text)
                 elif event_type == EVENT_TURN_FAILED:
                     terminal = True
-                    terminal_error = str(data.get("error") or "orchestrator turn failed")
+                    terminal_error = turn_failure_message(data) or "orchestrator turn failed"
                 elif event_type == EVENT_TURN_COMPLETED:
                     terminal = True
             if events and isinstance(events[-1], dict):
@@ -2130,10 +2170,10 @@ class CockpitConnector:
                 if latest_event_id:
                     after_event_id = latest_event_id
             if terminal_error:
-                raise RuntimeError(public_error_message(terminal_error))
+                raise ProviderTurnError(public_error_message(terminal_error))
             if terminal:
                 if not assistant_messages:
-                    raise RuntimeError("orchestrator turn completed without an assistant result")
+                    raise ProviderTurnError("orchestrator turn completed without an assistant result")
                 return assistant_messages[-1]
             if len(events) >= 500 and after_event_id:
                 continue

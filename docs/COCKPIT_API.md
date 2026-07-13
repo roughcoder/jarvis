@@ -922,6 +922,13 @@ To escalate the thread into a workspace-backed provider session, include a
 `workspace` object. `repos` may be repo names from the project registry or full
 remote refs; omitted repos materialize the project default repo when one exists.
 
+On an orchestrator thread, `workspace.engine` routes this turn: `codex` or
+`claude` only, and any other value is rejected before streaming starts with a
+recoverable `validation_failed` error. When the requested engine differs from
+the thread's current engine, the thread switches engines and the next provider
+session is created on an eligible worker for the new engine; the durable thread
+history is preserved and replayed into the new session's context.
+
 ```json
 {
   "text": "Inspect the runtime repo and summarize the failing tests.",
@@ -1043,6 +1050,14 @@ Turns on archived threads are rejected before streaming starts:
 ```
 
 The status is `409`; callers must explicitly unarchive first.
+
+A provider turn that reaches a terminal failure streams a recoverable
+`thread.turn.error` frame with code `engine_error` and the provider's public
+failure detail (for example a subscription usage limit). Infrastructure
+failures reaching memory or workers keep the `memory_unavailable` code. Both
+leave the conversation open in the `degraded` operational state with
+`diagnostic_reason` `engine_error`, and the turn may be retried with the same
+idempotency key.
 
 `PATCH /v1/projects/{id}/threads/{tid}` renames a thread. It is member-gated
 and idempotency-keyed like archive, accepts `{"title": "...", "idempotency_key":

@@ -32,6 +32,7 @@ from jarvis.connectors.cockpit import (  # noqa: E402
     CockpitConnector,
     CockpitThread,
     CockpitThreadIndex,
+    ProviderTurnError,
     _continue_child_watch,
     _read_child_work_result_tool,
     _start_ready_child_watch,
@@ -10603,3 +10604,198 @@ def test_duplicate_child_terminal_notifications_schedule_one_parent_continuation
     _start_ready_child_watch(cfg, parent.thread_id)
 
     assert len(started) == 1
+
+
+def test_turn_failure_message_extracts_provider_detail() -> None:
+    from jarvis.worker_session_contract import turn_failure_message
+
+    codex_payload = {
+        "provider_status": "failed",
+        "raw": {
+            "turn": {
+                "status": "failed",
+                "error": {
+                    "codexErrorInfo": "usageLimitExceeded",
+                    "message": "You've hit your usage limit.",
+                },
+            }
+        },
+    }
+    assert turn_failure_message(codex_payload) == "usageLimitExceeded: You've hit your usage limit."
+    assert turn_failure_message({"error": "worker exploded"}) == "worker exploded"
+    claude_payload = {
+        "provider_status": "error_max_turns",
+        "raw": {"is_error": True, "result": "ran out of turns", "subtype": "error_max_turns"},
+    }
+    assert turn_failure_message(claude_payload) == "ran out of turns"
+    assert turn_failure_message({"provider_status": "error_during_execution", "raw": {}}) == "error_during_execution"
+    assert turn_failure_message({"provider_status": "failed", "raw": {}}) == ""
+    assert turn_failure_message(None) == ""
+
+
+def test_orchestrator_turn_failure_surfaces_provider_error(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+
+    def get_events(_worker_id: str, path: str) -> dict:
+        return {
+            "events": [
+                {
+                    "event_id": "event_1",
+                    "type": "turn.failed",
+                    "data": {
+                        "turn_id": "turn_current",
+                        "provider": "codex",
+                        "provider_status": "failed",
+                        "raw": {
+                            "turn": {
+                                "status": "failed",
+                                "error": {
+                                    "codexErrorInfo": "usageLimitExceeded",
+                                    "message": "You've hit your usage limit.",
+                                },
+                            }
+                        },
+                    },
+                }
+            ]
+        }
+
+    monkeypatch.setattr(connector, "_get_worker_json", get_events)
+
+    with pytest.raises(ProviderTurnError, match="usageLimitExceeded"):
+        asyncio.run(
+            connector._wait_for_orchestrator_turn(  # noqa: SLF001
+                "worker_a",
+                "session_a",
+                "turn_current",
+            )
+        )
+
+
+def test_orchestrator_turn_engine_override_switches_idle_thread(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    thread = CockpitThread(
+        thread_id="thread_engine_switch",
+        project_id=project.id,
+        session_id=orchestrator_session_id(project.id, "thread_engine_switch"),
+        title="Plan",
+        created_at="2026-07-13T10:00:00Z",
+        updated_at="2026-07-13T10:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        engine="codex",
+        workspace={
+            "worker_id": "worker_a",
+            "session_id": "orch_thread_engine_switch",
+            "provider_started": True,
+            "status": "ready",
+            "session_generation": 3,
+        },
+    )
+    connector.index.save(thread)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    seen: list[CockpitThread] = []
+
+    async def fake_orchestrator_turn(_project, context_thread, *_args, **_kwargs):  # noqa: ANN001, ANN002, ANN003
+        seen.append(context_thread)
+        return "ok", context_thread
+
+    monkeypatch.setattr(connector, "_orchestrator_turn", fake_orchestrator_turn)
+
+    reply, updated, events = asyncio.run(
+        connector.turn(
+            project,
+            thread,
+            requester,
+            "switch to claude",
+            workspace_request={"engine": "claude"},
+        )
+    )
+
+    assert reply == "ok"
+    assert events == ()
+    assert seen[0].engine == "claude"
+    stored = connector.index.get(project.id, thread.thread_id)
+    assert stored is not None
+    assert stored.engine == "claude"
+    assert stored.workspace["session_id"] == ""
+    assert stored.workspace["provider_started"] is False
+    assert stored.workspace["session_generation"] == 4
+
+    with pytest.raises(ValueError, match="orchestrator engine must be codex or claude"):
+        asyncio.run(
+            connector.turn(
+                project,
+                thread,
+                requester,
+                "switch to something else",
+                workspace_request={"engine": "gpt4"},
+            )
+        )
+
+    same = asyncio.run(
+        connector.turn(
+            project,
+            thread,
+            requester,
+            "same engine keeps the session",
+            workspace_request={"engine": "claude"},
+        )
+    )
+    assert same[0] == "ok"
+    unchanged = connector.index.get(project.id, thread.thread_id)
+    assert unchanged is not None
+    assert unchanged.workspace["session_generation"] == 4
+
+
+def test_project_thread_turn_maps_provider_failures_to_engine_error(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    connector = CockpitConnector(
+        cfg,
+        memory=memory,
+        gateway=FakeGateway(["unused"]),
+        tts=None,
+        tracer=None,
+    )
+
+    async def failing_turn(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        raise ProviderTurnError("usageLimitExceeded: You've hit your usage limit.")
+
+    monkeypatch.setattr(connector, "turn", failing_turn)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Plan"})
+        thread = opened.json()["thread"]
+        failed = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "Run a turn.", "idempotency_key": "turn-engine-error-1"},
+        )
+        return {"events": _sse_events(failed.text)}
+
+    result = asyncio.run(_with_server(cfg, calls))
+
+    errors = [event for event in result["events"] if event["_event"] == "thread.turn.error"]
+    assert errors
+    payload = json.dumps(errors[0])
+    assert "engine_error" in payload
+    assert "usageLimitExceeded" in payload

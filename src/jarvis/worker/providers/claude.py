@@ -58,6 +58,7 @@ from jarvis.worker_session_contract import (
     SESSION_STOPPED,
     SESSION_WAITING_APPROVAL,
     SESSION_WAITING_INPUT,
+    turn_failure_message,
 )
 
 _RUNTIME_LOCK = threading.RLock()
@@ -796,11 +797,16 @@ def _project_sdk_message(
         is_error = bool(getattr(message, "is_error", False))
         if _session_cancelled(sessions, session_id):
             return True
+        payload = {**common, "provider_status": str(getattr(message, "subtype", "") or ""), "raw": raw}
+        if is_error:
+            failure = turn_failure_message(payload)
+            if failure:
+                payload["error"] = failure
         sessions.append_event_with_status(
             session_id,
             SESSION_FAILED if is_error else SESSION_COMPLETED,
             EVENT_TURN_FAILED if is_error else EVENT_TURN_COMPLETED,
-            {**common, "provider_status": str(getattr(message, "subtype", "") or ""), "raw": raw},
+            payload,
         )
         return True
     else:
@@ -870,11 +876,16 @@ def _project_claude_message(
         if _session_cancelled(sessions, session_id):
             return True
         event_type = EVENT_TURN_FAILED if is_error else EVENT_TURN_COMPLETED
+        payload = {**common, "provider_status": subtype or message_type, "raw": message}
+        if is_error:
+            failure = turn_failure_message(payload)
+            if failure:
+                payload["error"] = failure
         sessions.append_event_with_status(
             session_id,
             SESSION_FAILED if is_error else SESSION_COMPLETED,
             event_type,
-            {**common, "provider_status": subtype or message_type, "raw": message},
+            payload,
         )
         return True
     elif message_type:

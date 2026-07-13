@@ -59,6 +59,7 @@ from jarvis.worker_session_contract import (
     SESSION_STOPPED,
     SESSION_WAITING_APPROVAL,
     SESSION_WAITING_INPUT,
+    turn_failure_message,
 )
 
 
@@ -768,11 +769,16 @@ def _project_jsonrpc_message(
             return True
         status = str(dict(params.get("turn") or {}).get("status") or "completed")
         event_type = EVENT_TURN_COMPLETED if status in {"completed", "done", "succeeded"} else EVENT_TURN_FAILED
+        payload = {**common, "provider_status": status, "raw": params}
+        if event_type == EVENT_TURN_FAILED:
+            failure = turn_failure_message(payload)
+            if failure:
+                payload["error"] = failure
         sessions.append_event_with_status(
             session_id,
             SESSION_COMPLETED if event_type == EVENT_TURN_COMPLETED else SESSION_FAILED,
             event_type,
-            {**common, "provider_status": status, "raw": params},
+            payload,
         )
         return True
     elif method == "turn/started":
