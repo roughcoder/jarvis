@@ -748,16 +748,22 @@ def resolve_repo(repo: str, repo_root: str) -> str | None:
 
 
 async def clone_repo(name: str, repo_root: str, timeout_s: float) -> tuple[str | None, str | None]:
-    """Clone a missing repo into repo_root with `gh repo clone` (auth handled by
-    gh). `name` may be a bare name (your namespace) or "org/name". Returns
-    (path, None) on success or (None, error)."""
+    """Clone a missing repo into repo_root, preferring `gh repo clone` and
+    falling back to git-over-SSH for "org/name" refs — worker hosts often have
+    a deploy key but no interactive gh login. Returns (path, None) on success
+    or (None, error)."""
     dest = pathlib.Path(repo_root).expanduser() / pathlib.Path(name).name
     if (dest / ".git").exists():
         return str(dest), None
     out = await run_exec(["gh", "repo", "clone", name, str(dest)], None, timeout_s)
     if (dest / ".git").exists():
         return str(dest), None
-    return None, f"couldn't clone {name!r}: {out[:200]}"
+    if "/" in name and not name.startswith(("/", "~")):
+        ssh_out = await run_exec(["git", "clone", f"git@github.com:{name}.git", str(dest)], None, timeout_s)
+        if (dest / ".git").exists():
+            return str(dest), None
+        out = f"{out[:150]}; ssh fallback: {ssh_out[:150]}"
+    return None, f"couldn't clone {name!r}: {out[:320]}"
 
 
 async def fetch_repo(repo: str, timeout_s: float) -> str | None:
