@@ -146,6 +146,8 @@ CONFIG_KEY = web.AppKey("config", Config)
 logger = logging.getLogger(__name__)
 SSE_REFRESH_ERROR_LOG_INTERVAL_S = 60.0
 MCP_TOKEN_STORE_LOCK = threading.Lock()
+THREAD_QUEUE_DRAIN_LOCK = threading.Lock()
+THREAD_QUEUE_DRAINS: set[tuple[str, str]] = set()
 
 
 @dataclass(frozen=True)
@@ -714,6 +716,15 @@ def make_app(
         if profile.worker_id != worker_id:
             raise CockpitError("forbidden", "worker identity does not match token", status=403)
         hub.notify(worker_id=worker_id, session_id=session_id, job_id=job_id)
+        if session_id:
+            index = CockpitThreadIndex(Path(ctx.cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
+            for thread in index._threads().values():  # noqa: SLF001 - worker notification re-arms durable queues.
+                if (
+                    str(thread.workspace.get("worker_id") or thread.worker_id or "") == worker_id
+                    and str(thread.workspace.get("session_id") or "") == session_id
+                    and thread.queued_turns
+                ):
+                    _start_thread_queue_drain(ctx, thread.project_id, thread.thread_id)
         return web.json_response({"ok": True, "accepted": True})
 
     app.add_routes([
@@ -792,6 +803,7 @@ def make_app(
         web.post("/v1/sessions/{session_ref}/close", writes.session_close),
         web.post("/v1/sessions/{session_ref}/rename", writes.session_rename),
     ])
+    _rearm_thread_queues(ctx)
     return app
 
 
@@ -1110,6 +1122,7 @@ class CockpitReadHandlers:
         if thread is None:
             raise CockpitError("not_found", "thread not found", status=404)
         execution = await asyncio.to_thread(_thread_execution_projection, thread, self.ctx)
+        _start_thread_queue_drain(self.ctx, project.id, thread.thread_id)
         return web.json_response(
             {
                 "api_version": API_VERSION,
@@ -1725,6 +1738,14 @@ class CockpitWriteHandlers:
         text = str(body.get("text") or body.get("message") or body.get("prompt") or "").strip()
         if not text:
             raise CockpitError("validation_failed", "turn text is required", recoverable=True, status=400)
+        idempotency_key = str(body.get("idempotency_key") or "").strip()
+        if not idempotency_key:
+            raise CockpitError(
+                "validation_failed",
+                "idempotency_key is required",
+                recoverable=True,
+                status=400,
+            )
         registry = await asyncio.to_thread(_registry_store, self.ctx.cfg)
         requester = _cockpit_requester_context(request, self.ctx.cfg)
         project = (
@@ -1740,11 +1761,107 @@ class CockpitWriteHandlers:
             raise CockpitError("not_found", "thread not found", status=404)
         if thread.archived_at:
             raise CockpitError("thread_archived", "thread is archived", recoverable=True, status=409)
+        workspace_request = dict(body["workspace"]) if isinstance(body.get("workspace"), dict) else None
+        if idempotency_key:
+            try:
+                receipt = await asyncio.to_thread(
+                    connector.index.foreground_turn_receipt,
+                    project.id,
+                    thread.thread_id,
+                    text=text,
+                    idempotency_key=idempotency_key,
+                    workspace_request=workspace_request,
+                    attachments=attachments or None,
+                )
+            except ValueError as exc:
+                raise CockpitError("idempotency_conflict", str(exc), recoverable=True, status=409) from exc
+            if receipt is not None:
+                return await _write_thread_turn_receipt_response(request, self.ctx, thread, receipt)
+        execution = await asyncio.to_thread(_thread_execution_projection, thread, self.ctx)
+        if _thread_execution_is_active(execution):
+            if attachments:
+                raise CockpitError(
+                    "queue_attachments_unsupported",
+                    "attachments cannot be queued until durable attachment references are available",
+                    recoverable=True,
+                    status=409,
+                )
+            try:
+                queued_thread, queued_turn, created = await asyncio.to_thread(
+                    connector.index.enqueue_turn,
+                    project.id,
+                    thread.thread_id,
+                    requester=requester,
+                    text=text,
+                    idempotency_key=idempotency_key,
+                    workspace_request=workspace_request,
+                    attachments=attachments or None,
+                )
+            except ValueError as exc:
+                raise CockpitError("idempotency_conflict", str(exc), recoverable=True, status=409) from exc
+            except OverflowError as exc:
+                raise CockpitError("queue_full", str(exc), recoverable=True, status=409) from exc
+            response = web.StreamResponse(
+                status=200,
+                headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+            )
+            _apply_cors_headers(request, response)
+            await response.prepare(request)
+            cursor = new_id("threadturn")
+            payload = {
+                "project_id": project.id,
+                "thread_id": thread.thread_id,
+                "queue_id": str(queued_turn.get("queue_id") or ""),
+                "idempotent": not created,
+                "thread": _thread_projection(queued_thread, self.ctx, include_messages=True),
+            }
+            await _write_sse(
+                response,
+                "thread.turn.queued",
+                cursor,
+                _sse_envelope(cursor, "thread.turn.queued", payload),
+            )
+            await _write_sse(
+                response,
+                "thread.turn.done",
+                cursor,
+                _sse_envelope(cursor, "thread.turn.done", payload),
+            )
+            await response.write_eof()
+            _start_thread_queue_drain(self.ctx, project.id, thread.thread_id)
+            return response
+        foreground_receipt: dict[str, Any] | None = None
+        if idempotency_key:
+            try:
+                foreground_receipt, should_dispatch = await asyncio.to_thread(
+                    connector.index.reserve_foreground_turn,
+                    project.id,
+                    thread.thread_id,
+                    text=text,
+                    idempotency_key=idempotency_key,
+                    requester=requester,
+                    dispatch_mode=(
+                        "worker"
+                        if thread.chat_type == "orchestrator" or bool(thread.workspace) or workspace_request is not None
+                        else "brain"
+                    ),
+                    workspace_request=workspace_request,
+                    attachments=attachments or None,
+                )
+            except ValueError as exc:
+                raise CockpitError("idempotency_conflict", str(exc), recoverable=True, status=409) from exc
+            if not should_dispatch:
+                return await _write_thread_turn_receipt_response(
+                    request,
+                    self.ctx,
+                    thread,
+                    foreground_receipt,
+                )
         response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
         _apply_cors_headers(request, response)
         await response.prepare(request)
         cursor = new_id("threadturn")
-        turn_id = new_id("turn")
+        turn_id = str((foreground_receipt or {}).get("logical_turn_id") or new_id("turn"))
         turn_started_at = utc_now()
         await _write_sse(
             response,
@@ -1806,11 +1923,86 @@ class CockpitWriteHandlers:
                 requester,
                 text,
                 attachments=attachments or None,
-                workspace_request=dict(body["workspace"]) if isinstance(body.get("workspace"), dict) else None,
+                workspace_request=workspace_request,
                 progress=progress,
                 cold_task_sink=defer_cold_tasks,
+                logical_turn_id=str((foreground_receipt or {}).get("logical_turn_id") or turn_id),
+                idempotency_key=idempotency_key,
             )
+            if idempotency_key:
+                await asyncio.to_thread(
+                    connector.index.finish_foreground_turn,
+                    project.id,
+                    thread.thread_id,
+                    idempotency_key,
+                    status="accepted" if reply == "Workspace turn is running." else "completed",
+                    reply=reply,
+                )
         except (UnsupportedMemoryOperation, TimeoutError, OSError, RuntimeError) as exc:
+            if idempotency_key:
+                await asyncio.to_thread(
+                    connector.index.fail_foreground_turn,
+                    project.id,
+                    thread.thread_id,
+                    idempotency_key,
+                )
+            if _thread_turn_error_is_active(exc) and idempotency_key:
+                await asyncio.to_thread(connector.index.release_execution_turn, project.id, thread.thread_id)
+                if attachments:
+                    return await _write_thread_turn_error(
+                        response,
+                        cursor,
+                        project_id=project.id,
+                        thread_id=thread.thread_id,
+                        code="queue_attachments_unsupported",
+                        message="attachments cannot be queued until durable attachment references are available",
+                        recoverable=True,
+                    )
+                try:
+                    queued_thread, queued_turn, created = await asyncio.to_thread(
+                        connector.index.enqueue_turn,
+                        project.id,
+                        thread.thread_id,
+                        requester=requester,
+                        text=text,
+                        idempotency_key=idempotency_key,
+                        workspace_request=workspace_request,
+                        attachments=attachments or None,
+                    )
+                except ValueError as conflict:
+                    return await _write_thread_turn_error(
+                        response,
+                        cursor,
+                        project_id=project.id,
+                        thread_id=thread.thread_id,
+                        code="idempotency_conflict",
+                        message=str(conflict),
+                        recoverable=True,
+                    )
+                payload = {
+                    "project_id": project.id,
+                    "thread_id": thread.thread_id,
+                    "queue_id": str(queued_turn.get("queue_id") or ""),
+                    "idempotent": not created,
+                    "thread": _thread_projection(queued_thread, self.ctx, include_messages=True),
+                }
+                await _write_sse(
+                    response,
+                    "thread.turn.queued",
+                    cursor,
+                    _sse_envelope(cursor, "thread.turn.queued", payload),
+                )
+                await _write_sse(
+                    response,
+                    "thread.turn.done",
+                    cursor,
+                    _sse_envelope(cursor, "thread.turn.done", payload),
+                )
+                await response.write_eof()
+                self.ctx.thread_turn_states.pop(state_key, None)
+                self.ctx.thread_turn_legacy_states.pop(state_key, None)
+                _start_thread_queue_drain(self.ctx, project.id, thread.thread_id)
+                return response
             self.ctx.thread_turn_states[state_key] = ("degraded", "engine_error")
             try:
                 return await _write_thread_turn_error(
@@ -1826,6 +2018,13 @@ class CockpitWriteHandlers:
                 self.ctx.thread_turn_legacy_states[state_key] = ("failed", "engine_error")
                 self.ctx.thread_turn_states.pop(state_key, None)
         except Exception as exc:  # noqa: BLE001 - preserve SSE contract after prepare.
+            if idempotency_key:
+                await asyncio.to_thread(
+                    connector.index.fail_foreground_turn,
+                    project.id,
+                    thread.thread_id,
+                    idempotency_key,
+                )
             self.ctx.thread_turn_states[state_key] = ("degraded", "engine_error")
             try:
                 return await _write_thread_turn_error(
@@ -1859,6 +2058,7 @@ class CockpitWriteHandlers:
         finally:
             for session in cold_sessions:
                 schedule_cold_task_drain(session)
+        _start_thread_queue_drain(self.ctx, project.id, thread.thread_id)
         return response
 
     async def project_thread_control(self, request: web.Request) -> web.Response:
@@ -2577,6 +2777,75 @@ async def _write_sse(response: web.StreamResponse, event: str, cursor: str, data
 
 def _sse_envelope(cursor: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {"cursor": cursor, "occurred_at": utc_now(), "type": event_type, "payload": payload}
+
+
+async def _write_thread_turn_receipt_response(
+    request: web.Request,
+    ctx: CockpitAppContext,
+    thread: CockpitThread,
+    receipt: dict[str, Any],
+) -> web.StreamResponse:
+    status = str(receipt.get("status") or "dispatching")
+    if status in {"uncertain", "retry_required"}:
+        raise CockpitError(
+            "turn_outcome_uncertain" if status == "uncertain" else "turn_retry_required",
+            (
+                str(receipt.get("recovery_reason") or "turn outcome requires operator review")
+                + "; review the durable thread, then submit with a new idempotency_key to retry"
+            ),
+            recoverable=True,
+            status=409,
+        )
+    response = web.StreamResponse(
+        status=200,
+        headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+    )
+    _apply_cors_headers(request, response)
+    await response.prepare(request)
+    cursor = new_id("threadturn")
+    if status in {"dispatching", "accepted"}:
+        event_type = "thread.turn.in_progress" if status == "dispatching" else "thread.turn.accepted"
+        payload = {
+            "project_id": thread.project_id,
+            "thread_id": thread.thread_id,
+            "turn_id": str(receipt.get("logical_turn_id") or receipt.get("queue_id") or ""),
+            "idempotent": True,
+            "receipt_status": status,
+            "thread": _thread_projection(thread, ctx, include_messages=True),
+        }
+        await _write_sse(response, event_type, cursor, _sse_envelope(cursor, event_type, payload))
+        await response.write_eof()
+        return response
+    if receipt.get("queue_id") and status in {"queued", "claimed"}:
+        event_type = "thread.turn.queued"
+        payload = {
+            "project_id": thread.project_id,
+            "thread_id": thread.thread_id,
+            "queue_id": str(receipt.get("queue_id") or ""),
+            "idempotent": True,
+            "receipt_status": status,
+            "thread": _thread_projection(thread, ctx, include_messages=True),
+        }
+    else:
+        event_type = "thread.turn.replayed"
+        payload = {
+            "project_id": thread.project_id,
+            "thread_id": thread.thread_id,
+            "turn_id": str(receipt.get("logical_turn_id") or ""),
+            "reply": str(receipt.get("reply") or ""),
+            "idempotent": True,
+            "receipt_status": status,
+            "thread": _thread_projection(thread, ctx, include_messages=True),
+        }
+    await _write_sse(response, event_type, cursor, _sse_envelope(cursor, event_type, payload))
+    await _write_sse(
+        response,
+        "thread.turn.done",
+        cursor,
+        _sse_envelope(cursor, "thread.turn.done", payload),
+    )
+    await response.write_eof()
+    return response
 
 
 async def _write_thread_turn_error(
@@ -4114,6 +4383,63 @@ def _cockpit_connector(ctx: CockpitAppContext) -> CockpitConnector:
     return CockpitConnector(ctx.cfg)
 
 
+def _start_thread_queue_drain(ctx: CockpitAppContext, project_id: str, thread_id: str) -> None:
+    key = (project_id, thread_id)
+    index = CockpitThreadIndex(Path(ctx.cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
+    if not index.has_queued_turns(project_id, thread_id):
+        return
+    with THREAD_QUEUE_DRAIN_LOCK:
+        if key in THREAD_QUEUE_DRAINS:
+            return
+        THREAD_QUEUE_DRAINS.add(key)
+
+    def run() -> None:
+        try:
+            project = RegistryStore(ctx.cfg.registry.path).get_project(project_id)
+            if project is None:
+                return
+
+            async def drain_until_idle() -> None:
+                connector = _cockpit_connector(ctx)
+                deadline = asyncio.get_running_loop().time() + max(
+                    1.0,
+                    float(ctx.cfg.worker.job_timeout_s),
+                )
+                while index.has_queued_turns(project_id, thread_id):
+                    await connector.drain_queued_turns(project, thread_id)
+                    if not index.has_queued_turns(project_id, thread_id):
+                        return
+                    if asyncio.get_running_loop().time() >= deadline:
+                        return
+                    await asyncio.sleep(0.25)
+
+            asyncio.run(drain_until_idle())
+        except Exception:
+            logger.exception("project thread queue drain failed for %s/%s", project_id, thread_id)
+        finally:
+            with THREAD_QUEUE_DRAIN_LOCK:
+                THREAD_QUEUE_DRAINS.discard(key)
+
+    threading.Thread(
+        target=run,
+        name=f"jarvis-thread-queue-{thread_id}",
+        daemon=True,
+    ).start()
+
+
+def _rearm_thread_queues(ctx: CockpitAppContext) -> None:
+    index = CockpitThreadIndex(Path(ctx.cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
+    for thread in index._threads().values():  # noqa: SLF001 - startup recovery scans durable thread state.
+        if thread.archived_at:
+            continue
+        index.recover_dispatching_turns(thread.project_id, thread.thread_id)
+        thread = index.get(thread.project_id, thread.thread_id) or thread
+        if not thread.queued_turns:
+            continue
+        index.rearm_queued_turns(thread.project_id, thread.thread_id)
+        _start_thread_queue_drain(ctx, thread.project_id, thread.thread_id)
+
+
 def _make_thread_child_terminal_notifier(cfg: Config) -> Callable[[str, Any], bool]:
     return make_child_terminal_notifier(cfg)
 
@@ -4251,6 +4577,16 @@ def _thread_detail_projection(
     row = _thread_projection(thread, ctx)
     if execution is not None:
         row["execution"] = execution
+    row["queued_turns"] = [
+        {
+            "queue_id": str(item.get("queue_id") or ""),
+            "text": str(item.get("text") or ""),
+            "queued_at": str(item.get("queued_at") or ""),
+            "status": str(item.get("status") or "queued"),
+        }
+        for item in thread.queued_turns
+        if str(item.get("status") or "queued") in {"queued", "claimed"}
+    ]
     row["messages"] = [
         {
             "role": message.get("role", ""),
@@ -4325,9 +4661,26 @@ def _public_thread_execution(raw: dict[str, Any]) -> dict[str, Any]:
             for item in controls
             if str(item) in {"turn", "input", "approval", "interrupt", "stop"}
         ],
-        "supports": {"steer": False, "queue": False},
+        "supports": {"steer": False, "queue": True},
         "diagnostic": None,
     }
+
+
+def _thread_execution_is_active(execution: dict[str, Any]) -> bool:
+    return isinstance(execution.get("active_turn"), dict) or str(execution.get("status") or "") in {
+        "starting",
+        "working",
+        "running",
+        "waiting_approval",
+        "waiting_input",
+        "interrupting",
+    }
+
+
+def _thread_turn_error_is_active(exc: BaseException) -> bool:
+    code = str(getattr(exc, "code", "") or "")
+    message = str(exc).lower()
+    return code == "session_active" or "active turn" in message or "already has an active turn" in message
 
 
 def _public_thread_pending_request(item: dict[str, Any]) -> dict[str, Any]:
@@ -4387,7 +4740,7 @@ def _local_thread_execution_projection(
         ),
         "pending_requests": [],
         "supported_controls": ["turn"] if not thread.archived_at else [],
-        "supports": {"steer": False, "queue": False},
+        "supports": {"steer": False, "queue": True},
         "diagnostic": None,
     }
 
@@ -4399,7 +4752,7 @@ def _unavailable_thread_execution(message: str) -> dict[str, Any]:
         "active_turn": None,
         "pending_requests": [],
         "supported_controls": [],
-        "supports": {"steer": False, "queue": False},
+        "supports": {"steer": False, "queue": True},
         "diagnostic": {
             "code": "worker_unavailable",
             "message": message,

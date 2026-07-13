@@ -314,7 +314,15 @@ class FakeGateway:
         return item
 
 
-async def _with_server(cfg: Config, fn: Callable[[str, httpx.AsyncClient], Any], *, http_get=None, http_post=None, http_delete=None) -> Any:  # noqa: ANN001
+async def _with_server(  # noqa: ANN001
+    cfg: Config,
+    fn: Callable[[str, httpx.AsyncClient], Any],
+    *,
+    http_get=None,
+    http_post=None,
+    http_delete=None,
+    auto_turn_idempotency: bool = True,
+) -> Any:
     runner = web.AppRunner(make_app(cfg, http_get=http_get, http_post=http_post, http_delete=http_delete))
     await runner.setup()
     site = web.TCPSite(runner, "localhost", 0)
@@ -322,7 +330,27 @@ async def _with_server(cfg: Config, fn: Callable[[str, httpx.AsyncClient], Any],
     sockets = site._server.sockets  # type: ignore[union-attr, attr-defined]  # noqa: SLF001
     port = sockets[0].getsockname()[1]
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        class TestClient(httpx.AsyncClient):
+            turn_sequence = 0
+
+            async def post(self, url, **kwargs):  # noqa: ANN001
+                payload = kwargs.get("json")
+                if (
+                    auto_turn_idempotency
+                    and "/v1/projects/" in str(url)
+                    and "/threads/" in str(url)
+                    and str(url).endswith("/turns")
+                    and isinstance(payload, dict)
+                    and not payload.get("idempotency_key")
+                ):
+                    type(self).turn_sequence += 1
+                    kwargs["json"] = {
+                        **payload,
+                        "idempotency_key": f"test-turn-{type(self).turn_sequence}",
+                    }
+                return await super().post(url, **kwargs)
+
+        async with TestClient(timeout=10) as client:
             return await fn(f"http://localhost:{port}", client)
     finally:
         await runner.cleanup()
@@ -2943,7 +2971,7 @@ def test_cockpit_thread_detail_enriches_from_one_targeted_worker_execution_read(
             }
         ],
         "supported_controls": ["turn"],
-        "supports": {"steer": False, "queue": False},
+        "supports": {"steer": False, "queue": True},
         "diagnostic": None,
     }
 
@@ -3022,7 +3050,7 @@ def test_cockpit_thread_detail_degrades_worker_execution_failures_to_durable_det
         "active_turn": None,
         "pending_requests": [],
         "supported_controls": [],
-        "supports": {"steer": False, "queue": False},
+        "supports": {"steer": False, "queue": True},
         "diagnostic": {
             "code": "worker_unavailable",
             "message": thread["execution"]["diagnostic"]["message"],
@@ -3046,7 +3074,7 @@ def test_cockpit_thread_execution_ignores_future_request_kinds_without_erasing_a
                 {"request_id": "future_1", "kind": "future_request", "status": "pending"}
             ],
             "supported_controls": ["turn"],
-            "supports": {"steer": False, "queue": False},
+            "supports": {"steer": False, "queue": True},
         }
     )
 
@@ -3496,6 +3524,680 @@ def test_cockpit_thread_control_requires_global_capability(tmp_path, monkeypatch
     assert writes == []
 
 
+def test_cockpit_active_thread_turn_is_durably_queued_and_deduped_without_transcript_duplication(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    index.save(
+        CockpitThread(
+            thread_id="thread_queue",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_queue"),
+            title="Queued conversation",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            workspace={
+                "worker_id": "macbook-worker",
+                "session_id": "conv_thread_queue",
+                "status": "ready",
+            },
+        )
+    )
+    writes: list[str] = []
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        assert url.endswith("/sessions/conv_thread_queue/execution-state")
+        return Response(
+            {
+                "session_id": "conv_thread_queue",
+                "status": "running",
+                "active_turn": {"turn_id": "turn_active", "status": "running"},
+                "pending_requests": [],
+                "supported_controls": ["turn", "interrupt"],
+                "supports": {"steer": False, "queue": False},
+            }
+        )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[httpx.Response, httpx.Response, dict[str, Any]]:
+        payload = {"text": "Please run the focused tests next.", "idempotency_key": "human-turn-2"}
+        first = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_queue/turns",
+            json=payload,
+        )
+        duplicate = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_queue/turns",
+            json=payload,
+        )
+        detail = (
+            await client.get(f"{base}/v1/projects/neil-shared/threads/thread_queue")
+        ).json()["thread"]
+        return first, duplicate, detail
+
+    first, duplicate, detail = asyncio.run(
+        _with_server(
+            cfg,
+            calls,
+            http_get=worker_get,
+            http_post=lambda url, **_kwargs: writes.append(url) or Response({"ok": True}),
+        )
+    )
+
+    first_queued = [event for event in _sse_events(first.text) if event["_event"] == "thread.turn.queued"]
+    duplicate_queued = [
+        event for event in _sse_events(duplicate.text) if event["_event"] == "thread.turn.queued"
+    ]
+    assert first.status_code == 200
+    assert first_queued[0]["payload"]["idempotent"] is False
+    assert duplicate_queued[0]["payload"]["idempotent"] is True
+    assert detail["queued_turns"] == [
+        {
+            "queue_id": first_queued[0]["payload"]["queue_id"],
+            "text": "Please run the focused tests next.",
+            "queued_at": detail["queued_turns"][0]["queued_at"],
+            "status": "queued",
+        }
+    ]
+    assert detail["messages"] == []
+    assert detail["execution"]["supports"] == {"steer": False, "queue": True}
+    assert writes == []
+
+
+def test_cockpit_thread_queue_drains_human_turns_in_submission_order(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    memory = FakeProjectMemory()
+    connector = CockpitConnector(
+        cfg,
+        memory=memory,
+        gateway=FakeGateway(["First reply.", "Second reply."]),
+        tts=None,
+        tracer=None,
+    )
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_fifo",
+            project_id=project.id,
+            session_id=orchestrator_session_id(project.id, "thread_fifo"),
+            title="FIFO conversation",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+        )
+    )
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    connector.index.enqueue_turn(
+        project.id,
+        thread.thread_id,
+        requester=requester,
+        text="First human message.",
+        idempotency_key="fifo-1",
+    )
+    connector.index.enqueue_turn(
+        project.id,
+        thread.thread_id,
+        requester=requester,
+        text="Second human message.",
+        idempotency_key="fifo-2",
+    )
+
+    drained = asyncio.run(connector.drain_queued_turns(project, thread.thread_id))
+
+    stored = connector.index.get_with_messages(project.id, thread.thread_id)
+    assert drained == 2
+    assert stored is not None
+    assert stored.queued_turns == ()
+    assert [message["content"] for message in stored.messages] == [
+        "First human message.",
+        "First reply.",
+        "Second human message.",
+        "Second reply.",
+    ]
+
+
+def test_cockpit_startup_rearms_and_drains_a_claimed_durable_thread_turn(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway(["Recovered reply."]),
+        tts=None,
+        tracer=None,
+    )
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_restart_queue",
+            project_id=project.id,
+            session_id=orchestrator_session_id(project.id, "thread_restart_queue"),
+            title="Restart queue",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+        )
+    )
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    connector.index.enqueue_turn(
+        project.id,
+        thread.thread_id,
+        requester=requester,
+        text="Resume me after restart.",
+        idempotency_key="restart-1",
+    )
+    assert connector.index.claim_queued_turn(project.id, thread.thread_id) is not None
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    make_app(cfg)
+    for _ in range(100):
+        stored = connector.index.get_with_messages(project.id, thread.thread_id)
+        if stored is not None and not stored.queued_turns:
+            break
+        time.sleep(0.02)
+
+    assert stored is not None
+    assert stored.queued_turns == ()
+    assert [message["content"] for message in stored.messages] == [
+        "Resume me after restart.",
+        "Recovered reply.",
+    ]
+
+
+def test_cockpit_idle_thread_turn_replays_same_key_and_rejects_conflicting_payload(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    gateway = FakeGateway(["One durable reply."])
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=gateway,
+        tts=None,
+        tracer=None,
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[httpx.Response, httpx.Response, httpx.Response, str]:
+        opened = (await client.post(f"{base}/v1/projects/neil-shared/threads", json={})).json()["thread"]
+        url = f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}/turns"
+        first = await client.post(url, json={"text": "Run this once.", "idempotency_key": "idle-once"})
+        replay = await client.post(url, json={"text": "Run this once.", "idempotency_key": "idle-once"})
+        conflict = await client.post(url, json={"text": "Different work.", "idempotency_key": "idle-once"})
+        return first, replay, conflict, opened["thread_id"]
+
+    first, replay, conflict, thread_id = asyncio.run(_with_server(cfg, calls))
+
+    replayed = [event for event in _sse_events(replay.text) if event["_event"] == "thread.turn.replayed"]
+    stored = connector.index.get_with_messages("neil-shared", thread_id)
+    assert first.status_code == 200
+    assert replayed[0]["payload"]["reply"] == "One durable reply."
+    assert replayed[0]["payload"]["receipt_status"] == "completed"
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "idempotency_conflict"
+    assert gateway.calls == 1
+    assert stored is not None
+    assert [message["content"] for message in stored.messages] == ["Run this once.", "One durable reply."]
+    receipt = next(item for item in stored.turn_receipts if item["idempotency_key"] == "idle-once")
+    assert not ({"text", "requester", "workspace_request", "has_attachments"} & receipt.keys())
+
+
+def test_cockpit_idle_turn_response_loss_replays_without_redispatch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    gateway = FakeGateway(["Persisted before delivery."])
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=gateway,
+        tts=None,
+        tracer=None,
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+    original_write_sse = cockpit_api_module._write_sse  # noqa: SLF001
+    lost = False
+
+    async def lose_first_reply(response, event, cursor, data):  # noqa: ANN001
+        nonlocal lost
+        if event == "thread.reply" and not lost:
+            lost = True
+            raise ConnectionResetError("simulated client loss")
+        return await original_write_sse(response, event, cursor, data)
+
+    monkeypatch.setattr(cockpit_api_module, "_write_sse", lose_first_reply)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> httpx.Response:
+        opened = (await client.post(f"{base}/v1/projects/neil-shared/threads", json={})).json()["thread"]
+        url = f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}/turns"
+        await client.post(url, json={"text": "Do not repeat me.", "idempotency_key": "lost-response"})
+        return await client.post(
+            url,
+            json={"text": "Do not repeat me.", "idempotency_key": "lost-response"},
+        )
+
+    replay = asyncio.run(_with_server(cfg, calls))
+
+    replayed = [event for event in _sse_events(replay.text) if event["_event"] == "thread.turn.replayed"]
+    assert replayed[0]["payload"]["reply"] == "Persisted before delivery."
+    assert gateway.calls == 1
+
+
+def test_cockpit_simultaneous_idle_same_key_dispatches_once(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    gateway = FakeGateway(["Only one dispatch."])
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=gateway,
+        tts=None,
+        tracer=None,
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+    original_lookup = connector.index.foreground_turn_receipt
+    barrier = threading.Barrier(2)
+
+    def synchronized_lookup(*args, **kwargs):  # noqa: ANN002, ANN003
+        receipt = original_lookup(*args, **kwargs)
+        barrier.wait(timeout=2)
+        return receipt
+
+    monkeypatch.setattr(connector.index, "foreground_turn_receipt", synchronized_lookup)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[httpx.Response, httpx.Response, str]:
+        opened = (await client.post(f"{base}/v1/projects/neil-shared/threads", json={})).json()["thread"]
+        url = f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}/turns"
+        payload = {"text": "Dispatch once concurrently.", "idempotency_key": "concurrent-once"}
+        first, second = await asyncio.gather(client.post(url, json=payload), client.post(url, json=payload))
+        return first, second, opened["thread_id"]
+
+    first, second, thread_id = asyncio.run(_with_server(cfg, calls))
+
+    stored = connector.index.get_with_messages("neil-shared", thread_id)
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert gateway.calls == 1
+    assert stored is not None
+    assert [message["content"] for message in stored.messages] == [
+        "Dispatch once concurrently.",
+        "Only one dispatch.",
+    ]
+
+
+def test_cockpit_project_thread_turn_requires_idempotency_key(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json").save(
+        CockpitThread(
+            thread_id="thread_missing_key",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_missing_key"),
+            title="Missing key",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+        )
+    )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_missing_key/turns",
+            json={"text": "Missing key."},
+        )
+
+    response = asyncio.run(_with_server(cfg, calls, auto_turn_idempotency=False))
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "idempotency_key is required"
+
+
+def test_cockpit_queued_worker_turn_uses_stable_logical_and_idempotency_ids(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    posts: list[dict[str, Any]] = []
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        if url.endswith("/execution-state"):
+            return Response({"status": "created", "active_turn": None})
+        return Response({"session_id": "conv_stable", "status": "created"})
+
+    def worker_post(url: str, **kwargs: Any) -> Response:
+        assert url.endswith("/sessions/conv_stable/turns")
+        posts.append(kwargs["json"])
+        return Response({"ok": True})
+
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+        worker_get=worker_get,
+        worker_post=worker_post,
+    )
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_stable_queue",
+            project_id=project.id,
+            session_id=orchestrator_session_id(project.id, "thread_stable_queue"),
+            title="Stable queue",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            workspace={
+                "worker_id": "macbook-worker",
+                "session_id": "conv_stable",
+                "status": "ready",
+                "provision_phase": "ready",
+            },
+        )
+    )
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    receipt, should_dispatch = connector.index.reserve_foreground_turn(
+        project.id,
+        thread.thread_id,
+        requester=requester,
+        text="Stable retry.",
+        idempotency_key="stable-key",
+        dispatch_mode="worker",
+    )
+    assert should_dispatch is True
+    connector.index.recover_dispatching_turns(project.id, thread.thread_id)
+    recovered = connector.index.get(project.id, thread.thread_id)
+    assert recovered is not None
+    queued = recovered.queued_turns[0]
+    assert queued["queue_id"] == receipt["logical_turn_id"]
+
+    asyncio.run(connector.drain_queued_turns(project, thread.thread_id))
+
+    assert posts[0]["turn_id"] == queued["queue_id"]
+    assert posts[0]["idempotency_key"] == f"thread-turn:{thread.thread_id}:stable-key"
+
+
+def test_cockpit_startup_blocks_ambiguous_brain_receipt_instead_of_redispatching(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_uncertain_brain",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_uncertain_brain"),
+            title="Uncertain brain turn",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            worker_id="preferred-worker-only",
+        )
+    )
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    connector.index.reserve_foreground_turn(
+        thread.project_id,
+        thread.thread_id,
+        requester=requester,
+        text="Potentially ambiguous work.",
+        idempotency_key="uncertain-key",
+        dispatch_mode="brain",
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}/turns",
+            json={"text": "Potentially ambiguous work.", "idempotency_key": "uncertain-key"},
+        )
+
+    response = asyncio.run(_with_server(cfg, calls))
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "turn_outcome_uncertain"
+    assert "new idempotency_key" in response.json()["error"]["message"]
+
+
+def test_cockpit_dispatching_receipt_replays_in_progress_without_terminal_done(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    connector = CockpitConnector(cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None)
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_dispatching_replay",
+            project_id="neil-shared",
+            session_id="session_dispatching_replay",
+            title="Dispatching",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+        )
+    )
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> httpx.Response:
+        connector.index.reserve_foreground_turn(
+            thread.project_id,
+            thread.thread_id,
+            requester=requester,
+            dispatch_mode="brain",
+            text="Still running.",
+            idempotency_key="dispatching-key",
+        )
+        return await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}/turns",
+            json={"text": "Still running.", "idempotency_key": "dispatching-key"},
+        )
+
+    response = asyncio.run(_with_server(cfg, calls))
+    events = _sse_events(response.text)
+    assert [event["_event"] for event in events] == ["thread.turn.in_progress"]
+
+
+def test_cockpit_completed_queue_receipt_replays_as_completed_not_queued(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    connector = CockpitConnector(cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None)
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_completed_queue",
+            project_id="neil-shared",
+            session_id="session_completed_queue",
+            title="Completed queue",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+        )
+    )
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    _stored, queued, _created = connector.index.enqueue_turn(
+        thread.project_id,
+        thread.thread_id,
+        requester=requester,
+        text="Already completed.",
+        idempotency_key="completed-queue-key",
+    )
+    connector.index.finish_queued_turn(thread.project_id, thread.thread_id, queued["queue_id"])
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}/turns",
+            json={"text": "Already completed.", "idempotency_key": "completed-queue-key"},
+        )
+
+    response = asyncio.run(_with_server(cfg, calls))
+    assert [event["_event"] for event in _sse_events(response.text)] == [
+        "thread.turn.replayed",
+        "thread.turn.done",
+    ]
+
+
+def test_cockpit_recovery_never_exceeds_queue_cap(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    connector = CockpitConnector(cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_recovery_cap",
+            project_id="neil-shared",
+            session_id="session_recovery_cap",
+            title="Recovery cap",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_recovery_cap"},
+        )
+    )
+    for index in range(32):
+        connector.index.enqueue_turn(
+            thread.project_id,
+            thread.thread_id,
+            requester=requester,
+            text=f"Queued {index}",
+            idempotency_key=f"queued-{index}",
+        )
+    connector.index.reserve_foreground_turn(
+        thread.project_id,
+        thread.thread_id,
+        requester=requester,
+        dispatch_mode="worker",
+        text="Overflow recovery.",
+        idempotency_key="overflow-recovery",
+    )
+
+    recovered = connector.index.recover_dispatching_turns(thread.project_id, thread.thread_id)
+    assert recovered is not None
+    assert len(recovered.queued_turns) == 32
+    receipt = next(item for item in recovered.turn_receipts if item["idempotency_key"] == "overflow-recovery")
+    assert receipt["status"] == "retry_required"
+
+
+def test_cockpit_queue_rejects_raw_attachments_without_persisting_them(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_attachment_queue",
+            project_id="neil-shared",
+            session_id="session_attachment_queue",
+            title="Attachment queue",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+        )
+    )
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+
+    with pytest.raises(ValueError, match="durable attachment references"):
+        connector.index.enqueue_turn(
+            thread.project_id,
+            thread.thread_id,
+            requester=requester,
+            text="Queue this image.",
+            idempotency_key="attachment-key",
+            attachments=[{"name": "secret.png", "content_base64": "raw-secret-base64"}],
+        )
+
+    assert "raw-secret-base64" not in Path(connector.index.path).read_text()
+
+
+def test_cockpit_queue_drainer_waits_through_active_completion_without_detail_poll(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    execution_reads = 0
+    turn_posts: list[dict[str, Any]] = []
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        nonlocal execution_reads
+        if url.endswith("/execution-state"):
+            execution_reads += 1
+            active = execution_reads <= 3
+            return Response(
+                {
+                    "session_id": "conv_polling_queue",
+                    "status": "running" if active else "created",
+                    "active_turn": {"turn_id": "turn_old", "status": "running"} if active else None,
+                    "pending_requests": [],
+                    "supported_controls": ["turn"],
+                    "supports": {"steer": False, "queue": False},
+                }
+            )
+        return Response({"session_id": "conv_polling_queue", "status": "created"})
+
+    def worker_post(url: str, **kwargs: Any) -> Response:
+        assert url.endswith("/sessions/conv_polling_queue/turns")
+        turn_posts.append(kwargs["json"])
+        return Response({"ok": True})
+
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+        worker_get=worker_get,
+        worker_post=worker_post,
+    )
+    connector.index.save(
+        CockpitThread(
+            thread_id="thread_polling_queue",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_polling_queue"),
+            title="Polling queue",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            workspace={
+                "worker_id": "macbook-worker",
+                "session_id": "conv_polling_queue",
+                "status": "ready",
+                "provision_phase": "ready",
+            },
+        )
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_polling_queue/turns",
+            json={"text": "Run after completion.", "idempotency_key": "polling-key"},
+        )
+
+    response = asyncio.run(_with_server(cfg, calls, http_get=worker_get, http_post=worker_post))
+    for _ in range(100):
+        if turn_posts:
+            break
+        time.sleep(0.02)
+
+    assert response.status_code == 200
+    assert turn_posts[0]["idempotency_key"] == "thread-turn:thread_polling_queue:polling-key"
+
+
 def test_cockpit_brain_thread_detail_exposes_addressable_local_active_turn(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     class BlockingGateway(FakeGateway):
         def __init__(self) -> None:
@@ -3545,7 +4247,7 @@ def test_cockpit_brain_thread_detail_exposes_addressable_local_active_turn(tmp_p
     assert thread["execution"]["active_turn"]["started_at"]
     assert thread["execution"]["pending_requests"] == []
     assert thread["execution"]["supported_controls"] == ["turn"]
-    assert thread["execution"]["supports"] == {"steer": False, "queue": False}
+    assert thread["execution"]["supports"] == {"steer": False, "queue": True}
 
 
 def test_cockpit_thread_turn_streams_reply_and_writes_lane1_attribution(tmp_path, monkeypatch) -> None:  # noqa: ANN001

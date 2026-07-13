@@ -101,6 +101,8 @@ CONVERSATION_SESSION_ALLOWED_ACTIONS = [
 ]
 THREAD_HISTORY_LIMIT = 24
 CHILD_WATCH_LEASE_S = 300
+THREAD_TURN_QUEUE_LIMIT = 32
+THREAD_TURN_RECEIPT_REPLY_LIMIT = 4_000
 CHILD_WORK_LANDING_MODES = {"none", "branch_only", "draft_pr", "ready_pr", "confirm_before_pr"}
 _THREAD_INDEX_LOCK = threading.RLock()
 _THREAD_TRANSCRIPT_LOCKS_LOCK = threading.Lock()
@@ -232,6 +234,8 @@ class CockpitThread:
     last_turn_at: str = ""
     messages: tuple[dict[str, Any], ...] = ()
     workspace: dict[str, Any] = field(default_factory=dict)
+    queued_turns: tuple[dict[str, Any], ...] = ()
+    turn_receipts: tuple[dict[str, Any], ...] = ()
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], *, include_messages: bool = True) -> "CockpitThread":
@@ -254,6 +258,8 @@ class CockpitThread:
             last_turn_at=str(data.get("last_turn_at") or ""),
             messages=tuple(_normalized_messages(data.get("messages") or ())) if include_messages else (),
             workspace=dict(data.get("workspace") or {}),
+            queued_turns=tuple(dict(item) for item in data.get("queued_turns") or () if isinstance(item, dict)),
+            turn_receipts=tuple(dict(item) for item in data.get("turn_receipts") or () if isinstance(item, dict)),
         )
 
     def as_dict(self, *, include_messages: bool = False) -> dict[str, Any]:
@@ -279,6 +285,10 @@ class CockpitThread:
             data["messages"] = [dict(message) for message in self.messages]
         if self.workspace:
             data["workspace"] = dict(self.workspace)
+        if self.queued_turns:
+            data["queued_turns"] = [dict(item) for item in self.queued_turns]
+        if self.turn_receipts:
+            data["turn_receipts"] = [dict(item) for item in self.turn_receipts[-100:]]
         return data
 
 
@@ -330,6 +340,329 @@ class CockpitThreadIndex:
             atomic_write_json(self.path, data)
             return replace(thread, messages=())
 
+    def enqueue_turn(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        requester: RequestContext,
+        text: str,
+        idempotency_key: str,
+        workspace_request: dict[str, Any] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> tuple[CockpitThread, dict[str, Any], bool]:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                raise KeyError(thread_id)
+            if attachments:
+                raise ValueError("queued attachments require durable attachment references")
+            key = idempotency_key.strip()
+            fingerprint = _thread_turn_fingerprint(text, workspace_request, attachments)
+            for receipt in thread.turn_receipts:
+                if str(receipt.get("idempotency_key") or "") == key:
+                    if str(receipt.get("fingerprint") or "") != fingerprint:
+                        raise ValueError("idempotency key was already used for a different thread turn")
+                    if str(receipt.get("status") or "") == "failed":
+                        thread = replace(
+                            thread,
+                            turn_receipts=tuple(item for item in thread.turn_receipts if item is not receipt),
+                        )
+                        break
+                    queue_id = str(receipt.get("queue_id") or "")
+                    existing = next(
+                        (item for item in thread.queued_turns if str(item.get("queue_id") or "") == queue_id),
+                        {"queue_id": queue_id, "text": text, "queued_at": "", "status": "completed"},
+                    )
+                    return thread, dict(existing), False
+            if len(thread.queued_turns) >= THREAD_TURN_QUEUE_LIMIT:
+                raise OverflowError("thread turn queue is full")
+            queued_at = utc_now()
+            item = {
+                "queue_id": new_id("queuedturn"),
+                "idempotency_key": key,
+                "fingerprint": fingerprint,
+                "text": text,
+                "queued_at": queued_at,
+                "status": "queued",
+                "requester": _snapshot_from_context(requester),
+                "workspace_request": dict(workspace_request) if workspace_request is not None else None,
+            }
+            updated = self.save(
+                replace(
+                    thread,
+                    updated_at=queued_at,
+                    queued_turns=(*thread.queued_turns, item),
+                    turn_receipts=(
+                        *thread.turn_receipts[-99:],
+                        {
+                            "idempotency_key": key,
+                            "queue_id": str(item["queue_id"]),
+                            "fingerprint": fingerprint,
+                            "status": "queued",
+                        },
+                    ),
+                )
+            )
+            return updated, item, True
+
+    def foreground_turn_receipt(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        text: str,
+        idempotency_key: str,
+        workspace_request: dict[str, Any] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        thread = self.get(project_id, thread_id)
+        if thread is None:
+            return None
+        fingerprint = _thread_turn_fingerprint(text, workspace_request, attachments)
+        receipt = next(
+            (item for item in thread.turn_receipts if item.get("idempotency_key") == idempotency_key),
+            None,
+        )
+        if receipt is None or str(receipt.get("status") or "") == "failed":
+            return None
+        if str(receipt.get("fingerprint") or "") != fingerprint:
+            raise ValueError("idempotency key was already used for a different thread turn")
+        return dict(receipt)
+
+    def reserve_foreground_turn(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        text: str,
+        idempotency_key: str,
+        requester: RequestContext,
+        dispatch_mode: str,
+        workspace_request: dict[str, Any] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                raise KeyError(thread_id)
+            fingerprint = _thread_turn_fingerprint(text, workspace_request, attachments)
+            receipts = [dict(item) for item in thread.turn_receipts]
+            for index, receipt in enumerate(receipts):
+                if receipt.get("idempotency_key") != idempotency_key:
+                    continue
+                if str(receipt.get("fingerprint") or "") != fingerprint:
+                    raise ValueError("idempotency key was already used for a different thread turn")
+                if str(receipt.get("status") or "") != "failed":
+                    return receipt, False
+                receipt.update(
+                    status="dispatching",
+                    attempt=int(receipt.get("attempt") or 0) + 1,
+                    updated_at=utc_now(),
+                    text=text,
+                    requester=_snapshot_from_context(requester),
+                    workspace_request=dict(workspace_request) if workspace_request is not None else None,
+                    has_attachments=bool(attachments),
+                    dispatch_mode=dispatch_mode,
+                )
+                receipts[index] = receipt
+                self.save(replace(thread, turn_receipts=tuple(receipts[-100:])))
+                return receipt, True
+            receipt = {
+                "idempotency_key": idempotency_key,
+                "fingerprint": fingerprint,
+                "logical_turn_id": new_id("turn"),
+                "status": "dispatching",
+                "attempt": 1,
+                "created_at": utc_now(),
+                "text": text,
+                "requester": _snapshot_from_context(requester),
+                "workspace_request": dict(workspace_request) if workspace_request is not None else None,
+                "has_attachments": bool(attachments),
+                "dispatch_mode": dispatch_mode,
+            }
+            self.save(replace(thread, turn_receipts=(*thread.turn_receipts[-99:], receipt)))
+            return receipt, True
+
+    def finish_foreground_turn(
+        self,
+        project_id: str,
+        thread_id: str,
+        idempotency_key: str,
+        *,
+        status: str,
+        reply: str = "",
+    ) -> None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return
+            receipts = [dict(item) for item in thread.turn_receipts]
+            for index, receipt in enumerate(receipts):
+                if receipt.get("idempotency_key") != idempotency_key:
+                    continue
+                receipt.update(
+                    status=status,
+                    reply=reply[:THREAD_TURN_RECEIPT_REPLY_LIMIT],
+                    reply_truncated=len(reply) > THREAD_TURN_RECEIPT_REPLY_LIMIT,
+                    updated_at=utc_now(),
+                )
+                if status in {"completed", "accepted", "failed"}:
+                    for key in ("text", "requester", "workspace_request", "has_attachments"):
+                        receipt.pop(key, None)
+                receipts[index] = receipt
+                self.save(replace(thread, turn_receipts=tuple(receipts)))
+                return
+
+    def fail_foreground_turn(self, project_id: str, thread_id: str, idempotency_key: str) -> None:
+        self.finish_foreground_turn(project_id, thread_id, idempotency_key, status="failed")
+
+    def has_queued_turns(self, project_id: str, thread_id: str) -> bool:
+        thread = self.get(project_id, thread_id)
+        return bool(thread and thread.queued_turns)
+
+    def turn_receipt(self, project_id: str, thread_id: str, idempotency_key: str) -> dict[str, Any] | None:
+        thread = self.get(project_id, thread_id)
+        if thread is None:
+            return None
+        receipt = next(
+            (
+                item
+                for item in thread.turn_receipts
+                if str(item.get("idempotency_key") or "") == idempotency_key
+            ),
+            None,
+        )
+        if receipt is None:
+            return None
+        queue_id = str(receipt.get("queue_id") or "")
+        queued = next(
+            (item for item in thread.queued_turns if str(item.get("queue_id") or "") == queue_id),
+            None,
+        )
+        return dict(queued or {**receipt, "status": "completed"})
+
+    def rearm_queued_turns(self, project_id: str, thread_id: str) -> CockpitThread | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None or not any(item.get("status") == "claimed" for item in thread.queued_turns):
+                return thread
+            queued = tuple(
+                {key: value for key, value in item.items() if key != "claimed_at"}
+                | {"status": "queued"}
+                if item.get("status") == "claimed"
+                else dict(item)
+                for item in thread.queued_turns
+            )
+            return self.save(replace(thread, queued_turns=queued))
+
+    def recover_dispatching_turns(self, project_id: str, thread_id: str) -> CockpitThread | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            receipts = [dict(item) for item in thread.turn_receipts]
+            queued = [dict(item) for item in thread.queued_turns]
+            changed = False
+            for index, receipt in enumerate(receipts):
+                if str(receipt.get("status") or "") != "dispatching":
+                    continue
+                changed = True
+                if receipt.get("has_attachments"):
+                    receipt["status"] = "retry_required"
+                    receipt["recovery_reason"] = "durable attachment references unavailable"
+                elif str(receipt.get("dispatch_mode") or "brain") != "worker":
+                    receipt["status"] = "uncertain"
+                    receipt["recovery_reason"] = "brain turn outcome is ambiguous after restart"
+                else:
+                    if len(queued) >= THREAD_TURN_QUEUE_LIMIT:
+                        receipt["status"] = "retry_required"
+                        receipt["recovery_reason"] = "thread turn queue is full during recovery"
+                        receipts[index] = receipt
+                        continue
+                    queue_id = str(receipt.get("logical_turn_id") or new_id("queuedturn"))
+                    if not any(str(item.get("queue_id") or "") == queue_id for item in queued):
+                        queued.append(
+                            {
+                                "queue_id": queue_id,
+                                "idempotency_key": str(receipt.get("idempotency_key") or queue_id),
+                                "fingerprint": str(receipt.get("fingerprint") or ""),
+                                "text": str(receipt.get("text") or ""),
+                                "queued_at": str(receipt.get("created_at") or utc_now()),
+                                "status": "queued",
+                                "requester": dict(receipt.get("requester") or {}),
+                                "workspace_request": receipt.get("workspace_request"),
+                                "attachments": [],
+                            }
+                        )
+                    receipt["queue_id"] = queue_id
+                    receipt["status"] = "queued"
+                receipts[index] = receipt
+            if not changed:
+                return thread
+            return self.save(
+                replace(
+                    thread,
+                    queued_turns=tuple(queued),
+                    turn_receipts=tuple(receipts),
+                    updated_at=utc_now(),
+                )
+            )
+
+    def claim_queued_turn(self, project_id: str, thread_id: str) -> dict[str, Any] | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            queued = [dict(item) for item in thread.queued_turns]
+            for index, item in enumerate(queued):
+                if str(item.get("status") or "queued") != "queued":
+                    continue
+                item["status"] = "claimed"
+                item["claimed_at"] = utc_now()
+                queued[index] = item
+                self.save(replace(thread, queued_turns=tuple(queued)))
+                return dict(item)
+            return None
+
+    def finish_queued_turn(
+        self,
+        project_id: str,
+        thread_id: str,
+        queue_id: str,
+        *,
+        retry: bool = False,
+    ) -> None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return
+            queued: list[dict[str, Any]] = []
+            for raw in thread.queued_turns:
+                item = dict(raw)
+                if str(item.get("queue_id") or "") != queue_id:
+                    queued.append(item)
+                elif retry:
+                    item.pop("claimed_at", None)
+                    item["status"] = "queued"
+                    queued.append(item)
+            receipts = [dict(item) for item in thread.turn_receipts]
+            if not retry:
+                for index, receipt in enumerate(receipts):
+                    if str(receipt.get("queue_id") or "") == queue_id:
+                        receipt["status"] = "completed"
+                        receipt["updated_at"] = utc_now()
+                        receipts[index] = receipt
+                        break
+            self.save(
+                replace(
+                    thread,
+                    queued_turns=tuple(queued),
+                    turn_receipts=tuple(receipts),
+                    updated_at=utc_now(),
+                )
+            )
+
     def reserve_execution_turn(self, project_id: str, thread_id: str) -> CockpitThread | None:
         with _THREAD_INDEX_LOCK:
             thread = self.get(project_id, thread_id)
@@ -350,6 +683,22 @@ class CockpitThreadIndex:
                         **thread.workspace,
                         "status": "starting",
                         "provision_phase": "starting",
+                    },
+                )
+            )
+
+    def release_execution_turn(self, project_id: str, thread_id: str) -> CockpitThread | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None or str(thread.workspace.get("status") or "") != "starting":
+                return thread
+            return self.save(
+                replace(
+                    thread,
+                    workspace={
+                        **thread.workspace,
+                        "status": "ready",
+                        "provision_phase": "ready",
                     },
                 )
             )
@@ -703,6 +1052,7 @@ class CockpitThreadIndex:
         assistant_peer_id: str,
         assistant_text: str,
         events: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+        idempotency_key: str = "",
     ) -> CockpitThread:
         with self._transcript_lock(thread.project_id, thread.thread_id):
             observed_at = utc_now()
@@ -710,12 +1060,19 @@ class CockpitThreadIndex:
             if stored is None and self._is_deleted(thread.project_id, thread.thread_id):
                 raise KeyError(thread.thread_id)
             archive_source = stored or thread
+            existing_messages = self._thread_messages(archive_source, seed_messages=thread.messages)
+            if idempotency_key and any(
+                message.get("turn_idempotency_key") == idempotency_key
+                for message in existing_messages
+            ):
+                return replace(archive_source, messages=tuple(existing_messages))
             appended = [
                 {
                     "role": "user",
                     "peer_id": user_peer_id,
                     "content": user_text,
                     "observed_at": observed_at,
+                    "turn_idempotency_key": idempotency_key,
                 },
                 {
                     "role": "assistant",
@@ -736,6 +1093,8 @@ class CockpitThreadIndex:
                     last_turn_at=observed_at,
                     messages=(),
                     workspace=dict(archive_source.workspace),
+                    queued_turns=tuple(archive_source.queued_turns),
+                    turn_receipts=tuple(archive_source.turn_receipts),
                 )
             )
             messages = self._append_thread_messages(updated, appended, seed_messages=thread.messages)
@@ -748,6 +1107,7 @@ class CockpitThreadIndex:
         user_peer_id: str,
         user_text: str,
         assistant_peer_id: str,
+        idempotency_key: str = "",
     ) -> CockpitThread:
         with self._transcript_lock(thread.project_id, thread.thread_id):
             observed_at = utc_now()
@@ -755,12 +1115,19 @@ class CockpitThreadIndex:
             if stored is None and self._is_deleted(thread.project_id, thread.thread_id):
                 raise KeyError(thread.thread_id)
             archive_source = stored or thread
+            existing_messages = self._thread_messages(archive_source, seed_messages=thread.messages)
+            if idempotency_key and any(
+                message.get("turn_idempotency_key") == idempotency_key
+                for message in existing_messages
+            ):
+                return replace(archive_source, messages=tuple(existing_messages))
             appended = [
                 {
                     "role": "user",
                     "peer_id": user_peer_id,
                     "content": user_text,
                     "observed_at": observed_at,
+                    "turn_idempotency_key": idempotency_key,
                 },
                 {
                     "role": "assistant",
@@ -780,6 +1147,8 @@ class CockpitThreadIndex:
                     last_turn_at=observed_at,
                     messages=(),
                     workspace=dict(archive_source.workspace),
+                    queued_turns=tuple(archive_source.queued_turns),
+                    turn_receipts=tuple(archive_source.turn_receipts),
                 )
             )
             messages = self._append_thread_messages(updated, appended, seed_messages=thread.messages)
@@ -1154,6 +1523,60 @@ class CockpitConnector:
             expected_generation=expected_generation,
         )
 
+    async def drain_queued_turns(self, project: ProjectEntry, thread_id: str) -> int:
+        drained = 0
+        while True:
+            thread = self._index.get(project.id, thread_id)
+            if thread is None or thread.archived_at or not thread.queued_turns:
+                return drained
+            worker_id = str(thread.workspace.get("worker_id") or thread.worker_id or "")
+            session_id = str(thread.workspace.get("session_id") or "")
+            if worker_id and session_id:
+                execution = await asyncio.to_thread(
+                    self._get_worker_json,
+                    worker_id,
+                    f"/sessions/{session_id}/execution-state",
+                )
+                if isinstance(execution.get("active_turn"), dict) or str(execution.get("status") or "") in {
+                    "starting",
+                    "running",
+                    "waiting_approval",
+                    "waiting_input",
+                    "interrupting",
+                }:
+                    return drained
+            queued = self._index.claim_queued_turn(project.id, thread_id)
+            if queued is None:
+                return drained
+            queue_id = str(queued.get("queue_id") or "")
+            try:
+                await self.turn(
+                    project,
+                    thread,
+                    _context_from_snapshot(dict(queued.get("requester") or {})),
+                    str(queued.get("text") or ""),
+                    attachments=[dict(item) for item in queued.get("attachments") or () if isinstance(item, dict)] or None,
+                    workspace_request=(
+                        dict(queued["workspace_request"])
+                        if isinstance(queued.get("workspace_request"), dict)
+                        else None
+                    ),
+                    logical_turn_id=queue_id,
+                    idempotency_key=str(queued.get("idempotency_key") or queue_id),
+                )
+            except WorkerRequestError as exc:
+                self._index.release_execution_turn(project.id, thread_id)
+                self._index.finish_queued_turn(project.id, thread_id, queue_id, retry=True)
+                if exc.code == WORKER_ERROR_SESSION_ACTIVE:
+                    return drained
+                raise
+            except Exception:
+                self._index.release_execution_turn(project.id, thread_id)
+                self._index.finish_queued_turn(project.id, thread_id, queue_id, retry=True)
+                raise
+            self._index.finish_queued_turn(project.id, thread_id, queue_id)
+            drained += 1
+
     def delete_thread(self, project: ProjectEntry, thread_id: str) -> tuple[CockpitThread | None, bool]:
         return self._index.delete(project.id, thread_id)
 
@@ -1224,6 +1647,8 @@ class CockpitConnector:
         workspace_request: dict[str, Any] | None = None,
         progress: Callable[[dict[str, Any]], Any] | None = None,
         cold_task_sink: Callable[[BrainSession], Any] | None = None,
+        logical_turn_id: str = "",
+        idempotency_key: str = "",
     ) -> tuple[str, CockpitThread, tuple[dict[str, Any], ...]]:
         text = text.strip()
         if not text:
@@ -1238,6 +1663,8 @@ class CockpitConnector:
                 requester,
                 _text_with_attachment_markers(text, attachments),
                 progress=progress,
+                logical_turn_id=logical_turn_id,
+                idempotency_key=idempotency_key,
             )
             return reply, updated, ()
         if context_thread.workspace or explicit_workspace_request:
@@ -1248,6 +1675,8 @@ class CockpitConnector:
                 _text_with_attachment_markers(text, attachments),
                 workspace_request=workspace_request,
                 progress=progress,
+                logical_turn_id=logical_turn_id,
+                idempotency_key=idempotency_key,
             )
             return reply, updated, ()
         project_context = _project_context(self._memory, project, context_thread)
@@ -1315,6 +1744,7 @@ class CockpitConnector:
             assistant_peer_id=self._cfg.memory.assistant_peer_id,
             assistant_text=reply,
             events=events,
+            idempotency_key=idempotency_key,
         )
         return reply, updated, events
 
@@ -1327,6 +1757,8 @@ class CockpitConnector:
         *,
         workspace_request: dict[str, Any],
         progress: Callable[[dict[str, Any]], Any] | None,
+        logical_turn_id: str = "",
+        idempotency_key: str = "",
     ) -> tuple[str, CockpitThread]:
         await _emit_progress(progress, {"phase": "resolving-access", "thread_id": thread.thread_id})
         thread = self._index.reserve_execution_turn(project.id, thread.thread_id) or thread
@@ -1351,6 +1783,7 @@ class CockpitConnector:
             worker_id,
             f"/sessions/{session_id}/turns",
             {
+                "turn_id": logical_turn_id or new_id("turn"),
                 "prompt": _workspace_prompt(project, thread, text),
                 "metadata": {
                     "surface": "cockpit_thread",
@@ -1359,13 +1792,11 @@ class CockpitConnector:
                     "honcho_session_id": thread.session_id,
                     "allowed_actions": [WORKER_SESSION_TURN],
                 },
-                # `thread` here comes from _ensure_workspace, whose index round-trip
-                # always returns messages=() (CockpitThreadIndex.save() strips them),
-                # so a len(thread.messages) key would be constant and every repeat of
-                # the same text would collide as a "replay" the worker never re-runs.
-                # A fresh id() per call keeps each real turn distinct; the cockpit
-                # doesn't retry the same turn object, so there is no dedupe need here.
-                "idempotency_key": f"thread-turn:{thread.thread_id}:{new_id('turn')}:{_stable_text_hash(text)}",
+                "idempotency_key": (
+                    f"thread-turn:{thread.thread_id}:{idempotency_key}"
+                    if idempotency_key
+                    else f"thread-turn:{thread.thread_id}:{new_id('turn')}:{_stable_text_hash(text)}"
+                ),
             },
         )
         if not turn.get("ok", True):
@@ -1400,6 +1831,7 @@ class CockpitConnector:
             user_peer_id=requester.memory_peer,
             user_text=text,
             assistant_peer_id=self._cfg.memory.assistant_peer_id,
+            idempotency_key=idempotency_key,
         )
         return reply, updated
 
@@ -1411,6 +1843,8 @@ class CockpitConnector:
         text: str,
         *,
         progress: Callable[[dict[str, Any]], Any] | None,
+        logical_turn_id: str = "",
+        idempotency_key: str = "",
     ) -> tuple[str, CockpitThread]:
         thread = self._index.reserve_execution_turn(project.id, thread.thread_id) or thread
         reserved_session_id = str(thread.workspace.get("session_id") or "")
@@ -1440,7 +1874,7 @@ class CockpitConnector:
             thread_id=thread.thread_id,
             requester=requester,
         )
-        turn_id = new_id("turn")
+        turn_id = logical_turn_id or new_id("turn")
         response = await asyncio.to_thread(
             self._post_worker_json,
             worker_id,
@@ -1464,7 +1898,11 @@ class CockpitConnector:
                         "timeout_s": _orchestrator_mcp_timeout_s(self._cfg),
                     }
                 },
-                "idempotency_key": f"orchestrator-turn:{thread.thread_id}:{turn_id}",
+                "idempotency_key": (
+                    f"orchestrator-turn:{thread.thread_id}:{idempotency_key}"
+                    if idempotency_key
+                    else f"orchestrator-turn:{thread.thread_id}:{turn_id}"
+                ),
             },
         )
         if response.get("ok") is False:
@@ -1529,6 +1967,7 @@ class CockpitConnector:
             user_text=text,
             assistant_peer_id=self._cfg.memory.assistant_peer_id,
             assistant_text=reply,
+            idempotency_key=idempotency_key,
         )
 
     async def _ensure_orchestrator_session(
@@ -2456,6 +2895,12 @@ def _continue_child_watch(cfg: Config, parent_chat_id: str, watch: dict[str, Any
             if not index.child_watch_is_claimed(parent_chat_id, watch_id):
                 return
             try:
+                if index.has_queued_turns(thread.project_id, thread.thread_id):
+                    await connector.drain_queued_turns(project, thread.thread_id)
+                    if index.has_queued_turns(thread.project_id, thread.thread_id):
+                        index.renew_child_watch_claim(parent_chat_id, watch_id)
+                        await asyncio.sleep(0.25)
+                        continue
                 await connector.turn(project, thread, requester, instruction)
                 break
             except RuntimeError as exc:
@@ -2905,6 +3350,24 @@ def _thread_title(text: str) -> str:
     return title if len(title) <= 72 else title[:71] + "..."
 
 
+def _thread_turn_fingerprint(
+    text: str,
+    workspace_request: dict[str, Any] | None,
+    attachments: list[dict[str, Any]] | None,
+) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "text": text,
+                "workspace_request": workspace_request,
+                "attachments": attachments or [],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _timestamp_before(value: str, threshold: datetime) -> bool:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -2938,6 +3401,7 @@ def _normalized_messages(messages: Any) -> list[dict[str, Any]]:
             "claimed_at",
             "completed_at",
             "error",
+            "turn_idempotency_key",
         ):
             if key in item:
                 message[key] = str(item.get(key) or "")
