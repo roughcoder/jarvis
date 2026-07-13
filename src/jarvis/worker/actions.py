@@ -776,6 +776,23 @@ async def fetch_repo(repo: str, timeout_s: float) -> str | None:
     return None
 
 
+_REPO_MUTATION_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def repo_mutation_lock(repo: pathlib.Path | str) -> asyncio.Lock:
+    """Serialize ref/worktree mutations per source repo.
+
+    Concurrent `git worktree add` calls against the same checkout race on the
+    refs directory ("cannot lock ref ... unable to create directory"), so any
+    branch-resolve + worktree-add pair must hold this lock.
+    """
+    key = str(pathlib.Path(repo).expanduser().resolve())
+    lock = _REPO_MUTATION_LOCKS.get(key)
+    if lock is None:
+        lock = _REPO_MUTATION_LOCKS.setdefault(key, asyncio.Lock())
+    return lock
+
+
 async def prepare_worktree(
     repo: str, worktrees_dir: str, slug: str, branch_prefix: str, timeout_s: float
 ) -> tuple[str | None, str | None, str | None]:
@@ -796,9 +813,10 @@ async def prepare_worktree(
         except OSError as exc:
             return None, None, f"error: could not copy non-git input into scratch ({exc})"
         return str(scratch), None, None
-    branch = await resolve_available_worktree_branch(repo_path, f"{branch_prefix}/{slug}-{suffix}", timeout_s)
-    worktree = worktrees_root / f"{slug}-{suffix}"
-    out = await run_exec(["git", "-C", str(repo_path), "worktree", "add", "-b", branch, str(worktree)], None, timeout_s)
+    async with repo_mutation_lock(repo_path):
+        branch = await resolve_available_worktree_branch(repo_path, f"{branch_prefix}/{slug}-{suffix}", timeout_s)
+        worktree = worktrees_root / f"{slug}-{suffix}"
+        out = await run_exec(["git", "-C", str(repo_path), "worktree", "add", "-b", branch, str(worktree)], None, timeout_s)
     if not worktree.exists():
         return None, None, f"error: could not create worktree ({out})"
     return str(worktree), branch, None
