@@ -1332,11 +1332,14 @@ class CockpitConnector:
         thread = self._index.reserve_execution_turn(project.id, thread.thread_id) or thread
         reserved_session_id = str(thread.workspace.get("session_id") or "")
         thread = await self._ensure_workspace(project, thread, requester, workspace_request=workspace_request, progress=progress)
+        stored_thread = self._index.get(project.id, thread.thread_id) or thread
         if (
-            str(thread.workspace.get("session_id") or "") != reserved_session_id
-            or str(thread.workspace.get("status") or "") != "starting"
+            str(stored_thread.workspace.get("session_id") or "") != reserved_session_id
+            or str(stored_thread.workspace.get("status") or "") != "starting"
         ):
             thread = self._index.reserve_execution_turn(project.id, thread.thread_id) or thread
+        else:
+            thread = stored_thread
         worker_id = str(thread.workspace.get("worker_id") or "")
         session_id = str(thread.workspace.get("session_id") or "")
         session_generation = int(thread.workspace.get("session_generation") or 0)
@@ -1412,11 +1415,14 @@ class CockpitConnector:
         thread = self._index.reserve_execution_turn(project.id, thread.thread_id) or thread
         reserved_session_id = str(thread.workspace.get("session_id") or "")
         thread = await self._ensure_orchestrator_session(project, thread, requester, progress=progress)
+        stored_thread = self._index.get(project.id, thread.thread_id) or thread
         if (
-            str(thread.workspace.get("session_id") or "") != reserved_session_id
-            or str(thread.workspace.get("status") or "") != "starting"
+            str(stored_thread.workspace.get("session_id") or "") != reserved_session_id
+            or str(stored_thread.workspace.get("status") or "") != "starting"
         ):
             thread = self._index.reserve_execution_turn(project.id, thread.thread_id) or thread
+        else:
+            thread = stored_thread
         worker_id = str(thread.workspace.get("worker_id") or "")
         session_id = str(thread.workspace.get("session_id") or "")
         session_generation = int(thread.workspace.get("session_generation") or 0)
