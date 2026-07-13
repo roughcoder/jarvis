@@ -508,8 +508,7 @@ class CockpitThreadIndex:
                     updated_at=utc_now(),
                 )
                 if status in {"completed", "accepted", "failed"}:
-                    for key in ("text", "requester", "workspace_request", "has_attachments"):
-                        receipt.pop(key, None)
+                    _scrub_turn_receipt_recovery_fields(receipt)
                 receipts[index] = receipt
                 self.save(replace(thread, turn_receipts=tuple(receipts)))
                 return
@@ -571,13 +570,16 @@ class CockpitThreadIndex:
                 if receipt.get("has_attachments"):
                     receipt["status"] = "retry_required"
                     receipt["recovery_reason"] = "durable attachment references unavailable"
+                    _scrub_turn_receipt_recovery_fields(receipt)
                 elif str(receipt.get("dispatch_mode") or "brain") != "worker":
                     receipt["status"] = "uncertain"
                     receipt["recovery_reason"] = "brain turn outcome is ambiguous after restart"
+                    _scrub_turn_receipt_recovery_fields(receipt)
                 else:
                     if len(queued) >= THREAD_TURN_QUEUE_LIMIT:
                         receipt["status"] = "retry_required"
                         receipt["recovery_reason"] = "thread turn queue is full during recovery"
+                        _scrub_turn_receipt_recovery_fields(receipt)
                         receipts[index] = receipt
                         continue
                     queue_id = str(receipt.get("logical_turn_id") or new_id("queuedturn"))
@@ -652,6 +654,7 @@ class CockpitThreadIndex:
                     if str(receipt.get("queue_id") or "") == queue_id:
                         receipt["status"] = "completed"
                         receipt["updated_at"] = utc_now()
+                        _scrub_turn_receipt_recovery_fields(receipt)
                         receipts[index] = receipt
                         break
             self.save(
@@ -3348,6 +3351,11 @@ def _thread_title(text: str) -> str:
     if not title:
         return "Project thread"
     return title if len(title) <= 72 else title[:71] + "..."
+
+
+def _scrub_turn_receipt_recovery_fields(receipt: dict[str, Any]) -> None:
+    for key in ("text", "requester", "workspace_request", "has_attachments"):
+        receipt.pop(key, None)
 
 
 def _thread_turn_fingerprint(

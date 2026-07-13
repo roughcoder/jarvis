@@ -2138,11 +2138,12 @@ def test_cockpit_sse_probe_respects_worker_backoff_before_profile_probe(tmp_path
     from jarvis.orchestration.api import _HubWorkerSync, _hub_worker_state
 
     cfg = _cfg(tmp_path, monkeypatch)
+    store, _run_id = _seed_run(cfg)
     ctx = CockpitAppContext(
         cfg=cfg,
         get=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("backed-off worker was polled")),
         post=lambda *_args, **_kwargs: Response({}),
-        store=OrchestrationStore(cfg.orchestration.workspace),
+        store=store,
         idempotency=IdempotencyStore(cfg.orchestration.workspace),
         idempotency_locks={},
         idempotency_lock_refs={},
@@ -2151,10 +2152,273 @@ def test_cockpit_sse_probe_respects_worker_backoff_before_profile_probe(tmp_path
     hub = SseSnapshotHub(ctx)
     hub._tick = 2  # noqa: SLF001
     hub._worker_backoff_until["macbook-worker"] = 9  # noqa: SLF001
+    cached_worker = {"worker_id": "macbook-worker", "status": "online", "system": {"cpu_model": "cached-probe"}}
+    cached_session = {
+        "session_ref": make_session_ref("macbook-worker", "worker_only"),
+        "worker_id": "macbook-worker",
+        "session_id": "worker_only",
+        "status": "running",
+    }
+    previous = {
+        "workers": [cached_worker],
+        "sessions": {cached_session["session_ref"]: cached_session},
+        "requests": [],
+        "checkpoints": [],
+        "partial": True,
+        "diagnostics": [
+            {
+                "worker_id": "macbook-worker",
+                "resource": "sessions",
+                "status": "failure",
+                "failure_kind": "transport_error",
+                "status_code": 0,
+                "error_type": "TimeoutError",
+                "session_id": "",
+            }
+        ],
+    }
 
-    state = _hub_worker_state(ctx, "probe", _HubWorkerSync(hub), [])
+    state = _hub_worker_state(ctx, "probe", _HubWorkerSync(hub), store.list_runs(), previous=previous)
 
-    assert state["workers"][0]["worker_id"] == "macbook-worker"
+    assert state["workers"] == [cached_worker]
+    assert set(row["session_id"] for row in state["sessions"].values()) == {"worker_only", "sess_123"}
+    assert state["partial"] is True
+    assert state["diagnostics"] == previous["diagnostics"]
+
+
+def test_cockpit_initial_sse_snapshot_uses_shared_worker_refresh(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions/requests"):
+            return Response({"requests": []})
+        if url.endswith("/sessions/checkpoints"):
+            return Response({"checkpoints": []})
+        if url.endswith("/sessions"):
+            return Response({"sessions": [{"session_id": "sse_initial", "provider": "codex", "status": "running"}]})
+        raise AssertionError(url)
+
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=get,
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+
+    async def snapshot() -> dict[str, Any]:
+        return await SseSnapshotHub(ctx)._snapshot("fast")  # noqa: SLF001
+
+    import asyncio
+
+    body = asyncio.run(snapshot())
+    assert [row["session_id"] for row in body["sessions"]] == ["sse_initial"]
+    assert ctx.worker_state_cache["fast"]["sessions"]
+
+
+def test_cockpit_dirty_refresh_preserves_untouched_worker_diagnostics() -> None:
+    from jarvis.orchestration.api import _reconcile_worker_diagnostics
+
+    previous = [
+        {"worker_id": "steady", "resource": "sessions", "status": "failure"},
+        {"worker_id": "dirty", "resource": "requests", "status": "failure"},
+    ]
+    current = [{"worker_id": "dirty", "resource": "checkpoints", "status": "unsupported"}]
+
+    merged = _reconcile_worker_diagnostics(previous, current, {"dirty"}, {"dirty"}, {"dirty", "steady"})
+
+    assert merged == [previous[0], current[0]]
+
+
+def test_cockpit_full_refresh_clears_workers_removed_from_registry(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.api import _HubWorkerSync, _hub_worker_state
+
+    cfg = _cfg(tmp_path, monkeypatch)
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions"):
+            return Response({"sessions": []})
+        if url.endswith("/sessions/requests"):
+            return Response({"requests": []})
+        raise AssertionError(url)
+
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=get,
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+    ghost_ref = make_session_ref("removed-worker", "ghost")
+    previous = {
+        "workers": [{"worker_id": "removed-worker"}],
+        "sessions": {ghost_ref: {"session_ref": ghost_ref, "worker_id": "removed-worker", "session_id": "ghost"}},
+        "requests": [],
+        "checkpoints": [],
+        "diagnostics": [{"worker_id": "removed-worker", "resource": "sessions", "status": "failure"}],
+    }
+
+    state = _hub_worker_state(ctx, "fast", _HubWorkerSync(SseSnapshotHub(ctx)), [], previous=previous)
+
+    assert [row["worker_id"] for row in state["workers"]] == ["macbook-worker"]
+    assert state["sessions"] == {}
+    assert state["diagnostics"] == []
+    assert state["partial"] is False
+
+
+def test_cockpit_offline_worker_preserves_cached_worker_only_facets(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.api import _HubWorkerSync, _cockpit_snapshot, _hub_worker_state
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    _set_worker_status(cfg, "offline")
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("offline worker was polled")),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+    ref = make_session_ref("macbook-worker", "cached-offline")
+    previous = {
+        "workers": [{"worker_id": "macbook-worker", "status": "online", "system": {"cpu_model": "cached"}}],
+        "sessions": {ref: {"session_ref": ref, "worker_id": "macbook-worker", "session_id": "cached-offline"}},
+        "requests": [],
+        "checkpoints": [],
+        "partial": False,
+        "diagnostics": [],
+    }
+
+    state = _hub_worker_state(ctx, "fast", _HubWorkerSync(SseSnapshotHub(ctx)), [], previous=previous)
+    snapshot = _cockpit_snapshot(
+        ctx,
+        "fast",
+        sync={"mode": "fast", "status": "fresh", "synced_at": "", "errors": []},
+        worker_state=state,
+        all_runs=[],
+    )
+
+    assert state["workers"][0]["status"] == "offline"
+    assert state["sessions"] == previous["sessions"]
+    assert state["diagnostics"][0]["failure_kind"] == "offline"
+    assert state["partial"] is True
+    assert snapshot["workers"][0]["status"] == "offline"
+    assert snapshot["sync"]["status"] == "partial"
+
+
+def test_cockpit_backoff_stays_partial_until_successful_retry(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.api import _HubWorkerSync, _hub_worker_state
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    failing = {"value": True}
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if failing["value"]:
+            raise TimeoutError("worker unavailable")
+        if url.endswith("/sessions"):
+            return Response({"sessions": []})
+        if url.endswith("/sessions/requests"):
+            return Response({"requests": []})
+        raise AssertionError(url)
+
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=get,
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+    hub = SseSnapshotHub(ctx)
+    sync = _HubWorkerSync(hub)
+    profile = sync.profiles[0]
+    with pytest.raises(TimeoutError):
+        sync.get(f"{profile.base_url}/sessions")
+
+    first = _hub_worker_state(ctx, "fast", sync, [])
+    unsupported_previous = {
+        **first,
+        "partial": False,
+        "diagnostics": [
+            {
+                "worker_id": profile.worker_id,
+                "resource": "checkpoints",
+                "status": "unsupported",
+                "failure_kind": "unsupported",
+                "status_code": 404,
+                "error_type": "",
+                "session_id": "",
+            }
+        ],
+    }
+    unsupported_backoff = _hub_worker_state(ctx, "fast", sync, [], previous=unsupported_previous)
+    second = _hub_worker_state(ctx, "fast", sync, [], previous=first)
+    failing["value"] = False
+    hub._tick = hub._worker_backoff_until[profile.worker_id]  # noqa: SLF001
+    recovered = _hub_worker_state(ctx, "fast", sync, [], previous=second)
+
+    assert first["partial"] is True
+    assert first["diagnostics"][0]["failure_kind"] == "backoff"
+    assert [item["failure_kind"] for item in unsupported_backoff["diagnostics"]] == ["unsupported", "backoff"]
+    assert unsupported_backoff["partial"] is True
+    assert second["partial"] is True
+    assert recovered["partial"] is False
+    assert recovered["diagnostics"] == []
+
+
+def test_cockpit_archived_session_prunes_cached_session_diagnostic(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.api import _HubWorkerSync, _hub_worker_state
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    store.archive_worker_session("macbook-worker", "diagnostic-tombstone")
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("backed-off worker was polled")),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=store,
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+    hub = SseSnapshotHub(ctx)
+    hub._worker_backoff_until["macbook-worker"] = 5  # noqa: SLF001
+    ref = make_session_ref("macbook-worker", "diagnostic-tombstone")
+    previous = {
+        "workers": [{"worker_id": "macbook-worker", "status": "online"}],
+        "sessions": {ref: {"session_ref": ref, "worker_id": "macbook-worker", "session_id": "diagnostic-tombstone"}},
+        "requests": [],
+        "checkpoints": [],
+        "partial": True,
+        "diagnostics": [
+            {
+                "worker_id": "macbook-worker",
+                "resource": "session_checkpoints",
+                "status": "failure",
+                "failure_kind": "transport_error",
+                "session_id": "diagnostic-tombstone",
+            }
+        ],
+    }
+
+    state = _hub_worker_state(ctx, "fast", _HubWorkerSync(hub), [], previous=previous)
+
+    assert state["sessions"] == {}
+    assert all(item.get("session_id") != "diagnostic-tombstone" for item in state["diagnostics"])
+    assert state["diagnostics"][0]["failure_kind"] == "backoff"
 
 
 def test_cockpit_dirty_worker_state_preserves_cached_other_workers() -> None:
@@ -2188,6 +2452,170 @@ def test_cockpit_dirty_worker_state_preserves_cached_other_workers() -> None:
         {"worker_id": "dirty", "request_id": "new"},
     ]
     assert merged["checkpoints"] == [{"worker_id": "steady", "checkpoint_id": "keep"}]
+
+
+def test_cockpit_rest_snapshot_retains_failed_worker_facets_then_clears_successful_empty(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    phase = {"value": "populated"}
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions/requests"):
+            if phase["value"] == "failure":
+                raise TimeoutError("secret-worker.example requests timed out")
+            requests = [] if phase["value"] == "empty" else [
+                {"request_id": "req_1", "session_id": "sess_1", "kind": "approval"}
+            ]
+            return Response({"requests": requests})
+        if url.endswith("/sessions/checkpoints"):
+            if phase["value"] == "failure":
+                raise TimeoutError("secret-worker.example checkpoints timed out")
+            checkpoints = [] if phase["value"] == "empty" else [
+                {"checkpoint_id": "ckpt_1", "session_id": "sess_1"}
+            ]
+            return Response({"checkpoints": checkpoints})
+        if url.endswith("/sessions"):
+            if phase["value"] == "failure":
+                raise TimeoutError("secret-worker.example sessions timed out")
+            sessions = [] if phase["value"] == "empty" else [
+                {"session_id": "sess_1", "provider": "codex", "status": "running"}
+            ]
+            return Response({"sessions": sessions})
+        raise AssertionError(url)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        populated = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+        phase["value"] = "failure"
+        retained = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+        phase["value"] = "empty"
+        cleared = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+
+        assert len(populated["sessions"]) == len(populated["requests"]) == len(populated["checkpoints"]) == 1
+        assert [row["session_id"] for row in retained["sessions"]] == ["sess_1"]
+        assert retained["requests"] == populated["requests"]
+        assert retained["checkpoints"] == populated["checkpoints"]
+        assert retained["sync"]["status"] == "partial"
+        assert {item["resource"] for item in retained["sync"]["diagnostics"]} >= {
+            "sessions",
+            "requests",
+            "checkpoints",
+        }
+        assert "secret-worker.example" not in json.dumps(retained["sync"])
+        assert cleared["sessions"] == []
+        assert cleared["requests"] == []
+        assert cleared["checkpoints"] == []
+        assert cleared["sync"]["status"] == "fresh"
+        assert cleared["sync"]["diagnostics"] == []
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
+def test_cockpit_failed_refresh_does_not_resurrect_archived_cached_session(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    failed = {"value": False}
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions/requests"):
+            return Response({"requests": []})
+        if url.endswith("/sessions/checkpoints"):
+            return Response({"checkpoints": []})
+        if url.endswith("/sessions"):
+            if failed["value"]:
+                raise TimeoutError("worker unavailable")
+            return Response({"sessions": [{"session_id": "archive_cached", "provider": "codex", "status": "running"}]})
+        raise AssertionError(url)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        populated = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+        ref = populated["sessions"][0]["session_ref"]
+        archived = await client.post(f"{base}/v1/sessions/{ref}/archive", json={"idempotency_key": "archive-cached"})
+        failed["value"] = True
+        refreshed = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+
+        assert archived.status_code == 200
+        assert refreshed["sessions"] == []
+        assert refreshed["requests"] == []
+        assert refreshed["checkpoints"] == []
+        assert refreshed["sync"]["status"] == "partial"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
+def test_cockpit_checkpoint_fallback_retains_only_failed_session_facet(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.api import _HubWorkerSync, _hub_worker_state
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    phase = {"value": "populated"}
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions"):
+            return Response(
+                {
+                    "sessions": [
+                        {"session_id": "sess_failed", "provider": "codex", "status": "running"},
+                        {"session_id": "sess_empty", "provider": "codex", "status": "running"},
+                    ]
+                }
+            )
+        if url.endswith("/sessions/requests"):
+            return Response({"requests": []})
+        if url.endswith("/sessions/checkpoints"):
+            if phase["value"] == "populated":
+                return Response(
+                    {
+                        "checkpoints": [
+                            {"session_id": "sess_failed", "checkpoint_id": "ckpt_failed"},
+                            {"session_id": "sess_empty", "checkpoint_id": "ckpt_empty"},
+                        ]
+                    }
+                )
+            return Response({}, status_code=404)
+        if url.endswith("/sessions/sess_failed/checkpoints"):
+            raise TimeoutError("private checkpoint path")
+        if url.endswith("/sessions/sess_empty/checkpoints"):
+            return Response({"checkpoints": []})
+        raise AssertionError(url)
+
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=get,
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+    hub = SseSnapshotHub(ctx)
+    sync = _HubWorkerSync(hub)
+    previous = _hub_worker_state(ctx, "fast", sync, [])
+    phase["value"] = "fallback"
+    current = _hub_worker_state(ctx, "fast", sync, [], previous=previous)
+
+    assert [row["checkpoint_id"] for row in current["checkpoints"]] == ["ckpt_failed"]
+    assert current["partial"] is True
+    failed = [item for item in current["diagnostics"] if item["status"] == "failure"]
+    assert failed == [
+        {
+            "worker_id": "macbook-worker",
+            "resource": "session_checkpoints",
+            "status": "failure",
+            "failure_kind": "transport_error",
+            "status_code": 0,
+            "error_type": "TimeoutError",
+            "session_id": "sess_failed",
+        }
+    ]
 
 
 def test_cockpit_sse_hub_notify_wakes_early_and_targets_the_dirty_run(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -3921,6 +4349,11 @@ def test_cockpit_queued_worker_turn_uses_stable_logical_and_idempotency_ids(tmp_
 
     assert posts[0]["turn_id"] == queued["queue_id"]
     assert posts[0]["idempotency_key"] == f"thread-turn:{thread.thread_id}:stable-key"
+    completed = connector.index.get(project.id, thread.thread_id)
+    assert completed is not None
+    completed_receipt = next(item for item in completed.turn_receipts if item["idempotency_key"] == "stable-key")
+    assert completed_receipt["status"] == "completed"
+    assert {"text", "requester", "workspace_request", "has_attachments"}.isdisjoint(completed_receipt)
 
 
 def test_cockpit_startup_blocks_ambiguous_brain_receipt_instead_of_redispatching(
@@ -3970,6 +4403,11 @@ def test_cockpit_startup_blocks_ambiguous_brain_receipt_instead_of_redispatching
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "turn_outcome_uncertain"
     assert "new idempotency_key" in response.json()["error"]["message"]
+    uncertain = connector.index.get(thread.project_id, thread.thread_id)
+    assert uncertain is not None
+    uncertain_receipt = next(item for item in uncertain.turn_receipts if item["idempotency_key"] == "uncertain-key")
+    assert uncertain_receipt["status"] == "uncertain"
+    assert {"text", "requester", "workspace_request", "has_attachments"}.isdisjoint(uncertain_receipt)
 
 
 def test_cockpit_dispatching_receipt_replays_in_progress_without_terminal_done(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -4086,6 +4524,7 @@ def test_cockpit_recovery_never_exceeds_queue_cap(tmp_path, monkeypatch) -> None
     assert len(recovered.queued_turns) == 32
     receipt = next(item for item in recovered.turn_receipts if item["idempotency_key"] == "overflow-recovery")
     assert receipt["status"] == "retry_required"
+    assert {"text", "requester", "workspace_request", "has_attachments"}.isdisjoint(receipt)
 
 
 def test_cockpit_queue_rejects_raw_attachments_without_persisting_them(tmp_path, monkeypatch) -> None:  # noqa: ANN001

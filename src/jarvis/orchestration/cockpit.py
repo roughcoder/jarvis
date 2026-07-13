@@ -57,6 +57,7 @@ class WorkerReadDiagnostic:
     failure_kind: str = ""
     status_code: int = 0
     error_type: str = ""
+    session_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -346,6 +347,15 @@ def cockpit_snapshot(
             timeout_s=sync_timeout_s,
             should_sync_worker=should_sync_worker,
         )
+    if worker_state is not None:
+        sync = dict(sync)
+        sync["diagnostics"] = [
+            dict(item)
+            for item in worker_state.get("diagnostics") or []
+            if isinstance(item, dict)
+        ]
+        if worker_state.get("partial"):
+            sync["status"] = "partial"
     all_runs = all_runs if all_runs is not None else store.list_runs()
     archived_run_ids = {run.run_id for run in all_runs if run.archived_at}
     archived_session_refs = archived_session_refs_for_store(store, all_runs) | deleted_session_refs_for_store(store)
@@ -843,6 +853,7 @@ def aggregate_checkpoints(
             fallback = _worker_collection_read(
                 worker_id=worker_id,
                 resource="session_checkpoints",
+                session_id=session_id,
                 url=f"{profile.base_url}/sessions/{session_id}/checkpoints",
                 collection_key="checkpoints",
                 headers=headers,
@@ -869,6 +880,7 @@ def _worker_collection_read(
     *,
     worker_id: str,
     resource: str,
+    session_id: str = "",
     url: str,
     collection_key: str,
     headers: dict[str, str],
@@ -888,6 +900,7 @@ def _worker_collection_read(
                 status="failure",
                 failure_kind="transport_error",
                 error_type=type(exc).__name__,
+                session_id=session_id,
             ),
         )
     status_code = getattr(response, "status_code", 200)
@@ -900,6 +913,7 @@ def _worker_collection_read(
                 status="unsupported",
                 failure_kind="unsupported",
                 status_code=status_code,
+                session_id=session_id,
             ),
         )
     if status_code >= 400:
@@ -911,6 +925,7 @@ def _worker_collection_read(
                 status="failure",
                 failure_kind="http_error",
                 status_code=status_code,
+                session_id=session_id,
             ),
         )
     try:
@@ -926,6 +941,7 @@ def _worker_collection_read(
                 resource=resource,
                 status="failure",
                 failure_kind="invalid_payload",
+                session_id=session_id,
             ),
         )
     return WorkerCollectionRead(status="success", items=tuple(dict(item) for item in raw_items))

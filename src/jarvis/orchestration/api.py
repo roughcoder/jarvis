@@ -62,6 +62,7 @@ from jarvis.orchestration.cockpit import (
     CockpitError,
     IdempotencyStore,
     SessionRef,
+    WorkerReadDiagnostic,
     aggregate_checkpoints,
     aggregate_requests,
     aggregate_sessions,
@@ -182,6 +183,8 @@ class CockpitAppContext:
     # Kept separate so compatibility state cannot make the conversation itself
     # look terminal or degraded.
     thread_turn_legacy_states: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+    worker_state_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    worker_state_cache_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     delete: HttpDelete = httpx.delete
 
     async def require_auth(self, request: web.Request) -> None:
@@ -254,8 +257,9 @@ class SseSubscription:
 class _HubWorkerSync:
     """Bound the hub's worker pulls without changing interactive call budgets."""
 
-    def __init__(self, hub: SseSnapshotHub) -> None:
+    def __init__(self, hub: SseSnapshotHub, *, respect_backoff: bool = True) -> None:
         self.hub = hub
+        self.respect_backoff = respect_backoff
         registry = WorkerRegistry(hub.ctx.cfg.worker, profiles_path=hub.ctx.cfg.orchestration.workers_path)
         self.profiles = registry.profiles(probe=False)
         self._worker_by_base_url = {
@@ -265,7 +269,10 @@ class _HubWorkerSync:
         }
 
     def should_sync(self, profile) -> bool:  # noqa: ANN001
-        return self.hub._worker_backoff_until.get(profile.worker_id, 0) <= self.hub._tick
+        return not self.respect_backoff or self.hub._worker_backoff_until.get(profile.worker_id, 0) <= self.hub._tick
+
+    def is_backed_off(self, profile) -> bool:  # noqa: ANN001
+        return self.respect_backoff and self.hub._worker_backoff_until.get(profile.worker_id, 0) > self.hub._tick
 
     def online_workers(self) -> frozenset[str]:
         return frozenset(
@@ -309,7 +316,7 @@ class SseSnapshotHub:
         self._subscribers: dict[int, SseSubscription] = {}
         self._snapshots: dict[str, dict[str, Any]] = {}
         self._snapshot_stamps: dict[str, tuple[int, frozenset[str], str]] = {}
-        self._worker_states: dict[str, dict[str, Any]] = {}
+        self._worker_states = ctx.worker_state_cache
         self._event_counts: dict[str, dict[str, int]] = {}
         self._worker_backoff_until: dict[str, int] = {}
         self._tick = 0
@@ -367,7 +374,7 @@ class SseSnapshotHub:
 
     async def _snapshot(self, mode: str) -> dict[str, Any]:
         cached = self._snapshots.get(mode)
-        body = cached if cached is not None else await asyncio.to_thread(_cockpit_snapshot, self.ctx, mode)
+        body = cached if cached is not None else await _shared_snapshot_body(self.ctx, self, mode)
         if mode not in self._event_counts:
             # Baseline per-run event counts at subscribe time so events that
             # land between now and the first refresh tick are emitted, not
@@ -424,13 +431,12 @@ class SseSnapshotHub:
                         run_snapshot = await asyncio.to_thread(self.ctx.store.list_runs)
                         dirty_worker_ids = {worker_id for worker_id, _session_id, _job_id in dirty}
                         worker_state = await asyncio.to_thread(
-                            _hub_worker_state,
+                            _refresh_worker_state,
                             self.ctx,
                             mode,
                             worker_sync,
                             run_snapshot,
                             dirty_worker_ids if mode in self._worker_states else None,
-                            self._worker_states.get(mode),
                         )
                     else:
                         sync = (
@@ -447,7 +453,7 @@ class SseSnapshotHub:
                             run_snapshot = await asyncio.to_thread(self.ctx.store.list_runs)
                         worker_state = (
                             await asyncio.to_thread(
-                                _hub_worker_state,
+                                _refresh_worker_state,
                                 self.ctx,
                                 mode,
                                 worker_sync,
@@ -456,8 +462,6 @@ class SseSnapshotHub:
                             if worker_sync is not None
                             else None
                         )
-                    if worker_state is not None:
-                        self._worker_states[mode] = worker_state
                     stamp = self._snapshot_stamp(worker_sync, worker_state)
                     force_refresh = self._tick % max(1, int(self.ctx.cfg.orchestration.sse_forced_refresh_ticks)) == 0
                     if not force_refresh and self._snapshot_stamps.get(mode) == stamp:
@@ -865,7 +869,8 @@ class CockpitReadHandlers:
     async def snapshot(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         mode = _sync_mode(request)
-        return web.json_response(await asyncio.to_thread(_cockpit_snapshot, self.ctx, mode))
+        hub = request.app[SSE_SNAPSHOT_HUB_KEY]
+        return web.json_response(await _shared_snapshot_body(self.ctx, hub, mode, respect_backoff=False))
 
     async def mcp_status(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -3750,6 +3755,38 @@ def _hub_sync_dirty(
     }
 
 
+async def _shared_snapshot_body(
+    ctx: CockpitAppContext,
+    hub: SseSnapshotHub,
+    mode: str,
+    *,
+    respect_backoff: bool = True,
+) -> dict[str, Any]:
+    if mode not in {"fast", "probe"}:
+        return await asyncio.to_thread(_cockpit_snapshot, ctx, mode)
+    worker_sync = _HubWorkerSync(hub, respect_backoff=respect_backoff)
+    sync = await asyncio.to_thread(_hub_sync_state, ctx, mode, worker_sync)
+    all_runs = await asyncio.to_thread(ctx.store.list_runs)
+    worker_state = await asyncio.to_thread(
+        _refresh_worker_state,
+        ctx,
+        mode,
+        worker_sync,
+        all_runs,
+    )
+    return await asyncio.to_thread(
+        _cockpit_snapshot,
+        ctx,
+        mode,
+        sync=sync,
+        sync_timeout_s=float(ctx.cfg.orchestration.sse_sync_timeout_s),
+        should_sync_worker=worker_sync.should_sync,
+        http_get=worker_sync.get,
+        worker_state=worker_state,
+        all_runs=all_runs,
+    )
+
+
 def _hub_worker_state(
     ctx: CockpitAppContext,
     mode: str,
@@ -3773,6 +3810,7 @@ def _hub_worker_state(
         profiles_path=ctx.cfg.orchestration.workers_path,
         http_get=worker_sync.get,
     )
+    previous = previous or {}
     profiles = registry.profiles(probe=False)
     if mode == "probe":
         profiles = [
@@ -3781,15 +3819,47 @@ def _hub_worker_state(
             else profile
             for profile in profiles
         ]
+    eligible_worker_ids = {
+        profile.worker_id
+        for profile in profiles
+        if profile.status != "offline" and worker_sync.should_sync(profile)
+    }
     workers = [
         project_worker_profile(profile, default_repo=ctx.cfg.orchestration.default_repo)
         for profile in profiles
     ]
 
-    def should_sync(profile: Any) -> bool:
-        return (worker_ids is None or profile.worker_id in worker_ids) and worker_sync.should_sync(profile)
+    current_worker_ids = {profile.worker_id for profile in profiles}
+    previous_worker_ids = _worker_state_ids(previous)
+    refresh_worker_ids = (
+        set(worker_ids)
+        if worker_ids is not None
+        else current_worker_ids | previous_worker_ids
+    )
+    attempted_worker_ids = {
+        profile.worker_id
+        for profile in profiles
+        if profile.worker_id in refresh_worker_ids and profile.worker_id in eligible_worker_ids
+    }
+    unattempted_worker_ids = (refresh_worker_ids & current_worker_ids) - attempted_worker_ids
+    backed_off_worker_ids = {
+        profile.worker_id
+        for profile in profiles
+        if profile.status != "offline"
+        and profile.worker_id in unattempted_worker_ids
+        and worker_sync.is_backed_off(profile)
+    }
+    offline_worker_ids = {
+        profile.worker_id
+        for profile in profiles
+        if profile.status == "offline" and profile.worker_id in unattempted_worker_ids
+    }
 
-    sessions = aggregate_sessions(
+    def should_sync(profile: Any) -> bool:
+        return profile.worker_id in attempted_worker_ids
+
+    session_diagnostics: list[WorkerReadDiagnostic] = []
+    current_sessions = aggregate_sessions(
         runs=runs,
         worker_cfg=ctx.cfg.worker,
         workers_path=ctx.cfg.orchestration.workers_path,
@@ -3800,16 +3870,38 @@ def _hub_worker_state(
         archived_session_refs=archived_session_refs,
         timeout_s=float(ctx.cfg.orchestration.sse_sync_timeout_s),
         should_sync_worker=should_sync,
+        diagnostics=session_diagnostics,
     )
-    requests = aggregate_requests(
+    sessions = _reconcile_session_rows(
+        previous.get("sessions") or {},
+        current_sessions,
+        refresh_worker_ids,
+        _failed_workers(session_diagnostics, "sessions") | unattempted_worker_ids,
+    )
+    sessions = {
+        ref: row
+        for ref, row in sessions.items()
+        if ref not in archived_session_refs and str(row.get("run_id") or "") not in archived_run_ids
+    }
+    request_diagnostics: list[WorkerReadDiagnostic] = []
+    current_requests = aggregate_requests(
         worker_cfg=ctx.cfg.worker,
         workers_path=ctx.cfg.orchestration.workers_path,
         http_get=worker_sync.get,
         timeout_s=float(ctx.cfg.orchestration.sse_sync_timeout_s),
         should_sync_worker=should_sync,
+        diagnostics=request_diagnostics,
+    )
+    requests = _reconcile_worker_rows(
+        previous.get("requests") or [],
+        current_requests,
+        refresh_worker_ids,
+        _failed_workers(request_diagnostics, "requests") | unattempted_worker_ids,
+        sessions=sessions,
     )
     requests = [request for request in requests if str(request.get("session_ref") or "") in sessions]
-    checkpoints = aggregate_checkpoints(
+    checkpoint_diagnostics: list[WorkerReadDiagnostic] = []
+    current_checkpoints = aggregate_checkpoints(
         runs=runs,
         sessions=sessions,
         worker_cfg=ctx.cfg.worker,
@@ -3817,16 +3909,251 @@ def _hub_worker_state(
         http_get=worker_sync.get,
         timeout_s=float(ctx.cfg.orchestration.sse_sync_timeout_s),
         should_sync_worker=should_sync,
+        diagnostics=checkpoint_diagnostics,
+    )
+    checkpoints = _reconcile_checkpoint_rows(
+        previous.get("checkpoints") or [],
+        current_checkpoints,
+        refresh_worker_ids,
+        checkpoint_diagnostics,
+        sessions,
+        unattempted_worker_ids=unattempted_worker_ids,
+    )
+    checkpoints = [
+        checkpoint
+        for checkpoint in checkpoints
+        if str(checkpoint.get("session_ref") or "") in sessions
+    ]
+    diagnostics = [*session_diagnostics, *request_diagnostics, *checkpoint_diagnostics]
+    projected_diagnostics = _reconcile_worker_diagnostics(
+        [dict(item) for item in previous.get("diagnostics") or [] if isinstance(item, dict)],
+        [_worker_read_diagnostic(item) for item in diagnostics],
+        refresh_worker_ids,
+        attempted_worker_ids,
+        current_worker_ids,
+    )
+    projected_diagnostics = [
+        item
+        for item in projected_diagnostics
+        if not str(item.get("session_id") or "")
+        or make_session_ref(
+            str(item.get("worker_id") or ""),
+            str(item.get("session_id") or ""),
+        ) not in archived_session_refs
+    ]
+    failed_worker_ids = {
+        str(item.get("worker_id") or "")
+        for item in projected_diagnostics
+        if item.get("status") == "failure"
+    }
+    projected_diagnostics.extend(
+        {
+            "worker_id": worker_id,
+            "resource": "worker_state",
+            "status": "failure",
+            "failure_kind": failure_kind,
+            "status_code": 0,
+            "error_type": "",
+            "session_id": "",
+        }
+        for failure_kind, worker_ids_for_kind in (
+            ("backoff", backed_off_worker_ids),
+            ("offline", offline_worker_ids),
+        )
+        for worker_id in sorted(worker_ids_for_kind - failed_worker_ids)
     )
     current = {
-        "workers": workers,
+        "workers": _reconcile_worker_rows(
+            previous.get("workers") or [],
+            workers,
+            refresh_worker_ids,
+            backed_off_worker_ids,
+            include_new_for_failed=True,
+        ),
         "sessions": sessions,
         "requests": requests,
         "checkpoints": checkpoints,
+        "partial": any(item.get("status") == "failure" for item in projected_diagnostics),
+        "diagnostics": projected_diagnostics,
     }
-    if worker_ids is None or previous is None:
-        return current
-    return _merge_dirty_worker_state(previous, current, worker_ids)
+    return current
+
+
+def _refresh_worker_state(
+    ctx: CockpitAppContext,
+    mode: str,
+    worker_sync: _HubWorkerSync,
+    all_runs: list[Any] | None = None,
+    worker_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Refresh the process-wide last-known worker projection used by REST and SSE."""
+    with ctx.worker_state_cache_lock:
+        state = _hub_worker_state(
+            ctx,
+            mode,
+            worker_sync,
+            all_runs,
+            worker_ids,
+            ctx.worker_state_cache.get(mode),
+        )
+        ctx.worker_state_cache[mode] = state
+        return state
+
+
+def _failed_workers(diagnostics: list[WorkerReadDiagnostic], resource: str) -> set[str]:
+    return {
+        item.worker_id
+        for item in diagnostics
+        if item.resource == resource and item.status == "failure"
+    }
+
+
+def _worker_state_ids(state: dict[str, Any]) -> set[str]:
+    ids = {
+        str(row.get("worker_id") or "")
+        for name in ("workers", "diagnostics")
+        for row in state.get(name) or []
+        if isinstance(row, dict)
+    }
+    ids.update(
+        str(row.get("worker_id") or "")
+        for row in (state.get("sessions") or {}).values()
+        if isinstance(row, dict)
+    )
+    ids.discard("")
+    return ids
+
+
+def _reconcile_worker_diagnostics(
+    previous: list[dict[str, Any]],
+    current: list[dict[str, Any]],
+    refresh_worker_ids: set[str],
+    attempted_worker_ids: set[str],
+    current_worker_ids: set[str],
+) -> list[dict[str, Any]]:
+    preserve_worker_ids = (refresh_worker_ids & current_worker_ids) - attempted_worker_ids
+    retained = [
+        item
+        for item in previous
+        if str(item.get("worker_id") or "") not in refresh_worker_ids
+        or str(item.get("worker_id") or "") in preserve_worker_ids
+    ]
+    refreshed = [
+        item
+        for item in current
+        if str(item.get("worker_id") or "") in attempted_worker_ids
+    ]
+    return [*retained, *refreshed]
+
+
+def _reconcile_worker_rows(
+    previous: list[dict[str, Any]],
+    current: list[dict[str, Any]],
+    target_worker_ids: set[str],
+    failed_worker_ids: set[str],
+    *,
+    sessions: dict[str, dict[str, Any]] | None = None,
+    include_new_for_failed: bool = False,
+) -> list[dict[str, Any]]:
+    def worker_id(row: dict[str, Any]) -> str:
+        direct = str(row.get("worker_id") or "")
+        if direct or sessions is None:
+            return direct
+        session = sessions.get(str(row.get("session_ref") or "")) or {}
+        return str(session.get("worker_id") or "")
+
+    retained = [
+        row
+        for row in previous
+        if worker_id(row) not in target_worker_ids
+        or worker_id(row) in failed_worker_ids
+    ]
+    previous_worker_ids = {worker_id(row) for row in previous}
+    refreshed = [
+        row
+        for row in current
+        if worker_id(row) in target_worker_ids
+        and (
+            worker_id(row) not in failed_worker_ids
+            or (include_new_for_failed and worker_id(row) not in previous_worker_ids)
+        )
+    ]
+    return [*retained, *refreshed]
+
+
+def _reconcile_session_rows(
+    previous: dict[str, dict[str, Any]],
+    current: dict[str, dict[str, Any]],
+    target_worker_ids: set[str],
+    failed_worker_ids: set[str],
+) -> dict[str, dict[str, Any]]:
+    retained = {
+        ref: row
+        for ref, row in previous.items()
+        if str(row.get("worker_id") or "") not in target_worker_ids
+        or str(row.get("worker_id") or "") in failed_worker_ids
+    }
+    refreshed = {
+        ref: row
+        for ref, row in current.items()
+        if str(row.get("worker_id") or "") in target_worker_ids
+        and (
+            str(row.get("worker_id") or "") not in failed_worker_ids
+            or ref not in previous
+        )
+    }
+    return {**retained, **refreshed}
+
+
+def _reconcile_checkpoint_rows(
+    previous: list[dict[str, Any]],
+    current: list[dict[str, Any]],
+    target_worker_ids: set[str],
+    diagnostics: list[WorkerReadDiagnostic],
+    sessions: dict[str, dict[str, Any]],
+    *,
+    unattempted_worker_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    failed_workers = _failed_workers(diagnostics, "checkpoints") | (unattempted_worker_ids or set())
+    failed_sessions = {
+        (item.worker_id, item.session_id)
+        for item in diagnostics
+        if item.resource == "session_checkpoints" and item.status == "failure" and item.session_id
+    }
+
+    def failed(row: dict[str, Any]) -> bool:
+        session = sessions.get(str(row.get("session_ref") or "")) or {}
+        worker_id = str(row.get("worker_id") or session.get("worker_id") or "")
+        session_id = str(row.get("session_id") or session.get("session_id") or "")
+        return worker_id in failed_workers or (worker_id, session_id) in failed_sessions
+
+    def worker_id(row: dict[str, Any]) -> str:
+        session = sessions.get(str(row.get("session_ref") or "")) or {}
+        return str(row.get("worker_id") or session.get("worker_id") or "")
+
+    retained = [
+        row
+        for row in previous
+        if worker_id(row) not in target_worker_ids or failed(row)
+    ]
+    refreshed = [
+        row
+        for row in current
+        if worker_id(row) in target_worker_ids and not failed(row)
+    ]
+    return [*retained, *refreshed]
+
+
+def _worker_read_diagnostic(item: WorkerReadDiagnostic) -> dict[str, Any]:
+    return {
+        "worker_id": item.worker_id,
+        "resource": item.resource,
+        "status": item.status,
+        "failure_kind": item.failure_kind,
+        "status_code": item.status_code,
+        "error_type": item.error_type,
+        "session_id": item.session_id,
+    }
 
 
 def _merge_dirty_worker_state(
