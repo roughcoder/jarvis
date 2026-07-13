@@ -10875,3 +10875,56 @@ def test_child_watch_continuation_survives_worker_restart(tmp_path, monkeypatch)
     ]
     assert records
     assert not records[-1].get("error")
+
+
+def test_worker_state_refresh_is_single_flight_under_a_hung_worker(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    import threading as _threading
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: Response({}),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+    entered = _threading.Event()
+    release = _threading.Event()
+    calls: list[str] = []
+
+    def slow_hub_worker_state(_ctx, mode, *_args, **_kwargs):  # noqa: ANN001, ANN002, ANN003
+        calls.append(mode)
+        entered.set()
+        # Model an unresponsive worker: the read blocks until its timeout.
+        release.wait(timeout=5)
+        return {"workers": [], "mode": mode}
+
+    monkeypatch.setattr(cockpit_api_module, "_hub_worker_state", slow_hub_worker_state)
+
+    first = _threading.Thread(
+        target=lambda: cockpit_api_module._refresh_worker_state(ctx, "all", None),  # noqa: SLF001
+        daemon=True,
+    )
+    first.start()
+    assert entered.wait(timeout=5)
+
+    # A second refresh while the first is stuck must not queue another blocking
+    # read; it returns immediately with the last-known projection.
+    ctx.worker_state_cache["all"] = {"workers": [], "mode": "all", "cached": True}
+    done = _threading.Event()
+
+    def second() -> None:
+        cockpit_api_module._refresh_worker_state(ctx, "all", None)  # noqa: SLF001
+        done.set()
+
+    _threading.Thread(target=second, daemon=True).start()
+    assert done.wait(timeout=2), "second refresh convoyed on the stuck worker read"
+    assert calls == ["all"]
+
+    release.set()
+    first.join(timeout=5)
+    assert calls == ["all"]
+    assert "all" not in ctx.worker_state_refresh_modes

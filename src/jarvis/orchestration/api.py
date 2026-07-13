@@ -186,6 +186,7 @@ class CockpitAppContext:
     thread_turn_legacy_states: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
     worker_state_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
     worker_state_cache_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    worker_state_refresh_modes: set[str] = field(default_factory=set, repr=False, compare=False)
     delete: HttpDelete = httpx.delete
 
     async def require_auth(self, request: web.Request) -> None:
@@ -3995,16 +3996,36 @@ def _refresh_worker_state(
     all_runs: list[Any] | None = None,
     worker_ids: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Refresh the process-wide last-known worker projection used by REST and SSE."""
+    """Refresh the process-wide last-known worker projection used by REST and SSE.
+
+    Worker reads block for as long as an unresponsive worker takes to time out.
+    Holding `worker_state_cache_lock` across them convoyed every refresh caller
+    onto the lock and exhausted the default executor, starving *all* other
+    `to_thread` work — conversation reads included — until the API stopped
+    serving. So refreshes are single-flight per mode: a caller that finds one
+    already running reuses the last-known projection instead of queueing another
+    blocking read, and the lock is only held around the cache swap.
+    """
     with ctx.worker_state_cache_lock:
+        if mode in ctx.worker_state_refresh_modes:
+            cached = ctx.worker_state_cache.get(mode)
+            if cached is not None:
+                return cached
+        ctx.worker_state_refresh_modes.add(mode)
+        previous = ctx.worker_state_cache.get(mode)
+    try:
         state = _hub_worker_state(
             ctx,
             mode,
             worker_sync,
             all_runs,
             worker_ids,
-            ctx.worker_state_cache.get(mode),
+            previous,
         )
+    finally:
+        with ctx.worker_state_cache_lock:
+            ctx.worker_state_refresh_modes.discard(mode)
+    with ctx.worker_state_cache_lock:
         ctx.worker_state_cache[mode] = state
         return state
 
