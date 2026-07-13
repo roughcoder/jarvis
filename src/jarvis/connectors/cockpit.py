@@ -16,7 +16,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import httpx
@@ -2639,7 +2639,10 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
         title = str(args.get("title") or args.get("name") or task).strip()
         if not task:
             return "error: task is required"
-        repo = _child_work_repo(project, str(args.get("repo") or ""), default=cfg.orchestration.default_repo)
+        try:
+            repo = _child_work_repo(project, str(args.get("repo") or ""), default=cfg.orchestration.default_repo)
+        except ValueError as exc:
+            return f"error: {exc}"
         item = WorkItem(
             source="manual",
             id=new_id("manual"),
@@ -3151,13 +3154,31 @@ def _child_work_repo(project: ProjectEntry, requested: str, *, default: str = ""
     """Resolve a child work repo request to a worker-usable remote.
 
     Orchestrators reference repos by their registry alias (the name shown in
-    the workspace projection); workers only understand remotes, so an alias
-    that reaches `gh repo clone` unmapped fails to resolve.
+    the workspace projection) or echo another worker's absolute checkout path;
+    workers only understand remotes, so both must map through the registry.
+    A path that maps to no registry repo is rejected rather than dispatched —
+    it is meaningless (or worse, someone else's checkout) on another worker.
     """
     repo = requested.strip() or _project_default_repo(project) or default
     registry_match = next((entry for entry in project.repos if repo in (entry.name, entry.remote)), None)
     if registry_match is not None and registry_match.remote:
         return registry_match.remote
+    if repo.startswith(("/", "~")):
+        basename = PurePosixPath(repo).name
+        basename_match = next(
+            (
+                entry
+                for entry in project.repos
+                if entry.remote and (entry.name == basename or entry.remote.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") == basename)
+            ),
+            None,
+        )
+        if basename_match is not None:
+            return basename_match.remote
+        raise ValueError(
+            f"child work repo {repo!r} is a worker-local path with no matching project repository; "
+            "use a registry repo name or org/name remote"
+        )
     return repo
 
 

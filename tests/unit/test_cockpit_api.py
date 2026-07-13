@@ -10822,5 +10822,9 @@ def test_child_work_repo_resolves_registry_alias_to_remote() -> None:
     assert _child_work_repo(project, "roughcoder/jarvis-cockpit") == "roughcoder/jarvis-cockpit"
     assert _child_work_repo(project, "") == "roughcoder/jarvis"
     assert _child_work_repo(project, "other-org/other-repo") == "other-org/other-repo"
+    assert _child_work_repo(project, "/Users/someone/Development/jarvis-cockpit") == "roughcoder/jarvis-cockpit"
+    assert _child_work_repo(project, "~/src/runtime") == "roughcoder/jarvis"
+    with pytest.raises(ValueError, match="worker-local path"):
+        _child_work_repo(project, "/opt/checkouts/unrelated-repo")
     empty = ProjectEntry(id="bare", name="Bare", owner="neil", members=("neil",))
     assert _child_work_repo(empty, "", default="fallback/repo") == "fallback/repo"
