@@ -4790,6 +4790,9 @@ def _rearm_thread_queues(ctx: CockpitAppContext) -> None:
         if thread.archived_at:
             continue
         index.recover_dispatching_turns(thread.project_id, thread.thread_id)
+        # An execution lease cannot outlive the process that held it; releasing
+        # it here is what lets queued turns drain after a restart.
+        index.recover_orphaned_execution(thread.project_id, thread.thread_id)
         thread = index.get(thread.project_id, thread.thread_id) or thread
         if not thread.queued_turns:
             continue

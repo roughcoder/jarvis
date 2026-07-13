@@ -10928,3 +10928,52 @@ def test_worker_state_refresh_is_single_flight_under_a_hung_worker(tmp_path, mon
     first.join(timeout=5)
     assert calls == ["all"]
     assert "all" not in ctx.worker_state_refresh_modes
+
+
+def test_restart_recovery_releases_orphaned_execution_and_drains_queue(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    thread = CockpitThread(
+        thread_id="thread_orphaned_lease",
+        project_id="neil-shared",
+        session_id="project:neil-shared:orchestrator:thread_orphaned_lease",
+        title="Drill",
+        created_at="2026-07-13T14:00:00Z",
+        updated_at="2026-07-13T14:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        engine="claude",
+        workspace={
+            "worker_id": "worker_a",
+            "session_id": "orch_thread_orphaned_lease",
+            "provider_started": True,
+            # The process that owned this in-flight turn died mid-turn.
+            "status": "running",
+            "provision_phase": "running",
+            "session_generation": 5,
+        },
+    )
+    index.save(thread)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    index.enqueue_turn(
+        thread.project_id,
+        thread.thread_id,
+        requester=requester,
+        text="Queued behind the dead turn.",
+        idempotency_key="queued-1",
+    )
+    stored = index.get(thread.project_id, thread.thread_id)
+    assert stored is not None
+    assert len(stored.queued_turns) == 1
+
+    recovered = index.recover_orphaned_execution(thread.project_id, thread.thread_id)
+
+    assert recovered is not None
+    assert recovered.workspace["status"] == "ready"
+    assert recovered.workspace["provision_phase"] == "ready"
+    assert recovered.workspace["provider_started"] is False
+    # The provider session itself is preserved for the next turn to re-ensure.
+    assert recovered.workspace["session_id"] == "orch_thread_orphaned_lease"
+    execution = cockpit_api_module._thread_execution_projection(recovered, None)  # noqa: SLF001
+    assert not cockpit_api_module._thread_execution_is_active(execution)  # noqa: SLF001

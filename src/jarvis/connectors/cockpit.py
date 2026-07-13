@@ -713,6 +713,35 @@ class CockpitThreadIndex:
                 )
             )
 
+    def recover_orphaned_execution(self, project_id: str, thread_id: str) -> CockpitThread | None:
+        """Release an execution lease left behind by a previous API process.
+
+        A foreground turn holds the lease in memory of the process running it.
+        Once that process is gone the turn cannot still be in flight, so a lease
+        surviving a restart is orphaned — and while it survives, every new turn
+        queues behind an execution that will never finish. The provider session
+        itself is untouched: the next turn re-ensures or replaces it.
+        """
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            status = str(thread.workspace.get("status") or "")
+            if status not in {"starting", "running"}:
+                return thread
+            return self.save(
+                replace(
+                    thread,
+                    updated_at=utc_now(),
+                    workspace={
+                        **thread.workspace,
+                        "status": "ready",
+                        "provision_phase": "ready",
+                        "provider_started": False,
+                    },
+                )
+            )
+
     def claim_execution_interrupt(self, project_id: str, thread_id: str) -> CockpitThread | None:
         with _THREAD_INDEX_LOCK:
             thread = self.get(project_id, thread_id)
