@@ -3170,7 +3170,7 @@ def test_cockpit_thread_approval_resolves_attached_execution_idempotently(tmp_pa
             "active_turn": {"turn_id": "turn_1", "status": "running", "started_at": "now"},
             "pending_requests": [],
             "supported_controls": ["turn", "approval", "interrupt"],
-            "supports": {"steer": False, "queue": False},
+            "supports": {"steer": False, "queue": True},
             "diagnostic": None,
         },
     }
