@@ -716,7 +716,11 @@ def _project_jsonrpc_message(
             rpc_id=message.get("id"),
             params=params,
         )
-        sessions.append_event(session_id, EVENT_APPROVAL_REQUESTED, {**common, **params, "request_id": request_id})
+        sessions.append_event(
+            session_id,
+            EVENT_APPROVAL_REQUESTED,
+            {**common, **params, "request_id": request_id, "request_kind": "command"},
+        )
         sessions.update_status(session_id, SESSION_WAITING_APPROVAL)
     elif method == "item/fileChange/requestApproval":
         request_id = _message_request_id(message, params)
@@ -728,7 +732,11 @@ def _project_jsonrpc_message(
             rpc_id=message.get("id"),
             params=params,
         )
-        sessions.append_event(session_id, EVENT_APPROVAL_REQUESTED, {**common, **params, "request_id": request_id})
+        sessions.append_event(
+            session_id,
+            EVENT_APPROVAL_REQUESTED,
+            {**common, **params, "request_id": request_id, "request_kind": "file-change"},
+        )
         sessions.update_status(session_id, SESSION_WAITING_APPROVAL)
     elif method == "item/tool/requestUserInput":
         request_id = _message_request_id(message, params)

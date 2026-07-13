@@ -149,6 +149,14 @@ MCP_TOKEN_STORE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
+class ThreadTurnState:
+    operational_state: str
+    diagnostic_reason: str = ""
+    turn_id: str = ""
+    started_at: str = ""
+
+
+@dataclass(frozen=True)
 class CockpitAppContext:
     cfg: Config
     get: HttpGet
@@ -160,10 +168,13 @@ class CockpitAppContext:
     source_factory: Callable[[str, Any], WorkSource]
     oauth_validator: OAuthTokenValidator | None = None
     # Live project-conversation operational state, keyed (project_id, thread_id).
-    # Values are (operational_state, diagnostic_reason). Process-local state may
-    # describe an active attempt, but it never owns or terminates the durable
-    # conversation. A restart safely returns open conversations to idle.
-    thread_turn_states: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+    # Process-local state may describe an active attempt, but it never owns or
+    # terminates the durable conversation. A restart safely returns open
+    # conversations to idle. Tuples remain accepted for v1 compatibility tests.
+    thread_turn_states: dict[
+        tuple[str, str],
+        ThreadTurnState | tuple[str, str],
+    ] = field(default_factory=dict)
     # Legacy v1 status remains turn-terminal until the next turn starts, while
     # the durable conversation operational state returns to idle immediately.
     # Kept separate so compatibility state cannot make the conversation itself
@@ -1094,12 +1105,13 @@ class CockpitReadHandlers:
         thread = await asyncio.to_thread(connector.index.get_with_messages, project.id, request.match_info["thread_id"])
         if thread is None:
             raise CockpitError("not_found", "thread not found", status=404)
+        execution = await asyncio.to_thread(_thread_execution_projection, thread, self.ctx)
         return web.json_response(
             {
                 "api_version": API_VERSION,
                 "schema_version": SCHEMA_VERSION,
                 "project_id": project.id,
-                "thread": _thread_detail_projection(thread, self.ctx),
+                "thread": _thread_detail_projection(thread, self.ctx, execution=execution),
             }
         )
 
@@ -1728,6 +1740,8 @@ class CockpitWriteHandlers:
         _apply_cors_headers(request, response)
         await response.prepare(request)
         cursor = new_id("threadturn")
+        turn_id = new_id("turn")
+        turn_started_at = utc_now()
         await _write_sse(
             response,
             "thread.turn.started",
@@ -1735,11 +1749,19 @@ class CockpitWriteHandlers:
             _sse_envelope(
                 cursor,
                 "thread.turn.started",
-                {"project_id": project.id, "thread_id": thread.thread_id},
+                {
+                    "project_id": project.id,
+                    "thread_id": thread.thread_id,
+                    "turn_id": turn_id,
+                },
             ),
         )
         state_key = (project.id, thread.thread_id)
-        self.ctx.thread_turn_states[state_key] = ("working", "")
+        self.ctx.thread_turn_states[state_key] = ThreadTurnState(
+            operational_state="working",
+            turn_id=turn_id,
+            started_at=turn_started_at,
+        )
         cold_sessions = []
         client_gone = False
 
@@ -4067,7 +4089,7 @@ def _thread_operational_state(thread: CockpitThread, ctx: CockpitAppContext | No
         return "archived", ""
     live = ctx.thread_turn_states.get((thread.project_id, thread.thread_id)) if ctx is not None else None
     if live is not None:
-        status, reason = live
+        status, reason, _turn_id, _started_at = _thread_turn_state_values(live)
         return {
             "created": "starting",
             "running": "working",
@@ -4083,7 +4105,7 @@ def _thread_status(thread: CockpitThread, ctx: CockpitAppContext | None) -> tupl
     """Return the legacy v1 turn-derived status contract."""
     live = ctx.thread_turn_states.get((thread.project_id, thread.thread_id)) if ctx is not None else None
     if live is not None:
-        state, reason = live
+        state, reason, _turn_id, _started_at = _thread_turn_state_values(live)
         if state in {"created", "running", "completed", "failed"}:
             return state, reason
         if state in {"starting", "working", "waiting_for_children", "waiting_for_input", "joining"}:
@@ -4102,8 +4124,30 @@ def _thread_status(thread: CockpitThread, ctx: CockpitAppContext | None) -> tupl
     return "created", ""
 
 
-def _thread_detail_projection(thread: CockpitThread, ctx: CockpitAppContext | None = None) -> dict[str, Any]:
+def _thread_turn_state_values(
+    state: ThreadTurnState | tuple[str, str] | None,
+) -> tuple[str, str, str, str]:
+    if isinstance(state, ThreadTurnState):
+        return (
+            state.operational_state,
+            state.diagnostic_reason,
+            state.turn_id,
+            state.started_at,
+        )
+    if state is not None:
+        return state[0], state[1], "", ""
+    return "", "", "", ""
+
+
+def _thread_detail_projection(
+    thread: CockpitThread,
+    ctx: CockpitAppContext | None = None,
+    *,
+    execution: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     row = _thread_projection(thread, ctx)
+    if execution is not None:
+        row["execution"] = execution
     row["messages"] = [
         {
             "role": message.get("role", ""),
@@ -4114,6 +4158,150 @@ def _thread_detail_projection(thread: CockpitThread, ctx: CockpitAppContext | No
         for message in thread.messages
     ]
     return row
+
+
+def _thread_execution_projection(thread: CockpitThread, ctx: CockpitAppContext) -> dict[str, Any]:
+    worker_id = str(thread.workspace.get("worker_id") or thread.worker_id or "")
+    session_id = str(thread.workspace.get("session_id") or "")
+    if not worker_id or not session_id:
+        return _local_thread_execution_projection(thread, ctx)
+    try:
+        raw = _worker_get_json(
+            ctx.cfg,
+            worker_id,
+            f"/sessions/{session_id}/execution-state",
+            get=ctx.get,
+            timeout_s=float(ctx.cfg.orchestration.sse_sync_timeout_s),
+        )
+        return _public_thread_execution(raw)
+    except Exception as exc:  # noqa: BLE001 - execution diagnostics must not hide durable detail.
+        message = exc.message if isinstance(exc, CockpitError) else str(exc)
+        return _unavailable_thread_execution(public_error_message(message or "worker execution state unavailable"))
+
+
+def _public_thread_execution(raw: dict[str, Any]) -> dict[str, Any]:
+    if (
+        not str(raw.get("session_id") or "")
+        or not str(raw.get("status") or "")
+        or raw.get("active_turn") is not None
+        and not isinstance(raw.get("active_turn"), dict)
+        or not isinstance(raw.get("pending_requests"), list)
+        or not isinstance(raw.get("supported_controls"), list)
+        or not isinstance(raw.get("supports"), dict)
+    ):
+        raise ValueError("worker returned invalid execution state")
+    active = raw.get("active_turn") if isinstance(raw.get("active_turn"), dict) else None
+    if active is not None and (
+        not str(active.get("turn_id") or "")
+        or not str(active.get("status") or "")
+    ):
+        raise ValueError("worker returned invalid active turn")
+    pending = raw.get("pending_requests") if isinstance(raw.get("pending_requests"), list) else []
+    controls = raw.get("supported_controls") if isinstance(raw.get("supported_controls"), list) else []
+    return {
+        "available": True,
+        "status": str(raw.get("status") or ""),
+        "active_turn": (
+            {
+                "turn_id": str(active.get("turn_id") or ""),
+                "status": str(active.get("status") or ""),
+                "started_at": str(active.get("started_at") or ""),
+            }
+            if active is not None
+            else None
+        ),
+        "pending_requests": [
+            _public_thread_pending_request(item)
+            for item in pending
+            if isinstance(item, dict)
+            and str(item.get("kind") or "") in {"approval", "input"}
+            and bool(str(item.get("request_id") or ""))
+        ],
+        "supported_controls": [
+            str(item)
+            for item in controls
+            if str(item) in {"turn", "input", "approval", "interrupt", "stop"}
+        ],
+        "supports": {"steer": False, "queue": False},
+        "diagnostic": None,
+    }
+
+
+def _public_thread_pending_request(item: dict[str, Any]) -> dict[str, Any]:
+    kind = str(item.get("kind") or "")
+    result = {
+        "request_id": str(item.get("request_id") or ""),
+        "kind": kind,
+        "status": str(item.get("status") or "pending"),
+        "title": public_error_message(str(item.get("title") or "")),
+        "detail": public_error_message(str(item.get("detail") or "")),
+        "created_at": str(item.get("created_at") or ""),
+    }
+    if kind == "approval":
+        request_kind = str(item.get("request_kind") or "")
+        result["request_kind"] = (
+            request_kind if request_kind in {"command", "file-read", "file-change"} else "command"
+        )
+    if kind == "input" and isinstance(item.get("questions"), list):
+        result["questions"] = [
+            {
+                "id": public_error_message(str(question.get("id") or "")),
+                "header": public_error_message(str(question.get("header") or "")),
+                "question": public_error_message(str(question.get("question") or "")),
+                "options": [
+                    {
+                        "label": public_error_message(str(option.get("label") or "")),
+                        "description": public_error_message(str(option.get("description") or "")),
+                    }
+                    for option in question.get("options", [])
+                    if isinstance(option, dict)
+                ],
+                "multi_select": bool(question.get("multi_select")),
+            }
+            for question in item["questions"]
+            if isinstance(question, dict)
+        ]
+    return result
+
+
+def _local_thread_execution_projection(
+    thread: CockpitThread,
+    ctx: CockpitAppContext,
+) -> dict[str, Any]:
+    state = ctx.thread_turn_states.get((thread.project_id, thread.thread_id))
+    status, _reason, turn_id, started_at = _thread_turn_state_values(state)
+    return {
+        "available": True,
+        "status": status or "idle",
+        "active_turn": (
+            {
+                "turn_id": turn_id,
+                "status": status,
+                "started_at": started_at,
+            }
+            if turn_id
+            else None
+        ),
+        "pending_requests": [],
+        "supported_controls": ["turn"] if not thread.archived_at else [],
+        "supports": {"steer": False, "queue": False},
+        "diagnostic": None,
+    }
+
+
+def _unavailable_thread_execution(message: str) -> dict[str, Any]:
+    return {
+        "available": False,
+        "status": "unavailable",
+        "active_turn": None,
+        "pending_requests": [],
+        "supported_controls": [],
+        "supports": {"steer": False, "queue": False},
+        "diagnostic": {
+            "code": "worker_unavailable",
+            "message": message,
+        },
+    }
 
 
 def _include_archived(request: web.Request) -> bool:
@@ -4335,10 +4523,16 @@ def _worker_get_json(
     *,
     params: dict[str, Any] | None = None,
     get: HttpGet,
+    timeout_s: float | None = None,
 ) -> dict[str, Any]:
     profile = _worker_profile(cfg, worker_id)
     try:
-        response = get(f"{profile.base_url}{path}", headers=worker_headers(cfg.worker, profile), params=params or {}, timeout=cfg.worker.request_timeout_s)
+        response = get(
+            f"{profile.base_url}{path}",
+            headers=worker_headers(cfg.worker, profile),
+            params=params or {},
+            timeout=cfg.worker.request_timeout_s if timeout_s is None else timeout_s,
+        )
     except Exception as exc:  # noqa: BLE001 - exact session reads should return the public cockpit error contract
         message = public_error_message(str(exc) or "worker request failed")
         raise CockpitError("worker_unavailable", message, recoverable=True, status=502) from exc

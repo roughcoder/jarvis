@@ -20,6 +20,16 @@ def redact(value: str) -> str:
     text = re.sub(r"/(?:Applications|home|workspace|workspaces|tmp|mnt|opt)/[^\s)]+", "<local-path>", text)
     text = re.sub(r"/(?:private/tmp|var/folders)/[^\s)]+", "<local-path>", text)
     text = re.sub(r"\b(?:lin_api|ghp|github_pat|sk-[A-Za-z0-9])[A-Za-z0-9_\-]{12,}\b", "<redacted-token>", text)
+    text = re.sub(
+        r"(?i)\b(?:authorization\s*:\s*)?bearer\s+[A-Za-z0-9._~+/=\-]{8,}",
+        "Bearer <redacted-token>",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(?:[A-Z][A-Z0-9_]*_)?(?:TOKEN|SECRET|PASSWORD|API_KEY)\s*=\s*[^\s]+",
+        "<redacted-secret>",
+        text,
+    )
     text = re.sub(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", "<redacted-email>", text)
     return text
 

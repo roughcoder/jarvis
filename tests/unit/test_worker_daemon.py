@@ -58,6 +58,9 @@ from jarvis.worker.sessions import SessionManager  # noqa: E402
 from jarvis.worker.notify import WorkerChangeNotifier  # noqa: E402
 from jarvis.worker_session_contract import (  # noqa: E402
     EVENT_APPROVAL_RESOLVED,
+    EVENT_APPROVAL_REQUESTED,
+    EVENT_INPUT_REQUESTED,
+    EVENT_PROVIDER_LOG,
     EVENT_TOOL_RESULT,
     EVENT_TURN_COMPLETED,
     REQUEST_KIND_APPROVAL,
@@ -2720,6 +2723,183 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
     assert checkpoints["checkpoints"][0]["checkpoint_id"] == "ckpt_turn_checkpoint"
     assert restored["event"]["type"] == "checkpoint.restored"
     assert checkpoints_after_restore["checkpoints"][0]["restored"] is True
+
+
+def test_daemon_session_execution_state_projects_active_turn_and_redacted_requests(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "provider": "fake",
+                    "engine": "fake",
+                    "metadata": _authority_metadata(
+                        "fake",
+                        extra_actions=[
+                            WORKER_SESSION_APPROVE,
+                            WORKER_SESSION_INPUT,
+                            WORKER_SESSION_INTERRUPT,
+                            WORKER_SESSION_STOP,
+                        ],
+                    ),
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        await c.post(
+            f"{base}/sessions/{session_id}/turns",
+            json={
+                "turn_id": "turn_active",
+                "prompt": "request approval",
+                "metadata": _control_metadata(WORKER_SESSION_TURN),
+            },
+            headers=headers,
+        )
+        state = await c.get(f"{base}/sessions/{session_id}/execution-state", headers=headers)
+        input_created = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "provider": "fake",
+                    "engine": "fake",
+                    "metadata": _authority_metadata(
+                        "fake",
+                        extra_actions=[WORKER_SESSION_INPUT],
+                    ),
+                },
+                headers=headers,
+            )
+        ).json()
+        input_session_id = input_created["session"]["session_id"]
+        await c.post(
+            f"{base}/sessions/{input_session_id}/turns",
+            json={
+                "turn_id": "turn_input",
+                "prompt": "request input",
+                "metadata": _control_metadata(WORKER_SESSION_TURN),
+            },
+            headers=headers,
+        )
+        input_state = await c.get(
+            f"{base}/sessions/{input_session_id}/execution-state",
+            headers=headers,
+        )
+        return state.status_code, state.json(), input_state.json()
+
+    status, state, input_state = asyncio.run(_with_server(cfg, 8898, calls))
+
+    assert status == 200
+    assert state["active_turn"] == {
+        "turn_id": "turn_active",
+        "status": "waiting_approval",
+        "started_at": state["active_turn"]["started_at"],
+    }
+    assert state["pending_requests"] == [
+        {
+            "request_id": "approval_turn_active",
+            "kind": "approval",
+            "status": "pending",
+            "title": "Approve action",
+            "detail": "Approve fake provider action?",
+            "created_at": state["pending_requests"][0]["created_at"],
+            "request_kind": "command",
+        }
+    ]
+    assert state["supported_controls"] == ["turn", "input", "approval", "interrupt", "stop"]
+    assert state["supports"] == {"steer": False, "queue": False}
+    assert "prompt" not in json.dumps(state)
+    assert input_state["pending_requests"][0]["questions"] == [
+        {
+            "id": "response",
+            "header": "Input",
+            "question": "Provide fake provider input.",
+            "options": [],
+            "multi_select": False,
+        }
+    ]
+
+
+def test_session_execution_state_normalizes_claude_requests_redacts_secrets_and_bounds_history(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _created = sessions.create({"provider": "claude", "engine": "claude"})
+    sessions.reserve_turn(session.session_id, {"turn_id": "turn_claude", "idempotency_key": "turn_1"})
+    for index in range(1_200):
+        sessions.append_event(
+            session.session_id,
+            EVENT_PROVIDER_LOG,
+            {"turn_id": "turn_claude", "text": f"event-{index}-" + ("x" * 1024)},
+        )
+    sessions.append_event(
+        session.session_id,
+        EVENT_INPUT_REQUESTED,
+        {
+            "turn_id": "turn_claude",
+            "request_id": "request_input",
+            "tool_name": "AskUserQuestion",
+            "input": {
+                "questions": [
+                    {
+                        "id": "targets",
+                        "header": "Targets",
+                        "question": "Which targets?",
+                        "multiSelect": True,
+                        "options": [
+                            {"label": "Web", "description": "Use the web app"},
+                            {"label": "Server", "description": "Use the API"},
+                        ],
+                    }
+                ]
+            },
+        },
+    )
+    sessions.append_event(
+        session.session_id,
+        EVENT_APPROVAL_REQUESTED,
+        {
+            "turn_id": "turn_claude",
+            "request_id": "request_approval",
+            "tool_name": "Bash",
+            "description": (
+                "Authorization: Bearer supersecretvalue123456 "
+                "TOKEN=supersecretvalue123456 SECRET=supersecretvalue123456 "
+                "PASSWORD=supersecretvalue123456 API_KEY=supersecretvalue123456"
+            ),
+            "input": {"content": "x" * (1024 * 1024 + 1)},
+        },
+    )
+    sessions.update_status(session.session_id, SESSION_WAITING_INPUT)
+    monkeypatch.setattr(sessions, "events", lambda *_args, **_kwargs: pytest.fail("full event scan"))
+
+    state = sessions.execution_state(session.session_id)
+
+    assert state is not None
+    assert state["active_turn"]["turn_id"] == "turn_claude"
+    input_request = next(item for item in state["pending_requests"] if item["kind"] == "input")
+    assert input_request["questions"] == [
+        {
+            "id": "targets",
+            "header": "Targets",
+            "question": "Which targets?",
+            "options": [
+                {"label": "Web", "description": "Use the web app"},
+                {"label": "Server", "description": "Use the API"},
+            ],
+            "multi_select": True,
+        }
+    ]
+    approval = next(item for item in state["pending_requests"] if item["kind"] == "approval")
+    assert approval["request_kind"] == "command"
+    encoded = json.dumps(approval)
+    assert "supersecretvalue123456" not in encoded
+    assert "<redacted-token>" in encoded
+    assert "<redacted-secret>" in encoded
 
 
 def test_daemon_session_read_endpoints_offload_file_reads(tmp_path, monkeypatch) -> None:  # noqa: ANN001

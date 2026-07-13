@@ -2843,6 +2843,261 @@ def test_cockpit_threads_open_and_list_are_membership_filtered(tmp_path, monkeyp
     assert memory.messages == []
 
 
+def test_cockpit_thread_detail_enriches_from_one_targeted_worker_execution_read(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    index.save(
+        CockpitThread(
+            thread_id="thread_active",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_active"),
+            title="Active workspace conversation",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            engine="codex",
+            worker_id="macbook-worker",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_thread_active"},
+        )
+    )
+    reads: list[str] = []
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        reads.append(url)
+        assert url == "http://worker.test/sessions/conv_thread_active/execution-state"
+        return Response(
+            {
+                "session_id": "conv_thread_active",
+                "status": "waiting_input",
+                "active_turn": {
+                    "turn_id": "turn_active",
+                    "status": "waiting_input",
+                    "started_at": "2026-07-13T00:00:01Z",
+                },
+                "pending_requests": [
+                    {
+                        "request_id": "input_1",
+                        "kind": "input",
+                        "status": "pending",
+                        "title": "Input needed",
+                        "detail": "Choose a target.",
+                        "created_at": "2026-07-13T00:00:02Z",
+                        "questions": [
+                            {
+                                "id": "target",
+                                "header": "Target",
+                                "question": "Which target?",
+                                "options": [{"label": "Tests", "description": "Run tests"}],
+                                "multi_select": False,
+                            }
+                        ],
+                    }
+                ],
+                "supported_controls": ["turn"],
+                "supports": {"steer": False, "queue": False},
+            }
+        )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        response = await client.get(f"{base}/v1/projects/neil-shared/threads/thread_active")
+        assert response.status_code == 200
+        return response.json()["thread"]
+
+    thread = asyncio.run(_with_server(cfg, calls, http_get=worker_get))
+
+    assert reads == ["http://worker.test/sessions/conv_thread_active/execution-state"]
+    assert thread["execution"] == {
+        "available": True,
+        "status": "waiting_input",
+        "active_turn": {
+            "turn_id": "turn_active",
+            "status": "waiting_input",
+            "started_at": "2026-07-13T00:00:01Z",
+        },
+        "pending_requests": [
+            {
+                "request_id": "input_1",
+                "kind": "input",
+                "status": "pending",
+                "title": "Input needed",
+                "detail": "Choose a target.",
+                "created_at": "2026-07-13T00:00:02Z",
+                "questions": [
+                    {
+                        "id": "target",
+                        "header": "Target",
+                        "question": "Which target?",
+                        "options": [{"label": "Tests", "description": "Run tests"}],
+                        "multi_select": False,
+                    }
+                ],
+            }
+        ],
+        "supported_controls": ["turn"],
+        "supports": {"steer": False, "queue": False},
+        "diagnostic": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        TimeoutError("timed out at /Users/neil/private with sk-abcdefghijklmnopqrstuvwxyz"),
+        Response({"error": "unauthorized"}, status_code=401),
+        Response({"error": "missing"}, status_code=404),
+        Response({"error": "worker exploded"}, status_code=500),
+        TextResponse("not json", status_code=200),
+        Response({"status": "running", "pending_requests": "invalid"}),
+        Response(
+            {
+                "session_id": "conv_thread_degraded",
+                "status": "waiting_input",
+                "active_turn": {"turn_id": "", "status": "waiting_input"},
+                "pending_requests": [
+                    {"request_id": "future_1", "kind": "future_request", "status": "pending"}
+                ],
+                "supported_controls": [],
+                "supports": {"steer": False, "queue": False},
+            }
+        ),
+    ],
+)
+def test_cockpit_thread_detail_degrades_worker_execution_failures_to_durable_detail(
+    tmp_path,
+    monkeypatch,
+    failure,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    stored = index.save(
+        CockpitThread(
+            thread_id="thread_degraded",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_degraded"),
+            title="Durable while worker is unavailable",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            engine="codex",
+            worker_id="macbook-worker",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_thread_degraded"},
+        )
+    )
+    index.append_turn(
+        stored,
+        user_peer_id="neil",
+        user_text="Keep this durable message.",
+        assistant_peer_id="jarvis",
+        assistant_text="Durable reply.",
+    )
+
+    def worker_get(_url: str, **kwargs: Any) -> Response:
+        assert kwargs["timeout"] == cfg.orchestration.sse_sync_timeout_s
+        if isinstance(failure, BaseException):
+            raise failure
+        return failure
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[int, dict[str, Any]]:
+        response = await client.get(f"{base}/v1/projects/neil-shared/threads/thread_degraded")
+        return response.status_code, response.json()["thread"]
+
+    status, thread = asyncio.run(_with_server(cfg, calls, http_get=worker_get))
+
+    assert status == 200
+    assert thread["title"] == "Durable while worker is unavailable"
+    assert thread["messages"][0]["content"] == "Keep this durable message."
+    assert thread["execution"] == {
+        "available": False,
+        "status": "unavailable",
+        "active_turn": None,
+        "pending_requests": [],
+        "supported_controls": [],
+        "supports": {"steer": False, "queue": False},
+        "diagnostic": {
+            "code": "worker_unavailable",
+            "message": thread["execution"]["diagnostic"]["message"],
+        },
+    }
+    assert "/Users/" not in json.dumps(thread["execution"])
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in json.dumps(thread["execution"])
+
+
+def test_cockpit_thread_execution_ignores_future_request_kinds_without_erasing_active_turn() -> None:
+    execution = cockpit_api_module._public_thread_execution(  # noqa: SLF001
+        {
+            "session_id": "conv_future",
+            "status": "running",
+            "active_turn": {
+                "turn_id": "turn_active",
+                "status": "running",
+                "started_at": "2026-07-13T00:00:00Z",
+            },
+            "pending_requests": [
+                {"request_id": "future_1", "kind": "future_request", "status": "pending"}
+            ],
+            "supported_controls": ["turn"],
+            "supports": {"steer": False, "queue": False},
+        }
+    )
+
+    assert execution["active_turn"]["turn_id"] == "turn_active"
+    assert execution["pending_requests"] == []
+
+
+def test_cockpit_brain_thread_detail_exposes_addressable_local_active_turn(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    class BlockingGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def stream_with_tools(self, messages, **_kwargs):  # noqa: ANN001
+            self.messages.append(messages)
+            self.entered.set()
+            await self.release.wait()
+            yield "Finished."
+
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    gateway = BlockingGateway()
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=gateway,
+        tts=None,
+        tracer=None,
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        opened = (await client.post(f"{base}/v1/projects/neil-shared/threads", json={})).json()["thread"]
+        turn = asyncio.create_task(
+            client.post(
+                f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}/turns",
+                json={"text": "Hold this turn open."},
+            )
+        )
+        await asyncio.wait_for(gateway.entered.wait(), timeout=2)
+        detail = (
+            await client.get(f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}")
+        ).json()["thread"]
+        gateway.release.set()
+        await turn
+        return detail
+
+    thread = asyncio.run(_with_server(cfg, calls))
+
+    assert thread["execution"]["status"] == "working"
+    assert thread["execution"]["active_turn"]["turn_id"].startswith("turn_")
+    assert thread["execution"]["active_turn"]["status"] == "working"
+    assert thread["execution"]["active_turn"]["started_at"]
+    assert thread["execution"]["pending_requests"] == []
+    assert thread["execution"]["supported_controls"] == ["turn"]
+    assert thread["execution"]["supports"] == {"steer": False, "queue": False}
+
+
 def test_cockpit_thread_turn_streams_reply_and_writes_lane1_attribution(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)

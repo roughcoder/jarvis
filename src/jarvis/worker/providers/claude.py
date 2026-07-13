@@ -497,6 +497,7 @@ class _ClaudeSessionRuntime:
             "description": str(getattr(context, "description", "") or ""),
             "decision_reason": str(getattr(context, "decision_reason", "") or ""),
             "blocked_path": str(getattr(context, "blocked_path", "") or ""),
+            "request_kind": _claude_request_kind(tool_name),
         }
         with self._pending_lock:
             self._pending[request_id] = pending
@@ -936,6 +937,15 @@ def _claude_session_id(session: WorkerSession) -> str:
 def _approval_allowed(request: dict[str, Any]) -> bool:
     decision = str(request.get("decision") or "").strip().lower()
     return decision in {"approved", "approve", "allow", "allowed", "yes", "accept", "acceptforsession", "accept_for_session", "always"}
+
+
+def _claude_request_kind(tool_name: str) -> str:
+    normalized = tool_name.strip().lower()
+    if "read" in normalized:
+        return "file-read"
+    if any(word in normalized for word in ("edit", "write", "notebook")):
+        return "file-change"
+    return "command"
 
 
 def _updated_question_input(tool_input: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
