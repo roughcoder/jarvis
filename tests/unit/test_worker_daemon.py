@@ -619,9 +619,28 @@ def test_worker_session_authority_does_not_override_envelope_denial() -> None:
         WorkerSessionAuthority.from_metadata(metadata, provider="codex")
 
 
+@pytest.mark.parametrize(
+    ("jarvis_decision", "codex_decision", "claude_allowed"),
+    [
+        ("approved", "accept", True),
+        ("approved_for_session", "acceptForSession", True),
+        ("denied", "decline", False),
+        ("declined", "decline", False),
+        ("cancelled", "cancel", False),
+    ],
+)
+def test_provider_approval_decisions_cover_the_jarvis_vocabulary(
+    jarvis_decision: str,
+    codex_decision: str,
+    claude_allowed: bool,
+) -> None:
+    request = {"decision": jarvis_decision}
+
+    assert _approval_result(request) == {"decision": codex_decision}
+    assert claude._approval_allowed(request) is claude_allowed  # noqa: SLF001
+
+
 def test_codex_protocol_response_shapes_match_app_server_contract() -> None:
-    assert _approval_result({"decision": "approved"}) == {"decision": "accept"}
-    assert _approval_result({"decision": "denied"}) == {"decision": "decline"}
     assert _approval_result({"decision": "acceptForSession"}) == {"decision": "acceptForSession"}
 
     assert _input_result(

@@ -3214,6 +3214,8 @@ def test_cockpit_thread_interrupt_keeps_conversation_open_and_next_turn_recreate
     cfg = _cfg(tmp_path, monkeypatch, identity="neil", caps=WORKER_SESSION_INTERRUPT)
     _seed_project_registry(cfg)
     posts: list[tuple[str, dict[str, Any]]] = []
+    interrupt_started = threading.Event()
+    release_interrupt = threading.Event()
 
     def worker_get(url: str, **_kwargs: Any) -> Response:
         if url.endswith("/execution-state"):
@@ -3258,6 +3260,8 @@ def test_cockpit_thread_interrupt_keeps_conversation_open_and_next_turn_recreate
             "worktrees": [],
         }
         if url.endswith("/interrupt"):
+            interrupt_started.set()
+            assert release_interrupt.wait(timeout=2)
             return Response({"ok": True, "session": {"status": "interrupted"}})
         if url.endswith("/conversation-workspaces"):
             return Response({"ok": True, "workspace": workspace})
@@ -3299,11 +3303,23 @@ def test_cockpit_thread_interrupt_keeps_conversation_open_and_next_turn_recreate
     )
     monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
 
-    async def calls(base: str, client: httpx.AsyncClient) -> tuple[httpx.Response, httpx.Response, dict[str, Any]]:
-        interrupted = await client.post(
-            f"{base}/v1/projects/neil-shared/threads/thread_interrupt/interrupt",
-            json={"turn_id": "turn_active", "idempotency_key": "interrupt-once"},
+    async def calls(
+        base: str,
+        client: httpx.AsyncClient,
+    ) -> tuple[httpx.Response, httpx.Response, httpx.Response, dict[str, Any]]:
+        interrupt_task = asyncio.create_task(
+            client.post(
+                f"{base}/v1/projects/neil-shared/threads/thread_interrupt/interrupt",
+                json={"turn_id": "turn_active", "idempotency_key": "interrupt-once"},
+            )
         )
+        assert await asyncio.to_thread(interrupt_started.wait, 2)
+        raced_turn = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_interrupt/turns",
+            json={"text": "Do not reuse the execution being interrupted."},
+        )
+        release_interrupt.set()
+        interrupted = await interrupt_task
         next_turn = await client.post(
             f"{base}/v1/projects/neil-shared/threads/thread_interrupt/turns",
             json={"text": "Continue with a fresh execution."},
@@ -3311,9 +3327,9 @@ def test_cockpit_thread_interrupt_keeps_conversation_open_and_next_turn_recreate
         detail = (
             await client.get(f"{base}/v1/projects/neil-shared/threads/thread_interrupt")
         ).json()["thread"]
-        return interrupted, next_turn, detail
+        return interrupted, raced_turn, next_turn, detail
 
-    interrupted, next_turn, detail = asyncio.run(
+    interrupted, raced_turn, next_turn, detail = asyncio.run(
         _with_server(cfg, calls, http_get=worker_get, http_post=worker_post)
     )
 
@@ -3324,11 +3340,16 @@ def test_cockpit_thread_interrupt_keeps_conversation_open_and_next_turn_recreate
         "accepted": True,
         "turn_id": "turn_active",
     }
+    assert raced_turn.status_code == 200
+    assert "thread.turn.error" in raced_turn.text
     assert next_turn.status_code == 200
     assert detail["lifecycle"] == "open"
     assert detail["archived_at"] == ""
     created_sessions = [body for url, body in posts if url.endswith("/sessions")]
     assert created_sessions[-1]["session_id"] == "conv_thread-interrupt_1"
+    assert not any(
+        url.endswith("/sessions/conv_thread_interrupt/turns") for url, _body in posts
+    )
 
 
 def test_cockpit_thread_controls_require_addressable_request_or_turn_ids(tmp_path, monkeypatch) -> None:  # noqa: ANN001

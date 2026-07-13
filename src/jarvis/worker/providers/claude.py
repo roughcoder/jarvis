@@ -21,6 +21,7 @@ from jarvis.worker.orchestrator_runtime import (
 from jarvis.worker.providers._common import (
     control_request_id as _control_request_id,
 )
+from jarvis.worker.providers._common import normalize_approval_decision
 from jarvis.worker.providers._common import (
     record_provider_log as _record_provider_log_impl,
 )
@@ -935,8 +936,10 @@ def _claude_session_id(session: WorkerSession) -> str:
 
 
 def _approval_allowed(request: dict[str, Any]) -> bool:
-    decision = str(request.get("decision") or "").strip().lower()
-    return decision in {"approved", "approve", "allow", "allowed", "yes", "accept", "acceptforsession", "accept_for_session", "always"}
+    return normalize_approval_decision(request.get("decision")) in {
+        "approved",
+        "approved_for_session",
+    }
 
 
 def _claude_request_kind(tool_name: str) -> str:

@@ -330,6 +330,117 @@ class CockpitThreadIndex:
             atomic_write_json(self.path, data)
             return replace(thread, messages=())
 
+    def reserve_execution_turn(self, project_id: str, thread_id: str) -> CockpitThread | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            if not str(thread.workspace.get("session_id") or ""):
+                return thread
+            status = str(thread.workspace.get("status") or "")
+            if status == "interrupting":
+                raise RuntimeError("conversation execution is being interrupted")
+            if status in {"starting", "running"}:
+                raise RuntimeError("conversation execution already has an active turn")
+            return self.save(
+                replace(
+                    thread,
+                    updated_at=utc_now(),
+                    workspace={
+                        **thread.workspace,
+                        "status": "starting",
+                        "provision_phase": "starting",
+                    },
+                )
+            )
+
+    def claim_execution_interrupt(self, project_id: str, thread_id: str) -> CockpitThread | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            if not str(thread.workspace.get("session_id") or ""):
+                return thread
+            return self.save(
+                replace(
+                    thread,
+                    updated_at=utc_now(),
+                    workspace={
+                        **thread.workspace,
+                        "status": "interrupting",
+                        "provision_phase": "interrupting",
+                    },
+                )
+            )
+
+    def detach_execution_if_matches(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        expected_session_id: str,
+        expected_generation: int,
+    ) -> CockpitThread | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            current_session_id = str(thread.workspace.get("session_id") or "")
+            current_generation = int(thread.workspace.get("session_generation") or 0)
+            if (
+                current_session_id != expected_session_id
+                or current_generation != expected_generation
+            ):
+                return thread
+            return self.save(
+                replace(
+                    thread,
+                    updated_at=utc_now(),
+                    workspace={
+                        **thread.workspace,
+                        "session_id": "",
+                        "provider_started": False,
+                        "status": "interrupted",
+                        "provision_phase": "interrupted",
+                        "session_generation": current_generation + 1,
+                    },
+                )
+            )
+
+    def update_execution_if_matches(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        expected_session_id: str,
+        expected_generation: int,
+        status: str,
+        provision_phase: str,
+        extra: dict[str, Any] | None = None,
+    ) -> CockpitThread | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            if (
+                str(thread.workspace.get("session_id") or "") != expected_session_id
+                or int(thread.workspace.get("session_generation") or 0) != expected_generation
+                or str(thread.workspace.get("status") or "") == "interrupting"
+            ):
+                return None
+            return self.save(
+                replace(
+                    thread,
+                    updated_at=utc_now(),
+                    workspace={
+                        **thread.workspace,
+                        "status": status,
+                        "provision_phase": provision_phase,
+                        **(extra or {}),
+                    },
+                )
+            )
+
     def set_archived(
         self,
         project_id: str,
@@ -624,6 +735,7 @@ class CockpitThreadIndex:
                     archive_reason=archive_source.archive_reason,
                     last_turn_at=observed_at,
                     messages=(),
+                    workspace=dict(archive_source.workspace),
                 )
             )
             messages = self._append_thread_messages(updated, appended, seed_messages=thread.messages)
@@ -667,6 +779,7 @@ class CockpitThreadIndex:
                     archive_reason=archive_source.archive_reason,
                     last_turn_at=observed_at,
                     messages=(),
+                    workspace=dict(archive_source.workspace),
                 )
             )
             messages = self._append_thread_messages(updated, appended, seed_messages=thread.messages)
@@ -1023,23 +1136,22 @@ class CockpitConnector:
             return thread
         return self._index.save(replace(thread, title=title[:200], updated_at=utc_now()))
 
-    def detach_interrupted_execution(self, project: ProjectEntry, thread_id: str) -> CockpitThread | None:
-        thread = self._index.get(project.id, thread_id)
-        if thread is None:
-            return None
-        return self._index.save(
-            replace(
-                thread,
-                updated_at=utc_now(),
-                workspace={
-                    **thread.workspace,
-                    "session_id": "",
-                    "provider_started": False,
-                    "status": "interrupted",
-                    "provision_phase": "interrupted",
-                    "session_generation": int(thread.workspace.get("session_generation") or 0) + 1,
-                },
-            )
+    def claim_execution_interrupt(self, project: ProjectEntry, thread_id: str) -> CockpitThread | None:
+        return self._index.claim_execution_interrupt(project.id, thread_id)
+
+    def detach_interrupted_execution(
+        self,
+        project: ProjectEntry,
+        thread_id: str,
+        *,
+        expected_session_id: str,
+        expected_generation: int,
+    ) -> CockpitThread | None:
+        return self._index.detach_execution_if_matches(
+            project.id,
+            thread_id,
+            expected_session_id=expected_session_id,
+            expected_generation=expected_generation,
         )
 
     def delete_thread(self, project: ProjectEntry, thread_id: str) -> tuple[CockpitThread | None, bool]:
@@ -1217,9 +1329,17 @@ class CockpitConnector:
         progress: Callable[[dict[str, Any]], Any] | None,
     ) -> tuple[str, CockpitThread]:
         await _emit_progress(progress, {"phase": "resolving-access", "thread_id": thread.thread_id})
+        thread = self._index.reserve_execution_turn(project.id, thread.thread_id) or thread
+        reserved_session_id = str(thread.workspace.get("session_id") or "")
         thread = await self._ensure_workspace(project, thread, requester, workspace_request=workspace_request, progress=progress)
+        if (
+            str(thread.workspace.get("session_id") or "") != reserved_session_id
+            or str(thread.workspace.get("status") or "") != "starting"
+        ):
+            thread = self._index.reserve_execution_turn(project.id, thread.thread_id) or thread
         worker_id = str(thread.workspace.get("worker_id") or "")
         session_id = str(thread.workspace.get("session_id") or "")
+        session_generation = int(thread.workspace.get("session_generation") or 0)
         if not worker_id or not session_id:
             raise RuntimeError("conversation workspace has no worker session")
         await _emit_progress(progress, {"phase": "running", "thread_id": thread.thread_id, "workspace": workspace_public(thread.workspace)})
@@ -1247,6 +1367,16 @@ class CockpitConnector:
         )
         if not turn.get("ok", True):
             raise RuntimeError(str(turn.get("error") or "worker rejected conversation turn"))
+        thread = self._index.update_execution_if_matches(
+            project.id,
+            thread.thread_id,
+            expected_session_id=session_id,
+            expected_generation=session_generation,
+            status="ready",
+            provision_phase="ready",
+        )
+        if thread is None:
+            raise RuntimeError("conversation execution was interrupted")
         reply = "Workspace turn is running."
         # Best-effort per AGENTS.md: a memory outage here must not raise out of
         # the turn handler after the worker turn was already dispatched — that
@@ -1279,9 +1409,17 @@ class CockpitConnector:
         *,
         progress: Callable[[dict[str, Any]], Any] | None,
     ) -> tuple[str, CockpitThread]:
+        thread = self._index.reserve_execution_turn(project.id, thread.thread_id) or thread
+        reserved_session_id = str(thread.workspace.get("session_id") or "")
         thread = await self._ensure_orchestrator_session(project, thread, requester, progress=progress)
+        if (
+            str(thread.workspace.get("session_id") or "") != reserved_session_id
+            or str(thread.workspace.get("status") or "") != "starting"
+        ):
+            thread = self._index.reserve_execution_turn(project.id, thread.thread_id) or thread
         worker_id = str(thread.workspace.get("worker_id") or "")
         session_id = str(thread.workspace.get("session_id") or "")
+        session_generation = int(thread.workspace.get("session_generation") or 0)
         if not worker_id or not session_id:
             raise RuntimeError("orchestrator conversation has no worker session")
         context = _project_context(self._memory, project, thread)
@@ -1325,40 +1463,38 @@ class CockpitConnector:
         )
         if response.get("ok") is False:
             raise RuntimeError(str(response.get("error") or "worker rejected orchestrator turn"))
-        thread = self._index.save(
-            replace(
-                thread,
-                workspace={
-                    **thread.workspace,
-                    "provider_started": True,
-                    "status": "running",
-                    "provision_phase": "running",
-                },
-            )
+        thread = self._index.update_execution_if_matches(
+            project.id,
+            thread.thread_id,
+            expected_session_id=session_id,
+            expected_generation=session_generation,
+            status="running",
+            provision_phase="running",
+            extra={"provider_started": True},
         )
+        if thread is None:
+            raise RuntimeError("conversation execution was interrupted")
         await _emit_progress(progress, {"phase": "running", "thread_id": thread.thread_id, "workspace": workspace_public(thread.workspace)})
         try:
             reply = await self._wait_for_orchestrator_turn(worker_id, session_id, turn_id)
         except Exception:
-            failed = self._index.save(
-                replace(
-                    thread,
-                    updated_at=utc_now(),
-                    workspace={
-                        **thread.workspace,
-                        "status": "failed",
-                        "provision_phase": "failed",
+            failed = self._index.update_execution_if_matches(
+                project.id,
+                thread.thread_id,
+                expected_session_id=session_id,
+                expected_generation=session_generation,
+                status="failed",
+                provision_phase="failed",
+            )
+            if failed is not None:
+                await _emit_progress(
+                    progress,
+                    {
+                        "phase": "failed",
+                        "thread_id": failed.thread_id,
+                        "workspace": workspace_public(failed.workspace),
                     },
                 )
-            )
-            await _emit_progress(
-                progress,
-                {
-                    "phase": "failed",
-                    "thread_id": failed.thread_id,
-                    "workspace": workspace_public(failed.workspace),
-                },
-            )
             raise
         try:
             await asyncio.to_thread(
@@ -1371,14 +1507,16 @@ class CockpitConnector:
             )
         except Exception:
             pass
-        completed = replace(
-            thread,
-            workspace={
-                **thread.workspace,
-                "status": "ready",
-                "provision_phase": "ready",
-            },
+        completed = self._index.update_execution_if_matches(
+            project.id,
+            thread.thread_id,
+            expected_session_id=session_id,
+            expected_generation=session_generation,
+            status="ready",
+            provision_phase="ready",
         )
+        if completed is None:
+            raise RuntimeError("conversation execution was interrupted")
         return reply, self._index.append_turn(
             completed,
             user_peer_id=requester.memory_peer,
@@ -2843,7 +2981,7 @@ def _workspace_is_ready(thread: CockpitThread) -> bool:
     return (
         bool(workspace.get("worker_id"))
         and bool(workspace.get("session_id"))
-        and str(workspace.get("status") or "") == "ready"
+        and str(workspace.get("status") or "") in {"ready", "starting"}
     )
 
 

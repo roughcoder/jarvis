@@ -1898,18 +1898,48 @@ class CockpitWriteHandlers:
 
         async def produce() -> dict[str, Any]:
             _require_capability(self.ctx.cfg, required)
+            control_thread = thread
+            if action == "interrupt":
+                claimed = await asyncio.to_thread(
+                    connector.claim_execution_interrupt,
+                    project,
+                    thread_id,
+                )
+                if claimed is None:
+                    raise CockpitError("not_found", "thread not found", status=404)
+                control_thread = claimed
+            control_worker_id = str(
+                control_thread.workspace.get("worker_id") or control_thread.worker_id or ""
+            )
+            control_session_id = str(control_thread.workspace.get("session_id") or "")
+            if not control_worker_id or not control_session_id:
+                raise CockpitError(
+                    "execution_unavailable",
+                    "thread has no attached worker execution",
+                    recoverable=True,
+                    status=409,
+                )
+            expected_generation = int(control_thread.workspace.get("session_generation") or 0)
             await asyncio.to_thread(
                 _worker_post_json,
                 self.ctx.cfg,
-                worker_id,
-                f"/sessions/{session_id}/{action}",
+                control_worker_id,
+                f"/sessions/{control_session_id}/{action}",
                 _worker_control_body(body, required),
                 post=self.ctx.post,
             )
-            execution = _thread_execution_projection(thread, self.ctx)
             control = {"action": action, "accepted": True, reference_key: reference_id}
+            execution = _thread_execution_projection(control_thread, self.ctx)
             if action == "interrupt":
-                await asyncio.to_thread(connector.detach_interrupted_execution, project, thread_id)
+                detached = await asyncio.to_thread(
+                    connector.detach_interrupted_execution,
+                    project,
+                    thread_id,
+                    expected_session_id=control_session_id,
+                    expected_generation=expected_generation,
+                )
+                if detached is not None:
+                    control_thread = detached
             return {
                 "ok": True,
                 "api_version": API_VERSION,

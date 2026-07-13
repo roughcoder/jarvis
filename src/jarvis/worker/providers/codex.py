@@ -18,6 +18,7 @@ from jarvis.worker.orchestrator_runtime import (
 from jarvis.worker.providers._common import (
     control_request_id as _control_request_id,
 )
+from jarvis.worker.providers._common import normalize_approval_decision
 from jarvis.worker.providers._common import (
     record_provider_log as _record_provider_log_impl,
 )
@@ -868,16 +869,15 @@ def _clear_pending_requests(session_id: str, process: subprocess.Popen[str]) -> 
 
 
 def _approval_result(request: dict[str, Any]) -> dict[str, Any]:
-    decision = str(request.get("decision") or "").strip().lower()
-    if decision in {"approved", "approve", "allow", "allowed", "yes", "accept"}:
-        mapped = "accept"
-    elif decision in {"acceptforsession", "accept_for_session", "always"}:
-        mapped = "acceptForSession"
-    elif decision == "cancel":
-        mapped = "cancel"
-    else:
-        mapped = "decline"
-    return {"decision": mapped}
+    decision = normalize_approval_decision(request.get("decision"))
+    return {
+        "decision": {
+            "approved": "accept",
+            "approved_for_session": "acceptForSession",
+            "denied": "decline",
+            "cancelled": "cancel",
+        }[decision]
+    }
 
 
 def _input_result(request: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
