@@ -53,7 +53,7 @@ from jarvis.brain.facade import (
     make_project_tools,
 )
 from jarvis.config import Config
-from jarvis.engines import worker_supports_engine
+from jarvis.engines import BUILTIN_CODE_ENGINES, normalize_engine_id, worker_supports_engine
 from jarvis.ids import new_id, utc_now
 from jarvis.jsonl_cache import JsonlCacheEntry, read_jsonl_projection
 from jarvis.orchestrator_tool_contract import (
@@ -2703,12 +2703,20 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
         )
         worker_id = str(args.get("worker_id") or "").strip()
         provider_instance_id = str(args.get("provider_instance_id") or "").strip()
+        # An unknown engine id matched no worker and surfaced as the misleading
+        # "No eligible worker found"; name the real problem instead.
+        requested_engine = normalize_engine_id(str(args.get("engine") or ""))
+        if requested_engine and requested_engine not in BUILTIN_CODE_ENGINES:
+            return (
+                f"error: unknown engine {requested_engine!r}; "
+                f"valid engines are {', '.join(sorted(BUILTIN_CODE_ENGINES))}"
+            )
         command = WorkCommand(
             operation="start_next_work",
             source="manual",
             filters={"project_id": project.id},
             target_worker_id=worker_id,
-            target_engine_id=str(args.get("engine") or ""),
+            target_engine_id=requested_engine,
             target_model_id=str(args.get("model") or ""),
             provider_instance_id=provider_instance_id,
             start=True,
@@ -2751,7 +2759,11 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
                     "type": "string",
                     "description": "Optional explicit cockpit provider instance id, preserved independently of fleet worker routing.",
                 },
-                "engine": {"type": "string", "description": "Optional worker engine route, e.g. codex or claude."},
+                "engine": {
+                    "type": "string",
+                    "enum": sorted(BUILTIN_CODE_ENGINES),
+                    "description": "Optional worker engine route: exactly 'codex' or 'claude'.",
+                },
                 "model": {"type": "string", "description": "Optional explicit provider model id."},
                 "landing_mode": {
                     "type": "string",

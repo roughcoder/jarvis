@@ -11040,3 +11040,32 @@ def test_orchestrator_turn_fails_closed_on_an_unanswerable_approval(tmp_path, mo
         asyncio.run(
             connector._wait_for_orchestrator_turn("worker_a", "session_a", "turn_current")  # noqa: SLF001
         )
+
+
+def test_spawn_child_rejects_an_unknown_engine_with_a_truthful_error(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.connectors.cockpit import _spawn_child_work_tool
+
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    thread = CockpitThread(
+        thread_id="thread_engine_validation",
+        project_id=project.id,
+        session_id="project:neil-shared:orchestrator:thread_engine_validation",
+        title="Spawn",
+        created_at="2026-07-13T15:00:00Z",
+        updated_at="2026-07-13T15:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+    )
+    tool = _spawn_child_work_tool(cfg, project, thread)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+
+    result = asyncio.run(tool.handler(requester, {"task": "list dirs", "engine": "claude-engine"}))
+
+    # An unknown engine used to match no worker and surface as the misleading
+    # "No eligible worker found".
+    assert "unknown engine" in result
+    assert "claude-engine" in result
+    assert "claude" in result and "codex" in result
