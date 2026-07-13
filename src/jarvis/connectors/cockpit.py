@@ -2954,10 +2954,17 @@ def _continue_child_watch(cfg: Config, parent_chat_id: str, watch: dict[str, Any
                         continue
                 await connector.turn(project, thread, requester, instruction)
                 break
-            except RuntimeError as exc:
+            except (RuntimeError, OSError, TimeoutError, httpx.TransportError) as exc:
                 message = str(exc).lower()
                 code = exc.code if isinstance(exc, WorkerRequestError) else ""
-                retryable = code in {
+                # A worker restart mid-join surfaces as a transport failure;
+                # the child results are durable, so keep the claim and retry
+                # until the deadline instead of losing the continuation.
+                transport = isinstance(exc, (OSError, TimeoutError, httpx.TransportError)) or any(
+                    marker in message
+                    for marker in ("connection refused", "connection reset", "timed out", "connect error")
+                )
+                retryable = transport or code in {
                     WORKER_ERROR_SESSION_ACTIVE,
                     WORKER_ERROR_SESSION_TERMINAL,
                 } or (
@@ -2971,7 +2978,7 @@ def _continue_child_watch(cfg: Config, parent_chat_id: str, watch: dict[str, Any
                 if not retryable or asyncio.get_running_loop().time() >= deadline:
                     raise
                 index.renew_child_watch_claim(parent_chat_id, watch_id)
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(2.0 if transport else 0.25)
 
     try:
         asyncio.run(run())

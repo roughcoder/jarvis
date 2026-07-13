@@ -10828,3 +10828,50 @@ def test_child_work_repo_resolves_registry_alias_to_remote() -> None:
         _child_work_repo(project, "/opt/checkouts/unrelated-repo")
     empty = ProjectEntry(id="bare", name="Bare", owner="neil", members=("neil",))
     assert _child_work_repo(empty, "", default="fallback/repo") == "fallback/repo"
+
+
+def test_child_watch_continuation_survives_worker_restart(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    parent = CockpitThread(
+        thread_id="thread_restart_join",
+        project_id="neil-shared",
+        session_id="project:neil-shared:orchestrator:thread_restart_join",
+        title="Restart drill",
+        created_at="2026-07-13T12:00:00Z",
+        updated_at="2026-07-13T12:00:00Z",
+        created_by="neil",
+    )
+    index.save(parent)
+    requester = RequestContext(
+        device_id="local-mac",
+        identity="neil",
+        scope="personal",
+        capabilities=frozenset({"orchestration.runs.read"}),
+    )
+    index.register_child_watch(parent, ["run_restart"], requester=requester)
+    watch = index.claim_ready_child_watch(parent.thread_id, {"run_restart"})
+    assert watch is not None
+    attempts: list[str] = []
+
+    async def turn(_self, _project, _thread, _requester, instruction):  # noqa: ANN001
+        attempts.append(instruction)
+        if len(attempts) < 3:
+            raise ConnectionRefusedError(61, "Connection refused")
+        return "done", parent, []
+
+    monkeypatch.setattr(CockpitConnector, "turn", turn)
+
+    _continue_child_watch(cfg, parent.thread_id, watch)
+
+    assert len(attempts) == 3
+    stored = index.get(parent.project_id, parent.thread_id)
+    assert stored is not None
+    records = [
+        message
+        for message in index._thread_messages(stored)  # noqa: SLF001
+        if message.get("type") == "child_watch"
+    ]
+    assert records
+    assert not records[-1].get("error")
