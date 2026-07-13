@@ -5578,6 +5578,14 @@ async def serve(cfg: Config) -> int:
             "  Set ORCHESTRATION_API_TOKEN, or ORCHESTRATION_API_ALLOW_INSECURE=true to override.\n"
         )
         return 1
+    import contextlib
+    import faulthandler
+    import signal as _signal
+
+    # SIGUSR1 dumps every thread's Python stack to stderr (the launchd error
+    # log) so a wedged process can be diagnosed without killing it.
+    with contextlib.suppress(AttributeError, ValueError, RuntimeError):
+        faulthandler.register(_signal.SIGUSR1, all_threads=True)
     app = make_app(cfg)
     runner = web.AppRunner(app, keepalive_timeout=15)
     await runner.setup()
