@@ -24,7 +24,6 @@ import httpx
 from jarvis.capabilities import (
     FORGE_BRANCH_PUSH,
     FORGE_PR_COMMENT,
-    WORKER_SESSION_APPROVE,
     WORKER_SESSION_CREATE,
     WORKER_SESSION_INPUT,
     WORKER_SESSION_INTERRUPT,
@@ -79,6 +78,7 @@ from jarvis.tools.base import Tool
 from jarvis.text import slugify
 from jarvis.users import load_users
 from jarvis.worker_session_contract import (
+    EVENT_APPROVAL_REQUESTED,
     EVENT_ASSISTANT_MESSAGE,
     EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
@@ -104,11 +104,15 @@ THREAD_TRANSCRIPTS_DIRNAME = "cockpit-thread-transcripts"
 # sandbox and Claude to plan mode, which leaves the agent unable to do the work
 # it is being asked to coordinate. Plan mode remains a per-turn choice the
 # operator can make from the composer, never an imposed default.
+# WORKER_SESSION_APPROVE is deliberately absent: holding it makes Codex ask for
+# approval on every command and Claude ask before acting, and an orchestrator
+# turn runs headless with nobody to answer — it would hang until the job
+# timeout. Without it the session acts autonomously (Codex "never", Claude
+# "dontAsk") inside its workspace-write sandbox.
 CONVERSATION_SESSION_ALLOWED_ACTIONS = [
     WORKER_SESSION_CREATE,
     WORKER_SESSION_TURN,
     WORKER_SESSION_INPUT,
-    WORKER_SESSION_APPROVE,
     WORKER_SESSION_INTERRUPT,
     WORKER_SESSION_STOP,
     FORGE_BRANCH_PUSH,
@@ -2205,6 +2209,15 @@ class CockpitConnector:
                 elif event_type == EVENT_TURN_FAILED:
                     terminal = True
                     terminal_error = turn_failure_message(data) or "orchestrator turn failed"
+                elif event_type == EVENT_APPROVAL_REQUESTED:
+                    # The session is minted to never ask; an approval here means
+                    # nobody can answer it, so fail closed instead of hanging
+                    # headless until the job timeout.
+                    terminal = True
+                    terminal_error = (
+                        "orchestrator turn requested an approval it cannot receive; "
+                        "the session is configured to act without approvals"
+                    )
                 elif event_type == EVENT_TURN_COMPLETED:
                     terminal = True
             if events and isinstance(events[-1], dict):

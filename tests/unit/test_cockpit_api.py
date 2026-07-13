@@ -5273,11 +5273,14 @@ def test_cockpit_thread_escalates_to_workspace_without_losing_thread_history(tmp
     assert turn_posts
     assert "Honcho session: project:neil-shared:orchestrator:" in turn_posts[0]["json"]["prompt"]
     session_create = next(call["json"] for call in state["posts"] if call["url"].endswith("/sessions"))
-    assert set(session_create["metadata"]["allowed_actions"]) >= {
+    granted = set(session_create["metadata"]["allowed_actions"])
+    assert granted >= {
         WORKER_SESSION_INPUT,
-        WORKER_SESSION_APPROVE,
         WORKER_SESSION_INTERRUPT,
     }
+    # Conversation turns are awaited headlessly, so the session must act rather
+    # than raise an approval nobody is there to answer.
+    assert WORKER_SESSION_APPROVE not in granted
     assert session_create["metadata"]["execution_envelope"]["allowed_actions"] == session_create["metadata"][
         "allowed_actions"
     ]
@@ -9849,11 +9852,15 @@ def test_failed_orchestrator_session_is_recreated_for_retry(tmp_path, monkeypatc
     assert retried.workspace["provider_started"] is False
     assert retried.workspace["status"] == "ready"
     session_create = posts[-1][1]
-    assert set(session_create["metadata"]["allowed_actions"]) >= {
+    granted = set(session_create["metadata"]["allowed_actions"])
+    assert granted >= {
         WORKER_SESSION_INPUT,
-        WORKER_SESSION_APPROVE,
         WORKER_SESSION_INTERRUPT,
     }
+    # The orchestrator acts autonomously: holding approve authority would make
+    # the provider ask for approvals no one can answer on a headless turn.
+    assert WORKER_SESSION_APPROVE not in granted
+    assert session_create["metadata"]["landing"]["mode"] == "branch_only"
     assert session_create["metadata"]["execution_envelope"]["allowed_actions"] == session_create["metadata"][
         "allowed_actions"
     ]
@@ -10999,3 +11006,37 @@ def test_orchestrator_session_authority_is_not_read_only_or_plan_mode() -> None:
     assert authority.claude_tool_denial("Bash") == ""
     assert authority.claude_tool_denial("Edit") == ""
     assert authority.claude_tool_denial("mcp__jarvis_orchestrator__spawn_child_work_session") == ""
+    # An orchestrator turn runs headless: asking for approval would hang it, so
+    # the session must be minted to act without one.
+    assert authority.codex_approval_policy == "never"
+    assert authority.claude_permission_mode == "dontAsk"
+    assert not authority.can_resolve_approval
+
+
+def test_orchestrator_turn_fails_closed_on_an_unanswerable_approval(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+
+    def get_events(_worker_id: str, _path: str) -> dict:
+        return {
+            "events": [
+                {
+                    "event_id": "event_1",
+                    "type": "approval.requested",
+                    "data": {"turn_id": "turn_current", "request_id": "req_1"},
+                }
+            ]
+        }
+
+    monkeypatch.setattr(connector, "_get_worker_json", get_events)
+
+    with pytest.raises(ProviderTurnError, match="approval"):
+        asyncio.run(
+            connector._wait_for_orchestrator_turn("worker_a", "session_a", "turn_current")  # noqa: SLF001
+        )

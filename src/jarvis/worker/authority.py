@@ -127,7 +127,12 @@ class WorkerSessionAuthority:
             trusted_mcp_servers=self.trusted_mcp_servers,
         ):
             return f"worker session is read-only; refusing Claude tool {name or '<unknown>'}"
-        if self.codex_sandbox != "read-only" and not self.can_resolve_approval:
+        # A write-capable session without approval authority runs in "dontAsk"
+        # mode: it never raises an approval, so there is nothing to strand. The
+        # sandbox and landing mode remain the real boundary. Only a session that
+        # *would* ask (permission mode "default") and cannot resolve the answer
+        # needs to refuse — that one would hang on its own request.
+        if self.claude_permission_mode == "default" and not self.can_resolve_approval:
             return f"worker session lacks {WORKER_SESSION_APPROVE}; refusing Claude tool {name or '<unknown>'}"
         return ""
 
