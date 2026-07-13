@@ -21,6 +21,11 @@ import httpx  # noqa: E402
 from aiohttp import web  # noqa: E402
 
 from jarvis.brain.capabilities import RequestContext, can_query_memory_peer  # noqa: E402
+from jarvis.capabilities import (  # noqa: E402
+    WORKER_SESSION_APPROVE,
+    WORKER_SESSION_INPUT,
+    WORKER_SESSION_INTERRUPT,
+)
 from jarvis.brain.memory_client import ConclusionRecord, MemoryMessage, RepresentationRecord, SessionPeer  # noqa: E402
 from jarvis.brain.memory_outbox import CurationOutbox  # noqa: E402
 from jarvis.connectors.cockpit import (  # noqa: E402
@@ -3049,6 +3054,427 @@ def test_cockpit_thread_execution_ignores_future_request_kinds_without_erasing_a
     assert execution["pending_requests"] == []
 
 
+def test_cockpit_thread_approval_resolves_attached_execution_idempotently(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil", caps=WORKER_SESSION_APPROVE)
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    index.save(
+        CockpitThread(
+            thread_id="thread_approval",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_approval"),
+            title="Approval conversation",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            engine="codex",
+            worker_id="macbook-worker",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_thread_approval"},
+        )
+    )
+    writes: list[tuple[str, dict[str, Any]]] = []
+
+    def worker_post(url: str, **kwargs: Any) -> Response:
+        writes.append((url, kwargs["json"]))
+        return Response({"ok": True, "event": {"type": "approval.resolved"}})
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        assert url == "http://worker.test/sessions/conv_thread_approval/execution-state"
+        return Response(
+            {
+                "session_id": "conv_thread_approval",
+                "status": "running",
+                "active_turn": {"turn_id": "turn_1", "status": "running", "started_at": "now"},
+                "pending_requests": [],
+                "supported_controls": ["turn", "approval", "interrupt"],
+                "supports": {"steer": False, "queue": False},
+            }
+        )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[httpx.Response, httpx.Response]:
+        payload = {
+            "request_id": "approval_1",
+            "decision": "approved",
+            "idempotency_key": "approve-once",
+            "allowed_actions": ["worker.session.stop"],
+            "metadata": {"allowed_actions": ["worker.session.stop"], "surface": "browser"},
+        }
+        first = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_approval/approval",
+            json=payload,
+        )
+        replay = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_approval/approval",
+            json=payload,
+        )
+        return first, replay
+
+    first, replay = asyncio.run(_with_server(cfg, calls, http_get=worker_get, http_post=worker_post))
+
+    assert first.status_code == 200
+    assert replay.json() == {**first.json(), "idempotent": True}
+    assert writes == [
+        (
+            "http://worker.test/sessions/conv_thread_approval/approval",
+            {
+                "request_id": "approval_1",
+                "decision": "approved",
+                "idempotency_key": "approve-once",
+                "metadata": {"surface": "browser"},
+                "allowed_actions": [WORKER_SESSION_APPROVE],
+            },
+        )
+    ]
+    assert first.json() == {
+        "ok": True,
+        "api_version": "v1",
+        "schema_version": 1,
+        "project_id": "neil-shared",
+        "thread_id": "thread_approval",
+        "control": {
+            "action": "approval",
+            "accepted": True,
+            "request_id": "approval_1",
+        },
+        "execution": {
+            "available": True,
+            "status": "running",
+            "active_turn": {"turn_id": "turn_1", "status": "running", "started_at": "now"},
+            "pending_requests": [],
+            "supported_controls": ["turn", "approval", "interrupt"],
+            "supports": {"steer": False, "queue": False},
+            "diagnostic": None,
+        },
+    }
+
+
+def test_cockpit_thread_input_resolves_by_conversation_identity(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil", caps=WORKER_SESSION_INPUT)
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    index.save(
+        CockpitThread(
+            thread_id="thread_input",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_input"),
+            title="Input conversation",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_thread_input"},
+        )
+    )
+    writes: list[dict[str, Any]] = []
+
+    def worker_post(url: str, **kwargs: Any) -> Response:
+        assert url == "http://worker.test/sessions/conv_thread_input/input"
+        writes.append(kwargs["json"])
+        return Response({"ok": True})
+
+    def worker_get(_url: str, **_kwargs: Any) -> Response:
+        return Response(
+            {
+                "session_id": "conv_thread_input",
+                "status": "running",
+                "active_turn": {"turn_id": "turn_1", "status": "running"},
+                "pending_requests": [],
+                "supported_controls": ["turn", "input"],
+                "supports": {"steer": False, "queue": False},
+            }
+        )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_input/input",
+            json={"request_id": "input_1", "answers": {"target": "Tests"}},
+        )
+
+    response = asyncio.run(_with_server(cfg, calls, http_get=worker_get, http_post=worker_post))
+
+    assert response.status_code == 200
+    assert response.json()["control"] == {
+        "action": "input",
+        "accepted": True,
+        "request_id": "input_1",
+    }
+    assert writes == [
+        {
+            "request_id": "input_1",
+            "answers": {"target": "Tests"},
+            "metadata": {},
+            "allowed_actions": [WORKER_SESSION_INPUT],
+        }
+    ]
+
+
+def test_cockpit_thread_interrupt_keeps_conversation_open_and_next_turn_recreates_execution(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil", caps=WORKER_SESSION_INTERRUPT)
+    _seed_project_registry(cfg)
+    posts: list[tuple[str, dict[str, Any]]] = []
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        if url.endswith("/execution-state"):
+            return Response(
+                {
+                    "session_id": "conv_thread_interrupt",
+                    "status": "interrupted",
+                    "active_turn": None,
+                    "pending_requests": [],
+                    "supported_controls": ["turn"],
+                    "supports": {"steer": False, "queue": False},
+                }
+            )
+        if url.endswith("/health"):
+            return Response(
+                {
+                    "ok": True,
+                    "agent": "codex",
+                    "default_engine": "codex",
+                    "supported_engines": ["codex"],
+                    "engine_supports": {"codex": {"streaming": True}},
+                    "repositories": [{"repo": "roughcoder/jarvis", "status": "ready"}],
+                }
+            )
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions"):
+            return Response({"sessions": []})
+        return Response({})
+
+    def worker_post(url: str, **kwargs: Any) -> Response:
+        body = kwargs["json"]
+        posts.append((url, body))
+        workspace = {
+            "workspace_id": "neil-shared-thread-interrupt",
+            "conversation_id": "neil-shared-thread-interrupt",
+            "root": str(tmp_path / "worker" / "conversation"),
+            "root_label": "thread-interrupt",
+            "cwd_label": "thread-interrupt",
+            "status": "ready",
+            "provision_phase": "ready",
+            "worktrees": [],
+        }
+        if url.endswith("/interrupt"):
+            return Response({"ok": True, "session": {"status": "interrupted"}})
+        if url.endswith("/conversation-workspaces"):
+            return Response({"ok": True, "workspace": workspace})
+        if url.endswith("/worktrees"):
+            workspace["worktrees"] = [{**body, "path": str(tmp_path / "worker" / "conversation" / "runtime")}]
+            return Response({"ok": True, "workspace": workspace})
+        if url.endswith("/sessions"):
+            return Response({"ok": True, "session": {**body, "status": "created"}})
+        if url.endswith("/turns"):
+            return Response({"ok": True, "session": {"session_id": body.get("session_id", ""), "status": "running"}})
+        return Response({"ok": False, "error": "unexpected worker post"}, status_code=400)
+
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+        worker_get=worker_get,
+        worker_post=worker_post,
+    )
+    connector.index.save(
+        CockpitThread(
+            thread_id="thread_interrupt",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_interrupt"),
+            title="Interrupt conversation",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            workspace={
+                "worker_id": "macbook-worker",
+                "session_id": "conv_thread_interrupt",
+                "status": "ready",
+                "provision_phase": "ready",
+                "root": str(tmp_path / "worker" / "conversation"),
+            },
+        )
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[httpx.Response, httpx.Response, dict[str, Any]]:
+        interrupted = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_interrupt/interrupt",
+            json={"turn_id": "turn_active", "idempotency_key": "interrupt-once"},
+        )
+        next_turn = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_interrupt/turns",
+            json={"text": "Continue with a fresh execution."},
+        )
+        detail = (
+            await client.get(f"{base}/v1/projects/neil-shared/threads/thread_interrupt")
+        ).json()["thread"]
+        return interrupted, next_turn, detail
+
+    interrupted, next_turn, detail = asyncio.run(
+        _with_server(cfg, calls, http_get=worker_get, http_post=worker_post)
+    )
+
+    assert interrupted.status_code == 200
+    assert interrupted.json()["execution"]["status"] == "interrupted"
+    assert interrupted.json()["control"] == {
+        "action": "interrupt",
+        "accepted": True,
+        "turn_id": "turn_active",
+    }
+    assert next_turn.status_code == 200
+    assert detail["lifecycle"] == "open"
+    assert detail["archived_at"] == ""
+    created_sessions = [body for url, body in posts if url.endswith("/sessions")]
+    assert created_sessions[-1]["session_id"] == "conv_thread-interrupt_1"
+
+
+def test_cockpit_thread_controls_require_addressable_request_or_turn_ids(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        identity="neil",
+        caps=f"{WORKER_SESSION_APPROVE},{WORKER_SESSION_INPUT},{WORKER_SESSION_INTERRUPT}",
+    )
+    _seed_project_registry(cfg)
+    CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json").save(
+        CockpitThread(
+            thread_id="thread_ids",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_ids"),
+            title="Addressable controls",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_thread_ids"},
+        )
+    )
+    writes: list[str] = []
+
+    async def calls(base: str, client: httpx.AsyncClient) -> list[httpx.Response]:
+        return [
+            await client.post(
+                f"{base}/v1/projects/neil-shared/threads/thread_ids/{action}",
+                json={},
+            )
+            for action in ("approval", "input", "interrupt")
+        ]
+
+    responses = asyncio.run(
+        _with_server(
+            cfg,
+            calls,
+            http_post=lambda url, **_kwargs: writes.append(url) or Response({"ok": True}),
+        )
+    )
+
+    assert [response.status_code for response in responses] == [400, 400, 400]
+    assert [response.json()["error"]["message"] for response in responses] == [
+        "request_id is required",
+        "request_id is required",
+        "turn_id is required",
+    ]
+    assert writes == []
+
+
+def test_cockpit_thread_controls_reject_archived_unattached_and_legacy_executions_safely(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil", caps=WORKER_SESSION_APPROVE)
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    common = {
+        "project_id": "neil-shared",
+        "session_id": orchestrator_session_id("neil-shared", "thread_control"),
+        "title": "Control safety",
+        "created_at": "2026-07-13T00:00:00Z",
+        "updated_at": "2026-07-13T00:00:00Z",
+        "created_by": "neil",
+    }
+    index.save(
+        CockpitThread(
+            thread_id="thread_archived",
+            archived_at="2026-07-13T00:01:00Z",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_archived"},
+            **common,
+        )
+    )
+    index.save(CockpitThread(thread_id="thread_unattached", **common))
+    index.save(
+        CockpitThread(
+            thread_id="thread_legacy",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_legacy"},
+            **common,
+        )
+    )
+    writes: list[str] = []
+
+    def worker_post(url: str, **_kwargs: Any) -> Response:
+        writes.append(url)
+        return Response(
+            {"ok": False, "error": "worker session missing required authority: worker.session.approve"},
+            status_code=403,
+        )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> list[httpx.Response]:
+        return [
+            await client.post(
+                f"{base}/v1/projects/neil-shared/threads/{thread_id}/approval",
+                json={"request_id": "approval_1", "decision": "approved"},
+            )
+            for thread_id in ("thread_archived", "thread_unattached", "thread_legacy")
+        ]
+
+    archived, unattached, legacy = asyncio.run(_with_server(cfg, calls, http_post=worker_post))
+
+    assert archived.status_code == 409
+    assert archived.json()["error"]["code"] == "thread_archived"
+    assert unattached.status_code == 409
+    assert unattached.json()["error"]["code"] == "execution_unavailable"
+    assert legacy.status_code == 403
+    assert legacy.json()["error"]["code"] == "forbidden"
+    assert writes == ["http://worker.test/sessions/conv_legacy/approval"]
+
+
+def test_cockpit_thread_control_requires_global_capability(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json").save(
+        CockpitThread(
+            thread_id="thread_no_capability",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_no_capability"),
+            title="No authority",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_no_capability"},
+        )
+    )
+    writes: list[str] = []
+
+    async def calls(base: str, client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_no_capability/approval",
+            json={"request_id": "approval_1", "decision": "approved"},
+        )
+
+    response = asyncio.run(
+        _with_server(
+            cfg,
+            calls,
+            http_post=lambda url, **_kwargs: writes.append(url) or Response({"ok": True}),
+        )
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["message"] == f"missing authority: {WORKER_SESSION_APPROVE}"
+    assert writes == []
+
+
 def test_cockpit_brain_thread_detail_exposes_addressable_local_active_turn(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     class BlockingGateway(FakeGateway):
         def __init__(self) -> None:
@@ -3683,6 +4109,15 @@ def test_cockpit_thread_escalates_to_workspace_without_losing_thread_history(tmp
     turn_posts = [call for call in state["posts"] if call["url"].endswith("/turns")]
     assert turn_posts
     assert "Honcho session: project:neil-shared:orchestrator:" in turn_posts[0]["json"]["prompt"]
+    session_create = next(call["json"] for call in state["posts"] if call["url"].endswith("/sessions"))
+    assert set(session_create["metadata"]["allowed_actions"]) >= {
+        WORKER_SESSION_INPUT,
+        WORKER_SESSION_APPROVE,
+        WORKER_SESSION_INTERRUPT,
+    }
+    assert session_create["metadata"]["execution_envelope"]["allowed_actions"] == session_create["metadata"][
+        "allowed_actions"
+    ]
 
 
 def test_cockpit_thread_workspace_turn_idempotency_key_differs_for_repeat_text(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -8224,10 +8659,10 @@ def test_failed_orchestrator_session_is_recreated_for_retry(tmp_path, monkeypatc
         max_concurrent_jobs=2,
     )
     registry = type("Registry", (), {"choose": lambda *_args, **_kwargs: profile})()
-    posts: list[str] = []
+    posts: list[tuple[str, dict[str, Any]]] = []
 
     def post(_worker_id: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
-        posts.append(path)
+        posts.append((path, body))
         if path == "/conversation-workspaces":
             return {"ok": True, "workspace": {"root": str(tmp_path / "conversation")}}
         assert path == "/sessions"
@@ -8246,10 +8681,19 @@ def test_failed_orchestrator_session_is_recreated_for_retry(tmp_path, monkeypatc
         )
     )
 
-    assert posts == ["/conversation-workspaces", "/sessions"]
+    assert [path for path, _body in posts] == ["/conversation-workspaces", "/sessions"]
     assert retried.workspace["session_id"] == "orch_thread-retry_1"
     assert retried.workspace["provider_started"] is False
     assert retried.workspace["status"] == "ready"
+    session_create = posts[-1][1]
+    assert set(session_create["metadata"]["allowed_actions"]) >= {
+        WORKER_SESSION_INPUT,
+        WORKER_SESSION_APPROVE,
+        WORKER_SESSION_INTERRUPT,
+    }
+    assert session_create["metadata"]["execution_envelope"]["allowed_actions"] == session_create["metadata"][
+        "allowed_actions"
+    ]
 
 
 def test_cockpit_thread_projection_keeps_conversation_open_after_turn(tmp_path, monkeypatch) -> None:  # noqa: ANN001

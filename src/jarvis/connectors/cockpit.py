@@ -21,7 +21,15 @@ from typing import Any
 
 import httpx
 
-from jarvis.capabilities import FORGE_PR_COMMENT, WORKER_SESSION_CREATE, WORKER_SESSION_STOP, WORKER_SESSION_TURN
+from jarvis.capabilities import (
+    FORGE_PR_COMMENT,
+    WORKER_SESSION_APPROVE,
+    WORKER_SESSION_CREATE,
+    WORKER_SESSION_INPUT,
+    WORKER_SESSION_INTERRUPT,
+    WORKER_SESSION_STOP,
+    WORKER_SESSION_TURN,
+)
 from jarvis.brain.facade import (
     PROJECT_THREAD_TOOL_SURFACE_CONTRACT,
     ActiveProject,
@@ -83,6 +91,14 @@ from jarvis.worker_session_contract import (
 
 THREAD_INDEX_FILENAME = "cockpit-threads.json"
 THREAD_TRANSCRIPTS_DIRNAME = "cockpit-thread-transcripts"
+CONVERSATION_SESSION_ALLOWED_ACTIONS = [
+    WORKER_SESSION_CREATE,
+    WORKER_SESSION_TURN,
+    WORKER_SESSION_INPUT,
+    WORKER_SESSION_APPROVE,
+    WORKER_SESSION_INTERRUPT,
+    WORKER_SESSION_STOP,
+]
 THREAD_HISTORY_LIMIT = 24
 CHILD_WATCH_LEASE_S = 300
 CHILD_WORK_LANDING_MODES = {"none", "branch_only", "draft_pr", "ready_pr", "confirm_before_pr"}
@@ -1006,6 +1022,26 @@ class CockpitConnector:
         if not title or title == thread.title:
             return thread
         return self._index.save(replace(thread, title=title[:200], updated_at=utc_now()))
+
+    def detach_interrupted_execution(self, project: ProjectEntry, thread_id: str) -> CockpitThread | None:
+        thread = self._index.get(project.id, thread_id)
+        if thread is None:
+            return None
+        return self._index.save(
+            replace(
+                thread,
+                updated_at=utc_now(),
+                workspace={
+                    **thread.workspace,
+                    "session_id": "",
+                    "provider_started": False,
+                    "status": "interrupted",
+                    "provision_phase": "interrupted",
+                    "session_generation": int(thread.workspace.get("session_generation") or 0) + 1,
+                },
+            )
+        )
+
     def delete_thread(self, project: ProjectEntry, thread_id: str) -> tuple[CockpitThread | None, bool]:
         return self._index.delete(project.id, thread_id)
 
@@ -1439,10 +1475,10 @@ class CockpitConnector:
                         "run_id": thread.thread_id,
                         "engine": thread.engine,
                         "model": thread.model,
-                        "allowed_actions": [WORKER_SESSION_CREATE, WORKER_SESSION_TURN, WORKER_SESSION_STOP],
+                        "allowed_actions": CONVERSATION_SESSION_ALLOWED_ACTIONS,
                         "landing": {"mode": "review", "allow_merge": False},
                     },
-                    "allowed_actions": [WORKER_SESSION_CREATE, WORKER_SESSION_TURN, WORKER_SESSION_STOP],
+                    "allowed_actions": CONVERSATION_SESSION_ALLOWED_ACTIONS,
                     "landing": {"mode": "review", "allow_merge": False},
                     "model": thread.model,
                     "trusted_mcp_servers": ["jarvis_orchestrator"],
@@ -1545,11 +1581,19 @@ class CockpitConnector:
         repos = _workspace_repos(project, workspace_request)
         for repo in repos:
             thread = self._mark_phase(thread, phase="cloning")
-            if progress is not None:
-                progress({"phase": "cloning", "thread_id": thread.thread_id, "repo": repo.get("name") or repo.get("repo")})
+            await _emit_progress(
+                progress,
+                {"phase": "cloning", "thread_id": thread.thread_id, "repo": repo.get("name") or repo.get("repo")},
+            )
             thread = self._mark_phase(thread, phase="creating-worktree")
-            if progress is not None:
-                progress({"phase": "creating-worktree", "thread_id": thread.thread_id, "repo": repo.get("name") or repo.get("repo")})
+            await _emit_progress(
+                progress,
+                {
+                    "phase": "creating-worktree",
+                    "thread_id": thread.thread_id,
+                    "repo": repo.get("name") or repo.get("repo"),
+                },
+            )
             materialized = await asyncio.to_thread(
                 self._post_worker_json,
                 worker_id,
@@ -1635,7 +1679,9 @@ class CockpitConnector:
                 workspace_state,
                 progress,
             )
-            session_id = str(state.get("session_id") or f"conv_{slugify(thread.thread_id)}")
+            generation = int(state.get("session_generation") or 0)
+            suffix = f"_{generation}" if generation else ""
+            session_id = str(state.get("session_id") or f"conv_{slugify(thread.thread_id)}{suffix}")
             engine = str(workspace_request.get("engine") or profile.default_engine or profile.agent or self._cfg.worker.agent)
             await asyncio.to_thread(
                 self._ensure_worker_session,
@@ -1651,10 +1697,10 @@ class CockpitConnector:
                         "execution_envelope": {
                             "run_id": thread.thread_id,
                             "engine": engine,
-                            "allowed_actions": [WORKER_SESSION_CREATE, WORKER_SESSION_TURN, WORKER_SESSION_STOP],
+                            "allowed_actions": CONVERSATION_SESSION_ALLOWED_ACTIONS,
                             "landing": {"mode": "branch_only", "allow_merge": False},
                         },
-                        "allowed_actions": [WORKER_SESSION_CREATE, WORKER_SESSION_TURN, WORKER_SESSION_STOP],
+                        "allowed_actions": CONVERSATION_SESSION_ALLOWED_ACTIONS,
                         "landing": {"mode": "branch_only", "allow_merge": False},
                         "conversation_workspace": True,
                         "workspace_id": workspace_state.get("workspace_id") or "",

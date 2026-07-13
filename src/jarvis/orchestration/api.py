@@ -777,6 +777,10 @@ def make_app(
         web.post("/v1/projects/{project_id}/threads", writes.project_thread_open),
         web.patch("/v1/projects/{project_id}/threads/{thread_id}", writes.project_thread_rename),
         web.post("/v1/projects/{project_id}/threads/{thread_id}/turns", writes.project_thread_turn),
+        web.post(
+            "/v1/projects/{project_id}/threads/{thread_id}/{action:input|approval|interrupt}",
+            writes.project_thread_control,
+        ),
         web.post("/v1/projects/{project_id}/threads/{thread_id}/archive", writes.project_thread_archive),
         web.post("/v1/projects/{project_id}/threads/{thread_id}/unarchive", writes.project_thread_unarchive),
         web.delete("/v1/projects/{project_id}/threads/{thread_id}", writes.project_thread_delete),
@@ -1856,6 +1860,75 @@ class CockpitWriteHandlers:
             for session in cold_sessions:
                 schedule_cold_task_drain(session)
         return response
+
+    async def project_thread_control(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        body = await _json_body(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        project = await _project_for_member_route(self.ctx, request, requester)
+        connector = _cockpit_connector(self.ctx)
+        thread_id = request.match_info["thread_id"]
+        thread = await asyncio.to_thread(connector.index.get, project.id, thread_id)
+        if thread is None:
+            raise CockpitError("not_found", "thread not found", status=404)
+        if thread.archived_at:
+            raise CockpitError("thread_archived", "thread is archived", recoverable=True, status=409)
+        worker_id = str(thread.workspace.get("worker_id") or thread.worker_id or "")
+        session_id = str(thread.workspace.get("session_id") or "")
+        if not worker_id or not session_id:
+            raise CockpitError(
+                "execution_unavailable",
+                "thread has no attached worker execution",
+                recoverable=True,
+                status=409,
+            )
+        action = request.match_info["action"]
+        required = _required_session_action(action)
+        reference_key = "turn_id" if action == "interrupt" else "request_id"
+        reference_id = str(body.get(reference_key) or "").strip()
+        if not reference_id:
+            raise CockpitError(
+                "validation_failed",
+                f"{reference_key} is required",
+                recoverable=True,
+                status=400,
+            )
+        scope = f"projects/{project.id}/threads/{thread_id}/{action}"
+        fingerprint_body = {**body, "project_id": project.id, "thread_id": thread_id, "action": action}
+
+        async def produce() -> dict[str, Any]:
+            _require_capability(self.ctx.cfg, required)
+            await asyncio.to_thread(
+                _worker_post_json,
+                self.ctx.cfg,
+                worker_id,
+                f"/sessions/{session_id}/{action}",
+                _worker_control_body(body, required),
+                post=self.ctx.post,
+            )
+            execution = _thread_execution_projection(thread, self.ctx)
+            control = {"action": action, "accepted": True, reference_key: reference_id}
+            if action == "interrupt":
+                await asyncio.to_thread(connector.detach_interrupted_execution, project, thread_id)
+            return {
+                "ok": True,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "project_id": project.id,
+                "thread_id": thread_id,
+                "control": control,
+                "execution": execution,
+            }
+
+        response_body = await _idempotent_write_body(
+            self.ctx,
+            scope,
+            str(body.get("idempotency_key") or ""),
+            fingerprint_body,
+            produce,
+            requester=requester,
+        )
+        return web.json_response(response_body)
 
     async def project_thread_rename(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
