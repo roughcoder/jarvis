@@ -10801,3 +10801,26 @@ def test_project_thread_turn_maps_provider_failures_to_engine_error(tmp_path, mo
     payload = json.dumps(errors[0])
     assert "engine_error" in payload
     assert "usageLimitExceeded" in payload
+
+
+def test_child_work_repo_resolves_registry_alias_to_remote() -> None:
+    from jarvis.brain.registry import ProjectEntry, RepoEntry
+    from jarvis.connectors.cockpit import _child_work_repo
+
+    project = ProjectEntry(
+        id="jarvis",
+        name="Jarvis",
+        owner="neil",
+        members=("neil",),
+        repos=(
+            RepoEntry(name="runtime", remote="roughcoder/jarvis", default=True),
+            RepoEntry(name="cockpit", remote="roughcoder/jarvis-cockpit"),
+        ),
+    )
+
+    assert _child_work_repo(project, "cockpit") == "roughcoder/jarvis-cockpit"
+    assert _child_work_repo(project, "roughcoder/jarvis-cockpit") == "roughcoder/jarvis-cockpit"
+    assert _child_work_repo(project, "") == "roughcoder/jarvis"
+    assert _child_work_repo(project, "other-org/other-repo") == "other-org/other-repo"
+    empty = ProjectEntry(id="bare", name="Bare", owner="neil", members=("neil",))
+    assert _child_work_repo(empty, "", default="fallback/repo") == "fallback/repo"

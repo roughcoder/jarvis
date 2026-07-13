@@ -2639,7 +2639,7 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
         title = str(args.get("title") or args.get("name") or task).strip()
         if not task:
             return "error: task is required"
-        repo = str(args.get("repo") or _project_default_repo(project) or cfg.orchestration.default_repo).strip()
+        repo = _child_work_repo(project, str(args.get("repo") or ""), default=cfg.orchestration.default_repo)
         item = WorkItem(
             source="manual",
             id=new_id("manual"),
@@ -3145,6 +3145,20 @@ def _github_review_worker(cfg: Config, project: ProjectEntry, repo: str):  # noq
         ):
             return worker
     raise RuntimeError(f"no authenticated worker can publish reviews for a repository in project {project.id}")
+
+
+def _child_work_repo(project: ProjectEntry, requested: str, *, default: str = "") -> str:
+    """Resolve a child work repo request to a worker-usable remote.
+
+    Orchestrators reference repos by their registry alias (the name shown in
+    the workspace projection); workers only understand remotes, so an alias
+    that reaches `gh repo clone` unmapped fails to resolve.
+    """
+    repo = requested.strip() or _project_default_repo(project) or default
+    registry_match = next((entry for entry in project.repos if repo in (entry.name, entry.remote)), None)
+    if registry_match is not None and registry_match.remote:
+        return registry_match.remote
+    return repo
 
 
 def _project_default_repo(project: ProjectEntry) -> str:
