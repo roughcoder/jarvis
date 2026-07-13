@@ -120,6 +120,10 @@ CONVERSATION_SESSION_ALLOWED_ACTIONS = [
 CONVERSATION_SESSION_LANDING = {"mode": "branch_only", "allow_merge": False}
 THREAD_HISTORY_LIMIT = 24
 CHILD_WATCH_LEASE_S = 300
+# A claim only needs a heartbeat, not a durable write per retry tick. Renewing
+# on every tick appended a child_watch record each time and grew the transcript
+# without bound (a 40s wait once produced 158 records for one watch).
+CHILD_WATCH_RENEW_INTERVAL_S = CHILD_WATCH_LEASE_S // 3
 THREAD_TURN_QUEUE_LIMIT = 32
 THREAD_TURN_RECEIPT_REPLY_LIMIT = 4_000
 CHILD_WORK_LANDING_MODES = {"none", "branch_only", "draft_pr", "ready_pr", "confirm_before_pr"}
@@ -1011,6 +1015,23 @@ class CockpitThreadIndex:
                 self._append_thread_messages(stored, [existing])
             return watch_id
 
+    @staticmethod
+    def _latest_child_watches(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """Effective state per watch: the transcript is append-only, so each
+        renewal/claim/finish adds a record and only the *last* one for a watch
+        id is current. Scanning for the first match reads state that a later
+        record has already superseded — a completed watch still looked
+        `waiting`, which could re-claim it and fire a duplicate continuation.
+        """
+        latest: dict[str, dict[str, Any]] = {}
+        for message in messages:
+            if message.get("type") != "child_watch":
+                continue
+            watch_id = str(message.get("watch_id") or "")
+            if watch_id:
+                latest[watch_id] = message
+        return latest
+
     def claim_ready_child_watch(self, parent_chat_id: str, terminal_child_ids: set[str]) -> dict[str, Any] | None:
         thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
         if thread is None:
@@ -1021,22 +1042,18 @@ class CockpitThreadIndex:
                 return None
             messages = self._thread_messages(thread)
             claimed: dict[str, Any] | None = None
-            for message in messages:
+            for message in self._latest_child_watches(messages).values():
                 expected = {str(item) for item in message.get("child_chat_ids") or []}
                 phase = str(message.get("phase") or "")
                 lease_expired = phase == "claimed" and _timestamp_before(
                     str(message.get("claimed_at") or ""),
                     datetime.now(UTC) - timedelta(seconds=CHILD_WATCH_LEASE_S),
                 )
-                if (
-                    message.get("type") == "child_watch"
-                    and (phase == "waiting" or lease_expired)
-                    and expected
-                    and expected <= terminal_child_ids
-                ):
+                if (phase == "waiting" or lease_expired) and expected and expected <= terminal_child_ids:
+                    message = dict(message)
                     message["phase"] = "claimed"
                     message["claimed_at"] = utc_now()
-                    claimed = dict(message)
+                    claimed = message
                     break
             if claimed is not None:
                 self._append_thread_messages(thread, [claimed])
@@ -1051,14 +1068,15 @@ class CockpitThreadIndex:
             if thread is None:
                 return
             messages = self._thread_messages(thread)
-            for message in messages:
-                if message.get("type") == "child_watch" and message.get("watch_id") == watch_id:
-                    message["phase"] = "failed" if error else "completed"
-                    message["completed_at"] = utc_now()
-                    if error:
-                        message["error"] = public_error_message(error)
-                    self._append_thread_messages(thread, [message])
-                    break
+            latest = self._latest_child_watches(messages).get(watch_id)
+            if latest is None:
+                return
+            finished = dict(latest)
+            finished["phase"] = "failed" if error else "completed"
+            finished["completed_at"] = utc_now()
+            if error:
+                finished["error"] = public_error_message(error)
+            self._append_thread_messages(thread, [finished])
 
     def renew_child_watch_claim(self, parent_chat_id: str, watch_id: str) -> None:
         thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
@@ -1069,15 +1087,19 @@ class CockpitThreadIndex:
             if thread is None:
                 return
             messages = self._thread_messages(thread)
-            for message in messages:
-                if (
-                    message.get("type") == "child_watch"
-                    and message.get("watch_id") == watch_id
-                    and message.get("phase") == "claimed"
-                ):
-                    message["claimed_at"] = utc_now()
-                    self._append_thread_messages(thread, [message])
-                    return
+            latest = self._latest_child_watches(messages).get(watch_id)
+            if latest is None or str(latest.get("phase") or "") != "claimed":
+                return
+            # The lease is still comfortably alive; another record would only
+            # grow the transcript.
+            if not _timestamp_before(
+                str(latest.get("claimed_at") or ""),
+                datetime.now(UTC) - timedelta(seconds=CHILD_WATCH_RENEW_INTERVAL_S),
+            ):
+                return
+            renewed = dict(latest)
+            renewed["claimed_at"] = utc_now()
+            self._append_thread_messages(thread, [renewed])
 
     def child_watch_is_claimed(self, parent_chat_id: str, watch_id: str) -> bool:
         thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
@@ -1087,12 +1109,8 @@ class CockpitThreadIndex:
             thread = self.get(thread.project_id, thread.thread_id)
             if thread is None:
                 return False
-            return any(
-                message.get("type") == "child_watch"
-                and message.get("watch_id") == watch_id
-                and message.get("phase") == "claimed"
-                for message in self._thread_messages(thread)
-            )
+            latest = self._latest_child_watches(self._thread_messages(thread)).get(watch_id)
+            return latest is not None and str(latest.get("phase") or "") == "claimed"
 
     def append_turn(
         self,
@@ -3012,7 +3030,7 @@ def _continue_child_watch(cfg: Config, parent_chat_id: str, watch: dict[str, Any
                     await connector.drain_queued_turns(project, thread.thread_id)
                     if index.has_queued_turns(thread.project_id, thread.thread_id):
                         index.renew_child_watch_claim(parent_chat_id, watch_id)
-                        await asyncio.sleep(0.25)
+                        await asyncio.sleep(1.0)
                         continue
                 await connector.turn(project, thread, requester, instruction)
                 break
@@ -3040,7 +3058,7 @@ def _continue_child_watch(cfg: Config, parent_chat_id: str, watch: dict[str, Any
                 if not retryable or asyncio.get_running_loop().time() >= deadline:
                     raise
                 index.renew_child_watch_claim(parent_chat_id, watch_id)
-                await asyncio.sleep(2.0 if transport else 0.25)
+                await asyncio.sleep(2.0 if transport else 1.0)
 
     try:
         asyncio.run(run())
