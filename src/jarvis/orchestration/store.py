@@ -13,6 +13,7 @@ import shutil
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
+from typing import Any
 
 from jarvis.ids import new_id, utc_now
 from jarvis.jsonl_cache import JsonlCacheEntry, read_jsonl_projection
@@ -249,6 +250,32 @@ class OrchestrationStore:
         self.bump_generation()
         return event
 
+    def append_event_if_run_visible(
+        self,
+        run_id: str,
+        event_type: str,
+        message: str = "",
+        data: dict | None = None,
+    ) -> RunEvent | None:
+        """Append only while the run still exists and has not been archived."""
+
+        with self._locked():
+            run = self.get(run_id)
+            if run is None or run.archived_at:
+                return None
+            return self.append_event(run_id, event_type, message, data)
+
+    def persist_worker_session_events(
+        self,
+        run_id: str,
+        session_id: str,
+        events: list[dict[str, Any]],
+    ) -> int:
+        """Atomically deduplicate and append worker events shared by sync and dispatch writers."""
+
+        with self._locked():
+            return self._persist_worker_session_events_unlocked(run_id, session_id, events)
+
     def events(self, run_id: str) -> list[RunEvent]:
         try:
             p = self.events_path(run_id)
@@ -290,6 +317,48 @@ class OrchestrationStore:
             run.terminal_reason = ""
         self.save(run)
         self.append_event(run_id, "phase_changed", message or f"Phase changed to {phase}", {"phase": phase})
+        if run.status == "terminal":
+            self.notify_parent_child_terminal(run)
+        return run
+
+    def set_phase_if_execution_unchanged(
+        self,
+        run_id: str,
+        phase: str,
+        message: str,
+        *,
+        expected_phase: str,
+        expected_status: str,
+        expected_jobs: tuple[tuple[str, str, str], ...],
+        expected_sessions: tuple[tuple[str, str, str, str], ...],
+    ) -> OrchestrationRun | None:
+        """Atomically finalize a run only while its observed execution set is unchanged."""
+
+        with self._locked():
+            run = self.get(run_id)
+            if run is None or run.archived_at:
+                return None
+            jobs = tuple((job.worker_id, job.job_id, job.status) for job in run.jobs)
+            sessions = tuple(
+                (session.worker_id, session.session_id, session.status, session.archived_at)
+                for session in run.sessions
+            )
+            if (
+                run.phase != expected_phase
+                or run.status != expected_status
+                or jobs != expected_jobs
+                or sessions != expected_sessions
+            ):
+                return None
+            run.phase = phase  # type: ignore[assignment]
+            if phase in {"done", "completed", "failed", "blocked", "cancelled", "needs_human"}:
+                run.status = "terminal"
+                run.terminal_reason = message
+            else:
+                run.status = "active"
+                run.terminal_reason = ""
+            self.save(run)
+            self.append_event(run_id, "phase_changed", message or f"Phase changed to {phase}", {"phase": phase})
         if run.status == "terminal":
             self.notify_parent_child_terminal(run)
         return run
@@ -670,6 +739,93 @@ class OrchestrationStore:
                 )
             return run
 
+    def update_session_if_unchanged(
+        self,
+        run_id: str,
+        session_id: str,
+        *,
+        worker_id: str,
+        expected: WorkerSessionLink,
+        events: list[dict[str, Any]] | None = None,
+        **updates: str | list[str],
+    ) -> OrchestrationRun | None:
+        """Apply a worker observation only if the linked session is still the observed version."""
+
+        with self._locked():
+            run = self.get(run_id)
+            if run is None or run.archived_at or run.status == "terminal":
+                return None
+            session = next((x for x in run.sessions if x.worker_id == worker_id and x.session_id == session_id), None)
+            if session is None or session.to_dict() != expected.to_dict():
+                return None
+            if events:
+                self._persist_worker_session_events_unlocked(run_id, session_id, events)
+            changed: dict[str, str | list[str]] = {}
+            for field in (
+                "status",
+                "ended_reason",
+                "provider",
+                "engine",
+                "project_id",
+                "branch",
+                "cwd",
+                "last_event_id",
+                "allowed_actions",
+            ):
+                value = updates.get(field)
+                if value is None:
+                    continue
+                if getattr(session, field) != value:
+                    setattr(session, field, value)
+                    changed[field] = value
+            if changed:
+                self.save(run)
+                self.append_event(
+                    run_id,
+                    "session_updated",
+                    f"Worker session {session_id} updated",
+                    {"session_id": session_id, **changed},
+                )
+            return run
+
+    def _persist_worker_session_events_unlocked(
+        self,
+        run_id: str,
+        session_id: str,
+        events: list[dict[str, Any]],
+    ) -> int:
+        run = self.get(run_id)
+        if run is None or run.archived_at:
+            return 0
+        existing = {
+            str(event.data.get("event_id") or "")
+            for event in self.events(run_id)
+            if isinstance(event.data, dict) and event.data.get("event_id")
+        }
+        persisted = 0
+        for raw in events:
+            event_id = str(raw.get("event_id") or "")
+            if event_id and event_id in existing:
+                continue
+            data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+            self.append_event(
+                run_id,
+                str(raw.get("type") or "session.event"),
+                "",
+                {
+                    "session_id": session_id,
+                    "event_id": event_id,
+                    "turn_id": str(data.get("turn_id") or ""),
+                    "message_id": str(data.get("message_id") or ""),
+                    "time": str(raw.get("time") or ""),
+                    "data": dict(data),
+                },
+            )
+            persisted += 1
+            if event_id:
+                existing.add(event_id)
+        return persisted
+
     def reserve_job_if_idle(self, run_id: str, job: WorkerJobLink) -> OrchestrationRun:
         with self._locked():
             run = self.get(run_id)
@@ -768,6 +924,41 @@ class OrchestrationStore:
             job = next((x for x in run.jobs if x.job_id == job_id), None)
             if job is None:
                 raise KeyError(job_id)
+            changed: dict[str, str] = {}
+            for field in ("status", "session_id", "session_name", "branch", "cwd"):
+                value = updates.get(field)
+                if value is None:
+                    continue
+                if getattr(job, field) != value:
+                    setattr(job, field, value)
+                    changed[field] = value
+            if changed:
+                self.save(run)
+                self.append_event(
+                    run_id,
+                    "job_updated",
+                    f"Worker job {job_id} updated",
+                    {"job_id": job_id, **changed},
+                )
+            return run
+
+    def update_job_if_unchanged(
+        self,
+        run_id: str,
+        job_id: str,
+        *,
+        expected: WorkerJobLink,
+        **updates: str,
+    ) -> OrchestrationRun | None:
+        """Apply a worker observation only if the linked job is still the observed version."""
+
+        with self._locked():
+            run = self.get(run_id)
+            if run is None or run.archived_at or run.status == "terminal":
+                return None
+            job = next((x for x in run.jobs if x.job_id == job_id), None)
+            if job is None or job.to_dict() != expected.to_dict():
+                return None
             changed: dict[str, str] = {}
             for field in ("status", "session_id", "session_name", "branch", "cwd"):
                 value = updates.get(field)

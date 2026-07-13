@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import pathlib
 import re
+import threading
 import time
 from dataclasses import dataclass
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 from jarvis.capabilities import (
     FORGE_BRANCH_PUSH,
@@ -38,6 +40,31 @@ from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES
 API_VERSION = "v1"
 SCHEMA_VERSION = 1
 IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
+BULK_CHECKPOINT_WARNING_INTERVAL_S = 60.0
+
+logger = logging.getLogger(__name__)
+_bulk_checkpoint_warning_lock = threading.Lock()
+_bulk_checkpoint_next_warning_at: dict[tuple[str, str], float] = {}
+
+WorkerReadStatus = Literal["success", "unsupported", "failure"]
+
+
+@dataclass(frozen=True)
+class WorkerReadDiagnostic:
+    worker_id: str
+    resource: str
+    status: WorkerReadStatus
+    failure_kind: str = ""
+    status_code: int = 0
+    error_type: str = ""
+    session_id: str = ""
+
+
+@dataclass(frozen=True)
+class WorkerCollectionRead:
+    status: WorkerReadStatus
+    items: tuple[dict[str, Any], ...] = ()
+    diagnostic: WorkerReadDiagnostic | None = None
 
 CURSOR_PREFIX = "evt_"
 MAX_PAGE_LIMIT = 500
@@ -320,6 +347,15 @@ def cockpit_snapshot(
             timeout_s=sync_timeout_s,
             should_sync_worker=should_sync_worker,
         )
+    if worker_state is not None:
+        sync = dict(sync)
+        sync["diagnostics"] = [
+            dict(item)
+            for item in worker_state.get("diagnostics") or []
+            if isinstance(item, dict)
+        ]
+        if worker_state.get("partial"):
+            sync["status"] = "partial"
     all_runs = all_runs if all_runs is not None else store.list_runs()
     archived_run_ids = {run.run_id for run in all_runs if run.archived_at}
     archived_session_refs = archived_session_refs_for_store(store, all_runs) | deleted_session_refs_for_store(store)
@@ -675,6 +711,7 @@ def aggregate_sessions(
     archived_session_refs: set[str] | None = None,
     timeout_s: float | None = None,
     should_sync_worker: Callable[[WorkerProfile], bool] | None = None,
+    diagnostics: list[WorkerReadDiagnostic] | None = None,
 ) -> dict[str, dict[str, Any]]:
     sessions: dict[str, dict[str, Any]] = {}
     worker_by_id = worker_by_id or {}
@@ -701,29 +738,33 @@ def aggregate_sessions(
         if should_sync_worker is not None and not should_sync_worker(profile):
             continue
         headers = worker_headers(worker_cfg, profile)
-        try:
-            response = http_get(f"{profile.base_url}/sessions", headers=headers, timeout=timeout)
-            if getattr(response, "status_code", 200) >= 400:
-                continue
-            for raw in response.json().get("sessions", []):
-                if not isinstance(raw, dict):
-                    continue
-                ref = make_session_ref(profile.worker_id, str(raw.get("session_id") or ""))
-                if ref in archived_session_refs or str(raw.get("run_id") or "") in archived_run_ids:
-                    continue
-                run = run_by_id.get(str(raw.get("run_id") or ""))
-                worker_row = _session_from_worker(raw, profile.worker_id, run=run)
-                if ref in sessions:
-                    stored = sessions[ref]
-                    worker_row["project_id"] = worker_row.get("project_id") or stored.get("project_id", "")
-                    worker_row["run_id"] = worker_row.get("run_id") or stored.get("run_id", "")
-                    worker_row["title"] = worker_row.get("title") or stored.get("title", "")
-                    worker_row["latest_event_cursor"] = worker_row.get("latest_event_cursor") or stored.get("latest_event_cursor", "")
-                    worker_row["archived_at"] = stored.get("archived_at") or worker_row.get("archived_at", "")
-                    worker_row["allowed_actions"] = worker_row.get("allowed_actions") or stored.get("allowed_actions", [])
-                sessions[ref] = worker_row
-        except Exception:  # noqa: BLE001 - aggregate views must remain inspectable
+        outcome = _worker_collection_read(
+            worker_id=profile.worker_id,
+            resource="sessions",
+            url=f"{profile.base_url}/sessions",
+            collection_key="sessions",
+            headers=headers,
+            timeout=timeout,
+            http_get=http_get,
+        )
+        _append_worker_read_diagnostic(diagnostics, outcome)
+        if outcome.status != "success":
             continue
+        for raw in outcome.items:
+            ref = make_session_ref(profile.worker_id, str(raw.get("session_id") or ""))
+            if ref in archived_session_refs or str(raw.get("run_id") or "") in archived_run_ids:
+                continue
+            run = run_by_id.get(str(raw.get("run_id") or ""))
+            worker_row = _session_from_worker(raw, profile.worker_id, run=run)
+            if ref in sessions:
+                stored = sessions[ref]
+                worker_row["project_id"] = worker_row.get("project_id") or stored.get("project_id", "")
+                worker_row["run_id"] = worker_row.get("run_id") or stored.get("run_id", "")
+                worker_row["title"] = worker_row.get("title") or stored.get("title", "")
+                worker_row["latest_event_cursor"] = worker_row.get("latest_event_cursor") or stored.get("latest_event_cursor", "")
+                worker_row["archived_at"] = stored.get("archived_at") or worker_row.get("archived_at", "")
+                worker_row["allowed_actions"] = worker_row.get("allowed_actions") or stored.get("allowed_actions", [])
+            sessions[ref] = worker_row
     return sessions
 
 
@@ -734,6 +775,7 @@ def aggregate_requests(
     http_get: Any = worker_http_get,
     timeout_s: float | None = None,
     should_sync_worker: Callable[[WorkerProfile], bool] | None = None,
+    diagnostics: list[WorkerReadDiagnostic] | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     registry = WorkerRegistry(worker_cfg, profiles_path=workers_path)
@@ -742,15 +784,19 @@ def aggregate_requests(
         if should_sync_worker is not None and not should_sync_worker(profile):
             continue
         headers = worker_headers(worker_cfg, profile)
-        try:
-            response = http_get(f"{profile.base_url}/sessions/requests", headers=headers, timeout=timeout)
-            if getattr(response, "status_code", 200) >= 400:
-                continue
-            for raw in response.json().get("requests", []):
-                if isinstance(raw, dict):
-                    results.append(project_request(raw, profile.worker_id))
-        except Exception:  # noqa: BLE001
+        outcome = _worker_collection_read(
+            worker_id=profile.worker_id,
+            resource="requests",
+            url=f"{profile.base_url}/sessions/requests",
+            collection_key="requests",
+            headers=headers,
+            timeout=timeout,
+            http_get=http_get,
+        )
+        _append_worker_read_diagnostic(diagnostics, outcome)
+        if outcome.status != "success":
             continue
+        results.extend(project_request(raw, profile.worker_id) for raw in outcome.items)
     return results
 
 
@@ -763,6 +809,7 @@ def aggregate_checkpoints(
     http_get: Any = worker_http_get,
     timeout_s: float | None = None,
     should_sync_worker: Callable[[WorkerProfile], bool] | None = None,
+    diagnostics: list[WorkerReadDiagnostic] | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     registry = WorkerRegistry(worker_cfg, profiles_path=workers_path)
@@ -787,52 +834,183 @@ def aggregate_checkpoints(
         if should_sync_worker is not None and not should_sync_worker(profile):
             continue
         headers = worker_headers(worker_cfg, profile)
-        bulk = _worker_bulk_checkpoints(profile.base_url, headers, timeout, http_get)
-        if bulk is not None:
+        bulk = _worker_bulk_checkpoint_read(worker_id, profile.base_url, headers, timeout, http_get)
+        _append_worker_read_diagnostic(diagnostics, bulk)
+        if bulk.status == "success":
             row_by_session = {str(row.get("session_id") or ""): row for row in worker_rows}
-            for raw in bulk:
+            for raw in bulk.items:
                 session_id = str(raw.get("session_id") or "")
                 row = row_by_session.get(session_id)
                 if row is not None:
                     results.append(project_checkpoint(raw, worker_id, session_id, str(row.get("run_id") or "")))
             continue
+        if bulk.status == "failure":
+            continue
         for row in worker_rows:
             session_id = str(row.get("session_id") or "")
             if not session_id:
                 continue
-            try:
-                response = http_get(
-                    f"{profile.base_url}/sessions/{session_id}/checkpoints",
-                    headers=headers,
-                    timeout=timeout,
-                )
-                if getattr(response, "status_code", 200) >= 400:
-                    continue
-                for raw in response.json().get("checkpoints", []):
-                    if isinstance(raw, dict):
-                        results.append(project_checkpoint(raw, worker_id, session_id, str(row.get("run_id") or "")))
-            except Exception:  # noqa: BLE001
+            fallback = _worker_collection_read(
+                worker_id=worker_id,
+                resource="session_checkpoints",
+                session_id=session_id,
+                url=f"{profile.base_url}/sessions/{session_id}/checkpoints",
+                collection_key="checkpoints",
+                headers=headers,
+                timeout=timeout,
+                http_get=http_get,
+            )
+            _append_worker_read_diagnostic(diagnostics, fallback)
+            if fallback.status != "success":
                 continue
+            for raw in fallback.items:
+                results.append(project_checkpoint(raw, worker_id, session_id, str(row.get("run_id") or "")))
     return results
 
 
-def _worker_bulk_checkpoints(base_url: str, headers: dict[str, str], timeout: float, http_get: Any) -> list[dict[str, Any]] | None:
+def _append_worker_read_diagnostic(
+    diagnostics: list[WorkerReadDiagnostic] | None,
+    outcome: WorkerCollectionRead,
+) -> None:
+    if diagnostics is not None and outcome.diagnostic is not None:
+        diagnostics.append(outcome.diagnostic)
+
+
+def _worker_collection_read(
+    *,
+    worker_id: str,
+    resource: str,
+    session_id: str = "",
+    url: str,
+    collection_key: str,
+    headers: dict[str, str],
+    timeout: float,
+    http_get: Any,
+) -> WorkerCollectionRead:
     try:
-        response = http_get(
-            f"{base_url}/sessions/checkpoints",
-            headers=headers,
-            timeout=timeout,
-        )
-        if getattr(response, "status_code", 200) >= 400:
-            return None
-        raw_items = response.json().get("checkpoints", [])
+        response = http_get(url, headers=headers, timeout=timeout)
     except AssertionError:
         raise
-    except Exception:  # noqa: BLE001 - workers may not support the bulk endpoint yet
+    except Exception as exc:  # noqa: BLE001 - aggregate reads degrade to explicit partial state
+        return WorkerCollectionRead(
+            status="failure",
+            diagnostic=WorkerReadDiagnostic(
+                worker_id=worker_id,
+                resource=resource,
+                status="failure",
+                failure_kind="transport_error",
+                error_type=type(exc).__name__,
+                session_id=session_id,
+            ),
+        )
+    status_code = getattr(response, "status_code", 200)
+    if status_code in {404, 405}:
+        return WorkerCollectionRead(
+            status="unsupported",
+            diagnostic=WorkerReadDiagnostic(
+                worker_id=worker_id,
+                resource=resource,
+                status="unsupported",
+                failure_kind="unsupported",
+                status_code=status_code,
+                session_id=session_id,
+            ),
+        )
+    if status_code >= 400:
+        return WorkerCollectionRead(
+            status="failure",
+            diagnostic=WorkerReadDiagnostic(
+                worker_id=worker_id,
+                resource=resource,
+                status="failure",
+                failure_kind="http_error",
+                status_code=status_code,
+                session_id=session_id,
+            ),
+        )
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001 - malformed JSON is an explicit failed read
+        payload = None
+    raw_items = payload.get(collection_key) if isinstance(payload, dict) else None
+    if not isinstance(raw_items, list) or any(not isinstance(item, dict) for item in raw_items):
+        return WorkerCollectionRead(
+            status="failure",
+            diagnostic=WorkerReadDiagnostic(
+                worker_id=worker_id,
+                resource=resource,
+                status="failure",
+                failure_kind="invalid_payload",
+                session_id=session_id,
+            ),
+        )
+    return WorkerCollectionRead(status="success", items=tuple(dict(item) for item in raw_items))
+
+
+def _worker_bulk_checkpoint_read(
+    worker_id: str,
+    base_url: str,
+    headers: dict[str, str],
+    timeout: float,
+    http_get: Any,
+) -> WorkerCollectionRead:
+    outcome = _worker_collection_read(
+        worker_id=worker_id,
+        resource="checkpoints",
+        url=f"{base_url}/sessions/checkpoints",
+        collection_key="checkpoints",
+        headers=headers,
+        timeout=timeout,
+        http_get=http_get,
+    )
+    if outcome.status == "failure" and outcome.diagnostic is not None:
+        _warn_bulk_checkpoint_failure(
+            worker_id,
+            outcome.diagnostic.failure_kind,
+            status_code=outcome.diagnostic.status_code,
+            error_type=outcome.diagnostic.error_type,
+        )
+    return outcome
+
+
+def _worker_bulk_checkpoints(
+    worker_id: str,
+    base_url: str,
+    headers: dict[str, str],
+    timeout: float,
+    http_get: Any,
+) -> list[dict[str, Any]] | None:
+    """Compatibility projection for callers that predate explicit worker read outcomes."""
+    outcome = _worker_bulk_checkpoint_read(worker_id, base_url, headers, timeout, http_get)
+    if outcome.status == "unsupported":
         return None
-    if not isinstance(raw_items, list):
-        return None
-    return [dict(item) for item in raw_items if isinstance(item, dict)]
+    return [dict(item) for item in outcome.items]
+
+
+def _warn_bulk_checkpoint_failure(
+    worker_id: str,
+    failure_kind: str,
+    *,
+    status_code: int = 0,
+    error: Exception | None = None,
+    error_type: str = "",
+) -> None:
+    now = time.monotonic()
+    key = (worker_id, failure_kind)
+    with _bulk_checkpoint_warning_lock:
+        if now < _bulk_checkpoint_next_warning_at.get(key, 0.0):
+            return
+        _bulk_checkpoint_next_warning_at[key] = now + BULK_CHECKPOINT_WARNING_INTERVAL_S
+    logger.warning(
+        "worker bulk checkpoints unavailable; returning partial checkpoint state",
+        extra={
+            "event": "worker_bulk_checkpoints_unavailable",
+            "worker_id": worker_id,
+            "failure_kind": failure_kind,
+            "status_code": status_code,
+            "error_type": error_type or (type(error).__name__ if error is not None else ""),
+        },
+    )
 
 
 def run_summary(

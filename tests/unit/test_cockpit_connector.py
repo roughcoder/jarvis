@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -791,3 +792,82 @@ def test_thread_index_revalidates_stale_child_notification_after_deletion(tmp_pa
 
     assert index.get("jarvis", thread.thread_id) is None
     assert not index._transcript_path("jarvis", thread.thread_id).exists()
+
+
+def test_thread_index_interrupt_detach_does_not_clear_new_session_generation(tmp_path) -> None:
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    thread = index.save(
+        CockpitThread(
+            thread_id="thread_interrupt_cas",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_interrupt_cas",
+            title="Interrupt CAS",
+            created_at="2026-07-13T08:00:00+00:00",
+            updated_at="2026-07-13T08:00:00+00:00",
+            created_by="operator",
+            workspace={
+                "worker_id": "worker-1",
+                "session_id": "session-old",
+                "session_generation": 3,
+                "status": "ready",
+            },
+        )
+    )
+    claimed = index.claim_execution_interrupt("jarvis", thread.thread_id)
+    assert claimed is not None
+    index.save(
+        replace(
+            claimed,
+            workspace={
+                **claimed.workspace,
+                "session_id": "session-new",
+                "session_generation": 4,
+                "status": "ready",
+            },
+        )
+    )
+
+    current = index.detach_execution_if_matches(
+        "jarvis",
+        thread.thread_id,
+        expected_session_id="session-old",
+        expected_generation=3,
+    )
+
+    assert current is not None
+    assert current.workspace["session_id"] == "session-new"
+    assert current.workspace["session_generation"] == 4
+
+
+def test_thread_index_pending_turn_does_not_overwrite_interrupt_claim(tmp_path) -> None:
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    stale = index.save(
+        CockpitThread(
+            thread_id="thread_pending_interrupt",
+            project_id="jarvis",
+            session_id="project:jarvis:orchestrator:thread_pending_interrupt",
+            title="Pending interrupt",
+            created_at="2026-07-13T08:00:00+00:00",
+            updated_at="2026-07-13T08:00:00+00:00",
+            created_by="operator",
+            workspace={
+                "worker_id": "worker-1",
+                "session_id": "session-old",
+                "session_generation": 3,
+                "status": "ready",
+            },
+        )
+    )
+    claimed = index.claim_execution_interrupt("jarvis", stale.thread_id)
+    assert claimed is not None
+
+    updated = index.append_pending_turn(
+        stale,
+        user_peer_id="operator",
+        user_text="continue",
+        assistant_peer_id="jarvis",
+    )
+
+    assert updated.workspace["status"] == "interrupting"
+    assert updated.workspace["session_id"] == "session-old"
+    assert updated.workspace["session_generation"] == 3

@@ -575,3 +575,31 @@ def test_stale_running_job_reloads_as_interrupted(tmp_path) -> None:
     )
     jm = JobManager(store_dir=str(tmp_path))
     assert jm.get("deadbeef0000").status == "interrupted"
+
+
+def test_prepare_worktree_serializes_concurrent_calls_per_repo(tmp_path) -> None:  # noqa: ANN001
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run([*git, "init", "-q"], cwd=repo, check=True)
+    subprocess.run([*git, "commit", "--allow-empty", "-qm", "init"], cwd=repo, check=True)
+    worktrees = tmp_path / "worktrees"
+
+    async def run_concurrent() -> list[tuple[str | None, str | None, str | None]]:
+        return await asyncio.gather(
+            *(
+                prepare_worktree(str(repo), str(worktrees), f"race-{index}", "jarvis", 30)
+                for index in range(6)
+            )
+        )
+
+    results = asyncio.run(run_concurrent())
+
+    errors = [err for _, _, err in results if err]
+    assert errors == []
+    paths = [cwd for cwd, _, _ in results]
+    branches = [branch for _, branch, _ in results]
+    assert len(set(paths)) == 6
+    assert len(set(branches)) == 6

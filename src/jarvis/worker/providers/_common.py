@@ -8,7 +8,7 @@ providers' text differs (the provider label).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from jarvis.config import WorkerConfig
 from jarvis.worker.providers.base import ProviderTurn
@@ -20,6 +20,38 @@ from jarvis.worker_session_contract import CANCELLED_SESSION_STATUSES, EVENT_PRO
 PROVIDER_LOG_EVENT_LIMIT = 20
 # Truncate provider log text to this many characters before storing.
 PROVIDER_LOG_TEXT_LIMIT = 1000
+
+JarvisApprovalDecision = Literal[
+    "approved",
+    "approved_for_session",
+    "denied",
+    "declined",
+    "cancelled",
+]
+ProviderApprovalDecision = Literal[
+    "approved",
+    "approved_for_session",
+    "denied",
+    "cancelled",
+]
+
+
+def normalize_approval_decision(value: Any) -> ProviderApprovalDecision:
+    """Normalize Jarvis's five public decisions and legacy provider aliases."""
+    decision = str(value or "").strip().lower()
+    if decision in {"approved", "approve", "allow", "allowed", "yes", "accept"}:
+        return "approved"
+    if decision in {
+        "approved_for_session",
+        "approvedforsession",
+        "accept_for_session",
+        "acceptforsession",
+        "always",
+    }:
+        return "approved_for_session"
+    if decision in {"cancel", "cancelled", "canceled"}:
+        return "cancelled"
+    return "denied"
 
 
 def session_cwd(session: WorkerSession, worker_cfg: WorkerConfig, *, provider: str) -> str:

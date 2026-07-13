@@ -728,6 +728,7 @@ for the project. Archived threads are hidden by default; pass
   "project_id": "jarvis",
   "threads": [
     {
+      "conversation_id": "thread_...",
       "thread_id": "thread_...",
       "chat_id": "thread_...",
       "parent_chat_id": "",
@@ -739,8 +740,12 @@ for the project. Archived threads are hidden by default; pass
       "model": "fast",
       "worker_id": null,
       "host": "mac-mini.local",
+      "lifecycle": "open",
+      "operational_state": "idle",
       "status": "created",
       "ended_reason": null,
+      "diagnostic_reason": null,
+      "last_turn_at": null,
       "created_at": "2026-07-05T09:00:00+00:00",
       "updated_at": "2026-07-05T09:00:00+00:00",
       "created_by": "neil",
@@ -780,8 +785,24 @@ only by labels.
 Thread enrichment fields (on list, detail, open, turn, archive, and rename
 responses alike):
 
+- `conversation_id` is the stable durable conversation identity. During the v1
+  compatibility window it is identical to `thread_id`; clients should prefer
+  `conversation_id` when present and keep existing deep links keyed by the same
+  value.
+- `lifecycle` is `open` or `archived`. A conversation does not become terminal
+  when its turn, worker, or provider session finishes.
+- `operational_state` is the current conversation projection. This increment
+  emits `idle`, `working`, `degraded`, or `archived`; later compatible releases
+  may add the documented waiting/starting/joining states.
+- `status` and `ended_reason` preserve the original v1 turn-derived contract:
+  `created`, `running`, `completed`, or `failed`. New clients must use `lifecycle`
+  and `operational_state` for the durable conversation itself.
+- `diagnostic_reason` may explain a temporary degraded operational state without
+  ending the conversation.
+- `last_turn_at` records the latest durable turn timestamp when present.
 - `chat_type` is `assistant` or `orchestrator`. Missing values on legacy rows
-  mean `assistant`.
+  mean `assistant`. This is a legacy execution hint during migration, not a
+  conversation lifecycle or durable product type.
 - Assistant threads use `engine: "jarvis"`, a LiteLLM route in `model`, a null
   `worker_id`, and the brain `host`.
 - Orchestrator threads use `engine: "codex"` or `"claude"`, the provider model
@@ -791,12 +812,6 @@ responses alike):
   project memory plus a signed, short-lived, parent-thread-scoped MCP surface
   for spawning, watching, reading, and publishing child review work. The grant
   cannot access another project, parent thread, or tool.
-- `status` is `created` (no turns yet), `running` (a turn is in flight),
-  `completed` (last turn finished), or `failed` (last turn errored; the live
-  `running`/`failed` states are process-local and revert to the durable
-  `created`/`completed` derivation after a brain restart).
-- `ended_reason` uses the session taxonomy: `null` while created/running,
-  `completed` after a normal turn, `engine_error` after a failed one.
 
 `GET /v1/projects/{id}/threads/{tid}` returns one active or archived thread plus
 the locally recorded turn history for rendering resumed conversations:
@@ -807,6 +822,7 @@ the locally recorded turn history for rendering resumed conversations:
   "schema_version": 1,
   "project_id": "jarvis",
   "thread": {
+    "conversation_id": "thread_...",
     "thread_id": "thread_...",
     "project_id": "jarvis",
     "session_id": "project:jarvis:orchestrator:thread_...",
@@ -815,8 +831,11 @@ the locally recorded turn history for rendering resumed conversations:
     "model": "fast",
     "worker_id": null,
     "host": "mac-mini.local",
+    "lifecycle": "open",
+    "operational_state": "idle",
     "status": "completed",
     "ended_reason": "completed",
+    "last_turn_at": "2026-07-06T10:00:00+00:00",
     "created_at": "2026-07-05T09:00:00+00:00",
     "updated_at": "2026-07-06T10:00:00+00:00",
     "created_by": "neil",
@@ -902,6 +921,13 @@ Thread open response:
 To escalate the thread into a workspace-backed provider session, include a
 `workspace` object. `repos` may be repo names from the project registry or full
 remote refs; omitted repos materialize the project default repo when one exists.
+
+On an orchestrator thread, `workspace.engine` routes this turn: `codex` or
+`claude` only, and any other value is rejected before streaming starts with a
+recoverable `validation_failed` error. When the requested engine differs from
+the thread's current engine, the thread switches engines and the next provider
+session is created on an eligible worker for the new engine; the durable thread
+history is preserved and replayed into the new session's context.
 
 ```json
 {
@@ -1024,6 +1050,14 @@ Turns on archived threads are rejected before streaming starts:
 ```
 
 The status is `409`; callers must explicitly unarchive first.
+
+A provider turn that reaches a terminal failure streams a recoverable
+`thread.turn.error` frame with code `engine_error` and the provider's public
+failure detail (for example a subscription usage limit). Infrastructure
+failures reaching memory or workers keep the `memory_unavailable` code. Both
+leave the conversation open in the `degraded` operational state with
+`diagnostic_reason` `engine_error`, and the turn may be retried with the same
+idempotency key.
 
 `PATCH /v1/projects/{id}/threads/{tid}` renames a thread. It is member-gated
 and idempotency-keyed like archive, accepts `{"title": "...", "idempotency_key":

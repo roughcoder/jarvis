@@ -748,16 +748,22 @@ def resolve_repo(repo: str, repo_root: str) -> str | None:
 
 
 async def clone_repo(name: str, repo_root: str, timeout_s: float) -> tuple[str | None, str | None]:
-    """Clone a missing repo into repo_root with `gh repo clone` (auth handled by
-    gh). `name` may be a bare name (your namespace) or "org/name". Returns
-    (path, None) on success or (None, error)."""
+    """Clone a missing repo into repo_root, preferring `gh repo clone` and
+    falling back to git-over-SSH for "org/name" refs — worker hosts often have
+    a deploy key but no interactive gh login. Returns (path, None) on success
+    or (None, error)."""
     dest = pathlib.Path(repo_root).expanduser() / pathlib.Path(name).name
     if (dest / ".git").exists():
         return str(dest), None
     out = await run_exec(["gh", "repo", "clone", name, str(dest)], None, timeout_s)
     if (dest / ".git").exists():
         return str(dest), None
-    return None, f"couldn't clone {name!r}: {out[:200]}"
+    if "/" in name and not name.startswith(("/", "~")):
+        ssh_out = await run_exec(["git", "clone", f"git@github.com:{name}.git", str(dest)], None, timeout_s)
+        if (dest / ".git").exists():
+            return str(dest), None
+        out = f"{out[:150]}; ssh fallback: {ssh_out[:150]}"
+    return None, f"couldn't clone {name!r}: {out[:320]}"
 
 
 async def fetch_repo(repo: str, timeout_s: float) -> str | None:
@@ -774,6 +780,23 @@ async def fetch_repo(repo: str, timeout_s: float) -> str | None:
     if out.startswith("error"):
         return f"couldn't fetch {repo!r}: {out[:500]}"
     return None
+
+
+_REPO_MUTATION_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def repo_mutation_lock(repo: pathlib.Path | str) -> asyncio.Lock:
+    """Serialize ref/worktree mutations per source repo.
+
+    Concurrent `git worktree add` calls against the same checkout race on the
+    refs directory ("cannot lock ref ... unable to create directory"), so any
+    branch-resolve + worktree-add pair must hold this lock.
+    """
+    key = str(pathlib.Path(repo).expanduser().resolve())
+    lock = _REPO_MUTATION_LOCKS.get(key)
+    if lock is None:
+        lock = _REPO_MUTATION_LOCKS.setdefault(key, asyncio.Lock())
+    return lock
 
 
 async def prepare_worktree(
@@ -796,9 +819,10 @@ async def prepare_worktree(
         except OSError as exc:
             return None, None, f"error: could not copy non-git input into scratch ({exc})"
         return str(scratch), None, None
-    branch = await resolve_available_worktree_branch(repo_path, f"{branch_prefix}/{slug}-{suffix}", timeout_s)
-    worktree = worktrees_root / f"{slug}-{suffix}"
-    out = await run_exec(["git", "-C", str(repo_path), "worktree", "add", "-b", branch, str(worktree)], None, timeout_s)
+    async with repo_mutation_lock(repo_path):
+        branch = await resolve_available_worktree_branch(repo_path, f"{branch_prefix}/{slug}-{suffix}", timeout_s)
+        worktree = worktrees_root / f"{slug}-{suffix}"
+        out = await run_exec(["git", "-C", str(repo_path), "worktree", "add", "-b", branch, str(worktree)], None, timeout_s)
     if not worktree.exists():
         return None, None, f"error: could not create worktree ({out})"
     return str(worktree), branch, None

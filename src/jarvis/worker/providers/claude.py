@@ -21,6 +21,7 @@ from jarvis.worker.orchestrator_runtime import (
 from jarvis.worker.providers._common import (
     control_request_id as _control_request_id,
 )
+from jarvis.worker.providers._common import normalize_approval_decision
 from jarvis.worker.providers._common import (
     record_provider_log as _record_provider_log_impl,
 )
@@ -57,6 +58,7 @@ from jarvis.worker_session_contract import (
     SESSION_STOPPED,
     SESSION_WAITING_APPROVAL,
     SESSION_WAITING_INPUT,
+    turn_failure_message,
 )
 
 _RUNTIME_LOCK = threading.RLock()
@@ -497,6 +499,7 @@ class _ClaudeSessionRuntime:
             "description": str(getattr(context, "description", "") or ""),
             "decision_reason": str(getattr(context, "decision_reason", "") or ""),
             "blocked_path": str(getattr(context, "blocked_path", "") or ""),
+            "request_kind": _claude_request_kind(tool_name),
         }
         with self._pending_lock:
             self._pending[request_id] = pending
@@ -794,11 +797,16 @@ def _project_sdk_message(
         is_error = bool(getattr(message, "is_error", False))
         if _session_cancelled(sessions, session_id):
             return True
+        payload = {**common, "provider_status": str(getattr(message, "subtype", "") or ""), "raw": raw}
+        if is_error:
+            failure = turn_failure_message(payload)
+            if failure:
+                payload["error"] = failure
         sessions.append_event_with_status(
             session_id,
             SESSION_FAILED if is_error else SESSION_COMPLETED,
             EVENT_TURN_FAILED if is_error else EVENT_TURN_COMPLETED,
-            {**common, "provider_status": str(getattr(message, "subtype", "") or ""), "raw": raw},
+            payload,
         )
         return True
     else:
@@ -868,11 +876,16 @@ def _project_claude_message(
         if _session_cancelled(sessions, session_id):
             return True
         event_type = EVENT_TURN_FAILED if is_error else EVENT_TURN_COMPLETED
+        payload = {**common, "provider_status": subtype or message_type, "raw": message}
+        if is_error:
+            failure = turn_failure_message(payload)
+            if failure:
+                payload["error"] = failure
         sessions.append_event_with_status(
             session_id,
             SESSION_FAILED if is_error else SESSION_COMPLETED,
             event_type,
-            {**common, "provider_status": subtype or message_type, "raw": message},
+            payload,
         )
         return True
     elif message_type:
@@ -934,8 +947,19 @@ def _claude_session_id(session: WorkerSession) -> str:
 
 
 def _approval_allowed(request: dict[str, Any]) -> bool:
-    decision = str(request.get("decision") or "").strip().lower()
-    return decision in {"approved", "approve", "allow", "allowed", "yes", "accept", "acceptforsession", "accept_for_session", "always"}
+    return normalize_approval_decision(request.get("decision")) in {
+        "approved",
+        "approved_for_session",
+    }
+
+
+def _claude_request_kind(tool_name: str) -> str:
+    normalized = tool_name.strip().lower()
+    if "read" in normalized:
+        return "file-read"
+    if any(word in normalized for word in ("edit", "write", "notebook")):
+        return "file-change"
+    return "command"
 
 
 def _updated_question_input(tool_input: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
