@@ -338,6 +338,10 @@ def test_worker_session_authority_maps_read_only_to_codex_read_only() -> None:
     assert authority.claude_tool_denial("Read") == ""
     assert authority.claude_tool_denial("Grep") == ""
     assert authority.claude_tool_denial("AskUserQuestion") == ""
+    # Plan mode is entered automatically for read-only sessions; denying the
+    # exit would trap the session with no way to use its permitted tools.
+    assert authority.claude_tool_denial("ExitPlanMode") == ""
+    assert authority.claude_tool_is_preapproved("ExitPlanMode")
 
 
 def test_worker_session_authority_allows_only_declared_mcp_server_in_read_only_mode() -> None:

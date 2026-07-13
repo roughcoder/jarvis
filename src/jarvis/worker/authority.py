@@ -158,4 +158,15 @@ def _claude_tool_is_read_only(tool_name: str, *, trusted_mcp_servers: list[str] 
         return False
     if name.startswith("mcp__"):
         return any(name.startswith(f"mcp__{server}__") for server in trusted_mcp_servers or [])
-    return name in {"AskUserQuestion", "Glob", "Grep", "Read", "WebFetch", "WebSearch"}
+    # ExitPlanMode mutates nothing outside the agent's own mode. Denying it
+    # traps a read-only Claude session in plan mode forever: it cannot act, not
+    # even with the read-only and trusted-MCP tools it is explicitly allowed.
+    return name in {
+        "AskUserQuestion",
+        "ExitPlanMode",
+        "Glob",
+        "Grep",
+        "Read",
+        "WebFetch",
+        "WebSearch",
+    }
