@@ -59,6 +59,7 @@ from jarvis.worker.notify import WorkerChangeNotifier  # noqa: E402
 from jarvis.worker_session_contract import (  # noqa: E402
     EVENT_APPROVAL_RESOLVED,
     EVENT_APPROVAL_REQUESTED,
+    EVENT_CHECKPOINT_CREATED,
     EVENT_INPUT_REQUESTED,
     EVENT_PROVIDER_LOG,
     EVENT_TOOL_RESULT,
@@ -2723,6 +2724,37 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
     assert checkpoints["checkpoints"][0]["checkpoint_id"] == "ckpt_turn_checkpoint"
     assert restored["event"]["type"] == "checkpoint.restored"
     assert checkpoints_after_restore["checkpoints"][0]["restored"] is True
+
+
+def test_daemon_bulk_session_checkpoints_are_authenticated_and_deterministic(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    sessions = SessionManager(str(tmp_path / "worker" / "sessions"))
+    expected_ids = [f"sess_{index:02d}" for index in range(20)]
+    for session_id in reversed(expected_ids):
+        sessions.create({"session_id": session_id, "provider": "fake", "engine": "fake"})
+        sessions.append_event(
+            session_id,
+            EVENT_CHECKPOINT_CREATED,
+            {"checkpoint_id": f"ckpt_{session_id}", "label": f"Checkpoint {session_id}", "provider": "fake"},
+        )
+
+    async def calls(base, client):  # noqa: ANN001
+        unauthorized = await client.get(f"{base}/sessions/checkpoints")
+        authorized = await client.get(
+            f"{base}/sessions/checkpoints",
+            headers={"Authorization": "Bearer tkn"},
+        )
+        return unauthorized, authorized
+
+    unauthorized, authorized = asyncio.run(_with_server(cfg, 8847, calls))
+
+    assert unauthorized.status_code == 401
+    assert unauthorized.json() == {"error": "unauthorized"}
+    assert authorized.status_code == 200
+    rows = authorized.json()["checkpoints"]
+    assert [row["session_id"] for row in rows] == expected_ids
+    assert [row["checkpoint_id"] for row in rows] == [f"ckpt_{session_id}" for session_id in expected_ids]
+    assert "tkn" not in authorized.text
 
 
 def test_daemon_session_execution_state_projects_active_turn_and_redacted_requests(tmp_path) -> None:

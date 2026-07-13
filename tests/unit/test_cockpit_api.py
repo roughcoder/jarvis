@@ -45,6 +45,9 @@ from jarvis.orchestration.oauth import OAuthTokenValidator, OAuthValidationError
 from jarvis.orchestration.service import StartedWork  # noqa: E402
 from jarvis.orchestration.store import OrchestrationStore  # noqa: E402
 from jarvis.brain.registry import RegistryStore  # noqa: E402
+from jarvis.worker.server import make_app as make_worker_app  # noqa: E402
+from jarvis.worker.sessions import SessionManager  # noqa: E402
+from jarvis.worker_session_contract import EVENT_CHECKPOINT_CREATED  # noqa: E402
 
 
 class Response:
@@ -6009,6 +6012,56 @@ def test_cockpit_checkpoint_aggregation_uses_worker_bulk_endpoint(tmp_path, monk
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
+def test_cockpit_snapshot_uses_same_version_worker_bulk_checkpoints(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    worker_token = "worker-test-token"
+    worker_cfg = WorkerConfig(_env_file=None, token=worker_token, workspace=str(tmp_path / "worker"))
+    sessions = SessionManager(str(tmp_path / "worker" / "sessions"))
+    for index in range(20):
+        session_id = f"sess_{index:02d}"
+        sessions.create({"session_id": session_id, "provider": "fake", "engine": "fake"})
+        sessions.append_event(
+            session_id,
+            EVENT_CHECKPOINT_CREATED,
+            {"checkpoint_id": f"ckpt_{index:02d}", "label": f"Checkpoint {index:02d}", "provider": "fake"},
+        )
+    cfg = _cfg(tmp_path, monkeypatch, worker_token=worker_token)
+
+    async def run() -> tuple[dict[str, Any], list[str]]:
+        worker_runner = web.AppRunner(make_worker_app(worker_cfg))
+        await worker_runner.setup()
+        worker_site = web.TCPSite(worker_runner, "localhost", 0)
+        await worker_site.start()
+        worker_socket = worker_site._server.sockets[0]  # type: ignore[union-attr]  # noqa: SLF001
+        worker_base = f"http://localhost:{worker_socket.getsockname()[1]}"
+        workers_path = Path(cfg.orchestration.workers_path)
+        workers = json.loads(workers_path.read_text())
+        workers["workers"][0]["base_url"] = worker_base
+        workers_path.write_text(json.dumps(workers))
+        calls_seen: list[str] = []
+        try:
+            with httpx.Client(timeout=10) as worker_client:
+                def worker_get(url: str, **kwargs):  # noqa: ANN001, ANN202
+                    calls_seen.append(url)
+                    return worker_client.get(url, **kwargs)
+
+                async def snapshot(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+                    response = await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})
+                    assert response.status_code == 200
+                    return response.json()
+
+                body = await _with_server(cfg, snapshot, http_get=worker_get)
+            return body, calls_seen
+        finally:
+            await worker_runner.cleanup()
+
+    body, calls_seen = asyncio.run(run())
+
+    assert len(body["sessions"]) == 20
+    assert len(body["checkpoints"]) == 20
+    assert sum(url.endswith("/sessions/checkpoints") for url in calls_seen) == 1
+    assert not any("/sessions/sess_" in url and url.endswith("/checkpoints") for url in calls_seen)
 
 
 @pytest.mark.parametrize("bulk_failure", ["timeout", "http_503", "invalid_payload"])

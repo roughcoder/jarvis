@@ -687,6 +687,12 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         requests = await asyncio.to_thread(sessions.pending_requests)
         return web.json_response({"requests": requests})
 
+    async def list_session_checkpoints(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        checkpoints = await asyncio.to_thread(sessions.all_checkpoints)
+        return web.json_response({"checkpoints": checkpoints})
+
     async def get_session_checkpoints(request: web.Request) -> web.Response:
         if not authorised(request):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -1220,6 +1226,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         web.post("/sessions", create_session),
         web.get("/sessions", list_sessions),
         web.get("/sessions/requests", list_session_requests),
+        web.get("/sessions/checkpoints", list_session_checkpoints),
         web.post("/conversation-workspaces", create_conversation_workspace),
         web.get("/conversation-workspaces/{conversation_id}", get_conversation_workspace),
         web.post("/conversation-workspaces/{conversation_id}/worktrees", create_conversation_worktree),

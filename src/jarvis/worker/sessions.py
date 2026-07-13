@@ -533,6 +533,14 @@ class SessionManager:
             )
         return checkpoints
 
+    def all_checkpoints(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                checkpoint
+                for session in sorted(self.list(), key=lambda item: item.session_id)
+                for checkpoint in self.checkpoints(session.session_id)
+            ]
+
     def remove(self, session_id: str) -> bool:
         with self._lock:
             try:
