@@ -10701,6 +10701,7 @@ def test_orchestrator_turn_engine_override_switches_idle_thread(tmp_path, monkey
         created_by="neil",
         chat_type="orchestrator",
         engine="codex",
+        model="gpt-5.5",
         workspace={
             "worker_id": "worker_a",
             "session_id": "orch_thread_engine_switch",
@@ -10735,6 +10736,7 @@ def test_orchestrator_turn_engine_override_switches_idle_thread(tmp_path, monkey
     stored = connector.index.get(project.id, thread.thread_id)
     assert stored is not None
     assert stored.engine == "claude"
+    assert stored.model == ""
     assert stored.workspace["session_id"] == ""
     assert stored.workspace["provider_started"] is False
     assert stored.workspace["session_generation"] == 4

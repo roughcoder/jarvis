@@ -1999,17 +1999,22 @@ class CockpitConnector:
             raise ValueError("orchestrator engine must be codex or claude")
         if engine == thread.engine:
             return thread
+        workspace = {
+            **thread.workspace,
+            "session_id": "",
+            "provider_started": False,
+            "session_generation": int(thread.workspace.get("session_generation") or 0) + 1,
+        }
+        workspace.pop("model", None)
         return self._index.save(
             replace(
                 thread,
                 engine=engine,
+                # The previous model id belongs to the old provider; the new
+                # provider's session starts on its own default.
+                model="",
                 updated_at=utc_now(),
-                workspace={
-                    **thread.workspace,
-                    "session_id": "",
-                    "provider_started": False,
-                    "session_generation": int(thread.workspace.get("session_generation") or 0) + 1,
-                },
+                workspace=workspace,
             )
         )
 
