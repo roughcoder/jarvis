@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 
 from jarvis.capabilities import (
+    FORGE_BRANCH_PUSH,
     FORGE_PR_COMMENT,
     WORKER_SESSION_APPROVE,
     WORKER_SESSION_CREATE,
@@ -98,6 +99,11 @@ ORCHESTRATOR_ENGINES = {"codex", "claude"}
 
 THREAD_INDEX_FILENAME = "cockpit-threads.json"
 THREAD_TRANSCRIPTS_DIRNAME = "cockpit-thread-transcripts"
+# The orchestrator conversation is the operator's most capable surface: it must
+# be able to act, not only read. A read-only envelope maps Codex to a read-only
+# sandbox and Claude to plan mode, which leaves the agent unable to do the work
+# it is being asked to coordinate. Plan mode remains a per-turn choice the
+# operator can make from the composer, never an imposed default.
 CONVERSATION_SESSION_ALLOWED_ACTIONS = [
     WORKER_SESSION_CREATE,
     WORKER_SESSION_TURN,
@@ -105,7 +111,9 @@ CONVERSATION_SESSION_ALLOWED_ACTIONS = [
     WORKER_SESSION_APPROVE,
     WORKER_SESSION_INTERRUPT,
     WORKER_SESSION_STOP,
+    FORGE_BRANCH_PUSH,
 ]
+CONVERSATION_SESSION_LANDING = {"mode": "branch_only", "allow_merge": False}
 THREAD_HISTORY_LIMIT = 24
 CHILD_WATCH_LEASE_S = 300
 THREAD_TURN_QUEUE_LIMIT = 32
@@ -2136,10 +2144,10 @@ class CockpitConnector:
                         "engine": thread.engine,
                         "model": thread.model,
                         "allowed_actions": CONVERSATION_SESSION_ALLOWED_ACTIONS,
-                        "landing": {"mode": "review", "allow_merge": False},
+                        "landing": dict(CONVERSATION_SESSION_LANDING),
                     },
                     "allowed_actions": CONVERSATION_SESSION_ALLOWED_ACTIONS,
-                    "landing": {"mode": "review", "allow_merge": False},
+                    "landing": dict(CONVERSATION_SESSION_LANDING),
                     "model": thread.model,
                     "trusted_mcp_servers": ["jarvis_orchestrator"],
                     "chat_type": "orchestrator",

@@ -10977,3 +10977,25 @@ def test_restart_recovery_releases_orphaned_execution_and_drains_queue(tmp_path,
     assert recovered.workspace["session_id"] == "orch_thread_orphaned_lease"
     execution = cockpit_api_module._thread_execution_projection(recovered, None)  # noqa: SLF001
     assert not cockpit_api_module._thread_execution_is_active(execution)  # noqa: SLF001
+
+
+def test_orchestrator_session_authority_is_not_read_only_or_plan_mode() -> None:
+    from jarvis.connectors.cockpit import (
+        CONVERSATION_SESSION_ALLOWED_ACTIONS,
+        CONVERSATION_SESSION_LANDING,
+    )
+    from jarvis.worker.authority import WorkerSessionAuthority
+
+    authority = WorkerSessionAuthority(
+        allowed_actions=list(CONVERSATION_SESSION_ALLOWED_ACTIONS),
+        landing=dict(CONVERSATION_SESSION_LANDING),
+        trusted_mcp_servers=["jarvis_orchestrator"],
+    )
+
+    # The orchestrator must be able to act on the work it coordinates. Plan mode
+    # stays an operator choice, never an imposed default.
+    assert authority.codex_sandbox == "workspace-write"
+    assert authority.claude_permission_mode != "plan"
+    assert authority.claude_tool_denial("Bash") == ""
+    assert authority.claude_tool_denial("Edit") == ""
+    assert authority.claude_tool_denial("mcp__jarvis_orchestrator__spawn_child_work_session") == ""
