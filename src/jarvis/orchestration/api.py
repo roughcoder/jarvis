@@ -656,6 +656,7 @@ class SseSnapshotHub:
 
 SSE_SNAPSHOT_HUB_KEY = web.AppKey("sse_snapshot_hub", SseSnapshotHub)
 RETENTION_CTX_KEY = web.AppKey("retention_ctx", CockpitAppContext)
+WORKER_PROBE_CTX_KEY = web.AppKey("worker_probe_ctx", CockpitAppContext)
 
 
 def _queue_latest(queue: asyncio.Queue[dict[str, Any] | None], item: dict[str, Any] | None) -> None:
@@ -817,6 +818,59 @@ async def _retention_context(app: web.Application):  # noqa: ANN202
             await task
 
 
+def run_worker_probe_sweep(ctx: CockpitAppContext) -> list[Any]:
+    """Refresh all configured worker health/catalog snapshots.
+
+    Worker reachability is advisory for the API tier, so this never raises for
+    individual offline workers. The registry probe records successful snapshots;
+    unreachable workers report offline and wait for the next sweep.
+    """
+
+    registry = WorkerRegistry(
+        ctx.cfg.worker,
+        profiles_path=ctx.cfg.orchestration.workers_path,
+        http_get=ctx.get,
+    )
+    profiles = registry.profiles(probe=True)
+    online = sum(1 for profile in profiles if profile.status == "online")
+    offline = sum(1 for profile in profiles if profile.status == "offline")
+    unknown = max(0, len(profiles) - online - offline)
+    logger.info(
+        "worker probe sweep refreshed %s worker(s): %s online, %s offline, %s unknown",
+        len(profiles),
+        online,
+        offline,
+        unknown,
+    )
+    return profiles
+
+
+async def _worker_probe_context(app: web.Application):  # noqa: ANN202
+    ctx = app[WORKER_PROBE_CTX_KEY]
+    interval = max(0.0, float(ctx.cfg.orchestration.worker_probe_interval_s))
+    if interval <= 0:
+        yield
+        return
+
+    async def loop() -> None:
+        while True:
+            try:
+                await asyncio.to_thread(run_worker_probe_sweep, ctx)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - background probes must not take the API down
+                logger.warning("worker probe sweep failed: %s", exc)
+            await asyncio.sleep(interval)
+
+    task = asyncio.create_task(loop(), name="cockpit-worker-probe")
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 def make_app(
     cfg: Config,
     *,
@@ -865,6 +919,8 @@ def make_app(
     app.cleanup_ctx.append(_sse_snapshot_hub_context)
     app[RETENTION_CTX_KEY] = ctx
     app.cleanup_ctx.append(_retention_context)
+    app[WORKER_PROBE_CTX_KEY] = ctx
+    app.cleanup_ctx.append(_worker_probe_context)
 
     async def worker_notify(request: web.Request) -> web.Response:
         try:

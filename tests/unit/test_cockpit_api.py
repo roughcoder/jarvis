@@ -394,6 +394,7 @@ def _cfg(
     mcp_serve_oauth_jwks_url: str = "",
     mcp_serve_oauth_required_scopes: str = "",
     worker_token: str = "",
+    worker_probe_interval_s: str = "0",
     retention_enabled: str = "false",
 ) -> Config:
     env = tmp_path / ".env"
@@ -441,6 +442,7 @@ def _cfg(
                 # retention sweep would collect them mid-test. Retention has its
                 # own suite (test_orchestration_retention.py).
                 f"ORCHESTRATION_RETENTION_ENABLED={retention_enabled}",
+                f"ORCHESTRATION_WORKER_PROBE_INTERVAL_S={worker_probe_interval_s}",
             ]
         )
     )
@@ -9754,6 +9756,78 @@ def test_cockpit_unprobed_worker_reports_last_probed_inventory(tmp_path, monkeyp
     assert unprobed[0]["worktree_inventory"]["orphan_count"] == 12
     assert unprobed[0]["runtime"]["version"] == "0.1.22"
     assert unprobed[0]["last_seen_at"] != ""
+
+
+def test_cockpit_snapshot_keeps_model_catalog_after_probe_snapshot_ttl_expires(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _warm_probe_model_catalog_snapshot(cfg)
+    probes_path = Path(cfg.orchestration.workers_path).with_name("workers.json.probes.json")
+    raw = json.loads(probes_path.read_text())
+    for row in raw["snapshots"].values():
+        row["expires_at"] = time.time() - 60
+    probes_path.write_text(json.dumps(raw))
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        return (await client.get(f"{base}/v1/cockpit/snapshot")).json()
+
+    body = asyncio.run(_with_server(cfg, calls))
+
+    worker = body["workers"][0]
+    engines = {row["engine"]: row for row in worker["engines"]}
+    assert worker["last_seen_at"] == ""
+    assert worker["runtime"]["version"] == ""
+    assert worker["worktree_inventory"]["count"] is None
+    assert worker["worktree_inventory"]["status"] == "unknown"
+    assert engines["codex"]["supports"]["models"] == [
+        {"id": "gpt-x", "label": "GPT X"},
+        {"id": "gpt-y", "label": "GPT Y"},
+    ]
+    assert engines["codex"]["supports"]["default_model"] == "gpt-x"
+    assert engines["claude"]["supports"]["models"] == [{"id": "opus", "label": "Opus"}]
+
+
+def test_cockpit_worker_probe_context_runs_enabled_sweep(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, worker_probe_interval_s="0.05")
+    calls = []
+
+    async def run() -> None:
+        fired = asyncio.Event()
+
+        def sweep(ctx):  # noqa: ANN001, ANN202
+            calls.append(ctx)
+            fired.set()
+            return []
+
+        monkeypatch.setattr(cockpit_api_module, "run_worker_probe_sweep", sweep)
+        runner = web.AppRunner(make_app(cfg))
+        await runner.setup()
+        try:
+            await asyncio.wait_for(fired.wait(), timeout=1)
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+
+    assert calls
+
+
+def test_cockpit_worker_probe_context_disabled_by_zero_knob(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, worker_probe_interval_s="0")
+
+    def sweep(_ctx):  # noqa: ANN001, ANN202
+        raise AssertionError("disabled worker probe loop should not sweep")
+
+    monkeypatch.setattr(cockpit_api_module, "run_worker_probe_sweep", sweep)
+
+    async def run() -> None:
+        runner = web.AppRunner(make_app(cfg))
+        await runner.setup()
+        try:
+            await asyncio.sleep(0.1)
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
 
 
 def test_cockpit_snapshot_hides_requests_for_archived_sessions(tmp_path, monkeypatch) -> None:  # noqa: ANN001

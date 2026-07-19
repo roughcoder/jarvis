@@ -25,18 +25,21 @@ _PROFILE_CACHE: dict[str, tuple[int, float, list[dict[str, Any]]]] = {}
 # seen, of unknown version, with zero worktrees — indistinguishable from a
 # healthy empty worker. Remember the last successful probe per worker so
 # unprobed reads (the cockpit's default) report last-known truth instead.
-_PROBE_SNAPSHOT_FIELDS = (
-    "last_seen_at",
+_PROBE_CATALOG_FIELDS = (
     "agent",
     "default_engine",
     "supported_engines",
     "engine_supports",
     "engine_models",
     "engine_default_model",
+)
+_PROBE_LIVENESS_FIELDS = (
+    "last_seen_at",
     "runtime",
     "system",
     "worktree_inventory",
 )
+_PROBE_SNAPSHOT_FIELDS = (*_PROBE_LIVENESS_FIELDS, *_PROBE_CATALOG_FIELDS)
 _PROBE_SNAPSHOT_REPLACE_FIELDS = {
     "agent",
     "default_engine",
@@ -82,18 +85,18 @@ def _apply_probe_snapshot(profile: WorkerProfile, snapshots_path: pathlib.Path |
     if entry is None:
         return profile
     expires_at, snapshot = entry
-    if expires_at <= time_monotonic():
-        _PROBE_SNAPSHOTS.pop(key, None)
-        return profile
+    liveness_fresh = expires_at > time_monotonic()
     for field, value in snapshot.items():
-        if _should_apply_probe_field(profile, field, value):
+        if _should_apply_probe_field(profile, field, value, liveness_fresh=liveness_fresh):
             setattr(profile, field, deepcopy(value))
     profile.__post_init__()
     return profile
 
 
-def _should_apply_probe_field(profile: WorkerProfile, field: str, value: Any) -> bool:
+def _should_apply_probe_field(profile: WorkerProfile, field: str, value: Any, *, liveness_fresh: bool) -> bool:
     if field not in _PROBE_SNAPSHOT_FIELDS or not value:
+        return False
+    if field in _PROBE_LIVENESS_FIELDS and not liveness_fresh:
         return False
     if field in _PROBE_SNAPSHOT_REPLACE_FIELDS:
         return True
@@ -119,13 +122,11 @@ def _read_probe_snapshot(snapshots_path: pathlib.Path | None, key: str) -> tuple
         expires_wall = float(row.get("expires_at") or 0.0)
     except (TypeError, ValueError):
         return None
-    remaining = expires_wall - time_wall()
-    if remaining <= 0:
-        return None
     snapshot = row.get("snapshot")
     if not isinstance(snapshot, dict):
         return None
     filtered = {field: deepcopy(snapshot[field]) for field in _PROBE_SNAPSHOT_FIELDS if field in snapshot}
+    remaining = expires_wall - time_wall()
     entry = (time_monotonic() + remaining, filtered)
     _PROBE_SNAPSHOTS[key] = entry
     return entry
@@ -140,9 +141,7 @@ def _write_probe_snapshot(snapshots_path: pathlib.Path | None, key: str, snapsho
         raw = json.loads(snapshots_path.read_text())
         existing = raw.get("snapshots") if isinstance(raw, dict) else None
         if isinstance(existing, dict):
-            for existing_key, row in existing.items():
-                if isinstance(row, dict) and float(row.get("expires_at") or 0.0) > now:
-                    rows[str(existing_key)] = row
+            rows = {str(existing_key): row for existing_key, row in existing.items() if isinstance(row, dict)}
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         rows = {}
     rows[key] = {"expires_at": now + _PROBE_SNAPSHOT_TTL_S, "snapshot": deepcopy(snapshot)}
