@@ -11069,3 +11069,81 @@ def test_spawn_child_rejects_an_unknown_engine_with_a_truthful_error(tmp_path, m
     assert "unknown engine" in result
     assert "claude-engine" in result
     assert "claude" in result and "codex" in result
+
+
+def test_child_watch_claim_renewal_does_not_grow_the_transcript(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.connectors import cockpit as cockpit_connector_module
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    parent = CockpitThread(
+        thread_id="thread_renewal",
+        project_id="neil-shared",
+        session_id="project:neil-shared:orchestrator:thread_renewal",
+        title="Join",
+        created_at="2026-07-13T16:00:00Z",
+        updated_at="2026-07-13T16:00:00Z",
+        created_by="neil",
+    )
+    index.save(parent)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    index.register_child_watch(parent, ["run_a"], requester=requester)
+    watch = index.claim_ready_child_watch(parent.thread_id, {"run_a"})
+    assert watch is not None
+    watch_id = str(watch["watch_id"])
+
+    # The projection collapses a watch to its latest record, so growth is only
+    # visible in the append-only transcript itself.
+    transcript = index._transcript_path(parent.project_id, parent.thread_id)  # noqa: SLF001
+
+    def transcript_lines() -> int:
+        return len([line for line in transcript.read_text().splitlines() if line.strip()])
+
+    baseline = transcript_lines()
+
+    # The continuation loop renews on every retry tick while it waits. A live
+    # lease must not append a record each time: one join once wrote 158.
+    for _ in range(40):
+        index.renew_child_watch_claim(parent.thread_id, watch_id)
+
+    assert transcript_lines() == baseline
+
+    # A lease that has aged past the heartbeat interval still renews, so a long
+    # join keeps its claim alive.
+    monkeypatch.setattr(cockpit_connector_module, "CHILD_WATCH_RENEW_INTERVAL_S", -60)
+
+    index.renew_child_watch_claim(parent.thread_id, watch_id)
+
+    assert transcript_lines() == baseline + 1
+
+
+def test_completed_child_watch_is_never_reclaimed(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    parent = CockpitThread(
+        thread_id="thread_reclaim",
+        project_id="neil-shared",
+        session_id="project:neil-shared:orchestrator:thread_reclaim",
+        title="Join",
+        created_at="2026-07-13T16:00:00Z",
+        updated_at="2026-07-13T16:00:00Z",
+        created_by="neil",
+    )
+    index.save(parent)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    index.register_child_watch(parent, ["run_a"], requester=requester)
+
+    claimed = index.claim_ready_child_watch(parent.thread_id, {"run_a"})
+    assert claimed is not None
+    watch_id = str(claimed["watch_id"])
+    assert index.child_watch_is_claimed(parent.thread_id, watch_id)
+
+    index.finish_child_watch(parent.thread_id, watch_id)
+
+    # The append-only transcript still holds the original "waiting" record. Only
+    # the latest record is the effective state, so the finished watch must not
+    # be claimable again — a second claim would fire a duplicate continuation.
+    assert not index.child_watch_is_claimed(parent.thread_id, watch_id)
+    assert index.claim_ready_child_watch(parent.thread_id, {"run_a"}) is None
