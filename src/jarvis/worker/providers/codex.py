@@ -116,15 +116,15 @@ class CodexProviderAdapter:
         return [started]
 
     def interrupt(self, *, session: WorkerSession, sessions: SessionManager) -> tuple[WorkerSession, SessionEvent]:
-        _terminate_provider_process(session)
         updated = sessions.update_status(session.session_id, SESSION_INTERRUPTED)
         event = sessions.append_event(updated.session_id, EVENT_SESSION_INTERRUPTED, {"status": SESSION_INTERRUPTED})
+        _terminate_provider_process(updated)
         return updated, event
 
     def stop(self, *, session: WorkerSession, sessions: SessionManager) -> tuple[WorkerSession, SessionEvent]:
-        _terminate_provider_process(session)
         updated = sessions.update_status(session.session_id, SESSION_STOPPED)
         event = sessions.append_event(updated.session_id, EVENT_SESSION_STOPPED, {"status": SESSION_STOPPED})
+        _terminate_provider_process(updated)
         return updated, event
 
     def resolve_approval(

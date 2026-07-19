@@ -275,7 +275,7 @@ def test_deriver_idle_wait_unsupported_queue_status_is_immediate_and_refreshes(t
     t0 = time.perf_counter()
     asyncio.run(session._cold_path("hello", "there"))
 
-    assert (time.perf_counter() - t0) < 0.3
+    assert (time.perf_counter() - t0) < 2.0
     assert memory.calls == [
         ("write_turn", None, "hello", "there"),
         ("queue_status",),

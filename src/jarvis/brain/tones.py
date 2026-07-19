@@ -8,7 +8,10 @@ loads a file instead of generating.
 
 from __future__ import annotations
 
+import array
+import math
 import pathlib
+import sys
 
 
 def make_tone(sample_rate: int, *, sound: str = "chime", freq: float = 880.0, seconds: float = 0.8) -> bytes:
@@ -38,22 +41,34 @@ def _load_file(path: str, sample_rate: int) -> bytes | None:
 
 
 def _generate(sample_rate: int, freq: float, seconds: float, *, double: bool) -> bytes:
-    import numpy as np
-
-    def beep(f: float, ms: int, amp: float = 0.5):  # noqa: ANN202
-        t = np.linspace(0, ms / 1000, int(sample_rate * ms / 1000), False)
-        tone = amp * np.sin(2 * np.pi * f * t)
-        fade = max(1, int(sample_rate * 0.01))  # 10ms fades kill clicks
-        env = np.ones_like(tone)
-        env[:fade] = np.linspace(0, 1, fade)
-        env[-fade:] = np.linspace(1, 0, fade)
-        return tone * env
-
     ms = int(seconds * 1000)
     if double:  # two-tone "ding-dong" — friendlier than a flat beep
         half = ms // 2
-        gap = np.zeros(int(sample_rate * 0.04))
-        buf = np.concatenate([beep(freq, half), gap, beep(freq * 1.335, half)])
+        samples = _beep_samples(sample_rate, freq, half)
+        samples.extend([0] * int(sample_rate * 0.04))
+        samples.extend(_beep_samples(sample_rate, freq * 1.335, half))
     else:
-        buf = beep(freq, ms)
-    return (np.clip(buf, -1, 1) * 32767).astype(np.int16).tobytes()
+        samples = _beep_samples(sample_rate, freq, ms)
+    return _pcm_bytes(samples)
+
+
+def _beep_samples(sample_rate: int, freq: float, ms: int, amp: float = 0.5) -> array.array[int]:
+    count = max(1, int(sample_rate * ms / 1000))
+    fade = min(count // 2 or 1, max(1, int(sample_rate * 0.01)))  # 10ms fades kill clicks
+    samples: array.array[int] = array.array("h")
+    for index in range(count):
+        env = 1.0
+        if index < fade:
+            env = index / fade
+        elif index >= count - fade:
+            env = (count - index - 1) / fade
+        value = amp * math.sin(2 * math.pi * freq * index / sample_rate) * max(0.0, env)
+        samples.append(int(max(-1.0, min(1.0, value)) * 32767))
+    return samples
+
+
+def _pcm_bytes(samples: array.array[int]) -> bytes:
+    if sys.byteorder != "little":
+        samples = array.array(samples.typecode, samples)
+        samples.byteswap()
+    return samples.tobytes()

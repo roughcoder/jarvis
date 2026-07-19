@@ -15,8 +15,11 @@ finally), and the caller then calls `finalize()` to remember exactly that.
 from __future__ import annotations
 
 import asyncio
+import array
 import json
+import math
 import pathlib
+import sys
 import time
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
@@ -234,20 +237,27 @@ def _format_withdrawn_records(title: str, records: list[ActiveRetraction]) -> st
 def _make_heartbeat(sample_rate: int) -> bytes:
     """A soft 'lub-dub' as 16-bit PCM at the playback rate — the gentle pulse
     played periodically while a slow tool (web search) runs."""
-    import numpy as np
 
-    def thump(freq: float, ms: int, amp: float):  # noqa: ANN202
-        t = np.linspace(0, ms / 1000, int(sample_rate * ms / 1000), False)
-        tone = amp * np.sin(2 * np.pi * freq * t)
-        fade = max(1, int(sample_rate * 0.012))  # 12ms fades kill clicks
-        env = np.ones_like(tone)
-        env[:fade] = np.linspace(0, 1, fade)
-        env[-fade:] = np.linspace(1, 0, fade)
-        return tone * env
+    def thump(freq: float, ms: int, amp: float) -> array.array[int]:
+        count = max(1, int(sample_rate * ms / 1000))
+        fade = min(count // 2 or 1, max(1, int(sample_rate * 0.012)))  # 12ms fades kill clicks
+        samples: array.array[int] = array.array("h")
+        for index in range(count):
+            env = 1.0
+            if index < fade:
+                env = index / fade
+            elif index >= count - fade:
+                env = (count - index - 1) / fade
+            value = amp * math.sin(2 * math.pi * freq * index / sample_rate) * max(0.0, env)
+            samples.append(int(max(-1.0, min(1.0, value)) * 32767))
+        return samples
 
-    gap = np.zeros(int(sample_rate * 0.10))  # 100ms between lub and dub
-    buf = np.concatenate([thump(150, 90, 0.16), gap, thump(120, 110, 0.12)])
-    return (buf * 32767).astype(np.int16).tobytes()
+    samples = thump(150, 90, 0.16)
+    samples.extend([0] * int(sample_rate * 0.10))  # 100ms between lub and dub
+    samples.extend(thump(120, 110, 0.12))
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return samples.tobytes()
 
 
 @dataclass

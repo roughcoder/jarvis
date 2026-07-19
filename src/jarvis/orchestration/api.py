@@ -375,6 +375,20 @@ class SseSnapshotHub:
                 # subscriber doesn't get the idle period replayed as frames.
                 self._event_counts.pop(subscription.mode, None)
 
+    async def seed_snapshot(self, mode: str, body: dict[str, Any]) -> None:
+        """Let a REST snapshot establish the baseline for a follow-up SSE stream.
+
+        Do this only while the mode has no active subscribers. Mutating the hub
+        baseline underneath live streams would make the next refresh compare
+        against the wrong previous snapshot and could suppress deltas.
+        """
+
+        async with self._lock:
+            if any(existing.mode == mode for existing in self._subscribers.values()):
+                return
+            self._snapshots[mode] = body
+            self._snapshot_stamps[mode] = self._snapshot_stamp()
+
     async def _snapshot(self, mode: str) -> dict[str, Any]:
         cached = self._snapshots.get(mode)
         body = cached if cached is not None else await _shared_snapshot_body(self.ctx, self, mode)
@@ -873,7 +887,9 @@ class CockpitReadHandlers:
         await self.ctx.require_auth(request)
         mode = _sync_mode(request)
         hub = request.app[SSE_SNAPSHOT_HUB_KEY]
-        return web.json_response(await _shared_snapshot_body(self.ctx, hub, mode, respect_backoff=False))
+        body = await _shared_snapshot_body(self.ctx, hub, mode, respect_backoff=False)
+        await hub.seed_snapshot(mode, body)
+        return web.json_response(body)
 
     async def mcp_status(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)

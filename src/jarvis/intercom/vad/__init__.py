@@ -10,10 +10,29 @@ through the same instance; call reset() between independent utterances.
 
 from __future__ import annotations
 
+import logging
+
 from jarvis.config import VADConfig
 
 # Silero v5 requires exactly 512 samples per call at 16kHz.
 FRAME_SAMPLES_16K = 512
+logger = logging.getLogger(__name__)
+
+
+class _EnergyVAD:
+    """Fallback for test/dev environments without the optional webrtcvad wheel."""
+
+    def is_speech(self, frame_int16: bytes, _sample_rate: int) -> bool:
+        if not frame_int16:
+            return False
+        sample_count = len(frame_int16) // 2
+        if sample_count == 0:
+            return False
+        total = 0
+        for offset in range(0, len(frame_int16) - 1, 2):
+            sample = int.from_bytes(frame_int16[offset : offset + 2], "little", signed=True)
+            total += abs(sample)
+        return (total / sample_count) > 500
 
 
 class SileroVAD:
@@ -27,11 +46,18 @@ class SileroVAD:
         if self._cfg.engine == "webrtc":
             if self._webrtc is not None:
                 return
-            import webrtcvad
-
-            self._webrtc = webrtcvad.Vad(
-                max(0, min(3, int(self._cfg.webrtc_aggressiveness)))
-            )
+            try:
+                import webrtcvad
+            except ModuleNotFoundError:
+                logger.warning(
+                    "webrtcvad is unavailable; using energy-threshold VAD fallback "
+                    "(acceptable for dev/test, not production audio devices)"
+                )
+                self._webrtc = _EnergyVAD()
+            else:
+                self._webrtc = webrtcvad.Vad(
+                    max(0, min(3, int(self._cfg.webrtc_aggressiveness)))
+                )
             return
 
         if self._model is not None:

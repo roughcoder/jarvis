@@ -74,16 +74,33 @@ from jarvis.worker_session_contract import (  # noqa: E402
 )
 
 
-async def _with_server(cfg: WorkerConfig, port: int, fn):  # noqa: ANN001
+async def _with_server(cfg: WorkerConfig, port: int, fn, *, timeout: float = 60.0):  # noqa: ANN001
     runner = web.AppRunner(make_app(cfg))
     await runner.setup()
     site = web.TCPSite(runner, "localhost", port)
     await site.start()
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             return await fn(f"http://localhost:{port}", client)
     finally:
         await runner.cleanup()
+
+
+async def _wait_job(
+    client: httpx.AsyncClient,
+    base: str,
+    job_id: str,
+    *,
+    attempts: int = 300,
+    interval_s: float = 0.05,
+) -> dict:
+    job: dict = {}
+    for _ in range(attempts):
+        job = (await client.get(f"{base}/jobs/{job_id}")).json()
+        if job.get("status") != "running":
+            return job
+        await asyncio.sleep(interval_s)
+    return job
 
 
 def _authority_metadata(engine: str = "codex", extra_actions: list[str] | None = None) -> dict:
@@ -1763,24 +1780,27 @@ def test_daemon_health_reports_diagnostics_error_without_500(tmp_path, monkeypat
 
 
 def test_daemon_health_does_not_wait_for_slow_diagnostics(tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    import time
+    started = threading.Event()
+    release = threading.Event()
 
     def slow_diagnostics(**_kwargs):  # noqa: ANN001
-        time.sleep(0.25)
+        started.set()
+        release.wait(timeout=5)
         return {"repositories": [{"repo": "jarvis", "status": "ready"}]}
 
     monkeypatch.setattr("jarvis.worker.server.diagnostics", slow_diagnostics)
     cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"))
 
     async def calls(base, c):  # noqa: ANN001
-        started = time.monotonic()
-        response = await c.get(base + "/health")
-        elapsed = time.monotonic() - started
-        return elapsed, response.json()
+        try:
+            response = await asyncio.wait_for(c.get(base + "/health"), timeout=1.0)
+            assert started.wait(timeout=1)
+            return response.json()
+        finally:
+            release.set()
 
-    elapsed, health = asyncio.run(_with_server(cfg, 8849, calls))
+    health = asyncio.run(_with_server(cfg, 8849, calls))
 
-    assert elapsed < 0.20
     assert health["diagnostics"] == {"status": "refreshing", "repositories": []}
 
 
@@ -1885,7 +1905,7 @@ def test_daemon_conversation_workspace_serializes_concurrent_materialization(tmp
         fetched = (await c.get(f"{base}/conversation-workspaces/thread_race", headers=headers)).json()
         return first.json(), second.json(), fetched
 
-    first, second, fetched = asyncio.run(_with_server(cfg, 8853, calls))
+    first, second, fetched = asyncio.run(_with_server(cfg, 8853, calls, timeout=30.0))
 
     assert first["ok"] is True
     assert second["ok"] is True
@@ -4495,12 +4515,7 @@ def test_daemon_code_dispatch_marks_nonzero_agent_exit_as_error(tmp_path) -> Non
             )
         ).json()
         jid = disp["job_id"]
-        job = {}
-        for _ in range(100):
-            job = (await c.get(f"{base}/jobs/{jid}")).json()
-            if job["status"] != "running":
-                break
-            await asyncio.sleep(0.02)
+        job = await _wait_job(c, base, jid)
         return job
 
     job = asyncio.run(_with_server(cfg, 8820, calls))
@@ -4918,9 +4933,8 @@ def test_no_repo_jobs_get_isolated_run_dirs(tmp_path) -> None:
     async def calls(base, c):  # noqa: ANN001
         r1 = (await c.post(base + "/run", json={"action": "code", "args": {"prompt": "a", "name": "job one"}})).json()
         r2 = (await c.post(base + "/run", json={"action": "code", "args": {"prompt": "b", "name": "job two"}})).json()
-        await asyncio.sleep(0.3)
-        j1 = (await c.get(f"{base}/jobs/{r1['job_id']}")).json()
-        j2 = (await c.get(f"{base}/jobs/{r2['job_id']}")).json()
+        j1 = await _wait_job(c, base, r1["job_id"])
+        j2 = await _wait_job(c, base, r2["job_id"])
         return j1, j2
 
     j1, j2 = asyncio.run(_with_server(cfg, 8810, calls))
@@ -4944,8 +4958,7 @@ def test_repo_job_isolates_on_a_worktree_branch(tmp_path) -> None:
 
     async def calls(base, c):  # noqa: ANN001
         r = (await c.post(base + "/run", json={"action": "code", "args": {"prompt": "do x", "name": "refactor", "repo": str(repo)}})).json()
-        await asyncio.sleep(0.3)
-        j = (await c.get(f"{base}/jobs/{r['job_id']}")).json()
+        j = await _wait_job(c, base, r["job_id"])
         return r, j
 
     r, j = asyncio.run(_with_server(cfg, 8812, calls))
@@ -4972,8 +4985,7 @@ def test_non_git_repo_input_is_copied_to_worker_scratch(tmp_path) -> None:
                 json={"action": "code", "args": {"prompt": "x", "name": "plain", "repo": str(user_dir)}},
             )
         ).json()
-        await asyncio.sleep(0.3)
-        j = (await c.get(f"{base}/jobs/{r['job_id']}")).json()
+        j = await _wait_job(c, base, r["job_id"])
         existed_before_cleanup = pathlib.Path(j["cwd"]).exists()
         clean = (await c.post(base + "/run", json={"action": "cleanup", "args": {"job": "plain"}})).json()
         return r, j, existed_before_cleanup, clean
@@ -5002,8 +5014,7 @@ def test_cleanup_removes_worktree_and_branch(tmp_path) -> None:
 
     async def calls(base, c):  # noqa: ANN001
         r = (await c.post(base + "/run", json={"action": "code", "args": {"prompt": "x", "name": "cleanme", "repo": str(repo)}})).json()
-        await asyncio.sleep(0.3)
-        wt = (await c.get(f"{base}/jobs/{r['job_id']}")).json()["cwd"]
+        wt = (await _wait_job(c, base, r["job_id"]))["cwd"]
         clean = (await c.post(base + "/run", json={"action": "cleanup", "args": {"job": "cleanme"}})).json()
         after = (await c.get(base + "/jobs")).json()["jobs"]
         return r["branch"], wt, clean, after
@@ -5263,8 +5274,7 @@ def test_cleanup_all_removes_scratch_dir(tmp_path) -> None:
 
     async def calls(base, c):  # noqa: ANN001
         r = (await c.post(base + "/run", json={"action": "code", "args": {"prompt": "x", "name": "scratchy"}})).json()
-        await asyncio.sleep(0.3)
-        cwd = (await c.get(f"{base}/jobs/{r['job_id']}")).json()["cwd"]
+        cwd = (await _wait_job(c, base, r["job_id"]))["cwd"]
         clean = (await c.post(base + "/run", json={"action": "cleanup", "args": {"job": ""}})).json()
         return cwd, clean
 

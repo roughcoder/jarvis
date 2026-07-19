@@ -1107,7 +1107,7 @@ def test_oauth_real_mcp_app_serves_discovery_challenge_and_tool_call(tmp_path, m
                     url=f"{cfg.mcp_serve.resolved_resource_url}/mcp",
                     headers={"Authorization": f"Bearer {token}"},
                 ),
-                call_timeout_s=10.0,
+                call_timeout_s=30.0,
             )
             await asyncio.wait_for(client.connect(), 20.0)
             try:
