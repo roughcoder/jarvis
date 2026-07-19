@@ -1900,6 +1900,71 @@ If `after` does not match a cursor/id in the current page source, Jarvis returns
 the beginning. Clients should clear the cursor and refetch from the first page
 when they receive that error.
 
+## Retention
+
+Cockpit retention routes expose the same policy used by `jarvis conversations`
+and the automatic sweep:
+
+```text
+GET /v1/retention/plan
+GET /v1/retention/settings
+PUT /v1/retention/settings
+POST /v1/retention/prune
+```
+
+`GET /v1/retention/plan` returns:
+
+```json
+{
+  "ok": true,
+  "plan": {
+    "classes": [
+      {"name": "archived", "ttl_days": 14.0, "count": 0, "bytes": 0, "disabled": false},
+      {"name": "chat", "ttl_days": 7.0, "count": 0, "bytes": 0, "disabled": false},
+      {"name": "tree", "ttl_days": 7.0, "count": 0, "bytes": 0, "disabled": false}
+    ],
+    "total_count": 0,
+    "total_bytes": 0,
+    "kept": 0
+  },
+  "settings": {
+    "enabled": true,
+    "interval_s": 21600,
+    "archived_ttl_days": 14.0,
+    "chat_ttl_days": 7.0,
+    "tree_ttl_days": 7.0
+  },
+  "auto": {
+    "enabled": true,
+    "interval_s": 21600,
+    "last_run_at": null,
+    "last_result": null
+  }
+}
+```
+
+`GET /v1/retention/settings` returns the effective settings plus a per-field
+source of `env` or `override`. `PUT /v1/retention/settings` accepts any subset of
+`enabled`, `interval_s`, `archived_ttl_days`, `chat_ttl_days`, and
+`tree_ttl_days`, plus required `idempotency_key`; `null` clears that field back
+to env. Settings overrides are stored in the orchestration workspace and take
+effect on the next retention loop tick without restarting `jarvis api`.
+
+`POST /v1/retention/prune` requires `{"idempotency_key": "..."}` and returns:
+
+```json
+{
+  "ok": true,
+  "deleted": {"archived": 0, "chat": 0, "tree": 0},
+  "child_runs": 0,
+  "bytes_reclaimed": 0,
+  "kept": 0
+}
+```
+
+Reads use normal Cockpit read auth. Prune and settings writes require
+`orchestration.runs.write`.
+
 ## Writes
 
 Cockpit write responses use named envelopes:

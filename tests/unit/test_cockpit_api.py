@@ -495,6 +495,21 @@ def _set_worker_status(cfg: Config, status: str) -> None:
     workers_path.write_text(json.dumps(data))
 
 
+def _seed_retention_thread(cfg: Config, thread_id: str, *, days_idle: float = 30.0, project_id: str = "house-story") -> CockpitThread:
+    stamp = (datetime.now(UTC) - timedelta(days=days_idle)).replace(microsecond=0).isoformat()
+    thread = CockpitThread(
+        thread_id=thread_id,
+        project_id=project_id,
+        session_id=f"project:{project_id}:{thread_id}",
+        title=thread_id,
+        created_at=stamp,
+        updated_at=stamp,
+        created_by="neil",
+        last_turn_at=stamp,
+    )
+    return CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json").save(thread)
+
+
 def _seed_project_registry(cfg: Config) -> None:
     path = Path(cfg.registry.path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1473,6 +1488,166 @@ def test_cockpit_worker_worktree_prune_reaches_the_worker(tmp_path, monkeypatch)
     # The response carries a fresh recount so a caller can show before/after.
     assert body["worktree_inventory"]["count"] == 1
     assert body["worktree_inventory"]["stale_count"] == 0
+
+
+def test_cockpit_retention_reads_require_auth_and_return_contract_shape(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, token="secret")
+    _seed_retention_thread(cfg, "old_chat")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[int, int, dict[str, Any], dict[str, Any]]:
+        unauthorized = await client.get(f"{base}/v1/retention/plan")
+        unauthorized_settings = await client.get(f"{base}/v1/retention/settings")
+        headers = {"Authorization": "Bearer secret"}
+        plan_response = await client.get(f"{base}/v1/retention/plan", headers=headers)
+        settings_response = await client.get(f"{base}/v1/retention/settings", headers=headers)
+        assert plan_response.status_code == 200
+        assert settings_response.status_code == 200
+        return unauthorized.status_code, unauthorized_settings.status_code, plan_response.json(), settings_response.json()
+
+    import asyncio
+
+    unauthorized_status, unauthorized_settings_status, plan_body, settings_body = asyncio.run(_with_server(cfg, calls))
+
+    assert unauthorized_status == 401
+    assert unauthorized_settings_status == 401
+    assert plan_body["ok"] is True
+    assert plan_body["plan"]["classes"] == [
+        {"name": "archived", "ttl_days": 14.0, "count": 0, "bytes": 0, "disabled": False},
+        {"name": "chat", "ttl_days": 7.0, "count": 1, "bytes": 0, "disabled": False},
+        {"name": "tree", "ttl_days": 7.0, "count": 0, "bytes": 0, "disabled": False},
+    ]
+    assert plan_body["plan"]["total_count"] == 1
+    assert plan_body["plan"]["total_bytes"] == 0
+    assert plan_body["plan"]["kept"] == 0
+    assert plan_body["settings"] == {
+        "enabled": False,
+        "interval_s": 21600,
+        "archived_ttl_days": 14.0,
+        "chat_ttl_days": 7.0,
+        "tree_ttl_days": 7.0,
+    }
+    assert plan_body["auto"] == {
+        "enabled": False,
+        "interval_s": 21600,
+        "last_run_at": None,
+        "last_result": None,
+    }
+    assert settings_body == {
+        "ok": True,
+        "settings": plan_body["settings"],
+        "source": {
+            "enabled": "env",
+            "interval_s": "env",
+            "archived_ttl_days": "env",
+            "chat_ttl_days": "env",
+            "tree_ttl_days": "env",
+        },
+    }
+
+
+def test_cockpit_retention_settings_write_requires_capability_and_is_idempotent(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    denied_root = tmp_path / "denied"
+    allowed_root = tmp_path / "allowed"
+    denied_root.mkdir()
+    allowed_root.mkdir()
+    denied_cfg = _cfg(denied_root, monkeypatch)
+
+    async def denied_calls(base: str, client: httpx.AsyncClient) -> tuple[int, int]:
+        missing_key = await client.put(f"{base}/v1/retention/settings", json={"chat_ttl_days": 3})
+        forbidden = await client.put(
+            f"{base}/v1/retention/settings",
+            json={"idempotency_key": "settings_denied", "chat_ttl_days": 3},
+        )
+        return missing_key.status_code, forbidden.status_code
+
+    import asyncio
+
+    assert asyncio.run(_with_server(denied_cfg, denied_calls)) == (400, 403)
+
+    cfg = _cfg(allowed_root, monkeypatch, caps="orchestration.runs.write")
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+        first = await client.put(
+            f"{base}/v1/retention/settings",
+            json={"idempotency_key": "settings_1", "chat_ttl_days": 3.5, "interval_s": 60},
+        )
+        plan = await client.get(f"{base}/v1/retention/plan")
+        replay = await client.put(
+            f"{base}/v1/retention/settings",
+            json={"idempotency_key": "settings_1", "chat_ttl_days": 3.5, "interval_s": 60},
+        )
+        cleared = await client.put(
+            f"{base}/v1/retention/settings",
+            json={"idempotency_key": "settings_2", "chat_ttl_days": None},
+        )
+        fetched = await client.get(f"{base}/v1/retention/settings")
+        assert first.status_code == plan.status_code == replay.status_code == cleared.status_code == fetched.status_code == 200
+        return first.json(), plan.json(), replay.json(), cleared.json(), fetched.json()
+
+    first, plan, replay, cleared, fetched = asyncio.run(_with_server(cfg, calls))
+
+    assert first["settings"]["chat_ttl_days"] == 3.5
+    assert first["settings"]["interval_s"] == 60
+    assert first["source"]["chat_ttl_days"] == "override"
+    assert first["source"]["interval_s"] == "override"
+    assert plan["plan"]["classes"][1]["name"] == "chat"
+    assert plan["plan"]["classes"][1]["ttl_days"] == 3.5
+    assert replay["idempotent"] is True
+    assert replay["settings"] == first["settings"]
+    assert cleared["settings"]["chat_ttl_days"] == 7.0
+    assert cleared["source"]["chat_ttl_days"] == "env"
+    assert cleared["source"]["interval_s"] == "override"
+    assert fetched == cleared
+
+
+def test_cockpit_retention_prune_requires_capability_and_is_idempotent(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    denied_root = tmp_path / "denied"
+    allowed_root = tmp_path / "allowed"
+    denied_root.mkdir()
+    allowed_root.mkdir()
+    denied_cfg = _cfg(denied_root, monkeypatch)
+
+    async def denied_calls(base: str, client: httpx.AsyncClient) -> tuple[int, int]:
+        missing_key = await client.post(f"{base}/v1/retention/prune", json={})
+        forbidden = await client.post(f"{base}/v1/retention/prune", json={"idempotency_key": "prune_denied"})
+        return missing_key.status_code, forbidden.status_code
+
+    import asyncio
+
+    assert asyncio.run(_with_server(denied_cfg, denied_calls)) == (400, 403)
+
+    cfg = _cfg(allowed_root, monkeypatch, caps="orchestration.runs.write")
+    _seed_retention_thread(cfg, "old_chat")
+
+    class FakeMemory:
+        def __init__(self, _cfg) -> None:  # noqa: ANN001
+            pass
+
+        def delete_session(self, _session_id: str) -> None:
+            return None
+
+    monkeypatch.setattr(cockpit_api_module, "MemoryClient", FakeMemory)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        first = await client.post(f"{base}/v1/retention/prune", json={"idempotency_key": "prune_1"})
+        replay = await client.post(f"{base}/v1/retention/prune", json={"idempotency_key": "prune_1"})
+        plan = await client.get(f"{base}/v1/retention/plan")
+        assert first.status_code == replay.status_code == plan.status_code == 200
+        return first.json(), replay.json(), plan.json()
+
+    first, replay, plan = asyncio.run(_with_server(cfg, calls))
+
+    assert first == {
+        "ok": True,
+        "deleted": {"archived": 0, "chat": 1, "tree": 0},
+        "child_runs": 0,
+        "bytes_reclaimed": 0,
+        "kept": 0,
+    }
+    assert replay["idempotent"] is True
+    assert replay["deleted"] == first["deleted"]
+    assert plan["auto"]["last_run_at"]
+    assert plan["auto"]["last_result"] == {"deleted": 1, "bytes": 0}
 
 
 def test_cockpit_archived_run_is_not_worker_synced(tmp_path, monkeypatch) -> None:  # noqa: ANN001

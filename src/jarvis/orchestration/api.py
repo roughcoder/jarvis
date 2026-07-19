@@ -126,12 +126,17 @@ from jarvis.orchestration.oauth import (
     required_scopes,
 )
 from jarvis.orchestration.retention import (
+    RETENTION_CLASSES,
     RetentionPlan,
     RetentionPolicy,
     RetentionResult,
     directory_bytes,
     execute_plan,
     plan_retention,
+    read_retention_state,
+    record_retention_run,
+    resolve_retention_settings,
+    update_retention_overrides,
 )
 from jarvis.orchestration.service import (
     MissingAuthorityError,
@@ -730,9 +735,40 @@ def build_retention_plan(ctx: CockpitAppContext, policy: RetentionPolicy) -> Ret
     )
 
 
-async def run_retention_sweep(ctx: CockpitAppContext, policy: RetentionPolicy) -> RetentionResult:
+def _retention_plan_packet(plan: RetentionPlan, policy: RetentionPolicy) -> dict[str, Any]:
+    counts = plan.counts()
+    sizes = plan.bytes_by_class()
+    return {
+        "classes": [
+            {
+                "name": klass,
+                "ttl_days": float(policy.ttl_days(klass)),
+                "count": int(counts.get(klass, 0)),
+                "bytes": int(sizes.get(klass, 0)),
+                "disabled": not policy.class_enabled(klass),
+            }
+            for klass in RETENTION_CLASSES
+        ],
+        "total_count": len(plan.candidates),
+        "total_bytes": int(plan.total_bytes),
+        "kept": len(plan.kept),
+    }
+
+
+def _retention_auto_packet(ctx: CockpitAppContext, policy: RetentionPolicy) -> dict[str, Any]:
+    state = read_retention_state(ctx.cfg.orchestration)
+    return {
+        "enabled": bool(policy.enabled and policy.any_class_enabled),
+        "interval_s": max(0, int(policy.interval_s)),
+        "last_run_at": state["last_run_at"],
+        "last_result": state["last_result"],
+    }
+
+
+async def run_retention_sweep(ctx: CockpitAppContext, policy: RetentionPolicy | None = None) -> RetentionResult:
     """One retention pass. Best-effort: never raises into the caller's loop."""
 
+    policy = policy or resolve_retention_settings(ctx.cfg.orchestration).policy
     requester = retention_requester(ctx.cfg)
 
     async def delete_thread(project_id: str, thread_id: str) -> dict[str, Any]:
@@ -743,6 +779,7 @@ async def run_retention_sweep(ctx: CockpitAppContext, policy: RetentionPolicy) -
 
     plan = await asyncio.to_thread(build_retention_plan, ctx, policy)
     result = await execute_plan(plan, delete_thread=delete_thread, delete_run=delete_run)
+    record_retention_run(ctx.cfg.orchestration, result)
     logger.info("%s", result.summary_line())
     for failure in result.failures:
         logger.warning("conversation retention could not collect %s", failure)
@@ -751,27 +788,24 @@ async def run_retention_sweep(ctx: CockpitAppContext, policy: RetentionPolicy) -
 
 async def _retention_context(app: web.Application):  # noqa: ANN202
     ctx = app[RETENTION_CTX_KEY]
-    policy = RetentionPolicy.from_config(ctx.cfg.orchestration)
-    # Mirrors the worker's worktree GC refusal: with every class disabled there
-    # is nothing an automatic sweep could legally collect, so don't run a timer.
-    if not policy.enabled or not policy.any_class_enabled:
-        yield
-        return
+    disabled_poll_s = 60.0
 
     async def loop() -> None:
         # Startup sweep first — an API that has been down for a week comes back
         # with a backlog of dead conversations, and that's the moment to shed them.
+        interval = disabled_poll_s
         while True:
             try:
-                await run_retention_sweep(ctx, policy)
+                policy = resolve_retention_settings(ctx.cfg.orchestration).policy
+                active = policy.enabled and policy.any_class_enabled
+                if active:
+                    await run_retention_sweep(ctx, policy)
+                interval = max(0.0, float(policy.interval_s)) if active else disabled_poll_s
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - retention must never take the API down
                 logger.warning("conversation retention sweep failed: %s", exc)
-            interval = max(0.0, float(policy.interval_s))
-            if interval <= 0:
-                return
-            await asyncio.sleep(interval)
+            await asyncio.sleep(interval if interval > 0 else disabled_poll_s)
 
     task = asyncio.create_task(loop(), name="cockpit-conversation-retention")
     try:
@@ -874,6 +908,10 @@ def make_app(
         web.get("/v1/cockpit/catalog", reads.catalog),
         web.get("/v1/cockpit/snapshot", reads.snapshot),
         web.get("/v1/cockpit/events", sse.events),
+        web.get("/v1/retention/plan", reads.retention_plan),
+        web.get("/v1/retention/settings", reads.retention_settings),
+        web.post("/v1/retention/prune", writes.retention_prune),
+        web.put("/v1/retention/settings", writes.retention_settings),
         web.post("/v1/worker/notify", worker_notify),
         web.get("/v1/mcp/status", reads.mcp_status),
         web.get("/v1/mcp/tools", reads.mcp_tools),
@@ -1009,6 +1047,24 @@ class CockpitReadHandlers:
         body = await _shared_snapshot_body(self.ctx, hub, mode, respect_backoff=False)
         await hub.seed_snapshot(mode, body)
         return web.json_response(body)
+
+    async def retention_plan(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        resolved = await asyncio.to_thread(resolve_retention_settings, self.ctx.cfg.orchestration)
+        plan = await asyncio.to_thread(build_retention_plan, self.ctx, resolved.policy)
+        return web.json_response(
+            {
+                "ok": True,
+                "plan": _retention_plan_packet(plan, resolved.policy),
+                "settings": resolved.settings(),
+                "auto": _retention_auto_packet(self.ctx, resolved.policy),
+            }
+        )
+
+    async def retention_settings(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        resolved = await asyncio.to_thread(resolve_retention_settings, self.ctx.cfg.orchestration)
+        return web.json_response({"ok": True, "settings": resolved.settings(), "source": resolved.source})
 
     async def mcp_status(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -2610,6 +2666,45 @@ class CockpitWriteHandlers:
         )
         return web.json_response(response_body)
 
+    async def retention_prune(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        body = await _json_body(request)
+        key = _required_idempotency_key(body)
+        requester = _cockpit_requester_context(request, self.ctx.cfg)
+        scope = "retention/prune"
+
+        async def produce() -> dict[str, Any]:
+            _require_capability(self.ctx.cfg, "orchestration.runs.write")
+            result = await run_retention_sweep(self.ctx)
+            return {
+                "ok": True,
+                "deleted": {klass: int(result.deleted.get(klass, 0)) for klass in RETENTION_CLASSES},
+                "child_runs": int(result.child_runs),
+                "bytes_reclaimed": int(result.bytes_reclaimed),
+                "kept": int(result.kept),
+            }
+
+        response_body = await _idempotent_write_body(self.ctx, scope, key, body, produce, requester=requester)
+        return web.json_response(response_body)
+
+    async def retention_settings(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        body = await _json_body(request)
+        key = _required_idempotency_key(body)
+        requester = _cockpit_requester_context(request, self.ctx.cfg)
+        scope = "retention/settings"
+
+        async def produce() -> dict[str, Any]:
+            _require_capability(self.ctx.cfg, "orchestration.runs.write")
+            try:
+                resolved = await asyncio.to_thread(update_retention_overrides, self.ctx.cfg.orchestration, body)
+            except ValueError as exc:
+                raise CockpitError("validation_failed", str(exc), recoverable=True, status=400) from exc
+            return {"ok": True, "settings": resolved.settings(), "source": resolved.source}
+
+        response_body = await _idempotent_write_body(self.ctx, scope, key, body, produce, requester=requester)
+        return web.json_response(response_body)
+
     async def run_archive(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
@@ -3373,6 +3468,13 @@ async def _optional_json_body(request: web.Request) -> dict[str, Any]:
         if exc.code == "validation_failed" and not (request.content_length or 0):
             return {}
         raise
+
+
+def _required_idempotency_key(body: dict[str, Any]) -> str:
+    key = str(body.get("idempotency_key") or "").strip()
+    if not key:
+        raise CockpitError("validation_failed", "idempotency_key is required", recoverable=True, status=400)
+    return key
 
 
 async def _idempotent_write_body(
