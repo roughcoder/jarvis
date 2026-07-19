@@ -10,10 +10,13 @@ through the same instance; call reset() between independent utterances.
 
 from __future__ import annotations
 
+import logging
+
 from jarvis.config import VADConfig
 
 # Silero v5 requires exactly 512 samples per call at 16kHz.
 FRAME_SAMPLES_16K = 512
+logger = logging.getLogger(__name__)
 
 
 class _EnergyVAD:
@@ -46,6 +49,10 @@ class SileroVAD:
             try:
                 import webrtcvad
             except ModuleNotFoundError:
+                logger.warning(
+                    "webrtcvad is unavailable; using energy-threshold VAD fallback "
+                    "(acceptable for dev/test, not production audio devices)"
+                )
                 self._webrtc = _EnergyVAD()
             else:
                 self._webrtc = webrtcvad.Vad(
