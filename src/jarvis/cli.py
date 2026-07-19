@@ -949,10 +949,10 @@ def _cmd_conversations(args: argparse.Namespace) -> int:
     from dataclasses import replace
 
     from jarvis.orchestration.api import build_retention_plan, cockpit_context, run_retention_sweep
-    from jarvis.orchestration.retention import RETENTION_CLASSES, RetentionPolicy, human_bytes
+    from jarvis.orchestration.retention import RETENTION_CLASSES, human_bytes, resolve_retention_settings
 
     cfg = load_config()
-    policy = RetentionPolicy.from_config(cfg.orchestration)
+    policy = resolve_retention_settings(cfg.orchestration).policy
     if args.ttl_days is not None:
         # An explicit sweep may use a threshold the timer would refuse; the
         # protections below are what keep live work safe, not the TTL.

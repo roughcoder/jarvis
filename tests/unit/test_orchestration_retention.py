@@ -13,9 +13,14 @@ from jarvis.orchestration.retention import (
     CLASS_ARCHIVED,
     CLASS_CHAT,
     CLASS_TREE,
+    RetentionResult,
     RetentionPolicy,
     execute_plan,
     plan_retention,
+    read_retention_state,
+    record_retention_run,
+    resolve_retention_settings,
+    update_retention_overrides,
 )
 
 NOW = datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc)
@@ -377,6 +382,84 @@ def test_sweep_end_to_end_against_a_real_store(tmp_path, monkeypatch) -> None:  
     assert "kept 2" in result.summary_line()
 
 
+def test_sweep_default_policy_uses_effective_settings_override(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.config import Config
+    from jarvis.connectors.cockpit import THREAD_INDEX_FILENAME, CockpitThreadIndex
+    from jarvis.orchestration import api as api_module
+
+    env = tmp_path / ".env"
+    workspace = tmp_path / "orchestration"
+    env.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={workspace}",
+                f"MEMORY_CACHE_PATH={tmp_path / 'memory-cache.json'}",
+                "ORCHESTRATION_RETENTION_CHAT_TTL_DAYS=7",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env))
+    cfg = Config()
+    update_retention_overrides(cfg.orchestration, {"chat_ttl_days": 90})
+
+    index = CockpitThreadIndex(workspace / THREAD_INDEX_FILENAME)
+    index.save(thread("t_kept_by_override", days_idle=40))
+
+    ctx = api_module.cockpit_context(cfg)
+    result = asyncio.run(api_module.run_retention_sweep(ctx))
+
+    assert {t.thread_id for t in index.list_all()} == {"t_kept_by_override"}
+    assert result.deleted[CLASS_CHAT] == 0
+    assert result.kept == 1
+    assert read_retention_state(cfg.orchestration)["last_result"] == {"deleted": 0, "bytes": 0}
+
+
+def test_conversations_cli_uses_effective_settings_override(tmp_path, monkeypatch, capsys) -> None:  # noqa: ANN001
+    import json
+    from types import SimpleNamespace
+
+    from jarvis import cli
+    from jarvis.config import Config
+    from jarvis.connectors.cockpit import THREAD_INDEX_FILENAME, CockpitThreadIndex
+
+    env = tmp_path / ".env"
+    workspace = tmp_path / "orchestration"
+    env.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={workspace}",
+                f"MEMORY_CACHE_PATH={tmp_path / 'memory-cache.json'}",
+                "ORCHESTRATION_RETENTION_CHAT_TTL_DAYS=7",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("JARVIS_ENV_FILE", str(env))
+    cfg = Config()
+    update_retention_overrides(cfg.orchestration, {"chat_ttl_days": 90})
+
+    index = CockpitThreadIndex(workspace / THREAD_INDEX_FILENAME)
+    index.save(thread("t_cli_kept_by_override", days_idle=40))
+
+    rc = cli._cmd_conversations(
+        SimpleNamespace(
+            ttl_days=None,
+            json=True,
+            prune=False,
+            dry_run=False,
+            verbose=False,
+        )
+    )
+
+    assert rc == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["counts"][CLASS_CHAT] == 0
+    assert output["kept"][0]["thread_id"] == "t_cli_kept_by_override"
+    assert output["kept"][0]["class"] == CLASS_CHAT
+    assert output["kept"][0]["reason"].endswith("ttl 90d")
+
+
 def test_policy_reads_the_orchestration_config() -> None:
     from jarvis.config import OrchestrationConfig
 
@@ -384,3 +467,59 @@ def test_policy_reads_the_orchestration_config() -> None:
     assert policy.enabled is True
     assert policy.interval_s == 6 * 60 * 60
     assert (policy.archived_ttl_days, policy.chat_ttl_days, policy.tree_ttl_days) == (14.0, 7.0, 7.0)
+
+
+def test_effective_settings_prefer_overrides_and_clear_to_env(tmp_path) -> None:
+    from jarvis.config import OrchestrationConfig
+
+    env = tmp_path / ".env"
+    env.write_text(
+        "\n".join(
+            [
+                f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
+                "ORCHESTRATION_RETENTION_ENABLED=true",
+                "ORCHESTRATION_RETENTION_INTERVAL_S=600",
+                "ORCHESTRATION_RETENTION_CHAT_TTL_DAYS=21",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cfg = OrchestrationConfig(_env_file=str(env))
+
+    resolved = resolve_retention_settings(cfg)
+    assert resolved.settings()["chat_ttl_days"] == 21.0
+    assert resolved.source["chat_ttl_days"] == "env"
+
+    resolved = update_retention_overrides(
+        cfg,
+        {"enabled": False, "interval_s": 120, "chat_ttl_days": 3.5},
+    )
+    assert resolved.settings()["enabled"] is False
+    assert resolved.settings()["interval_s"] == 120
+    assert resolved.settings()["chat_ttl_days"] == 3.5
+    assert resolved.source["enabled"] == "override"
+    assert resolved.source["interval_s"] == "override"
+    assert resolved.source["chat_ttl_days"] == "override"
+
+    resolved = update_retention_overrides(cfg, {"enabled": None, "chat_ttl_days": None})
+    assert resolved.settings()["enabled"] is True
+    assert resolved.settings()["chat_ttl_days"] == 21.0
+    assert resolved.source["enabled"] == "env"
+    assert resolved.source["interval_s"] == "override"
+    assert resolved.source["chat_ttl_days"] == "env"
+
+
+def test_retention_run_state_records_last_sweep_outcome(tmp_path) -> None:
+    from jarvis.config import OrchestrationConfig
+
+    cfg = OrchestrationConfig(_env_file=None, workspace=str(tmp_path / "orchestration"))
+    result = RetentionResult(
+        deleted={CLASS_ARCHIVED: 1, CLASS_CHAT: 2, CLASS_TREE: 3},
+        bytes_reclaimed=4096,
+    )
+
+    recorded = record_retention_run(cfg, result)
+
+    assert recorded["last_run_at"]
+    assert recorded["last_result"] == {"deleted": 6, "bytes": 4096}
+    assert read_retention_state(cfg) == recorded

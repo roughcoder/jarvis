@@ -93,10 +93,32 @@ and `jarvis conversations` reports it as `disabled`. This mirrors the worker's
 `WORKER_WORKTREE_GC` refusal — an unbounded threshold is a sane answer for an
 explicit sweep but a foot-gun on a timer.
 
-`ORCHESTRATION_RETENTION_ENABLED=false`, or every class disabled, means no timer
-task is started at all. `ORCHESTRATION_RETENTION_INTERVAL_S=0` runs the startup
-sweep only. The sweep is best-effort: it logs one summary line per run and never
-propagates into the API's lifecycle.
+`ORCHESTRATION_RETENTION_ENABLED=false`, or every class disabled, means the timer
+skips deletion work. `ORCHESTRATION_RETENTION_INTERVAL_S=0` runs a startup sweep
+only while enabled. The API keeps a lightweight settings poll alive so Cockpit
+settings changes take effect without restart; interval changes apply on the next
+retention loop tick. The sweep is best-effort: it logs one summary line per run,
+records the last outcome for Cockpit, and never propagates into the API's
+lifecycle.
+
+### Cockpit API
+
+Cockpit can drive the same policy directly:
+
+```text
+GET /v1/retention/plan
+GET /v1/retention/settings
+PUT /v1/retention/settings
+POST /v1/retention/prune
+```
+
+Reads use the normal Cockpit read auth. `POST /v1/retention/prune` and
+`PUT /v1/retention/settings` require `orchestration.runs.write` and an
+`idempotency_key`, the same authority stance as worker worktree prune.
+
+Settings are resolved from env defaults first, then from the persisted
+`retention-settings.json` override record in the orchestration workspace. A
+`null` value in `PUT /v1/retention/settings` clears that field back to env.
 
 ### Protections
 

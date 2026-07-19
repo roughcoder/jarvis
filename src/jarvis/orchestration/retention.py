@@ -18,6 +18,7 @@ foot-gun on a timer.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
@@ -25,7 +26,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from jarvis.ids import utc_now
 from jarvis.orchestration.models import OrchestrationRun
+from jarvis.storage import atomic_write_json
 from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES
 
 # Conversation classes, in the order they are reported.
@@ -33,6 +36,15 @@ CLASS_ARCHIVED = "archived"
 CLASS_CHAT = "chat"
 CLASS_TREE = "tree"
 RETENTION_CLASSES = (CLASS_ARCHIVED, CLASS_CHAT, CLASS_TREE)
+RETENTION_SETTINGS_FIELDS = (
+    "enabled",
+    "interval_s",
+    "archived_ttl_days",
+    "chat_ttl_days",
+    "tree_ttl_days",
+)
+RETENTION_SETTINGS_FILENAME = "retention-settings.json"
+RETENTION_STATE_FILENAME = "retention-state.json"
 
 # A conversation whose workspace sits in one of these states has a turn in
 # flight (or an interrupt landing). Anything else is at rest.
@@ -77,6 +89,15 @@ class RetentionPolicy:
     @property
     def any_class_enabled(self) -> bool:
         return any(self.class_enabled(klass) for klass in RETENTION_CLASSES)
+
+
+@dataclass(frozen=True)
+class ResolvedRetentionSettings:
+    policy: RetentionPolicy
+    source: dict[str, str]
+
+    def settings(self) -> dict[str, bool | int | float]:
+        return retention_settings_packet(self.policy)
 
 
 @dataclass(frozen=True)
@@ -138,6 +159,141 @@ class RetentionResult:
         if self.failures:
             line += f", failed {len(self.failures)}"
         return line
+
+
+def retention_settings_packet(policy: RetentionPolicy) -> dict[str, bool | int | float]:
+    return {
+        "enabled": bool(policy.enabled),
+        "interval_s": max(0, int(policy.interval_s)),
+        "archived_ttl_days": float(policy.archived_ttl_days),
+        "chat_ttl_days": float(policy.chat_ttl_days),
+        "tree_ttl_days": float(policy.tree_ttl_days),
+    }
+
+
+def resolve_retention_settings(orchestration: Any) -> ResolvedRetentionSettings:
+    """Resolve retention config from env defaults plus cockpit overrides."""
+
+    policy = RetentionPolicy.from_config(orchestration)
+    source = dict.fromkeys(RETENTION_SETTINGS_FIELDS, "env")
+    overrides = _read_retention_overrides(_retention_settings_path(orchestration.workspace))
+    values = retention_settings_packet(policy)
+    for field_name, value in overrides.items():
+        if field_name not in RETENTION_SETTINGS_FIELDS:
+            continue
+        try:
+            values[field_name] = _normalize_retention_value(field_name, value)
+        except ValueError:
+            continue
+        source[field_name] = "override"
+    return ResolvedRetentionSettings(
+        policy=RetentionPolicy(
+            enabled=bool(values["enabled"]),
+            interval_s=float(values["interval_s"]),
+            archived_ttl_days=float(values["archived_ttl_days"]),
+            chat_ttl_days=float(values["chat_ttl_days"]),
+            tree_ttl_days=float(values["tree_ttl_days"]),
+        ),
+        source=source,
+    )
+
+
+def update_retention_overrides(orchestration: Any, body: dict[str, Any]) -> ResolvedRetentionSettings:
+    unknown = sorted(set(body) - set(RETENTION_SETTINGS_FIELDS) - {"idempotency_key"})
+    if unknown:
+        raise ValueError(f"unsupported retention setting: {unknown[0]}")
+
+    path = _retention_settings_path(orchestration.workspace)
+    overrides = _read_retention_overrides(path)
+    changed = False
+    for field_name in RETENTION_SETTINGS_FIELDS:
+        if field_name not in body:
+            continue
+        value = body[field_name]
+        if value is None:
+            changed = changed or field_name in overrides
+            overrides.pop(field_name, None)
+            continue
+        normalized = _normalize_retention_value(field_name, value)
+        changed = changed or overrides.get(field_name) != normalized
+        overrides[field_name] = normalized
+    if changed:
+        atomic_write_json(path, {"updated_at": utc_now(), "overrides": overrides})
+    elif not path.exists():
+        atomic_write_json(path, {"updated_at": utc_now(), "overrides": overrides})
+    return resolve_retention_settings(orchestration)
+
+
+def read_retention_state(orchestration: Any) -> dict[str, Any]:
+    path = _retention_state_path(orchestration.workspace)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"last_run_at": None, "last_result": None}
+    if not isinstance(data, dict):
+        return {"last_run_at": None, "last_result": None}
+    last_run_at = data.get("last_run_at")
+    last_result = data.get("last_result")
+    if not isinstance(last_run_at, str) or not last_run_at:
+        last_run_at = None
+    if not isinstance(last_result, dict):
+        last_result = None
+    else:
+        try:
+            last_result = {
+                "deleted": max(0, int(last_result.get("deleted") or 0)),
+                "bytes": max(0, int(last_result.get("bytes") or 0)),
+            }
+        except (TypeError, ValueError):
+            last_result = None
+    return {"last_run_at": last_run_at, "last_result": last_result}
+
+
+def record_retention_run(orchestration: Any, result: RetentionResult) -> dict[str, Any]:
+    state = {
+        "last_run_at": utc_now(),
+        "last_result": {
+            "deleted": sum(int(count or 0) for count in result.deleted.values()),
+            "bytes": max(0, int(result.bytes_reclaimed or 0)),
+        },
+    }
+    atomic_write_json(_retention_state_path(orchestration.workspace), state)
+    return state
+
+
+def _retention_settings_path(workspace: str) -> Path:
+    return Path(workspace).expanduser() / RETENTION_SETTINGS_FILENAME
+
+
+def _retention_state_path(workspace: str) -> Path:
+    return Path(workspace).expanduser() / RETENTION_STATE_FILENAME
+
+
+def _read_retention_overrides(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    overrides = data.get("overrides")
+    return dict(overrides) if isinstance(overrides, dict) else {}
+
+
+def _normalize_retention_value(field_name: str, value: Any) -> bool | int | float:
+    if field_name == "enabled":
+        if not isinstance(value, bool):
+            raise ValueError("enabled must be a boolean")
+        return value
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{field_name} must be numeric")
+    if value < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+    if field_name == "interval_s":
+        if int(value) != value:
+            raise ValueError("interval_s must be an integer number of seconds")
+        return int(value)
+    return float(value)
 
 
 def human_bytes(size: int) -> str:
