@@ -535,6 +535,12 @@ class WorkerConfig(_Base):
     supported_engines: str = ""      # CSV; empty means the default agent only
     codex_bin: str = "codex"
     claude_bin: str = "claude"
+    # Models each engine may run, as `id[:label]` CSV; the first entry is the
+    # engine's default. Empty falls back to worker/model_catalog.py's built-ins.
+    # Published via /health so cockpits can offer a picker, and used to validate
+    # a model requested on a turn.
+    codex_models: str = ""
+    claude_models: str = ""
     peekaboo_bin: str = "peekaboo"   # GUI automation (worker.gui; install + perms)
     # peekaboo's OWN agent (`control_mac`) needs an AI provider. The worker injects
     # these into the peekaboo subprocess. Leave the base URL empty for direct OpenAI;

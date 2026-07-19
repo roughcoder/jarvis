@@ -35,7 +35,7 @@ from jarvis.orchestration.store import SESSION_REF_PREFIX, OrchestrationStore
 from jarvis.orchestration.store import make_session_ref as _store_make_session_ref
 from jarvis.orchestration.supervisor import SyncSummary, sync_run_jobs, sync_run_sessions
 from jarvis.orchestration.workers import WorkerRegistry, worker_auth_headers, worker_http_get
-from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES
+from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, ENGINE_CATALOG_KEYS
 
 API_VERSION = "v1"
 SCHEMA_VERSION = 1
@@ -278,7 +278,7 @@ def cockpit_catalog(
     *,
     start_defaults: dict[str, Any] | None = None,
     engines: list[str] | None = None,
-    engine_supports: dict[str, dict[str, bool]] | None = None,
+    engine_supports: dict[str, dict[str, Any]] | None = None,
     orchestrator_model: str = "",
 ) -> dict[str, Any]:
     defaults = {
@@ -506,7 +506,7 @@ def project_worker_profile(profile: WorkerProfile, *, default_repo: str = "") ->
             engine,
             default=(engine == profile.default_engine),
             worker_status=profile.status,
-            supports=profile.engine_supports.get(engine, {}),
+            supports=profile.engine_supports_payload().get(engine, {}),
         )
         for engine in profile.supported_engines
     ]
@@ -1563,23 +1563,40 @@ def _session_supported_controls(session: dict[str, Any]) -> list[str]:
     return controls
 
 
-def _engine_catalog(engine: str, display_name: str, description: str, *, supports: dict[str, bool] | None = None) -> dict[str, Any]:
+def _engine_catalog(engine: str, display_name: str, description: str, *, supports: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "engine": engine,
         "display_name": display_name,
         "description": description,
-        "supports": {**_empty_engine_supports(), **{str(key): bool(value) for key, value in (supports or {}).items()}},
+        "supports": _engine_supports_payload(supports),
     }
 
 
-def _engine_row(engine: str, *, default: bool, worker_status: str, supports: dict[str, bool]) -> dict[str, Any]:
+def _engine_row(engine: str, *, default: bool, worker_status: str, supports: dict[str, Any]) -> dict[str, Any]:
     return {
         "engine": engine,
         "display_name": engine.capitalize(),
         "status": "available" if worker_status != "offline" else "unavailable",
         "default": default,
-        "supports": {**_empty_engine_supports(), **{str(key): bool(value) for key, value in supports.items()}},
+        "supports": _engine_supports_payload(supports),
     }
+
+
+def _engine_supports_payload(supports: dict[str, Any] | None) -> dict[str, Any]:
+    """Capability flags with the model catalog alongside them.
+
+    `models` / `default_model` are catalog data sharing the mapping with the
+    booleans, so they are copied across untouched rather than coerced.
+    """
+    supports = supports or {}
+    payload: dict[str, Any] = {
+        **_empty_engine_supports(),
+        **{str(key): bool(value) for key, value in supports.items() if key not in ENGINE_CATALOG_KEYS},
+    }
+    models = supports.get("models")
+    payload["models"] = [dict(row) for row in models if isinstance(row, dict)] if isinstance(models, list) else []
+    payload["default_model"] = str(supports.get("default_model") or "")
+    return payload
 
 
 def _empty_engine_supports() -> dict[str, bool]:

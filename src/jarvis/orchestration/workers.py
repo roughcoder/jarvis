@@ -14,7 +14,7 @@ from dotenv import dotenv_values
 from jarvis.config import WorkerConfig
 from jarvis.engines import engine_ids, normalize_engine_id, worker_supports_engine
 from jarvis.ids import utc_now
-from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, SESSION_RUNNING
+from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, ENGINE_CATALOG_KEYS, SESSION_RUNNING
 from jarvis.orchestration.models import WorkerProfile
 
 _PROFILE_CACHE_TTL_S = 2.0
@@ -241,6 +241,7 @@ class WorkerRegistry:
             profile.engine_supports = _engine_supports_from_mapping(data["engine_supports"])
         elif isinstance(data.get("engines"), list):
             profile.engine_supports = _engine_supports_from_rows(data["engines"])
+        profile.engine_models, profile.engine_default_model = _engine_models_from_health(data)
         if isinstance(data.get("git_identity"), dict):
             profile.git_identity = dict(data["git_identity"])
         if isinstance(data.get("repo_access"), list):
@@ -378,7 +379,7 @@ def _engine_supports_from_mapping(raw: dict[str, Any]) -> dict[str, dict[str, bo
     result: dict[str, dict[str, bool]] = {}
     for engine, supports in raw.items():
         if isinstance(supports, dict):
-            result[str(engine)] = {str(key): bool(value) for key, value in supports.items()}
+            result[str(engine)] = _capability_flags(supports)
     return result
 
 
@@ -390,8 +391,51 @@ def _engine_supports_from_rows(rows: list[Any]) -> dict[str, dict[str, bool]]:
         engine = str(row.get("engine") or "")
         supports = row.get("supports")
         if engine and isinstance(supports, dict):
-            result[engine] = {str(key): bool(value) for key, value in supports.items()}
+            result[engine] = _capability_flags(supports)
     return result
+
+
+def _capability_flags(supports: dict[str, Any]) -> dict[str, bool]:
+    """The boolean half of an `engine_supports` entry.
+
+    The worker ships the model catalog inside the same mapping; those keys are a
+    list and a string, so they must be lifted out before the bool coercion turns
+    them into `True`."""
+    return {
+        str(key): bool(value)
+        for key, value in supports.items()
+        if key not in ENGINE_CATALOG_KEYS
+    }
+
+
+def _engine_models_from_health(data: dict[str, Any]) -> tuple[dict[str, list[dict[str, str]]], dict[str, str]]:
+    """Per-engine model catalogs + default model id, from a worker /health body.
+
+    Workers predating the catalog contract simply report nothing here, and the
+    cockpit falls back to a picker-less engine.
+    """
+    raw = data.get("engine_supports")
+    rows: dict[str, Any] = {}
+    if isinstance(raw, dict):
+        rows = {str(engine): supports for engine, supports in raw.items() if isinstance(supports, dict)}
+    elif isinstance(data.get("engines"), list):
+        for row in data["engines"]:
+            if isinstance(row, dict) and row.get("engine") and isinstance(row.get("supports"), dict):
+                rows[str(row["engine"])] = row["supports"]
+    models: dict[str, list[dict[str, str]]] = {}
+    defaults: dict[str, str] = {}
+    for engine, supports in rows.items():
+        catalog = [
+            {"id": str(item["id"]), "label": str(item.get("label") or item["id"])}
+            for item in (supports.get("models") or [])
+            if isinstance(item, dict) and item.get("id")
+        ]
+        if catalog:
+            models[engine] = catalog
+        default = str(supports.get("default_model") or "")
+        if default:
+            defaults[engine] = default
+    return models, defaults
 
 
 def _system_from_health(raw: Any) -> dict[str, Any]:

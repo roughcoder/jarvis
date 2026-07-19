@@ -140,6 +140,7 @@ from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource, Wor
 from jarvis.orchestration.store import OrchestrationStore, RunArchivedError
 from jarvis.orchestration.supervisor import final_session_phase, sync_run_jobs, sync_run_sessions
 from jarvis.orchestration.workers import WorkerRegistry, worker_http_get
+from jarvis.worker_session_contract import validate_model
 from jarvis.system_info import system_info_cached
 from jarvis.users import HOUSE
 
@@ -1796,6 +1797,18 @@ class CockpitWriteHandlers:
                 recoverable=True,
                 status=400,
             )
+        # A turn may carry a model for the engine it is about to run on; empty or
+        # absent keeps the thread's current one. It rides in `workspace` so the
+        # connector sees engine and model together and can respawn once.
+        requested_model = str(body.get("model") or (workspace_request or {}).get("model") or "").strip()
+        if requested_model:
+            _, _, engine_supports = await asyncio.to_thread(_catalog_context, self.ctx.cfg)
+            target_engine = requested_engine or thread.engine
+            try:
+                validate_model(requested_model, engine_supports.get(target_engine, {}).get("models"), target_engine)
+            except ValueError as exc:
+                raise CockpitError("validation_failed", str(exc), recoverable=True, status=400) from exc
+            workspace_request = {**(workspace_request or {}), "model": requested_model}
         if idempotency_key:
             try:
                 receipt = await asyncio.to_thread(
@@ -4343,14 +4356,19 @@ def _cockpit_snapshot(
     )
 
 
-def _catalog_context(cfg: Config) -> tuple[dict[str, Any], list[str], dict[str, dict[str, bool]]]:
+def _catalog_context(cfg: Config) -> tuple[dict[str, Any], list[str], dict[str, dict[str, Any]]]:
     registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path)
     profiles = registry.profiles(probe=False)
     worker = profiles[0] if profiles else None
     engines: list[str] = []
     # Last-known provider capabilities, OR-ed across workers: engine supports
     # are provider-side, so any worker reporting a flag speaks for the engine.
-    engine_supports: dict[str, dict[str, bool]] = {}
+    engine_supports: dict[str, dict[str, Any]] = {}
+    # Model catalogs are per-worker config, not provider facts, so they union by
+    # id and the first worker to report a default for an engine wins — the
+    # catalog is a picker hint; the worker that runs the turn is the authority.
+    engine_models: dict[str, list[dict[str, str]]] = {}
+    engine_default_model: dict[str, str] = {}
     for profile in profiles:
         for engine in profile.supported_engines:
             if engine and engine not in engines:
@@ -4359,6 +4377,18 @@ def _catalog_context(cfg: Config) -> tuple[dict[str, Any], list[str], dict[str, 
             merged = engine_supports.setdefault(engine, {})
             for key, value in supports.items():
                 merged[key] = bool(merged.get(key)) or bool(value)
+        for engine, models in profile.engine_models.items():
+            rows = engine_models.setdefault(engine, [])
+            seen = {row["id"] for row in rows}
+            # Copy: the merged catalog outlives this loop and must not alias the
+            # registry's in-memory profiles.
+            rows.extend(dict(row) for row in models if row.get("id") and row["id"] not in seen)
+        for engine, default in profile.engine_default_model.items():
+            engine_default_model.setdefault(engine, default)
+    for engine in {*engine_supports, *engine_models, *engine_default_model}:
+        entry = engine_supports.setdefault(engine, {})
+        entry["models"] = list(engine_models.get(engine, []))
+        entry["default_model"] = engine_default_model.get(engine, "")
     defaults = {
         "worker_id": worker.worker_id if worker else "",
         "engine": (worker.default_engine or worker.agent) if worker else "",
