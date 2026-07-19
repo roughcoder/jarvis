@@ -1,10 +1,4 @@
-"""Memory backend selector.
-
-`MemoryClient(cfg)` remains the compatibility constructor used by the brain.
-The default backend is v3 (production cut over 2026-07-05); setting
-`MEMORY_BACKEND=v2` returns the legacy Honcho v2 client, kept for rollback,
-without changing `BrainSession` or the turn loop.
-"""
+"""Honcho v3 memory backend exports."""
 
 from __future__ import annotations
 
@@ -19,24 +13,19 @@ from jarvis.brain.memory_client.interface import (
     RepresentationRecord,
     SessionPeer,
     SessionRecord,
+    UnsupportedMemoryOperation,
 )
-from jarvis.brain.memory_client.v2 import HonchoV2MemoryClient, UnsupportedMemoryOperation
-from jarvis.config import MemoryConfig
+from jarvis.brain.memory_client.v3 import HonchoV3MemoryClient
 
 
-class MemoryClient:
-    def __new__(cls, cfg: MemoryConfig):  # noqa: ANN204
-        if cfg.backend == "v3":
-            from jarvis.brain.memory_client.v3 import HonchoV3MemoryClient
-
-            return HonchoV3MemoryClient(cfg)
-        return HonchoV2MemoryClient(cfg)
+class MemoryClient(HonchoV3MemoryClient):
+    """Compatibility name used by the brain; Honcho v3 is the only backend."""
 
 
 __all__ = [
     "ConclusionLevel",
     "ConclusionRecord",
-    "HonchoV2MemoryClient",
+    "HonchoV3MemoryClient",
     "MemoryBackend",
     "MemoryClient",
     "MemoryMessage",

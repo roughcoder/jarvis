@@ -34,9 +34,8 @@ from jarvis.config import MemoryConfig
 
 
 _CONCLUSION_LEVELS = {"explicit", "deductive", "inductive", "contradiction"}
-# Shape proven end-to-end by deploy/honcho-v3/validate.py (step 1). Verify
-# against the dev stack before cutover whether workspace-level env defaults
-# make this redundant; sending it explicitly is safe either way.
+# Shape proven end-to-end during the Honcho v3 validation. Sending it
+# explicitly keeps new sessions from depending on workspace-level defaults.
 _SESSION_CONFIGURATION = {
     "summary": {
         "enabled": True,
@@ -273,9 +272,9 @@ class HonchoV3MemoryClient:
         payload: dict[str, Any] = {
             "id": self._encoded_session(session_id),
             "metadata": {"jarvis_id": session_id, **(metadata or {})},
-            # Session-scoped reasoning features, matching the shape proven by
-            # deploy/honcho-v3/validate.py — without this block a v3 cutover
-            # could write turns that never produce conclusions or summaries.
+            # Session-scoped reasoning features, matching the validated v3
+            # shape; without this block a session may never produce conclusions
+            # or summaries.
             "configuration": _SESSION_CONFIGURATION,
         }
         if encoded_peers:

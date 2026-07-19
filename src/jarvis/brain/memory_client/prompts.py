@@ -1,9 +1,4 @@
-"""Shared prompt/session constants used by both Honcho memory backends.
-
-The v2 and v3 clients speak different Honcho APIs but agree on the shared
-dialectic query text, the per-turn metadata shape, and the base session id —
-kept here once so the two adapters can't drift apart.
-"""
+"""Shared prompt/session constants for Honcho memory."""
 
 from __future__ import annotations
 

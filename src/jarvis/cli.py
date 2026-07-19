@@ -66,7 +66,7 @@ def _cmd_memory_migrate(args: argparse.Namespace) -> int:
         print(f"memory-migrate safety error: {exc}", file=sys.stderr)
         return 2
 
-    memory_cfg = cfg.memory.model_copy(update={"backend": "v3", "workspace_id": workspace})
+    memory_cfg = cfg.memory.model_copy(update={"workspace_id": workspace})
     backend = MemoryClient(memory_cfg)
 
     if args.verify:

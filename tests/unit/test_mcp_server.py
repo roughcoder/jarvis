@@ -160,7 +160,6 @@ def _cfg(
                 "CAPS_DEFAULT_CAPABILITIES=",
                 f"ORCHESTRATION_WORKSPACE={tmp_path / 'orchestration'}",
                 f"REGISTRY_PATH={tmp_path / 'registry.json'}",
-                "MEMORY_BACKEND=v3",
                 f"MEMORY_CACHE_PATH={tmp_path / 'cache.json'}",
                 f"MEMORY_CURATION_OUTBOX_PATH={tmp_path / 'outbox.jsonl'}",
                 f"MCP_SERVE_TOKEN_STORE_PATH={tmp_path / 'tokens.json'}",

@@ -21,41 +21,13 @@ Validated surfaces:
 - Explicit conclusion create/list/delete: passed, with caveats below.
 - `/health` and `/v3/workspaces/{id}/queue/status`: passed.
 
-## Dev Stack
+## Canonical Stack
 
-Dev-only compose lives at:
-
-```bash
-deploy/honcho-v3/docker-compose.v3.yml
-```
-
-Default command — fully isolated: its own LiteLLM gateway, containers, DB,
-volumes, and network (`jarvis-honcho-v3`); the prod v2 stack and its spend
-logs are never touched, and `validate.py` can assert routing against the
-`jarvis-litellm-v3` container logs:
+The dedicated dev-only validation stack was removed when v2 rollback support was
+retired. The root `docker-compose.yml` is now the canonical Honcho v3 stack:
 
 ```bash
-docker compose --env-file .env -f deploy/honcho-v3/docker-compose.v3.yml --profile gateway up -d
-```
-
-Opt-in alternative, reusing an already-running host LiteLLM gateway on
-port 4000 (validate.py then skips its container-log routing assertion):
-
-```bash
-HONCHO_V3_LITELLM_BASE_URL=http://host.docker.internal:4000/v1 \
-  docker compose --env-file .env -f deploy/honcho-v3/docker-compose.v3.yml up -d
-```
-
-Run validation:
-
-```bash
-python3 deploy/honcho-v3/validate.py
-```
-
-Stop the dev stack:
-
-```bash
-docker compose --env-file .env -f deploy/honcho-v3/docker-compose.v3.yml --profile gateway down
+docker compose --env-file .env up -d
 ```
 
 ## Required Config
@@ -64,9 +36,8 @@ Use LiteLLM route names, not provider-native model ids:
 
 - `HONCHO_V3_LITELLM_CHAT_MODEL=honcho-llm`
 - `HONCHO_V3_LITELLM_EMBED_MODEL=embed`
-- `HONCHO_V3_LITELLM_BASE_URL` defaults to `http://litellm-v3:4000/v1` (the
-  isolated compose profile); set it to `http://host.docker.internal:4000/v1`
-  to reuse an existing host gateway instead.
+- `HONCHO_V3_LITELLM_BASE_URL` defaults to `http://litellm:4000/v1` inside the
+  canonical root compose stack.
 - `HONCHO_V3_LITELLM_KEY` optional. If unset, compose falls back to the
   existing `HONCHO_LLM_KEY`, then `sk-honcho-memory`.
 
@@ -92,21 +63,19 @@ Honcho v3 settings used by the compose:
 Runtime config confirmed inside the API container:
 
 ```text
-deriver honcho-llm http://litellm-v3:4000/v1 json_object
-embedding embed http://litellm-v3:4000/v1
-summary honcho-llm http://litellm-v3:4000/v1
-dream_deduction honcho-llm http://litellm-v3:4000/v1
-dream_induction honcho-llm http://litellm-v3:4000/v1
-dialectic minimal/low/medium/high/max honcho-llm http://litellm-v3:4000/v1
+deriver honcho-llm http://litellm:4000/v1 json_object
+embedding embed http://litellm:4000/v1
+summary honcho-llm http://litellm:4000/v1
+dream_deduction honcho-llm http://litellm:4000/v1
+dream_induction honcho-llm http://litellm:4000/v1
+dialectic minimal/low/medium/high/max honcho-llm http://litellm:4000/v1
 ```
 
 ## Evidence
 
-Validation command:
-
-```bash
-python3 deploy/honcho-v3/validate.py
-```
+Historical validation was run against the dev-only stack before production
+cutover. That temporary stack and script were removed when v2 rollback support
+was retired.
 
 Key output from the passing run:
 
@@ -166,7 +135,7 @@ Resource IDs cannot contain colons in v3. `WorkspaceCreate`, `PeerCreate`, and
 `SessionCreate` validate ids against `^[a-zA-Z0-9_-]+$`. The first validation
 attempt with `validation:<timestamp>` failed with HTTP 422. Jarvis's planned
 ids like `voice:<person>:<device>` and `project:<id>` need an encoding layer
-before the v3 client lands.
+before the v3 client landed.
 
 Explicit conclusions require both peers to exist first. Creating a conclusion
 for `project-jarvis` failed with HTTP 404 until the project peer was created.
@@ -188,8 +157,8 @@ Dream timing settings must be positive. `DREAM_IDLE_TIMEOUT_MINUTES=0` and
 `DREAM_MIN_HOURS_BETWEEN_DREAMS=0` fail pydantic validation at startup; the dev
 compose uses `1`.
 
-## Recommendation
+## Current State
 
-Proceed with Build order step 2 only if the v3 client includes the encoding
-layer for Honcho resource names and explicitly handles conclusion provenance.
-LiteLLM routing itself is validated for v3.0.11.
+Jarvis now ships only the v3 client. It includes the resource-id encoding layer
+and keeps conclusion provenance in `MEMORY_CONCLUSION_SIDECAR_PATH` because
+Honcho v3.0.11 does not round-trip conclusion metadata.

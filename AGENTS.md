@@ -77,7 +77,7 @@ the brain).
   + request tracing.
 - `honcho-api` + `honcho-deriver` + `honcho-db` (pgvector) + `honcho-redis` —
   the memory service. Honcho's LLM reasoning routes back through LiteLLM (the
-  `custom` provider) — no local model.
+  OpenAI-compatible transport) — no local model.
 
 ## Setup & run
 
@@ -172,11 +172,13 @@ keeps the original single-process behaviour. The think/speak core is shared
   the streaming player uses `blocksize=2048` + a silence pre-roll + a deque
   buffer (never concatenate a growing array under the realtime-callback lock).
   CallbackAbort = barge-in; CallbackStop = clean drain.
-- **Honcho is /v2; the honcho-ai SDK is /v3** — mismatch, so `memory_client`
-  uses the raw `/v2` REST API. Honcho's hot `/representation` endpoint is empty
-  until ~20 messages, so `refresh_cache` uses the dialectic (`/chat`) on the
-  COLD path only. All Honcho LLM features use the `custom` (OpenAI-compatible)
-  provider pointed at `http://litellm:4000/v1`.
+- **Honcho is v3-only.** `memory_client` uses the v3 HTTP API over the
+  configured `MEMORY_HOST` / `MEMORY_PORT` boundary. The hot path still reads
+  only the local cache; `refresh_cache` uses Honcho dialectic chat on the COLD
+  path only. Honcho v3 routes all LLM features through LiteLLM using OpenAI
+  transport with per-caller `base_url` overrides pointed at
+  `http://litellm:4000/v1`. Keep `MEMORY_CONCLUSION_SIDECAR_PATH`: Honcho
+  v3.0.11 drops conclusion metadata, so Jarvis stores provenance there.
 - **Barge-in self-trigger**: with no AEC mic, default barge-in is `wakeword`
   mode (say "Hey Jarvis" to interrupt) so Jarvis's own voice can't trip it. Per
   spec, do NOT build software AEC.

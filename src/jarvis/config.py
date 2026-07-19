@@ -84,11 +84,10 @@ class GatewayConfig(_Base):
 
 
 class MemoryConfig(_Base):
-    """Honcho memory service (spec §4, Step 8). Reached over HTTP only (§3.1)."""
+    """Honcho v3 memory service (spec §4, Step 8). Reached over HTTP only (§3.1)."""
 
     model_config = SettingsConfigDict(env_prefix="MEMORY_", env_file=".env", extra="ignore")
 
-    backend: str = "v3"  # production cut over 2026-07-05; v2 retained for rollback only.
     host: str = "localhost"
     port: int = 8000
     api_key: SecretStr = SecretStr("")  # shared secret on the Honcho server
@@ -989,7 +988,6 @@ class Config:
             "gateway.fast_model": self.gateway.fast_model,
             "gateway.voice_model": self.gateway.voice_model or self.gateway.fast_model,
             "gateway.strong_model": self.gateway.strong_model,
-            "memory.backend": self.memory.backend,
             "memory.base_url": self.memory.base_url,
             "memory.api_key": mask(self.memory.api_key),
             "memory.workspace_id": self.memory.workspace_id,
