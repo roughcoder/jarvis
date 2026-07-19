@@ -27,6 +27,20 @@ Phase = Literal[
 ]
 
 
+# The per-engine catalogs the worker publishes, as
+# `(wire rows key, profile rows attr, wire default key, profile default attr)`.
+# They ride inside `engine_supports.<engine>` on the wire but are stored split
+# out on WorkerProfile, because that mapping is bool-coerced end to end.
+ENGINE_CATALOG_FIELDS: tuple[tuple[str, str, str, str], ...] = (
+    ("models", "engine_models", "default_model", "engine_default_model"),
+    ("efforts", "engine_efforts", "default_effort", "engine_default_effort"),
+    ("speeds", "engine_speeds", "default_speed", "engine_default_speed"),
+)
+_ENGINE_CATALOG_ATTRS: tuple[str, ...] = tuple(
+    attr for _, rows_attr, _, default_attr in ENGINE_CATALOG_FIELDS for attr in (rows_attr, default_attr)
+)
+
+
 def _coerce(cls: type, data: dict[str, Any]):
     names = {f.name for f in fields(cls)}
     return cls(**{k: v for k, v in data.items() if k in names})
@@ -343,11 +357,16 @@ class WorkerProfile:
     last_seen_at: str = ""
     supported_engines: list[str] = field(default_factory=list)
     engine_supports: dict[str, dict[str, bool]] = field(default_factory=dict)
-    # Model catalog the worker publishes per engine, and the id a fresh session
-    # of that engine spawns with. Kept beside engine_supports rather than inside
-    # it because that mapping is bool-typed end to end.
+    # Model / effort / speed catalogs the worker publishes per engine, and the
+    # value a fresh session of that engine spawns with. Kept beside
+    # engine_supports rather than inside it because that mapping is bool-typed
+    # end to end; engine_supports_payload() folds them back at the wire edge.
     engine_models: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     engine_default_model: dict[str, str] = field(default_factory=dict)
+    engine_efforts: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+    engine_default_effort: dict[str, str] = field(default_factory=dict)
+    engine_speeds: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+    engine_default_speed: dict[str, str] = field(default_factory=dict)
     system: dict[str, Any] = field(default_factory=dict)
     git_identity: dict[str, Any] = field(default_factory=dict)
     repo_access: list[dict[str, Any]] = field(default_factory=list)
@@ -372,25 +391,27 @@ class WorkerProfile:
         self.repositories = [dict(item) for item in self.repositories if isinstance(item, dict) and (item.get("repo") or item.get("name"))]
         if not isinstance(self.worktree_inventory, dict):
             self.worktree_inventory = {}
-        if not isinstance(self.engine_models, dict):
-            self.engine_models = {}
-        if not isinstance(self.engine_default_model, dict):
-            self.engine_default_model = {}
+        for attr in _ENGINE_CATALOG_ATTRS:
+            if not isinstance(getattr(self, attr), dict):
+                setattr(self, attr, {})
         if not isinstance(self.runtime, dict):
             self.runtime = {}
         if self.readiness is not None and not isinstance(self.readiness, dict):
             self.readiness = None
 
     def engine_supports_payload(self) -> dict[str, dict[str, Any]]:
-        """`engine_supports` as cockpits read it: capability flags plus the model
-        catalog folded back into each engine's entry."""
+        """`engine_supports` as cockpits read it: capability flags plus the
+        model/effort/speed catalogs folded back into each engine's entry."""
+        engines = {*self.engine_supports}
+        for attr in _ENGINE_CATALOG_ATTRS:
+            engines |= {*getattr(self, attr)}
         payload: dict[str, dict[str, Any]] = {}
-        for engine in {*self.engine_supports, *self.engine_models, *self.engine_default_model}:
-            payload[engine] = {
-                **self.engine_supports.get(engine, {}),
-                "models": [dict(row) for row in self.engine_models.get(engine, [])],
-                "default_model": self.engine_default_model.get(engine, ""),
-            }
+        for engine in engines:
+            entry: dict[str, Any] = {**self.engine_supports.get(engine, {})}
+            for rows_key, rows_attr, default_key, default_attr in ENGINE_CATALOG_FIELDS:
+                entry[rows_key] = [dict(row) for row in getattr(self, rows_attr).get(engine, [])]
+                entry[default_key] = getattr(self, default_attr).get(engine, "")
+            payload[engine] = entry
         return payload
 
     @classmethod

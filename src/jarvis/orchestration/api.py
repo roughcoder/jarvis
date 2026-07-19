@@ -116,7 +116,7 @@ from jarvis.orchestration.orchestrator_grants import (
     OrchestratorGrantError,
     resolve_orchestrator_grant,
 )
-from jarvis.orchestration.models import WorkCommand, WorkItem
+from jarvis.orchestration.models import ENGINE_CATALOG_FIELDS, WorkCommand, WorkItem
 from jarvis.orchestration.oauth import (
     OAuthTokenValidator,
     OAuthValidationError,
@@ -153,7 +153,7 @@ from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource, Wor
 from jarvis.orchestration.store import OrchestrationStore, RunArchivedError
 from jarvis.orchestration.supervisor import final_session_phase, sync_run_jobs, sync_run_sessions
 from jarvis.orchestration.workers import WorkerRegistry, worker_http_get
-from jarvis.worker_session_contract import validate_model
+from jarvis.worker_session_contract import validate_effort, validate_model, validate_speed
 from jarvis.system_info import system_info_cached
 from jarvis.users import HOUSE
 
@@ -2026,18 +2026,30 @@ class CockpitWriteHandlers:
                 recoverable=True,
                 status=400,
             )
-        # A turn may carry a model for the engine it is about to run on; empty or
-        # absent keeps the thread's current one. It rides in `workspace` so the
-        # connector sees engine and model together and can respawn once.
-        requested_model = str(body.get("model") or (workspace_request or {}).get("model") or "").strip()
-        if requested_model:
+        # A turn may carry a model, reasoning effort and speed for the engine it
+        # is about to run on; empty or absent keeps the thread's current one.
+        # They ride in `workspace` so the connector sees engine and tuning
+        # together and can respawn once.
+        requested_tuning = {
+            key: str(body.get(key) or (workspace_request or {}).get(key) or "").strip()
+            for key in ("model", "effort", "speed")
+        }
+        requested_tuning = {key: value for key, value in requested_tuning.items() if value}
+        if requested_tuning:
             _, _, engine_supports = await asyncio.to_thread(_catalog_context, self.ctx.cfg)
             target_engine = requested_engine or thread.engine
+            supports = engine_supports.get(target_engine, {})
             try:
-                validate_model(requested_model, engine_supports.get(target_engine, {}).get("models"), target_engine)
+                for key, validate, rows_key in (
+                    ("model", validate_model, "models"),
+                    ("effort", validate_effort, "efforts"),
+                    ("speed", validate_speed, "speeds"),
+                ):
+                    if key in requested_tuning:
+                        validate(requested_tuning[key], supports.get(rows_key), target_engine)
             except ValueError as exc:
                 raise CockpitError("validation_failed", str(exc), recoverable=True, status=400) from exc
-            workspace_request = {**(workspace_request or {}), "model": requested_model}
+            workspace_request = {**(workspace_request or {}), **requested_tuning}
         if idempotency_key:
             try:
                 receipt = await asyncio.to_thread(
@@ -4655,11 +4667,12 @@ def _catalog_context(cfg: Config) -> tuple[dict[str, Any], list[str], dict[str, 
     # Last-known provider capabilities, OR-ed across workers: engine supports
     # are provider-side, so any worker reporting a flag speaks for the engine.
     engine_supports: dict[str, dict[str, Any]] = {}
-    # Model catalogs are per-worker config, not provider facts, so they union by
-    # id and the first worker to report a default for an engine wins — the
-    # catalog is a picker hint; the worker that runs the turn is the authority.
-    engine_models: dict[str, list[dict[str, str]]] = {}
-    engine_default_model: dict[str, str] = {}
+    # Model / effort / speed catalogs are per-worker config, not provider facts,
+    # so they union by id and the first worker to report a default for an engine
+    # wins — the catalog is a picker hint; the worker that runs the turn is the
+    # authority.
+    catalogs: dict[str, dict[str, list[dict[str, str]]]] = {rows_key: {} for rows_key, *_ in ENGINE_CATALOG_FIELDS}
+    catalog_defaults: dict[str, dict[str, str]] = {default_key: {} for _, _, default_key, _ in ENGINE_CATALOG_FIELDS}
     for profile in profiles:
         for engine in profile.supported_engines:
             if engine and engine not in engines:
@@ -4668,18 +4681,23 @@ def _catalog_context(cfg: Config) -> tuple[dict[str, Any], list[str], dict[str, 
             merged = engine_supports.setdefault(engine, {})
             for key, value in supports.items():
                 merged[key] = bool(merged.get(key)) or bool(value)
-        for engine, models in profile.engine_models.items():
-            rows = engine_models.setdefault(engine, [])
-            seen = {row["id"] for row in rows}
-            # Copy: the merged catalog outlives this loop and must not alias the
-            # registry's in-memory profiles.
-            rows.extend(dict(row) for row in models if row.get("id") and row["id"] not in seen)
-        for engine, default in profile.engine_default_model.items():
-            engine_default_model.setdefault(engine, default)
-    for engine in {*engine_supports, *engine_models, *engine_default_model}:
+        for rows_key, rows_attr, default_key, default_attr in ENGINE_CATALOG_FIELDS:
+            for engine, catalog in getattr(profile, rows_attr).items():
+                rows = catalogs[rows_key].setdefault(engine, [])
+                seen = {row["id"] for row in rows}
+                # Copy: the merged catalog outlives this loop and must not alias
+                # the registry's in-memory profiles.
+                rows.extend(dict(row) for row in catalog if row.get("id") and row["id"] not in seen)
+            for engine, default in getattr(profile, default_attr).items():
+                catalog_defaults[default_key].setdefault(engine, default)
+    catalogued_engines = {*engine_supports}
+    for rows_key, _, default_key, _ in ENGINE_CATALOG_FIELDS:
+        catalogued_engines |= {*catalogs[rows_key], *catalog_defaults[default_key]}
+    for engine in catalogued_engines:
         entry = engine_supports.setdefault(engine, {})
-        entry["models"] = list(engine_models.get(engine, []))
-        entry["default_model"] = engine_default_model.get(engine, "")
+        for rows_key, _, default_key, _ in ENGINE_CATALOG_FIELDS:
+            entry[rows_key] = list(catalogs[rows_key].get(engine, []))
+            entry[default_key] = catalog_defaults[default_key].get(engine, "")
     defaults = {
         "worker_id": worker.worker_id if worker else "",
         "engine": (worker.default_engine or worker.agent) if worker else "",
@@ -5238,6 +5256,10 @@ def _thread_projection(
         "chat_type": thread.chat_type,
         "engine": thread.engine,
         "model": thread.model or (_thread_model(ctx) if thread.engine == "jarvis" else ""),
+        # Empty means the engine's own default is in force; the catalog on
+        # `engine_supports` says what that is.
+        "effort": thread.effort,
+        "speed": thread.speed,
         "worker_id": thread.worker_id or None,
         "host": _BRAIN_HOSTNAME if thread.engine == "jarvis" else "",
         "lifecycle": lifecycle,

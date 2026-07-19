@@ -6,7 +6,7 @@ import json
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -11838,8 +11838,90 @@ def test_cockpit_catalog_carries_the_model_catalog_alongside_capability_flags() 
     assert rows["claude"]["supports"]["default_model"] == ""
 
 
+def test_cockpit_catalog_carries_effort_and_speed_alongside_capability_flags() -> None:
+    from jarvis.orchestration.cockpit import cockpit_catalog
+
+    catalog = cockpit_catalog(
+        engines=["codex", "claude"],
+        engine_supports={"codex": _ENGINE_SUPPORTS_CONTRACT_EXAMPLE["codex"]},
+    )
+
+    rows = {row["engine"]: row for row in catalog["engines"]}
+    codex = rows["codex"]["supports"]
+    expected = _ENGINE_SUPPORTS_CONTRACT_EXAMPLE["codex"]
+    # Catalog keys survive the bool coercion applied to the capability flags.
+    assert codex["efforts"] == expected["efforts"]
+    assert codex["default_effort"] == "high"
+    assert codex["speeds"] == expected["speeds"]
+    assert codex["default_speed"] == "standard"
+    assert codex["streaming"] is True
+    # An engine with no speeds reports an empty list, never a missing key.
+    assert rows["claude"]["supports"]["efforts"] == []
+    assert rows["claude"]["supports"]["speeds"] == []
+    assert rows["claude"]["supports"]["default_effort"] == ""
+
+
+# The wire contract exactly as the cockpit picker consumes it: everything lives
+# under engine_supports.<engine>, beside the capability booleans.
+_ENGINE_SUPPORTS_CONTRACT_EXAMPLE = {
+    "codex": {
+        "streaming": True,
+        "models": [{"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol"}],
+        "default_model": "gpt-5.6-sol",
+        "efforts": [
+            {"id": "low", "label": "Light"},
+            {"id": "medium", "label": "Medium"},
+            {"id": "high", "label": "High"},
+            {"id": "xhigh", "label": "Extra High", "description": "Consumes usage limits faster"},
+        ],
+        "default_effort": "high",
+        "speeds": [
+            {"id": "standard", "label": "Standard", "description": "Default speed"},
+            {"id": "priority", "label": "Fast", "description": "1.5x speed, more usage"},
+        ],
+        "default_speed": "standard",
+    }
+}
+
+
+def test_worker_health_publishes_the_engine_supports_contract_shape() -> None:
+    from jarvis.config import WorkerConfig
+    from jarvis.worker.server import _engine_supports
+
+    supports = _engine_supports(["codex", "claude"], WorkerConfig(_env_file=None))
+
+    expected = _ENGINE_SUPPORTS_CONTRACT_EXAMPLE["codex"]
+    codex = supports["codex"]
+    assert codex["streaming"] is True
+    assert codex["default_model"] == expected["default_model"]
+    assert codex["models"][0]["id"] == expected["models"][0]["id"]
+    assert codex["default_effort"] == expected["default_effort"]
+    assert codex["default_speed"] == expected["default_speed"]
+
+    # Ids and labels are the contract; `description` is per-row optional, and
+    # the built-ins carry one on every row rather than only where the example
+    # spells one out.
+    for rows_key in ("efforts", "speeds"):
+        published = codex[rows_key]
+        assert [(row["id"], row["label"]) for row in published] == [
+            (row["id"], row["label"]) for row in expected[rows_key]
+        ]
+        for row, example in zip(published, expected[rows_key], strict=True):
+            if "description" in example:
+                assert row["description"] == example["description"]
+
+    # Claude has real efforts but no fast mode — the UI hides the speed row.
+    assert supports["claude"]["speeds"] == []
+    assert supports["claude"]["default_speed"] == ""
+    assert supports["claude"]["default_effort"] == "high"
+
+
 def test_worker_profile_splits_catalog_out_of_engine_supports() -> None:
-    from jarvis.orchestration.workers import _engine_models_from_health, _engine_supports_from_mapping
+    from jarvis.orchestration.workers import (
+        _engine_catalog_from_health,
+        _engine_models_from_health,
+        _engine_supports_from_mapping,
+    )
 
     raw = {
         "codex": {
@@ -11847,19 +11929,38 @@ def test_worker_profile_splits_catalog_out_of_engine_supports() -> None:
             "checkpoints": False,
             "models": [{"id": "gpt-x", "label": "GPT X"}, {"id": "gpt-y"}],
             "default_model": "gpt-x",
+            "efforts": [{"id": "low", "label": "Light"}, {"id": "high", "label": "High", "description": "Slower"}],
+            "default_effort": "high",
+            "speeds": [{"id": "priority", "label": "Fast"}],
+            "default_speed": "standard",
         }
     }
 
     supports = _engine_supports_from_mapping(raw)
-    # Catalog keys must not leak into the bool mapping — a list would become True.
+    # Catalog keys must not leak into the bool mapping — a list would become True,
+    # and a default id string would too.
     assert supports == {"codex": {"streaming": True, "checkpoints": False}}
 
     models, defaults = _engine_models_from_health({"engine_supports": raw})
     assert models == {"codex": [{"id": "gpt-x", "label": "GPT X"}, {"id": "gpt-y", "label": "gpt-y"}]}
     assert defaults == {"codex": "gpt-x"}
 
+    efforts, effort_defaults = _engine_catalog_from_health({"engine_supports": raw}, "efforts", "default_effort")
+    # An optional description rides through so the picker can explain a choice.
+    assert efforts == {
+        "codex": [{"id": "low", "label": "Light"}, {"id": "high", "label": "High", "description": "Slower"}]
+    }
+    assert effort_defaults == {"codex": "high"}
+
+    speeds, speed_defaults = _engine_catalog_from_health({"engine_supports": raw}, "speeds", "default_speed")
+    assert speeds == {"codex": [{"id": "priority", "label": "Fast"}]}
+    assert speed_defaults == {"codex": "standard"}
+
     # A worker predating the contract reports nothing rather than breaking.
-    assert _engine_models_from_health({"engine_supports": {"codex": {"streaming": True}}}) == ({}, {})
+    bare = {"engine_supports": {"codex": {"streaming": True}}}
+    assert _engine_models_from_health(bare) == ({}, {})
+    assert _engine_catalog_from_health(bare, "efforts", "default_effort") == ({}, {})
+    assert _engine_catalog_from_health(bare, "speeds", "default_speed") == ({}, {})
 
 
 def test_worker_profile_payload_folds_the_catalog_back_into_engine_supports() -> None:
@@ -11875,6 +11976,34 @@ def test_worker_profile_payload_folds_the_catalog_back_into_engine_supports() ->
     assert payload["codex"]["streaming"] is True
     assert payload["codex"]["models"] == [{"id": "gpt-x", "label": "GPT X"}]
     assert payload["codex"]["default_model"] == "gpt-x"
+
+
+def test_worker_profile_payload_folds_effort_and_speed_back_in() -> None:
+    profile = WorkerProfile(
+        worker_id="worker_a",
+        display_name="Worker A",
+        engine_supports={"codex": {"streaming": True}, "claude": {"streaming": True}},
+        engine_efforts={"codex": [{"id": "high", "label": "High"}]},
+        engine_default_effort={"codex": "high"},
+        engine_speeds={"codex": [{"id": "priority", "label": "Fast"}]},
+        engine_default_speed={"codex": "standard"},
+    )
+
+    payload = profile.public()["engine_supports"]
+    assert payload["codex"]["efforts"] == [{"id": "high", "label": "High"}]
+    assert payload["codex"]["default_effort"] == "high"
+    assert payload["codex"]["speeds"] == [{"id": "priority", "label": "Fast"}]
+    assert payload["codex"]["default_speed"] == "standard"
+    # An engine with no catalogs still reports every key, so the picker never
+    # has to distinguish "missing" from "empty".
+    assert payload["claude"]["efforts"] == []
+    assert payload["claude"]["speeds"] == []
+    assert payload["claude"]["default_effort"] == ""
+
+    # Round-tripping through the stored form keeps the split intact.
+    restored = WorkerProfile.from_dict(json.loads(json.dumps(asdict(profile))))
+    assert restored.engine_efforts == profile.engine_efforts
+    assert restored.engine_default_speed == profile.engine_default_speed
 
 
 def _seed_worker_model_catalog(cfg: Config) -> None:

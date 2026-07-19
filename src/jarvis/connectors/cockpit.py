@@ -253,6 +253,10 @@ class CockpitThread:
     chat_type: str = "assistant"
     engine: str = "jarvis"
     model: str = ""
+    # Effective reasoning effort / speed tier. Empty means "whatever the engine
+    # defaults to" — the worker's catalog owns that default, not the thread.
+    effort: str = ""
+    speed: str = ""
     worker_id: str = ""
     parent_chat_id: str = ""
     archived_at: str = ""
@@ -1915,7 +1919,11 @@ class CockpitConnector:
         if not worker_id or not session_id:
             raise RuntimeError("conversation workspace has no worker session")
         await _emit_progress(progress, {"phase": "running", "thread_id": thread.thread_id, "workspace": workspace_public(thread.workspace)})
-        requested_model = str(workspace_request.get("model") or "").strip()
+        requested_tuning = {
+            key: str(workspace_request.get(key) or "").strip()
+            for key in ("model", "effort", "speed")
+        }
+        requested_tuning = {key: value for key, value in requested_tuning.items() if value}
         turn = await asyncio.to_thread(
             self._post_worker_json,
             worker_id,
@@ -1935,10 +1943,10 @@ class CockpitConnector:
                     if idempotency_key
                     else f"thread-turn:{thread.thread_id}:{new_id('turn')}:{_stable_text_hash(text)}"
                 ),
-                # Worker sessions switch model in place — the worker writes it to
-                # session metadata and the provider picks it up on this turn. No
-                # respawn, unlike the orchestrator path.
-                **({"model": requested_model} if requested_model else {}),
+                # Worker sessions switch model, effort and speed in place — the
+                # worker writes them to session metadata and the provider picks
+                # them up on this turn. No respawn, unlike the orchestrator path.
+                **requested_tuning,
             },
         )
         if not turn.get("ok", True):
@@ -1953,15 +1961,20 @@ class CockpitConnector:
         )
         if thread is None:
             raise RuntimeError("conversation execution was interrupted")
-        if requested_model and requested_model != thread.model:
-            # The worker accepted it, so it is the effective model from here on;
-            # thread detail reports it without waiting for a provider event.
+        applied = {
+            key: value
+            for key, value in requested_tuning.items()
+            if value != getattr(thread, key, "")
+        }
+        if applied:
+            # The worker accepted them, so they are effective from here on;
+            # thread detail reports them without waiting for a provider event.
             thread = self._index.save(
                 replace(
                     thread,
-                    model=requested_model,
+                    **applied,
                     updated_at=utc_now(),
-                    workspace={**thread.workspace, "model": requested_model},
+                    workspace={**thread.workspace, **applied},
                 )
             )
         reply = "Workspace turn is running."

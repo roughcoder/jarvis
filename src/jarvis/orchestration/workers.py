@@ -16,7 +16,7 @@ from jarvis.config import WorkerConfig
 from jarvis.engines import engine_ids, normalize_engine_id, worker_supports_engine
 from jarvis.ids import utc_now
 from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, ENGINE_CATALOG_KEYS, SESSION_RUNNING
-from jarvis.orchestration.models import WorkerProfile
+from jarvis.orchestration.models import ENGINE_CATALOG_FIELDS, WorkerProfile
 
 _PROFILE_CACHE_TTL_S = 2.0
 _PROFILE_CACHE: dict[str, tuple[int, float, list[dict[str, Any]]]] = {}
@@ -32,6 +32,10 @@ _PROBE_CATALOG_FIELDS = (
     "engine_supports",
     "engine_models",
     "engine_default_model",
+    "engine_efforts",
+    "engine_default_effort",
+    "engine_speeds",
+    "engine_default_speed",
 )
 _PROBE_LIVENESS_FIELDS = (
     "last_seen_at",
@@ -47,6 +51,10 @@ _PROBE_SNAPSHOT_REPLACE_FIELDS = {
     "engine_supports",
     "engine_models",
     "engine_default_model",
+    "engine_efforts",
+    "engine_default_effort",
+    "engine_speeds",
+    "engine_default_speed",
 }
 # Bounded: a worker that has been unreachable for this long should read as
 # unknown again rather than keep showing numbers from a machine that may since
@@ -337,7 +345,10 @@ class WorkerRegistry:
             profile.engine_supports = _engine_supports_from_mapping(data["engine_supports"])
         elif isinstance(data.get("engines"), list):
             profile.engine_supports = _engine_supports_from_rows(data["engines"])
-        profile.engine_models, profile.engine_default_model = _engine_models_from_health(data)
+        for rows_key, rows_attr, default_key, default_attr in ENGINE_CATALOG_FIELDS:
+            catalogs, defaults = _engine_catalog_from_health(data, rows_key, default_key)
+            setattr(profile, rows_attr, catalogs)
+            setattr(profile, default_attr, defaults)
         if isinstance(data.get("git_identity"), dict):
             profile.git_identity = dict(data["git_identity"])
         if isinstance(data.get("repo_access"), list):
@@ -510,12 +521,8 @@ def _capability_flags(supports: dict[str, Any]) -> dict[str, bool]:
     }
 
 
-def _engine_models_from_health(data: dict[str, Any]) -> tuple[dict[str, list[dict[str, str]]], dict[str, str]]:
-    """Per-engine model catalogs + default model id, from a worker /health body.
-
-    Workers predating the catalog contract simply report nothing here, and the
-    cockpit falls back to a picker-less engine.
-    """
+def _engine_supports_rows(data: dict[str, Any]) -> dict[str, Any]:
+    """The per-engine `supports` mappings in a worker /health body."""
     raw = data.get("engine_supports")
     rows: dict[str, Any] = {}
     if isinstance(raw, dict):
@@ -524,20 +531,41 @@ def _engine_models_from_health(data: dict[str, Any]) -> tuple[dict[str, list[dic
         for row in data["engines"]:
             if isinstance(row, dict) and row.get("engine") and isinstance(row.get("supports"), dict):
                 rows[str(row["engine"])] = row["supports"]
-    models: dict[str, list[dict[str, str]]] = {}
+    return rows
+
+
+def _engine_catalog_from_health(
+    data: dict[str, Any],
+    rows_key: str,
+    default_key: str,
+) -> tuple[dict[str, list[dict[str, str]]], dict[str, str]]:
+    """One per-engine catalog + its default id, from a worker /health body.
+
+    Workers predating a catalog contract simply report nothing here, and the
+    cockpit falls back to a picker-less engine. An optional `description` is
+    carried through when the worker sends one so pickers can explain a choice.
+    """
+    catalogs: dict[str, list[dict[str, str]]] = {}
     defaults: dict[str, str] = {}
-    for engine, supports in rows.items():
-        catalog = [
-            {"id": str(item["id"]), "label": str(item.get("label") or item["id"])}
-            for item in (supports.get("models") or [])
-            if isinstance(item, dict) and item.get("id")
-        ]
+    for engine, supports in _engine_supports_rows(data).items():
+        catalog: list[dict[str, str]] = []
+        for item in supports.get(rows_key) or []:
+            if not isinstance(item, dict) or not item.get("id"):
+                continue
+            row = {"id": str(item["id"]), "label": str(item.get("label") or item["id"])}
+            if item.get("description"):
+                row["description"] = str(item["description"])
+            catalog.append(row)
         if catalog:
-            models[engine] = catalog
-        default = str(supports.get("default_model") or "")
+            catalogs[engine] = catalog
+        default = str(supports.get(default_key) or "")
         if default:
             defaults[engine] = default
-    return models, defaults
+    return catalogs, defaults
+
+
+def _engine_models_from_health(data: dict[str, Any]) -> tuple[dict[str, list[dict[str, str]]], dict[str, str]]:
+    return _engine_catalog_from_health(data, "models", "default_model")
 
 
 def _system_from_health(raw: Any) -> dict[str, Any]:

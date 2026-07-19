@@ -37,31 +37,59 @@ TURN_RESUMABLE_SESSION_STATUSES = SUCCESS_SESSION_STATUSES
 WORKER_ERROR_SESSION_ACTIVE = "session_active"
 WORKER_ERROR_SESSION_TERMINAL = "session_terminal"
 
-# The worker publishes each engine's model catalog inside
-# `engine_supports.<engine>` alongside the capability booleans. These two keys
-# are catalog data (a list and a string), so every consumer must lift them out
-# before coercing the rest of the mapping to bools.
-ENGINE_CATALOG_KEYS = ("models", "default_model")
+# The worker publishes each engine's model / effort / speed catalogs inside
+# `engine_supports.<engine>` alongside the capability booleans. These keys are
+# catalog data (lists and strings), so every consumer must lift them out before
+# coercing the rest of the mapping to bools.
+ENGINE_CATALOG_KEYS = (
+    "models",
+    "default_model",
+    "efforts",
+    "default_effort",
+    "speeds",
+    "default_speed",
+)
 
 
 def model_ids(models: list[dict[str, Any]] | None) -> list[str]:
     return [str(row.get("id") or "") for row in (models or []) if isinstance(row, dict) and row.get("id")]
 
 
-def validate_model(model: str | None, models: list[dict[str, Any]] | None, engine: str) -> str:
-    """Return the requested model, or raise ValueError naming the allowed ids.
+# Efforts and speeds are the same `{id, label}` row shape as models.
+catalog_ids = model_ids
 
-    Empty means "keep the current model" and passes straight through. An engine
+
+def validate_catalog_choice(
+    value: str | None,
+    rows: list[dict[str, Any]] | None,
+    engine: str,
+    kind: str,
+) -> str:
+    """Return the requested id, or raise ValueError naming the allowed ids.
+
+    Empty means "keep the current value" and passes straight through. An engine
     with no published catalog accepts anything: the worker may predate this
-    contract, and rejecting every model would be worse than trusting the caller.
+    contract, and rejecting every value would be worse than trusting the caller.
     """
-    model = str(model or "").strip()
-    if not model:
+    value = str(value or "").strip()
+    if not value:
         return ""
-    allowed = model_ids(models)
-    if not allowed or model in allowed:
-        return model
-    raise ValueError(f"unknown model {model!r} for engine {engine!r}; allowed: {', '.join(allowed)}")
+    allowed = catalog_ids(rows)
+    if not allowed or value in allowed:
+        return value
+    raise ValueError(f"unknown {kind} {value!r} for engine {engine!r}; allowed: {', '.join(allowed)}")
+
+
+def validate_model(model: str | None, models: list[dict[str, Any]] | None, engine: str) -> str:
+    return validate_catalog_choice(model, models, engine, "model")
+
+
+def validate_effort(effort: str | None, efforts: list[dict[str, Any]] | None, engine: str) -> str:
+    return validate_catalog_choice(effort, efforts, engine, "effort")
+
+
+def validate_speed(speed: str | None, speeds: list[dict[str, Any]] | None, engine: str) -> str:
+    return validate_catalog_choice(speed, speeds, engine, "speed")
 
 EVENT_SESSION_CREATED = "session.created"
 EVENT_SESSION_INTERRUPTED = "session.interrupted"

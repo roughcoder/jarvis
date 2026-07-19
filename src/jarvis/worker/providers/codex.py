@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 from jarvis.config import WorkerConfig
 from jarvis.worker.authority import WorkerSessionAuthority
+from jarvis.worker.model_catalog import CODEX_STANDARD_SERVICE_TIER
 from jarvis.worker.orchestrator_runtime import (
     ORCHESTRATOR_INSTRUCTIONS,
     ORCHESTRATOR_MCP_SERVER_NAME,
@@ -372,6 +373,7 @@ def _codex_run_turn_and_wait(
                 "cwd": cwd,
                 "approvalPolicy": authority.codex_approval_policy,
                 **({"sandboxPolicy": turn_sandbox_policy} if turn_sandbox_policy else {}),
+                **_codex_turn_tuning(session_id, sessions),
                 "input": _turn_input(turn),
             },
         },
@@ -516,6 +518,24 @@ def _send_request(
         line_queue=line_queue,
         timeout_s=timeout_s,
     )
+
+
+def _codex_turn_tuning(session_id: str, sessions: SessionManager) -> dict[str, Any]:
+    """`effort` / `serviceTier` turn params from the session's metadata.
+
+    Both are documented as applying to "this turn and subsequent turns", so a
+    switch lands in place — unlike the model, none of this needs a fresh thread.
+    The standard tier is what codex uses when no tier is sent, so it is carried
+    in the catalog for the picker but never transmitted.
+    """
+    session = sessions.get(session_id)
+    metadata = (session.metadata if session else None) or {}
+    effort = str(metadata.get("effort") or "").strip()
+    speed = str(metadata.get("speed") or "").strip()
+    return {
+        **({"effort": effort} if effort else {}),
+        **({"serviceTier": speed} if speed and speed != CODEX_STANDARD_SERVICE_TIER else {}),
+    }
 
 
 def _orchestrator_thread_overrides(turn: ProviderTurn) -> dict[str, Any]:

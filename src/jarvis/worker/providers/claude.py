@@ -236,6 +236,7 @@ class _ClaudeSessionRuntime:
         self.claude_session_id = claude_session_id
         self.cwd = _session_cwd(session, worker_cfg)
         self.model = str(session.metadata.get("model") or "")
+        self.effort = _session_effort(session)
         self.orchestrator_mcp = orchestrator_mcp_server(bootstrap_turn)
         self.resume = bool(str(session.metadata.get("claude_session_started") or "").strip())
         self._queue: queue.Queue[_QueuedTurn | _StopRuntime] = queue.Queue()
@@ -324,6 +325,8 @@ class _ClaudeSessionRuntime:
             can_use_tool=self._can_use_tool,
             stderr=self._record_stderr,
         )
+        if self.effort:
+            option_kwargs["effort"] = self.effort
         if self.orchestrator_mcp is not None:
             option_kwargs.update(
                 mcp_servers={ORCHESTRATOR_MCP_SERVER_NAME: self.orchestrator_mcp},
@@ -663,6 +666,24 @@ def _runtime_for_session(
     claude_session_id: str,
     turn: ProviderTurn,
 ) -> _ClaudeSessionRuntime:
+    stale: _ClaudeSessionRuntime | None = None
+    with _RUNTIME_LOCK:
+        runtime = _RUNTIMES.get(session.session_id)
+        if runtime is not None and runtime.alive:
+            if runtime.effort == _session_effort(session):
+                runtime.authority = authority
+                runtime.enqueue(turn)
+                return runtime
+            # Effort is fixed when the SDK client is constructed — there is a
+            # set_model but no set_effort — so switching it means retiring this
+            # runtime. The replacement resumes the same claude session, so the
+            # conversation carries over; only the options are rebuilt.
+            stale = runtime
+            _RUNTIMES.pop(session.session_id, None)
+    # Outside the lock on purpose: stop() joins the runtime thread, and that
+    # thread's teardown takes _RUNTIME_LOCK itself.
+    if stale is not None:
+        stale.stop()
     with _RUNTIME_LOCK:
         runtime = _RUNTIMES.get(session.session_id)
         if runtime is not None and runtime.alive:
@@ -951,6 +972,14 @@ def _record_provider_log(session_id: str, turn: ProviderTurn, sessions: SessionM
 
 def _session_cwd(session: WorkerSession, worker_cfg: WorkerConfig) -> str:
     return _session_cwd_impl(session, worker_cfg, provider="claude")
+
+
+def _session_effort(session: WorkerSession) -> str:
+    """The reasoning effort the session is set to ("" = the CLI's own default).
+
+    Claude has no speed tier, so `speed` is deliberately not read here.
+    """
+    return str((session.metadata or {}).get("effort") or "").strip()
 
 
 def _claude_session_id(session: WorkerSession) -> str:

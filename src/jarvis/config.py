@@ -541,6 +541,14 @@ class WorkerConfig(_Base):
     # a model requested on a turn.
     codex_models: str = ""
     claude_models: str = ""
+    # Reasoning-effort levels and speed (service) tiers each engine may run, as
+    # `id[:label[:description]]` CSV. Empty falls back to model_catalog.py's
+    # built-ins; an engine with no speeds publishes an empty list and cockpits
+    # hide the row.
+    codex_efforts: str = ""
+    claude_efforts: str = ""
+    codex_speeds: str = ""
+    claude_speeds: str = ""
     peekaboo_bin: str = "peekaboo"   # GUI automation (worker.gui; install + perms)
     # peekaboo's OWN agent (`control_mac`) needs an AI provider. The worker injects
     # these into the peekaboo subprocess. Leave the base URL empty for direct OpenAI;
