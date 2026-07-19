@@ -5519,6 +5519,83 @@ def test_model_catalog_parsing_and_defaults() -> None:
     assert engine_models(builtin, "nonesuch") == []
 
 
+def test_effort_and_speed_catalog_parsing_and_defaults() -> None:
+    from jarvis.worker.model_catalog import (
+        default_effort,
+        default_speed,
+        engine_efforts,
+        engine_speeds,
+        parse_catalog_spec,
+    )
+
+    # A third field carries a description; without one the row stays {id,label}
+    # so model rows keep their shape.
+    assert parse_catalog_spec("low:Light:Fast and cheap, high:High") == [
+        {"id": "low", "label": "Light", "description": "Fast and cheap"},
+        {"id": "high", "label": "High"},
+    ]
+
+    configured = WorkerConfig(
+        _env_file=None,
+        codex_efforts="e-one:One,e-two:Two",
+        codex_speeds="s-one:One",
+    )
+    assert engine_efforts(configured, "codex") == [
+        {"id": "e-one", "label": "One"},
+        {"id": "e-two", "label": "Two"},
+    ]
+    # An override that drops the built-in default falls back to its first row.
+    assert default_effort(configured, "codex") == "e-one"
+    assert default_speed(configured, "codex") == "s-one"
+
+    builtin = WorkerConfig(_env_file=None)
+    # Verified against the local binaries: every codex model in the cache
+    # supports these four, and codex's only extra service tier is `priority`.
+    assert [row["id"] for row in engine_efforts(builtin, "codex")] == ["low", "medium", "high", "xhigh"]
+    assert [row["id"] for row in engine_speeds(builtin, "codex")] == ["standard", "priority"]
+    assert default_effort(builtin, "codex") == "high"
+    assert default_speed(builtin, "codex") == "standard"
+    # The default is NOT "first row wins" for efforts — ascending order is the
+    # picker order, and the useful default sits inside it.
+    assert engine_efforts(builtin, "codex")[0]["id"] != default_effort(builtin, "codex")
+
+    # Claude has real effort levels but no fast mode; an engine with no speeds
+    # publishes an empty list so the picker hides the row.
+    assert [row["id"] for row in engine_efforts(builtin, "claude")] == [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ]
+    assert engine_speeds(builtin, "claude") == []
+    assert default_speed(builtin, "claude") == ""
+    assert engine_efforts(builtin, "nonesuch") == []
+
+
+def test_validate_effort_and_speed_mirror_model_validation() -> None:
+    from jarvis.worker_session_contract import validate_effort, validate_speed
+
+    efforts = [{"id": "low", "label": "Light"}, {"id": "high", "label": "High"}]
+    # Empty means "keep the current value".
+    assert validate_effort("", efforts, "codex") == ""
+    assert validate_effort("high", efforts, "codex") == "high"
+    # No catalog: trust the caller rather than reject everything.
+    assert validate_effort("anything", [], "codex") == "anything"
+    assert validate_speed("turbo", None, "codex") == "turbo"
+
+    with pytest.raises(ValueError) as excinfo:
+        validate_effort("ultra", efforts, "codex")
+    message = str(excinfo.value)
+    assert "unknown effort 'ultra'" in message
+    # The error names the allowed ids so a cockpit can recover.
+    assert "low, high" in message
+
+    with pytest.raises(ValueError) as excinfo:
+        validate_speed("warp", [{"id": "standard", "label": "Standard"}], "codex")
+    assert "unknown speed 'warp'" in str(excinfo.value)
+
+
 def test_validate_model_accepts_empty_and_names_allowed_ids() -> None:
     from jarvis.worker_session_contract import validate_model
 
@@ -5603,6 +5680,124 @@ def test_session_turn_rejects_unknown_model_and_stores_a_known_one(tmp_path) -> 
     assert "gpt-x, gpt-y" in body["error"]
     # Rejection happens before the turn is reserved, so nothing changed.
     assert model == "gpt-x"
+
+
+def test_session_turn_rejects_unknown_effort_and_stores_known_effort_and_speed(tmp_path) -> None:  # noqa: ANN001
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="tkn",
+        workspace=str(tmp_path / "worker"),
+        agent="codex",
+        supported_engines="codex",
+        codex_efforts="low:Light,high:High",
+        codex_speeds="standard:Standard,priority:Fast",
+    )
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, client):  # noqa: ANN001
+        created = (
+            await client.post(
+                base + "/sessions",
+                json={
+                    "provider": "codex",
+                    "engine": "codex",
+                    "cwd": _owned_worker_cwd(tmp_path, "effort-switch"),
+                    "metadata": {**_authority_metadata("codex", [WORKER_SESSION_TURN]), "effort": "low"},
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        rejected = await client.post(
+            f"{base}/sessions/{session_id}/turns",
+            json={
+                "turn_id": "turn_bad_effort",
+                "prompt": "switch me",
+                "effort": "ultra",
+                "metadata": _control_metadata(WORKER_SESSION_TURN),
+            },
+            headers=headers,
+        )
+        after_reject = (await client.get(f"{base}/sessions/{session_id}", headers=headers)).json()
+        accepted = await client.post(
+            f"{base}/sessions/{session_id}/turns",
+            json={
+                "turn_id": "turn_good_effort",
+                "prompt": "switch me",
+                "effort": "high",
+                "speed": "priority",
+                "metadata": _control_metadata(WORKER_SESSION_TURN),
+            },
+            headers=headers,
+        )
+        after_accept = (await client.get(f"{base}/sessions/{session_id}", headers=headers)).json()
+        return (
+            rejected.status_code,
+            rejected.json(),
+            after_reject.get("session", after_reject)["metadata"],
+            accepted.status_code,
+            after_accept.get("session", after_accept)["metadata"],
+        )
+
+    status, body, before, accepted_status, after = asyncio.run(_with_server(cfg, 8846, calls))
+
+    assert status == 400
+    assert body["code"] == "validation_failed"
+    assert "low, high" in body["error"]
+    # Rejection happens before the turn is reserved, so nothing changed.
+    assert before["effort"] == "low"
+    assert "speed" not in before
+
+    assert accepted_status == 200
+    # Both land in metadata, where the providers read them at turn start.
+    assert after["effort"] == "high"
+    assert after["speed"] == "priority"
+
+
+def test_codex_turn_sends_effort_and_omits_the_implicit_standard_tier(tmp_path) -> None:  # noqa: ANN001
+    """`standard` is what codex uses when no serviceTier is sent, so selecting it
+    must transmit nothing rather than an unknown tier id."""
+    from jarvis.worker.providers.codex import _codex_turn_tuning
+    from jarvis.worker.sessions import SessionManager
+
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create({"provider": "codex", "engine": "codex", "metadata": {}})
+
+    # Nothing set: the session runs at codex's own defaults.
+    assert _codex_turn_tuning(session.session_id, sessions) == {}
+
+    sessions.update_metadata(session.session_id, {"effort": "xhigh", "speed": "standard"})
+    assert _codex_turn_tuning(session.session_id, sessions) == {"effort": "xhigh"}
+
+    sessions.update_metadata(session.session_id, {"speed": "priority"})
+    assert _codex_turn_tuning(session.session_id, sessions) == {
+        "effort": "xhigh",
+        "serviceTier": "priority",
+    }
+
+
+def test_claude_runtime_carries_effort_into_sdk_options(tmp_path) -> None:  # noqa: ANN001
+    """Claude takes effort as a construction-time option (there is no set_effort),
+    so a change must retire the runtime rather than mutate it in place."""
+    from jarvis.worker.providers.claude import _ClaudeSessionRuntime, _session_effort
+    from jarvis.worker.sessions import SessionManager
+
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {"provider": "claude", "engine": "claude", "metadata": {"model": "opus", "effort": "high"}}
+    )
+    session = sessions.get(session.session_id)
+    assert _session_effort(session) == "high"
+
+    runtime = object.__new__(_ClaudeSessionRuntime)
+    runtime.effort = _session_effort(session)
+    # A live runtime is only reusable while its effort still matches the session.
+    sessions.update_metadata(session.session_id, {"effort": "low"})
+    assert runtime.effort != _session_effort(sessions.get(session.session_id))
+
+    # Claude has no speed tier, so `speed` is deliberately not read.
+    sessions.update_metadata(session.session_id, {"speed": "priority"})
+    assert _session_effort(sessions.get(session.session_id)) == "low"
 
 
 def test_claude_runtime_applies_model_change_from_session_metadata(tmp_path) -> None:  # noqa: ANN001

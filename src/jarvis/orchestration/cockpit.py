@@ -1583,19 +1583,21 @@ def _engine_row(engine: str, *, default: bool, worker_status: str, supports: dic
 
 
 def _engine_supports_payload(supports: dict[str, Any] | None) -> dict[str, Any]:
-    """Capability flags with the model catalog alongside them.
+    """Capability flags with the model / effort / speed catalogs alongside them.
 
-    `models` / `default_model` are catalog data sharing the mapping with the
-    booleans, so they are copied across untouched rather than coerced.
+    Those keys are catalog data sharing the mapping with the booleans, so they
+    are copied across untouched rather than coerced. An engine that publishes no
+    catalog reports an empty one, never a missing key.
     """
     supports = supports or {}
     payload: dict[str, Any] = {
         **_empty_engine_supports(),
         **{str(key): bool(value) for key, value in supports.items() if key not in ENGINE_CATALOG_KEYS},
     }
-    models = supports.get("models")
-    payload["models"] = [dict(row) for row in models if isinstance(row, dict)] if isinstance(models, list) else []
-    payload["default_model"] = str(supports.get("default_model") or "")
+    for rows_key, default_key in (("models", "default_model"), ("efforts", "default_effort"), ("speeds", "default_speed")):
+        rows = supports.get(rows_key)
+        payload[rows_key] = [dict(row) for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+        payload[default_key] = str(supports.get(default_key) or "")
     return payload
 
 

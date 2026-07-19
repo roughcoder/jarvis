@@ -63,7 +63,14 @@ from jarvis.worker.actions import (
     worktree_inventory,
 )
 from jarvis.worker.jobs import JobManager, slugify
-from jarvis.worker.model_catalog import default_model, engine_models
+from jarvis.worker.model_catalog import (
+    default_effort,
+    default_model,
+    default_speed,
+    engine_efforts,
+    engine_models,
+    engine_speeds,
+)
 from jarvis.worker.notify import WorkerChangeNotifier
 from jarvis.worker.providers import ProviderTurn, provider_for
 from jarvis.worker.sessions import SessionManager, SessionTurnConflict, WorkerSession
@@ -91,7 +98,9 @@ from jarvis.worker_session_contract import (
     SESSION_FAILED,
     SESSION_INTERRUPTED,
     SESSION_STOPPED,
+    validate_effort,
     validate_model,
+    validate_speed,
 )
 
 
@@ -181,6 +190,10 @@ def _engine_supports(engines: list[str], cfg: WorkerConfig) -> dict[str, dict[st
             # before coercing the rest of the mapping to bools.
             "models": engine_models(cfg, engine),
             "default_model": default_model(cfg, engine),
+            "efforts": engine_efforts(cfg, engine),
+            "default_effort": default_effort(cfg, engine),
+            "speeds": engine_speeds(cfg, engine),
+            "default_speed": default_speed(cfg, engine),
         }
     return supports
 
@@ -861,23 +874,31 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             validated_runtime_context = _validate_runtime_context(body.get("runtime_context"))
         except RuntimeError as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400), None
-        # A turn may carry a model for this and every later turn on the session.
-        # Empty/absent keeps the current one. The metadata write must land before
-        # the turn is reserved: both providers read the model off session
-        # metadata when they start the turn.
+        # A turn may carry a model, reasoning effort and speed for this and every
+        # later turn on the session. Empty/absent keeps the current one. The
+        # metadata write must land before the turn is reserved: both providers
+        # read these off session metadata when they start the turn.
         try:
-            requested_model = validate_model(
-                body.get("model"),
-                engine_models(cfg, session.provider),
-                session.provider,
-            )
+            requested = {
+                key: validate(body.get(key), catalog(cfg, session.provider), session.provider)
+                for key, validate, catalog in (
+                    ("model", validate_model, engine_models),
+                    ("effort", validate_effort, engine_efforts),
+                    ("speed", validate_speed, engine_speeds),
+                )
+            }
         except ValueError as exc:
             return web.json_response(
                 {"ok": False, "error": str(exc), "code": "validation_failed"},
                 status=400,
             ), None
-        if requested_model and requested_model != str(session.metadata.get("model") or ""):
-            session = sessions.update_metadata(session.session_id, {"model": requested_model})
+        changed = {
+            key: value
+            for key, value in requested.items()
+            if value and value != str(session.metadata.get(key) or "")
+        }
+        if changed:
+            session = sessions.update_metadata(session.session_id, changed)
         running_event = None
         if session.metadata.get("provision_workspace") is True:
             running_event = sessions.append_event(
