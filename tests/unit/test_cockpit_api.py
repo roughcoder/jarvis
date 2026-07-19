@@ -11814,10 +11814,64 @@ def _seed_worker_model_catalog(cfg: Config) -> None:
     workers_path.write_text(json.dumps(data))
 
 
+def _warm_probe_model_catalog_snapshot(cfg: Config) -> None:
+    from jarvis.orchestration.cockpit import worker_profiles
+    from jarvis.orchestration.workers import reset_probe_snapshots
+
+    health = {
+        "ok": True,
+        "default_engine": "codex",
+        "supported_engines": ["codex", "claude"],
+        "engine_supports": {
+            "codex": {
+                "streaming": True,
+                "resume": True,
+                "interrupt": True,
+                "approval_requests": True,
+                "input_requests": True,
+                "checkpoints": True,
+                "models": [{"id": "gpt-x", "label": "GPT X"}, {"id": "gpt-y", "label": "GPT Y"}],
+                "default_model": "gpt-x",
+            },
+            "claude": {
+                "streaming": True,
+                "resume": True,
+                "interrupt": False,
+                "approval_requests": False,
+                "input_requests": False,
+                "checkpoints": False,
+                "models": [{"id": "opus", "label": "Opus"}],
+                "default_model": "opus",
+            },
+        },
+    }
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions"):
+            return Response({"sessions": []})
+        if url.endswith("/health"):
+            return Response(health)
+        raise AssertionError(url)
+
+    probed = worker_profiles(
+        worker_cfg=cfg.worker,
+        workers_path=cfg.orchestration.workers_path,
+        probe=True,
+        http_get=get,
+    )
+    engines = {row["engine"]: row for row in probed[0]["engines"]}
+    assert engines["codex"]["supports"]["models"][0]["id"] == "gpt-x"
+    # Simulate a fresh API process: the next read must come from the persisted
+    # probe snapshot, not the process-global in-memory snapshot.
+    reset_probe_snapshots()
+
+
 def test_cockpit_thread_turn_rejects_a_model_the_engine_does_not_offer(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)
-    _seed_worker_model_catalog(cfg)
+    _warm_probe_model_catalog_snapshot(cfg)
     index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
     index.save(
         CockpitThread(
@@ -11850,16 +11904,20 @@ def test_cockpit_thread_turn_rejects_a_model_the_engine_does_not_offer(tmp_path,
     assert "gpt-x, gpt-y" in body["error"]["message"]
 
 
-def test_cockpit_catalog_endpoint_publishes_worker_model_catalog(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+def test_cockpit_catalog_endpoint_publishes_last_probed_worker_model_catalog(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)
-    _seed_worker_model_catalog(cfg)
+    _warm_probe_model_catalog_snapshot(cfg)
 
     async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
         return (await client.get(f"{base}/v1/cockpit/catalog")).json()
 
     catalog = asyncio.run(_with_server(cfg, calls))
 
+    workers_path = Path(cfg.orchestration.workers_path)
+    assert workers_path.with_name(f"{workers_path.name}.probes.json").exists()
+    raw_workers = json.loads(workers_path.read_text())
+    assert "engine_models" not in raw_workers["workers"][0]
     rows = {row["engine"]: row for row in catalog["engines"]}
     assert rows["codex"]["supports"]["models"] == [
         {"id": "gpt-x", "label": "GPT X"},
