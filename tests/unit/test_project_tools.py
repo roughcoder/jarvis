@@ -29,7 +29,6 @@ def _ctx(
 def _memory_cfg(tmp_path: Path) -> MemoryConfig:
     return MemoryConfig(
         _env_file=None,
-        backend="v3",
         cache_path=str(tmp_path / "cache.json"),
         curation_outbox_path=str(tmp_path / "outbox.jsonl"),
         tool_timeout_s=0.05,

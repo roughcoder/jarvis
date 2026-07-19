@@ -373,7 +373,6 @@ def _cfg(
     oauth_default_alg: str = "RS256",
     oauth_jwks_ttl_s: str = "300",
     oauth_jwks_min_refresh_s: str = "30",
-    memory_backend: str = "v2",
     brain_peer_token: str = "",
     mcp_enabled: str = "false",
     mcp_servers: str = "[]",
@@ -411,7 +410,6 @@ def _cfg(
                 f"ORCHESTRATION_OAUTH_JWKS_MIN_REFRESH_S={oauth_jwks_min_refresh_s}",
                 f"CAPS_DEFAULT_CAPABILITIES={caps}",
                 f"CAPS_USERS_DIR={users_path}",
-                f"MEMORY_BACKEND={memory_backend}",
                 f"MEMORY_CACHE_PATH={tmp_path / 'memory-cache.json'}",
                 f"MEMORY_CURATION_OUTBOX_PATH={tmp_path / 'curation-outbox.jsonl'}",
                 f"BRAIN_PEER_TOKEN={brain_peer_token}",
@@ -3246,11 +3244,11 @@ def test_cockpit_project_memory_returns_representation_and_conclusions(tmp_path,
     asyncio.run(_with_server(cfg, calls))
 
 
-def test_cockpit_project_memory_degrades_when_backend_is_v2_or_dead(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+def test_cockpit_project_memory_degrades_when_live_memory_is_unavailable(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)
     memory = FakeProjectMemory(
-        live_error=cockpit_api_module.UnsupportedMemoryOperation("v2 unsupported"),
+        live_error=cockpit_api_module.UnsupportedMemoryOperation("live memory unsupported"),
         conclusion_error=RuntimeError("memory down"),
     )
     monkeypatch.setattr(cockpit_api_module, "MemoryClient", lambda _cfg: memory)
@@ -4860,7 +4858,6 @@ def test_cockpit_thread_turn_streams_tool_events_and_persists_detail_messages(tm
         monkeypatch,
         identity="neil",
         caps="memory.curate",
-        memory_backend="v3",
     )
     _seed_project_registry(cfg)
     memory = FakeProjectMemory()
@@ -5020,7 +5017,6 @@ def test_cockpit_thread_turn_guards_fake_review_even_when_memory_tool_ran(tmp_pa
         monkeypatch,
         identity="neil",
         caps="memory.curate",
-        memory_backend="v3",
     )
     _seed_project_registry(cfg)
     memory = FakeProjectMemory()
@@ -5484,7 +5480,6 @@ def test_cockpit_thread_turn_records_decision_only_through_lane2_tool(tmp_path, 
         monkeypatch,
         identity="neil",
         caps="memory.curate",
-        memory_backend="v3",
     )
     _seed_project_registry(cfg)
     memory = FakeProjectMemory()
@@ -5696,7 +5691,7 @@ def test_cockpit_thread_delete_promotes_children_to_root(tmp_path, monkeypatch) 
 
 
 def test_cockpit_thread_delete_treats_missing_v3_memory_session_as_reclaimed(tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    cfg = _cfg(tmp_path, monkeypatch, identity="neil", memory_backend="v3")
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)
     request = httpx.Request("DELETE", "http://memory/v3/workspaces/ws/sessions/missing")
     memory = FakeProjectMemory()
@@ -5813,7 +5808,7 @@ def test_cockpit_thread_backend_gaps_degrade_without_500(tmp_path, monkeypatch) 
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)
     memory = FakeProjectMemory()
-    memory.create_session_error = cockpit_api_module.UnsupportedMemoryOperation("v2 unsupported")
+    memory.create_session_error = cockpit_api_module.UnsupportedMemoryOperation("live memory unsupported")
     connector = CockpitConnector(cfg, memory=memory, gateway=FakeGateway(["reply"]), tts=None, tracer=None)
     monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
 
@@ -5834,7 +5829,7 @@ def test_cockpit_thread_backend_gaps_degrade_without_500(tmp_path, monkeypatch) 
             )
         )
         memory.create_session_error = None
-        memory.create_messages_error = cockpit_api_module.UnsupportedMemoryOperation("v2 unsupported")
+        memory.create_messages_error = cockpit_api_module.UnsupportedMemoryOperation("live memory unsupported")
         # A memory failure during the turn's Lane 1 persist must not break the
         # turn (AGENTS.md: "tracing/memory must never break a turn") — the
         # gateway reply already happened, so the turn still completes.

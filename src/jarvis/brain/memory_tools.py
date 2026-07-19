@@ -248,8 +248,6 @@ def make_memory_tools(
             timeout_s=cfg.tool_timeout_s + 1.0,
         ),
     ]
-    if cfg.backend != "v3":
-        return tools
     tools.extend([
         Tool(
             name="remember_contact",
