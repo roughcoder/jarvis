@@ -63,6 +63,7 @@ from jarvis.worker.actions import (
     worktree_inventory,
 )
 from jarvis.worker.jobs import JobManager, slugify
+from jarvis.worker.model_catalog import default_model, engine_models
 from jarvis.worker.notify import WorkerChangeNotifier
 from jarvis.worker.providers import ProviderTurn, provider_for
 from jarvis.worker.sessions import SessionManager, SessionTurnConflict, WorkerSession
@@ -90,6 +91,7 @@ from jarvis.worker_session_contract import (
     SESSION_FAILED,
     SESSION_INTERRUPTED,
     SESSION_STOPPED,
+    validate_model,
 )
 
 
@@ -160,8 +162,8 @@ def _worker_workspace(cfg: WorkerConfig) -> pathlib.Path:
     return workspace
 
 
-def _engine_supports(engines: list[str]) -> dict[str, dict[str, bool]]:
-    supports: dict[str, dict[str, bool]] = {}
+def _engine_supports(engines: list[str], cfg: WorkerConfig) -> dict[str, dict[str, Any]]:
+    supports: dict[str, dict[str, Any]] = {}
     for engine in engines:
         try:
             capabilities = provider_for(engine).capabilities()
@@ -175,6 +177,10 @@ def _engine_supports(engines: list[str]) -> dict[str, dict[str, bool]]:
             "input_requests": bool(capabilities.get("input_requests", capabilities.get("questions"))),
             "checkpoints": bool(capabilities.get("checkpoints")),
             "attachments": bool(capabilities.get("attachments")),
+            # Catalog data, not capability flags — consumers split these out
+            # before coercing the rest of the mapping to bools.
+            "models": engine_models(cfg, engine),
+            "default_model": default_model(cfg, engine),
         }
     return supports
 
@@ -855,6 +861,23 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             validated_runtime_context = _validate_runtime_context(body.get("runtime_context"))
         except RuntimeError as exc:
             return web.json_response({"ok": False, "error": str(exc)}, status=400), None
+        # A turn may carry a model for this and every later turn on the session.
+        # Empty/absent keeps the current one. The metadata write must land before
+        # the turn is reserved: both providers read the model off session
+        # metadata when they start the turn.
+        try:
+            requested_model = validate_model(
+                body.get("model"),
+                engine_models(cfg, session.provider),
+                session.provider,
+            )
+        except ValueError as exc:
+            return web.json_response(
+                {"ok": False, "error": str(exc), "code": "validation_failed"},
+                status=400,
+            ), None
+        if requested_model and requested_model != str(session.metadata.get("model") or ""):
+            session = sessions.update_metadata(session.session_id, {"model": requested_model})
         running_event = None
         if session.metadata.get("provision_workspace") is True:
             running_event = sessions.append_event(
@@ -1155,7 +1178,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             "agent": cfg.agent,
             "default_engine": normalize_engine_id(cfg.agent),
             "supported_engines": supported_engines,
-            "engine_supports": _engine_supports(supported_engines),
+            "engine_supports": _engine_supports(supported_engines, cfg),
             "workspace": str(workspace),
             "conversation_workspace_root": str(conversation_root),
             "repo_root_configured": bool(cfg.repo_root),

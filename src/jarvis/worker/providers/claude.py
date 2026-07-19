@@ -359,6 +359,18 @@ class _ClaudeSessionRuntime:
             with contextlib.suppress(Exception):
                 await client.disconnect()
 
+    async def _apply_model_change(self, client: Any) -> None:
+        """Switch the live SDK client's model if the session's changed since the
+        last turn. The turn handler writes the new id to session metadata; the
+        long-lived client was constructed with the old one, so re-read it here
+        rather than tearing the session down."""
+        session = self.sessions.get(self.session_id)
+        model = str(session.metadata.get("model") or "") if session is not None else ""
+        if not model or model == self.model:
+            return
+        await client.set_model(model)
+        self.model = model
+
     async def _run_turn(self, client: Any, turn: ProviderTurn) -> None:
         self._current_turn = turn
         timeout_s = max(1.0, float(self.worker_cfg.job_timeout_s))
@@ -370,6 +382,7 @@ class _ClaudeSessionRuntime:
             if _session_cancelled(self.sessions, self.session_id):
                 return
             await client.set_permission_mode(self.authority.claude_permission_mode)
+            await self._apply_model_change(client)
             await client.query(_turn_query_input(turn))
             terminal_seen = False
             async with asyncio.timeout(timeout_s) as turn_timeout:

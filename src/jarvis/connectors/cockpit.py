@@ -1786,8 +1786,14 @@ class CockpitConnector:
         workspace_request = dict(workspace_request or {})
         if context_thread.chat_type == "orchestrator":
             requested_engine = str(workspace_request.get("engine") or "").strip().lower()
-            if requested_engine:
-                context_thread = self._apply_orchestrator_engine(project, context_thread, requested_engine)
+            requested_model = str(workspace_request.get("model") or "").strip()
+            if requested_engine or requested_model:
+                context_thread = self._apply_orchestrator_engine_and_model(
+                    project,
+                    context_thread,
+                    requested_engine,
+                    requested_model,
+                )
             reply, updated = await self._orchestrator_turn(
                 project,
                 context_thread,
@@ -1909,6 +1915,7 @@ class CockpitConnector:
         if not worker_id or not session_id:
             raise RuntimeError("conversation workspace has no worker session")
         await _emit_progress(progress, {"phase": "running", "thread_id": thread.thread_id, "workspace": workspace_public(thread.workspace)})
+        requested_model = str(workspace_request.get("model") or "").strip()
         turn = await asyncio.to_thread(
             self._post_worker_json,
             worker_id,
@@ -1928,6 +1935,10 @@ class CockpitConnector:
                     if idempotency_key
                     else f"thread-turn:{thread.thread_id}:{new_id('turn')}:{_stable_text_hash(text)}"
                 ),
+                # Worker sessions switch model in place — the worker writes it to
+                # session metadata and the provider picks it up on this turn. No
+                # respawn, unlike the orchestrator path.
+                **({"model": requested_model} if requested_model else {}),
             },
         )
         if not turn.get("ok", True):
@@ -1942,6 +1953,17 @@ class CockpitConnector:
         )
         if thread is None:
             raise RuntimeError("conversation execution was interrupted")
+        if requested_model and requested_model != thread.model:
+            # The worker accepted it, so it is the effective model from here on;
+            # thread detail reports it without waiting for a provider event.
+            thread = self._index.save(
+                replace(
+                    thread,
+                    model=requested_model,
+                    updated_at=utc_now(),
+                    workspace={**thread.workspace, "model": requested_model},
+                )
+            )
         reply = "Workspace turn is running."
         # Best-effort per AGENTS.md: a memory outage here must not raise out of
         # the turn handler after the worker turn was already dispatched — that
@@ -2101,21 +2123,33 @@ class CockpitConnector:
             idempotency_key=idempotency_key,
         )
 
-    def _apply_orchestrator_engine(
+    def _apply_orchestrator_engine_and_model(
         self,
         project: ProjectEntry,
         thread: CockpitThread,
         engine: str,
+        model: str = "",
     ) -> CockpitThread:
-        """Route the reserved turn to `engine`, replacing any previous provider session.
+        """Route the reserved turn to `engine`/`model`, replacing any previous
+        provider session.
 
         Turn reservation upstream guarantees no other execution is in flight, so
         dropping the session is replay-safe: history lives on the thread and the
-        orchestrator prompt rebuilds project context every turn.
+        orchestrator prompt rebuilds project context every turn. A model change
+        takes the same path as an engine change — provider sessions are pinned to
+        the model they spawned with, so a fresh one is the only honest way to
+        switch.
         """
+        engine = str(engine or "").strip().lower() or thread.engine
+        model = str(model or "").strip()
         if engine not in ORCHESTRATOR_ENGINES:
             raise ValueError("orchestrator engine must be codex or claude")
-        if engine == thread.engine:
+        engine_changed = engine != thread.engine
+        # Crossing engines retires the old model id — it belongs to the previous
+        # provider. Without an explicit request the new session takes its own
+        # default.
+        target_model = model if model else ("" if engine_changed else thread.model)
+        if not engine_changed and target_model == thread.model:
             return thread
         workspace = {
             **thread.workspace,
@@ -2123,14 +2157,15 @@ class CockpitConnector:
             "provider_started": False,
             "session_generation": int(thread.workspace.get("session_generation") or 0) + 1,
         }
-        workspace.pop("model", None)
+        if target_model:
+            workspace["model"] = target_model
+        else:
+            workspace.pop("model", None)
         return self._index.save(
             replace(
                 thread,
                 engine=engine,
-                # The previous model id belongs to the old provider; the new
-                # provider's session starts on its own default.
-                model="",
+                model=target_model,
                 updated_at=utc_now(),
                 workspace=workspace,
             )

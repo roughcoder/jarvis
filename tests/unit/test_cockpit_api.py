@@ -11602,3 +11602,331 @@ def test_publish_review_tool_rejects_a_replayed_zero_id_result(tmp_path, monkeyp
     # flag preserved the false success on every retry.
     assert result.startswith("error:")
     assert "nothing was posted" in result
+
+
+# --- mid-conversation model switching ---------------------------------------
+
+
+def test_orchestrator_turn_model_override_respawns_the_session(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """A model change takes the engine-change path: same engine, fresh session."""
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    thread = CockpitThread(
+        thread_id="thread_model_switch",
+        project_id=project.id,
+        session_id=orchestrator_session_id(project.id, "thread_model_switch"),
+        title="Plan",
+        created_at="2026-07-19T10:00:00Z",
+        updated_at="2026-07-19T10:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        engine="codex",
+        model="gpt-5.5",
+        workspace={
+            "worker_id": "worker_a",
+            "session_id": "orch_thread_model_switch",
+            "provider_started": True,
+            "status": "ready",
+            "session_generation": 3,
+            "model": "gpt-5.5",
+        },
+    )
+    connector.index.save(thread)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    seen: list[CockpitThread] = []
+
+    async def fake_orchestrator_turn(_project, context_thread, *_args, **_kwargs):  # noqa: ANN001, ANN002, ANN003
+        seen.append(context_thread)
+        return "ok", context_thread
+
+    monkeypatch.setattr(connector, "_orchestrator_turn", fake_orchestrator_turn)
+
+    reply, _updated, events = asyncio.run(
+        connector.turn(
+            project,
+            thread,
+            requester,
+            "use the bigger model",
+            workspace_request={"model": "gpt-5.6-codex"},
+        )
+    )
+
+    assert reply == "ok"
+    assert events == ()
+    assert seen[0].model == "gpt-5.6-codex"
+    stored = connector.index.get(project.id, thread.thread_id)
+    assert stored is not None
+    # Engine is untouched; the session is dropped so the next spawn takes the model.
+    assert stored.engine == "codex"
+    assert stored.model == "gpt-5.6-codex"
+    assert stored.workspace["model"] == "gpt-5.6-codex"
+    assert stored.workspace["session_id"] == ""
+    assert stored.workspace["provider_started"] is False
+    assert stored.workspace["session_generation"] == 4
+
+    # Re-requesting the model already in force keeps the session.
+    asyncio.run(
+        connector.turn(
+            project,
+            connector.index.get(project.id, thread.thread_id),
+            requester,
+            "same model",
+            workspace_request={"model": "gpt-5.6-codex"},
+        )
+    )
+    unchanged = connector.index.get(project.id, thread.thread_id)
+    assert unchanged is not None
+    assert unchanged.workspace["session_generation"] == 4
+
+
+def test_orchestrator_engine_switch_without_model_still_clears_the_model(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """Crossing engines retires the old provider's model id."""
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    connector = CockpitConnector(cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None)
+    thread = CockpitThread(
+        thread_id="thread_engine_and_model",
+        project_id=project.id,
+        session_id=orchestrator_session_id(project.id, "thread_engine_and_model"),
+        title="Plan",
+        created_at="2026-07-19T10:00:00Z",
+        updated_at="2026-07-19T10:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        engine="codex",
+        model="gpt-5.5",
+        workspace={"worker_id": "worker_a", "session_id": "s1", "session_generation": 1, "model": "gpt-5.5"},
+    )
+    connector.index.save(thread)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+
+    async def fake_orchestrator_turn(_project, context_thread, *_args, **_kwargs):  # noqa: ANN001, ANN002, ANN003
+        return "ok", context_thread
+
+    monkeypatch.setattr(connector, "_orchestrator_turn", fake_orchestrator_turn)
+
+    asyncio.run(connector.turn(project, thread, requester, "go claude", workspace_request={"engine": "claude"}))
+    switched = connector.index.get(project.id, thread.thread_id)
+    assert switched is not None
+    assert switched.engine == "claude"
+    assert switched.model == ""
+    assert "model" not in switched.workspace
+
+    # Engine and model together respawn once, on both.
+    asyncio.run(
+        connector.turn(
+            project,
+            switched,
+            requester,
+            "back to codex on a pinned model",
+            workspace_request={"engine": "codex", "model": "gpt-5.6"},
+        )
+    )
+    both = connector.index.get(project.id, thread.thread_id)
+    assert both is not None
+    assert both.engine == "codex"
+    assert both.model == "gpt-5.6"
+    assert both.workspace["session_generation"] == 3
+
+
+def test_cockpit_catalog_carries_the_model_catalog_alongside_capability_flags() -> None:
+    from jarvis.orchestration.cockpit import cockpit_catalog
+
+    catalog = cockpit_catalog(
+        engines=["codex", "claude"],
+        engine_supports={
+            "codex": {
+                "streaming": True,
+                "models": [{"id": "gpt-x", "label": "GPT X"}],
+                "default_model": "gpt-x",
+            }
+        },
+    )
+
+    rows = {row["engine"]: row for row in catalog["engines"]}
+    # The catalog keys survive the bool coercion applied to the capability flags.
+    assert rows["codex"]["supports"]["models"] == [{"id": "gpt-x", "label": "GPT X"}]
+    assert rows["codex"]["supports"]["default_model"] == "gpt-x"
+    assert rows["codex"]["supports"]["streaming"] is True
+    # An engine with no catalog reports an empty one, never a missing key.
+    assert rows["claude"]["supports"]["models"] == []
+    assert rows["claude"]["supports"]["default_model"] == ""
+
+
+def test_worker_profile_splits_catalog_out_of_engine_supports() -> None:
+    from jarvis.orchestration.workers import _engine_models_from_health, _engine_supports_from_mapping
+
+    raw = {
+        "codex": {
+            "streaming": True,
+            "checkpoints": False,
+            "models": [{"id": "gpt-x", "label": "GPT X"}, {"id": "gpt-y"}],
+            "default_model": "gpt-x",
+        }
+    }
+
+    supports = _engine_supports_from_mapping(raw)
+    # Catalog keys must not leak into the bool mapping — a list would become True.
+    assert supports == {"codex": {"streaming": True, "checkpoints": False}}
+
+    models, defaults = _engine_models_from_health({"engine_supports": raw})
+    assert models == {"codex": [{"id": "gpt-x", "label": "GPT X"}, {"id": "gpt-y", "label": "gpt-y"}]}
+    assert defaults == {"codex": "gpt-x"}
+
+    # A worker predating the contract reports nothing rather than breaking.
+    assert _engine_models_from_health({"engine_supports": {"codex": {"streaming": True}}}) == ({}, {})
+
+
+def test_worker_profile_payload_folds_the_catalog_back_into_engine_supports() -> None:
+    profile = WorkerProfile(
+        worker_id="worker_a",
+        display_name="Worker A",
+        engine_supports={"codex": {"streaming": True}},
+        engine_models={"codex": [{"id": "gpt-x", "label": "GPT X"}]},
+        engine_default_model={"codex": "gpt-x"},
+    )
+
+    payload = profile.public()["engine_supports"]
+    assert payload["codex"]["streaming"] is True
+    assert payload["codex"]["models"] == [{"id": "gpt-x", "label": "GPT X"}]
+    assert payload["codex"]["default_model"] == "gpt-x"
+
+
+def _seed_worker_model_catalog(cfg: Config) -> None:
+    workers_path = Path(cfg.orchestration.workers_path)
+    data = json.loads(workers_path.read_text())
+    data["workers"][0]["engine_models"] = {
+        "codex": [{"id": "gpt-x", "label": "GPT X"}, {"id": "gpt-y", "label": "GPT Y"}],
+        "claude": [{"id": "opus", "label": "Opus"}],
+    }
+    data["workers"][0]["engine_default_model"] = {"codex": "gpt-x", "claude": "opus"}
+    workers_path.write_text(json.dumps(data))
+
+
+def test_cockpit_thread_turn_rejects_a_model_the_engine_does_not_offer(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    _seed_worker_model_catalog(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    index.save(
+        CockpitThread(
+            thread_id="thread_model_validation",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_model_validation"),
+            title="Model validation",
+            created_at="2026-07-19T00:00:00Z",
+            updated_at="2026-07-19T00:00:00Z",
+            created_by="neil",
+            chat_type="orchestrator",
+            engine="codex",
+            worker_id="macbook-worker",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_thread_model_validation"},
+        )
+    )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_model_validation/turns",
+            json={"text": "switch model", "model": "gpt-nope", "idempotency_key": "turn_bad_model"},
+        )
+
+    response = asyncio.run(_with_server(cfg, calls))
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"]["code"] == "validation_failed"
+    # The error names what the caller may pick instead.
+    assert "gpt-x, gpt-y" in body["error"]["message"]
+
+
+def test_cockpit_catalog_endpoint_publishes_worker_model_catalog(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    _seed_worker_model_catalog(cfg)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        return (await client.get(f"{base}/v1/cockpit/catalog")).json()
+
+    catalog = asyncio.run(_with_server(cfg, calls))
+
+    rows = {row["engine"]: row for row in catalog["engines"]}
+    assert rows["codex"]["supports"]["models"] == [
+        {"id": "gpt-x", "label": "GPT X"},
+        {"id": "gpt-y", "label": "GPT Y"},
+    ]
+    assert rows["codex"]["supports"]["default_model"] == "gpt-x"
+    assert rows["claude"]["supports"]["default_model"] == "opus"
+    # Capability flags are untouched by the catalog merge.
+    assert rows["codex"]["supports"]["checkpoints"] is True
+    assert rows["claude"]["supports"]["checkpoints"] is False
+
+
+def test_cockpit_workspace_turn_forwards_the_model_to_the_worker_session(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """Worker sessions switch in place — the model rides on the turn, no respawn."""
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    _seed_worker_model_catalog(cfg)
+    connector = CockpitConnector(cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None)
+    thread = CockpitThread(
+        thread_id="thread_ws_model",
+        project_id="neil-shared",
+        session_id=orchestrator_session_id("neil-shared", "thread_ws_model"),
+        title="Workspace",
+        created_at="2026-07-19T00:00:00Z",
+        updated_at="2026-07-19T00:00:00Z",
+        created_by="neil",
+        engine="codex",
+        model="gpt-x",
+        worker_id="macbook-worker",
+        workspace={
+            "worker_id": "macbook-worker",
+            "session_id": "conv_thread_ws_model",
+            "kind": "conversation",
+            "status": "ready",
+            "session_generation": 2,
+        },
+    )
+    connector.index.save(thread)
+    posts: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_post(worker_id: str, path: str, payload: dict[str, Any]) -> dict[str, Any]:  # noqa: ARG001
+        posts.append((path, payload))
+        return {"ok": True, "turn_id": "turn_1"}
+
+    async def fake_ensure_workspace(_project, thread_arg, *_args, **_kwargs):  # noqa: ANN001, ANN002, ANN003
+        return thread_arg
+
+    monkeypatch.setattr(connector, "_post_worker_json", fake_post)
+    monkeypatch.setattr(connector, "_ensure_workspace", fake_ensure_workspace)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+
+    asyncio.run(
+        connector.turn(
+            RegistryStore(cfg.registry.path).get_project("neil-shared"),
+            thread,
+            requester,
+            "switch model",
+            workspace_request={"model": "gpt-y"},
+        )
+    )
+
+    assert posts[0][0] == "/sessions/conv_thread_ws_model/turns"
+    assert posts[0][1]["model"] == "gpt-y"
+    stored = connector.index.get("neil-shared", "thread_ws_model")
+    assert stored is not None
+    # The session is NOT dropped: no generation bump, same session id.
+    assert stored.workspace["session_generation"] == 2
+    assert stored.workspace["session_id"] == "conv_thread_ws_model"
+    # Thread detail reports the new effective model.
+    assert stored.model == "gpt-y"

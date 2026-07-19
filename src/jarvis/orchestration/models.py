@@ -343,6 +343,11 @@ class WorkerProfile:
     last_seen_at: str = ""
     supported_engines: list[str] = field(default_factory=list)
     engine_supports: dict[str, dict[str, bool]] = field(default_factory=dict)
+    # Model catalog the worker publishes per engine, and the id a fresh session
+    # of that engine spawns with. Kept beside engine_supports rather than inside
+    # it because that mapping is bool-typed end to end.
+    engine_models: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+    engine_default_model: dict[str, str] = field(default_factory=dict)
     system: dict[str, Any] = field(default_factory=dict)
     git_identity: dict[str, Any] = field(default_factory=dict)
     repo_access: list[dict[str, Any]] = field(default_factory=list)
@@ -367,10 +372,26 @@ class WorkerProfile:
         self.repositories = [dict(item) for item in self.repositories if isinstance(item, dict) and (item.get("repo") or item.get("name"))]
         if not isinstance(self.worktree_inventory, dict):
             self.worktree_inventory = {}
+        if not isinstance(self.engine_models, dict):
+            self.engine_models = {}
+        if not isinstance(self.engine_default_model, dict):
+            self.engine_default_model = {}
         if not isinstance(self.runtime, dict):
             self.runtime = {}
         if self.readiness is not None and not isinstance(self.readiness, dict):
             self.readiness = None
+
+    def engine_supports_payload(self) -> dict[str, dict[str, Any]]:
+        """`engine_supports` as cockpits read it: capability flags plus the model
+        catalog folded back into each engine's entry."""
+        payload: dict[str, dict[str, Any]] = {}
+        for engine in {*self.engine_supports, *self.engine_models, *self.engine_default_model}:
+            payload[engine] = {
+                **self.engine_supports.get(engine, {}),
+                "models": [dict(row) for row in self.engine_models.get(engine, [])],
+                "default_model": self.engine_default_model.get(engine, ""),
+            }
+        return payload
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> WorkerProfile:
@@ -395,7 +416,7 @@ class WorkerProfile:
             "agent": self.agent,
             "default_engine": self.default_engine,
             "supported_engines": self.supported_engines,
-            "engine_supports": self.engine_supports,
+            "engine_supports": self.engine_supports_payload(),
             "system": self.system,
             "runtime": self.runtime,
             "git_identity": _public_value(self.git_identity),

@@ -5490,3 +5490,193 @@ def test_worker_app_client_max_size_fits_attachment_budget(tmp_path) -> None:
     cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
     app = make_app(cfg)
     assert app._client_max_size == max(1024 * 1024, cfg.max_request_bytes)  # noqa: SLF001
+
+
+# --- mid-session model switching -------------------------------------------
+
+
+def test_model_catalog_parsing_and_defaults() -> None:
+    from jarvis.worker.model_catalog import default_model, engine_models, parse_model_spec
+
+    assert parse_model_spec("gpt-5.6-codex:GPT-5.6 Codex, gpt-5.5") == [
+        {"id": "gpt-5.6-codex", "label": "GPT-5.6 Codex"},
+        {"id": "gpt-5.5", "label": "gpt-5.5"},
+    ]
+    # Blanks and duplicates cannot produce a broken picker.
+    assert parse_model_spec(" , a:A , a:Again , ") == [{"id": "a", "label": "A"}]
+    assert parse_model_spec("") == []
+
+    configured = WorkerConfig(_env_file=None, codex_models="m-one:One,m-two:Two")
+    assert engine_models(configured, "codex") == [
+        {"id": "m-one", "label": "One"},
+        {"id": "m-two", "label": "Two"},
+    ]
+    # First entry is the engine's default.
+    assert default_model(configured, "codex") == "m-one"
+    # Empty config falls back to the built-ins, not to nothing.
+    builtin = WorkerConfig(_env_file=None)
+    assert default_model(builtin, "claude") == "claude-opus-4-8"
+    assert engine_models(builtin, "nonesuch") == []
+
+
+def test_validate_model_accepts_empty_and_names_allowed_ids() -> None:
+    from jarvis.worker_session_contract import validate_model
+
+    models = [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}]
+    # Empty means "keep the current model".
+    assert validate_model("", models, "codex") == ""
+    assert validate_model("  b  ", models, "codex") == "b"
+    # A worker predating the catalog publishes nothing; trust the caller.
+    assert validate_model("anything", [], "codex") == "anything"
+    with pytest.raises(ValueError, match="unknown model 'c'.*allowed: a, b"):
+        validate_model("c", models, "codex")
+
+
+def test_daemon_health_publishes_model_catalog(tmp_path) -> None:  # noqa: ANN001
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="",
+        workspace=str(tmp_path / "worker"),
+        agent="codex",
+        supported_engines="codex,claude",
+        codex_models="gpt-x:GPT X,gpt-y:GPT Y",
+    )
+
+    async def calls(base, c):  # noqa: ANN001
+        return (await c.get(base + "/health")).json()
+
+    health = asyncio.run(_with_server(cfg, 8843, calls))
+
+    codex = health["engine_supports"]["codex"]
+    assert codex["models"] == [{"id": "gpt-x", "label": "GPT X"}, {"id": "gpt-y", "label": "GPT Y"}]
+    assert codex["default_model"] == "gpt-x"
+    # Unconfigured engines still publish a catalog from the built-ins.
+    assert health["engine_supports"]["claude"]["default_model"] == "claude-opus-4-8"
+    assert {"id": "claude-opus-4-8", "label": "Opus 4.8"} in health["engine_supports"]["claude"]["models"]
+    # The capability flags survive alongside the catalog.
+    assert codex["approval_requests"] is True
+
+
+def test_session_turn_rejects_unknown_model_and_stores_a_known_one(tmp_path) -> None:  # noqa: ANN001
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="tkn",
+        workspace=str(tmp_path / "worker"),
+        agent="codex",
+        supported_engines="codex",
+        codex_models="gpt-x:GPT X,gpt-y:GPT Y",
+    )
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, client):  # noqa: ANN001
+        created = (
+            await client.post(
+                base + "/sessions",
+                json={
+                    "provider": "codex",
+                    "engine": "codex",
+                    "cwd": _owned_worker_cwd(tmp_path, "model-switch"),
+                    "metadata": {**_authority_metadata("codex", [WORKER_SESSION_TURN]), "model": "gpt-x"},
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        rejected = await client.post(
+            f"{base}/sessions/{session_id}/turns",
+            json={
+                "turn_id": "turn_bad_model",
+                "prompt": "switch me",
+                "model": "gpt-nope",
+                "metadata": _control_metadata(WORKER_SESSION_TURN),
+            },
+            headers=headers,
+        )
+        after = (await client.get(f"{base}/sessions/{session_id}", headers=headers)).json()
+        session = after.get("session", after)
+        return rejected.status_code, rejected.json(), session["metadata"]["model"]
+
+    status, body, model = asyncio.run(_with_server(cfg, 8844, calls))
+
+    assert status == 400
+    assert body["code"] == "validation_failed"
+    assert "gpt-x, gpt-y" in body["error"]
+    # Rejection happens before the turn is reserved, so nothing changed.
+    assert model == "gpt-x"
+
+
+def test_claude_runtime_applies_model_change_from_session_metadata(tmp_path) -> None:  # noqa: ANN001
+    """The live SDK client is switched in place rather than torn down."""
+    from jarvis.worker.providers.claude import _ClaudeSessionRuntime
+    from jarvis.worker.sessions import SessionManager
+
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create({"provider": "claude", "engine": "claude", "metadata": {"model": "opus"}})
+
+    runtime = object.__new__(_ClaudeSessionRuntime)
+    runtime.session_id = session.session_id
+    runtime.sessions = sessions
+    runtime.model = "opus"
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.models: list[str] = []
+
+        async def set_model(self, model: str) -> None:
+            self.models.append(model)
+
+    client = FakeClient()
+    # Unchanged metadata must not churn the client.
+    asyncio.run(runtime._apply_model_change(client))  # noqa: SLF001
+    assert client.models == []
+
+    sessions.update_metadata(session.session_id, {"model": "sonnet"})
+    asyncio.run(runtime._apply_model_change(client))  # noqa: SLF001
+    assert client.models == ["sonnet"]
+    assert runtime.model == "sonnet"
+
+    # Idempotent once applied.
+    asyncio.run(runtime._apply_model_change(client))  # noqa: SLF001
+    assert client.models == ["sonnet"]
+
+
+def test_codex_resume_sends_the_session_metadata_model(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """Codex re-reads the model each turn, so a metadata write is the switch."""
+    from jarvis.worker.providers import codex as codex_provider
+    from jarvis.worker.sessions import SessionManager
+
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "codex",
+            "engine": "codex",
+            "metadata": {**_authority_metadata("codex"), "model": "gpt-x"},
+        }
+    )
+    # An established thread: `create` filters metadata to its allow-list, so the
+    # provider-owned keys land the way the provider itself writes them.
+    sessions.update_metadata(session.session_id, {"codex_thread_id": "thread_existing"})
+    captured: list[dict] = []
+
+    def fake_send_request(process, rpc_id, method, params, **kwargs):  # noqa: ANN001, ARG001
+        captured.append({"method": method, "params": params})
+        return {"result": {"thread": {"id": "thread_existing", "path": "/tmp/t", "sessionId": "s"}}}
+
+    monkeypatch.setattr(codex_provider, "_send_request", fake_send_request)
+    authority = WorkerSessionAuthority.from_session(session, provider="codex")
+
+    sessions.update_metadata(session.session_id, {"model": "gpt-y"})
+    codex_provider._codex_start_or_resume_thread(  # noqa: SLF001
+        None,
+        0,
+        session_id=session.session_id,
+        session=session,
+        sessions=sessions,
+        turn=ProviderTurn(turn_id="t1", prompt="hi"),
+        authority=authority,
+        cwd=str(tmp_path),
+        line_queue=None,
+    )
+
+    assert captured[0]["method"] == "thread/resume"
+    assert captured[0]["params"]["model"] == "gpt-y"
