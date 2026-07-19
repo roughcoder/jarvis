@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -791,3 +792,175 @@ def test_thread_index_revalidates_stale_child_notification_after_deletion(tmp_pa
 
     assert index.get("jarvis", thread.thread_id) is None
     assert not index._transcript_path("jarvis", thread.thread_id).exists()
+
+
+def _watch_parent(index: CockpitThreadIndex, thread_id: str = "thread_watch_parent") -> CockpitThread:
+    return index.save(
+        CockpitThread(
+            thread_id=thread_id,
+            project_id="jarvis",
+            session_id=f"project:jarvis:orchestrator:{thread_id}",
+            title="Watch parent",
+            created_at="2026-07-19T09:00:00+00:00",
+            updated_at="2026-07-19T09:00:00+00:00",
+            created_by="neil",
+        )
+    )
+
+
+def _watch_requester() -> RequestContext:
+    return RequestContext(
+        device_id="local-mac",
+        identity="neil",
+        scope="personal",
+        capabilities=frozenset({"orchestration.runs.read"}),
+    )
+
+
+def test_register_child_watch_reopens_a_terminal_watch_instead_of_pinning_the_parent(tmp_path) -> None:
+    # watch_id is derived from the child ids, so re-watching the same children
+    # after a finished run must not leave an unclaimable pending marker behind.
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    parent = _watch_parent(index)
+    requester = _watch_requester()
+
+    watch_id = index.register_child_watch(parent, ["run_a", "run_b"], requester=requester)
+    assert index.claim_ready_child_watch(parent.thread_id, {"run_a", "run_b"}) is not None
+    index.finish_child_watch(parent.thread_id, watch_id)
+    completed = index.get(parent.project_id, parent.thread_id)
+    assert completed is not None
+    assert "pending_child_watch_ids" not in completed.workspace
+
+    reopened_id = index.register_child_watch(
+        completed,
+        ["run_a", "run_b"],
+        requester=requester,
+        continuation_instruction="Re-check both reviewers.",
+    )
+    assert reopened_id == watch_id
+    pending = index.get(parent.project_id, parent.thread_id)
+    assert pending is not None
+    assert pending.workspace["pending_child_watch_ids"] == [watch_id]
+
+    # The marker is only safe to set because the watch is claimable again.
+    reclaimed = index.claim_ready_child_watch(parent.thread_id, {"run_a", "run_b"})
+    assert reclaimed is not None
+    assert reclaimed["continuation_instruction"] == "Re-check both reviewers."
+    assert "completed_at" not in reclaimed
+    index.finish_child_watch(parent.thread_id, watch_id)
+    cleared = index.get(parent.project_id, parent.thread_id)
+    assert cleared is not None
+    assert "pending_child_watch_ids" not in cleared.workspace
+
+
+def test_append_turn_keeps_store_owned_pending_watch_ids_over_a_stale_caller_snapshot(tmp_path) -> None:
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    parent = _watch_parent(index)
+    requester = _watch_requester()
+
+    first = index.register_child_watch(parent, ["run_a"], requester=requester)
+    stale = index.get(parent.project_id, parent.thread_id)
+    assert stale is not None
+    assert stale.workspace["pending_child_watch_ids"] == [first]
+
+    # A parent continuation registers a second watch while the caller still
+    # holds the one-watch snapshot.
+    second = index.register_child_watch(parent, ["run_b"], requester=requester)
+    appended = index.append_turn(
+        stale,
+        user_peer_id="neil",
+        user_text="Keep going",
+        assistant_peer_id="jarvis",
+        assistant_text="Watching both.",
+    )
+    assert appended.workspace["pending_child_watch_ids"] == sorted({first, second})
+
+    # ...and a snapshot from before finish_child_watch must not resurrect it.
+    index.finish_child_watch(parent.thread_id, first)
+    index.finish_child_watch(parent.thread_id, second)
+    resurrecting = index.append_turn(
+        stale,
+        user_peer_id="neil",
+        user_text="Anything else?",
+        assistant_peer_id="jarvis",
+        assistant_text="All done.",
+    )
+    assert "pending_child_watch_ids" not in resurrecting.workspace
+
+
+def test_append_turn_still_lets_callers_write_non_store_owned_workspace_keys(tmp_path) -> None:
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    parent = _watch_parent(index, "thread_workspace_merge")
+    index.save(replace(parent, workspace={"worker_id": "macbook-worker", "status": "ready"}))
+    caller = index.get(parent.project_id, parent.thread_id)
+    assert caller is not None
+
+    appended = index.append_turn(
+        replace(caller, workspace={**caller.workspace, "status": "provisioning"}),
+        user_peer_id="neil",
+        user_text="Provision",
+        assistant_peer_id="jarvis",
+        assistant_text="On it.",
+    )
+    assert appended.workspace["worker_id"] == "macbook-worker"
+    assert appended.workspace["status"] == "provisioning"
+
+
+def test_pending_watch_marker_alone_is_not_a_conversation_workspace(tmp_path) -> None:
+    # The marker must not read as a materialized checkout: the orchestrator
+    # prompt would otherwise drop its planning-only guardrail and claim file
+    # access it does not have.
+    from jarvis.connectors.cockpit import _project_context, is_conversation_workspace
+
+    assert is_conversation_workspace({}) is False
+    assert is_conversation_workspace({"pending_child_watch_ids": ["abc"]}) is False
+    assert is_conversation_workspace({"worker_id": "macbook-worker"}) is True
+
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    parent = _watch_parent(index, "thread_prompt_guardrail")
+    index.register_child_watch(parent, ["run_a"], requester=_watch_requester())
+    watching = index.get(parent.project_id, parent.thread_id)
+    assert watching is not None
+
+    project = ProjectEntry(id="jarvis", name="Jarvis", owner="neil", members=("neil",), visibility="private")
+    prompt = _project_context(FakeMemory(), project, watching)
+    assert "Conversation workspace: planning-only" in prompt
+
+
+def test_project_thread_turn_survives_a_pending_child_watch_marker(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    # A bare pending-watch marker is store bookkeeping, not a conversation
+    # workspace: the next follow-up must keep using the normal project path
+    # rather than demanding a worker session.
+    class StubSession:
+        def __init__(self) -> None:
+            self.pending_cold_tasks: tuple[Any, ...] = ()
+
+        async def respond_text(self, _text, _trace, result, *, attachments=None, on_text=None):  # noqa: ANN001
+            result.raw = "Still here."
+            return result.raw
+
+        def finalize(self, _text, result, _trace) -> None:  # noqa: ANN001
+            result.reply = result.raw
+
+    async def verify() -> None:
+        cfg = _cfg(tmp_path, monkeypatch)
+        connector = CockpitConnector(cfg, memory=FakeMemory(), gateway=object(), tts=None, tracer=None)
+        project = ProjectEntry(id="jarvis", name="Jarvis", owner="neil", members=("neil",), visibility="private")
+        requester = RequestContext("dev", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+        thread = await connector.open_thread(project, requester, title="Planning")
+        assert thread.chat_type != "orchestrator"
+        connector._index.register_child_watch(thread, ["run_a"], requester=requester)
+        monkeypatch.setattr(connector, "_make_session", lambda *_args, **_kwargs: StubSession())
+
+        stored = connector._index.get(project.id, thread.thread_id)
+        assert stored is not None
+        assert stored.workspace["pending_child_watch_ids"]
+
+        reply, updated, _events = await connector.turn(project, stored, requester, "Any news?")
+
+        assert reply == "Still here."
+        assert updated.workspace["pending_child_watch_ids"] == stored.workspace["pending_child_watch_ids"]
+
+    import asyncio
+
+    asyncio.run(verify())

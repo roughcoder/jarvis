@@ -42,6 +42,7 @@ from jarvis.connectors.cockpit import (
     CockpitThreadIndex,
     THREAD_INDEX_FILENAME,
     execute_orchestrator_tool,
+    is_conversation_workspace,
     make_child_terminal_notifier,
     schedule_cold_task_drain,
     workspace_public,
@@ -4012,7 +4013,7 @@ def _thread_projection(
         "archived_by": thread.archived_by,
         "archive_reason": thread.archive_reason,
     }
-    if thread.workspace:
+    if is_conversation_workspace(thread.workspace):
         data["workspace"] = workspace_public(thread.workspace)
     if include_messages:
         data["messages"] = [dict(message) for message in thread.messages]
