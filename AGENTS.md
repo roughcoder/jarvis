@@ -114,6 +114,7 @@ Secrets to put in `.env` (gitignored): `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
 | `jarvis status` | is the brain reachable + what is this device allowed to do? (§3) |
 | `jarvis google-setup` | one-time OAuth for the current house email/calendar adapter (gogcli) |
 | `jarvis jobs [-n N] [--prune]` | list worker jobs (name, status, branch, `codex resume`); `--prune` cleans finished |
+| `jarvis conversations [--prune] [-v]` | conversation retention: report (default) or apply what the TTL policy collects |
 | `jarvis remote-setup` | one-time: create the cloud agent + environment for the (dormant) remote lane |
 | `jarvis mcp` | probe configured MCP servers: discover their tools + the capability each needs |
 | `jarvis mcp login [--server N] [--user U]` | one-time interactive OAuth for http MCP servers (browser); tokens cached per user |

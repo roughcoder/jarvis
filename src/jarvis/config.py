@@ -891,6 +891,14 @@ class OrchestrationConfig(_Base):
     sse_forced_refresh_ticks: int = 30
     turn_attachment_max_count: int = 4
     turn_attachment_max_bytes: int = 5 * 1024 * 1024
+    # Conversation retention. The store keeps thread records, JSONL transcripts,
+    # and child run directories forever unless something collects them; these
+    # knobs are that something. Per-class TTL of 0 disables that class outright.
+    retention_enabled: bool = True
+    retention_interval_s: float = 6 * 60 * 60  # 0 = startup sweep only
+    retention_archived_ttl_days: float = 14.0
+    retention_chat_ttl_days: float = 7.0
+    retention_tree_ttl_days: float = 7.0
 
 
 class LinearConfig(_Base):
@@ -1183,6 +1191,11 @@ class Config:
             "orchestration.sse_sync_backoff_ticks": self.orchestration.sse_sync_backoff_ticks,
             "orchestration.sse_notify_min_interval_s": self.orchestration.sse_notify_min_interval_s,
             "orchestration.sse_forced_refresh_ticks": self.orchestration.sse_forced_refresh_ticks,
+            "orchestration.retention_enabled": self.orchestration.retention_enabled,
+            "orchestration.retention_interval_s": self.orchestration.retention_interval_s,
+            "orchestration.retention_archived_ttl_days": self.orchestration.retention_archived_ttl_days,
+            "orchestration.retention_chat_ttl_days": self.orchestration.retention_chat_ttl_days,
+            "orchestration.retention_tree_ttl_days": self.orchestration.retention_tree_ttl_days,
             "linear.api_key": mask(self.linear.api_key),
         }
 

@@ -125,6 +125,14 @@ from jarvis.orchestration.oauth import (
     oauth_metadata,
     required_scopes,
 )
+from jarvis.orchestration.retention import (
+    RetentionPlan,
+    RetentionPolicy,
+    RetentionResult,
+    directory_bytes,
+    execute_plan,
+    plan_retention,
+)
 from jarvis.orchestration.service import (
     MissingAuthorityError,
     MissingWorkRepoError,
@@ -641,6 +649,7 @@ class SseSnapshotHub:
 
 
 SSE_SNAPSHOT_HUB_KEY = web.AppKey("sse_snapshot_hub", SseSnapshotHub)
+RETENTION_CTX_KEY = web.AppKey("retention_ctx", CockpitAppContext)
 
 
 def _queue_latest(queue: asyncio.Queue[dict[str, Any] | None], item: dict[str, Any] | None) -> None:
@@ -657,6 +666,120 @@ async def _sse_snapshot_hub_context(app: web.Application):  # noqa: ANN202
         yield
     finally:
         await hub.stop()
+
+
+def cockpit_context(
+    cfg: Config,
+    *,
+    http_get: HttpGet | None = None,
+    http_post: HttpPost | None = None,
+    http_delete: HttpDelete | None = None,
+    source_factory: Callable[[str, Any], WorkSource] | None = None,
+    oauth_validator: OAuthTokenValidator | None = None,
+) -> CockpitAppContext:
+    """The cockpit tier's shared state. `make_app` and the CLI both build one."""
+
+    return CockpitAppContext(
+        cfg=cfg,
+        get=http_get or worker_http_get,
+        post=http_post or httpx.post,
+        delete=http_delete or httpx.delete,
+        store=OrchestrationStore(
+            cfg.orchestration.workspace,
+            thread_child_terminal_notifier=_make_thread_child_terminal_notifier(cfg),
+            thread_children_promoter=_make_thread_children_promoter(cfg),
+        ),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=source_factory or _work_source,
+        oauth_validator=oauth_validator,
+    )
+
+
+def retention_requester(cfg: Config) -> RequestContext:
+    """The actor retention deletes as, so activity rows attribute the sweep."""
+
+    return RequestContext(
+        device_id=cfg.capabilities.device_id,
+        identity="retention",
+        scope="personal",
+        capabilities=frozenset(resolve_capabilities(cfg.capabilities)),
+        channel="retention",
+        peer="retention",
+    )
+
+
+def build_retention_plan(ctx: CockpitAppContext, policy: RetentionPolicy) -> RetentionPlan:
+    """Snapshot the store and decide what is collectable. No side effects."""
+
+    connector = _cockpit_connector(ctx)
+    index = connector.index
+    return plan_retention(
+        threads=index.list_all(),
+        runs=ctx.store.list_runs(),
+        policy=policy,
+        # A turn in flight lives only in this process's memory; it is the one
+        # protection the on-disk record cannot express.
+        live_keys=frozenset(
+            key if isinstance(key, tuple) and len(key) == 2 else ("", "")
+            for key in ctx.thread_turn_states
+        ),
+        thread_bytes=index.transcript_bytes,
+        run_bytes=lambda run_id: directory_bytes(ctx.store.run_dir(run_id)),
+    )
+
+
+async def run_retention_sweep(ctx: CockpitAppContext, policy: RetentionPolicy) -> RetentionResult:
+    """One retention pass. Best-effort: never raises into the caller's loop."""
+
+    requester = retention_requester(ctx.cfg)
+
+    async def delete_thread(project_id: str, thread_id: str) -> dict[str, Any]:
+        return await _delete_project_thread_packet(ctx, project_id, thread_id, requester)
+
+    async def delete_run(run_id: str) -> dict[str, Any]:
+        return await asyncio.to_thread(_delete_run_packet, ctx, run_id)
+
+    plan = await asyncio.to_thread(build_retention_plan, ctx, policy)
+    result = await execute_plan(plan, delete_thread=delete_thread, delete_run=delete_run)
+    logger.info("%s", result.summary_line())
+    for failure in result.failures:
+        logger.warning("conversation retention could not collect %s", failure)
+    return result
+
+
+async def _retention_context(app: web.Application):  # noqa: ANN202
+    ctx = app[RETENTION_CTX_KEY]
+    policy = RetentionPolicy.from_config(ctx.cfg.orchestration)
+    # Mirrors the worker's worktree GC refusal: with every class disabled there
+    # is nothing an automatic sweep could legally collect, so don't run a timer.
+    if not policy.enabled or not policy.any_class_enabled:
+        yield
+        return
+
+    async def loop() -> None:
+        # Startup sweep first — an API that has been down for a week comes back
+        # with a backlog of dead conversations, and that's the moment to shed them.
+        while True:
+            try:
+                await run_retention_sweep(ctx, policy)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - retention must never take the API down
+                logger.warning("conversation retention sweep failed: %s", exc)
+            interval = max(0.0, float(policy.interval_s))
+            if interval <= 0:
+                return
+            await asyncio.sleep(interval)
+
+    task = asyncio.create_task(loop(), name="cockpit-conversation-retention")
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 def make_app(
@@ -683,20 +806,12 @@ def make_app(
         if auth_mode(str(orchestration.auth_mode)) in {"oauth", "hybrid"} and oauth_is_configured(orchestration)
         else None
     )
-    ctx = CockpitAppContext(
-        cfg=cfg,
-        get=http_get or worker_http_get,
-        post=http_post or httpx.post,
-        delete=http_delete or httpx.delete,
-        store=OrchestrationStore(
-            cfg.orchestration.workspace,
-            thread_child_terminal_notifier=_make_thread_child_terminal_notifier(cfg),
-            thread_children_promoter=_make_thread_children_promoter(cfg),
-        ),
-        idempotency=IdempotencyStore(cfg.orchestration.workspace),
-        idempotency_locks={},
-        idempotency_lock_refs={},
-        source_factory=source_factory or _work_source,
+    ctx = cockpit_context(
+        cfg,
+        http_get=http_get,
+        http_post=http_post,
+        http_delete=http_delete,
+        source_factory=source_factory,
         oauth_validator=validator,
     )
     _rebuild_session_ref_index_from_store(ctx.store)
@@ -713,6 +828,8 @@ def make_app(
     hub = SseSnapshotHub(ctx)
     app[SSE_SNAPSHOT_HUB_KEY] = hub
     app.cleanup_ctx.append(_sse_snapshot_hub_context)
+    app[RETENTION_CTX_KEY] = ctx
+    app.cleanup_ctx.append(_retention_context)
 
     async def worker_notify(request: web.Request) -> web.Response:
         try:
@@ -2294,53 +2411,7 @@ class CockpitWriteHandlers:
         fingerprint_body = {**body, "project_id": project.id, "thread_id": thread_id}
 
         async def produce() -> dict[str, Any]:
-            connector = _cockpit_connector(self.ctx)
-            existing = await asyncio.to_thread(connector.index.get, project.id, thread_id)
-            memory_deleted = False
-            notes: list[str] = []
-            if existing is not None:
-                try:
-                    await asyncio.to_thread(MemoryClient(self.ctx.cfg.memory).delete_session, existing.session_id)
-                    memory_deleted = True
-                except UnsupportedMemoryOperation as exc:
-                    notes.append(str(exc))
-                except httpx.HTTPStatusError as exc:
-                    if exc.response.status_code == 404:
-                        notes.append("memory session already absent")
-                    else:
-                        raise CockpitError("memory_unavailable", public_error_message(str(exc)), recoverable=True, status=503) from exc
-                except Exception as exc:
-                    raise CockpitError("memory_unavailable", public_error_message(str(exc)), recoverable=True, status=503) from exc
-            thread, deleted = await asyncio.to_thread(connector.delete_thread, project, thread_id)
-            if thread is None:
-                raise CockpitError("not_found", "thread not found", status=404)
-            if deleted:
-                # R3: removing a node reparents its children up — promote child
-                # runs and threads to root, same as archive; never orphan them.
-                await asyncio.to_thread(self.ctx.store.promote_children, thread_id)
-                await _record_project_activity(
-                    self.ctx,
-                    project.id,
-                    "thread.deleted",
-                    requester,
-                    f"Deleted project thread {thread_id}",
-                    {"project_id": project.id, "thread_id": thread_id},
-                )
-            summary = _reclamation_summary(
-                records=1 if deleted else 0,
-                events=len(thread.messages) if deleted else 0,
-                memory_sessions=1 if memory_deleted else 0,
-                notes=notes,
-            )
-            return {
-                "ok": True,
-                "api_version": API_VERSION,
-                "schema_version": SCHEMA_VERSION,
-                "deleted": deleted,
-                "project_id": project.id,
-                "thread_id": thread_id,
-                "reclamation": summary,
-            }
+            return await _delete_project_thread_packet(self.ctx, project.id, thread_id, requester)
 
         response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), fingerprint_body, produce, requester=requester)
         return web.json_response(response_body)
@@ -3548,6 +3619,68 @@ def _delete_session_packet(ctx: CockpitAppContext, ref: SessionRef) -> dict[str,
         "events": [],
         "requests": [],
         "artifacts": [],
+        "reclamation": summary,
+    }
+
+
+async def _delete_project_thread_packet(
+    ctx: CockpitAppContext,
+    project_id: str,
+    thread_id: str,
+    requester: RequestContext,
+) -> dict[str, Any]:
+    """The one conversation-delete path: HTTP route and retention both call this.
+
+    Keeping it single means the record, its memory session, its transcript, and
+    its child reparenting can never drift apart between an operator delete and
+    an automatic sweep.
+    """
+
+    connector = _cockpit_connector(ctx)
+    existing = await asyncio.to_thread(connector.index.get, project_id, thread_id)
+    memory_deleted = False
+    notes: list[str] = []
+    if existing is not None:
+        try:
+            await asyncio.to_thread(MemoryClient(ctx.cfg.memory).delete_session, existing.session_id)
+            memory_deleted = True
+        except UnsupportedMemoryOperation as exc:
+            notes.append(str(exc))
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                notes.append("memory session already absent")
+            else:
+                raise CockpitError("memory_unavailable", public_error_message(str(exc)), recoverable=True, status=503) from exc
+        except Exception as exc:
+            raise CockpitError("memory_unavailable", public_error_message(str(exc)), recoverable=True, status=503) from exc
+    thread, deleted = await asyncio.to_thread(connector.delete_thread, project_id, thread_id)
+    if thread is None:
+        raise CockpitError("not_found", "thread not found", status=404)
+    if deleted:
+        # R3: removing a node reparents its children up — promote child
+        # runs and threads to root, same as archive; never orphan them.
+        await asyncio.to_thread(ctx.store.promote_children, thread_id)
+        await _record_project_activity(
+            ctx,
+            project_id,
+            "thread.deleted",
+            requester,
+            f"Deleted project thread {thread_id}",
+            {"project_id": project_id, "thread_id": thread_id},
+        )
+    summary = _reclamation_summary(
+        records=1 if deleted else 0,
+        events=len(thread.messages) if deleted else 0,
+        memory_sessions=1 if memory_deleted else 0,
+        notes=notes,
+    )
+    return {
+        "ok": True,
+        "api_version": API_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "deleted": deleted,
+        "project_id": project_id,
+        "thread_id": thread_id,
         "reclamation": summary,
     }
 
