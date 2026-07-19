@@ -13,6 +13,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from jarvis.config import env_flag_enabled
 from jarvis.deploy import ROLES, dotenv_quote
 from jarvis.users import parse_front_matter, read_facts, remember_fact
 
@@ -403,7 +404,7 @@ def _digits(value: str) -> str:
 
 
 def _bool(value: str) -> bool:
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    return env_flag_enabled(value)
 
 
 def _as_list(value: object) -> list[str]:

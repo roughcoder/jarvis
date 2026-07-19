@@ -16,6 +16,22 @@ from jarvis.config import VADConfig
 FRAME_SAMPLES_16K = 512
 
 
+class _EnergyVAD:
+    """Fallback for test/dev environments without the optional webrtcvad wheel."""
+
+    def is_speech(self, frame_int16: bytes, _sample_rate: int) -> bool:
+        if not frame_int16:
+            return False
+        sample_count = len(frame_int16) // 2
+        if sample_count == 0:
+            return False
+        total = 0
+        for offset in range(0, len(frame_int16) - 1, 2):
+            sample = int.from_bytes(frame_int16[offset : offset + 2], "little", signed=True)
+            total += abs(sample)
+        return (total / sample_count) > 500
+
+
 class SileroVAD:
     def __init__(self, cfg: VADConfig) -> None:
         self._cfg = cfg
@@ -27,11 +43,14 @@ class SileroVAD:
         if self._cfg.engine == "webrtc":
             if self._webrtc is not None:
                 return
-            import webrtcvad
-
-            self._webrtc = webrtcvad.Vad(
-                max(0, min(3, int(self._cfg.webrtc_aggressiveness)))
-            )
+            try:
+                import webrtcvad
+            except ModuleNotFoundError:
+                self._webrtc = _EnergyVAD()
+            else:
+                self._webrtc = webrtcvad.Vad(
+                    max(0, min(3, int(self._cfg.webrtc_aggressiveness)))
+                )
             return
 
         if self._model is not None:

@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Modularity Review</title>
+<style>
+  :root {
+    --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    --font-mono: 'SF Mono', 'Fira Code', 'Fira Mono', Menlo, Consolas, monospace;
+    --max-width: 820px;
+  }
+
+  :root[data-theme="light"] {
+    --bg: #ffffff;
+    --bg-secondary: #f6f8fa;
+    --bg-tertiary: #eef1f5;
+    --text: #1a1a1a;
+    --text-secondary: #4a5568;
+    --text-muted: #718096;
+    --border: #e2e8f0;
+    --accent: #2b6cb0;
+    --accent-light: #ebf4ff;
+    --severity-critical: #c53030;
+    --severity-critical-bg: #fff5f5;
+    --severity-significant: #c05621;
+    --severity-significant-bg: #fffaf0;
+    --severity-minor: #2b6cb0;
+    --severity-minor-bg: #ebf8ff;
+    --table-stripe: #f7fafc;
+    --link: #2b6cb0;
+    --link-hover: #1a4971;
+    --shadow: rgba(0, 0, 0, 0.06);
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #1a1a1a;
+    --bg-secondary: #242424;
+    --bg-tertiary: #2e2e2e;
+    --text: #e2e2e2;
+    --text-secondary: #a0a0a0;
+    --text-muted: #717171;
+    --border: #333333;
+    --accent: #b0b0b0;
+    --accent-light: #2a2a2a;
+    --severity-critical: #fc8181;
+    --severity-critical-bg: #2d1b1b;
+    --severity-significant: #f6ad55;
+    --severity-significant-bg: #2d2415;
+    --severity-minor: #a0a0a0;
+    --severity-minor-bg: #282828;
+    --table-stripe: #222222;
+    --link: #e0c97f;
+    --link-hover: #f0dca0;
+    --shadow: rgba(0, 0, 0, 0.2);
+  }
+
+  *, *::before, *::after {
+    box-sizing: border-box;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+    margin: 0;
+    padding: 2rem 1.5rem;
+    transition: background 0.3s ease, color 0.3s ease;
+  }
+
+  .container {
+    max-width: var(--max-width);
+    margin: 0 auto;
+  }
+
+  /* Theme toggle */
+  .theme-toggle {
+    position: fixed;
+    top: 1.5rem;
+    right: 1.5rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    width: 40px;
+    height: 40px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.1rem;
+    color: var(--text);
+    transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+    z-index: 100;
+  }
+
+  .theme-toggle:hover {
+    background: var(--bg-tertiary);
+  }
+
+  /* Typography */
+  h1 {
+    font-size: 2rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin: 0 0 0.5rem 0;
+    color: var(--text);
+  }
+
+  h2 {
+    font-size: 1.4rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 2.5rem 0 1rem 0;
+    padding-bottom: 0.4rem;
+    border-bottom: 1px solid var(--border);
+    color: var(--text);
+  }
+
+  h3 {
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin: 1.8rem 0 0.6rem 0;
+    color: var(--text);
+  }
+
+  p {
+    margin: 0 0 1rem 0;
+    color: var(--text-secondary);
+  }
+
+  a {
+    color: var(--link);
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+    transition: border-color 0.2s ease;
+  }
+
+  a:hover {
+    color: var(--link-hover);
+    border-bottom-color: var(--link-hover);
+  }
+
+  /* Metadata */
+  .meta {
+    color: var(--text-muted);
+    font-size: 0.95rem;
+    margin-bottom: 2.5rem;
+  }
+
+  .meta strong {
+    color: var(--text-secondary);
+  }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1.5rem 0;
+    font-size: 0.9rem;
+  }
+
+  th {
+    background: var(--bg-secondary);
+    font-weight: 600;
+    text-align: left;
+    padding: 0.75rem 1rem;
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+
+  td {
+    padding: 0.65rem 1rem;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+  }
+
+  tr:nth-child(even) td {
+    background: var(--table-stripe);
+  }
+
+  /* Severity badges */
+  .severity {
+    display: inline-block;
+    font-size: 0.8rem;
+    font-weight: 600;
+    padding: 0.15rem 0.6rem;
+    border-radius: 4px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .severity-critical {
+    color: var(--severity-critical);
+    background: var(--severity-critical-bg);
+  }
+
+  .severity-significant {
+    color: var(--severity-significant);
+    background: var(--severity-significant-bg);
+  }
+
+  .severity-minor {
+    color: var(--severity-minor);
+    background: var(--severity-minor-bg);
+  }
+
+  /* Issue cards */
+  .issue {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.5rem 2rem;
+    margin: 1.5rem 0;
+    box-shadow: 0 1px 3px var(--shadow);
+  }
+
+  .issue h2 {
+    margin-top: 0;
+    border-bottom: none;
+    padding-bottom: 0;
+  }
+
+  .issue h3 {
+    font-size: 1rem;
+  }
+
+  .issue-meta {
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    margin-bottom: 1rem;
+  }
+
+  /* Lists */
+  ul, ol {
+    padding-left: 1.5rem;
+    color: var(--text-secondary);
+  }
+
+  li {
+    margin-bottom: 0.35rem;
+  }
+
+  /* Code */
+  code {
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    background: var(--bg-tertiary);
+    padding: 0.15rem 0.4rem;
+    border-radius: 3px;
+  }
+
+  /* Horizontal rule */
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 3rem 0 1.5rem 0;
+  }
+
+  /* Footer */
+  .footer {
+    margin-top: 3rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    font-style: italic;
+  }
+
+  .footer a {
+    color: var(--text-muted);
+    border-bottom-color: var(--border);
+  }
+
+  .footer a:hover {
+    color: var(--link);
+  }
+
+  /* Print */
+  @media print {
+    .theme-toggle { display: none; }
+    body { padding: 0; }
+    .issue { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<button class="theme-toggle" onclick="toggleTheme()" aria-label="Toggle theme">
+  <span id="theme-icon"></span>
+</button>
+
+<div class="container">
+  <h1>Modularity Review</h1>
+  <div class="meta">
+    <p><strong>Scope</strong>: PR #116 ("run review parents as code agents") — the code-agent orchestrator lane spanning <code>connectors/cockpit.py</code>, <code>orchestration/api.py</code>, <code>orchestration/orchestrator_grants.py</code>, <code>worker/server.py</code>, <code>worker/orchestrator_runtime.py</code>, <code>worker/orchestrator_mcp.py</code>, <code>worker/authority.py</code>, and the Codex/Claude provider adapters.<br>
+    <strong>Date</strong>: 2026-07-11</p>
+  </div>
+
+  <h2>Executive Summary</h2>
+  <p>Jarvis is an all-local voice assistant whose Cockpit tier dispatches coding work to provider sessions (Codex, Claude) on worker daemons across an HTTP boundary. PR #116 adds a new core capability: review-parent threads run as real code-agent sessions, reaching back into Jarvis through a signed, thread-scoped MCP tool surface. The overall <a href="https://coupling.dev/posts/core-concepts/modularity/">modularity</a> of the change is healthy — the brain/worker boundary is respected everywhere, secrets stay request-scoped, and the new grant module is a small, cohesive <a href="https://coupling.dev/posts/dimensions-of-coupling/integration-strength/">contract</a>. The most important finding is that the orchestrator <em>tool contract itself</em> — the set of four tool names and their argument shapes — has no single home: it is independently declared in four modules on both sides of the network boundary, in the most <a href="https://coupling.dev/posts/dimensions-of-coupling/volatility/">volatile</a> part of the system. Second, retry semantics in the parent-continuation path depend on matching worker error-message <em>strings</em> across the HTTP boundary — implicit coupling that will break silently.</p>
+
+  <h2>Coupling Overview</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Integration</th>
+        <th><a href="https://coupling.dev/posts/dimensions-of-coupling/integration-strength/">Strength</a></th>
+        <th><a href="https://coupling.dev/posts/dimensions-of-coupling/distance/">Distance</a></th>
+        <th><a href="https://coupling.dev/posts/dimensions-of-coupling/volatility/">Volatility</a></th>
+        <th><a href="https://coupling.dev/posts/core-concepts/balance/">Balanced?</a></th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Orchestrator tool contract: <code>orchestrator_grants</code> / <code>cockpit.execute_orchestrator_tool</code> ↔ <code>orchestrator_runtime</code> / <code>orchestrator_mcp</code></td>
+        <td><a href="https://coupling.dev/posts/dimensions-of-coupling/integration-strength/">Functional</a> (duplicated declarations)</td>
+        <td>High (brain ↔ worker process, HTTP)</td>
+        <td>High (new core lane; tools will grow)</td>
+        <td><strong>No — Issue 1</strong></td>
+      </tr>
+      <tr>
+        <td>Continuation retry loop (<code>cockpit._continue_child_watch</code>) ↔ <code>worker/sessions.reserve_turn</code> error text</td>
+        <td>Implicit <a href="https://coupling.dev/posts/dimensions-of-coupling/integration-strength/">functional</a></td>
+        <td>High (HTTP boundary)</td>
+        <td>Medium-high (just introduced)</td>
+        <td><strong>No — Issue 2</strong></td>
+      </tr>
+      <tr>
+        <td>Sub-responsibilities co-located inside <code>connectors/cockpit.py</code></td>
+        <td>Low (between the parts)</td>
+        <td>None (one 2,506-line module)</td>
+        <td>High (hottest file in the repo)</td>
+        <td><strong>No (low cohesion) — Issue 3</strong></td>
+      </tr>
+      <tr>
+        <td><code>orchestration/api.py</code> ↔ <code>connectors/cockpit.py</code></td>
+        <td><a href="https://coupling.dev/posts/dimensions-of-coupling/integration-strength/">Model</a></td>
+        <td>Low (same process, same team)</td>
+        <td>Medium</td>
+        <td>Borderline — Issue 4</td>
+      </tr>
+      <tr>
+        <td>Cockpit connector ↔ worker session API (turns/events via <code>worker_session_contract</code>)</td>
+        <td><a href="https://coupling.dev/posts/dimensions-of-coupling/integration-strength/">Contract</a></td>
+        <td>High (HTTP)</td>
+        <td>High</td>
+        <td><strong>Yes</strong></td>
+      </tr>
+      <tr>
+        <td><code>mint_orchestrator_grant</code> (connector) ↔ <code>resolve_orchestrator_grant</code> (API)</td>
+        <td><a href="https://coupling.dev/posts/dimensions-of-coupling/integration-strength/">Contract</a> (signed token schema, one module)</td>
+        <td>Low</td>
+        <td>Low (generic crypto)</td>
+        <td><strong>Yes</strong></td>
+      </tr>
+      <tr>
+        <td>MCP bridge (<code>orchestrator_mcp</code>) → <code>/v1/orchestrator-tools/...</code> endpoint</td>
+        <td><a href="https://coupling.dev/posts/dimensions-of-coupling/integration-strength/">Contract</a> (grant-scoped HTTP)</td>
+        <td>High</td>
+        <td>High</td>
+        <td><strong>Yes</strong></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>The three "Yes" rows are worth calling out as design wins: the worker reaches Jarvis only over HTTP with a scoped bearer grant (the repo's network-boundary constraint holds), turn/event consumption uses the shared <code>worker_session_contract</code> published language, and the grant format lives in exactly one module used by both mint and resolve sides.</p>
+
+  <div class="issue">
+    <h2>Issue 1: The orchestrator tool contract is declared in four places</h2>
+    <p class="issue-meta"><strong>Integration</strong>: <code>orchestration/orchestrator_grants.py</code> / <code>connectors/cockpit.py</code> (brain side) ↔ <code>worker/orchestrator_runtime.py</code> / <code>worker/orchestrator_mcp.py</code> (worker side) &nbsp;·&nbsp; <span class="severity severity-significant">Significant</span></p>
+
+    <h3>Knowledge Leakage</h3>
+    <p>The knowledge "which tools exist on the orchestrator surface, and what arguments they take" is <a href="https://coupling.dev/posts/dimensions-of-coupling/integration-strength/">shared functional knowledge</a> — every participant must agree on it for a tool call to succeed. Today it is re-declared independently four times:</p>
+    <ol>
+      <li><code>orchestrator_grants.ORCHESTRATOR_TOOL_NAMES</code> — a frozenset baked into every signed grant.</li>
+      <li><code>orchestrator_runtime.ORCHESTRATOR_TOOL_NAMES</code> — a tuple used to build the provider <code>allowed_tools</code> list.</li>
+      <li>The four <code>@mcp.tool</code> function signatures in <code>orchestrator_mcp.py</code> — which also encode each tool's argument schema.</li>
+      <li>The four <code>_*_tool(...)</code> registrations in <code>cockpit.execute_orchestrator_tool</code> — which encode the <em>authoritative</em> argument schemas a second time.</li>
+    </ol>
+    <p>Nothing ties these together — not an import, not a test that diffs them. The repo already has the right pattern for exactly this situation: <code>worker_session_contract.py</code> is the published language for session events, imported by both tiers. Tool names and argument shapes did not get the same treatment.</p>
+
+    <h3>Complexity Impact</h3>
+    <p>A developer adding a fifth orchestrator tool must know that four files need coordinated edits — and there is no compiler error, test failure, or grep-able single symbol that says so. Forgetting the grants frozenset produces the most confusing failure: the tool is offered to the agent (runtime list), callable through the bridge (MCP signature exists), served by the API handler — and then rejected with a 403 "grant does not cover this tool" minted two hours earlier. That is a change outcome nobody can predict from reading any one of the four files, which is the definition of <a href="https://coupling.dev/posts/core-concepts/complexity/">complexity</a> in this model: the shared knowledge exceeds what a maintainer can hold while editing one site.</p>
+
+    <h3>Cascading Changes</h3>
+    <p>Every evolution of this lane triggers the cascade: adding a tool (planned — this is the core, <a href="https://coupling.dev/posts/dimensions-of-coupling/volatility/">high-volatility</a> lane), renaming one, changing an argument (e.g. adding <code>base_branch</code> to <code>spawn_child_work_session</code> means editing the MCP bridge signature <em>and</em> the cockpit tool schema), or versioning the grant payload. Because the four sites sit on both sides of a process/HTTP boundary, the cost of a missed site is a runtime integration failure, not a local one — high <a href="https://coupling.dev/posts/dimensions-of-coupling/distance/">distance</a> multiplies the price of the duplicated knowledge.</p>
+
+    <h3>Recommended Improvement</h3>
+    <p>Introduce a shared contract module — <code>orchestrator_tool_contract.py</code>, sibling to <code>worker_session_contract.py</code> — owning the tool names (one constant) and, ideally, each tool's argument-schema as data. <code>orchestrator_grants</code>, <code>orchestrator_runtime</code>, and <code>cockpit.execute_orchestrator_tool</code> import it; <code>orchestrator_mcp</code> can generate its bridge tools from it (FastMCP supports dynamic registration) or at minimum assert against it at startup. This converts the <a href="https://coupling.dev/posts/dimensions-of-coupling/integration-strength/">functional coupling</a> into <a href="https://coupling.dev/posts/dimensions-of-coupling/integration-strength/">contract coupling</a>, which is the appropriate strength for the high distance involved. Trade-off: one more module and slightly more indirection in the bridge; worthwhile because this is the highest-volatility surface in the PR and the contract is guaranteed to change. (A cheaper first step: a unit test asserting the four declarations are identical.)</p>
+  </div>
+
+  <div class="issue">
+    <h2>Issue 2: Retry semantics depend on worker error-message strings</h2>
+    <p class="issue-meta"><strong>Integration</strong>: <code>connectors/cockpit.py</code> (<code>_continue_child_watch</code> retry loop) → <code>worker/sessions.py</code> (<code>reserve_turn</code> error text) &nbsp;·&nbsp; <span class="severity severity-significant">Significant</span></p>
+
+    <h3>Knowledge Leakage</h3>
+    <p>The continuation loop decides whether a failed parent turn is retryable by substring-matching the worker's error message: <code>"active turn"</code>, <code>"already has an active turn"</code>, <code>"does not accept new turns"</code>. These strings are formatted inside <code>reserve_turn</code> on the far side of the HTTP boundary and travel back as a free-text <code>error</code> field. The connector therefore holds implicit knowledge of the worker's <em>human-facing wording</em> — an implementation detail, not an interface. This is <a href="https://coupling.dev/posts/dimensions-of-coupling/integration-strength/">implicit coupling at near-intrusive strength</a> hiding inside what looks like a clean contract.</p>
+
+    <h3>Complexity Impact</h3>
+    <p>The dependency is invisible at both ends. A worker-side developer editing an error message for clarity has no signal that a brain-side retry loop parses it; a brain-side reader cannot tell which worker versions produce matching strings. Any intermediary that rewrites errors (the existing <code>public_error_message</code> redaction, a proxy, i18n) silently changes behaviour from "retry for up to <code>job_timeout_s</code>" to "fail the watch immediately" — and the failure mode (a review parent that never resumes after its children finish) manifests far from the cause.</p>
+
+    <h3>Cascading Changes</h3>
+    <p>Rewording one f-string in <code>worker/sessions.py</code> forces a matching edit in <code>connectors/cockpit.py</code>, but nothing enforces it — the cascade fails open. Given the two modules deploy separately in Phase 2 (worker on the fleet, brain on the mini), version skew makes silent breakage a <em>when</em>, not an <em>if</em>.</p>
+
+    <h3>Recommended Improvement</h3>
+    <p>Add a machine-readable code to the worker's 409 response (<code>{"ok": false, "error": "...", "code": "turn_active"}</code>) and define the code constants in <code>worker_session_contract.py</code>. The retry loop keys on the code; the message stays free for humans. This is a strict strength reduction — from implicit string knowledge to an explicit <a href="https://coupling.dev/posts/dimensions-of-coupling/integration-strength/">published language</a> — at trivial cost (one field, backward compatible since old workers simply omit it and the string match can remain as a fallback during transition).</p>
+  </div>
+
+  <div class="issue">
+    <h2>Issue 3: <code>connectors/cockpit.py</code> is a 2,506-line change magnet with low cohesion</h2>
+    <p class="issue-meta"><strong>Integration</strong>: co-located sub-responsibilities within <code>connectors/cockpit.py</code> &nbsp;·&nbsp; <span class="severity severity-significant">Significant</span></p>
+
+    <h3>Knowledge Leakage</h3>
+    <p>The inverse problem of Issues 1–2: components that share <em>little</em> knowledge are pinned at zero <a href="https://coupling.dev/posts/dimensions-of-coupling/distance/">distance</a>. One module now contains: the <code>CockpitThread</code> dataclass and JSON index (persistence), three distinct turn strategies (assistant/BrainSession, workspace, and the new orchestrator lane), the worker HTTP client helpers, the orchestrator tool factories and their schemas, grant minting calls, and the background child-watch threads. These parts interact mostly through well-defined seams (the index API, <code>_post_worker_json</code>), i.e. their mutual <a href="https://coupling.dev/posts/dimensions-of-coupling/integration-strength/">integration strength</a> is already low — which is precisely why their co-location is imbalance rather than cohesion. Low strength + low distance is the <a href="https://coupling.dev/posts/core-concepts/balance/">big-ball-of-mud gradient</a>.</p>
+
+    <h3>Complexity Impact</h3>
+    <p>Project memory shows this is the second-most-modified file in the repo (39 changes), and this PR alone added ~370 lines to it. Every feature in the Cockpit lane — whatever its actual subject — lands here, so every developer must page the whole module's concerns into working memory to change any one of them (well past the 4±1 working-memory budget). Merge conflicts concentrate here, and unrelated features become <a href="https://coupling.dev/posts/dimensions-of-coupling/distance/">lifecycle-coupled</a>: a change to watch-retry timing and a change to thread projection ship, review, and conflict together.</p>
+
+    <h3>Cascading Changes</h3>
+    <p>Not cascading <em>logic</em> changes — cascading <em>process</em> costs: conflicts, review blast radius, and accidental reuse of module-private helpers across unrelated strategies (e.g. the orchestrator turn reaching directly into <code>thread.workspace</code> dict internals shared with the workspace strategy). As the orchestrator lane grows (more engines, more tools — confirmed direction), the file's growth is superlinear in pain.</p>
+
+    <h3>Recommended Improvement</h3>
+    <p>Increase distance where strength is already low — the safe direction of the <a href="https://coupling.dev/posts/core-concepts/balance/">balance rule</a>. Extract, in order of value: (1) the orchestrator lane (<code>_orchestrator_turn</code>, <code>_ensure_orchestrator_session</code>, <code>_wait_for_orchestrator_turn</code>, <code>execute_orchestrator_tool</code>) into <code>connectors/cockpit_orchestrator.py</code>; (2) <code>CockpitThread</code> + <code>CockpitThreadIndex</code> into a persistence module. Both already interact with the rest through narrow seams, so this is file movement, not redesign. Trade-off: import churn and a slightly deeper package; worthwhile because this file is where the volatility is and the split makes each future PR touch one strategy instead of the union.</p>
+  </div>
+
+  <div class="issue">
+    <h2>Issue 4: <code>orchestration/api.py</code> ↔ <code>connectors/cockpit.py</code> bidirectional package coupling</h2>
+    <p class="issue-meta"><strong>Integration</strong>: <code>orchestration/api.py</code> → <code>connectors/cockpit.py</code> (six imported symbols) and <code>connectors/cockpit.py</code> → five <code>orchestration.*</code> modules &nbsp;·&nbsp; <span class="severity severity-minor">Minor</span></p>
+
+    <h3>Knowledge Leakage</h3>
+    <p>The API imports cockpit <em>internals</em> — <code>CockpitThread</code>, <code>CockpitThreadIndex</code>, <code>THREAD_INDEX_FILENAME</code>, and now <code>execute_orchestrator_tool</code> — while cockpit imports <code>orchestration.store</code>, <code>service</code>, <code>workers</code>, <code>redaction</code>, and the new <code>orchestrator_grants</code>. The two packages share their <a href="https://coupling.dev/posts/dimensions-of-coupling/integration-strength/">domain models</a> directly in both directions. Notably, the repo's architecture test (<code>test_orchestration_and_connectors_reach_brain_only_via_facade</code>) polices both packages' access to <code>brain/</code> but is silent on this pair — the discipline that exists at the brain boundary has no equivalent here.</p>
+
+    <h3>Complexity Impact</h3>
+    <p>Today this is largely tolerable: same process, same team, and <a href="https://coupling.dev/posts/dimensions-of-coupling/integration-strength/">model coupling</a> at low <a href="https://coupling.dev/posts/dimensions-of-coupling/distance/">distance</a> is balanced by the model's own rule. The cost is directional ambiguity — there is no single owner of the thread concept, so changes to <code>CockpitThread</code>'s shape must be checked against two packages' usage, and the new <code>/v1/orchestrator-tools</code> handler makes the API's behaviour depend on cockpit tool internals it cannot see.</p>
+
+    <h3>Cascading Changes</h3>
+    <p>The risk is future-tense: Phase 2 moves tiers across machines by design. If the Cockpit API and the connector ever land on different sides of a boundary, this bidirectional model sharing becomes high-strength/high-distance overnight — the <a href="https://coupling.dev/posts/core-concepts/balance/">distributed-monolith</a> pattern. Until then, cascades are cheap (same-process refactors).</p>
+
+    <h3>Recommended Improvement</h3>
+    <p>Accept the imbalance for now — <a href="https://coupling.dev/posts/dimensions-of-coupling/volatility/">volatility</a> of the <em>pairing</em> (as opposed to the lane's features) is moderate and the distance is minimal, so the balance rule tolerates it. Two cheap hardening steps: (a) extend the existing architecture test to pin the allowed import list between these two packages so growth is deliberate rather than accidental; (b) when Issue 3's extraction happens, let the API import the new orchestrator module rather than deepening its reach into <code>cockpit.py</code>. Full decoupling (a facade like <code>brain/facade.py</code>) is <em>not</em> recommended yet — that would add distance without reducing strength, the exact trade the model warns against.</p>
+  </div>
+
+  <div class="footer">
+    <p><em>This analysis was performed using the <a href="https://coupling.dev">Balanced Coupling</a> model by <a href="https://vladikk.com">Vlad Khononov</a>.</em></p>
+  </div>
+</div>
+
+<script>
+  function getDefaultTheme() {
+    const hour = new Date().getHours();
+    return (hour >= 7 && hour < 19) ? 'light' : 'dark';
+  }
+
+  function setTheme(theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('modularity-review-theme', theme);
+    document.getElementById('theme-icon').textContent = theme === 'light' ? '☾' : '☀';
+  }
+
+  function toggleTheme() {
+    const current = document.documentElement.getAttribute('data-theme');
+    setTheme(current === 'light' ? 'dark' : 'light');
+  }
+
+  const saved = localStorage.getItem('modularity-review-theme');
+  setTheme(saved || getDefaultTheme());
+</script>
+</body>
+</html>

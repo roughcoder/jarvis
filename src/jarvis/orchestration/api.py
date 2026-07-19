@@ -40,6 +40,7 @@ from jarvis.connectors.cockpit import (
     CockpitConnector,
     CockpitThread,
     CockpitThreadIndex,
+    ProviderTurnError,
     THREAD_INDEX_FILENAME,
     execute_orchestrator_tool,
     make_child_terminal_notifier,
@@ -62,6 +63,7 @@ from jarvis.orchestration.cockpit import (
     CockpitError,
     IdempotencyStore,
     SessionRef,
+    WorkerReadDiagnostic,
     aggregate_checkpoints,
     aggregate_requests,
     aggregate_sessions,
@@ -146,6 +148,16 @@ CONFIG_KEY = web.AppKey("config", Config)
 logger = logging.getLogger(__name__)
 SSE_REFRESH_ERROR_LOG_INTERVAL_S = 60.0
 MCP_TOKEN_STORE_LOCK = threading.Lock()
+THREAD_QUEUE_DRAIN_LOCK = threading.Lock()
+THREAD_QUEUE_DRAINS: set[tuple[str, str]] = set()
+
+
+@dataclass(frozen=True)
+class ThreadTurnState:
+    operational_state: str
+    diagnostic_reason: str = ""
+    turn_id: str = ""
+    started_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -159,11 +171,22 @@ class CockpitAppContext:
     idempotency_lock_refs: dict[str, int]
     source_factory: Callable[[str, Any], WorkSource]
     oauth_validator: OAuthTokenValidator | None = None
-    # Live project-thread turn state, keyed (project_id, thread_id). Values are
-    # (status, ended_reason). Process-local by design: thread turns only run
-    # through this API, and a restart safely reverts rows to the durable
-    # created/completed derivation.
-    thread_turn_states: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+    # Live project-conversation operational state, keyed (project_id, thread_id).
+    # Process-local state may describe an active attempt, but it never owns or
+    # terminates the durable conversation. A restart safely returns open
+    # conversations to idle. Tuples remain accepted for v1 compatibility tests.
+    thread_turn_states: dict[
+        tuple[str, str],
+        ThreadTurnState | tuple[str, str],
+    ] = field(default_factory=dict)
+    # Legacy v1 status remains turn-terminal until the next turn starts, while
+    # the durable conversation operational state returns to idle immediately.
+    # Kept separate so compatibility state cannot make the conversation itself
+    # look terminal or degraded.
+    thread_turn_legacy_states: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+    worker_state_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
+    worker_state_cache_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
+    worker_state_refresh_modes: set[str] = field(default_factory=set, repr=False, compare=False)
     delete: HttpDelete = httpx.delete
 
     async def require_auth(self, request: web.Request) -> None:
@@ -236,8 +259,9 @@ class SseSubscription:
 class _HubWorkerSync:
     """Bound the hub's worker pulls without changing interactive call budgets."""
 
-    def __init__(self, hub: SseSnapshotHub) -> None:
+    def __init__(self, hub: SseSnapshotHub, *, respect_backoff: bool = True) -> None:
         self.hub = hub
+        self.respect_backoff = respect_backoff
         registry = WorkerRegistry(hub.ctx.cfg.worker, profiles_path=hub.ctx.cfg.orchestration.workers_path)
         self.profiles = registry.profiles(probe=False)
         self._worker_by_base_url = {
@@ -247,7 +271,10 @@ class _HubWorkerSync:
         }
 
     def should_sync(self, profile) -> bool:  # noqa: ANN001
-        return self.hub._worker_backoff_until.get(profile.worker_id, 0) <= self.hub._tick
+        return not self.respect_backoff or self.hub._worker_backoff_until.get(profile.worker_id, 0) <= self.hub._tick
+
+    def is_backed_off(self, profile) -> bool:  # noqa: ANN001
+        return self.respect_backoff and self.hub._worker_backoff_until.get(profile.worker_id, 0) > self.hub._tick
 
     def online_workers(self) -> frozenset[str]:
         return frozenset(
@@ -291,7 +318,7 @@ class SseSnapshotHub:
         self._subscribers: dict[int, SseSubscription] = {}
         self._snapshots: dict[str, dict[str, Any]] = {}
         self._snapshot_stamps: dict[str, tuple[int, frozenset[str], str]] = {}
-        self._worker_states: dict[str, dict[str, Any]] = {}
+        self._worker_states = ctx.worker_state_cache
         self._event_counts: dict[str, dict[str, int]] = {}
         self._worker_backoff_until: dict[str, int] = {}
         self._tick = 0
@@ -347,9 +374,23 @@ class SseSnapshotHub:
                 # subscriber doesn't get the idle period replayed as frames.
                 self._event_counts.pop(subscription.mode, None)
 
+    async def seed_snapshot(self, mode: str, body: dict[str, Any]) -> None:
+        """Let a REST snapshot establish the baseline for a follow-up SSE stream.
+
+        Do this only while the mode has no active subscribers. Mutating the hub
+        baseline underneath live streams would make the next refresh compare
+        against the wrong previous snapshot and could suppress deltas.
+        """
+
+        async with self._lock:
+            if any(existing.mode == mode for existing in self._subscribers.values()):
+                return
+            self._snapshots[mode] = body
+            self._snapshot_stamps[mode] = self._snapshot_stamp()
+
     async def _snapshot(self, mode: str) -> dict[str, Any]:
         cached = self._snapshots.get(mode)
-        body = cached if cached is not None else await asyncio.to_thread(_cockpit_snapshot, self.ctx, mode)
+        body = cached if cached is not None else await _shared_snapshot_body(self.ctx, self, mode)
         if mode not in self._event_counts:
             # Baseline per-run event counts at subscribe time so events that
             # land between now and the first refresh tick are emitted, not
@@ -406,13 +447,12 @@ class SseSnapshotHub:
                         run_snapshot = await asyncio.to_thread(self.ctx.store.list_runs)
                         dirty_worker_ids = {worker_id for worker_id, _session_id, _job_id in dirty}
                         worker_state = await asyncio.to_thread(
-                            _hub_worker_state,
+                            _refresh_worker_state,
                             self.ctx,
                             mode,
                             worker_sync,
                             run_snapshot,
                             dirty_worker_ids if mode in self._worker_states else None,
-                            self._worker_states.get(mode),
                         )
                     else:
                         sync = (
@@ -429,7 +469,7 @@ class SseSnapshotHub:
                             run_snapshot = await asyncio.to_thread(self.ctx.store.list_runs)
                         worker_state = (
                             await asyncio.to_thread(
-                                _hub_worker_state,
+                                _refresh_worker_state,
                                 self.ctx,
                                 mode,
                                 worker_sync,
@@ -438,8 +478,6 @@ class SseSnapshotHub:
                             if worker_sync is not None
                             else None
                         )
-                    if worker_state is not None:
-                        self._worker_states[mode] = worker_state
                     stamp = self._snapshot_stamp(worker_sync, worker_state)
                     force_refresh = self._tick % max(1, int(self.ctx.cfg.orchestration.sse_forced_refresh_ticks)) == 0
                     if not force_refresh and self._snapshot_stamps.get(mode) == stamp:
@@ -698,6 +736,15 @@ def make_app(
         if profile.worker_id != worker_id:
             raise CockpitError("forbidden", "worker identity does not match token", status=403)
         hub.notify(worker_id=worker_id, session_id=session_id, job_id=job_id)
+        if session_id:
+            index = CockpitThreadIndex(Path(ctx.cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
+            for thread in index._threads().values():  # noqa: SLF001 - worker notification re-arms durable queues.
+                if (
+                    str(thread.workspace.get("worker_id") or thread.worker_id or "") == worker_id
+                    and str(thread.workspace.get("session_id") or "") == session_id
+                    and thread.queued_turns
+                ):
+                    _start_thread_queue_drain(ctx, thread.project_id, thread.thread_id)
         return web.json_response({"ok": True, "accepted": True})
 
     app.add_routes([
@@ -761,6 +808,10 @@ def make_app(
         web.post("/v1/projects/{project_id}/threads", writes.project_thread_open),
         web.patch("/v1/projects/{project_id}/threads/{thread_id}", writes.project_thread_rename),
         web.post("/v1/projects/{project_id}/threads/{thread_id}/turns", writes.project_thread_turn),
+        web.post(
+            "/v1/projects/{project_id}/threads/{thread_id}/{action:input|approval|interrupt}",
+            writes.project_thread_control,
+        ),
         web.post("/v1/projects/{project_id}/threads/{thread_id}/archive", writes.project_thread_archive),
         web.post("/v1/projects/{project_id}/threads/{thread_id}/unarchive", writes.project_thread_unarchive),
         web.delete("/v1/projects/{project_id}/threads/{thread_id}", writes.project_thread_delete),
@@ -772,6 +823,7 @@ def make_app(
         web.post("/v1/sessions/{session_ref}/close", writes.session_close),
         web.post("/v1/sessions/{session_ref}/rename", writes.session_rename),
     ])
+    _rearm_thread_queues(ctx)
     return app
 
 
@@ -833,7 +885,10 @@ class CockpitReadHandlers:
     async def snapshot(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         mode = _sync_mode(request)
-        return web.json_response(await asyncio.to_thread(_cockpit_snapshot, self.ctx, mode))
+        hub = request.app[SSE_SNAPSHOT_HUB_KEY]
+        body = await _shared_snapshot_body(self.ctx, hub, mode, respect_backoff=False)
+        await hub.seed_snapshot(mode, body)
+        return web.json_response(body)
 
     async def mcp_status(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -1089,12 +1144,14 @@ class CockpitReadHandlers:
         thread = await asyncio.to_thread(connector.index.get_with_messages, project.id, request.match_info["thread_id"])
         if thread is None:
             raise CockpitError("not_found", "thread not found", status=404)
+        execution = await asyncio.to_thread(_thread_execution_projection, thread, self.ctx)
+        _start_thread_queue_drain(self.ctx, project.id, thread.thread_id)
         return web.json_response(
             {
                 "api_version": API_VERSION,
                 "schema_version": SCHEMA_VERSION,
                 "project_id": project.id,
-                "thread": _thread_detail_projection(thread, self.ctx),
+                "thread": _thread_detail_projection(thread, self.ctx, execution=execution),
             }
         )
 
@@ -1704,6 +1761,14 @@ class CockpitWriteHandlers:
         text = str(body.get("text") or body.get("message") or body.get("prompt") or "").strip()
         if not text:
             raise CockpitError("validation_failed", "turn text is required", recoverable=True, status=400)
+        idempotency_key = str(body.get("idempotency_key") or "").strip()
+        if not idempotency_key:
+            raise CockpitError(
+                "validation_failed",
+                "idempotency_key is required",
+                recoverable=True,
+                status=400,
+            )
         registry = await asyncio.to_thread(_registry_store, self.ctx.cfg)
         requester = _cockpit_requester_context(request, self.ctx.cfg)
         project = (
@@ -1719,10 +1784,116 @@ class CockpitWriteHandlers:
             raise CockpitError("not_found", "thread not found", status=404)
         if thread.archived_at:
             raise CockpitError("thread_archived", "thread is archived", recoverable=True, status=409)
+        workspace_request = dict(body["workspace"]) if isinstance(body.get("workspace"), dict) else None
+        requested_engine = str((workspace_request or {}).get("engine") or "").strip().lower()
+        if requested_engine and thread.chat_type == "orchestrator" and requested_engine not in {"codex", "claude"}:
+            raise CockpitError(
+                "validation_failed",
+                "orchestrator engine must be codex or claude",
+                recoverable=True,
+                status=400,
+            )
+        if idempotency_key:
+            try:
+                receipt = await asyncio.to_thread(
+                    connector.index.foreground_turn_receipt,
+                    project.id,
+                    thread.thread_id,
+                    text=text,
+                    idempotency_key=idempotency_key,
+                    workspace_request=workspace_request,
+                    attachments=attachments or None,
+                )
+            except ValueError as exc:
+                raise CockpitError("idempotency_conflict", str(exc), recoverable=True, status=409) from exc
+            if receipt is not None:
+                return await _write_thread_turn_receipt_response(request, self.ctx, thread, receipt)
+        execution = await asyncio.to_thread(_thread_execution_projection, thread, self.ctx)
+        if _thread_execution_is_active(execution):
+            if attachments:
+                raise CockpitError(
+                    "queue_attachments_unsupported",
+                    "attachments cannot be queued until durable attachment references are available",
+                    recoverable=True,
+                    status=409,
+                )
+            try:
+                queued_thread, queued_turn, created = await asyncio.to_thread(
+                    connector.index.enqueue_turn,
+                    project.id,
+                    thread.thread_id,
+                    requester=requester,
+                    text=text,
+                    idempotency_key=idempotency_key,
+                    workspace_request=workspace_request,
+                    attachments=attachments or None,
+                )
+            except ValueError as exc:
+                raise CockpitError("idempotency_conflict", str(exc), recoverable=True, status=409) from exc
+            except OverflowError as exc:
+                raise CockpitError("queue_full", str(exc), recoverable=True, status=409) from exc
+            response = web.StreamResponse(
+                status=200,
+                headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+            )
+            _apply_cors_headers(request, response)
+            await response.prepare(request)
+            cursor = new_id("threadturn")
+            payload = {
+                "project_id": project.id,
+                "thread_id": thread.thread_id,
+                "queue_id": str(queued_turn.get("queue_id") or ""),
+                "idempotent": not created,
+                "thread": _thread_projection(queued_thread, self.ctx, include_messages=True),
+            }
+            await _write_sse(
+                response,
+                "thread.turn.queued",
+                cursor,
+                _sse_envelope(cursor, "thread.turn.queued", payload),
+            )
+            await _write_sse(
+                response,
+                "thread.turn.done",
+                cursor,
+                _sse_envelope(cursor, "thread.turn.done", payload),
+            )
+            await response.write_eof()
+            _start_thread_queue_drain(self.ctx, project.id, thread.thread_id)
+            return response
+        foreground_receipt: dict[str, Any] | None = None
+        if idempotency_key:
+            try:
+                foreground_receipt, should_dispatch = await asyncio.to_thread(
+                    connector.index.reserve_foreground_turn,
+                    project.id,
+                    thread.thread_id,
+                    text=text,
+                    idempotency_key=idempotency_key,
+                    requester=requester,
+                    dispatch_mode=(
+                        "worker"
+                        if thread.chat_type == "orchestrator" or bool(thread.workspace) or workspace_request is not None
+                        else "brain"
+                    ),
+                    workspace_request=workspace_request,
+                    attachments=attachments or None,
+                )
+            except ValueError as exc:
+                raise CockpitError("idempotency_conflict", str(exc), recoverable=True, status=409) from exc
+            if not should_dispatch:
+                return await _write_thread_turn_receipt_response(
+                    request,
+                    self.ctx,
+                    thread,
+                    foreground_receipt,
+                )
         response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
         _apply_cors_headers(request, response)
         await response.prepare(request)
         cursor = new_id("threadturn")
+        turn_id = str((foreground_receipt or {}).get("logical_turn_id") or new_id("turn"))
+        turn_started_at = utc_now()
         await _write_sse(
             response,
             "thread.turn.started",
@@ -1730,11 +1901,19 @@ class CockpitWriteHandlers:
             _sse_envelope(
                 cursor,
                 "thread.turn.started",
-                {"project_id": project.id, "thread_id": thread.thread_id},
+                {
+                    "project_id": project.id,
+                    "thread_id": thread.thread_id,
+                    "turn_id": turn_id,
+                },
             ),
         )
         state_key = (project.id, thread.thread_id)
-        self.ctx.thread_turn_states[state_key] = ("running", "")
+        self.ctx.thread_turn_states[state_key] = ThreadTurnState(
+            operational_state="working",
+            turn_id=turn_id,
+            started_at=turn_started_at,
+        )
         cold_sessions = []
         client_gone = False
 
@@ -1775,33 +1954,124 @@ class CockpitWriteHandlers:
                 requester,
                 text,
                 attachments=attachments or None,
-                workspace_request=dict(body["workspace"]) if isinstance(body.get("workspace"), dict) else None,
+                workspace_request=workspace_request,
                 progress=progress,
                 cold_task_sink=defer_cold_tasks,
+                logical_turn_id=str((foreground_receipt or {}).get("logical_turn_id") or turn_id),
+                idempotency_key=idempotency_key,
             )
+            if idempotency_key:
+                await asyncio.to_thread(
+                    connector.index.finish_foreground_turn,
+                    project.id,
+                    thread.thread_id,
+                    idempotency_key,
+                    status="accepted" if reply == "Workspace turn is running." else "completed",
+                    reply=reply,
+                )
         except (UnsupportedMemoryOperation, TimeoutError, OSError, RuntimeError) as exc:
-            self.ctx.thread_turn_states[state_key] = ("failed", "engine_error")
-            return await _write_thread_turn_error(
-                response,
-                cursor,
-                project_id=project.id,
-                thread_id=thread.thread_id,
-                code="memory_unavailable",
-                message=public_error_message(str(exc)),
-                recoverable=True,
-            )
+            if idempotency_key:
+                await asyncio.to_thread(
+                    connector.index.fail_foreground_turn,
+                    project.id,
+                    thread.thread_id,
+                    idempotency_key,
+                )
+            if _thread_turn_error_is_active(exc) and idempotency_key:
+                await asyncio.to_thread(connector.index.release_execution_turn, project.id, thread.thread_id)
+                if attachments:
+                    return await _write_thread_turn_error(
+                        response,
+                        cursor,
+                        project_id=project.id,
+                        thread_id=thread.thread_id,
+                        code="queue_attachments_unsupported",
+                        message="attachments cannot be queued until durable attachment references are available",
+                        recoverable=True,
+                    )
+                try:
+                    queued_thread, queued_turn, created = await asyncio.to_thread(
+                        connector.index.enqueue_turn,
+                        project.id,
+                        thread.thread_id,
+                        requester=requester,
+                        text=text,
+                        idempotency_key=idempotency_key,
+                        workspace_request=workspace_request,
+                        attachments=attachments or None,
+                    )
+                except ValueError as conflict:
+                    return await _write_thread_turn_error(
+                        response,
+                        cursor,
+                        project_id=project.id,
+                        thread_id=thread.thread_id,
+                        code="idempotency_conflict",
+                        message=str(conflict),
+                        recoverable=True,
+                    )
+                payload = {
+                    "project_id": project.id,
+                    "thread_id": thread.thread_id,
+                    "queue_id": str(queued_turn.get("queue_id") or ""),
+                    "idempotent": not created,
+                    "thread": _thread_projection(queued_thread, self.ctx, include_messages=True),
+                }
+                await _write_sse(
+                    response,
+                    "thread.turn.queued",
+                    cursor,
+                    _sse_envelope(cursor, "thread.turn.queued", payload),
+                )
+                await _write_sse(
+                    response,
+                    "thread.turn.done",
+                    cursor,
+                    _sse_envelope(cursor, "thread.turn.done", payload),
+                )
+                await response.write_eof()
+                self.ctx.thread_turn_states.pop(state_key, None)
+                self.ctx.thread_turn_legacy_states.pop(state_key, None)
+                _start_thread_queue_drain(self.ctx, project.id, thread.thread_id)
+                return response
+            self.ctx.thread_turn_states[state_key] = ("degraded", "engine_error")
+            try:
+                return await _write_thread_turn_error(
+                    response,
+                    cursor,
+                    project_id=project.id,
+                    thread_id=thread.thread_id,
+                    code="engine_error" if isinstance(exc, ProviderTurnError) else "memory_unavailable",
+                    message=public_error_message(str(exc)),
+                    recoverable=True,
+                )
+            finally:
+                self.ctx.thread_turn_legacy_states[state_key] = ("failed", "engine_error")
+                self.ctx.thread_turn_states.pop(state_key, None)
         except Exception as exc:  # noqa: BLE001 - preserve SSE contract after prepare.
-            self.ctx.thread_turn_states[state_key] = ("failed", "engine_error")
-            return await _write_thread_turn_error(
-                response,
-                cursor,
-                project_id=project.id,
-                thread_id=thread.thread_id,
-                code="internal_error",
-                message=public_error_message(str(exc)),
-                recoverable=False,
-            )
+            if idempotency_key:
+                await asyncio.to_thread(
+                    connector.index.fail_foreground_turn,
+                    project.id,
+                    thread.thread_id,
+                    idempotency_key,
+                )
+            self.ctx.thread_turn_states[state_key] = ("degraded", "engine_error")
+            try:
+                return await _write_thread_turn_error(
+                    response,
+                    cursor,
+                    project_id=project.id,
+                    thread_id=thread.thread_id,
+                    code="internal_error",
+                    message=public_error_message(str(exc)),
+                    recoverable=False,
+                )
+            finally:
+                self.ctx.thread_turn_legacy_states[state_key] = ("failed", "engine_error")
+                self.ctx.thread_turn_states.pop(state_key, None)
         self.ctx.thread_turn_states.pop(state_key, None)
+        self.ctx.thread_turn_legacy_states.pop(state_key, None)
         payload = {
             "project_id": project.id,
             "thread": _thread_projection(updated, self.ctx, include_messages=True),
@@ -1819,7 +2089,107 @@ class CockpitWriteHandlers:
         finally:
             for session in cold_sessions:
                 schedule_cold_task_drain(session)
+        _start_thread_queue_drain(self.ctx, project.id, thread.thread_id)
         return response
+
+    async def project_thread_control(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        body = await _json_body(request)
+        requester = _requester_or_404(request, self.ctx.cfg)
+        project = await _project_for_member_route(self.ctx, request, requester)
+        connector = _cockpit_connector(self.ctx)
+        thread_id = request.match_info["thread_id"]
+        thread = await asyncio.to_thread(connector.index.get, project.id, thread_id)
+        if thread is None:
+            raise CockpitError("not_found", "thread not found", status=404)
+        if thread.archived_at:
+            raise CockpitError("thread_archived", "thread is archived", recoverable=True, status=409)
+        worker_id = str(thread.workspace.get("worker_id") or thread.worker_id or "")
+        session_id = str(thread.workspace.get("session_id") or "")
+        if not worker_id or not session_id:
+            raise CockpitError(
+                "execution_unavailable",
+                "thread has no attached worker execution",
+                recoverable=True,
+                status=409,
+            )
+        action = request.match_info["action"]
+        required = _required_session_action(action)
+        reference_key = "turn_id" if action == "interrupt" else "request_id"
+        reference_id = str(body.get(reference_key) or "").strip()
+        if not reference_id:
+            raise CockpitError(
+                "validation_failed",
+                f"{reference_key} is required",
+                recoverable=True,
+                status=400,
+            )
+        scope = f"projects/{project.id}/threads/{thread_id}/{action}"
+        fingerprint_body = {**body, "project_id": project.id, "thread_id": thread_id, "action": action}
+
+        async def produce() -> dict[str, Any]:
+            _require_capability(self.ctx.cfg, required)
+            control_thread = thread
+            if action == "interrupt":
+                claimed = await asyncio.to_thread(
+                    connector.claim_execution_interrupt,
+                    project,
+                    thread_id,
+                )
+                if claimed is None:
+                    raise CockpitError("not_found", "thread not found", status=404)
+                control_thread = claimed
+            control_worker_id = str(
+                control_thread.workspace.get("worker_id") or control_thread.worker_id or ""
+            )
+            control_session_id = str(control_thread.workspace.get("session_id") or "")
+            if not control_worker_id or not control_session_id:
+                raise CockpitError(
+                    "execution_unavailable",
+                    "thread has no attached worker execution",
+                    recoverable=True,
+                    status=409,
+                )
+            expected_generation = int(control_thread.workspace.get("session_generation") or 0)
+            await asyncio.to_thread(
+                _worker_post_json,
+                self.ctx.cfg,
+                control_worker_id,
+                f"/sessions/{control_session_id}/{action}",
+                _worker_control_body(body, required),
+                post=self.ctx.post,
+            )
+            control = {"action": action, "accepted": True, reference_key: reference_id}
+            execution = _thread_execution_projection(control_thread, self.ctx)
+            if action == "interrupt":
+                detached = await asyncio.to_thread(
+                    connector.detach_interrupted_execution,
+                    project,
+                    thread_id,
+                    expected_session_id=control_session_id,
+                    expected_generation=expected_generation,
+                )
+                if detached is not None:
+                    control_thread = detached
+            return {
+                "ok": True,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "project_id": project.id,
+                "thread_id": thread_id,
+                "control": control,
+                "execution": execution,
+            }
+
+        response_body = await _idempotent_write_body(
+            self.ctx,
+            scope,
+            str(body.get("idempotency_key") or ""),
+            fingerprint_body,
+            produce,
+            requester=requester,
+        )
+        return web.json_response(response_body)
 
     async def project_thread_rename(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -2438,6 +2808,75 @@ async def _write_sse(response: web.StreamResponse, event: str, cursor: str, data
 
 def _sse_envelope(cursor: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {"cursor": cursor, "occurred_at": utc_now(), "type": event_type, "payload": payload}
+
+
+async def _write_thread_turn_receipt_response(
+    request: web.Request,
+    ctx: CockpitAppContext,
+    thread: CockpitThread,
+    receipt: dict[str, Any],
+) -> web.StreamResponse:
+    status = str(receipt.get("status") or "dispatching")
+    if status in {"uncertain", "retry_required"}:
+        raise CockpitError(
+            "turn_outcome_uncertain" if status == "uncertain" else "turn_retry_required",
+            (
+                str(receipt.get("recovery_reason") or "turn outcome requires operator review")
+                + "; review the durable thread, then submit with a new idempotency_key to retry"
+            ),
+            recoverable=True,
+            status=409,
+        )
+    response = web.StreamResponse(
+        status=200,
+        headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+    )
+    _apply_cors_headers(request, response)
+    await response.prepare(request)
+    cursor = new_id("threadturn")
+    if status in {"dispatching", "accepted"}:
+        event_type = "thread.turn.in_progress" if status == "dispatching" else "thread.turn.accepted"
+        payload = {
+            "project_id": thread.project_id,
+            "thread_id": thread.thread_id,
+            "turn_id": str(receipt.get("logical_turn_id") or receipt.get("queue_id") or ""),
+            "idempotent": True,
+            "receipt_status": status,
+            "thread": _thread_projection(thread, ctx, include_messages=True),
+        }
+        await _write_sse(response, event_type, cursor, _sse_envelope(cursor, event_type, payload))
+        await response.write_eof()
+        return response
+    if receipt.get("queue_id") and status in {"queued", "claimed"}:
+        event_type = "thread.turn.queued"
+        payload = {
+            "project_id": thread.project_id,
+            "thread_id": thread.thread_id,
+            "queue_id": str(receipt.get("queue_id") or ""),
+            "idempotent": True,
+            "receipt_status": status,
+            "thread": _thread_projection(thread, ctx, include_messages=True),
+        }
+    else:
+        event_type = "thread.turn.replayed"
+        payload = {
+            "project_id": thread.project_id,
+            "thread_id": thread.thread_id,
+            "turn_id": str(receipt.get("logical_turn_id") or ""),
+            "reply": str(receipt.get("reply") or ""),
+            "idempotent": True,
+            "receipt_status": status,
+            "thread": _thread_projection(thread, ctx, include_messages=True),
+        }
+    await _write_sse(response, event_type, cursor, _sse_envelope(cursor, event_type, payload))
+    await _write_sse(
+        response,
+        "thread.turn.done",
+        cursor,
+        _sse_envelope(cursor, "thread.turn.done", payload),
+    )
+    await response.write_eof()
+    return response
 
 
 async def _write_thread_turn_error(
@@ -3342,6 +3781,38 @@ def _hub_sync_dirty(
     }
 
 
+async def _shared_snapshot_body(
+    ctx: CockpitAppContext,
+    hub: SseSnapshotHub,
+    mode: str,
+    *,
+    respect_backoff: bool = True,
+) -> dict[str, Any]:
+    if mode not in {"fast", "probe"}:
+        return await asyncio.to_thread(_cockpit_snapshot, ctx, mode)
+    worker_sync = _HubWorkerSync(hub, respect_backoff=respect_backoff)
+    sync = await asyncio.to_thread(_hub_sync_state, ctx, mode, worker_sync)
+    all_runs = await asyncio.to_thread(ctx.store.list_runs)
+    worker_state = await asyncio.to_thread(
+        _refresh_worker_state,
+        ctx,
+        mode,
+        worker_sync,
+        all_runs,
+    )
+    return await asyncio.to_thread(
+        _cockpit_snapshot,
+        ctx,
+        mode,
+        sync=sync,
+        sync_timeout_s=float(ctx.cfg.orchestration.sse_sync_timeout_s),
+        should_sync_worker=worker_sync.should_sync,
+        http_get=worker_sync.get,
+        worker_state=worker_state,
+        all_runs=all_runs,
+    )
+
+
 def _hub_worker_state(
     ctx: CockpitAppContext,
     mode: str,
@@ -3365,6 +3836,7 @@ def _hub_worker_state(
         profiles_path=ctx.cfg.orchestration.workers_path,
         http_get=worker_sync.get,
     )
+    previous = previous or {}
     profiles = registry.profiles(probe=False)
     if mode == "probe":
         profiles = [
@@ -3373,15 +3845,47 @@ def _hub_worker_state(
             else profile
             for profile in profiles
         ]
+    eligible_worker_ids = {
+        profile.worker_id
+        for profile in profiles
+        if profile.status != "offline" and worker_sync.should_sync(profile)
+    }
     workers = [
         project_worker_profile(profile, default_repo=ctx.cfg.orchestration.default_repo)
         for profile in profiles
     ]
 
-    def should_sync(profile: Any) -> bool:
-        return (worker_ids is None or profile.worker_id in worker_ids) and worker_sync.should_sync(profile)
+    current_worker_ids = {profile.worker_id for profile in profiles}
+    previous_worker_ids = _worker_state_ids(previous)
+    refresh_worker_ids = (
+        set(worker_ids)
+        if worker_ids is not None
+        else current_worker_ids | previous_worker_ids
+    )
+    attempted_worker_ids = {
+        profile.worker_id
+        for profile in profiles
+        if profile.worker_id in refresh_worker_ids and profile.worker_id in eligible_worker_ids
+    }
+    unattempted_worker_ids = (refresh_worker_ids & current_worker_ids) - attempted_worker_ids
+    backed_off_worker_ids = {
+        profile.worker_id
+        for profile in profiles
+        if profile.status != "offline"
+        and profile.worker_id in unattempted_worker_ids
+        and worker_sync.is_backed_off(profile)
+    }
+    offline_worker_ids = {
+        profile.worker_id
+        for profile in profiles
+        if profile.status == "offline" and profile.worker_id in unattempted_worker_ids
+    }
 
-    sessions = aggregate_sessions(
+    def should_sync(profile: Any) -> bool:
+        return profile.worker_id in attempted_worker_ids
+
+    session_diagnostics: list[WorkerReadDiagnostic] = []
+    current_sessions = aggregate_sessions(
         runs=runs,
         worker_cfg=ctx.cfg.worker,
         workers_path=ctx.cfg.orchestration.workers_path,
@@ -3392,16 +3896,38 @@ def _hub_worker_state(
         archived_session_refs=archived_session_refs,
         timeout_s=float(ctx.cfg.orchestration.sse_sync_timeout_s),
         should_sync_worker=should_sync,
+        diagnostics=session_diagnostics,
     )
-    requests = aggregate_requests(
+    sessions = _reconcile_session_rows(
+        previous.get("sessions") or {},
+        current_sessions,
+        refresh_worker_ids,
+        _failed_workers(session_diagnostics, "sessions") | unattempted_worker_ids,
+    )
+    sessions = {
+        ref: row
+        for ref, row in sessions.items()
+        if ref not in archived_session_refs and str(row.get("run_id") or "") not in archived_run_ids
+    }
+    request_diagnostics: list[WorkerReadDiagnostic] = []
+    current_requests = aggregate_requests(
         worker_cfg=ctx.cfg.worker,
         workers_path=ctx.cfg.orchestration.workers_path,
         http_get=worker_sync.get,
         timeout_s=float(ctx.cfg.orchestration.sse_sync_timeout_s),
         should_sync_worker=should_sync,
+        diagnostics=request_diagnostics,
+    )
+    requests = _reconcile_worker_rows(
+        previous.get("requests") or [],
+        current_requests,
+        refresh_worker_ids,
+        _failed_workers(request_diagnostics, "requests") | unattempted_worker_ids,
+        sessions=sessions,
     )
     requests = [request for request in requests if str(request.get("session_ref") or "") in sessions]
-    checkpoints = aggregate_checkpoints(
+    checkpoint_diagnostics: list[WorkerReadDiagnostic] = []
+    current_checkpoints = aggregate_checkpoints(
         runs=runs,
         sessions=sessions,
         worker_cfg=ctx.cfg.worker,
@@ -3409,16 +3935,271 @@ def _hub_worker_state(
         http_get=worker_sync.get,
         timeout_s=float(ctx.cfg.orchestration.sse_sync_timeout_s),
         should_sync_worker=should_sync,
+        diagnostics=checkpoint_diagnostics,
+    )
+    checkpoints = _reconcile_checkpoint_rows(
+        previous.get("checkpoints") or [],
+        current_checkpoints,
+        refresh_worker_ids,
+        checkpoint_diagnostics,
+        sessions,
+        unattempted_worker_ids=unattempted_worker_ids,
+    )
+    checkpoints = [
+        checkpoint
+        for checkpoint in checkpoints
+        if str(checkpoint.get("session_ref") or "") in sessions
+    ]
+    diagnostics = [*session_diagnostics, *request_diagnostics, *checkpoint_diagnostics]
+    projected_diagnostics = _reconcile_worker_diagnostics(
+        [dict(item) for item in previous.get("diagnostics") or [] if isinstance(item, dict)],
+        [_worker_read_diagnostic(item) for item in diagnostics],
+        refresh_worker_ids,
+        attempted_worker_ids,
+        current_worker_ids,
+    )
+    projected_diagnostics = [
+        item
+        for item in projected_diagnostics
+        if not str(item.get("session_id") or "")
+        or make_session_ref(
+            str(item.get("worker_id") or ""),
+            str(item.get("session_id") or ""),
+        ) not in archived_session_refs
+    ]
+    failed_worker_ids = {
+        str(item.get("worker_id") or "")
+        for item in projected_diagnostics
+        if item.get("status") == "failure"
+    }
+    projected_diagnostics.extend(
+        {
+            "worker_id": worker_id,
+            "resource": "worker_state",
+            "status": "failure",
+            "failure_kind": failure_kind,
+            "status_code": 0,
+            "error_type": "",
+            "session_id": "",
+        }
+        for failure_kind, worker_ids_for_kind in (
+            ("backoff", backed_off_worker_ids),
+            ("offline", offline_worker_ids),
+        )
+        for worker_id in sorted(worker_ids_for_kind - failed_worker_ids)
     )
     current = {
-        "workers": workers,
+        "workers": _reconcile_worker_rows(
+            previous.get("workers") or [],
+            workers,
+            refresh_worker_ids,
+            backed_off_worker_ids,
+            include_new_for_failed=True,
+        ),
         "sessions": sessions,
         "requests": requests,
         "checkpoints": checkpoints,
+        "partial": any(item.get("status") == "failure" for item in projected_diagnostics),
+        "diagnostics": projected_diagnostics,
     }
-    if worker_ids is None or previous is None:
-        return current
-    return _merge_dirty_worker_state(previous, current, worker_ids)
+    return current
+
+
+def _refresh_worker_state(
+    ctx: CockpitAppContext,
+    mode: str,
+    worker_sync: _HubWorkerSync,
+    all_runs: list[Any] | None = None,
+    worker_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Refresh the process-wide last-known worker projection used by REST and SSE.
+
+    Worker reads block for as long as an unresponsive worker takes to time out.
+    Holding `worker_state_cache_lock` across them convoyed every refresh caller
+    onto the lock and exhausted the default executor, starving *all* other
+    `to_thread` work — conversation reads included — until the API stopped
+    serving. So refreshes are single-flight per mode: a caller that finds one
+    already running reuses the last-known projection instead of queueing another
+    blocking read, and the lock is only held around the cache swap.
+    """
+    with ctx.worker_state_cache_lock:
+        if mode in ctx.worker_state_refresh_modes:
+            cached = ctx.worker_state_cache.get(mode)
+            if cached is not None:
+                return cached
+        ctx.worker_state_refresh_modes.add(mode)
+        previous = ctx.worker_state_cache.get(mode)
+    try:
+        state = _hub_worker_state(
+            ctx,
+            mode,
+            worker_sync,
+            all_runs,
+            worker_ids,
+            previous,
+        )
+    finally:
+        with ctx.worker_state_cache_lock:
+            ctx.worker_state_refresh_modes.discard(mode)
+    with ctx.worker_state_cache_lock:
+        ctx.worker_state_cache[mode] = state
+        return state
+
+
+def _failed_workers(diagnostics: list[WorkerReadDiagnostic], resource: str) -> set[str]:
+    return {
+        item.worker_id
+        for item in diagnostics
+        if item.resource == resource and item.status == "failure"
+    }
+
+
+def _worker_state_ids(state: dict[str, Any]) -> set[str]:
+    ids = {
+        str(row.get("worker_id") or "")
+        for name in ("workers", "diagnostics")
+        for row in state.get(name) or []
+        if isinstance(row, dict)
+    }
+    ids.update(
+        str(row.get("worker_id") or "")
+        for row in (state.get("sessions") or {}).values()
+        if isinstance(row, dict)
+    )
+    ids.discard("")
+    return ids
+
+
+def _reconcile_worker_diagnostics(
+    previous: list[dict[str, Any]],
+    current: list[dict[str, Any]],
+    refresh_worker_ids: set[str],
+    attempted_worker_ids: set[str],
+    current_worker_ids: set[str],
+) -> list[dict[str, Any]]:
+    preserve_worker_ids = (refresh_worker_ids & current_worker_ids) - attempted_worker_ids
+    retained = [
+        item
+        for item in previous
+        if str(item.get("worker_id") or "") not in refresh_worker_ids
+        or str(item.get("worker_id") or "") in preserve_worker_ids
+    ]
+    refreshed = [
+        item
+        for item in current
+        if str(item.get("worker_id") or "") in attempted_worker_ids
+    ]
+    return [*retained, *refreshed]
+
+
+def _reconcile_worker_rows(
+    previous: list[dict[str, Any]],
+    current: list[dict[str, Any]],
+    target_worker_ids: set[str],
+    failed_worker_ids: set[str],
+    *,
+    sessions: dict[str, dict[str, Any]] | None = None,
+    include_new_for_failed: bool = False,
+) -> list[dict[str, Any]]:
+    def worker_id(row: dict[str, Any]) -> str:
+        direct = str(row.get("worker_id") or "")
+        if direct or sessions is None:
+            return direct
+        session = sessions.get(str(row.get("session_ref") or "")) or {}
+        return str(session.get("worker_id") or "")
+
+    retained = [
+        row
+        for row in previous
+        if worker_id(row) not in target_worker_ids
+        or worker_id(row) in failed_worker_ids
+    ]
+    previous_worker_ids = {worker_id(row) for row in previous}
+    refreshed = [
+        row
+        for row in current
+        if worker_id(row) in target_worker_ids
+        and (
+            worker_id(row) not in failed_worker_ids
+            or (include_new_for_failed and worker_id(row) not in previous_worker_ids)
+        )
+    ]
+    return [*retained, *refreshed]
+
+
+def _reconcile_session_rows(
+    previous: dict[str, dict[str, Any]],
+    current: dict[str, dict[str, Any]],
+    target_worker_ids: set[str],
+    failed_worker_ids: set[str],
+) -> dict[str, dict[str, Any]]:
+    retained = {
+        ref: row
+        for ref, row in previous.items()
+        if str(row.get("worker_id") or "") not in target_worker_ids
+        or str(row.get("worker_id") or "") in failed_worker_ids
+    }
+    refreshed = {
+        ref: row
+        for ref, row in current.items()
+        if str(row.get("worker_id") or "") in target_worker_ids
+        and (
+            str(row.get("worker_id") or "") not in failed_worker_ids
+            or ref not in previous
+        )
+    }
+    return {**retained, **refreshed}
+
+
+def _reconcile_checkpoint_rows(
+    previous: list[dict[str, Any]],
+    current: list[dict[str, Any]],
+    target_worker_ids: set[str],
+    diagnostics: list[WorkerReadDiagnostic],
+    sessions: dict[str, dict[str, Any]],
+    *,
+    unattempted_worker_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    failed_workers = _failed_workers(diagnostics, "checkpoints") | (unattempted_worker_ids or set())
+    failed_sessions = {
+        (item.worker_id, item.session_id)
+        for item in diagnostics
+        if item.resource == "session_checkpoints" and item.status == "failure" and item.session_id
+    }
+
+    def failed(row: dict[str, Any]) -> bool:
+        session = sessions.get(str(row.get("session_ref") or "")) or {}
+        worker_id = str(row.get("worker_id") or session.get("worker_id") or "")
+        session_id = str(row.get("session_id") or session.get("session_id") or "")
+        return worker_id in failed_workers or (worker_id, session_id) in failed_sessions
+
+    def worker_id(row: dict[str, Any]) -> str:
+        session = sessions.get(str(row.get("session_ref") or "")) or {}
+        return str(row.get("worker_id") or session.get("worker_id") or "")
+
+    retained = [
+        row
+        for row in previous
+        if worker_id(row) not in target_worker_ids or failed(row)
+    ]
+    refreshed = [
+        row
+        for row in current
+        if worker_id(row) in target_worker_ids and not failed(row)
+    ]
+    return [*retained, *refreshed]
+
+
+def _worker_read_diagnostic(item: WorkerReadDiagnostic) -> dict[str, Any]:
+    return {
+        "worker_id": item.worker_id,
+        "resource": item.resource,
+        "status": item.status,
+        "failure_kind": item.failure_kind,
+        "status_code": item.status_code,
+        "error_type": item.error_type,
+        "session_id": item.session_id,
+    }
 
 
 def _merge_dirty_worker_state(
@@ -3975,6 +4756,66 @@ def _cockpit_connector(ctx: CockpitAppContext) -> CockpitConnector:
     return CockpitConnector(ctx.cfg)
 
 
+def _start_thread_queue_drain(ctx: CockpitAppContext, project_id: str, thread_id: str) -> None:
+    key = (project_id, thread_id)
+    index = CockpitThreadIndex(Path(ctx.cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
+    if not index.has_queued_turns(project_id, thread_id):
+        return
+    with THREAD_QUEUE_DRAIN_LOCK:
+        if key in THREAD_QUEUE_DRAINS:
+            return
+        THREAD_QUEUE_DRAINS.add(key)
+
+    def run() -> None:
+        try:
+            project = RegistryStore(ctx.cfg.registry.path).get_project(project_id)
+            if project is None:
+                return
+
+            async def drain_until_idle() -> None:
+                connector = _cockpit_connector(ctx)
+                deadline = asyncio.get_running_loop().time() + max(
+                    1.0,
+                    float(ctx.cfg.worker.job_timeout_s),
+                )
+                while index.has_queued_turns(project_id, thread_id):
+                    await connector.drain_queued_turns(project, thread_id)
+                    if not index.has_queued_turns(project_id, thread_id):
+                        return
+                    if asyncio.get_running_loop().time() >= deadline:
+                        return
+                    await asyncio.sleep(0.25)
+
+            asyncio.run(drain_until_idle())
+        except Exception:
+            logger.exception("project thread queue drain failed for %s/%s", project_id, thread_id)
+        finally:
+            with THREAD_QUEUE_DRAIN_LOCK:
+                THREAD_QUEUE_DRAINS.discard(key)
+
+    threading.Thread(
+        target=run,
+        name=f"jarvis-thread-queue-{thread_id}",
+        daemon=True,
+    ).start()
+
+
+def _rearm_thread_queues(ctx: CockpitAppContext) -> None:
+    index = CockpitThreadIndex(Path(ctx.cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
+    for thread in index._threads().values():  # noqa: SLF001 - startup recovery scans durable thread state.
+        if thread.archived_at:
+            continue
+        index.recover_dispatching_turns(thread.project_id, thread.thread_id)
+        # An execution lease cannot outlive the process that held it; releasing
+        # it here is what lets queued turns drain after a restart.
+        index.recover_orphaned_execution(thread.project_id, thread.thread_id)
+        thread = index.get(thread.project_id, thread.thread_id) or thread
+        if not thread.queued_turns:
+            continue
+        index.rearm_queued_turns(thread.project_id, thread.thread_id)
+        _start_thread_queue_drain(ctx, thread.project_id, thread.thread_id)
+
+
 def _make_thread_child_terminal_notifier(cfg: Config) -> Callable[[str, Any], bool]:
     return make_child_terminal_notifier(cfg)
 
@@ -3990,8 +4831,11 @@ def _thread_projection(
     *,
     include_messages: bool = False,
 ) -> dict[str, Any]:
+    operational_state, diagnostic_reason = _thread_operational_state(thread, ctx)
     status, ended_reason = _thread_status(thread, ctx)
+    lifecycle = "archived" if thread.archived_at else "open"
     data = {
+        "conversation_id": thread.thread_id,
         "thread_id": thread.thread_id,
         "chat_id": thread.thread_id,
         "parent_chat_id": thread.parent_chat_id,
@@ -4003,14 +4847,20 @@ def _thread_projection(
         "model": thread.model or (_thread_model(ctx) if thread.engine == "jarvis" else ""),
         "worker_id": thread.worker_id or None,
         "host": _BRAIN_HOSTNAME if thread.engine == "jarvis" else "",
+        "lifecycle": lifecycle,
+        "operational_state": operational_state,
+        # Preserve the original v1 turn-derived contract while clients migrate
+        # to lifecycle + operational_state for durable conversations.
         "status": status,
         "ended_reason": ended_reason or None,
+        "diagnostic_reason": diagnostic_reason or None,
         "created_at": thread.created_at,
         "updated_at": thread.updated_at,
         "created_by": thread.created_by,
         "archived_at": thread.archived_at,
         "archived_by": thread.archived_by,
         "archive_reason": thread.archive_reason,
+        "last_turn_at": thread.last_turn_at or None,
     }
     if thread.workspace:
         data["workspace"] = workspace_public(thread.workspace)
@@ -4039,17 +4889,80 @@ def _thread_model(ctx: CockpitAppContext | None) -> str:
     return str(gateway.voice_model or gateway.fast_model)
 
 
-def _thread_status(thread: CockpitThread, ctx: CockpitAppContext | None) -> tuple[str, str]:
+def _thread_operational_state(thread: CockpitThread, ctx: CockpitAppContext | None) -> tuple[str, str]:
+    if thread.archived_at:
+        return "archived", ""
     live = ctx.thread_turn_states.get((thread.project_id, thread.thread_id)) if ctx is not None else None
     if live is not None:
-        return live
+        status, reason, _turn_id, _started_at = _thread_turn_state_values(live)
+        return {
+            "created": "starting",
+            "running": "working",
+            "completed": "idle",
+            "failed": "degraded",
+        }.get(status, status), reason
+    if str(thread.workspace.get("status") or "") == "failed":
+        return "degraded", "engine_error"
+    return "idle", ""
+
+
+def _thread_status(thread: CockpitThread, ctx: CockpitAppContext | None) -> tuple[str, str]:
+    """Return the legacy v1 turn-derived status contract."""
+    live = ctx.thread_turn_states.get((thread.project_id, thread.thread_id)) if ctx is not None else None
+    if live is not None:
+        state, reason, _turn_id, _started_at = _thread_turn_state_values(live)
+        if state in {"created", "running", "completed", "failed"}:
+            return state, reason
+        if state in {"starting", "working", "waiting_for_children", "waiting_for_input", "joining"}:
+            return "running", ""
+        if state in {"degraded", "blocked"}:
+            return "failed", reason or "engine_error"
+    legacy = (
+        getattr(ctx, "thread_turn_legacy_states", {}).get((thread.project_id, thread.thread_id))
+        if ctx is not None
+        else None
+    )
+    if legacy is not None:
+        return legacy
     if thread.last_turn_at or thread.messages:
         return "completed", "completed"
     return "created", ""
 
 
-def _thread_detail_projection(thread: CockpitThread, ctx: CockpitAppContext | None = None) -> dict[str, Any]:
+def _thread_turn_state_values(
+    state: ThreadTurnState | tuple[str, str] | None,
+) -> tuple[str, str, str, str]:
+    if isinstance(state, ThreadTurnState):
+        return (
+            state.operational_state,
+            state.diagnostic_reason,
+            state.turn_id,
+            state.started_at,
+        )
+    if state is not None:
+        return state[0], state[1], "", ""
+    return "", "", "", ""
+
+
+def _thread_detail_projection(
+    thread: CockpitThread,
+    ctx: CockpitAppContext | None = None,
+    *,
+    execution: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     row = _thread_projection(thread, ctx)
+    if execution is not None:
+        row["execution"] = execution
+    row["queued_turns"] = [
+        {
+            "queue_id": str(item.get("queue_id") or ""),
+            "text": str(item.get("text") or ""),
+            "queued_at": str(item.get("queued_at") or ""),
+            "status": str(item.get("status") or "queued"),
+        }
+        for item in thread.queued_turns
+        if str(item.get("status") or "queued") in {"queued", "claimed"}
+    ]
     row["messages"] = [
         {
             "role": message.get("role", ""),
@@ -4060,6 +4973,167 @@ def _thread_detail_projection(thread: CockpitThread, ctx: CockpitAppContext | No
         for message in thread.messages
     ]
     return row
+
+
+def _thread_execution_projection(thread: CockpitThread, ctx: CockpitAppContext) -> dict[str, Any]:
+    worker_id = str(thread.workspace.get("worker_id") or thread.worker_id or "")
+    session_id = str(thread.workspace.get("session_id") or "")
+    if not worker_id or not session_id:
+        return _local_thread_execution_projection(thread, ctx)
+    try:
+        raw = _worker_get_json(
+            ctx.cfg,
+            worker_id,
+            f"/sessions/{session_id}/execution-state",
+            get=ctx.get,
+            timeout_s=float(ctx.cfg.orchestration.sse_sync_timeout_s),
+        )
+        return _public_thread_execution(raw)
+    except Exception as exc:  # noqa: BLE001 - execution diagnostics must not hide durable detail.
+        message = exc.message if isinstance(exc, CockpitError) else str(exc)
+        return _unavailable_thread_execution(public_error_message(message or "worker execution state unavailable"))
+
+
+def _public_thread_execution(raw: dict[str, Any]) -> dict[str, Any]:
+    if (
+        not str(raw.get("session_id") or "")
+        or not str(raw.get("status") or "")
+        or raw.get("active_turn") is not None
+        and not isinstance(raw.get("active_turn"), dict)
+        or not isinstance(raw.get("pending_requests"), list)
+        or not isinstance(raw.get("supported_controls"), list)
+        or not isinstance(raw.get("supports"), dict)
+    ):
+        raise ValueError("worker returned invalid execution state")
+    active = raw.get("active_turn") if isinstance(raw.get("active_turn"), dict) else None
+    if active is not None and (
+        not str(active.get("turn_id") or "")
+        or not str(active.get("status") or "")
+    ):
+        raise ValueError("worker returned invalid active turn")
+    pending = raw.get("pending_requests") if isinstance(raw.get("pending_requests"), list) else []
+    controls = raw.get("supported_controls") if isinstance(raw.get("supported_controls"), list) else []
+    return {
+        "available": True,
+        "status": str(raw.get("status") or ""),
+        "active_turn": (
+            {
+                "turn_id": str(active.get("turn_id") or ""),
+                "status": str(active.get("status") or ""),
+                "started_at": str(active.get("started_at") or ""),
+            }
+            if active is not None
+            else None
+        ),
+        "pending_requests": [
+            _public_thread_pending_request(item)
+            for item in pending
+            if isinstance(item, dict)
+            and str(item.get("kind") or "") in {"approval", "input"}
+            and bool(str(item.get("request_id") or ""))
+        ],
+        "supported_controls": [
+            str(item)
+            for item in controls
+            if str(item) in {"turn", "input", "approval", "interrupt", "stop"}
+        ],
+        "supports": {"steer": False, "queue": True},
+        "diagnostic": None,
+    }
+
+
+def _thread_execution_is_active(execution: dict[str, Any]) -> bool:
+    return isinstance(execution.get("active_turn"), dict) or str(execution.get("status") or "") in {
+        "starting",
+        "working",
+        "running",
+        "waiting_approval",
+        "waiting_input",
+        "interrupting",
+    }
+
+
+def _thread_turn_error_is_active(exc: BaseException) -> bool:
+    code = str(getattr(exc, "code", "") or "")
+    message = str(exc).lower()
+    return code == "session_active" or "active turn" in message or "already has an active turn" in message
+
+
+def _public_thread_pending_request(item: dict[str, Any]) -> dict[str, Any]:
+    kind = str(item.get("kind") or "")
+    result = {
+        "request_id": str(item.get("request_id") or ""),
+        "kind": kind,
+        "status": str(item.get("status") or "pending"),
+        "title": public_error_message(str(item.get("title") or "")),
+        "detail": public_error_message(str(item.get("detail") or "")),
+        "created_at": str(item.get("created_at") or ""),
+    }
+    if kind == "approval":
+        request_kind = str(item.get("request_kind") or "")
+        result["request_kind"] = (
+            request_kind if request_kind in {"command", "file-read", "file-change"} else "command"
+        )
+    if kind == "input" and isinstance(item.get("questions"), list):
+        result["questions"] = [
+            {
+                "id": public_error_message(str(question.get("id") or "")),
+                "header": public_error_message(str(question.get("header") or "")),
+                "question": public_error_message(str(question.get("question") or "")),
+                "options": [
+                    {
+                        "label": public_error_message(str(option.get("label") or "")),
+                        "description": public_error_message(str(option.get("description") or "")),
+                    }
+                    for option in question.get("options", [])
+                    if isinstance(option, dict)
+                ],
+                "multi_select": bool(question.get("multi_select")),
+            }
+            for question in item["questions"]
+            if isinstance(question, dict)
+        ]
+    return result
+
+
+def _local_thread_execution_projection(
+    thread: CockpitThread,
+    ctx: CockpitAppContext,
+) -> dict[str, Any]:
+    state = ctx.thread_turn_states.get((thread.project_id, thread.thread_id))
+    status, _reason, turn_id, started_at = _thread_turn_state_values(state)
+    return {
+        "available": True,
+        "status": status or "idle",
+        "active_turn": (
+            {
+                "turn_id": turn_id,
+                "status": status,
+                "started_at": started_at,
+            }
+            if turn_id
+            else None
+        ),
+        "pending_requests": [],
+        "supported_controls": ["turn"] if not thread.archived_at else [],
+        "supports": {"steer": False, "queue": True},
+        "diagnostic": None,
+    }
+
+
+def _unavailable_thread_execution(message: str) -> dict[str, Any]:
+    return {
+        "available": False,
+        "status": "unavailable",
+        "active_turn": None,
+        "pending_requests": [],
+        "supported_controls": [],
+        "supports": {"steer": False, "queue": True},
+        "diagnostic": {
+            "code": "worker_unavailable",
+            "message": message,
+        },
+    }
 
 
 def _include_archived(request: web.Request) -> bool:
@@ -4281,10 +5355,16 @@ def _worker_get_json(
     *,
     params: dict[str, Any] | None = None,
     get: HttpGet,
+    timeout_s: float | None = None,
 ) -> dict[str, Any]:
     profile = _worker_profile(cfg, worker_id)
     try:
-        response = get(f"{profile.base_url}{path}", headers=worker_headers(cfg.worker, profile), params=params or {}, timeout=cfg.worker.request_timeout_s)
+        response = get(
+            f"{profile.base_url}{path}",
+            headers=worker_headers(cfg.worker, profile),
+            params=params or {},
+            timeout=cfg.worker.request_timeout_s if timeout_s is None else timeout_s,
+        )
     except Exception as exc:  # noqa: BLE001 - exact session reads should return the public cockpit error contract
         message = public_error_message(str(exc) or "worker request failed")
         raise CockpitError("worker_unavailable", message, recoverable=True, status=502) from exc
@@ -4538,6 +5618,14 @@ async def serve(cfg: Config) -> int:
             "  Set ORCHESTRATION_API_TOKEN, or ORCHESTRATION_API_ALLOW_INSECURE=true to override.\n"
         )
         return 1
+    import contextlib
+    import faulthandler
+    import signal as _signal
+
+    # SIGUSR1 dumps every thread's Python stack to stderr (the launchd error
+    # log) so a wedged process can be diagnosed without killing it.
+    with contextlib.suppress(AttributeError, ValueError, RuntimeError):
+        faulthandler.register(_signal.SIGUSR1, all_threads=True)
     app = make_app(cfg)
     runner = web.AppRunner(app, keepalive_timeout=15)
     await runner.setup()

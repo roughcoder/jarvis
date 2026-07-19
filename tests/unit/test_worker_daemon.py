@@ -58,6 +58,10 @@ from jarvis.worker.sessions import SessionManager  # noqa: E402
 from jarvis.worker.notify import WorkerChangeNotifier  # noqa: E402
 from jarvis.worker_session_contract import (  # noqa: E402
     EVENT_APPROVAL_RESOLVED,
+    EVENT_APPROVAL_REQUESTED,
+    EVENT_CHECKPOINT_CREATED,
+    EVENT_INPUT_REQUESTED,
+    EVENT_PROVIDER_LOG,
     EVENT_TOOL_RESULT,
     EVENT_TURN_COMPLETED,
     REQUEST_KIND_APPROVAL,
@@ -69,16 +73,33 @@ from jarvis.worker_session_contract import (  # noqa: E402
 )
 
 
-async def _with_server(cfg: WorkerConfig, port: int, fn):  # noqa: ANN001
+async def _with_server(cfg: WorkerConfig, port: int, fn, *, timeout: float = 60.0):  # noqa: ANN001
     runner = web.AppRunner(make_app(cfg))
     await runner.setup()
     site = web.TCPSite(runner, "localhost", port)
     await site.start()
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             return await fn(f"http://localhost:{port}", client)
     finally:
         await runner.cleanup()
+
+
+async def _wait_job(
+    client: httpx.AsyncClient,
+    base: str,
+    job_id: str,
+    *,
+    attempts: int = 300,
+    interval_s: float = 0.05,
+) -> dict:
+    job: dict = {}
+    for _ in range(attempts):
+        job = (await client.get(f"{base}/jobs/{job_id}")).json()
+        if job.get("status") != "running":
+            return job
+        await asyncio.sleep(interval_s)
+    return job
 
 
 def _authority_metadata(engine: str = "codex", extra_actions: list[str] | None = None) -> dict:
@@ -324,6 +345,7 @@ def test_worker_session_authority_maps_read_only_to_codex_read_only() -> None:
     authority = WorkerSessionAuthority.from_session(_session_with_authority())
 
     assert authority.codex_sandbox == "read-only"
+    assert authority.codex_turn_sandbox_policy == {"type": "readOnly", "networkAccess": True}
     assert authority.codex_approval_policy == "never"
     assert authority.claude_permission_mode == "plan"
     assert authority.claude_tool_denial("Bash")
@@ -333,6 +355,10 @@ def test_worker_session_authority_maps_read_only_to_codex_read_only() -> None:
     assert authority.claude_tool_denial("Read") == ""
     assert authority.claude_tool_denial("Grep") == ""
     assert authority.claude_tool_denial("AskUserQuestion") == ""
+    # Plan mode is entered automatically for read-only sessions; denying the
+    # exit would trap the session with no way to use its permitted tools.
+    assert authority.claude_tool_denial("ExitPlanMode") == ""
+    assert authority.claude_tool_is_preapproved("ExitPlanMode")
 
 
 def test_worker_session_authority_allows_only_declared_mcp_server_in_read_only_mode() -> None:
@@ -553,6 +579,7 @@ def test_worker_session_authority_maps_branch_only_to_workspace_write() -> None:
     )
 
     assert authority.codex_sandbox == "workspace-write"
+    assert authority.codex_turn_sandbox_policy is None
     assert authority.codex_approval_policy == "never"
     assert authority.claude_permission_mode == "dontAsk"
 
@@ -613,9 +640,28 @@ def test_worker_session_authority_does_not_override_envelope_denial() -> None:
         WorkerSessionAuthority.from_metadata(metadata, provider="codex")
 
 
+@pytest.mark.parametrize(
+    ("jarvis_decision", "codex_decision", "claude_allowed"),
+    [
+        ("approved", "accept", True),
+        ("approved_for_session", "acceptForSession", True),
+        ("denied", "decline", False),
+        ("declined", "decline", False),
+        ("cancelled", "cancel", False),
+    ],
+)
+def test_provider_approval_decisions_cover_the_jarvis_vocabulary(
+    jarvis_decision: str,
+    codex_decision: str,
+    claude_allowed: bool,
+) -> None:
+    request = {"decision": jarvis_decision}
+
+    assert _approval_result(request) == {"decision": codex_decision}
+    assert claude._approval_allowed(request) is claude_allowed  # noqa: SLF001
+
+
 def test_codex_protocol_response_shapes_match_app_server_contract() -> None:
-    assert _approval_result({"decision": "approved"}) == {"decision": "accept"}
-    assert _approval_result({"decision": "denied"}) == {"decision": "decline"}
     assert _approval_result({"decision": "acceptForSession"}) == {"decision": "acceptForSession"}
 
     assert _input_result(
@@ -1669,24 +1715,27 @@ def test_daemon_health_reports_diagnostics_error_without_500(tmp_path, monkeypat
 
 
 def test_daemon_health_does_not_wait_for_slow_diagnostics(tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    import time
+    started = threading.Event()
+    release = threading.Event()
 
     def slow_diagnostics(**_kwargs):  # noqa: ANN001
-        time.sleep(0.25)
+        started.set()
+        release.wait(timeout=5)
         return {"repositories": [{"repo": "jarvis", "status": "ready"}]}
 
     monkeypatch.setattr("jarvis.worker.server.diagnostics", slow_diagnostics)
     cfg = WorkerConfig(_env_file=None, token="", workspace=str(tmp_path / "worker"))
 
     async def calls(base, c):  # noqa: ANN001
-        started = time.monotonic()
-        response = await c.get(base + "/health")
-        elapsed = time.monotonic() - started
-        return elapsed, response.json()
+        try:
+            response = await asyncio.wait_for(c.get(base + "/health"), timeout=1.0)
+            assert started.wait(timeout=1)
+            return response.json()
+        finally:
+            release.set()
 
-    elapsed, health = asyncio.run(_with_server(cfg, 8849, calls))
+    health = asyncio.run(_with_server(cfg, 8849, calls))
 
-    assert elapsed < 0.20
     assert health["diagnostics"] == {"status": "refreshing", "repositories": []}
 
 
@@ -1791,7 +1840,7 @@ def test_daemon_conversation_workspace_serializes_concurrent_materialization(tmp
         fetched = (await c.get(f"{base}/conversation-workspaces/thread_race", headers=headers)).json()
         return first.json(), second.json(), fetched
 
-    first, second, fetched = asyncio.run(_with_server(cfg, 8853, calls))
+    first, second, fetched = asyncio.run(_with_server(cfg, 8853, calls, timeout=30.0))
 
     assert first["ok"] is True
     assert second["ok"] is True
@@ -2720,6 +2769,214 @@ def test_daemon_session_pending_requests_and_checkpoints_are_projected(tmp_path)
     assert checkpoints_after_restore["checkpoints"][0]["restored"] is True
 
 
+def test_daemon_bulk_session_checkpoints_are_authenticated_and_deterministic(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    sessions = SessionManager(str(tmp_path / "worker" / "sessions"))
+    expected_ids = [f"sess_{index:02d}" for index in range(20)]
+    for session_id in reversed(expected_ids):
+        sessions.create({"session_id": session_id, "provider": "fake", "engine": "fake"})
+        sessions.append_event(
+            session_id,
+            EVENT_CHECKPOINT_CREATED,
+            {"checkpoint_id": f"ckpt_{session_id}", "label": f"Checkpoint {session_id}", "provider": "fake"},
+        )
+
+    async def calls(base, client):  # noqa: ANN001
+        unauthorized = await client.get(f"{base}/sessions/checkpoints")
+        authorized = await client.get(
+            f"{base}/sessions/checkpoints",
+            headers={"Authorization": "Bearer tkn"},
+        )
+        return unauthorized, authorized
+
+    unauthorized, authorized = asyncio.run(_with_server(cfg, 8847, calls))
+
+    assert unauthorized.status_code == 401
+    assert unauthorized.json() == {"error": "unauthorized"}
+    assert authorized.status_code == 200
+    rows = authorized.json()["checkpoints"]
+    assert [row["session_id"] for row in rows] == expected_ids
+    assert [row["checkpoint_id"] for row in rows] == [f"ckpt_{session_id}" for session_id in expected_ids]
+    assert "tkn" not in authorized.text
+
+
+def test_daemon_session_execution_state_projects_active_turn_and_redacted_requests(tmp_path) -> None:
+    cfg = WorkerConfig(_env_file=None, token="tkn", workspace=str(tmp_path / "worker"))
+    headers = {"Authorization": "Bearer tkn"}
+
+    async def calls(base, c):  # noqa: ANN001
+        created = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "provider": "fake",
+                    "engine": "fake",
+                    "metadata": _authority_metadata(
+                        "fake",
+                        extra_actions=[
+                            WORKER_SESSION_APPROVE,
+                            WORKER_SESSION_INPUT,
+                            WORKER_SESSION_INTERRUPT,
+                            WORKER_SESSION_STOP,
+                        ],
+                    ),
+                },
+                headers=headers,
+            )
+        ).json()
+        session_id = created["session"]["session_id"]
+        await c.post(
+            f"{base}/sessions/{session_id}/turns",
+            json={
+                "turn_id": "turn_active",
+                "prompt": "request approval",
+                "metadata": _control_metadata(WORKER_SESSION_TURN),
+            },
+            headers=headers,
+        )
+        state = await c.get(f"{base}/sessions/{session_id}/execution-state", headers=headers)
+        input_created = (
+            await c.post(
+                base + "/sessions",
+                json={
+                    "provider": "fake",
+                    "engine": "fake",
+                    "metadata": _authority_metadata(
+                        "fake",
+                        extra_actions=[WORKER_SESSION_INPUT],
+                    ),
+                },
+                headers=headers,
+            )
+        ).json()
+        input_session_id = input_created["session"]["session_id"]
+        await c.post(
+            f"{base}/sessions/{input_session_id}/turns",
+            json={
+                "turn_id": "turn_input",
+                "prompt": "request input",
+                "metadata": _control_metadata(WORKER_SESSION_TURN),
+            },
+            headers=headers,
+        )
+        input_state = await c.get(
+            f"{base}/sessions/{input_session_id}/execution-state",
+            headers=headers,
+        )
+        return state.status_code, state.json(), input_state.json()
+
+    status, state, input_state = asyncio.run(_with_server(cfg, 8898, calls))
+
+    assert status == 200
+    assert state["active_turn"] == {
+        "turn_id": "turn_active",
+        "status": "waiting_approval",
+        "started_at": state["active_turn"]["started_at"],
+    }
+    assert state["pending_requests"] == [
+        {
+            "request_id": "approval_turn_active",
+            "kind": "approval",
+            "status": "pending",
+            "title": "Approve action",
+            "detail": "Approve fake provider action?",
+            "created_at": state["pending_requests"][0]["created_at"],
+            "request_kind": "command",
+        }
+    ]
+    assert state["supported_controls"] == ["turn", "input", "approval", "interrupt", "stop"]
+    assert state["supports"] == {"steer": False, "queue": False}
+    assert "prompt" not in json.dumps(state)
+    assert input_state["pending_requests"][0]["questions"] == [
+        {
+            "id": "response",
+            "header": "Input",
+            "question": "Provide fake provider input.",
+            "options": [],
+            "multi_select": False,
+        }
+    ]
+
+
+def test_session_execution_state_normalizes_claude_requests_redacts_secrets_and_bounds_history(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _created = sessions.create({"provider": "claude", "engine": "claude"})
+    sessions.reserve_turn(session.session_id, {"turn_id": "turn_claude", "idempotency_key": "turn_1"})
+    for index in range(1_200):
+        sessions.append_event(
+            session.session_id,
+            EVENT_PROVIDER_LOG,
+            {"turn_id": "turn_claude", "text": f"event-{index}-" + ("x" * 1024)},
+        )
+    sessions.append_event(
+        session.session_id,
+        EVENT_INPUT_REQUESTED,
+        {
+            "turn_id": "turn_claude",
+            "request_id": "request_input",
+            "tool_name": "AskUserQuestion",
+            "input": {
+                "questions": [
+                    {
+                        "id": "targets",
+                        "header": "Targets",
+                        "question": "Which targets?",
+                        "multiSelect": True,
+                        "options": [
+                            {"label": "Web", "description": "Use the web app"},
+                            {"label": "Server", "description": "Use the API"},
+                        ],
+                    }
+                ]
+            },
+        },
+    )
+    sessions.append_event(
+        session.session_id,
+        EVENT_APPROVAL_REQUESTED,
+        {
+            "turn_id": "turn_claude",
+            "request_id": "request_approval",
+            "tool_name": "Bash",
+            "description": (
+                "Authorization: Bearer supersecretvalue123456 "
+                "TOKEN=supersecretvalue123456 SECRET=supersecretvalue123456 "
+                "PASSWORD=supersecretvalue123456 API_KEY=supersecretvalue123456"
+            ),
+            "input": {"content": "x" * (1024 * 1024 + 1)},
+        },
+    )
+    sessions.update_status(session.session_id, SESSION_WAITING_INPUT)
+    monkeypatch.setattr(sessions, "events", lambda *_args, **_kwargs: pytest.fail("full event scan"))
+
+    state = sessions.execution_state(session.session_id)
+
+    assert state is not None
+    assert state["active_turn"]["turn_id"] == "turn_claude"
+    input_request = next(item for item in state["pending_requests"] if item["kind"] == "input")
+    assert input_request["questions"] == [
+        {
+            "id": "targets",
+            "header": "Targets",
+            "question": "Which targets?",
+            "options": [
+                {"label": "Web", "description": "Use the web app"},
+                {"label": "Server", "description": "Use the API"},
+            ],
+            "multi_select": True,
+        }
+    ]
+    approval = next(item for item in state["pending_requests"] if item["kind"] == "approval")
+    assert approval["request_kind"] == "command"
+    encoded = json.dumps(approval)
+    assert "supersecretvalue123456" not in encoded
+    assert "<redacted-token>" in encoded
+    assert "<redacted-secret>" in encoded
+
+
 def test_daemon_session_read_endpoints_offload_file_reads(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     """Session event/request projection must not perform disk reads on aiohttp's loop."""
     from jarvis.worker import server as worker_server
@@ -2822,10 +3079,13 @@ def test_daemon_checkpoint_restore_returns_unsupported_without_provider_handler(
 
 def test_daemon_codex_provider_projects_app_server_events(tmp_path) -> None:
     agent = tmp_path / "fake-codex"
+    request_log = tmp_path / "codex-requests.jsonl"
     agent.write_text(
         """#!/usr/bin/env python3
 import json
 import sys
+
+REQUEST_LOG = __REQUEST_LOG__
 
 
 def emit(payload):
@@ -2836,6 +3096,8 @@ for line in sys.stdin:
     if not line.strip():
         continue
     payload = json.loads(line)
+    with open(REQUEST_LOG, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload) + "\\n")
     method = payload.get("method")
     request_id = payload.get("id")
     if method == "initialize":
@@ -2867,7 +3129,7 @@ for line in sys.stdin:
             "method": "turn/completed",
             "params": {"turn": {"id": "turn_fake", "status": "completed"}},
         })
-"""
+""".replace("__REQUEST_LOG__", repr(str(request_log)))
     )
     agent.chmod(0o755)
     cfg = WorkerConfig(
@@ -2878,6 +3140,13 @@ for line in sys.stdin:
         job_timeout_s=5,
     )
     headers = {"Authorization": "Bearer tkn"}
+    read_only_metadata = _authority_metadata("codex")
+    read_only_actions = ["worker.session.create", "worker.session.turn"]
+    read_only_landing = {"mode": "none", "allow_merge": False}
+    read_only_metadata["execution_envelope"]["allowed_actions"] = read_only_actions
+    read_only_metadata["execution_envelope"]["landing"] = read_only_landing
+    read_only_metadata["allowed_actions"] = read_only_actions
+    read_only_metadata["landing"] = read_only_landing
 
     async def calls(base, c):  # noqa: ANN001
         created = (
@@ -2891,7 +3160,7 @@ for line in sys.stdin:
                     "branch": "jarvis/codex-session",
                     "cwd": _owned_worker_cwd(tmp_path, "codex-projection"),
                     "title": "Codex app-server projection",
-                    "metadata": _authority_metadata("codex"),
+                    "metadata": read_only_metadata,
                 },
                 headers=headers,
             )
@@ -2931,6 +3200,9 @@ for line in sys.stdin:
     assert fetched["status"] == "completed"
     assert fetched["metadata"]["codex_thread_id"] == "thread_fake"
     assert fetched["metadata"]["provider_session_id"] == "session_fake"
+    requests = [json.loads(line) for line in request_log.read_text().splitlines()]
+    turn_start = next(request for request in requests if request.get("method") == "turn/start")
+    assert turn_start["params"]["sandboxPolicy"] == {"type": "readOnly", "networkAccess": True}
 
 
 def test_codex_turn_completed_does_not_overwrite_cancelled_session(tmp_path) -> None:
@@ -4168,12 +4440,7 @@ def test_daemon_code_dispatch_marks_nonzero_agent_exit_as_error(tmp_path) -> Non
             )
         ).json()
         jid = disp["job_id"]
-        job = {}
-        for _ in range(100):
-            job = (await c.get(f"{base}/jobs/{jid}")).json()
-            if job["status"] != "running":
-                break
-            await asyncio.sleep(0.02)
+        job = await _wait_job(c, base, jid)
         return job
 
     job = asyncio.run(_with_server(cfg, 8820, calls))
@@ -4591,9 +4858,8 @@ def test_no_repo_jobs_get_isolated_run_dirs(tmp_path) -> None:
     async def calls(base, c):  # noqa: ANN001
         r1 = (await c.post(base + "/run", json={"action": "code", "args": {"prompt": "a", "name": "job one"}})).json()
         r2 = (await c.post(base + "/run", json={"action": "code", "args": {"prompt": "b", "name": "job two"}})).json()
-        await asyncio.sleep(0.3)
-        j1 = (await c.get(f"{base}/jobs/{r1['job_id']}")).json()
-        j2 = (await c.get(f"{base}/jobs/{r2['job_id']}")).json()
+        j1 = await _wait_job(c, base, r1["job_id"])
+        j2 = await _wait_job(c, base, r2["job_id"])
         return j1, j2
 
     j1, j2 = asyncio.run(_with_server(cfg, 8810, calls))
@@ -4617,8 +4883,7 @@ def test_repo_job_isolates_on_a_worktree_branch(tmp_path) -> None:
 
     async def calls(base, c):  # noqa: ANN001
         r = (await c.post(base + "/run", json={"action": "code", "args": {"prompt": "do x", "name": "refactor", "repo": str(repo)}})).json()
-        await asyncio.sleep(0.3)
-        j = (await c.get(f"{base}/jobs/{r['job_id']}")).json()
+        j = await _wait_job(c, base, r["job_id"])
         return r, j
 
     r, j = asyncio.run(_with_server(cfg, 8812, calls))
@@ -4645,8 +4910,7 @@ def test_non_git_repo_input_is_copied_to_worker_scratch(tmp_path) -> None:
                 json={"action": "code", "args": {"prompt": "x", "name": "plain", "repo": str(user_dir)}},
             )
         ).json()
-        await asyncio.sleep(0.3)
-        j = (await c.get(f"{base}/jobs/{r['job_id']}")).json()
+        j = await _wait_job(c, base, r["job_id"])
         existed_before_cleanup = pathlib.Path(j["cwd"]).exists()
         clean = (await c.post(base + "/run", json={"action": "cleanup", "args": {"job": "plain"}})).json()
         return r, j, existed_before_cleanup, clean
@@ -4675,8 +4939,7 @@ def test_cleanup_removes_worktree_and_branch(tmp_path) -> None:
 
     async def calls(base, c):  # noqa: ANN001
         r = (await c.post(base + "/run", json={"action": "code", "args": {"prompt": "x", "name": "cleanme", "repo": str(repo)}})).json()
-        await asyncio.sleep(0.3)
-        wt = (await c.get(f"{base}/jobs/{r['job_id']}")).json()["cwd"]
+        wt = (await _wait_job(c, base, r["job_id"]))["cwd"]
         clean = (await c.post(base + "/run", json={"action": "cleanup", "args": {"job": "cleanme"}})).json()
         after = (await c.get(base + "/jobs")).json()["jobs"]
         return r["branch"], wt, clean, after
@@ -4936,8 +5199,7 @@ def test_cleanup_all_removes_scratch_dir(tmp_path) -> None:
 
     async def calls(base, c):  # noqa: ANN001
         r = (await c.post(base + "/run", json={"action": "code", "args": {"prompt": "x", "name": "scratchy"}})).json()
-        await asyncio.sleep(0.3)
-        cwd = (await c.get(f"{base}/jobs/{r['job_id']}")).json()["cwd"]
+        cwd = (await _wait_job(c, base, r["job_id"]))["cwd"]
         clean = (await c.post(base + "/run", json={"action": "cleanup", "args": {"job": ""}})).json()
         return cwd, clean
 

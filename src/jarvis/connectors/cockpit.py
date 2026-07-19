@@ -16,12 +16,20 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import httpx
 
-from jarvis.capabilities import FORGE_PR_COMMENT, WORKER_SESSION_CREATE, WORKER_SESSION_STOP, WORKER_SESSION_TURN
+from jarvis.capabilities import (
+    FORGE_BRANCH_PUSH,
+    FORGE_PR_COMMENT,
+    WORKER_SESSION_CREATE,
+    WORKER_SESSION_INPUT,
+    WORKER_SESSION_INTERRUPT,
+    WORKER_SESSION_STOP,
+    WORKER_SESSION_TURN,
+)
 from jarvis.brain.facade import (
     PROJECT_THREAD_TOOL_SURFACE_CONTRACT,
     ActiveProject,
@@ -45,7 +53,7 @@ from jarvis.brain.facade import (
     make_project_tools,
 )
 from jarvis.config import Config
-from jarvis.engines import worker_supports_engine
+from jarvis.engines import BUILTIN_CODE_ENGINES, normalize_engine_id, worker_supports_engine
 from jarvis.ids import new_id, utc_now
 from jarvis.jsonl_cache import JsonlCacheEntry, read_jsonl_projection
 from jarvis.orchestrator_tool_contract import (
@@ -70,6 +78,7 @@ from jarvis.tools.base import Tool
 from jarvis.text import slugify
 from jarvis.users import load_users
 from jarvis.worker_session_contract import (
+    EVENT_APPROVAL_REQUESTED,
     EVENT_ASSISTANT_MESSAGE,
     EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
@@ -78,13 +87,45 @@ from jarvis.worker_session_contract import (
     FAILED_SESSION_STATUSES,
     WORKER_ERROR_SESSION_ACTIVE,
     WORKER_ERROR_SESSION_TERMINAL,
+    turn_failure_message,
 )
 
 
+class ProviderTurnError(RuntimeError):
+    """A provider/worker turn reached a terminal failure the operator must see."""
+
+
+ORCHESTRATOR_ENGINES = {"codex", "claude"}
+
 THREAD_INDEX_FILENAME = "cockpit-threads.json"
 THREAD_TRANSCRIPTS_DIRNAME = "cockpit-thread-transcripts"
+# The orchestrator conversation is the operator's most capable surface: it must
+# be able to act, not only read. A read-only envelope maps Codex to a read-only
+# sandbox and Claude to plan mode, which leaves the agent unable to do the work
+# it is being asked to coordinate. Plan mode remains a per-turn choice the
+# operator can make from the composer, never an imposed default.
+# WORKER_SESSION_APPROVE is deliberately absent: holding it makes Codex ask for
+# approval on every command and Claude ask before acting, and an orchestrator
+# turn runs headless with nobody to answer — it would hang until the job
+# timeout. Without it the session acts autonomously (Codex "never", Claude
+# "dontAsk") inside its workspace-write sandbox.
+CONVERSATION_SESSION_ALLOWED_ACTIONS = [
+    WORKER_SESSION_CREATE,
+    WORKER_SESSION_TURN,
+    WORKER_SESSION_INPUT,
+    WORKER_SESSION_INTERRUPT,
+    WORKER_SESSION_STOP,
+    FORGE_BRANCH_PUSH,
+]
+CONVERSATION_SESSION_LANDING = {"mode": "branch_only", "allow_merge": False}
 THREAD_HISTORY_LIMIT = 24
 CHILD_WATCH_LEASE_S = 300
+# A claim only needs a heartbeat, not a durable write per retry tick. Renewing
+# on every tick appended a child_watch record each time and grew the transcript
+# without bound (a 40s wait once produced 158 records for one watch).
+CHILD_WATCH_RENEW_INTERVAL_S = CHILD_WATCH_LEASE_S // 3
+THREAD_TURN_QUEUE_LIMIT = 32
+THREAD_TURN_RECEIPT_REPLY_LIMIT = 4_000
 CHILD_WORK_LANDING_MODES = {"none", "branch_only", "draft_pr", "ready_pr", "confirm_before_pr"}
 _THREAD_INDEX_LOCK = threading.RLock()
 _THREAD_TRANSCRIPT_LOCKS_LOCK = threading.Lock()
@@ -216,6 +257,8 @@ class CockpitThread:
     last_turn_at: str = ""
     messages: tuple[dict[str, Any], ...] = ()
     workspace: dict[str, Any] = field(default_factory=dict)
+    queued_turns: tuple[dict[str, Any], ...] = ()
+    turn_receipts: tuple[dict[str, Any], ...] = ()
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], *, include_messages: bool = True) -> "CockpitThread":
@@ -238,6 +281,8 @@ class CockpitThread:
             last_turn_at=str(data.get("last_turn_at") or ""),
             messages=tuple(_normalized_messages(data.get("messages") or ())) if include_messages else (),
             workspace=dict(data.get("workspace") or {}),
+            queued_turns=tuple(dict(item) for item in data.get("queued_turns") or () if isinstance(item, dict)),
+            turn_receipts=tuple(dict(item) for item in data.get("turn_receipts") or () if isinstance(item, dict)),
         )
 
     def as_dict(self, *, include_messages: bool = False) -> dict[str, Any]:
@@ -263,6 +308,10 @@ class CockpitThread:
             data["messages"] = [dict(message) for message in self.messages]
         if self.workspace:
             data["workspace"] = dict(self.workspace)
+        if self.queued_turns:
+            data["queued_turns"] = [dict(item) for item in self.queued_turns]
+        if self.turn_receipts:
+            data["turn_receipts"] = [dict(item) for item in self.turn_receipts[-100:]]
         return data
 
 
@@ -313,6 +362,488 @@ class CockpitThreadIndex:
             threads[thread.thread_id] = thread.as_dict(include_messages=False)
             atomic_write_json(self.path, data)
             return replace(thread, messages=())
+
+    def enqueue_turn(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        requester: RequestContext,
+        text: str,
+        idempotency_key: str,
+        workspace_request: dict[str, Any] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> tuple[CockpitThread, dict[str, Any], bool]:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                raise KeyError(thread_id)
+            if attachments:
+                raise ValueError("queued attachments require durable attachment references")
+            key = idempotency_key.strip()
+            fingerprint = _thread_turn_fingerprint(text, workspace_request, attachments)
+            for receipt in thread.turn_receipts:
+                if str(receipt.get("idempotency_key") or "") == key:
+                    if str(receipt.get("fingerprint") or "") != fingerprint:
+                        raise ValueError("idempotency key was already used for a different thread turn")
+                    if str(receipt.get("status") or "") == "failed":
+                        thread = replace(
+                            thread,
+                            turn_receipts=tuple(item for item in thread.turn_receipts if item is not receipt),
+                        )
+                        break
+                    queue_id = str(receipt.get("queue_id") or "")
+                    existing = next(
+                        (item for item in thread.queued_turns if str(item.get("queue_id") or "") == queue_id),
+                        {"queue_id": queue_id, "text": text, "queued_at": "", "status": "completed"},
+                    )
+                    return thread, dict(existing), False
+            if len(thread.queued_turns) >= THREAD_TURN_QUEUE_LIMIT:
+                raise OverflowError("thread turn queue is full")
+            queued_at = utc_now()
+            item = {
+                "queue_id": new_id("queuedturn"),
+                "idempotency_key": key,
+                "fingerprint": fingerprint,
+                "text": text,
+                "queued_at": queued_at,
+                "status": "queued",
+                "requester": _snapshot_from_context(requester),
+                "workspace_request": dict(workspace_request) if workspace_request is not None else None,
+            }
+            updated = self.save(
+                replace(
+                    thread,
+                    updated_at=queued_at,
+                    queued_turns=(*thread.queued_turns, item),
+                    turn_receipts=(
+                        *thread.turn_receipts[-99:],
+                        {
+                            "idempotency_key": key,
+                            "queue_id": str(item["queue_id"]),
+                            "fingerprint": fingerprint,
+                            "status": "queued",
+                        },
+                    ),
+                )
+            )
+            return updated, item, True
+
+    def foreground_turn_receipt(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        text: str,
+        idempotency_key: str,
+        workspace_request: dict[str, Any] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        thread = self.get(project_id, thread_id)
+        if thread is None:
+            return None
+        fingerprint = _thread_turn_fingerprint(text, workspace_request, attachments)
+        receipt = next(
+            (item for item in thread.turn_receipts if item.get("idempotency_key") == idempotency_key),
+            None,
+        )
+        if receipt is None or str(receipt.get("status") or "") == "failed":
+            return None
+        if str(receipt.get("fingerprint") or "") != fingerprint:
+            raise ValueError("idempotency key was already used for a different thread turn")
+        return dict(receipt)
+
+    def reserve_foreground_turn(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        text: str,
+        idempotency_key: str,
+        requester: RequestContext,
+        dispatch_mode: str,
+        workspace_request: dict[str, Any] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                raise KeyError(thread_id)
+            fingerprint = _thread_turn_fingerprint(text, workspace_request, attachments)
+            receipts = [dict(item) for item in thread.turn_receipts]
+            for index, receipt in enumerate(receipts):
+                if receipt.get("idempotency_key") != idempotency_key:
+                    continue
+                if str(receipt.get("fingerprint") or "") != fingerprint:
+                    raise ValueError("idempotency key was already used for a different thread turn")
+                if str(receipt.get("status") or "") != "failed":
+                    return receipt, False
+                receipt.update(
+                    status="dispatching",
+                    attempt=int(receipt.get("attempt") or 0) + 1,
+                    updated_at=utc_now(),
+                    text=text,
+                    requester=_snapshot_from_context(requester),
+                    workspace_request=dict(workspace_request) if workspace_request is not None else None,
+                    has_attachments=bool(attachments),
+                    dispatch_mode=dispatch_mode,
+                )
+                receipts[index] = receipt
+                self.save(replace(thread, turn_receipts=tuple(receipts[-100:])))
+                return receipt, True
+            receipt = {
+                "idempotency_key": idempotency_key,
+                "fingerprint": fingerprint,
+                "logical_turn_id": new_id("turn"),
+                "status": "dispatching",
+                "attempt": 1,
+                "created_at": utc_now(),
+                "text": text,
+                "requester": _snapshot_from_context(requester),
+                "workspace_request": dict(workspace_request) if workspace_request is not None else None,
+                "has_attachments": bool(attachments),
+                "dispatch_mode": dispatch_mode,
+            }
+            self.save(replace(thread, turn_receipts=(*thread.turn_receipts[-99:], receipt)))
+            return receipt, True
+
+    def finish_foreground_turn(
+        self,
+        project_id: str,
+        thread_id: str,
+        idempotency_key: str,
+        *,
+        status: str,
+        reply: str = "",
+    ) -> None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return
+            receipts = [dict(item) for item in thread.turn_receipts]
+            for index, receipt in enumerate(receipts):
+                if receipt.get("idempotency_key") != idempotency_key:
+                    continue
+                receipt.update(
+                    status=status,
+                    reply=reply[:THREAD_TURN_RECEIPT_REPLY_LIMIT],
+                    reply_truncated=len(reply) > THREAD_TURN_RECEIPT_REPLY_LIMIT,
+                    updated_at=utc_now(),
+                )
+                if status in {"completed", "accepted", "failed"}:
+                    _scrub_turn_receipt_recovery_fields(receipt)
+                receipts[index] = receipt
+                self.save(replace(thread, turn_receipts=tuple(receipts)))
+                return
+
+    def fail_foreground_turn(self, project_id: str, thread_id: str, idempotency_key: str) -> None:
+        self.finish_foreground_turn(project_id, thread_id, idempotency_key, status="failed")
+
+    def has_queued_turns(self, project_id: str, thread_id: str) -> bool:
+        thread = self.get(project_id, thread_id)
+        return bool(thread and thread.queued_turns)
+
+    def turn_receipt(self, project_id: str, thread_id: str, idempotency_key: str) -> dict[str, Any] | None:
+        thread = self.get(project_id, thread_id)
+        if thread is None:
+            return None
+        receipt = next(
+            (
+                item
+                for item in thread.turn_receipts
+                if str(item.get("idempotency_key") or "") == idempotency_key
+            ),
+            None,
+        )
+        if receipt is None:
+            return None
+        queue_id = str(receipt.get("queue_id") or "")
+        queued = next(
+            (item for item in thread.queued_turns if str(item.get("queue_id") or "") == queue_id),
+            None,
+        )
+        return dict(queued or {**receipt, "status": "completed"})
+
+    def rearm_queued_turns(self, project_id: str, thread_id: str) -> CockpitThread | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None or not any(item.get("status") == "claimed" for item in thread.queued_turns):
+                return thread
+            queued = tuple(
+                {key: value for key, value in item.items() if key != "claimed_at"}
+                | {"status": "queued"}
+                if item.get("status") == "claimed"
+                else dict(item)
+                for item in thread.queued_turns
+            )
+            return self.save(replace(thread, queued_turns=queued))
+
+    def recover_dispatching_turns(self, project_id: str, thread_id: str) -> CockpitThread | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            receipts = [dict(item) for item in thread.turn_receipts]
+            queued = [dict(item) for item in thread.queued_turns]
+            changed = False
+            for index, receipt in enumerate(receipts):
+                if str(receipt.get("status") or "") != "dispatching":
+                    continue
+                changed = True
+                if receipt.get("has_attachments"):
+                    receipt["status"] = "retry_required"
+                    receipt["recovery_reason"] = "durable attachment references unavailable"
+                    _scrub_turn_receipt_recovery_fields(receipt)
+                elif str(receipt.get("dispatch_mode") or "brain") != "worker":
+                    receipt["status"] = "uncertain"
+                    receipt["recovery_reason"] = "brain turn outcome is ambiguous after restart"
+                    _scrub_turn_receipt_recovery_fields(receipt)
+                else:
+                    if len(queued) >= THREAD_TURN_QUEUE_LIMIT:
+                        receipt["status"] = "retry_required"
+                        receipt["recovery_reason"] = "thread turn queue is full during recovery"
+                        _scrub_turn_receipt_recovery_fields(receipt)
+                        receipts[index] = receipt
+                        continue
+                    queue_id = str(receipt.get("logical_turn_id") or new_id("queuedturn"))
+                    if not any(str(item.get("queue_id") or "") == queue_id for item in queued):
+                        queued.append(
+                            {
+                                "queue_id": queue_id,
+                                "idempotency_key": str(receipt.get("idempotency_key") or queue_id),
+                                "fingerprint": str(receipt.get("fingerprint") or ""),
+                                "text": str(receipt.get("text") or ""),
+                                "queued_at": str(receipt.get("created_at") or utc_now()),
+                                "status": "queued",
+                                "requester": dict(receipt.get("requester") or {}),
+                                "workspace_request": receipt.get("workspace_request"),
+                                "attachments": [],
+                            }
+                        )
+                    receipt["queue_id"] = queue_id
+                    receipt["status"] = "queued"
+                receipts[index] = receipt
+            if not changed:
+                return thread
+            return self.save(
+                replace(
+                    thread,
+                    queued_turns=tuple(queued),
+                    turn_receipts=tuple(receipts),
+                    updated_at=utc_now(),
+                )
+            )
+
+    def claim_queued_turn(self, project_id: str, thread_id: str) -> dict[str, Any] | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            queued = [dict(item) for item in thread.queued_turns]
+            for index, item in enumerate(queued):
+                if str(item.get("status") or "queued") != "queued":
+                    continue
+                item["status"] = "claimed"
+                item["claimed_at"] = utc_now()
+                queued[index] = item
+                self.save(replace(thread, queued_turns=tuple(queued)))
+                return dict(item)
+            return None
+
+    def finish_queued_turn(
+        self,
+        project_id: str,
+        thread_id: str,
+        queue_id: str,
+        *,
+        retry: bool = False,
+    ) -> None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return
+            queued: list[dict[str, Any]] = []
+            for raw in thread.queued_turns:
+                item = dict(raw)
+                if str(item.get("queue_id") or "") != queue_id:
+                    queued.append(item)
+                elif retry:
+                    item.pop("claimed_at", None)
+                    item["status"] = "queued"
+                    queued.append(item)
+            receipts = [dict(item) for item in thread.turn_receipts]
+            if not retry:
+                for index, receipt in enumerate(receipts):
+                    if str(receipt.get("queue_id") or "") == queue_id:
+                        receipt["status"] = "completed"
+                        receipt["updated_at"] = utc_now()
+                        _scrub_turn_receipt_recovery_fields(receipt)
+                        receipts[index] = receipt
+                        break
+            self.save(
+                replace(
+                    thread,
+                    queued_turns=tuple(queued),
+                    turn_receipts=tuple(receipts),
+                    updated_at=utc_now(),
+                )
+            )
+
+    def reserve_execution_turn(self, project_id: str, thread_id: str) -> CockpitThread | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            if not str(thread.workspace.get("session_id") or ""):
+                return thread
+            status = str(thread.workspace.get("status") or "")
+            if status == "interrupting":
+                raise RuntimeError("conversation execution is being interrupted")
+            if status in {"starting", "running"}:
+                raise RuntimeError("conversation execution already has an active turn")
+            return self.save(
+                replace(
+                    thread,
+                    updated_at=utc_now(),
+                    workspace={
+                        **thread.workspace,
+                        "status": "starting",
+                        "provision_phase": "starting",
+                    },
+                )
+            )
+
+    def release_execution_turn(self, project_id: str, thread_id: str) -> CockpitThread | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None or str(thread.workspace.get("status") or "") != "starting":
+                return thread
+            return self.save(
+                replace(
+                    thread,
+                    workspace={
+                        **thread.workspace,
+                        "status": "ready",
+                        "provision_phase": "ready",
+                    },
+                )
+            )
+
+    def recover_orphaned_execution(self, project_id: str, thread_id: str) -> CockpitThread | None:
+        """Release an execution lease left behind by a previous API process.
+
+        A foreground turn holds the lease in memory of the process running it.
+        Once that process is gone the turn cannot still be in flight, so a lease
+        surviving a restart is orphaned — and while it survives, every new turn
+        queues behind an execution that will never finish. The provider session
+        itself is untouched: the next turn re-ensures or replaces it.
+        """
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            status = str(thread.workspace.get("status") or "")
+            if status not in {"starting", "running"}:
+                return thread
+            return self.save(
+                replace(
+                    thread,
+                    updated_at=utc_now(),
+                    workspace={
+                        **thread.workspace,
+                        "status": "ready",
+                        "provision_phase": "ready",
+                        "provider_started": False,
+                    },
+                )
+            )
+
+    def claim_execution_interrupt(self, project_id: str, thread_id: str) -> CockpitThread | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            if not str(thread.workspace.get("session_id") or ""):
+                return thread
+            return self.save(
+                replace(
+                    thread,
+                    updated_at=utc_now(),
+                    workspace={
+                        **thread.workspace,
+                        "status": "interrupting",
+                        "provision_phase": "interrupting",
+                    },
+                )
+            )
+
+    def detach_execution_if_matches(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        expected_session_id: str,
+        expected_generation: int,
+    ) -> CockpitThread | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            current_session_id = str(thread.workspace.get("session_id") or "")
+            current_generation = int(thread.workspace.get("session_generation") or 0)
+            if (
+                current_session_id != expected_session_id
+                or current_generation != expected_generation
+            ):
+                return thread
+            return self.save(
+                replace(
+                    thread,
+                    updated_at=utc_now(),
+                    workspace={
+                        **thread.workspace,
+                        "session_id": "",
+                        "provider_started": False,
+                        "status": "interrupted",
+                        "provision_phase": "interrupted",
+                        "session_generation": current_generation + 1,
+                    },
+                )
+            )
+
+    def update_execution_if_matches(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        expected_session_id: str,
+        expected_generation: int,
+        status: str,
+        provision_phase: str,
+        extra: dict[str, Any] | None = None,
+    ) -> CockpitThread | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            if (
+                str(thread.workspace.get("session_id") or "") != expected_session_id
+                or int(thread.workspace.get("session_generation") or 0) != expected_generation
+                or str(thread.workspace.get("status") or "") == "interrupting"
+            ):
+                return None
+            return self.save(
+                replace(
+                    thread,
+                    updated_at=utc_now(),
+                    workspace={
+                        **thread.workspace,
+                        "status": status,
+                        "provision_phase": provision_phase,
+                        **(extra or {}),
+                    },
+                )
+            )
 
     def set_archived(
         self,
@@ -484,6 +1015,23 @@ class CockpitThreadIndex:
                 self._append_thread_messages(stored, [existing])
             return watch_id
 
+    @staticmethod
+    def _latest_child_watches(messages: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """Effective state per watch: the transcript is append-only, so each
+        renewal/claim/finish adds a record and only the *last* one for a watch
+        id is current. Scanning for the first match reads state that a later
+        record has already superseded — a completed watch still looked
+        `waiting`, which could re-claim it and fire a duplicate continuation.
+        """
+        latest: dict[str, dict[str, Any]] = {}
+        for message in messages:
+            if message.get("type") != "child_watch":
+                continue
+            watch_id = str(message.get("watch_id") or "")
+            if watch_id:
+                latest[watch_id] = message
+        return latest
+
     def claim_ready_child_watch(self, parent_chat_id: str, terminal_child_ids: set[str]) -> dict[str, Any] | None:
         thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
         if thread is None:
@@ -494,22 +1042,18 @@ class CockpitThreadIndex:
                 return None
             messages = self._thread_messages(thread)
             claimed: dict[str, Any] | None = None
-            for message in messages:
+            for message in self._latest_child_watches(messages).values():
                 expected = {str(item) for item in message.get("child_chat_ids") or []}
                 phase = str(message.get("phase") or "")
                 lease_expired = phase == "claimed" and _timestamp_before(
                     str(message.get("claimed_at") or ""),
                     datetime.now(UTC) - timedelta(seconds=CHILD_WATCH_LEASE_S),
                 )
-                if (
-                    message.get("type") == "child_watch"
-                    and (phase == "waiting" or lease_expired)
-                    and expected
-                    and expected <= terminal_child_ids
-                ):
+                if (phase == "waiting" or lease_expired) and expected and expected <= terminal_child_ids:
+                    message = dict(message)
                     message["phase"] = "claimed"
                     message["claimed_at"] = utc_now()
-                    claimed = dict(message)
+                    claimed = message
                     break
             if claimed is not None:
                 self._append_thread_messages(thread, [claimed])
@@ -524,14 +1068,15 @@ class CockpitThreadIndex:
             if thread is None:
                 return
             messages = self._thread_messages(thread)
-            for message in messages:
-                if message.get("type") == "child_watch" and message.get("watch_id") == watch_id:
-                    message["phase"] = "failed" if error else "completed"
-                    message["completed_at"] = utc_now()
-                    if error:
-                        message["error"] = public_error_message(error)
-                    self._append_thread_messages(thread, [message])
-                    break
+            latest = self._latest_child_watches(messages).get(watch_id)
+            if latest is None:
+                return
+            finished = dict(latest)
+            finished["phase"] = "failed" if error else "completed"
+            finished["completed_at"] = utc_now()
+            if error:
+                finished["error"] = public_error_message(error)
+            self._append_thread_messages(thread, [finished])
 
     def renew_child_watch_claim(self, parent_chat_id: str, watch_id: str) -> None:
         thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
@@ -542,15 +1087,19 @@ class CockpitThreadIndex:
             if thread is None:
                 return
             messages = self._thread_messages(thread)
-            for message in messages:
-                if (
-                    message.get("type") == "child_watch"
-                    and message.get("watch_id") == watch_id
-                    and message.get("phase") == "claimed"
-                ):
-                    message["claimed_at"] = utc_now()
-                    self._append_thread_messages(thread, [message])
-                    return
+            latest = self._latest_child_watches(messages).get(watch_id)
+            if latest is None or str(latest.get("phase") or "") != "claimed":
+                return
+            # The lease is still comfortably alive; another record would only
+            # grow the transcript.
+            if not _timestamp_before(
+                str(latest.get("claimed_at") or ""),
+                datetime.now(UTC) - timedelta(seconds=CHILD_WATCH_RENEW_INTERVAL_S),
+            ):
+                return
+            renewed = dict(latest)
+            renewed["claimed_at"] = utc_now()
+            self._append_thread_messages(thread, [renewed])
 
     def child_watch_is_claimed(self, parent_chat_id: str, watch_id: str) -> bool:
         thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
@@ -560,12 +1109,8 @@ class CockpitThreadIndex:
             thread = self.get(thread.project_id, thread.thread_id)
             if thread is None:
                 return False
-            return any(
-                message.get("type") == "child_watch"
-                and message.get("watch_id") == watch_id
-                and message.get("phase") == "claimed"
-                for message in self._thread_messages(thread)
-            )
+            latest = self._latest_child_watches(self._thread_messages(thread)).get(watch_id)
+            return latest is not None and str(latest.get("phase") or "") == "claimed"
 
     def append_turn(
         self,
@@ -576,6 +1121,7 @@ class CockpitThreadIndex:
         assistant_peer_id: str,
         assistant_text: str,
         events: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+        idempotency_key: str = "",
     ) -> CockpitThread:
         with self._transcript_lock(thread.project_id, thread.thread_id):
             observed_at = utc_now()
@@ -583,12 +1129,19 @@ class CockpitThreadIndex:
             if stored is None and self._is_deleted(thread.project_id, thread.thread_id):
                 raise KeyError(thread.thread_id)
             archive_source = stored or thread
+            existing_messages = self._thread_messages(archive_source, seed_messages=thread.messages)
+            if idempotency_key and any(
+                message.get("turn_idempotency_key") == idempotency_key
+                for message in existing_messages
+            ):
+                return replace(archive_source, messages=tuple(existing_messages))
             appended = [
                 {
                     "role": "user",
                     "peer_id": user_peer_id,
                     "content": user_text,
                     "observed_at": observed_at,
+                    "turn_idempotency_key": idempotency_key,
                 },
                 {
                     "role": "assistant",
@@ -608,6 +1161,9 @@ class CockpitThreadIndex:
                     archive_reason=archive_source.archive_reason,
                     last_turn_at=observed_at,
                     messages=(),
+                    workspace=dict(archive_source.workspace),
+                    queued_turns=tuple(archive_source.queued_turns),
+                    turn_receipts=tuple(archive_source.turn_receipts),
                 )
             )
             messages = self._append_thread_messages(updated, appended, seed_messages=thread.messages)
@@ -620,6 +1176,7 @@ class CockpitThreadIndex:
         user_peer_id: str,
         user_text: str,
         assistant_peer_id: str,
+        idempotency_key: str = "",
     ) -> CockpitThread:
         with self._transcript_lock(thread.project_id, thread.thread_id):
             observed_at = utc_now()
@@ -627,12 +1184,19 @@ class CockpitThreadIndex:
             if stored is None and self._is_deleted(thread.project_id, thread.thread_id):
                 raise KeyError(thread.thread_id)
             archive_source = stored or thread
+            existing_messages = self._thread_messages(archive_source, seed_messages=thread.messages)
+            if idempotency_key and any(
+                message.get("turn_idempotency_key") == idempotency_key
+                for message in existing_messages
+            ):
+                return replace(archive_source, messages=tuple(existing_messages))
             appended = [
                 {
                     "role": "user",
                     "peer_id": user_peer_id,
                     "content": user_text,
                     "observed_at": observed_at,
+                    "turn_idempotency_key": idempotency_key,
                 },
                 {
                     "role": "assistant",
@@ -651,6 +1215,9 @@ class CockpitThreadIndex:
                     archive_reason=archive_source.archive_reason,
                     last_turn_at=observed_at,
                     messages=(),
+                    workspace=dict(archive_source.workspace),
+                    queued_turns=tuple(archive_source.queued_turns),
+                    turn_receipts=tuple(archive_source.turn_receipts),
                 )
             )
             messages = self._append_thread_messages(updated, appended, seed_messages=thread.messages)
@@ -1006,6 +1573,79 @@ class CockpitConnector:
         if not title or title == thread.title:
             return thread
         return self._index.save(replace(thread, title=title[:200], updated_at=utc_now()))
+
+    def claim_execution_interrupt(self, project: ProjectEntry, thread_id: str) -> CockpitThread | None:
+        return self._index.claim_execution_interrupt(project.id, thread_id)
+
+    def detach_interrupted_execution(
+        self,
+        project: ProjectEntry,
+        thread_id: str,
+        *,
+        expected_session_id: str,
+        expected_generation: int,
+    ) -> CockpitThread | None:
+        return self._index.detach_execution_if_matches(
+            project.id,
+            thread_id,
+            expected_session_id=expected_session_id,
+            expected_generation=expected_generation,
+        )
+
+    async def drain_queued_turns(self, project: ProjectEntry, thread_id: str) -> int:
+        drained = 0
+        while True:
+            thread = self._index.get(project.id, thread_id)
+            if thread is None or thread.archived_at or not thread.queued_turns:
+                return drained
+            worker_id = str(thread.workspace.get("worker_id") or thread.worker_id or "")
+            session_id = str(thread.workspace.get("session_id") or "")
+            if worker_id and session_id:
+                execution = await asyncio.to_thread(
+                    self._get_worker_json,
+                    worker_id,
+                    f"/sessions/{session_id}/execution-state",
+                )
+                if isinstance(execution.get("active_turn"), dict) or str(execution.get("status") or "") in {
+                    "starting",
+                    "running",
+                    "waiting_approval",
+                    "waiting_input",
+                    "interrupting",
+                }:
+                    return drained
+            queued = self._index.claim_queued_turn(project.id, thread_id)
+            if queued is None:
+                return drained
+            queue_id = str(queued.get("queue_id") or "")
+            try:
+                await self.turn(
+                    project,
+                    thread,
+                    _context_from_snapshot(dict(queued.get("requester") or {})),
+                    str(queued.get("text") or ""),
+                    attachments=[dict(item) for item in queued.get("attachments") or () if isinstance(item, dict)] or None,
+                    workspace_request=(
+                        dict(queued["workspace_request"])
+                        if isinstance(queued.get("workspace_request"), dict)
+                        else None
+                    ),
+                    logical_turn_id=queue_id,
+                    idempotency_key=str(queued.get("idempotency_key") or queue_id),
+                )
+            except WorkerRequestError as exc:
+                self._index.release_execution_turn(project.id, thread_id)
+                self._index.finish_queued_turn(project.id, thread_id, queue_id, retry=True)
+                if exc.code == WORKER_ERROR_SESSION_ACTIVE:
+                    return drained
+                raise
+            except Exception:
+                self._index.release_execution_turn(project.id, thread_id)
+                self._index.finish_queued_turn(project.id, thread_id, queue_id, retry=True)
+                raise
+            self._index.finish_queued_turn(project.id, thread_id, queue_id)
+            drained += 1
+
     def delete_thread(self, project: ProjectEntry, thread_id: str) -> tuple[CockpitThread | None, bool]:
         return self._index.delete(project.id, thread_id)
 
@@ -1076,6 +1716,8 @@ class CockpitConnector:
         workspace_request: dict[str, Any] | None = None,
         progress: Callable[[dict[str, Any]], Any] | None = None,
         cold_task_sink: Callable[[BrainSession], Any] | None = None,
+        logical_turn_id: str = "",
+        idempotency_key: str = "",
     ) -> tuple[str, CockpitThread, tuple[dict[str, Any], ...]]:
         text = text.strip()
         if not text:
@@ -1084,12 +1726,17 @@ class CockpitConnector:
         explicit_workspace_request = workspace_request is not None
         workspace_request = dict(workspace_request or {})
         if context_thread.chat_type == "orchestrator":
+            requested_engine = str(workspace_request.get("engine") or "").strip().lower()
+            if requested_engine:
+                context_thread = self._apply_orchestrator_engine(project, context_thread, requested_engine)
             reply, updated = await self._orchestrator_turn(
                 project,
                 context_thread,
                 requester,
                 _text_with_attachment_markers(text, attachments),
                 progress=progress,
+                logical_turn_id=logical_turn_id,
+                idempotency_key=idempotency_key,
             )
             return reply, updated, ()
         if context_thread.workspace or explicit_workspace_request:
@@ -1100,6 +1747,8 @@ class CockpitConnector:
                 _text_with_attachment_markers(text, attachments),
                 workspace_request=workspace_request,
                 progress=progress,
+                logical_turn_id=logical_turn_id,
+                idempotency_key=idempotency_key,
             )
             return reply, updated, ()
         project_context = _project_context(self._memory, project, context_thread)
@@ -1167,6 +1816,7 @@ class CockpitConnector:
             assistant_peer_id=self._cfg.memory.assistant_peer_id,
             assistant_text=reply,
             events=events,
+            idempotency_key=idempotency_key,
         )
         return reply, updated, events
 
@@ -1179,11 +1829,24 @@ class CockpitConnector:
         *,
         workspace_request: dict[str, Any],
         progress: Callable[[dict[str, Any]], Any] | None,
+        logical_turn_id: str = "",
+        idempotency_key: str = "",
     ) -> tuple[str, CockpitThread]:
         await _emit_progress(progress, {"phase": "resolving-access", "thread_id": thread.thread_id})
+        thread = self._index.reserve_execution_turn(project.id, thread.thread_id) or thread
+        reserved_session_id = str(thread.workspace.get("session_id") or "")
         thread = await self._ensure_workspace(project, thread, requester, workspace_request=workspace_request, progress=progress)
+        stored_thread = self._index.get(project.id, thread.thread_id) or thread
+        if (
+            str(stored_thread.workspace.get("session_id") or "") != reserved_session_id
+            or str(stored_thread.workspace.get("status") or "") != "starting"
+        ):
+            thread = self._index.reserve_execution_turn(project.id, thread.thread_id) or thread
+        else:
+            thread = stored_thread
         worker_id = str(thread.workspace.get("worker_id") or "")
         session_id = str(thread.workspace.get("session_id") or "")
+        session_generation = int(thread.workspace.get("session_generation") or 0)
         if not worker_id or not session_id:
             raise RuntimeError("conversation workspace has no worker session")
         await _emit_progress(progress, {"phase": "running", "thread_id": thread.thread_id, "workspace": workspace_public(thread.workspace)})
@@ -1192,6 +1855,7 @@ class CockpitConnector:
             worker_id,
             f"/sessions/{session_id}/turns",
             {
+                "turn_id": logical_turn_id or new_id("turn"),
                 "prompt": _workspace_prompt(project, thread, text),
                 "metadata": {
                     "surface": "cockpit_thread",
@@ -1200,17 +1864,25 @@ class CockpitConnector:
                     "honcho_session_id": thread.session_id,
                     "allowed_actions": [WORKER_SESSION_TURN],
                 },
-                # `thread` here comes from _ensure_workspace, whose index round-trip
-                # always returns messages=() (CockpitThreadIndex.save() strips them),
-                # so a len(thread.messages) key would be constant and every repeat of
-                # the same text would collide as a "replay" the worker never re-runs.
-                # A fresh id() per call keeps each real turn distinct; the cockpit
-                # doesn't retry the same turn object, so there is no dedupe need here.
-                "idempotency_key": f"thread-turn:{thread.thread_id}:{new_id('turn')}:{_stable_text_hash(text)}",
+                "idempotency_key": (
+                    f"thread-turn:{thread.thread_id}:{idempotency_key}"
+                    if idempotency_key
+                    else f"thread-turn:{thread.thread_id}:{new_id('turn')}:{_stable_text_hash(text)}"
+                ),
             },
         )
         if not turn.get("ok", True):
             raise RuntimeError(str(turn.get("error") or "worker rejected conversation turn"))
+        thread = self._index.update_execution_if_matches(
+            project.id,
+            thread.thread_id,
+            expected_session_id=session_id,
+            expected_generation=session_generation,
+            status="ready",
+            provision_phase="ready",
+        )
+        if thread is None:
+            raise RuntimeError("conversation execution was interrupted")
         reply = "Workspace turn is running."
         # Best-effort per AGENTS.md: a memory outage here must not raise out of
         # the turn handler after the worker turn was already dispatched — that
@@ -1231,6 +1903,7 @@ class CockpitConnector:
             user_peer_id=requester.memory_peer,
             user_text=text,
             assistant_peer_id=self._cfg.memory.assistant_peer_id,
+            idempotency_key=idempotency_key,
         )
         return reply, updated
 
@@ -1242,10 +1915,23 @@ class CockpitConnector:
         text: str,
         *,
         progress: Callable[[dict[str, Any]], Any] | None,
+        logical_turn_id: str = "",
+        idempotency_key: str = "",
     ) -> tuple[str, CockpitThread]:
+        thread = self._index.reserve_execution_turn(project.id, thread.thread_id) or thread
+        reserved_session_id = str(thread.workspace.get("session_id") or "")
         thread = await self._ensure_orchestrator_session(project, thread, requester, progress=progress)
+        stored_thread = self._index.get(project.id, thread.thread_id) or thread
+        if (
+            str(stored_thread.workspace.get("session_id") or "") != reserved_session_id
+            or str(stored_thread.workspace.get("status") or "") != "starting"
+        ):
+            thread = self._index.reserve_execution_turn(project.id, thread.thread_id) or thread
+        else:
+            thread = stored_thread
         worker_id = str(thread.workspace.get("worker_id") or "")
         session_id = str(thread.workspace.get("session_id") or "")
+        session_generation = int(thread.workspace.get("session_generation") or 0)
         if not worker_id or not session_id:
             raise RuntimeError("orchestrator conversation has no worker session")
         context = _project_context(self._memory, project, thread)
@@ -1260,7 +1946,7 @@ class CockpitConnector:
             thread_id=thread.thread_id,
             requester=requester,
         )
-        turn_id = new_id("turn")
+        turn_id = logical_turn_id or new_id("turn")
         response = await asyncio.to_thread(
             self._post_worker_json,
             worker_id,
@@ -1284,45 +1970,47 @@ class CockpitConnector:
                         "timeout_s": _orchestrator_mcp_timeout_s(self._cfg),
                     }
                 },
-                "idempotency_key": f"orchestrator-turn:{thread.thread_id}:{turn_id}",
+                "idempotency_key": (
+                    f"orchestrator-turn:{thread.thread_id}:{idempotency_key}"
+                    if idempotency_key
+                    else f"orchestrator-turn:{thread.thread_id}:{turn_id}"
+                ),
             },
         )
         if response.get("ok") is False:
             raise RuntimeError(str(response.get("error") or "worker rejected orchestrator turn"))
-        thread = self._index.save(
-            replace(
-                thread,
-                workspace={
-                    **thread.workspace,
-                    "provider_started": True,
-                    "status": "running",
-                    "provision_phase": "running",
-                },
-            )
+        thread = self._index.update_execution_if_matches(
+            project.id,
+            thread.thread_id,
+            expected_session_id=session_id,
+            expected_generation=session_generation,
+            status="running",
+            provision_phase="running",
+            extra={"provider_started": True},
         )
+        if thread is None:
+            raise RuntimeError("conversation execution was interrupted")
         await _emit_progress(progress, {"phase": "running", "thread_id": thread.thread_id, "workspace": workspace_public(thread.workspace)})
         try:
             reply = await self._wait_for_orchestrator_turn(worker_id, session_id, turn_id)
         except Exception:
-            failed = self._index.save(
-                replace(
-                    thread,
-                    updated_at=utc_now(),
-                    workspace={
-                        **thread.workspace,
-                        "status": "failed",
-                        "provision_phase": "failed",
+            failed = self._index.update_execution_if_matches(
+                project.id,
+                thread.thread_id,
+                expected_session_id=session_id,
+                expected_generation=session_generation,
+                status="failed",
+                provision_phase="failed",
+            )
+            if failed is not None:
+                await _emit_progress(
+                    progress,
+                    {
+                        "phase": "failed",
+                        "thread_id": failed.thread_id,
+                        "workspace": workspace_public(failed.workspace),
                     },
                 )
-            )
-            await _emit_progress(
-                progress,
-                {
-                    "phase": "failed",
-                    "thread_id": failed.thread_id,
-                    "workspace": workspace_public(failed.workspace),
-                },
-            )
             raise
         try:
             await asyncio.to_thread(
@@ -1335,20 +2023,58 @@ class CockpitConnector:
             )
         except Exception:
             pass
-        completed = replace(
-            thread,
-            workspace={
-                **thread.workspace,
-                "status": "ready",
-                "provision_phase": "ready",
-            },
+        completed = self._index.update_execution_if_matches(
+            project.id,
+            thread.thread_id,
+            expected_session_id=session_id,
+            expected_generation=session_generation,
+            status="ready",
+            provision_phase="ready",
         )
+        if completed is None:
+            raise RuntimeError("conversation execution was interrupted")
         return reply, self._index.append_turn(
             completed,
             user_peer_id=requester.memory_peer,
             user_text=text,
             assistant_peer_id=self._cfg.memory.assistant_peer_id,
             assistant_text=reply,
+            idempotency_key=idempotency_key,
+        )
+
+    def _apply_orchestrator_engine(
+        self,
+        project: ProjectEntry,
+        thread: CockpitThread,
+        engine: str,
+    ) -> CockpitThread:
+        """Route the reserved turn to `engine`, replacing any previous provider session.
+
+        Turn reservation upstream guarantees no other execution is in flight, so
+        dropping the session is replay-safe: history lives on the thread and the
+        orchestrator prompt rebuilds project context every turn.
+        """
+        if engine not in ORCHESTRATOR_ENGINES:
+            raise ValueError("orchestrator engine must be codex or claude")
+        if engine == thread.engine:
+            return thread
+        workspace = {
+            **thread.workspace,
+            "session_id": "",
+            "provider_started": False,
+            "session_generation": int(thread.workspace.get("session_generation") or 0) + 1,
+        }
+        workspace.pop("model", None)
+        return self._index.save(
+            replace(
+                thread,
+                engine=engine,
+                # The previous model id belongs to the old provider; the new
+                # provider's session starts on its own default.
+                model="",
+                updated_at=utc_now(),
+                workspace=workspace,
+            )
         )
 
     async def _ensure_orchestrator_session(
@@ -1439,11 +2165,11 @@ class CockpitConnector:
                         "run_id": thread.thread_id,
                         "engine": thread.engine,
                         "model": thread.model,
-                        "allowed_actions": [WORKER_SESSION_CREATE, WORKER_SESSION_TURN, WORKER_SESSION_STOP],
-                        "landing": {"mode": "review", "allow_merge": False},
+                        "allowed_actions": CONVERSATION_SESSION_ALLOWED_ACTIONS,
+                        "landing": dict(CONVERSATION_SESSION_LANDING),
                     },
-                    "allowed_actions": [WORKER_SESSION_CREATE, WORKER_SESSION_TURN, WORKER_SESSION_STOP],
-                    "landing": {"mode": "review", "allow_merge": False},
+                    "allowed_actions": CONVERSATION_SESSION_ALLOWED_ACTIONS,
+                    "landing": dict(CONVERSATION_SESSION_LANDING),
                     "model": thread.model,
                     "trusted_mcp_servers": ["jarvis_orchestrator"],
                     "chat_type": "orchestrator",
@@ -1500,7 +2226,16 @@ class CockpitConnector:
                         assistant_messages.append(event_text)
                 elif event_type == EVENT_TURN_FAILED:
                     terminal = True
-                    terminal_error = str(data.get("error") or "orchestrator turn failed")
+                    terminal_error = turn_failure_message(data) or "orchestrator turn failed"
+                elif event_type == EVENT_APPROVAL_REQUESTED:
+                    # The session is minted to never ask; an approval here means
+                    # nobody can answer it, so fail closed instead of hanging
+                    # headless until the job timeout.
+                    terminal = True
+                    terminal_error = (
+                        "orchestrator turn requested an approval it cannot receive; "
+                        "the session is configured to act without approvals"
+                    )
                 elif event_type == EVENT_TURN_COMPLETED:
                     terminal = True
             if events and isinstance(events[-1], dict):
@@ -1508,10 +2243,10 @@ class CockpitConnector:
                 if latest_event_id:
                     after_event_id = latest_event_id
             if terminal_error:
-                raise RuntimeError(public_error_message(terminal_error))
+                raise ProviderTurnError(public_error_message(terminal_error))
             if terminal:
                 if not assistant_messages:
-                    raise RuntimeError("orchestrator turn completed without an assistant result")
+                    raise ProviderTurnError("orchestrator turn completed without an assistant result")
                 return assistant_messages[-1]
             if len(events) >= 500 and after_event_id:
                 continue
@@ -1545,11 +2280,19 @@ class CockpitConnector:
         repos = _workspace_repos(project, workspace_request)
         for repo in repos:
             thread = self._mark_phase(thread, phase="cloning")
-            if progress is not None:
-                progress({"phase": "cloning", "thread_id": thread.thread_id, "repo": repo.get("name") or repo.get("repo")})
+            await _emit_progress(
+                progress,
+                {"phase": "cloning", "thread_id": thread.thread_id, "repo": repo.get("name") or repo.get("repo")},
+            )
             thread = self._mark_phase(thread, phase="creating-worktree")
-            if progress is not None:
-                progress({"phase": "creating-worktree", "thread_id": thread.thread_id, "repo": repo.get("name") or repo.get("repo")})
+            await _emit_progress(
+                progress,
+                {
+                    "phase": "creating-worktree",
+                    "thread_id": thread.thread_id,
+                    "repo": repo.get("name") or repo.get("repo"),
+                },
+            )
             materialized = await asyncio.to_thread(
                 self._post_worker_json,
                 worker_id,
@@ -1635,7 +2378,9 @@ class CockpitConnector:
                 workspace_state,
                 progress,
             )
-            session_id = str(state.get("session_id") or f"conv_{slugify(thread.thread_id)}")
+            generation = int(state.get("session_generation") or 0)
+            suffix = f"_{generation}" if generation else ""
+            session_id = str(state.get("session_id") or f"conv_{slugify(thread.thread_id)}{suffix}")
             engine = str(workspace_request.get("engine") or profile.default_engine or profile.agent or self._cfg.worker.agent)
             await asyncio.to_thread(
                 self._ensure_worker_session,
@@ -1651,10 +2396,10 @@ class CockpitConnector:
                         "execution_envelope": {
                             "run_id": thread.thread_id,
                             "engine": engine,
-                            "allowed_actions": [WORKER_SESSION_CREATE, WORKER_SESSION_TURN, WORKER_SESSION_STOP],
+                            "allowed_actions": CONVERSATION_SESSION_ALLOWED_ACTIONS,
                             "landing": {"mode": "branch_only", "allow_merge": False},
                         },
-                        "allowed_actions": [WORKER_SESSION_CREATE, WORKER_SESSION_TURN, WORKER_SESSION_STOP],
+                        "allowed_actions": CONVERSATION_SESSION_ALLOWED_ACTIONS,
                         "landing": {"mode": "branch_only", "allow_merge": False},
                         "conversation_workspace": True,
                         "workspace_id": workspace_state.get("workspace_id") or "",
@@ -1962,7 +2707,10 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
         title = str(args.get("title") or args.get("name") or task).strip()
         if not task:
             return "error: task is required"
-        repo = str(args.get("repo") or _project_default_repo(project) or cfg.orchestration.default_repo).strip()
+        try:
+            repo = _child_work_repo(project, str(args.get("repo") or ""), default=cfg.orchestration.default_repo)
+        except ValueError as exc:
+            return f"error: {exc}"
         item = WorkItem(
             source="manual",
             id=new_id("manual"),
@@ -1973,12 +2721,20 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
         )
         worker_id = str(args.get("worker_id") or "").strip()
         provider_instance_id = str(args.get("provider_instance_id") or "").strip()
+        # An unknown engine id matched no worker and surfaced as the misleading
+        # "No eligible worker found"; name the real problem instead.
+        requested_engine = normalize_engine_id(str(args.get("engine") or ""))
+        if requested_engine and requested_engine not in BUILTIN_CODE_ENGINES:
+            return (
+                f"error: unknown engine {requested_engine!r}; "
+                f"valid engines are {', '.join(sorted(BUILTIN_CODE_ENGINES))}"
+            )
         command = WorkCommand(
             operation="start_next_work",
             source="manual",
             filters={"project_id": project.id},
             target_worker_id=worker_id,
-            target_engine_id=str(args.get("engine") or ""),
+            target_engine_id=requested_engine,
             target_model_id=str(args.get("model") or ""),
             provider_instance_id=provider_instance_id,
             start=True,
@@ -2021,7 +2777,11 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
                     "type": "string",
                     "description": "Optional explicit cockpit provider instance id, preserved independently of fleet worker routing.",
                 },
-                "engine": {"type": "string", "description": "Optional worker engine route, e.g. codex or claude."},
+                "engine": {
+                    "type": "string",
+                    "enum": sorted(BUILTIN_CODE_ENGINES),
+                    "description": "Optional worker engine route: exactly 'codex' or 'claude'.",
+                },
                 "model": {"type": "string", "description": "Optional explicit provider model id."},
                 "landing_mode": {
                     "type": "string",
@@ -2266,12 +3026,25 @@ def _continue_child_watch(cfg: Config, parent_chat_id: str, watch: dict[str, Any
             if not index.child_watch_is_claimed(parent_chat_id, watch_id):
                 return
             try:
+                if index.has_queued_turns(thread.project_id, thread.thread_id):
+                    await connector.drain_queued_turns(project, thread.thread_id)
+                    if index.has_queued_turns(thread.project_id, thread.thread_id):
+                        index.renew_child_watch_claim(parent_chat_id, watch_id)
+                        await asyncio.sleep(1.0)
+                        continue
                 await connector.turn(project, thread, requester, instruction)
                 break
-            except RuntimeError as exc:
+            except (RuntimeError, OSError, TimeoutError, httpx.TransportError) as exc:
                 message = str(exc).lower()
                 code = exc.code if isinstance(exc, WorkerRequestError) else ""
-                retryable = code in {
+                # A worker restart mid-join surfaces as a transport failure;
+                # the child results are durable, so keep the claim and retry
+                # until the deadline instead of losing the continuation.
+                transport = isinstance(exc, (OSError, TimeoutError, httpx.TransportError)) or any(
+                    marker in message
+                    for marker in ("connection refused", "connection reset", "timed out", "connect error")
+                )
+                retryable = transport or code in {
                     WORKER_ERROR_SESSION_ACTIVE,
                     WORKER_ERROR_SESSION_TERMINAL,
                 } or (
@@ -2285,7 +3058,7 @@ def _continue_child_watch(cfg: Config, parent_chat_id: str, watch: dict[str, Any
                 if not retryable or asyncio.get_running_loop().time() >= deadline:
                     raise
                 index.renew_child_watch_claim(parent_chat_id, watch_id)
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(2.0 if transport else 1.0)
 
     try:
         asyncio.run(run())
@@ -2335,14 +3108,27 @@ def _publish_github_pr_review_tool(cfg: Config, project: ProjectEntry) -> Tool:
         except Exception as exc:  # noqa: BLE001 - external write errors become bounded tool output
             return f"error: could not publish GitHub review ({public_error_message(str(exc))})"
         result = payload.get("review") if isinstance(payload.get("review"), dict) else {}
+        review_id = int(result.get("review_id") or 0)
+        replayed = bool(payload.get("replayed"))
+        # A receipt must describe what actually happened. Reporting published
+        # for an empty result let an orchestrator truthfully relay a review it
+        # never posted. A zero id means no GitHub review exists — including a
+        # replayed idempotency result cached from an earlier empty or
+        # all-duplicate response, which would otherwise preserve the false
+        # success on every retry.
+        if review_id <= 0:
+            return (
+                "error: GitHub returned no review for this publish; nothing was posted. "
+                f"skipped_comments={int(result.get('skipped_comments') or 0)}"
+            )
         return json.dumps(
             {
                 "published": True,
-                "review_id": int(result.get("review_id") or 0),
+                "review_id": review_id,
                 "url": str(result.get("url") or ""),
                 "comments": int(result.get("comments") or 0),
                 "skipped_comments": int(result.get("skipped_comments") or 0),
-                "replayed": bool(payload.get("replayed")),
+                "replayed": replayed,
                 "worker_id": worker.worker_id,
             },
             sort_keys=True,
@@ -2462,6 +3248,38 @@ def _github_review_worker(cfg: Config, project: ProjectEntry, repo: str):  # noq
         ):
             return worker
     raise RuntimeError(f"no authenticated worker can publish reviews for a repository in project {project.id}")
+
+
+def _child_work_repo(project: ProjectEntry, requested: str, *, default: str = "") -> str:
+    """Resolve a child work repo request to a worker-usable remote.
+
+    Orchestrators reference repos by their registry alias (the name shown in
+    the workspace projection) or echo another worker's absolute checkout path;
+    workers only understand remotes, so both must map through the registry.
+    A path that maps to no registry repo is rejected rather than dispatched —
+    it is meaningless (or worse, someone else's checkout) on another worker.
+    """
+    repo = requested.strip() or _project_default_repo(project) or default
+    registry_match = next((entry for entry in project.repos if repo in (entry.name, entry.remote)), None)
+    if registry_match is not None and registry_match.remote:
+        return registry_match.remote
+    if repo.startswith(("/", "~")):
+        basename = PurePosixPath(repo).name
+        basename_match = next(
+            (
+                entry
+                for entry in project.repos
+                if entry.remote and (entry.name == basename or entry.remote.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") == basename)
+            ),
+            None,
+        )
+        if basename_match is not None:
+            return basename_match.remote
+        raise ValueError(
+            f"child work repo {repo!r} is a worker-local path with no matching project repository; "
+            "use a registry repo name or org/name remote"
+        )
+    return repo
 
 
 def _project_default_repo(project: ProjectEntry) -> str:
@@ -2715,6 +3533,29 @@ def _thread_title(text: str) -> str:
     return title if len(title) <= 72 else title[:71] + "..."
 
 
+def _scrub_turn_receipt_recovery_fields(receipt: dict[str, Any]) -> None:
+    for key in ("text", "requester", "workspace_request", "has_attachments"):
+        receipt.pop(key, None)
+
+
+def _thread_turn_fingerprint(
+    text: str,
+    workspace_request: dict[str, Any] | None,
+    attachments: list[dict[str, Any]] | None,
+) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "text": text,
+                "workspace_request": workspace_request,
+                "attachments": attachments or [],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _timestamp_before(value: str, threshold: datetime) -> bool:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -2748,6 +3589,7 @@ def _normalized_messages(messages: Any) -> list[dict[str, Any]]:
             "claimed_at",
             "completed_at",
             "error",
+            "turn_idempotency_key",
         ):
             if key in item:
                 message[key] = str(item.get(key) or "")
@@ -2797,7 +3639,7 @@ def _workspace_is_ready(thread: CockpitThread) -> bool:
     return (
         bool(workspace.get("worker_id"))
         and bool(workspace.get("session_id"))
-        and str(workspace.get("status") or "") == "ready"
+        and str(workspace.get("status") or "") in {"ready", "starting"}
     )
 
 

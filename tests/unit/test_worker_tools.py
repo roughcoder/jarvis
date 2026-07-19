@@ -102,8 +102,12 @@ def test_check_latest_and_list_against_live_daemon(tmp_path) -> None:
             tools = {t.name: t for t in make_worker_tools(tcfg)}
             ctx = _ctx("worker.code")
             started = await tools["start_coding_job"].handler(ctx, {"task": "say hi"})
-            await asyncio.sleep(0.3)
-            checked = await tools["check_coding_job"].handler(ctx, {})  # no id => latest
+            checked = ""
+            for _ in range(300):
+                checked = await tools["check_coding_job"].handler(ctx, {})  # no id => latest
+                if "still running" not in checked:
+                    break
+                await asyncio.sleep(0.05)
             listed = await tools["list_coding_jobs"].handler(ctx, {})
             return started, checked, listed
         finally:

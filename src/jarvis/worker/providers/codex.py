@@ -18,6 +18,7 @@ from jarvis.worker.orchestrator_runtime import (
 from jarvis.worker.providers._common import (
     control_request_id as _control_request_id,
 )
+from jarvis.worker.providers._common import normalize_approval_decision
 from jarvis.worker.providers._common import (
     record_provider_log as _record_provider_log_impl,
 )
@@ -58,6 +59,7 @@ from jarvis.worker_session_contract import (
     SESSION_STOPPED,
     SESSION_WAITING_APPROVAL,
     SESSION_WAITING_INPUT,
+    turn_failure_message,
 )
 
 
@@ -110,15 +112,15 @@ class CodexProviderAdapter:
         return [started]
 
     def interrupt(self, *, session: WorkerSession, sessions: SessionManager) -> tuple[WorkerSession, SessionEvent]:
-        _terminate_provider_process(session)
         updated = sessions.update_status(session.session_id, SESSION_INTERRUPTED)
         event = sessions.append_event(updated.session_id, EVENT_SESSION_INTERRUPTED, {"status": SESSION_INTERRUPTED})
+        _terminate_provider_process(updated)
         return updated, event
 
     def stop(self, *, session: WorkerSession, sessions: SessionManager) -> tuple[WorkerSession, SessionEvent]:
-        _terminate_provider_process(session)
         updated = sessions.update_status(session.session_id, SESSION_STOPPED)
         event = sessions.append_event(updated.session_id, EVENT_SESSION_STOPPED, {"status": SESSION_STOPPED})
+        _terminate_provider_process(updated)
         return updated, event
 
     def resolve_approval(
@@ -354,6 +356,7 @@ def _codex_run_turn_and_wait(
     """Start the turn on the resolved thread, then block reading app-server
     events until the turn completes (or times out)."""
     rpc_id += 1
+    turn_sandbox_policy = authority.codex_turn_sandbox_policy
     _send_json(
         process,
         {
@@ -364,6 +367,7 @@ def _codex_run_turn_and_wait(
                 "threadId": thread_id,
                 "cwd": cwd,
                 "approvalPolicy": authority.codex_approval_policy,
+                **({"sandboxPolicy": turn_sandbox_policy} if turn_sandbox_policy else {}),
                 "input": _turn_input(turn),
             },
         },
@@ -714,7 +718,11 @@ def _project_jsonrpc_message(
             rpc_id=message.get("id"),
             params=params,
         )
-        sessions.append_event(session_id, EVENT_APPROVAL_REQUESTED, {**common, **params, "request_id": request_id})
+        sessions.append_event(
+            session_id,
+            EVENT_APPROVAL_REQUESTED,
+            {**common, **params, "request_id": request_id, "request_kind": "command"},
+        )
         sessions.update_status(session_id, SESSION_WAITING_APPROVAL)
     elif method == "item/fileChange/requestApproval":
         request_id = _message_request_id(message, params)
@@ -726,7 +734,11 @@ def _project_jsonrpc_message(
             rpc_id=message.get("id"),
             params=params,
         )
-        sessions.append_event(session_id, EVENT_APPROVAL_REQUESTED, {**common, **params, "request_id": request_id})
+        sessions.append_event(
+            session_id,
+            EVENT_APPROVAL_REQUESTED,
+            {**common, **params, "request_id": request_id, "request_kind": "file-change"},
+        )
         sessions.update_status(session_id, SESSION_WAITING_APPROVAL)
     elif method == "item/tool/requestUserInput":
         request_id = _message_request_id(message, params)
@@ -757,11 +769,16 @@ def _project_jsonrpc_message(
             return True
         status = str(dict(params.get("turn") or {}).get("status") or "completed")
         event_type = EVENT_TURN_COMPLETED if status in {"completed", "done", "succeeded"} else EVENT_TURN_FAILED
+        payload = {**common, "provider_status": status, "raw": params}
+        if event_type == EVENT_TURN_FAILED:
+            failure = turn_failure_message(payload)
+            if failure:
+                payload["error"] = failure
         sessions.append_event_with_status(
             session_id,
             SESSION_COMPLETED if event_type == EVENT_TURN_COMPLETED else SESSION_FAILED,
             event_type,
-            {**common, "provider_status": status, "raw": params},
+            payload,
         )
         return True
     elif method == "turn/started":
@@ -858,16 +875,15 @@ def _clear_pending_requests(session_id: str, process: subprocess.Popen[str]) -> 
 
 
 def _approval_result(request: dict[str, Any]) -> dict[str, Any]:
-    decision = str(request.get("decision") or "").strip().lower()
-    if decision in {"approved", "approve", "allow", "allowed", "yes", "accept"}:
-        mapped = "accept"
-    elif decision in {"acceptforsession", "accept_for_session", "always"}:
-        mapped = "acceptForSession"
-    elif decision == "cancel":
-        mapped = "cancel"
-    else:
-        mapped = "decline"
-    return {"decision": mapped}
+    decision = normalize_approval_decision(request.get("decision"))
+    return {
+        "decision": {
+            "approved": "accept",
+            "approved_for_session": "acceptForSession",
+            "denied": "decline",
+            "cancelled": "cancel",
+        }[decision]
+    }
 
 
 def _input_result(request: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:

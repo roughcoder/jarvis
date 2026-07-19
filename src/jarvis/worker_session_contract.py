@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 SESSION_CREATED = "created"
 SESSION_RUNNING = "running"
 SESSION_WAITING_PROVIDER = "waiting_provider"
@@ -91,3 +93,41 @@ def request_type(event_type: str) -> str:
 
 def resolved_request_type(event_type: str) -> str:
     return RESOLVED_REQUEST_EVENT_TYPES.get(event_type, "")
+
+
+def turn_failure_message(data: Any) -> str:
+    """Operator-readable failure text for a `turn.failed` event payload.
+
+    Providers attach their terminal payload under `raw` with provider-specific
+    shapes; older workers may emit neither `error` nor a parseable `raw`, so an
+    empty string means "no detail available" and callers keep their fallback.
+    """
+    if not isinstance(data, dict):
+        return ""
+    error = str(data.get("error") or "").strip()
+    if error:
+        return error
+    raw = data.get("raw")
+    if not isinstance(raw, dict):
+        return ""
+    turn = raw.get("turn")
+    if isinstance(turn, dict) and isinstance(turn.get("error"), dict):
+        turn_error = turn["error"]
+        message = str(turn_error.get("message") or "").strip()
+        code = str(turn_error.get("codexErrorInfo") or turn_error.get("code") or "").strip()
+        if message and code:
+            return f"{code}: {message}"
+        if message or code:
+            return message or code
+    for key in ("error", "result"):
+        value = raw.get(key)
+        if isinstance(value, dict):
+            message = str(value.get("message") or "").strip()
+            if message:
+                return message
+        elif isinstance(value, str) and value.strip() and bool(raw.get("is_error")):
+            return value.strip()
+    status = str(data.get("provider_status") or "").strip()
+    if status and status not in {"failed", "error"}:
+        return status
+    return ""

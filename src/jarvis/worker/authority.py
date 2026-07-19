@@ -96,6 +96,23 @@ class WorkerSessionAuthority:
         return "workspace-write"
 
     @property
+    def codex_turn_sandbox_policy(self) -> dict[str, Any] | None:
+        """Keep review sessions read-only without cutting them off from remote sources.
+
+        Codex's legacy ``sandbox: "read-only"`` thread setting also defaults
+        network access to false. Review agents still need read-only access to
+        GitHub (for example, ``gh pr view`` and ``gh pr diff``), so override the
+        turn with the structured policy supported by the app-server protocol.
+
+        Workspace-write sessions retain their existing thread policy here. A
+        structured workspace-write policy also needs an explicit writable-root
+        contract, which is separate from this read-only review correction.
+        """
+        if self.codex_sandbox == "read-only":
+            return {"type": "readOnly", "networkAccess": True}
+        return None
+
+    @property
     def claude_permission_mode(self) -> str:
         if self.codex_sandbox == "read-only":
             return "plan"
@@ -110,7 +127,12 @@ class WorkerSessionAuthority:
             trusted_mcp_servers=self.trusted_mcp_servers,
         ):
             return f"worker session is read-only; refusing Claude tool {name or '<unknown>'}"
-        if self.codex_sandbox != "read-only" and not self.can_resolve_approval:
+        # A write-capable session without approval authority runs in "dontAsk"
+        # mode: it never raises an approval, so there is nothing to strand. The
+        # sandbox and landing mode remain the real boundary. Only a session that
+        # *would* ask (permission mode "default") and cannot resolve the answer
+        # needs to refuse — that one would hang on its own request.
+        if self.claude_permission_mode == "default" and not self.can_resolve_approval:
             return f"worker session lacks {WORKER_SESSION_APPROVE}; refusing Claude tool {name or '<unknown>'}"
         return ""
 
@@ -141,4 +163,15 @@ def _claude_tool_is_read_only(tool_name: str, *, trusted_mcp_servers: list[str] 
         return False
     if name.startswith("mcp__"):
         return any(name.startswith(f"mcp__{server}__") for server in trusted_mcp_servers or [])
-    return name in {"AskUserQuestion", "Glob", "Grep", "Read", "WebFetch", "WebSearch"}
+    # ExitPlanMode mutates nothing outside the agent's own mode. Denying it
+    # traps a read-only Claude session in plan mode forever: it cannot act, not
+    # even with the read-only and trusted-MCP tools it is explicitly allowed.
+    return name in {
+        "AskUserQuestion",
+        "ExitPlanMode",
+        "Glob",
+        "Grep",
+        "Read",
+        "WebFetch",
+        "WebSearch",
+    }
