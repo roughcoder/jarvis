@@ -189,6 +189,7 @@ class ExecutionEnvelope:
     cwd: str = ""
     session_id: str = ""
     session_name: str = ""
+    display_title: str = ""
     resume_session: bool = False
     allowed_actions: list[str] = field(default_factory=lambda: [WORKER_SESSION_CREATE, WORKER_SESSION_TURN])
     verification: VerificationPlan = field(default_factory=VerificationPlan)

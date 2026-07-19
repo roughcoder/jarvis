@@ -126,6 +126,10 @@ CHILD_WATCH_LEASE_S = 300
 CHILD_WATCH_RENEW_INTERVAL_S = CHILD_WATCH_LEASE_S // 3
 THREAD_TURN_QUEUE_LIMIT = 32
 THREAD_TURN_RECEIPT_REPLY_LIMIT = 4_000
+# Workspace keys the thread store owns outright. Callers hand back workspace
+# snapshots that can be arbitrarily stale, so these are always re-read from the
+# stored thread rather than merged from the caller's copy.
+STORE_OWNED_WORKSPACE_KEYS = frozenset({"pending_child_watch_ids"})
 CHILD_WORK_LANDING_MODES = {"none", "branch_only", "draft_pr", "ready_pr", "confirm_before_pr"}
 _THREAD_INDEX_LOCK = threading.RLock()
 _THREAD_TRANSCRIPT_LOCKS_LOCK = threading.Lock()
@@ -980,14 +984,8 @@ class CockpitThreadIndex:
             messages = self._thread_messages(stored)
             continuation = str(continuation_instruction or "").strip()
             requester_snapshot = _snapshot_from_context(requester)
-            existing = next(
-                (
-                    message
-                    for message in messages
-                    if message.get("type") == "child_watch" and message.get("watch_id") == watch_id
-                ),
-                None,
-            )
+            existing = self._latest_child_watches(messages).get(watch_id)
+            existing_phase = str((existing or {}).get("phase") or "")
             if existing is None:
                 messages.append(
                     {
@@ -1004,15 +1002,46 @@ class CockpitThreadIndex:
                     }
                 )
                 self._append_thread_messages(stored, [messages[-1]])
+            elif existing_phase in {"completed", "failed"}:
+                # watch_id is deterministic from the child ids, so re-watching the
+                # same children after a finished run lands on the terminal record.
+                # Reopen it as waiting instead of leaving a pending marker that can
+                # never be claimed (which would pin the parent to 'running').
+                reopened = dict(existing)
+                reopened["phase"] = "waiting"
+                reopened["continuation_instruction"] = continuation
+                reopened["requester"] = requester_snapshot
+                reopened["observed_at"] = utc_now()
+                for key in ("claimed_at", "completed_at", "error"):
+                    reopened.pop(key, None)
+                self._append_thread_messages(stored, [reopened])
             elif (
-                str(existing.get("phase") or "") == "waiting"
+                existing_phase == "waiting"
                 and continuation
                 and existing.get("requester") == requester_snapshot
                 and continuation != str(existing.get("continuation_instruction") or "")
             ):
-                existing["continuation_instruction"] = continuation
-                existing["observed_at"] = utc_now()
-                self._append_thread_messages(stored, [existing])
+                refreshed = dict(existing)
+                refreshed["continuation_instruction"] = continuation
+                refreshed["observed_at"] = utc_now()
+                self._append_thread_messages(stored, [refreshed])
+            pending_watch_ids = {
+                str(item)
+                for item in stored.workspace.get("pending_child_watch_ids") or []
+                if str(item).strip()
+            }
+            if watch_id not in pending_watch_ids:
+                pending_watch_ids.add(watch_id)
+                self.save(
+                    replace(
+                        stored,
+                        workspace={
+                            **stored.workspace,
+                            "pending_child_watch_ids": sorted(pending_watch_ids),
+                        },
+                        updated_at=utc_now(),
+                    )
+                )
             return watch_id
 
     @staticmethod
@@ -1077,6 +1106,17 @@ class CockpitThreadIndex:
             if error:
                 finished["error"] = public_error_message(error)
             self._append_thread_messages(thread, [finished])
+            pending_watch_ids = {
+                str(item)
+                for item in thread.workspace.get("pending_child_watch_ids") or []
+                if str(item).strip() and str(item) != watch_id
+            }
+            workspace = {**thread.workspace}
+            if pending_watch_ids:
+                workspace["pending_child_watch_ids"] = sorted(pending_watch_ids)
+            else:
+                workspace.pop("pending_child_watch_ids", None)
+            self.save(replace(thread, workspace=workspace, updated_at=utc_now()))
 
     def renew_child_watch_claim(self, parent_chat_id: str, watch_id: str) -> None:
         thread = next((item for item in self._threads().values() if item.thread_id == parent_chat_id), None)
@@ -1161,6 +1201,9 @@ class CockpitThreadIndex:
                     archive_reason=archive_source.archive_reason,
                     last_turn_at=observed_at,
                     messages=(),
+                    # The store owns the workspace: a caller's snapshot can be
+                    # arbitrarily stale and would drop or resurrect pending
+                    # child-watch ids on merge.
                     workspace=dict(archive_source.workspace),
                     queued_turns=tuple(archive_source.queued_turns),
                     turn_receipts=tuple(archive_source.turn_receipts),
@@ -1739,7 +1782,7 @@ class CockpitConnector:
                 idempotency_key=idempotency_key,
             )
             return reply, updated, ()
-        if context_thread.workspace or explicit_workspace_request:
+        if is_conversation_workspace(context_thread.workspace) or explicit_workspace_request:
             reply, updated = await self._workspace_turn(
                 project,
                 context_thread,
@@ -2680,7 +2723,7 @@ def _project_context(memory: MemoryBackend, project: ProjectEntry, thread: Cockp
                 content = content[:799] + "..."
             history.append(f"- {role} ({peer}): {content}")
         parts.append("Recent orchestrator thread history:\n" + "\n".join(history))
-    if thread.workspace:
+    if is_conversation_workspace(thread.workspace):
         parts.append("Conversation workspace:\n" + json.dumps(workspace_public(thread.workspace), sort_keys=True))
     else:
         parts.append(
@@ -3581,6 +3624,7 @@ def _normalized_messages(messages: Any) -> list[dict[str, Any]]:
             "type",
             "child_chat_id",
             "child_run_id",
+            "title",
             "phase",
             "status",
             "terminal_reason",
@@ -3632,6 +3676,11 @@ def _atomic_write_jsonl(path: Path, messages: list[dict[str, Any]]) -> None:
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+def is_conversation_workspace(workspace: dict[str, Any]) -> bool:
+    """True when a workspace carries real worker-session state, not just bookkeeping."""
+    return any(key not in STORE_OWNED_WORKSPACE_KEYS for key in workspace)
 
 
 def _workspace_is_ready(thread: CockpitThread) -> bool:

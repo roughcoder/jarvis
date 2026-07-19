@@ -19,6 +19,9 @@ from jarvis.worker.orchestrator_runtime import (
     orchestrator_mcp_server,
 )
 from jarvis.worker.providers._common import (
+    tool_event_data,
+)
+from jarvis.worker.providers._common import (
     control_request_id as _control_request_id,
 )
 from jarvis.worker.providers._common import normalize_approval_decision
@@ -828,9 +831,11 @@ def _project_content_block(
         if text:
             sessions.append_event(session_id, EVENT_ASSISTANT_MESSAGE, {**common, "text": text})
     elif isinstance(block, (sdk.ToolUseBlock, sdk.ServerToolUseBlock)):
-        sessions.append_event(session_id, EVENT_TOOL_CALL, {**common, "item": _message_raw(block)})
+        item = _message_raw(block)
+        sessions.append_event(session_id, EVENT_TOOL_CALL, {**common, **tool_event_data(item, phase="call")})
     elif isinstance(block, (sdk.ToolResultBlock, sdk.ServerToolResultBlock)):
-        sessions.append_event(session_id, EVENT_TOOL_RESULT, {**common, "item": _message_raw(block)})
+        item = _message_raw(block)
+        sessions.append_event(session_id, EVENT_TOOL_RESULT, {**common, **tool_event_data(item, phase="result")})
     else:
         sessions.append_event(session_id, EVENT_PROVIDER_EVENT, {**common, "raw": _message_raw(block)})
 
@@ -868,9 +873,9 @@ def _project_claude_message(
                 if text:
                     sessions.append_event(session_id, EVENT_ASSISTANT_MESSAGE, {**common, "text": text})
             elif item_type in {"tool_use", "server_tool_use"}:
-                sessions.append_event(session_id, EVENT_TOOL_CALL, {**common, "item": item})
+                sessions.append_event(session_id, EVENT_TOOL_CALL, {**common, **tool_event_data(item, phase="call")})
             elif item_type in {"tool_result", "advisor_tool_result"}:
-                sessions.append_event(session_id, EVENT_TOOL_RESULT, {**common, "item": item})
+                sessions.append_event(session_id, EVENT_TOOL_RESULT, {**common, **tool_event_data(item, phase="result")})
     elif message_type == "result":
         is_error = bool(message.get("is_error")) or subtype not in {"success", "done", "completed"}
         if _session_cancelled(sessions, session_id):
