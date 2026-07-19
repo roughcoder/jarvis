@@ -150,12 +150,16 @@ PUBLIC_EVENT_DATA_KEYS = {
     "decision",
     "delta",
     "detail",
+    "error",
     "exit_code",
     "id",
+    "input",
     "item",
+    "item_type",
     "label",
     "message_id",
     "options",
+    "output",
     "payload",
     "phase",
     "provider",
@@ -164,11 +168,14 @@ PUBLIC_EVENT_DATA_KEYS = {
     "request_id",
     "request_kind",
     "run_id",
+    "server_name",
     "status",
     "summary",
     "terminal_reason",
     "text",
     "title",
+    "tool_call_id",
+    "tool_name",
     "turn_id",
     "url",
 }
@@ -1609,7 +1616,23 @@ def _title(objective: str) -> str:
 
 def _message_id(raw: dict[str, Any], data: dict[str, Any], turn_id: str) -> str:
     message = data.get("message")
-    explicit = data.get("message_id") or (message.get("id") if isinstance(message, dict) else "")
+    item = data.get("item")
+    item_id = ""
+    if isinstance(item, dict):
+        item_id = str(
+            item.get("tool_call_id")
+            or item.get("toolCallId")
+            or item.get("id")
+            or item.get("tool_use_id")
+            or item.get("toolUseId")
+            or ""
+        )
+    explicit = (
+        data.get("message_id")
+        or data.get("tool_call_id")
+        or (message.get("id") if isinstance(message, dict) else "")
+        or item_id
+    )
     if explicit:
         return str(explicit)
     if raw.get("type") == "assistant.delta" and turn_id:

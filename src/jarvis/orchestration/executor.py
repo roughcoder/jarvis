@@ -117,7 +117,7 @@ def _acquire_worker_session(
             "repo": envelope.repo,
             "branch": envelope.branch_name,
             "cwd": envelope.cwd,
-            "title": envelope.session_name or _job_name(envelope),
+            "title": envelope.display_title or envelope.session_name or _job_name(envelope),
             "metadata": {
                 "execution_envelope": envelope.to_dict(),
                 "model": envelope.model,

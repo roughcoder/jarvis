@@ -2206,6 +2206,8 @@ def test_start_worker_session_links_run_graph(tmp_path) -> None:
     assert calls[0][1]["metadata"]["execution_envelope"]["run_id"] == run.run_id
     assert calls[0][1]["metadata"]["execution_envelope"]["model"] == "gpt-5.5"
     assert calls[0][1]["metadata"]["execution_envelope"]["provider_instance_id"] == "codex-primary"
+    assert calls[0][1]["metadata"]["execution_envelope"]["display_title"] == "Fix the worker"
+    assert calls[0][1]["title"] == "Fix the worker"
     assert calls[0][1]["metadata"]["model"] == "gpt-5.5"
     assert calls[1][1]["turn_id"] == f"turn_{envelope.dispatch_id}"
     assert calls[1][1]["idempotency_key"] == f"{run.run_id}:{envelope.dispatch_id}:turn"

@@ -43,6 +43,7 @@ from jarvis.connectors.cockpit import (
     ProviderTurnError,
     THREAD_INDEX_FILENAME,
     execute_orchestrator_tool,
+    is_conversation_workspace,
     make_child_terminal_notifier,
     schedule_cold_task_drain,
     workspace_public,
@@ -4862,7 +4863,7 @@ def _thread_projection(
         "archive_reason": thread.archive_reason,
         "last_turn_at": thread.last_turn_at or None,
     }
-    if thread.workspace:
+    if is_conversation_workspace(thread.workspace):
         data["workspace"] = workspace_public(thread.workspace)
     if include_messages:
         data["messages"] = [dict(message) for message in thread.messages]
@@ -4903,6 +4904,10 @@ def _thread_operational_state(thread: CockpitThread, ctx: CockpitAppContext | No
         }.get(status, status), reason
     if str(thread.workspace.get("status") or "") == "failed":
         return "degraded", "engine_error"
+    # The parent's own turn has ended, but a watch it registered is still
+    # pending — the thread is genuinely waiting on its children, not idle.
+    if thread.workspace.get("pending_child_watch_ids"):
+        return "waiting_for_children", ""
     return "idle", ""
 
 
@@ -4924,6 +4929,8 @@ def _thread_status(thread: CockpitThread, ctx: CockpitAppContext | None) -> tupl
     )
     if legacy is not None:
         return legacy
+    if thread.workspace.get("pending_child_watch_ids"):
+        return "running", ""
     if thread.last_turn_at or thread.messages:
         return "completed", "completed"
     return "created", ""
