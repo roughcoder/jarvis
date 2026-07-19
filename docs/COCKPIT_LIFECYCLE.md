@@ -72,6 +72,65 @@ thread index and returns a note in `reclamation.notes`.
 Deletes keep small local tombstones so repeated DELETE calls are idempotent.
 Unknown ids still return `404 not_found`.
 
+## Conversation Retention
+
+Archive hides; nothing used to collect. The cockpit API now runs a periodic
+retention sweep that deletes dead conversations through the *same* lifecycle
+delete described above — there is no second delete path.
+
+| Class | What qualifies | Ages from | Default TTL |
+|---|---|---|---|
+| `archived` | any thread with `archived_at` set | `archived_at` | `ORCHESTRATION_RETENTION_ARCHIVED_TTL_DAYS` (14d) |
+| `chat` | non-archived thread with no child runs | `last_turn_at`/`updated_at` | `ORCHESTRATION_RETENTION_CHAT_TTL_DAYS` (7d) |
+| `tree` | non-archived thread with child runs (review parent + children) | newest of the parent and every child | `ORCHESTRATION_RETENTION_TREE_TTL_DAYS` (7d) |
+
+Archive wins over structure: an archived review tree ages on the archived TTL.
+Cascade is a mechanism, not a class — a tree is always deleted whole, children
+first, so a partial sweep can never orphan a child.
+
+A per-class TTL of `0` disables that class outright: it is never auto-deleted,
+and `jarvis conversations` reports it as `disabled`. This mirrors the worker's
+`WORKER_WORKTREE_GC` refusal — an unbounded threshold is a sane answer for an
+explicit sweep but a foot-gun on a timer.
+
+`ORCHESTRATION_RETENTION_ENABLED=false`, or every class disabled, means no timer
+task is started at all. `ORCHESTRATION_RETENTION_INTERVAL_S=0` runs the startup
+sweep only. The sweep is best-effort: it logs one summary line per run and never
+propagates into the API's lifecycle.
+
+### Protections
+
+A conversation is kept — no matter how old — if any of these hold. All are read
+from local state, never a worker probe: an unreachable worker must not read as
+"nothing is running".
+
+- a turn is in flight for it in this API process
+- it has queued turns
+- its workspace status is `starting`, `running`, `interrupting`, `waiting_input`,
+  or `waiting_approval`
+- it has `pending_child_watch_ids` (a registered child watch)
+- any child run is non-terminal, has an active worker session, or still has
+  worker jobs (run delete `409`s on jobs, and a tree that cannot be collected
+  whole must not be collected at all)
+- its activity timestamp is missing or unparseable
+
+If the memory backend is unreachable, the delete fails closed and the
+conversation survives to the next sweep, rather than dropping the record while
+leaving its memory session behind.
+
+### Manual entry point
+
+```bash
+jarvis conversations                 # report what the policy would collect
+jarvis conversations --dry-run -v    # per-conversation delete/keep reasons
+jarvis conversations --json          # machine-readable plan
+jarvis conversations --prune         # apply it now
+jarvis conversations --prune --ttl-days 0.5   # override every class TTL
+```
+
+The report and the automatic sweep build the same plan from the same inputs, so
+`--dry-run` is exactly what the timer would do.
+
 ## Project Delete Policy
 
 Project delete is conservative while tree-aware chat cascade/reparent work is

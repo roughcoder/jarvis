@@ -941,6 +941,80 @@ def _cmd_runs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_conversations(args: argparse.Namespace) -> int:
+    """Report — and optionally apply — the conversation retention policy."""
+
+    import asyncio
+    import json
+    from dataclasses import replace
+
+    from jarvis.orchestration.api import build_retention_plan, cockpit_context, run_retention_sweep
+    from jarvis.orchestration.retention import RETENTION_CLASSES, RetentionPolicy, human_bytes
+
+    cfg = load_config()
+    policy = RetentionPolicy.from_config(cfg.orchestration)
+    if args.ttl_days is not None:
+        # An explicit sweep may use a threshold the timer would refuse; the
+        # protections below are what keep live work safe, not the TTL.
+        policy = replace(
+            policy,
+            archived_ttl_days=args.ttl_days,
+            chat_ttl_days=args.ttl_days,
+            tree_ttl_days=args.ttl_days,
+        )
+    ctx = cockpit_context(cfg)
+    plan = build_retention_plan(ctx, policy)
+
+    if args.json and not args.prune:
+        print(json.dumps(
+            {
+                "counts": plan.counts(),
+                "bytes": plan.bytes_by_class(),
+                "candidates": [
+                    {
+                        "project_id": c.project_id,
+                        "thread_id": c.thread_id,
+                        "class": c.klass,
+                        "title": c.title,
+                        "age_days": round(c.age_days, 2),
+                        "child_run_ids": list(c.child_run_ids),
+                        "bytes": c.bytes_estimate,
+                    }
+                    for c in plan.candidates
+                ],
+                "kept": [
+                    {"thread_id": k.thread_id, "class": k.klass, "reason": k.reason} for k in plan.kept
+                ],
+            },
+            indent=2,
+        ))
+        return 0
+
+    counts, sizes = plan.counts(), plan.bytes_by_class()
+    for klass in RETENTION_CLASSES:
+        ttl = policy.ttl_days(klass)
+        state = f"ttl {ttl:g}d" if ttl > 0 else "disabled"
+        print(f"{klass:<9} {counts[klass]:>4} conversation(s)  {human_bytes(sizes[klass]):>10}  ({state})")
+    print(f"{'total':<9} {len(plan.candidates):>4} conversation(s)  {human_bytes(plan.total_bytes):>10}, kept {len(plan.kept)}")
+    if args.verbose:
+        for candidate in plan.candidates:
+            children = f" +{len(candidate.child_run_ids)} child run(s)" if candidate.child_run_ids else ""
+            print(f"  delete {candidate.thread_id} [{candidate.klass}] {candidate.age_days:.1f}d{children} {candidate.title}")
+        for keep in plan.kept:
+            print(f"  keep   {keep.thread_id} [{keep.klass}] {keep.reason}")
+
+    if not args.prune:
+        if not args.dry_run:
+            print("\nNothing deleted. Pass --prune to apply, or --dry-run to silence this note.")
+        return 0
+
+    result = asyncio.run(run_retention_sweep(ctx, policy))
+    print(result.summary_line())
+    for failure in result.failures:
+        print(f"  failed: {failure}")
+    return 1 if result.failures else 0
+
+
 def _format_run(run) -> str:  # noqa: ANN001
     parts = [
         f"Run: {run.run_id}",
@@ -2738,6 +2812,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_runs.add_argument("-n", type=int, default=20, help="How many recent runs to list")
     p_runs.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     p_runs.set_defaults(func=_cmd_runs)
+
+    p_conversations = sub.add_parser(
+        "conversations",
+        help="Report/apply conversation retention (dead cockpit chats + their child runs)",
+    )
+    p_conversations.add_argument("--prune", action="store_true", help="Delete what the policy says is collectable")
+    p_conversations.add_argument("--dry-run", action="store_true", help="Report only (the default); silences the apply hint")
+    p_conversations.add_argument("--ttl-days", type=float, default=None, help="Override every class TTL for this sweep")
+    p_conversations.add_argument("-v", "--verbose", action="store_true", help="List each conversation and why it is kept or collected")
+    p_conversations.add_argument("--json", action="store_true", help="Print the machine-readable plan")
+    p_conversations.set_defaults(func=_cmd_conversations)
 
     p_workers = sub.add_parser("workers", help="List named orchestration workers")
     p_workers.add_argument("--probe", action="store_true", help="Probe worker health and current job capacity")

@@ -394,6 +394,7 @@ def _cfg(
     mcp_serve_oauth_jwks_url: str = "",
     mcp_serve_oauth_required_scopes: str = "",
     worker_token: str = "",
+    retention_enabled: str = "false",
 ) -> Config:
     env = tmp_path / ".env"
     workspace = tmp_path / "orchestration"
@@ -436,6 +437,10 @@ def _cfg(
                 "WORKER_PORT=8780",
                 f"MACBOOK_WORKER_TOKEN={worker_token}",
                 "WORKER_SUPPORTED_ENGINES=codex,claude",
+                # Fixtures seed threads with fixed past timestamps; the startup
+                # retention sweep would collect them mid-test. Retention has its
+                # own suite (test_orchestration_retention.py).
+                f"ORCHESTRATION_RETENTION_ENABLED={retention_enabled}",
             ]
         )
     )

@@ -340,6 +340,22 @@ class CockpitThreadIndex:
             reverse=True,
         )
 
+    def list_all(self) -> list[CockpitThread]:
+        """Every live thread across every project (retention sweeps this)."""
+
+        return list(self._threads().values())
+
+    def transcript_bytes(self, project_id: str, thread_id: str) -> int:
+        """On-disk size of a thread's transcript, for reclamation reporting."""
+
+        total = 0
+        for path in (self._transcript_path(project_id, thread_id), self._legacy_transcript_path(project_id, thread_id)):
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+        return total
+
     def get(self, project_id: str, thread_id: str) -> CockpitThread | None:
         thread = self._threads().get(thread_id)
         if thread is None or thread.project_id != project_id:
@@ -1689,8 +1705,8 @@ class CockpitConnector:
             self._index.finish_queued_turn(project.id, thread_id, queue_id)
             drained += 1
 
-    def delete_thread(self, project: ProjectEntry, thread_id: str) -> tuple[CockpitThread | None, bool]:
-        return self._index.delete(project.id, thread_id)
+    def delete_thread(self, project_id: str, thread_id: str) -> tuple[CockpitThread | None, bool]:
+        return self._index.delete(project_id, thread_id)
 
     async def open_thread(
         self,
