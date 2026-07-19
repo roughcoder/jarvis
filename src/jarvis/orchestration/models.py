@@ -348,6 +348,7 @@ class WorkerProfile:
     repo_access: list[dict[str, Any]] = field(default_factory=list)
     repositories: list[dict[str, Any]] = field(default_factory=list)
     worktree_inventory: dict[str, Any] = field(default_factory=dict)
+    runtime: dict[str, Any] = field(default_factory=dict)  # version/channel/git_sha from /health
     readiness: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
@@ -366,6 +367,8 @@ class WorkerProfile:
         self.repositories = [dict(item) for item in self.repositories if isinstance(item, dict) and (item.get("repo") or item.get("name"))]
         if not isinstance(self.worktree_inventory, dict):
             self.worktree_inventory = {}
+        if not isinstance(self.runtime, dict):
+            self.runtime = {}
         if self.readiness is not None and not isinstance(self.readiness, dict):
             self.readiness = None
 
@@ -394,6 +397,7 @@ class WorkerProfile:
             "supported_engines": self.supported_engines,
             "engine_supports": self.engine_supports,
             "system": self.system,
+            "runtime": self.runtime,
             "git_identity": _public_value(self.git_identity),
             "repo_access": _public_value(self.repo_access),
             "repositories": _public_value(self.repositories),

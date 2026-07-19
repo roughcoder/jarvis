@@ -1026,6 +1026,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             prune = await prune_worktrees(
                 str(workspace / "worktrees"),
                 str(workspace / "sessions"),
+                jobs_dir=str(workspace / "jobs"),
                 target=session.cwd,
                 stale_ttl_s=0.0,
                 timeout_s=cfg.shell_timeout_s,
@@ -1065,6 +1066,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             worktree_inventory,
             str(workspace / "worktrees"),
             str(workspace / "sessions"),
+            jobs_dir=str(workspace / "jobs"),
             stale_ttl_s=cfg.worktree_stale_ttl_s,
         )
         return web.json_response({"ok": True, "worktree_inventory": inventory})
@@ -1084,6 +1086,7 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         result = await prune_worktrees(
             str(workspace / "worktrees"),
             str(workspace / "sessions"),
+            jobs_dir=str(workspace / "jobs"),
             target=target,
             stale_ttl_s=ttl_s,
             timeout_s=cfg.shell_timeout_s,
@@ -1091,8 +1094,21 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         status = 200 if result.get("ok") else 409
         return web.json_response(result, status=status)
 
+    def _unknown_worktree_inventory(**extra: Any) -> dict[str, Any]:
+        # Counts are null, not 0: a card that renders "0 worktrees / 0 B" for a
+        # scan that has not happened yet is indistinguishable from a truly empty
+        # workspace, which is exactly how 12 GB hid in plain sight.
+        return {
+            "root": str(workspace / "worktrees"),
+            "count": None,
+            "disk_bytes": None,
+            "stale_count": None,
+            "orphan_count": None,
+            **extra,
+        }
+
     def _refreshing_worktree_inventory() -> dict[str, Any]:
-        return {"count": 0, "disk_bytes": 0, "stale_count": 0, "status": "refreshing"}
+        return _unknown_worktree_inventory(status="refreshing")
 
     async def _refresh_worktree_inventory() -> None:
         try:
@@ -1100,12 +1116,13 @@ def make_app(cfg: WorkerConfig) -> web.Application:
                 worktree_inventory,
                 str(workspace / "worktrees"),
                 str(workspace / "sessions"),
+                jobs_dir=str(workspace / "jobs"),
                 stale_ttl_s=cfg.worktree_stale_ttl_s,
             )
             if not isinstance(value, dict):
-                value = {"count": 0, "disk_bytes": 0, "stale_count": 0, "error": "invalid inventory payload"}
+                value = _unknown_worktree_inventory(error="invalid inventory payload")
         except Exception as exc:  # noqa: BLE001 - health must remain a liveness endpoint
-            value = {"count": 0, "disk_bytes": 0, "stale_count": 0, "error": str(exc)[:200] or exc.__class__.__name__}
+            value = _unknown_worktree_inventory(error=str(exc)[:200] or exc.__class__.__name__)
         worktree_inventory_state["value"] = value
         worktree_inventory_state["expires_at"] = asyncio.get_running_loop().time() + max(0.0, cfg.diagnostics_ttl_s)
         worktree_inventory_state["task"] = None
@@ -1206,7 +1223,62 @@ def make_app(cfg: WorkerConfig) -> web.Application:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
+    async def _gc_sweep() -> dict[str, Any]:
+        result = await prune_worktrees(
+            str(workspace / "worktrees"),
+            str(workspace / "sessions"),
+            jobs_dir=str(workspace / "jobs"),
+            stale_ttl_s=cfg.worktree_stale_ttl_s,
+            timeout_s=cfg.shell_timeout_s,
+        )
+        if cfg.verbose and (result.get("worktrees") or result.get("refused")):
+            print(
+                f"[worker] worktree gc: removed {result.get('worktrees')} "
+                f"({int(result.get('bytes') or 0) // (1024 * 1024)} MB), "
+                f"kept {len(result.get('refused') or [])}"
+            )
+        # A sweep just changed what's on disk — drop the cached inventory so the
+        # next /health probe reports the post-sweep truth rather than the TTL's
+        # stale pre-sweep numbers.
+        worktree_inventory_state["value"] = None
+        worktree_inventory_state["expires_at"] = 0.0
+        return result
+
+    async def _gc_loop() -> None:
+        # Startup sweep first: a worker that has been down for a week comes back
+        # with every worktree stale, and that's the moment to shed them.
+        while True:
+            try:
+                await _gc_sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - GC is best-effort, never fatal to the daemon
+                print(f"[worker] worktree gc failed: {str(exc)[:200] or exc.__class__.__name__}")
+            interval = max(0.0, float(cfg.worktree_gc_interval_s))
+            if interval <= 0:
+                return
+            await asyncio.sleep(interval)
+
     app = web.Application(client_max_size=max(1024 * 1024, int(cfg.max_request_bytes)))
+
+    async def worktree_gc_context(_app: web.Application):  # noqa: ANN202
+        # ttl<=0 means "every non-live worktree is stale", which is a sane answer
+        # for an operator-triggered sweep but a foot-gun on a timer: it would
+        # delete a worktree the moment its job finishes, before anyone can resume
+        # or inspect it. Automatic GC only runs against a real age threshold.
+        if not cfg.worktree_gc_enabled or cfg.worktree_stale_ttl_s <= 0:
+            yield
+            return
+        task = asyncio.create_task(_gc_loop())
+        try:
+            yield
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    app.cleanup_ctx.append(worktree_gc_context)
+
     async def notifier_context(_app: web.Application):  # noqa: ANN202
         await notifier.start()
         try:

@@ -13,6 +13,7 @@ import pathlib
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
@@ -447,6 +448,105 @@ def test_prune_spares_worktree_when_live_session_uses_subdirectory(tmp_path) -> 
     assert inventory["stale_count"] == 0
     assert result["worktrees"] == 0
     assert worktree.exists()
+
+
+def _job_record(jobs_dir, job_id: str, cwd, status: str) -> None:  # noqa: ANN001
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    (jobs_dir / f"{job_id}.json").write_text(
+        json.dumps({"id": job_id, "action": "code", "label": "", "cwd": str(cwd), "status": status})
+    )
+
+
+def test_prune_spares_worktree_of_a_running_job_with_no_session(tmp_path) -> None:
+    """A repo job holds its worktree for the whole run without ever writing a
+    session record — consulting sessions alone would delete it mid-run."""
+    worktrees = tmp_path / "worker" / "worktrees"
+    jobs = tmp_path / "worker" / "jobs"
+    running = worktrees / "job-running"
+    finished = worktrees / "job-finished"
+    running.mkdir(parents=True)
+    finished.mkdir(parents=True)
+    _job_record(jobs, "job_running", running, "running")
+    _job_record(jobs, "job_finished", finished, "done")
+
+    inventory = worktree_inventory(str(worktrees), "", jobs_dir=str(jobs), stale_ttl_s=0)
+    result = asyncio.run(prune_worktrees(str(worktrees), "", jobs_dir=str(jobs), stale_ttl_s=0))
+
+    assert inventory["count"] == 2
+    assert inventory["stale_count"] == 1
+    assert result["worktrees"] == 1
+    assert running.exists()
+    assert not finished.exists()
+
+
+def test_inventory_counts_orphans_and_prune_removes_them(tmp_path) -> None:
+    """Worktrees whose job record is gone have no other cleanup path — they are
+    what let a review worker reach 79 trees / 12 GB."""
+    worktrees = tmp_path / "worker" / "worktrees"
+    jobs = tmp_path / "worker" / "jobs"
+    orphan = worktrees / "orphan"
+    tracked = worktrees / "tracked"
+    orphan.mkdir(parents=True)
+    tracked.mkdir(parents=True)
+    (orphan / "payload.txt").write_text("orphaned payload")
+    _job_record(jobs, "job_tracked", tracked, "done")
+
+    inventory = worktree_inventory(str(worktrees), "", jobs_dir=str(jobs), stale_ttl_s=0)
+    result = asyncio.run(prune_worktrees(str(worktrees), "", jobs_dir=str(jobs), stale_ttl_s=0))
+
+    assert inventory["orphan_count"] == 1
+    assert inventory["root"] == str(worktrees.resolve())
+    assert result["worktrees"] == 2
+    assert not orphan.exists()
+
+
+def test_stale_classification_respects_age_threshold(tmp_path) -> None:
+    worktrees = tmp_path / "worker" / "worktrees"
+    fresh = worktrees / "fresh"
+    old = worktrees / "old"
+    fresh.mkdir(parents=True)
+    old.mkdir(parents=True)
+    ttl_s = 72 * 60 * 60
+    aged = time.time() - (ttl_s + 60)
+    os.utime(old, (aged, aged))
+
+    inventory = worktree_inventory(str(worktrees), "", stale_ttl_s=ttl_s)
+    result = asyncio.run(prune_worktrees(str(worktrees), "", stale_ttl_s=ttl_s))
+
+    assert inventory["count"] == 2
+    assert inventory["stale_count"] == 1
+    assert result["worktrees"] == 1
+    assert fresh.exists()
+    assert not old.exists()
+
+
+def test_prune_runs_git_worktree_prune_against_the_source_repo(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    worktrees = tmp_path / "worker" / "worktrees"
+    worktrees.mkdir(parents=True)
+    repo.mkdir()
+    for argv in (
+        ["git", "init", "-q", str(repo)],
+        ["git", "-C", str(repo), "config", "user.email", "t@example.com"],
+        ["git", "-C", str(repo), "config", "user.name", "t"],
+        ["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "init"],
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", "jarvis/gc-probe", str(worktrees / "gc-probe")],
+    ):
+        subprocess.run(argv, check=True, capture_output=True)
+
+    listed_before = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list"], check=True, capture_output=True, text=True
+    ).stdout
+    result = asyncio.run(prune_worktrees(str(worktrees), "", stale_ttl_s=0, timeout_s=30))
+    listed_after = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list"], check=True, capture_output=True, text=True
+    ).stdout
+
+    assert "gc-probe" in listed_before
+    assert result["worktrees"] == 1
+    assert result["repos_pruned"]
+    # The repo no longer advertises the worktree we deleted.
+    assert "gc-probe" not in listed_after
 
 
 def test_prune_refuses_target_outside_worktree_root(tmp_path) -> None:

@@ -27,6 +27,9 @@ from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES
 _SAFE_ENV_KEYS = (
     "PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "SHELL", "TZ",
 )
+# jobs.Job.status when the job is still executing (kept local so actions stays
+# free of a jobs import — the store is plain JSON on disk either way).
+JOB_RUNNING = "running"
 _DIAGNOSTICS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _REPO_ACCESS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 
@@ -500,34 +503,65 @@ def _probe_repo_with_git(repo: str, *, timeout_s: float) -> dict[str, Any]:
     }
 
 
-def worktree_inventory(worktrees_dir: str, sessions_dir: str = "", *, stale_ttl_s: float = 0.0) -> dict[str, Any]:
+def worktree_inventory(
+    worktrees_dir: str,
+    sessions_dir: str = "",
+    *,
+    jobs_dir: str = "",
+    stale_ttl_s: float = 0.0,
+) -> dict[str, Any]:
+    """Count what actually sits under the worker's worktrees root.
+
+    `root` is echoed back because the root is workspace-relative and therefore
+    differs per host — an inventory that reports zero is only meaningful next to
+    the path it scanned.
+    """
     root = pathlib.Path(worktrees_dir).expanduser().resolve(strict=False)
-    live = _live_session_cwds(sessions_dir, root)
+    live = _live_cwds(sessions_dir, jobs_dir, root)
+    known = _recorded_job_cwds(jobs_dir)
     count = 0
     disk_bytes = 0
     stale_count = 0
+    orphan_count = 0
     for path in _worktree_children(root):
         count += 1
         disk_bytes += _disk_usage(path)
         if _stale_worktree(path, root, live, stale_ttl_s):
             stale_count += 1
-    return {"count": count, "disk_bytes": disk_bytes, "stale_count": stale_count}
+        if not _has_job_record(path, known):
+            orphan_count += 1
+    return {
+        "root": str(root),
+        "count": count,
+        "disk_bytes": disk_bytes,
+        "stale_count": stale_count,
+        "orphan_count": orphan_count,
+    }
 
 
 async def prune_worktrees(
     worktrees_dir: str,
     sessions_dir: str = "",
     *,
+    jobs_dir: str = "",
     target: str = "",
     stale_ttl_s: float = 0.0,
     timeout_s: float = 30.0,
 ) -> dict[str, Any]:
+    """Remove stale worktrees and tidy the source repos' worktree metadata.
+
+    Stale means: not the cwd of a live session or a *running* job, and older
+    than `stale_ttl_s`. Orphans (a directory whose job record is long gone) are
+    covered by the same rule — nothing references them, so once they age out
+    they go. `git worktree prune` runs against each source repo afterwards so
+    the repo stops advertising the administrative entries we just deleted.
+    """
     root = pathlib.Path(worktrees_dir).expanduser().resolve(strict=False)
     # This is `async` (delete_session/the prune endpoint `await` it directly), but the
     # session-json reads and disk walks below are synchronous filesystem work — run
     # them via asyncio.to_thread so a large worktree doesn't block the whole daemon's
     # event loop (and every other in-flight request) for seconds.
-    live = await asyncio.to_thread(_live_session_cwds, sessions_dir, root)
+    live = await asyncio.to_thread(_live_cwds, sessions_dir, jobs_dir, root)
     if target:
         candidate, reason = _worktree_target(root, target)
         candidates = [(candidate, target, reason)]
@@ -541,6 +575,7 @@ async def prune_worktrees(
     pruned = []
     refused = []
     reclaimed = 0
+    source_repos: set[str] = set()
     for path, label, reason in candidates:
         if path is None:
             refused.append({"target": label, "reason": reason or "worktree not found"})
@@ -552,18 +587,22 @@ async def prune_worktrees(
             refused.append({"target": path.name, "reason": "live session uses this worktree"})
             continue
         bytes_before = await asyncio.to_thread(_disk_usage, path)
-        await _remove_worktree_path(path, timeout_s)
+        git_dir = await _remove_worktree_path(path, timeout_s)
         if path.exists():
             refused.append({"target": path.name, "reason": "remove failed"})
             continue
+        if git_dir:
+            source_repos.add(git_dir)
         reclaimed += bytes_before
         pruned.append({"name": path.name, "bytes": bytes_before})
+    repos_pruned = await _prune_source_repos(source_repos, timeout_s)
     return {
         "ok": not refused,
         "worktrees": len(pruned),
         "bytes": reclaimed,
         "pruned": pruned,
         "refused": refused,
+        "repos_pruned": repos_pruned,
     }
 
 
@@ -919,6 +958,57 @@ def _worktree_target(root: pathlib.Path, target: str) -> tuple[pathlib.Path | No
     return path, ""
 
 
+def _live_cwds(sessions_dir: str, jobs_dir: str, worktrees_root: pathlib.Path) -> set[str]:
+    """Every worktree cwd a live session OR a running job is still using.
+
+    Sessions alone are not enough: a repo job holds a worktree for its whole run
+    without ever creating a session record, so a sweep that only consulted
+    sessions could delete the tree out from under a running job.
+    """
+    return _live_session_cwds(sessions_dir, worktrees_root) | _running_job_cwds(jobs_dir, worktrees_root)
+
+
+def _running_job_cwds(jobs_dir: str, worktrees_root: pathlib.Path) -> set[str]:
+    live: set[str] = set()
+    for data in _job_records(jobs_dir):
+        if str(data.get("status") or "") != JOB_RUNNING:
+            continue
+        cwd = pathlib.Path(str(data.get("cwd") or "")).expanduser().resolve(strict=False)
+        if cwd.is_relative_to(worktrees_root.resolve(strict=False)):
+            live.add(str(cwd))
+    return live
+
+
+def _recorded_job_cwds(jobs_dir: str) -> set[str]:
+    """Worktree cwds any job record still claims, whatever its status."""
+    known: set[str] = set()
+    for data in _job_records(jobs_dir):
+        cwd = str(data.get("cwd") or "")
+        if cwd:
+            known.add(str(pathlib.Path(cwd).expanduser().resolve(strict=False)))
+    return known
+
+
+def _job_records(jobs_dir: str) -> list[dict[str, Any]]:
+    root = pathlib.Path(jobs_dir).expanduser() if jobs_dir else pathlib.Path()
+    if not root.is_dir():
+        return []
+    records = []
+    for path in root.glob("*.json"):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict):
+            records.append(data)
+    return records
+
+
+def _has_job_record(path: pathlib.Path, recorded_cwds: set[str]) -> bool:
+    resolved = str(path.resolve(strict=False))
+    return any(cwd == resolved or cwd.startswith(f"{resolved}/") for cwd in recorded_cwds)
+
+
 def _live_session_cwds(sessions_dir: str, worktrees_root: pathlib.Path) -> set[str]:
     root = pathlib.Path(sessions_dir).expanduser() if sessions_dir else pathlib.Path()
     if not root.is_dir():
@@ -1016,7 +1106,9 @@ async def _delete_worktree_branch(git_dir: str, branch: str, timeout_s: float) -
     await run_exec(["git", f"--git-dir={git_dir}", "branch", "-D", branch], None, timeout_s)
 
 
-async def _remove_worktree_path(path: pathlib.Path, timeout_s: float) -> None:
+async def _remove_worktree_path(path: pathlib.Path, timeout_s: float) -> str:
+    """Remove one worktree; return the source repo's git dir so the caller can
+    `git worktree prune` it once, after the whole sweep."""
     git_dir = path / ".git"
     branch = ""
     common_git_dir = ""
@@ -1026,3 +1118,21 @@ async def _remove_worktree_path(path: pathlib.Path, timeout_s: float) -> None:
         await _delete_worktree_branch(common_git_dir, branch, timeout_s)
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
+    return common_git_dir
+
+
+async def _prune_source_repos(git_dirs: set[str], timeout_s: float) -> list[str]:
+    """Drop the source repos' administrative entries for worktrees we deleted.
+
+    Removing the directory is not enough — an orphaned tree (one we had to
+    rmtree because git had already lost track of it) leaves a stale entry in
+    the repo's .git/worktrees until this runs.
+    """
+    pruned = []
+    for git_dir in sorted(git_dirs):
+        if not git_dir:
+            continue
+        result = await run_exec(["git", f"--git-dir={git_dir}", "worktree", "prune"], None, timeout_s)
+        if not result.startswith("error:"):
+            pruned.append(git_dir)
+    return pruned

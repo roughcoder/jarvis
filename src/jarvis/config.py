@@ -559,9 +559,16 @@ class WorkerConfig(_Base):
     # Repo jobs run on an isolated worktree branch "<prefix>/<name>-<id>", never
     # the user's checkout.
     worktree_branch_prefix: str = "jarvis"
-    # Worker-owned worktrees with no live session older than this can be pruned.
-    # Set to 0 to treat every non-live worktree as stale for explicit sweeps.
-    worktree_stale_ttl_s: float = 7 * 24 * 60 * 60
+    # Worker-owned worktrees with no live session or running job older than this
+    # can be pruned. Set to 0 to treat every non-live worktree as stale for
+    # explicit sweeps.
+    worktree_stale_ttl_s: float = 72 * 60 * 60
+    # Sweep stale worktrees automatically (on startup, then on a timer). Without
+    # this the ring only sheds worktrees when someone asks it to, which is how a
+    # review worker reached 79 trees / 12 GB. Ignored when the TTL above is 0 —
+    # automatic GC never runs without a real age threshold.
+    worktree_gc_enabled: bool = True
+    worktree_gc_interval_s: float = 6 * 60 * 60  # 0 = startup sweep only
     verbose: bool = True             # log each dispatched action + full peekaboo output
     # Secrets Jarvis may USE (not see) in shell commands: a comma-separated allowlist
     # of env var NAMES the worker injects into the shell environment (read from the
@@ -1097,6 +1104,8 @@ class Config:
             "worker.repo_access_probe_timeout_s": self.worker.repo_access_probe_timeout_s,
             "worker.repo_access_ttl_s": self.worker.repo_access_ttl_s,
             "worker.worktree_stale_ttl_s": self.worker.worktree_stale_ttl_s,
+            "worker.worktree_gc_enabled": self.worker.worktree_gc_enabled,
+            "worker.worktree_gc_interval_s": self.worker.worktree_gc_interval_s,
             "remote.api_key": mask(self.remote.api_key),
             "remote.configured": self.remote.configured,
             "remote.model": self.remote.model,

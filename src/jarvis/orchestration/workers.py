@@ -19,6 +19,45 @@ from jarvis.orchestration.models import WorkerProfile
 
 _PROFILE_CACHE_TTL_S = 2.0
 _PROFILE_CACHE: dict[str, tuple[int, float, list[dict[str, Any]]]] = {}
+# Fields that only ever come from a live /health probe. `workers.json` on disk
+# carries none of them, so an unprobed read used to report a worker as never
+# seen, of unknown version, with zero worktrees — indistinguishable from a
+# healthy empty worker. Remember the last successful probe per worker so
+# unprobed reads (the cockpit's default) report last-known truth instead.
+_PROBE_SNAPSHOT_FIELDS = ("last_seen_at", "runtime", "system", "worktree_inventory")
+# Bounded: a worker that has been unreachable for this long should read as
+# unknown again rather than keep showing numbers from a machine that may since
+# have been rebuilt.
+_PROBE_SNAPSHOT_TTL_S = 30 * 60.0
+_PROBE_SNAPSHOTS: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def reset_probe_snapshots() -> None:
+    """Drop remembered probe results (process-global; used by tests)."""
+    _PROBE_SNAPSHOTS.clear()
+
+
+def _probe_snapshot_key(profile: WorkerProfile) -> str:
+    return f"{profile.worker_id}@{profile.base_url}"
+
+
+def _remember_probe(profile: WorkerProfile) -> None:
+    snapshot = {field: getattr(profile, field) for field in _PROBE_SNAPSHOT_FIELDS}
+    _PROBE_SNAPSHOTS[_probe_snapshot_key(profile)] = (time_monotonic() + _PROBE_SNAPSHOT_TTL_S, snapshot)
+
+
+def _apply_probe_snapshot(profile: WorkerProfile) -> WorkerProfile:
+    entry = _PROBE_SNAPSHOTS.get(_probe_snapshot_key(profile))
+    if entry is None:
+        return profile
+    expires_at, snapshot = entry
+    if expires_at <= time_monotonic():
+        _PROBE_SNAPSHOTS.pop(_probe_snapshot_key(profile), None)
+        return profile
+    for field, value in snapshot.items():
+        if not getattr(profile, field, None):
+            setattr(profile, field, value)
+    return profile
 # The orchestration API makes many small worker reads while assembling cockpit
 # projections.  Keep one process-local client so those reads reuse connections
 # instead of paying a TCP/TLS setup cost for every row.  Callers can still
@@ -53,8 +92,8 @@ class WorkerRegistry:
         if not profiles:
             profiles = [self._default_profile()]
         if probe:
-            profiles = [self._probe(p) for p in profiles]
-        return profiles
+            return [self._probe(p) for p in profiles]
+        return [_apply_probe_snapshot(p) for p in profiles]
 
     def get(self, worker_id: str = "", *, probe: bool = False) -> WorkerProfile | None:
         profiles = self.profiles(probe=probe)
@@ -219,8 +258,11 @@ class WorkerRegistry:
                 ]
         if isinstance(data.get("worktree_inventory"), dict):
             profile.worktree_inventory = dict(data["worktree_inventory"])
+        if isinstance(data.get("runtime"), dict):
+            profile.runtime = {str(key): _string_or_none(value) for key, value in data["runtime"].items()}
         profile.system = _system_from_health(data.get("system"))
         profile.__post_init__()
+        _remember_probe(profile)
         return profile
 
     def _probe_repo_access(self, profile: WorkerProfile, repo: str) -> WorkerProfile:

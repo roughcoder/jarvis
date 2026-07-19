@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import pathlib
 import subprocess
 import threading
@@ -1747,8 +1748,66 @@ def test_daemon_health_does_not_block_on_slow_worktree_inventory(tmp_path, monke
     elapsed, first, second = asyncio.run(_with_server(cfg, 8867, calls))
 
     assert elapsed < 0.5
-    assert first["worktree_inventory"] == {"count": 0, "disk_bytes": 0, "stale_count": 0, "status": "refreshing"}
+    # A scan that has not finished reports null, not zero — "not measured yet"
+    # must never be mistaken for "this worker holds no worktrees".
+    assert first["worktree_inventory"]["status"] == "refreshing"
+    assert first["worktree_inventory"]["count"] is None
+    assert first["worktree_inventory"]["disk_bytes"] is None
+    assert first["worktree_inventory"]["root"].endswith("/worktrees")
     assert second["worktree_inventory"] == {"count": 9, "disk_bytes": 123, "stale_count": 1}
+
+
+def test_daemon_sweeps_stale_worktrees_on_startup(tmp_path) -> None:  # noqa: ANN001
+    """Nothing swept the ring automatically, which is how a review worker got to
+    79 worktrees / 12 GB. Startup GC is the backstop."""
+    ttl_s = 72 * 60 * 60
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="",
+        workspace=str(tmp_path / "worker"),
+        worktree_stale_ttl_s=ttl_s,
+        worktree_gc_interval_s=0,  # startup sweep only
+    )
+    worktrees = tmp_path / "worker" / "worktrees"
+    stale = worktrees / "stale"
+    fresh = worktrees / "fresh"
+    stale.mkdir(parents=True)
+    fresh.mkdir(parents=True)
+    aged = time.time() - (ttl_s + 60)
+    os.utime(stale, (aged, aged))
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        for _ in range(200):
+            if not stale.exists():
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(_with_server(cfg, 8871, calls))
+
+    assert not stale.exists()
+    assert fresh.exists()
+
+
+def test_daemon_startup_gc_is_disabled_without_an_age_threshold(tmp_path) -> None:  # noqa: ANN001
+    """ttl=0 means "every non-live worktree is stale" — fine for an operator's
+    explicit sweep, but on a timer it would delete a worktree the moment its job
+    finished, before anyone could resume or inspect it."""
+    cfg = WorkerConfig(
+        _env_file=None,
+        token="",
+        workspace=str(tmp_path / "worker"),
+        worktree_stale_ttl_s=0,
+    )
+    worktree = tmp_path / "worker" / "worktrees" / "just-finished"
+    worktree.mkdir(parents=True)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        await client.get(f"{base}/health")
+        await asyncio.sleep(0.2)
+
+    asyncio.run(_with_server(cfg, 8872, calls))
+
+    assert worktree.exists()
 
 
 def test_daemon_health_reports_diagnostics_error_without_500(tmp_path, monkeypatch) -> None:  # noqa: ANN001
