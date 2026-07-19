@@ -15,12 +15,12 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from jarvis.config import IntercomDeviceConfig
+from jarvis.config import IntercomDeviceConfig, env_flag_enabled
 
 
 def _enabled(value: str, *, auto: bool) -> bool:
     v = (value or "auto").strip().lower()
-    if v in {"1", "true", "yes", "on"}:
+    if env_flag_enabled(v):
         return True
     if v in {"0", "false", "no", "off"}:
         return False

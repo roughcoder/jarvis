@@ -26,6 +26,19 @@ class _Base(BaseSettings):
     )
 
 
+_TRUTHY_STRINGS = {"1", "true", "yes", "on"}
+
+
+def env_flag_enabled(value: str) -> bool:
+    """Shared truthy-string check for boolean-ish env/config values.
+
+    Case/whitespace-insensitive membership in {"1", "true", "yes", "on"}.
+    Callers own falsey-set/default handling; this only answers "is this
+    string in the truthy set".
+    """
+    return (value or "").strip().lower() in _TRUTHY_STRINGS
+
+
 class GatewayConfig(_Base):
     """LiteLLM proxy — the single OpenAI-compatible endpoint (spec §4, Step 1)."""
 
@@ -690,7 +703,7 @@ class MCPServeConfig(_Base):
     @property
     def resolved_oauth_allow_identity_subject(self) -> bool:
         value = str(self.oauth_allow_identity_subject).strip().lower()
-        if value in {"1", "true", "yes", "on"}:
+        if env_flag_enabled(value):
             return True
         if value in {"0", "false", "no", "off"}:
             return False

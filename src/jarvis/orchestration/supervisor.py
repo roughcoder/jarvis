@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 from jarvis.config import WorkerConfig
-from jarvis.orchestration.models import OrchestrationRun
+from jarvis.orchestration.models import OrchestrationRun, WorkerJobLink, WorkerSessionLink
+from jarvis.orchestration.redaction import public_error_message
 from jarvis.orchestration.store import OrchestrationStore
 from jarvis.worker_session_contract import ACTIVE_SESSION_STATUSES, FAILED_SESSION_STATUSES, SUCCESS_SESSION_STATUSES
 from jarvis.orchestration.workers import (
@@ -17,6 +19,11 @@ from jarvis.orchestration.workers import (
 )
 
 TERMINAL_JOB_STATUSES = {"done", "error", "interrupted"}
+RECONCILIATION_MAX_CONCURRENCY = 4
+SESSION_EVENT_SYNC_LIMIT = 500
+
+_Target = TypeVar("_Target")
+_Observation = TypeVar("_Observation")
 
 
 @dataclass
@@ -45,6 +52,39 @@ class SyncSummary:
         }
 
 
+@dataclass(frozen=True)
+class _JobSyncTarget:
+    run_id: str
+    link: WorkerJobLink
+    profile: WorkerProfile | None
+    headers: dict[str, str]
+    skipped: bool = False
+
+
+@dataclass(frozen=True)
+class _JobObservation:
+    target: _JobSyncTarget
+    data: dict[str, Any] | None = None
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class _SessionSyncTarget:
+    run_id: str
+    link: WorkerSessionLink
+    profile: WorkerProfile | None
+    headers: dict[str, str]
+    skipped: bool = False
+
+
+@dataclass(frozen=True)
+class _SessionObservation:
+    target: _SessionSyncTarget
+    data: dict[str, Any] | None = None
+    events: tuple[dict[str, Any], ...] = ()
+    error: str = ""
+
+
 def sync_run_jobs(
     store: OrchestrationStore,
     *,
@@ -59,58 +99,86 @@ def sync_run_jobs(
 
     http_get = get or worker_http_get
     timeout = worker_cfg.request_timeout_s if timeout_s is None else timeout_s
-    registry = WorkerRegistry(worker_cfg, profiles_path=workers_path)
     runs = _runs_to_sync(store, run_id)
     summary = SyncSummary(errors=[])
     summary.runs_seen = len(runs)
+    profiles = WorkerRegistry(worker_cfg, profiles_path=workers_path).profiles(probe=False)
+    targets: list[_JobSyncTarget] = []
     for run in runs:
         for link in run.jobs:
             summary.jobs_seen += 1
-            profile = _profile_for_job(registry, worker_cfg, link.worker_id)
-            if profile is None:
-                _record_sync_error(store, run.run_id, link.job_id, f"worker {link.worker_id!r} is not configured")
-                summary.errors.append(f"{run.run_id}:{link.job_id}: worker not configured")
-                continue
-            if should_sync_worker is not None and not should_sync_worker(profile):
-                continue
-            headers = _headers_for_worker(worker_cfg, profile)
-            try:
-                response = http_get(
-                    f"{profile.base_url}/jobs/{link.job_id}",
-                    headers=headers,
-                    timeout=timeout,
+            profile = _profile_for_job(profiles, worker_cfg, link.worker_id)
+            targets.append(
+                _JobSyncTarget(
+                    run_id=run.run_id,
+                    link=link,
+                    profile=profile,
+                    headers=_headers_for_worker(worker_cfg, profile) if profile is not None else {},
+                    skipped=profile is not None and should_sync_worker is not None and not should_sync_worker(profile),
                 )
-                status_code = getattr(response, "status_code", 200)
-                if status_code >= 400:
-                    raise RuntimeError(_response_error(response, status_code))
-                data = response.json()
-            except Exception as exc:  # noqa: BLE001 - sync must not make inspection unusable
-                _record_sync_error(store, run.run_id, link.job_id, str(exc))
-                summary.errors.append(f"{run.run_id}:{link.job_id}: {exc}")
-                continue
-            before = link.to_dict()
-            store.update_job(
-                run.run_id,
-                link.job_id,
-                status=str(data.get("status") or link.status),
-                session_id=str(data.get("session_id") or link.session_id or ""),
-                session_name=str(data.get("session_name") or link.session_name or ""),
-                branch=str(data.get("branch") or link.branch or ""),
-                cwd=str(data.get("cwd") or link.cwd or ""),
             )
-            reloaded = store.get(run.run_id)
-            if reloaded is not None:
-                updated = next((x for x in reloaded.jobs if x.job_id == link.job_id), link)
-                if updated.to_dict() != before:
-                    summary.jobs_updated += 1
-                run = reloaded
+
+    observations = _bounded_observe(
+        targets,
+        lambda target: _observe_job(target, http_get=http_get, timeout=timeout),
+    )
+    for observation in observations:
+        target = observation.target
+        link = target.link
+        if target.skipped:
+            continue
+        if target.profile is None:
+            _record_sync_error(
+                store,
+                target.run_id,
+                link.job_id,
+                f"worker {link.worker_id!r} is not configured",
+            )
+            summary.errors.append(f"{target.run_id}:{link.job_id}: worker not configured")
+            continue
+        if observation.error:
+            error = public_error_message(observation.error)
+            _record_sync_error(store, target.run_id, link.job_id, error)
+            summary.errors.append(f"{target.run_id}:{link.job_id}: {error}")
+            continue
+        data = observation.data or {}
+        before = link.to_dict()
+        updated_run = store.update_job_if_unchanged(
+            target.run_id,
+            link.job_id,
+            expected=link,
+            status=str(data.get("status") or link.status),
+            session_id=str(data.get("session_id") or link.session_id or ""),
+            session_name=str(data.get("session_name") or link.session_name or ""),
+            branch=str(data.get("branch") or link.branch or ""),
+            cwd=str(data.get("cwd") or link.cwd or ""),
+        )
+        if updated_run is not None:
+            updated = next((x for x in updated_run.jobs if x.job_id == link.job_id), link)
+            if updated.to_dict() != before:
+                summary.jobs_updated += 1
+
+    for original in runs:
+        run = store.get(original.run_id) or original
         final = _final_phase(run)
         if final == "completed":
-            store.set_phase(run.run_id, "completed", "All worker jobs completed")
-            summary.runs_completed += 1
+            finalized = store.set_phase_if_execution_unchanged(
+                run.run_id,
+                "completed",
+                "All worker jobs completed",
+                **_execution_fence(run),
+            )
+            if finalized is not None:
+                summary.runs_completed += 1
         elif final == "failed":
-            store.set_phase(run.run_id, "failed", "At least one worker job failed or was interrupted")
-            summary.runs_failed += 1
+            finalized = store.set_phase_if_execution_unchanged(
+                run.run_id,
+                "failed",
+                "At least one worker job failed or was interrupted",
+                **_execution_fence(run),
+            )
+            if finalized is not None:
+                summary.runs_failed += 1
     return summary
 
 
@@ -128,81 +196,116 @@ def sync_run_sessions(
 
     http_get = get or worker_http_get
     timeout = worker_cfg.request_timeout_s if timeout_s is None else timeout_s
-    registry = WorkerRegistry(worker_cfg, profiles_path=workers_path)
     runs = _session_runs_to_sync(store, run_id)
     summary = SyncSummary(errors=[])
     summary.runs_seen = len(runs)
+    profiles = WorkerRegistry(worker_cfg, profiles_path=workers_path).profiles(probe=False)
+    targets: list[_SessionSyncTarget] = []
     for run in runs:
         for link in run.sessions:
             if link.archived_at:
                 continue
             summary.sessions_seen += 1
-            profile = _profile_for_job(registry, worker_cfg, link.worker_id)
-            if profile is None:
-                _record_sync_error(store, run.run_id, link.session_id, f"worker {link.worker_id!r} is not configured")
-                summary.errors.append(f"{run.run_id}:{link.session_id}: worker not configured")
-                continue
-            if should_sync_worker is not None and not should_sync_worker(profile):
-                continue
-            headers = _headers_for_worker(worker_cfg, profile)
-            try:
-                response = http_get(
-                    f"{profile.base_url}/sessions/{link.session_id}",
-                    headers=headers,
-                    timeout=timeout,
+            profile = _profile_for_job(profiles, worker_cfg, link.worker_id)
+            targets.append(
+                _SessionSyncTarget(
+                    run_id=run.run_id,
+                    link=link,
+                    profile=profile,
+                    headers=_headers_for_worker(worker_cfg, profile) if profile is not None else {},
+                    skipped=profile is not None and should_sync_worker is not None and not should_sync_worker(profile),
                 )
-                status_code = getattr(response, "status_code", 200)
-                if status_code >= 400:
-                    raise RuntimeError(_response_error(response, status_code))
-                data = response.json()
-                events_response = http_get(
-                    f"{profile.base_url}/sessions/{link.session_id}/events",
-                    headers=headers,
-                    params={"after": link.last_event_id} if link.last_event_id else {},
-                    timeout=timeout,
-                )
-                event_status = getattr(events_response, "status_code", 200)
-                if event_status >= 400:
-                    raise RuntimeError(_response_error(events_response, event_status))
-                event_data = events_response.json()
-            except Exception as exc:  # noqa: BLE001 - sync must not make inspection unusable
-                _record_sync_error(store, run.run_id, link.session_id, str(exc))
-                summary.errors.append(f"{run.run_id}:{link.session_id}: {exc}")
-                continue
-            events = [event for event in event_data.get("events") or [] if isinstance(event, dict)]
-            last_event_id = str(events[-1].get("event_id") or link.last_event_id) if events else link.last_event_id
-            if events:
-                persist_session_events(store, run.run_id, link.session_id, events)
-            before = link.to_dict()
-            metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
-            store.update_session(
-                run.run_id,
-                link.session_id,
-                worker_id=link.worker_id,
-                status=str(data.get("status") or link.status),
-                # Persisted so terminal rows keep their reason after the
-                # worker goes offline; cleared ("") when a new turn starts.
-                ended_reason=str(data.get("ended_reason") or metadata.get("ended_reason") or ""),
-                provider=str(data.get("provider") or link.provider or ""),
-                engine=str(data.get("engine") or link.engine or ""),
-                branch=str(data.get("branch") or link.branch or ""),
-                cwd=str(data.get("cwd") or link.cwd or ""),
-                last_event_id=last_event_id,
             )
-            summary.session_events_seen += len(events)
-            reloaded = store.get(run.run_id)
-            if reloaded is not None:
-                updated = next((x for x in reloaded.sessions if x.worker_id == link.worker_id and x.session_id == link.session_id), link)
-                if updated.to_dict() != before:
-                    summary.sessions_updated += 1
-                run = reloaded
+
+    observations = _bounded_observe(
+        targets,
+        lambda target: _observe_session(target, http_get=http_get, timeout=timeout),
+    )
+    runs_with_more_events: set[str] = set()
+    for observation in observations:
+        target = observation.target
+        link = target.link
+        if target.skipped:
+            continue
+        if target.profile is None:
+            _record_sync_error(
+                store,
+                target.run_id,
+                link.session_id,
+                f"worker {link.worker_id!r} is not configured",
+            )
+            summary.errors.append(f"{target.run_id}:{link.session_id}: worker not configured")
+            continue
+        if observation.error:
+            error = public_error_message(observation.error)
+            _record_sync_error(store, target.run_id, link.session_id, error)
+            summary.errors.append(f"{target.run_id}:{link.session_id}: {error}")
+            continue
+        data = observation.data or {}
+        events = list(observation.events)
+        last_event_id = str(events[-1].get("event_id") or link.last_event_id) if events else link.last_event_id
+        observed_status = str(data.get("status") or link.status)
+        before = link.to_dict()
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        updated_run = store.update_session_if_unchanged(
+            target.run_id,
+            link.session_id,
+            worker_id=link.worker_id,
+            expected=link,
+            events=events,
+            status=str(data.get("status") or link.status),
+            # Persisted so terminal rows keep their reason after the
+            # worker goes offline; cleared ("") when a new turn starts.
+            ended_reason=str(data.get("ended_reason") or metadata.get("ended_reason") or ""),
+            provider=str(data.get("provider") or link.provider or ""),
+            engine=str(data.get("engine") or link.engine or ""),
+            branch=str(data.get("branch") or link.branch or ""),
+            cwd=str(data.get("cwd") or link.cwd or ""),
+            last_event_id=last_event_id,
+        )
+        if updated_run is None:
+            if events or observed_status in (SUCCESS_SESSION_STATUSES | FAILED_SESSION_STATUSES):
+                runs_with_more_events.add(target.run_id)
+            continue
+        summary.session_events_seen += len(events)
+        updated = next(
+            (
+                item
+                for item in updated_run.sessions
+                if item.worker_id == link.worker_id and item.session_id == link.session_id
+            ),
+            link,
+        )
+        if updated.to_dict() != before:
+            summary.sessions_updated += 1
+        if len(events) == SESSION_EVENT_SYNC_LIMIT and observed_status in (
+            SUCCESS_SESSION_STATUSES | FAILED_SESSION_STATUSES
+        ):
+            runs_with_more_events.add(target.run_id)
+
+    for original in runs:
+        run = store.get(original.run_id) or original
+        if run.run_id in runs_with_more_events:
+            continue
         final = final_session_phase(run)
         if final == "completed":
-            store.set_phase(run.run_id, "completed", "All worker sessions completed")
-            summary.runs_completed += 1
+            finalized = store.set_phase_if_execution_unchanged(
+                run.run_id,
+                "completed",
+                "All worker sessions completed",
+                **_execution_fence(run),
+            )
+            if finalized is not None:
+                summary.runs_completed += 1
         elif final == "failed":
-            store.set_phase(run.run_id, "failed", "At least one worker session failed, stopped, or was interrupted")
-            summary.runs_failed += 1
+            finalized = store.set_phase_if_execution_unchanged(
+                run.run_id,
+                "failed",
+                "At least one worker session failed, stopped, or was interrupted",
+                **_execution_fence(run),
+            )
+            if finalized is not None:
+                summary.runs_failed += 1
     return summary
 
 
@@ -220,8 +323,94 @@ def _session_runs_to_sync(store: OrchestrationStore, run_id: str) -> list[Orches
     return [run for run in store.list_runs() if not run.archived_at and run.status != "terminal" and any(not session.archived_at for session in run.sessions)]
 
 
-def _profile_for_job(registry: WorkerRegistry, worker_cfg: WorkerConfig, worker_id: str) -> WorkerProfile | None:
-    profile = registry.get(worker_id, probe=False)
+def _bounded_observe(
+    targets: list[_Target],
+    observe: Callable[[_Target], _Observation],
+) -> list[_Observation]:
+    if not targets:
+        return []
+    with ThreadPoolExecutor(
+        max_workers=min(RECONCILIATION_MAX_CONCURRENCY, len(targets)),
+        thread_name_prefix="jarvis-reconcile",
+    ) as executor:
+        return list(executor.map(observe, targets))
+
+
+def _observe_job(
+    target: _JobSyncTarget,
+    *,
+    http_get: Callable[..., Any],
+    timeout: float,
+) -> _JobObservation:
+    if target.skipped or target.profile is None:
+        return _JobObservation(target=target)
+    try:
+        response = http_get(
+            f"{target.profile.base_url}/jobs/{target.link.job_id}",
+            headers=target.headers,
+            timeout=timeout,
+        )
+        status_code = getattr(response, "status_code", 200)
+        if status_code >= 400:
+            raise RuntimeError(_response_error(response, status_code))
+        data = response.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("worker returned an invalid job response")
+        return _JobObservation(target=target, data=data)
+    except Exception as exc:  # noqa: BLE001 - sync must not make inspection unusable
+        return _JobObservation(target=target, error=str(exc))
+
+
+def _observe_session(
+    target: _SessionSyncTarget,
+    *,
+    http_get: Callable[..., Any],
+    timeout: float,
+) -> _SessionObservation:
+    if target.skipped or target.profile is None:
+        return _SessionObservation(target=target)
+    try:
+        response = http_get(
+            f"{target.profile.base_url}/sessions/{target.link.session_id}",
+            headers=target.headers,
+            timeout=timeout,
+        )
+        status_code = getattr(response, "status_code", 200)
+        if status_code >= 400:
+            raise RuntimeError(_response_error(response, status_code))
+        data = response.json()
+        if not isinstance(data, dict):
+            raise RuntimeError("worker returned an invalid session response")
+        events_response = http_get(
+            f"{target.profile.base_url}/sessions/{target.link.session_id}/events",
+            headers=target.headers,
+            params={
+                **({"after": target.link.last_event_id} if target.link.last_event_id else {}),
+                "limit": SESSION_EVENT_SYNC_LIMIT,
+            },
+            timeout=timeout,
+        )
+        event_status = getattr(events_response, "status_code", 200)
+        if event_status >= 400:
+            raise RuntimeError(_response_error(events_response, event_status))
+        event_data = events_response.json()
+        if not isinstance(event_data, dict):
+            raise RuntimeError("worker returned an invalid session events response")
+        events = tuple(event for event in event_data.get("events") or [] if isinstance(event, dict))
+        return _SessionObservation(target=target, data=data, events=events)
+    except Exception as exc:  # noqa: BLE001 - sync must not make inspection unusable
+        return _SessionObservation(target=target, error=str(exc))
+
+
+def _profile_for_job(
+    profiles: list[WorkerProfile],
+    worker_cfg: WorkerConfig,
+    worker_id: str,
+) -> WorkerProfile | None:
+    profile = next(
+        (candidate for candidate in profiles if not worker_id or candidate.worker_id == worker_id),
+        None,
+    )
     if profile is not None:
         return profile
     if not worker_id or worker_id == "local-worker":
@@ -256,47 +445,29 @@ def persist_session_events(store: OrchestrationStore, run_id: str, session_id: s
     stream) durable: the worker's `/events` cursor only returns each event once,
     so discarding events here would lose them. Dedup by event_id so overlapping
     syncs, dispatch responses, and cockpit session writes never double-append."""
-    existing = {
-        str(event.data.get("event_id") or "")
-        for event in store.events(run_id)
-        if isinstance(event.data, dict) and event.data.get("event_id")
-    }
-    persisted = False
-    for raw in events:
-        event_id = str(raw.get("event_id") or "")
-        if event_id and event_id in existing:
-            continue
-        data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
-        store.append_event(
-            run_id,
-            str(raw.get("type") or "session.event"),
-            "",
-            {
-                "session_id": session_id,
-                "event_id": event_id,
-                "turn_id": str(data.get("turn_id") or ""),
-                "message_id": str(data.get("message_id") or ""),
-                "time": str(raw.get("time") or ""),
-                "data": dict(data),
-            },
-        )
-        persisted = True
-        if event_id:
-            existing.add(event_id)
-    if persisted:
-        # append_event already updates the local generation. Keep this explicit
-        # at the sync boundary too: future batched persistence must still wake
-        # the SSE hub when it writes worker-originated events.
-        store.bump_generation()
+    store.persist_worker_session_events(run_id, session_id, events)
 
 
 def _record_sync_error(store: OrchestrationStore, run_id: str, job_id: str, error: str) -> None:
-    store.append_event(
+    error = public_error_message(error)
+    store.append_event_if_run_visible(
         run_id,
         "job_sync_failed",
         f"Could not sync worker job {job_id}: {error}",
         {"job_id": job_id, "error": error},
     )
+
+
+def _execution_fence(run: OrchestrationRun) -> dict[str, object]:
+    return {
+        "expected_phase": run.phase,
+        "expected_status": run.status,
+        "expected_jobs": tuple((job.worker_id, job.job_id, job.status) for job in run.jobs),
+        "expected_sessions": tuple(
+            (session.worker_id, session.session_id, session.status, session.archived_at)
+            for session in run.sessions
+        ),
+    }
 
 
 def _final_phase(run: OrchestrationRun) -> str:

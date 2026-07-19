@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from jarvis.ids import new_id, utc_now
+from jarvis.redaction import public_error_message
 from jarvis.worker_session_contract import (
     ACTIVE_SESSION_STATUSES,
     CHECKPOINT_ID_KEY,
@@ -64,7 +65,11 @@ PROVIDER_OWNED_METADATA_KEYS = {
     "codex_thread_id",
     "claude_session_id",
     "claude_session_started",
+    "active_turn",
+    "execution_pending_requests",
 }
+
+EXECUTION_EVENT_TAIL_BYTES = 1024 * 1024
 
 
 @dataclass
@@ -211,6 +216,9 @@ class SessionManager:
             if session is None:
                 raise KeyError(session_id)
             session.status = status
+            if status not in ACTIVE_SESSION_STATUSES:
+                session.metadata.pop("active_turn", None)
+                session.metadata["execution_pending_requests"] = []
             _apply_ended_reason(session, status, override=ended_reason)
             session.updated_at = utc_now()
             self.save(session)
@@ -271,6 +279,7 @@ class SessionManager:
             event = SessionEvent.create(session.session_id, event_type, data)
             with self.events_path(session.session_id).open("a") as f:
                 f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
+            _update_execution_pending_requests(session, event)
             session.updated_at = event.time
             self.save(session)
         self._changed(session_id, "session_event")
@@ -291,6 +300,9 @@ class SessionManager:
                 raise ValueError(f"invalid event type {event_type!r}")
             existing = self._idempotent_event(session.session_id, event_type, data or {})
             session.status = status
+            if status not in ACTIVE_SESSION_STATUSES:
+                session.metadata.pop("active_turn", None)
+                session.metadata["execution_pending_requests"] = []
             _apply_ended_reason(session, status)
             session.updated_at = utc_now()
             self.save(session)
@@ -314,6 +326,8 @@ class SessionManager:
             terminal_status = self._terminal_status_from_events(session.session_id)
             if terminal_status is not None:
                 session.status = terminal_status
+                session.metadata.pop("active_turn", None)
+                session.metadata["execution_pending_requests"] = []
                 _apply_ended_reason(session, terminal_status)
                 session.updated_at = utc_now()
                 self.save(session)
@@ -353,6 +367,10 @@ class SessionManager:
             with self.events_path(session.session_id).open("a") as f:
                 f.write(json.dumps(event.to_dict(), sort_keys=True) + "\n")
             session.status = SESSION_RUNNING
+            session.metadata["active_turn"] = {
+                "turn_id": str(data.get("turn_id") or ""),
+                "started_at": event.time,
+            }
             _apply_ended_reason(session, SESSION_RUNNING)
             session.updated_at = event.time
             self.save(session)
@@ -383,6 +401,8 @@ class SessionManager:
                     {"reason": "worker daemon restarted with active session state", "previous_status": session.status},
                 )
                 session.status = SESSION_INTERRUPTED
+                session.metadata.pop("active_turn", None)
+                session.metadata["execution_pending_requests"] = []
                 _apply_ended_reason(session, SESSION_INTERRUPTED, override="worker_lost")
                 session.updated_at = event.time
                 self.save(session)
@@ -431,28 +451,63 @@ class SessionManager:
 
     def pending_requests(self, session_id: str | None = None) -> list[dict[str, Any]]:
         sessions = [self.get(session_id)] if session_id else self.list()
-        pending: dict[tuple[str, str, str], dict[str, Any]] = {}
+        pending: list[dict[str, Any]] = []
         for session in [x for x in sessions if x is not None]:
-            if session.status in FAILED_SESSION_STATUSES or session.status in SUCCESS_SESSION_STATUSES:
+            pending.extend(_pending_requests_from_events(session, self.events(session.session_id)))
+        return pending
+
+    def execution_state(self, session_id: str) -> dict[str, Any] | None:
+        """Project the current turn and requests from the durable event log."""
+        session = self.get(session_id)
+        if session is None:
+            return None
+        events = self._execution_events(session_id)
+        stored_active = session.metadata.get("active_turn")
+        active_turn = (
+            {
+                "turn_id": str(stored_active.get("turn_id") or ""),
+                "status": session.status,
+                "started_at": str(stored_active.get("started_at") or ""),
+            }
+            if isinstance(stored_active, dict) and str(stored_active.get("turn_id") or "")
+            else _active_turn_from_events(events, session.status)
+        )
+        if session.status not in ACTIVE_SESSION_STATUSES or session.status == SESSION_CREATED:
+            active_turn = None
+
+        return {
+            "session_id": session.session_id,
+            "status": session.status,
+            "active_turn": active_turn,
+            "pending_requests": _execution_pending_requests(session, events),
+        }
+
+    def _execution_events(self, session_id: str) -> list[SessionEvent]:
+        """Read a bounded tail; providers pause after opening human requests."""
+        try:
+            path = self.events_path(session_id)
+        except ValueError:
+            return []
+        if not path.exists():
+            return []
+        with path.open("rb") as stream:
+            stream.seek(0, 2)
+            size = stream.tell()
+            start = max(0, size - EXECUTION_EVENT_TAIL_BYTES)
+            stream.seek(start)
+            payload = stream.read(EXECUTION_EVENT_TAIL_BYTES)
+        if start > 0:
+            newline = payload.find(b"\n")
+            payload = payload[newline + 1 :] if newline >= 0 else b""
+        events: list[SessionEvent] = []
+        for line in payload.splitlines():
+            if not line.strip():
                 continue
-            for event in self.events(session.session_id):
-                request_type = contract_request_type(event.type)
-                if request_type:
-                    request_id = str(event.data.get("request_id") or event.data.get("id") or event.event_id)
-                    pending[(session.session_id, request_type, request_id)] = {
-                        "session_id": session.session_id,
-                        "request_id": request_id,
-                        "kind": request_type,
-                        "status": "pending",
-                        "event": event.to_dict(),
-                    }
-                    continue
-                resolved_type = contract_resolved_request_type(event.type)
-                if resolved_type:
-                    request_id = str(event.data.get("request_id") or event.data.get("id") or "")
-                    if request_id:
-                        pending.pop((session.session_id, resolved_type, request_id), None)
-        return list(pending.values())
+            try:
+                events.append(SessionEvent.from_dict(json.loads(line)))
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                continue
+        return events
 
     def checkpoints(self, session_id: str) -> list[dict[str, Any]]:
         events = self.events(session_id)
@@ -477,6 +532,14 @@ class SessionManager:
                 }
             )
         return checkpoints
+
+    def all_checkpoints(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                checkpoint
+                for session in sorted(self.list(), key=lambda item: item.session_id)
+                for checkpoint in self.checkpoints(session.session_id)
+            ]
 
     def remove(self, session_id: str) -> bool:
         with self._lock:
@@ -535,6 +598,179 @@ def _apply_ended_reason(session: WorkerSession, status: str, *, override: str = 
     reason = override or ENDED_REASONS_BY_STATUS.get(status, "")
     if reason:
         session.metadata["ended_reason"] = reason
+
+
+def _execution_request(item: dict[str, Any]) -> dict[str, Any]:
+    event = item.get("event") if isinstance(item.get("event"), dict) else {}
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    nested_input = data.get("input") if isinstance(data.get("input"), dict) else {}
+    kind = str(item.get("kind") or "")
+    detail = str(
+        data.get("detail")
+        or data.get("description")
+        or nested_input.get("description")
+        or data.get("command")
+        or nested_input.get("command")
+        or data.get("path")
+        or data.get("blocked_path")
+        or nested_input.get("path")
+        or data.get("prompt")
+        or data.get("question")
+        or ""
+    )
+    result = {
+        "request_id": str(item.get("request_id") or ""),
+        "kind": kind,
+        "status": str(item.get("status") or "pending"),
+        "title": public_error_message(
+            str(data.get("title") or ("Approve action" if kind == "approval" else "Input needed"))
+        ),
+        "detail": public_error_message(detail),
+        "created_at": str(event.get("time") or data.get("created_at") or ""),
+    }
+    if kind == "approval":
+        result["request_kind"] = _execution_request_kind(data, nested_input)
+    if kind == "input":
+        result["questions"] = _execution_questions(nested_input or data, detail)
+    return result
+
+
+def _execution_questions(data: dict[str, Any], fallback: str) -> list[dict[str, Any]]:
+    raw_questions = data.get("questions")
+    questions: list[dict[str, Any]] = []
+    if isinstance(raw_questions, list):
+        for raw in raw_questions[:20]:
+            if not isinstance(raw, dict):
+                continue
+            raw_options = raw.get("options") if isinstance(raw.get("options"), list) else []
+            options = []
+            for option in raw_options[:20]:
+                if isinstance(option, dict):
+                    options.append(
+                        {
+                            "label": public_error_message(
+                                str(option.get("label") or option.get("value") or "Option")
+                            ),
+                            "description": public_error_message(str(option.get("description") or "")),
+                        }
+                    )
+                else:
+                    options.append(
+                        {"label": public_error_message(str(option) or "Option"), "description": ""}
+                    )
+            questions.append(
+                {
+                    "id": public_error_message(str(raw.get("id") or "response")),
+                    "header": public_error_message(str(raw.get("header") or "Input")),
+                    "question": public_error_message(
+                        str(raw.get("question") or fallback or "Input needed")
+                    ),
+                    "options": options,
+                    "multi_select": bool(raw.get("multiSelect") or raw.get("multi_select")),
+                }
+            )
+    if questions:
+        return questions
+    return [
+        {
+            "id": "response",
+            "header": "Input",
+            "question": public_error_message(fallback or "Input needed"),
+            "options": [],
+            "multi_select": False,
+        }
+    ]
+
+
+def _execution_request_kind(data: dict[str, Any], nested_input: dict[str, Any]) -> str:
+    explicit = str(data.get("request_kind") or nested_input.get("request_kind") or "")
+    if explicit in {"command", "file-read", "file-change"}:
+        return explicit
+    tool_name = str(data.get("tool_name") or "").lower()
+    if "read" in tool_name:
+        return "file-read"
+    if any(word in tool_name for word in ("edit", "write", "notebook")):
+        return "file-change"
+    return "command"
+
+
+def _active_turn_from_events(events: list[SessionEvent], status: str) -> dict[str, str] | None:
+    for event in reversed(events):
+        turn_id = str(event.data.get("turn_id") or "")
+        if turn_id:
+            return {"turn_id": turn_id, "status": status, "started_at": event.time}
+    return None
+
+
+def _pending_requests_from_events(
+    session: WorkerSession,
+    events: list[SessionEvent],
+) -> list[dict[str, Any]]:
+    if session.status in FAILED_SESSION_STATUSES or session.status in SUCCESS_SESSION_STATUSES:
+        return []
+    pending: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for event in events:
+        request_kind = contract_request_type(event.type)
+        if request_kind:
+            request_id = str(event.data.get("request_id") or event.data.get("id") or event.event_id)
+            pending[(session.session_id, request_kind, request_id)] = {
+                "session_id": session.session_id,
+                "request_id": request_id,
+                "kind": request_kind,
+                "status": "pending",
+                "event": event.to_dict(),
+            }
+            continue
+        resolved_kind = contract_resolved_request_type(event.type)
+        if resolved_kind:
+            request_id = str(event.data.get("request_id") or event.data.get("id") or "")
+            if request_id:
+                pending.pop((session.session_id, resolved_kind, request_id), None)
+    return list(pending.values())
+
+
+def _execution_pending_requests(
+    session: WorkerSession,
+    events: list[SessionEvent],
+) -> list[dict[str, Any]]:
+    stored = session.metadata.get("execution_pending_requests")
+    if isinstance(stored, list):
+        return [dict(item) for item in stored if isinstance(item, dict)]
+    return [_execution_request(item) for item in _pending_requests_from_events(session, events)]
+
+
+def _update_execution_pending_requests(session: WorkerSession, event: SessionEvent) -> None:
+    request_kind = contract_request_type(event.type)
+    resolved_kind = contract_resolved_request_type(event.type)
+    if not request_kind and not resolved_kind:
+        return
+    pending = [
+        dict(item)
+        for item in session.metadata.get("execution_pending_requests", [])
+        if isinstance(item, dict)
+    ]
+    request_id = str(event.data.get("request_id") or event.data.get("id") or event.event_id)
+    pending = [
+        item
+        for item in pending
+        if not (
+            str(item.get("request_id") or "") == request_id
+            and str(item.get("kind") or "") == (request_kind or resolved_kind)
+        )
+    ]
+    if request_kind:
+        pending.append(
+            _execution_request(
+                {
+                    "session_id": session.session_id,
+                    "request_id": request_id,
+                    "kind": request_kind,
+                    "status": "pending",
+                    "event": event.to_dict(),
+                }
+            )
+        )
+    session.metadata["execution_pending_requests"] = pending
 
 
 def _valid_id(value: str) -> bool:

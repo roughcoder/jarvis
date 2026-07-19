@@ -313,3 +313,39 @@ def test_publish_github_pr_review_suppresses_equivalent_existing_inline_comment(
     assert result.comments == 0
     assert result.skipped_comments == 1
     assert posted is False
+
+
+def test_publish_github_pr_review_still_posts_a_summary_only_review() -> None:
+    calls: list[tuple[list[str], str]] = []
+
+    def run(argv, **kwargs):  # noqa: ANN001
+        calls.append((list(argv), str(kwargs.get("input") or "")))
+        if argv[-1] == "repos/acme/widget/pulls/7":
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"head": {"sha": "abc123"}}), "")
+        if "--paginate" in argv:
+            return subprocess.CompletedProcess(argv, 0, json.dumps([[]]), "")
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            json.dumps({"id": 77, "html_url": "https://github.com/acme/widget/pull/7#review-77"}),
+            "",
+        )
+
+    # A reviewer that cannot anchor its findings to diff lines puts them in the
+    # summary instead. That review must still reach GitHub: dropping it posted
+    # nothing while the caller was told the review had been published.
+    result = publish_github_pr_review(
+        repo="acme/widget",
+        pull_number=7,
+        commit_id="abc123",
+        summary="## Joined review\n\n[P2] The bench script skips the generate step.",
+        comments=[],
+        runner=run,
+    )
+
+    assert result.review_id == 77
+    posted = [call for call in calls if "reviews" in call[0][-2:] or "reviews" in " ".join(call[0])]
+    assert posted, "no review was posted to GitHub"
+    payload = json.loads(posted[-1][1])
+    assert payload["comments"] == []
+    assert "[P2] The bench script skips the generate step." in payload["body"]

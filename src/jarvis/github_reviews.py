@@ -84,7 +84,10 @@ def publish_github_pr_review(
         rendered_comments.append(rendered)
     if skipped:
         summary = summary.strip() + "\n\nFindings not published inline:\n" + "\n".join(f"- {item}" for item in skipped)
-    if not rendered_comments and duplicate_count == len(comments) and invalid_count == 0:
+    # Skip only when every comment we were asked to post already exists. An
+    # empty `comments` list is not that case: it is a summary-only review, and
+    # dropping it published nothing while still reporting success.
+    if comments and not rendered_comments and duplicate_count == len(comments) and invalid_count == 0:
         return GitHubReviewResult(review_id=0, url="", comments=0, skipped_comments=len(skipped))
     payload = {
         "event": "COMMENT",

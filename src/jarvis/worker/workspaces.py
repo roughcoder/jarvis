@@ -9,7 +9,7 @@ from typing import Any
 from jarvis.config import WorkerConfig
 from jarvis.ids import utc_now
 from jarvis.text import slugify
-from jarvis.worker.actions import clone_repo, fetch_repo, list_repos, resolve_available_worktree_branch, resolve_repo, run_exec
+from jarvis.worker.actions import clone_repo, fetch_repo, list_repos, repo_mutation_lock, resolve_available_worktree_branch, resolve_repo, run_exec
 
 
 WORKSPACE_STATE_FILENAME = "workspace.json"
@@ -220,12 +220,13 @@ async def materialize_worktree(
                 # `existing` (looked up above) was None or not a live dir, so this is
                 # not a real name conflict.
                 await _reconcile_orphaned_worktree(cfg, resolved, worktree, requested_branch)
-            branch = await resolve_available_worktree_branch(resolved, requested_branch, cfg.shell_timeout_s)
-            out = await run_exec(
-                ["git", "-C", resolved, "worktree", "add", "-b", branch, "--", str(worktree), base],
-                None,
-                cfg.shell_timeout_s,
-            )
+            async with repo_mutation_lock(resolved):
+                branch = await resolve_available_worktree_branch(resolved, requested_branch, cfg.shell_timeout_s)
+                out = await run_exec(
+                    ["git", "-C", resolved, "worktree", "add", "-b", branch, "--", str(worktree), base],
+                    None,
+                    cfg.shell_timeout_s,
+                )
             if not worktree.exists():
                 raise ValueError(f"could not create worktree for {repo_ref!r}: {out[:200]}")
 

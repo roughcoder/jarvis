@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,7 +40,7 @@ from jarvis.orchestration.service import (
 )
 from jarvis.orchestration.sources import GitHubWorkSource, LinearWorkSource
 from jarvis.orchestration.store import ActiveWorkItemError, OrchestrationStore
-from jarvis.orchestration.supervisor import sync_run_jobs, sync_run_sessions
+from jarvis.orchestration.supervisor import persist_session_events, sync_run_jobs, sync_run_sessions
 from jarvis.orchestration.workers import WorkerProfile, WorkerRegistry
 
 
@@ -3063,7 +3064,466 @@ def test_sync_run_sessions_marks_completed_run_and_advances_event_cursor(tmp_pat
     assert reloaded is not None
     assert reloaded.phase == "completed"
     assert reloaded.sessions[0].last_event_id == "event_2"
-    assert seen["http://localhost:1/sessions/sess_123/events"]["params"] == {"after": "event_1"}
+    assert seen["http://localhost:1/sessions/sess_123/events"]["params"] == {
+        "after": "event_1",
+        "limit": 500,
+    }
+
+
+def test_sync_run_sessions_observes_concurrently_then_applies_in_link_order(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Reconcile concurrent sessions")
+    session_ids = [f"sess_{index}" for index in range(6)]
+    for session_id in session_ids:
+        store.link_session(
+            run.run_id,
+            WorkerSessionLink(
+                worker_id="local-worker",
+                session_id=session_id,
+                status="running",
+                provider="fake",
+                engine="fake",
+            ),
+        )
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, body: dict) -> None:
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    lock = threading.Lock()
+    first_wave = threading.Barrier(4)
+    started_detail = 0
+    active = 0
+    peak = 0
+    completed_calls: set[str] = set()
+
+    def fake_get(url, **_kwargs):  # noqa: ANN001
+        nonlocal active, peak, started_detail
+        is_events = url.endswith("/events")
+        session_id = url.split("/sessions/", 1)[1].split("/", 1)[0]
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            wait_for_first_wave = not is_events and started_detail < 4
+            if not is_events:
+                started_detail += 1
+        try:
+            if wait_for_first_wave:
+                first_wave.wait(timeout=5)
+            if is_events:
+                return Response(
+                    {
+                        "events": [
+                            {
+                                "event_id": f"event_{session_id}",
+                                "type": "turn.completed",
+                            }
+                        ]
+                    }
+                )
+            return Response(
+                {
+                    "session_id": session_id,
+                    "status": "completed",
+                    "provider": "fake",
+                    "engine": "fake",
+                }
+            )
+        finally:
+            with lock:
+                active -= 1
+                completed_calls.add(url)
+
+    expected_call_count = len(session_ids) * 2
+    mutation_order: list[str] = []
+    original_append_event = store.append_event
+    original_update_session = store.update_session_if_unchanged
+    original_set_phase = store.set_phase_if_execution_unchanged
+
+    def assert_observations_settled() -> None:
+        assert len(completed_calls) == expected_call_count
+
+    def append_event(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        assert_observations_settled()
+        return original_append_event(*args, **kwargs)
+
+    def update_session(run_id, session_id, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        assert_observations_settled()
+        mutation_order.append(session_id)
+        return original_update_session(run_id, session_id, **kwargs)
+
+    def set_phase(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        assert_observations_settled()
+        return original_set_phase(*args, **kwargs)
+
+    monkeypatch.setattr(store, "append_event", append_event)
+    monkeypatch.setattr(store, "update_session_if_unchanged", update_session)
+    monkeypatch.setattr(store, "set_phase_if_execution_unchanged", set_phase)
+
+    summary = sync_run_sessions(
+        store,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1),
+        get=fake_get,
+    )
+
+    reloaded = store.get(run.run_id)
+    assert 2 <= peak <= 4
+    assert mutation_order == session_ids
+    assert summary.sessions_seen == len(session_ids)
+    assert summary.sessions_updated == len(session_ids)
+    assert summary.session_events_seen == len(session_ids)
+    assert summary.runs_completed == 1
+    assert summary.errors == []
+    assert reloaded is not None
+    assert reloaded.phase == "completed"
+    assert [session.status for session in reloaded.sessions] == ["completed"] * len(session_ids)
+
+
+def test_sync_run_sessions_does_not_regress_concurrently_advanced_event_cursor(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Fence stale session observation")
+    store.link_session(
+        run.run_id,
+        WorkerSessionLink(
+            worker_id="local-worker",
+            session_id="sess_stale",
+            status="running",
+            provider="fake",
+            engine="fake",
+            last_event_id="event_original",
+        ),
+    )
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, body: dict) -> None:
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    def fake_get(url, **_kwargs):  # noqa: ANN001
+        if url.endswith("/events"):
+            store.update_session(
+                run.run_id,
+                "sess_stale",
+                worker_id="local-worker",
+                status="running",
+                last_event_id="event_external",
+            )
+            return Response({"events": [{"event_id": "event_stale", "type": "turn.completed"}]})
+        return Response(
+            {
+                "session_id": "sess_stale",
+                "status": "completed",
+                "provider": "fake",
+                "engine": "fake",
+            }
+        )
+
+    summary = sync_run_sessions(
+        store,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1),
+        get=fake_get,
+    )
+
+    reloaded = store.get(run.run_id)
+    assert reloaded is not None
+    assert reloaded.sessions[0].status == "running"
+    assert reloaded.sessions[0].last_event_id == "event_external"
+    assert summary.sessions_updated == 0
+    assert summary.session_events_seen == 0
+    assert all(event.data.get("event_id") != "event_stale" for event in store.events(run.run_id))
+
+
+def test_sync_run_sessions_retries_rejected_terminal_event_page_before_finalizing(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Retry fenced terminal events")
+    store.link_session(
+        run.run_id,
+        WorkerSessionLink(
+            worker_id="local-worker",
+            session_id="sess_fenced",
+            status="running",
+            provider="fake",
+            engine="fake",
+        ),
+    )
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, body: dict) -> None:
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    event_calls = 0
+
+    def fake_get(url, **_kwargs):  # noqa: ANN001
+        nonlocal event_calls
+        if url.endswith("/events"):
+            event_calls += 1
+            if event_calls == 1:
+                store.update_session(
+                    run.run_id,
+                    "sess_fenced",
+                    worker_id="local-worker",
+                    status="completed",
+                    branch="external-update",
+                )
+            return Response(
+                {
+                    "events": [
+                        {
+                            "event_id": "event_pending",
+                            "type": "turn.completed",
+                        }
+                    ]
+                }
+            )
+        return Response(
+            {
+                "session_id": "sess_fenced",
+                "status": "completed",
+                "provider": "fake",
+                "engine": "fake",
+                "branch": "external-update",
+            }
+        )
+
+    first = sync_run_sessions(
+        store,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1),
+        get=fake_get,
+    )
+    after_first = store.get(run.run_id)
+
+    assert after_first is not None
+    assert first.sessions_updated == 0
+    assert first.session_events_seen == 0
+    assert first.runs_completed == 0
+    assert after_first.status == "active"
+    assert after_first.sessions[0].status == "completed"
+    assert after_first.sessions[0].last_event_id == ""
+    assert all(event.data.get("event_id") != "event_pending" for event in store.events(run.run_id))
+
+    second = sync_run_sessions(
+        store,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1),
+        get=fake_get,
+    )
+    after_second = store.get(run.run_id)
+
+    assert after_second is not None
+    assert second.session_events_seen == 1
+    assert second.runs_completed == 1
+    assert after_second.status == "terminal"
+    assert after_second.sessions[0].last_event_id == "event_pending"
+    assert sum(
+        event.data.get("event_id") == "event_pending"
+        for event in store.events(run.run_id)
+    ) == 1
+
+
+def test_sync_run_sessions_does_not_finalize_over_new_reservation(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Fence final session phase")
+    store.link_session(
+        run.run_id,
+        WorkerSessionLink(
+            worker_id="local-worker",
+            session_id="sess_original",
+            status="running",
+            provider="fake",
+            engine="fake",
+        ),
+    )
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, body: dict) -> None:
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    original_finalize = store.set_phase_if_execution_unchanged
+    raced = False
+
+    def finalize_with_reservation(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        nonlocal raced
+        if not raced:
+            raced = True
+            store.reserve_session_if_idle(
+                run.run_id,
+                WorkerSessionLink(
+                    worker_id="local-worker",
+                    session_id="sess_new",
+                    status="running",
+                    provider="fake",
+                    engine="fake",
+                ),
+            )
+        return original_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(store, "set_phase_if_execution_unchanged", finalize_with_reservation)
+
+    def fake_get(url, **_kwargs):  # noqa: ANN001
+        if url.endswith("/events"):
+            return Response({"events": []})
+        return Response(
+            {
+                "session_id": "sess_original",
+                "status": "completed",
+                "provider": "fake",
+                "engine": "fake",
+            }
+        )
+
+    summary = sync_run_sessions(
+        store,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1),
+        get=fake_get,
+    )
+
+    reloaded = store.get(run.run_id)
+    assert reloaded is not None
+    assert summary.runs_completed == 0
+    assert reloaded.status == "active"
+    assert reloaded.phase == "running"
+    assert [(session.session_id, session.status) for session in reloaded.sessions] == [
+        ("sess_original", "completed"),
+        ("sess_new", "running"),
+    ]
+
+
+def test_sync_run_sessions_drains_full_terminal_event_page_before_finalizing(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Drain terminal event pages")
+    store.link_session(
+        run.run_id,
+        WorkerSessionLink(
+            worker_id="local-worker",
+            session_id="sess_paged",
+            status="running",
+            provider="fake",
+            engine="fake",
+        ),
+    )
+    worker_events = [
+        {"event_id": f"event_{index:03d}", "type": "assistant.message"}
+        for index in range(501)
+    ]
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, body: dict) -> None:
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    def fake_get(url, **kwargs):  # noqa: ANN001
+        if url.endswith("/events"):
+            after = kwargs["params"].get("after", "")
+            start = 500 if after == "event_499" else 0
+            return Response({"events": worker_events[start : start + kwargs["params"]["limit"]]})
+        return Response(
+            {
+                "session_id": "sess_paged",
+                "status": "completed",
+                "provider": "fake",
+                "engine": "fake",
+            }
+        )
+
+    first = sync_run_sessions(
+        store,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1),
+        get=fake_get,
+    )
+    after_first = store.get(run.run_id)
+
+    assert after_first is not None
+    assert first.session_events_seen == 500
+    assert first.runs_completed == 0
+    assert after_first.status == "active"
+    assert after_first.sessions[0].status == "completed"
+    assert after_first.sessions[0].last_event_id == "event_499"
+
+    second = sync_run_sessions(
+        store,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1),
+        get=fake_get,
+    )
+    after_second = store.get(run.run_id)
+    persisted_ids = {
+        event.data.get("event_id")
+        for event in store.events(run.run_id)
+        if str(event.data.get("event_id") or "").startswith("event_")
+    }
+
+    assert after_second is not None
+    assert second.session_events_seen == 1
+    assert second.runs_completed == 1
+    assert after_second.status == "terminal"
+    assert after_second.phase == "completed"
+    assert after_second.sessions[0].last_event_id == "event_500"
+    assert len(persisted_ids) == 501
+
+
+def test_persist_session_events_deduplicates_concurrent_writers_atomically(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Deduplicate concurrent session events")
+    store.link_session(
+        run.run_id,
+        WorkerSessionLink(
+            worker_id="local-worker",
+            session_id="sess_shared",
+            status="running",
+            provider="fake",
+            engine="fake",
+        ),
+    )
+    event = {
+        "event_id": "event_shared",
+        "type": "assistant.message",
+        "data": {"message_id": "message_shared"},
+    }
+    ready = threading.Barrier(2)
+    failures: list[BaseException] = []
+
+    def persist() -> None:
+        try:
+            ready.wait(timeout=5)
+            persist_session_events(store, run.run_id, "sess_shared", [event])
+        except BaseException as exc:  # noqa: BLE001 - surface thread failures in the assertion thread
+            failures.append(exc)
+
+    threads = [threading.Thread(target=persist) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert failures == []
+    assert all(not thread.is_alive() for thread in threads)
+    persisted = [
+        item
+        for item in store.events(run.run_id)
+        if item.data.get("event_id") == "event_shared"
+    ]
+    assert len(persisted) == 1
 
 
 def test_sync_run_sessions_updates_matching_worker_session_when_ids_collide(tmp_path) -> None:
@@ -3313,6 +3773,175 @@ def test_sync_run_jobs_marks_completed_run(tmp_path) -> None:
     assert reloaded.jobs[0].session_name == "jarvis-start-work"
     assert seen["url"] == "http://localhost:1/jobs/job123"
     assert seen["headers"] == {"Authorization": "Bearer secret"}
+
+
+def test_sync_run_jobs_observes_concurrently_then_applies_in_link_order(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Reconcile concurrent jobs")
+    job_ids = [f"job_{index}" for index in range(6)]
+    for job_id in job_ids:
+        store.link_job(
+            run.run_id,
+            WorkerJobLink(worker_id="local-worker", job_id=job_id, status="running"),
+        )
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, job_id: str) -> None:
+            self.job_id = job_id
+
+        def json(self):
+            return {"id": self.job_id, "status": "done"}
+
+    lock = threading.Lock()
+    first_wave = threading.Barrier(4)
+    started = 0
+    active = 0
+    peak = 0
+    completed: set[str] = set()
+
+    def fake_get(url, **_kwargs):  # noqa: ANN001
+        nonlocal active, peak, started
+        job_id = url.rsplit("/", 1)[-1]
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            wait_for_first_wave = started < 4
+            started += 1
+        try:
+            if wait_for_first_wave:
+                first_wave.wait(timeout=5)
+            return Response(job_id)
+        finally:
+            with lock:
+                active -= 1
+                completed.add(job_id)
+
+    mutation_order: list[str] = []
+    original_update_job = store.update_job_if_unchanged
+    original_set_phase = store.set_phase_if_execution_unchanged
+
+    def update_job(run_id, job_id, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        assert completed == set(job_ids)
+        mutation_order.append(job_id)
+        return original_update_job(run_id, job_id, **kwargs)
+
+    def set_phase(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        assert completed == set(job_ids)
+        return original_set_phase(*args, **kwargs)
+
+    monkeypatch.setattr(store, "update_job_if_unchanged", update_job)
+    monkeypatch.setattr(store, "set_phase_if_execution_unchanged", set_phase)
+
+    summary = sync_run_jobs(
+        store,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1),
+        get=fake_get,
+    )
+
+    reloaded = store.get(run.run_id)
+    assert 2 <= peak <= 4
+    assert mutation_order == job_ids
+    assert summary.jobs_seen == len(job_ids)
+    assert summary.jobs_updated == len(job_ids)
+    assert summary.runs_completed == 1
+    assert summary.errors == []
+    assert reloaded is not None
+    assert reloaded.phase == "completed"
+    assert [job.status for job in reloaded.jobs] == ["done"] * len(job_ids)
+
+
+def test_sync_run_jobs_does_not_overwrite_concurrently_resumed_link(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Fence stale job observation")
+    store.link_job(
+        run.run_id,
+        WorkerJobLink(worker_id="local-worker", job_id="job_stale", status="running"),
+    )
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"id": "job_stale", "status": "done"}
+
+    def fake_get(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        store.update_job(
+            run.run_id,
+            "job_stale",
+            status="running",
+            session_id="resumed-session",
+        )
+        return Response()
+
+    summary = sync_run_jobs(
+        store,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1),
+        get=fake_get,
+    )
+
+    reloaded = store.get(run.run_id)
+    assert reloaded is not None
+    assert reloaded.jobs[0].status == "running"
+    assert reloaded.jobs[0].session_id == "resumed-session"
+    assert summary.jobs_updated == 0
+    assert summary.runs_completed == 0
+
+
+def test_sync_run_jobs_redacts_worker_error_before_persisting(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Redact worker sync error")
+    store.link_job(
+        run.run_id,
+        WorkerJobLink(worker_id="local-worker", job_id="job_secret", status="running"),
+    )
+    private_error = (
+        "failed at https://user:password@private.example/api "
+        "/Users/neil/private/repo OPENAI_API_KEY=super-secret-value"
+    )
+
+    summary = sync_run_jobs(
+        store,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1),
+        get=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(private_error)),
+    )
+
+    event = store.events(run.run_id)[-1]
+    durable = json.dumps(event.to_dict())
+    assert event.type == "job_sync_failed"
+    assert private_error not in durable
+    assert "private.example" not in durable
+    assert "/Users/neil" not in durable
+    assert "super-secret-value" not in durable
+    assert "<redacted-url>" in durable
+    assert "<local-path>" in durable
+    assert "<redacted-secret>" in durable
+    assert summary.errors is not None
+    assert private_error not in summary.errors[0]
+
+
+def test_sync_run_jobs_does_not_recreate_deleted_run_for_sync_error(tmp_path) -> None:
+    store = OrchestrationStore(str(tmp_path))
+    run = store.create_run("Delete during failed observation")
+    store.link_job(
+        run.run_id,
+        WorkerJobLink(worker_id="local-worker", job_id="job_deleted", status="running"),
+    )
+
+    def failed_get(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        store.delete_run(run.run_id)
+        raise RuntimeError("worker disappeared")
+
+    summary = sync_run_jobs(
+        store,
+        worker_cfg=WorkerConfig(_env_file=None, host="localhost", port=1),
+        get=failed_get,
+    )
+
+    assert summary.errors == [f"{run.run_id}:job_deleted: worker disappeared"]
+    assert store.get(run.run_id) is None
+    assert not store.run_dir(run.run_id).exists()
 
 
 def test_sync_run_jobs_marks_successful_resume_after_interrupted_job_completed(tmp_path) -> None:

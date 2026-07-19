@@ -6,8 +6,10 @@ import json
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -19,12 +21,18 @@ import httpx  # noqa: E402
 from aiohttp import web  # noqa: E402
 
 from jarvis.brain.capabilities import RequestContext, can_query_memory_peer  # noqa: E402
+from jarvis.capabilities import (  # noqa: E402
+    WORKER_SESSION_APPROVE,
+    WORKER_SESSION_INPUT,
+    WORKER_SESSION_INTERRUPT,
+)
 from jarvis.brain.memory_client import ConclusionRecord, MemoryMessage, RepresentationRecord, SessionPeer  # noqa: E402
 from jarvis.brain.memory_outbox import CurationOutbox  # noqa: E402
 from jarvis.connectors.cockpit import (  # noqa: E402
     CockpitConnector,
     CockpitThread,
     CockpitThreadIndex,
+    ProviderTurnError,
     _continue_child_watch,
     _read_child_work_result_tool,
     _start_ready_child_watch,
@@ -32,6 +40,7 @@ from jarvis.connectors.cockpit import (  # noqa: E402
 )
 from jarvis.config import Config, MCPServerSpec, WorkerConfig  # noqa: E402
 import jarvis.orchestration.api as cockpit_api_module  # noqa: E402
+import jarvis.orchestration.cockpit as cockpit_module  # noqa: E402
 from jarvis.orchestration.api import CockpitAppContext, IdempotencyStore, SseSnapshotHub, _command_from_body, _idempotency_scope, make_app, serve  # noqa: E402
 from jarvis.orchestration.cockpit import make_session_ref  # noqa: E402
 from jarvis.mcp.status import mcp_status_path  # noqa: E402
@@ -42,6 +51,9 @@ from jarvis.orchestration.oauth import OAuthTokenValidator, OAuthValidationError
 from jarvis.orchestration.service import StartedWork  # noqa: E402
 from jarvis.orchestration.store import OrchestrationStore  # noqa: E402
 from jarvis.brain.registry import RegistryStore  # noqa: E402
+from jarvis.worker.server import make_app as make_worker_app  # noqa: E402
+from jarvis.worker.sessions import SessionManager  # noqa: E402
+from jarvis.worker_session_contract import EVENT_CHECKPOINT_CREATED  # noqa: E402
 
 
 class Response:
@@ -303,7 +315,15 @@ class FakeGateway:
         return item
 
 
-async def _with_server(cfg: Config, fn: Callable[[str, httpx.AsyncClient], Any], *, http_get=None, http_post=None, http_delete=None) -> Any:  # noqa: ANN001
+async def _with_server(  # noqa: ANN001
+    cfg: Config,
+    fn: Callable[[str, httpx.AsyncClient], Any],
+    *,
+    http_get=None,
+    http_post=None,
+    http_delete=None,
+    auto_turn_idempotency: bool = True,
+) -> Any:
     runner = web.AppRunner(make_app(cfg, http_get=http_get, http_post=http_post, http_delete=http_delete))
     await runner.setup()
     site = web.TCPSite(runner, "localhost", 0)
@@ -311,7 +331,27 @@ async def _with_server(cfg: Config, fn: Callable[[str, httpx.AsyncClient], Any],
     sockets = site._server.sockets  # type: ignore[union-attr, attr-defined]  # noqa: SLF001
     port = sockets[0].getsockname()[1]
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        class TestClient(httpx.AsyncClient):
+            turn_sequence = 0
+
+            async def post(self, url, **kwargs):  # noqa: ANN001
+                payload = kwargs.get("json")
+                if (
+                    auto_turn_idempotency
+                    and "/v1/projects/" in str(url)
+                    and "/threads/" in str(url)
+                    and str(url).endswith("/turns")
+                    and isinstance(payload, dict)
+                    and not payload.get("idempotency_key")
+                ):
+                    type(self).turn_sequence += 1
+                    kwargs["json"] = {
+                        **payload,
+                        "idempotency_key": f"test-turn-{type(self).turn_sequence}",
+                    }
+                return await super().post(url, **kwargs)
+
+        async with TestClient(timeout=10) as client:
             return await fn(f"http://localhost:{port}", client)
     finally:
         await runner.cleanup()
@@ -2099,11 +2139,12 @@ def test_cockpit_sse_probe_respects_worker_backoff_before_profile_probe(tmp_path
     from jarvis.orchestration.api import _HubWorkerSync, _hub_worker_state
 
     cfg = _cfg(tmp_path, monkeypatch)
+    store, _run_id = _seed_run(cfg)
     ctx = CockpitAppContext(
         cfg=cfg,
         get=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("backed-off worker was polled")),
         post=lambda *_args, **_kwargs: Response({}),
-        store=OrchestrationStore(cfg.orchestration.workspace),
+        store=store,
         idempotency=IdempotencyStore(cfg.orchestration.workspace),
         idempotency_locks={},
         idempotency_lock_refs={},
@@ -2112,10 +2153,273 @@ def test_cockpit_sse_probe_respects_worker_backoff_before_profile_probe(tmp_path
     hub = SseSnapshotHub(ctx)
     hub._tick = 2  # noqa: SLF001
     hub._worker_backoff_until["macbook-worker"] = 9  # noqa: SLF001
+    cached_worker = {"worker_id": "macbook-worker", "status": "online", "system": {"cpu_model": "cached-probe"}}
+    cached_session = {
+        "session_ref": make_session_ref("macbook-worker", "worker_only"),
+        "worker_id": "macbook-worker",
+        "session_id": "worker_only",
+        "status": "running",
+    }
+    previous = {
+        "workers": [cached_worker],
+        "sessions": {cached_session["session_ref"]: cached_session},
+        "requests": [],
+        "checkpoints": [],
+        "partial": True,
+        "diagnostics": [
+            {
+                "worker_id": "macbook-worker",
+                "resource": "sessions",
+                "status": "failure",
+                "failure_kind": "transport_error",
+                "status_code": 0,
+                "error_type": "TimeoutError",
+                "session_id": "",
+            }
+        ],
+    }
 
-    state = _hub_worker_state(ctx, "probe", _HubWorkerSync(hub), [])
+    state = _hub_worker_state(ctx, "probe", _HubWorkerSync(hub), store.list_runs(), previous=previous)
 
-    assert state["workers"][0]["worker_id"] == "macbook-worker"
+    assert state["workers"] == [cached_worker]
+    assert set(row["session_id"] for row in state["sessions"].values()) == {"worker_only", "sess_123"}
+    assert state["partial"] is True
+    assert state["diagnostics"] == previous["diagnostics"]
+
+
+def test_cockpit_initial_sse_snapshot_uses_shared_worker_refresh(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions/requests"):
+            return Response({"requests": []})
+        if url.endswith("/sessions/checkpoints"):
+            return Response({"checkpoints": []})
+        if url.endswith("/sessions"):
+            return Response({"sessions": [{"session_id": "sse_initial", "provider": "codex", "status": "running"}]})
+        raise AssertionError(url)
+
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=get,
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+
+    async def snapshot() -> dict[str, Any]:
+        return await SseSnapshotHub(ctx)._snapshot("fast")  # noqa: SLF001
+
+    import asyncio
+
+    body = asyncio.run(snapshot())
+    assert [row["session_id"] for row in body["sessions"]] == ["sse_initial"]
+    assert ctx.worker_state_cache["fast"]["sessions"]
+
+
+def test_cockpit_dirty_refresh_preserves_untouched_worker_diagnostics() -> None:
+    from jarvis.orchestration.api import _reconcile_worker_diagnostics
+
+    previous = [
+        {"worker_id": "steady", "resource": "sessions", "status": "failure"},
+        {"worker_id": "dirty", "resource": "requests", "status": "failure"},
+    ]
+    current = [{"worker_id": "dirty", "resource": "checkpoints", "status": "unsupported"}]
+
+    merged = _reconcile_worker_diagnostics(previous, current, {"dirty"}, {"dirty"}, {"dirty", "steady"})
+
+    assert merged == [previous[0], current[0]]
+
+
+def test_cockpit_full_refresh_clears_workers_removed_from_registry(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.api import _HubWorkerSync, _hub_worker_state
+
+    cfg = _cfg(tmp_path, monkeypatch)
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions"):
+            return Response({"sessions": []})
+        if url.endswith("/sessions/requests"):
+            return Response({"requests": []})
+        raise AssertionError(url)
+
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=get,
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+    ghost_ref = make_session_ref("removed-worker", "ghost")
+    previous = {
+        "workers": [{"worker_id": "removed-worker"}],
+        "sessions": {ghost_ref: {"session_ref": ghost_ref, "worker_id": "removed-worker", "session_id": "ghost"}},
+        "requests": [],
+        "checkpoints": [],
+        "diagnostics": [{"worker_id": "removed-worker", "resource": "sessions", "status": "failure"}],
+    }
+
+    state = _hub_worker_state(ctx, "fast", _HubWorkerSync(SseSnapshotHub(ctx)), [], previous=previous)
+
+    assert [row["worker_id"] for row in state["workers"]] == ["macbook-worker"]
+    assert state["sessions"] == {}
+    assert state["diagnostics"] == []
+    assert state["partial"] is False
+
+
+def test_cockpit_offline_worker_preserves_cached_worker_only_facets(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.api import _HubWorkerSync, _cockpit_snapshot, _hub_worker_state
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    _set_worker_status(cfg, "offline")
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("offline worker was polled")),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+    ref = make_session_ref("macbook-worker", "cached-offline")
+    previous = {
+        "workers": [{"worker_id": "macbook-worker", "status": "online", "system": {"cpu_model": "cached"}}],
+        "sessions": {ref: {"session_ref": ref, "worker_id": "macbook-worker", "session_id": "cached-offline"}},
+        "requests": [],
+        "checkpoints": [],
+        "partial": False,
+        "diagnostics": [],
+    }
+
+    state = _hub_worker_state(ctx, "fast", _HubWorkerSync(SseSnapshotHub(ctx)), [], previous=previous)
+    snapshot = _cockpit_snapshot(
+        ctx,
+        "fast",
+        sync={"mode": "fast", "status": "fresh", "synced_at": "", "errors": []},
+        worker_state=state,
+        all_runs=[],
+    )
+
+    assert state["workers"][0]["status"] == "offline"
+    assert state["sessions"] == previous["sessions"]
+    assert state["diagnostics"][0]["failure_kind"] == "offline"
+    assert state["partial"] is True
+    assert snapshot["workers"][0]["status"] == "offline"
+    assert snapshot["sync"]["status"] == "partial"
+
+
+def test_cockpit_backoff_stays_partial_until_successful_retry(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.api import _HubWorkerSync, _hub_worker_state
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    failing = {"value": True}
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if failing["value"]:
+            raise TimeoutError("worker unavailable")
+        if url.endswith("/sessions"):
+            return Response({"sessions": []})
+        if url.endswith("/sessions/requests"):
+            return Response({"requests": []})
+        raise AssertionError(url)
+
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=get,
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+    hub = SseSnapshotHub(ctx)
+    sync = _HubWorkerSync(hub)
+    profile = sync.profiles[0]
+    with pytest.raises(TimeoutError):
+        sync.get(f"{profile.base_url}/sessions")
+
+    first = _hub_worker_state(ctx, "fast", sync, [])
+    unsupported_previous = {
+        **first,
+        "partial": False,
+        "diagnostics": [
+            {
+                "worker_id": profile.worker_id,
+                "resource": "checkpoints",
+                "status": "unsupported",
+                "failure_kind": "unsupported",
+                "status_code": 404,
+                "error_type": "",
+                "session_id": "",
+            }
+        ],
+    }
+    unsupported_backoff = _hub_worker_state(ctx, "fast", sync, [], previous=unsupported_previous)
+    second = _hub_worker_state(ctx, "fast", sync, [], previous=first)
+    failing["value"] = False
+    hub._tick = hub._worker_backoff_until[profile.worker_id]  # noqa: SLF001
+    recovered = _hub_worker_state(ctx, "fast", sync, [], previous=second)
+
+    assert first["partial"] is True
+    assert first["diagnostics"][0]["failure_kind"] == "backoff"
+    assert [item["failure_kind"] for item in unsupported_backoff["diagnostics"]] == ["unsupported", "backoff"]
+    assert unsupported_backoff["partial"] is True
+    assert second["partial"] is True
+    assert recovered["partial"] is False
+    assert recovered["diagnostics"] == []
+
+
+def test_cockpit_archived_session_prunes_cached_session_diagnostic(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.api import _HubWorkerSync, _hub_worker_state
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    store = OrchestrationStore(cfg.orchestration.workspace)
+    store.archive_worker_session("macbook-worker", "diagnostic-tombstone")
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("backed-off worker was polled")),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=store,
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+    hub = SseSnapshotHub(ctx)
+    hub._worker_backoff_until["macbook-worker"] = 5  # noqa: SLF001
+    ref = make_session_ref("macbook-worker", "diagnostic-tombstone")
+    previous = {
+        "workers": [{"worker_id": "macbook-worker", "status": "online"}],
+        "sessions": {ref: {"session_ref": ref, "worker_id": "macbook-worker", "session_id": "diagnostic-tombstone"}},
+        "requests": [],
+        "checkpoints": [],
+        "partial": True,
+        "diagnostics": [
+            {
+                "worker_id": "macbook-worker",
+                "resource": "session_checkpoints",
+                "status": "failure",
+                "failure_kind": "transport_error",
+                "session_id": "diagnostic-tombstone",
+            }
+        ],
+    }
+
+    state = _hub_worker_state(ctx, "fast", _HubWorkerSync(hub), [], previous=previous)
+
+    assert state["sessions"] == {}
+    assert all(item.get("session_id") != "diagnostic-tombstone" for item in state["diagnostics"])
+    assert state["diagnostics"][0]["failure_kind"] == "backoff"
 
 
 def test_cockpit_dirty_worker_state_preserves_cached_other_workers() -> None:
@@ -2149,6 +2453,170 @@ def test_cockpit_dirty_worker_state_preserves_cached_other_workers() -> None:
         {"worker_id": "dirty", "request_id": "new"},
     ]
     assert merged["checkpoints"] == [{"worker_id": "steady", "checkpoint_id": "keep"}]
+
+
+def test_cockpit_rest_snapshot_retains_failed_worker_facets_then_clears_successful_empty(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    phase = {"value": "populated"}
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions/requests"):
+            if phase["value"] == "failure":
+                raise TimeoutError("secret-worker.example requests timed out")
+            requests = [] if phase["value"] == "empty" else [
+                {"request_id": "req_1", "session_id": "sess_1", "kind": "approval"}
+            ]
+            return Response({"requests": requests})
+        if url.endswith("/sessions/checkpoints"):
+            if phase["value"] == "failure":
+                raise TimeoutError("secret-worker.example checkpoints timed out")
+            checkpoints = [] if phase["value"] == "empty" else [
+                {"checkpoint_id": "ckpt_1", "session_id": "sess_1"}
+            ]
+            return Response({"checkpoints": checkpoints})
+        if url.endswith("/sessions"):
+            if phase["value"] == "failure":
+                raise TimeoutError("secret-worker.example sessions timed out")
+            sessions = [] if phase["value"] == "empty" else [
+                {"session_id": "sess_1", "provider": "codex", "status": "running"}
+            ]
+            return Response({"sessions": sessions})
+        raise AssertionError(url)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        populated = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+        phase["value"] = "failure"
+        retained = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+        phase["value"] = "empty"
+        cleared = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+
+        assert len(populated["sessions"]) == len(populated["requests"]) == len(populated["checkpoints"]) == 1
+        assert [row["session_id"] for row in retained["sessions"]] == ["sess_1"]
+        assert retained["requests"] == populated["requests"]
+        assert retained["checkpoints"] == populated["checkpoints"]
+        assert retained["sync"]["status"] == "partial"
+        assert {item["resource"] for item in retained["sync"]["diagnostics"]} >= {
+            "sessions",
+            "requests",
+            "checkpoints",
+        }
+        assert "secret-worker.example" not in json.dumps(retained["sync"])
+        assert cleared["sessions"] == []
+        assert cleared["requests"] == []
+        assert cleared["checkpoints"] == []
+        assert cleared["sync"]["status"] == "fresh"
+        assert cleared["sync"]["diagnostics"] == []
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
+def test_cockpit_failed_refresh_does_not_resurrect_archived_cached_session(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    failed = {"value": False}
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions/requests"):
+            return Response({"requests": []})
+        if url.endswith("/sessions/checkpoints"):
+            return Response({"checkpoints": []})
+        if url.endswith("/sessions"):
+            if failed["value"]:
+                raise TimeoutError("worker unavailable")
+            return Response({"sessions": [{"session_id": "archive_cached", "provider": "codex", "status": "running"}]})
+        raise AssertionError(url)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        populated = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+        ref = populated["sessions"][0]["session_ref"]
+        archived = await client.post(f"{base}/v1/sessions/{ref}/archive", json={"idempotency_key": "archive-cached"})
+        failed["value"] = True
+        refreshed = (await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})).json()
+
+        assert archived.status_code == 200
+        assert refreshed["sessions"] == []
+        assert refreshed["requests"] == []
+        assert refreshed["checkpoints"] == []
+        assert refreshed["sync"]["status"] == "partial"
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
+def test_cockpit_checkpoint_fallback_retains_only_failed_session_facet(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.orchestration.api import _HubWorkerSync, _hub_worker_state
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    phase = {"value": "populated"}
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/sessions"):
+            return Response(
+                {
+                    "sessions": [
+                        {"session_id": "sess_failed", "provider": "codex", "status": "running"},
+                        {"session_id": "sess_empty", "provider": "codex", "status": "running"},
+                    ]
+                }
+            )
+        if url.endswith("/sessions/requests"):
+            return Response({"requests": []})
+        if url.endswith("/sessions/checkpoints"):
+            if phase["value"] == "populated":
+                return Response(
+                    {
+                        "checkpoints": [
+                            {"session_id": "sess_failed", "checkpoint_id": "ckpt_failed"},
+                            {"session_id": "sess_empty", "checkpoint_id": "ckpt_empty"},
+                        ]
+                    }
+                )
+            return Response({}, status_code=404)
+        if url.endswith("/sessions/sess_failed/checkpoints"):
+            raise TimeoutError("private checkpoint path")
+        if url.endswith("/sessions/sess_empty/checkpoints"):
+            return Response({"checkpoints": []})
+        raise AssertionError(url)
+
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=get,
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+    hub = SseSnapshotHub(ctx)
+    sync = _HubWorkerSync(hub)
+    previous = _hub_worker_state(ctx, "fast", sync, [])
+    phase["value"] = "fallback"
+    current = _hub_worker_state(ctx, "fast", sync, [], previous=previous)
+
+    assert [row["checkpoint_id"] for row in current["checkpoints"]] == ["ckpt_failed"]
+    assert current["partial"] is True
+    failed = [item for item in current["diagnostics"] if item["status"] == "failure"]
+    assert failed == [
+        {
+            "worker_id": "macbook-worker",
+            "resource": "session_checkpoints",
+            "status": "failure",
+            "failure_kind": "transport_error",
+            "status_code": 0,
+            "error_type": "TimeoutError",
+            "session_id": "sess_failed",
+        }
+    ]
 
 
 def test_cockpit_sse_hub_notify_wakes_early_and_targets_the_dirty_run(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -2840,6 +3308,1388 @@ def test_cockpit_threads_open_and_list_are_membership_filtered(tmp_path, monkeyp
     assert memory.messages == []
 
 
+def test_cockpit_thread_detail_enriches_from_one_targeted_worker_execution_read(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    index.save(
+        CockpitThread(
+            thread_id="thread_active",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_active"),
+            title="Active workspace conversation",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            engine="codex",
+            worker_id="macbook-worker",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_thread_active"},
+        )
+    )
+    reads: list[str] = []
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        reads.append(url)
+        assert url == "http://worker.test/sessions/conv_thread_active/execution-state"
+        return Response(
+            {
+                "session_id": "conv_thread_active",
+                "status": "waiting_input",
+                "active_turn": {
+                    "turn_id": "turn_active",
+                    "status": "waiting_input",
+                    "started_at": "2026-07-13T00:00:01Z",
+                },
+                "pending_requests": [
+                    {
+                        "request_id": "input_1",
+                        "kind": "input",
+                        "status": "pending",
+                        "title": "Input needed",
+                        "detail": "Choose a target.",
+                        "created_at": "2026-07-13T00:00:02Z",
+                        "questions": [
+                            {
+                                "id": "target",
+                                "header": "Target",
+                                "question": "Which target?",
+                                "options": [{"label": "Tests", "description": "Run tests"}],
+                                "multi_select": False,
+                            }
+                        ],
+                    }
+                ],
+                "supported_controls": ["turn"],
+                "supports": {"steer": False, "queue": False},
+            }
+        )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        response = await client.get(f"{base}/v1/projects/neil-shared/threads/thread_active")
+        assert response.status_code == 200
+        return response.json()["thread"]
+
+    thread = asyncio.run(_with_server(cfg, calls, http_get=worker_get))
+
+    assert reads == ["http://worker.test/sessions/conv_thread_active/execution-state"]
+    assert thread["execution"] == {
+        "available": True,
+        "status": "waiting_input",
+        "active_turn": {
+            "turn_id": "turn_active",
+            "status": "waiting_input",
+            "started_at": "2026-07-13T00:00:01Z",
+        },
+        "pending_requests": [
+            {
+                "request_id": "input_1",
+                "kind": "input",
+                "status": "pending",
+                "title": "Input needed",
+                "detail": "Choose a target.",
+                "created_at": "2026-07-13T00:00:02Z",
+                "questions": [
+                    {
+                        "id": "target",
+                        "header": "Target",
+                        "question": "Which target?",
+                        "options": [{"label": "Tests", "description": "Run tests"}],
+                        "multi_select": False,
+                    }
+                ],
+            }
+        ],
+        "supported_controls": ["turn"],
+        "supports": {"steer": False, "queue": True},
+        "diagnostic": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        TimeoutError("timed out at /Users/neil/private with sk-abcdefghijklmnopqrstuvwxyz"),
+        Response({"error": "unauthorized"}, status_code=401),
+        Response({"error": "missing"}, status_code=404),
+        Response({"error": "worker exploded"}, status_code=500),
+        TextResponse("not json", status_code=200),
+        Response({"status": "running", "pending_requests": "invalid"}),
+        Response(
+            {
+                "session_id": "conv_thread_degraded",
+                "status": "waiting_input",
+                "active_turn": {"turn_id": "", "status": "waiting_input"},
+                "pending_requests": [
+                    {"request_id": "future_1", "kind": "future_request", "status": "pending"}
+                ],
+                "supported_controls": [],
+                "supports": {"steer": False, "queue": False},
+            }
+        ),
+    ],
+)
+def test_cockpit_thread_detail_degrades_worker_execution_failures_to_durable_detail(
+    tmp_path,
+    monkeypatch,
+    failure,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    stored = index.save(
+        CockpitThread(
+            thread_id="thread_degraded",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_degraded"),
+            title="Durable while worker is unavailable",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            engine="codex",
+            worker_id="macbook-worker",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_thread_degraded"},
+        )
+    )
+    index.append_turn(
+        stored,
+        user_peer_id="neil",
+        user_text="Keep this durable message.",
+        assistant_peer_id="jarvis",
+        assistant_text="Durable reply.",
+    )
+
+    def worker_get(_url: str, **kwargs: Any) -> Response:
+        assert kwargs["timeout"] == cfg.orchestration.sse_sync_timeout_s
+        if isinstance(failure, BaseException):
+            raise failure
+        return failure
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[int, dict[str, Any]]:
+        response = await client.get(f"{base}/v1/projects/neil-shared/threads/thread_degraded")
+        return response.status_code, response.json()["thread"]
+
+    status, thread = asyncio.run(_with_server(cfg, calls, http_get=worker_get))
+
+    assert status == 200
+    assert thread["title"] == "Durable while worker is unavailable"
+    assert thread["messages"][0]["content"] == "Keep this durable message."
+    assert thread["execution"] == {
+        "available": False,
+        "status": "unavailable",
+        "active_turn": None,
+        "pending_requests": [],
+        "supported_controls": [],
+        "supports": {"steer": False, "queue": True},
+        "diagnostic": {
+            "code": "worker_unavailable",
+            "message": thread["execution"]["diagnostic"]["message"],
+        },
+    }
+    assert "/Users/" not in json.dumps(thread["execution"])
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in json.dumps(thread["execution"])
+
+
+def test_cockpit_thread_execution_ignores_future_request_kinds_without_erasing_active_turn() -> None:
+    execution = cockpit_api_module._public_thread_execution(  # noqa: SLF001
+        {
+            "session_id": "conv_future",
+            "status": "running",
+            "active_turn": {
+                "turn_id": "turn_active",
+                "status": "running",
+                "started_at": "2026-07-13T00:00:00Z",
+            },
+            "pending_requests": [
+                {"request_id": "future_1", "kind": "future_request", "status": "pending"}
+            ],
+            "supported_controls": ["turn"],
+            "supports": {"steer": False, "queue": True},
+        }
+    )
+
+    assert execution["active_turn"]["turn_id"] == "turn_active"
+    assert execution["pending_requests"] == []
+
+
+def test_cockpit_thread_approval_resolves_attached_execution_idempotently(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil", caps=WORKER_SESSION_APPROVE)
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    index.save(
+        CockpitThread(
+            thread_id="thread_approval",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_approval"),
+            title="Approval conversation",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            engine="codex",
+            worker_id="macbook-worker",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_thread_approval"},
+        )
+    )
+    writes: list[tuple[str, dict[str, Any]]] = []
+
+    def worker_post(url: str, **kwargs: Any) -> Response:
+        writes.append((url, kwargs["json"]))
+        return Response({"ok": True, "event": {"type": "approval.resolved"}})
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        assert url == "http://worker.test/sessions/conv_thread_approval/execution-state"
+        return Response(
+            {
+                "session_id": "conv_thread_approval",
+                "status": "running",
+                "active_turn": {"turn_id": "turn_1", "status": "running", "started_at": "now"},
+                "pending_requests": [],
+                "supported_controls": ["turn", "approval", "interrupt"],
+                "supports": {"steer": False, "queue": False},
+            }
+        )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[httpx.Response, httpx.Response]:
+        payload = {
+            "request_id": "approval_1",
+            "decision": "approved",
+            "idempotency_key": "approve-once",
+            "allowed_actions": ["worker.session.stop"],
+            "metadata": {"allowed_actions": ["worker.session.stop"], "surface": "browser"},
+        }
+        first = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_approval/approval",
+            json=payload,
+        )
+        replay = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_approval/approval",
+            json=payload,
+        )
+        return first, replay
+
+    first, replay = asyncio.run(_with_server(cfg, calls, http_get=worker_get, http_post=worker_post))
+
+    assert first.status_code == 200
+    assert replay.json() == {**first.json(), "idempotent": True}
+    assert writes == [
+        (
+            "http://worker.test/sessions/conv_thread_approval/approval",
+            {
+                "request_id": "approval_1",
+                "decision": "approved",
+                "idempotency_key": "approve-once",
+                "metadata": {"surface": "browser"},
+                "allowed_actions": [WORKER_SESSION_APPROVE],
+            },
+        )
+    ]
+    assert first.json() == {
+        "ok": True,
+        "api_version": "v1",
+        "schema_version": 1,
+        "project_id": "neil-shared",
+        "thread_id": "thread_approval",
+        "control": {
+            "action": "approval",
+            "accepted": True,
+            "request_id": "approval_1",
+        },
+        "execution": {
+            "available": True,
+            "status": "running",
+            "active_turn": {"turn_id": "turn_1", "status": "running", "started_at": "now"},
+            "pending_requests": [],
+            "supported_controls": ["turn", "approval", "interrupt"],
+            "supports": {"steer": False, "queue": True},
+            "diagnostic": None,
+        },
+    }
+
+
+def test_cockpit_thread_input_resolves_by_conversation_identity(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil", caps=WORKER_SESSION_INPUT)
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    index.save(
+        CockpitThread(
+            thread_id="thread_input",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_input"),
+            title="Input conversation",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_thread_input"},
+        )
+    )
+    writes: list[dict[str, Any]] = []
+
+    def worker_post(url: str, **kwargs: Any) -> Response:
+        assert url == "http://worker.test/sessions/conv_thread_input/input"
+        writes.append(kwargs["json"])
+        return Response({"ok": True})
+
+    def worker_get(_url: str, **_kwargs: Any) -> Response:
+        return Response(
+            {
+                "session_id": "conv_thread_input",
+                "status": "running",
+                "active_turn": {"turn_id": "turn_1", "status": "running"},
+                "pending_requests": [],
+                "supported_controls": ["turn", "input"],
+                "supports": {"steer": False, "queue": False},
+            }
+        )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_input/input",
+            json={"request_id": "input_1", "answers": {"target": "Tests"}},
+        )
+
+    response = asyncio.run(_with_server(cfg, calls, http_get=worker_get, http_post=worker_post))
+
+    assert response.status_code == 200
+    assert response.json()["control"] == {
+        "action": "input",
+        "accepted": True,
+        "request_id": "input_1",
+    }
+    assert writes == [
+        {
+            "request_id": "input_1",
+            "answers": {"target": "Tests"},
+            "metadata": {},
+            "allowed_actions": [WORKER_SESSION_INPUT],
+        }
+    ]
+
+
+def test_cockpit_thread_interrupt_keeps_conversation_open_and_next_turn_recreates_execution(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil", caps=WORKER_SESSION_INTERRUPT)
+    _seed_project_registry(cfg)
+    posts: list[tuple[str, dict[str, Any]]] = []
+    interrupt_started = threading.Event()
+    release_interrupt = threading.Event()
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        if url.endswith("/execution-state"):
+            return Response(
+                {
+                    "session_id": "conv_thread_interrupt",
+                    "status": "interrupted",
+                    "active_turn": None,
+                    "pending_requests": [],
+                    "supported_controls": ["turn"],
+                    "supports": {"steer": False, "queue": False},
+                }
+            )
+        if url.endswith("/health"):
+            return Response(
+                {
+                    "ok": True,
+                    "agent": "codex",
+                    "default_engine": "codex",
+                    "supported_engines": ["codex"],
+                    "engine_supports": {"codex": {"streaming": True}},
+                    "repositories": [{"repo": "roughcoder/jarvis", "status": "ready"}],
+                }
+            )
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions"):
+            return Response({"sessions": []})
+        return Response({})
+
+    def worker_post(url: str, **kwargs: Any) -> Response:
+        body = kwargs["json"]
+        posts.append((url, body))
+        workspace = {
+            "workspace_id": "neil-shared-thread-interrupt",
+            "conversation_id": "neil-shared-thread-interrupt",
+            "root": str(tmp_path / "worker" / "conversation"),
+            "root_label": "thread-interrupt",
+            "cwd_label": "thread-interrupt",
+            "status": "ready",
+            "provision_phase": "ready",
+            "worktrees": [],
+        }
+        if url.endswith("/interrupt"):
+            interrupt_started.set()
+            assert release_interrupt.wait(timeout=2)
+            return Response({"ok": True, "session": {"status": "interrupted"}})
+        if url.endswith("/conversation-workspaces"):
+            return Response({"ok": True, "workspace": workspace})
+        if url.endswith("/worktrees"):
+            workspace["worktrees"] = [{**body, "path": str(tmp_path / "worker" / "conversation" / "runtime")}]
+            return Response({"ok": True, "workspace": workspace})
+        if url.endswith("/sessions"):
+            return Response({"ok": True, "session": {**body, "status": "created"}})
+        if url.endswith("/turns"):
+            return Response({"ok": True, "session": {"session_id": body.get("session_id", ""), "status": "running"}})
+        return Response({"ok": False, "error": "unexpected worker post"}, status_code=400)
+
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+        worker_get=worker_get,
+        worker_post=worker_post,
+    )
+    connector.index.save(
+        CockpitThread(
+            thread_id="thread_interrupt",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_interrupt"),
+            title="Interrupt conversation",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            workspace={
+                "worker_id": "macbook-worker",
+                "session_id": "conv_thread_interrupt",
+                "status": "ready",
+                "provision_phase": "ready",
+                "root": str(tmp_path / "worker" / "conversation"),
+            },
+        )
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(
+        base: str,
+        client: httpx.AsyncClient,
+    ) -> tuple[httpx.Response, httpx.Response, httpx.Response, dict[str, Any]]:
+        interrupt_task = asyncio.create_task(
+            client.post(
+                f"{base}/v1/projects/neil-shared/threads/thread_interrupt/interrupt",
+                json={"turn_id": "turn_active", "idempotency_key": "interrupt-once"},
+            )
+        )
+        assert await asyncio.to_thread(interrupt_started.wait, 2)
+        raced_turn = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_interrupt/turns",
+            json={"text": "Do not reuse the execution being interrupted."},
+        )
+        release_interrupt.set()
+        interrupted = await interrupt_task
+        next_turn = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_interrupt/turns",
+            json={"text": "Continue with a fresh execution."},
+        )
+        detail = (
+            await client.get(f"{base}/v1/projects/neil-shared/threads/thread_interrupt")
+        ).json()["thread"]
+        return interrupted, raced_turn, next_turn, detail
+
+    interrupted, raced_turn, next_turn, detail = asyncio.run(
+        _with_server(cfg, calls, http_get=worker_get, http_post=worker_post)
+    )
+
+    assert interrupted.status_code == 200
+    assert interrupted.json()["execution"]["status"] == "interrupted"
+    assert interrupted.json()["control"] == {
+        "action": "interrupt",
+        "accepted": True,
+        "turn_id": "turn_active",
+    }
+    assert raced_turn.status_code == 200
+    assert "thread.turn.error" in raced_turn.text
+    assert next_turn.status_code == 200
+    assert detail["lifecycle"] == "open"
+    assert detail["archived_at"] == ""
+    created_sessions = [body for url, body in posts if url.endswith("/sessions")]
+    assert created_sessions[-1]["session_id"] == "conv_thread-interrupt_1"
+    assert not any(
+        url.endswith("/sessions/conv_thread_interrupt/turns") for url, _body in posts
+    )
+
+
+def test_cockpit_thread_controls_require_addressable_request_or_turn_ids(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        identity="neil",
+        caps=f"{WORKER_SESSION_APPROVE},{WORKER_SESSION_INPUT},{WORKER_SESSION_INTERRUPT}",
+    )
+    _seed_project_registry(cfg)
+    CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json").save(
+        CockpitThread(
+            thread_id="thread_ids",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_ids"),
+            title="Addressable controls",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_thread_ids"},
+        )
+    )
+    writes: list[str] = []
+
+    async def calls(base: str, client: httpx.AsyncClient) -> list[httpx.Response]:
+        return [
+            await client.post(
+                f"{base}/v1/projects/neil-shared/threads/thread_ids/{action}",
+                json={},
+            )
+            for action in ("approval", "input", "interrupt")
+        ]
+
+    responses = asyncio.run(
+        _with_server(
+            cfg,
+            calls,
+            http_post=lambda url, **_kwargs: writes.append(url) or Response({"ok": True}),
+        )
+    )
+
+    assert [response.status_code for response in responses] == [400, 400, 400]
+    assert [response.json()["error"]["message"] for response in responses] == [
+        "request_id is required",
+        "request_id is required",
+        "turn_id is required",
+    ]
+    assert writes == []
+
+
+def test_cockpit_thread_controls_reject_archived_unattached_and_legacy_executions_safely(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil", caps=WORKER_SESSION_APPROVE)
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    common = {
+        "project_id": "neil-shared",
+        "session_id": orchestrator_session_id("neil-shared", "thread_control"),
+        "title": "Control safety",
+        "created_at": "2026-07-13T00:00:00Z",
+        "updated_at": "2026-07-13T00:00:00Z",
+        "created_by": "neil",
+    }
+    index.save(
+        CockpitThread(
+            thread_id="thread_archived",
+            archived_at="2026-07-13T00:01:00Z",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_archived"},
+            **common,
+        )
+    )
+    index.save(CockpitThread(thread_id="thread_unattached", **common))
+    index.save(
+        CockpitThread(
+            thread_id="thread_legacy",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_legacy"},
+            **common,
+        )
+    )
+    writes: list[str] = []
+
+    def worker_post(url: str, **_kwargs: Any) -> Response:
+        writes.append(url)
+        return Response(
+            {"ok": False, "error": "worker session missing required authority: worker.session.approve"},
+            status_code=403,
+        )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> list[httpx.Response]:
+        return [
+            await client.post(
+                f"{base}/v1/projects/neil-shared/threads/{thread_id}/approval",
+                json={"request_id": "approval_1", "decision": "approved"},
+            )
+            for thread_id in ("thread_archived", "thread_unattached", "thread_legacy")
+        ]
+
+    archived, unattached, legacy = asyncio.run(_with_server(cfg, calls, http_post=worker_post))
+
+    assert archived.status_code == 409
+    assert archived.json()["error"]["code"] == "thread_archived"
+    assert unattached.status_code == 409
+    assert unattached.json()["error"]["code"] == "execution_unavailable"
+    assert legacy.status_code == 403
+    assert legacy.json()["error"]["code"] == "forbidden"
+    assert writes == ["http://worker.test/sessions/conv_legacy/approval"]
+
+
+def test_cockpit_thread_control_requires_global_capability(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json").save(
+        CockpitThread(
+            thread_id="thread_no_capability",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_no_capability"),
+            title="No authority",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_no_capability"},
+        )
+    )
+    writes: list[str] = []
+
+    async def calls(base: str, client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_no_capability/approval",
+            json={"request_id": "approval_1", "decision": "approved"},
+        )
+
+    response = asyncio.run(
+        _with_server(
+            cfg,
+            calls,
+            http_post=lambda url, **_kwargs: writes.append(url) or Response({"ok": True}),
+        )
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["message"] == f"missing authority: {WORKER_SESSION_APPROVE}"
+    assert writes == []
+
+
+def test_cockpit_active_thread_turn_is_durably_queued_and_deduped_without_transcript_duplication(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    index.save(
+        CockpitThread(
+            thread_id="thread_queue",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_queue"),
+            title="Queued conversation",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            workspace={
+                "worker_id": "macbook-worker",
+                "session_id": "conv_thread_queue",
+                "status": "ready",
+            },
+        )
+    )
+    writes: list[str] = []
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        assert url.endswith("/sessions/conv_thread_queue/execution-state")
+        return Response(
+            {
+                "session_id": "conv_thread_queue",
+                "status": "running",
+                "active_turn": {"turn_id": "turn_active", "status": "running"},
+                "pending_requests": [],
+                "supported_controls": ["turn", "interrupt"],
+                "supports": {"steer": False, "queue": False},
+            }
+        )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[httpx.Response, httpx.Response, dict[str, Any]]:
+        payload = {"text": "Please run the focused tests next.", "idempotency_key": "human-turn-2"}
+        first = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_queue/turns",
+            json=payload,
+        )
+        duplicate = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_queue/turns",
+            json=payload,
+        )
+        detail = (
+            await client.get(f"{base}/v1/projects/neil-shared/threads/thread_queue")
+        ).json()["thread"]
+        return first, duplicate, detail
+
+    first, duplicate, detail = asyncio.run(
+        _with_server(
+            cfg,
+            calls,
+            http_get=worker_get,
+            http_post=lambda url, **_kwargs: writes.append(url) or Response({"ok": True}),
+        )
+    )
+
+    first_queued = [event for event in _sse_events(first.text) if event["_event"] == "thread.turn.queued"]
+    duplicate_queued = [
+        event for event in _sse_events(duplicate.text) if event["_event"] == "thread.turn.queued"
+    ]
+    assert first.status_code == 200
+    assert first_queued[0]["payload"]["idempotent"] is False
+    assert duplicate_queued[0]["payload"]["idempotent"] is True
+    assert detail["queued_turns"] == [
+        {
+            "queue_id": first_queued[0]["payload"]["queue_id"],
+            "text": "Please run the focused tests next.",
+            "queued_at": detail["queued_turns"][0]["queued_at"],
+            "status": "queued",
+        }
+    ]
+    assert detail["messages"] == []
+    assert detail["execution"]["supports"] == {"steer": False, "queue": True}
+    assert writes == []
+
+
+def test_cockpit_thread_queue_drains_human_turns_in_submission_order(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    memory = FakeProjectMemory()
+    connector = CockpitConnector(
+        cfg,
+        memory=memory,
+        gateway=FakeGateway(["First reply.", "Second reply."]),
+        tts=None,
+        tracer=None,
+    )
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_fifo",
+            project_id=project.id,
+            session_id=orchestrator_session_id(project.id, "thread_fifo"),
+            title="FIFO conversation",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+        )
+    )
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    connector.index.enqueue_turn(
+        project.id,
+        thread.thread_id,
+        requester=requester,
+        text="First human message.",
+        idempotency_key="fifo-1",
+    )
+    connector.index.enqueue_turn(
+        project.id,
+        thread.thread_id,
+        requester=requester,
+        text="Second human message.",
+        idempotency_key="fifo-2",
+    )
+
+    drained = asyncio.run(connector.drain_queued_turns(project, thread.thread_id))
+
+    stored = connector.index.get_with_messages(project.id, thread.thread_id)
+    assert drained == 2
+    assert stored is not None
+    assert stored.queued_turns == ()
+    assert [message["content"] for message in stored.messages] == [
+        "First human message.",
+        "First reply.",
+        "Second human message.",
+        "Second reply.",
+    ]
+
+
+def test_cockpit_startup_rearms_and_drains_a_claimed_durable_thread_turn(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway(["Recovered reply."]),
+        tts=None,
+        tracer=None,
+    )
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_restart_queue",
+            project_id=project.id,
+            session_id=orchestrator_session_id(project.id, "thread_restart_queue"),
+            title="Restart queue",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+        )
+    )
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    connector.index.enqueue_turn(
+        project.id,
+        thread.thread_id,
+        requester=requester,
+        text="Resume me after restart.",
+        idempotency_key="restart-1",
+    )
+    assert connector.index.claim_queued_turn(project.id, thread.thread_id) is not None
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    make_app(cfg)
+    for _ in range(100):
+        stored = connector.index.get_with_messages(project.id, thread.thread_id)
+        if stored is not None and not stored.queued_turns:
+            break
+        time.sleep(0.02)
+
+    assert stored is not None
+    assert stored.queued_turns == ()
+    assert [message["content"] for message in stored.messages] == [
+        "Resume me after restart.",
+        "Recovered reply.",
+    ]
+
+
+def test_cockpit_idle_thread_turn_replays_same_key_and_rejects_conflicting_payload(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    gateway = FakeGateway(["One durable reply."])
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=gateway,
+        tts=None,
+        tracer=None,
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[httpx.Response, httpx.Response, httpx.Response, str]:
+        opened = (await client.post(f"{base}/v1/projects/neil-shared/threads", json={})).json()["thread"]
+        url = f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}/turns"
+        first = await client.post(url, json={"text": "Run this once.", "idempotency_key": "idle-once"})
+        replay = await client.post(url, json={"text": "Run this once.", "idempotency_key": "idle-once"})
+        conflict = await client.post(url, json={"text": "Different work.", "idempotency_key": "idle-once"})
+        return first, replay, conflict, opened["thread_id"]
+
+    first, replay, conflict, thread_id = asyncio.run(_with_server(cfg, calls))
+
+    replayed = [event for event in _sse_events(replay.text) if event["_event"] == "thread.turn.replayed"]
+    stored = connector.index.get_with_messages("neil-shared", thread_id)
+    assert first.status_code == 200
+    assert replayed[0]["payload"]["reply"] == "One durable reply."
+    assert replayed[0]["payload"]["receipt_status"] == "completed"
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "idempotency_conflict"
+    assert gateway.calls == 1
+    assert stored is not None
+    assert [message["content"] for message in stored.messages] == ["Run this once.", "One durable reply."]
+    receipt = next(item for item in stored.turn_receipts if item["idempotency_key"] == "idle-once")
+    assert not ({"text", "requester", "workspace_request", "has_attachments"} & receipt.keys())
+
+
+def test_cockpit_idle_turn_response_loss_replays_without_redispatch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    gateway = FakeGateway(["Persisted before delivery."])
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=gateway,
+        tts=None,
+        tracer=None,
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+    original_write_sse = cockpit_api_module._write_sse  # noqa: SLF001
+    lost = False
+
+    async def lose_first_reply(response, event, cursor, data):  # noqa: ANN001
+        nonlocal lost
+        if event == "thread.reply" and not lost:
+            lost = True
+            raise ConnectionResetError("simulated client loss")
+        return await original_write_sse(response, event, cursor, data)
+
+    monkeypatch.setattr(cockpit_api_module, "_write_sse", lose_first_reply)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> httpx.Response:
+        opened = (await client.post(f"{base}/v1/projects/neil-shared/threads", json={})).json()["thread"]
+        url = f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}/turns"
+        await client.post(url, json={"text": "Do not repeat me.", "idempotency_key": "lost-response"})
+        return await client.post(
+            url,
+            json={"text": "Do not repeat me.", "idempotency_key": "lost-response"},
+        )
+
+    replay = asyncio.run(_with_server(cfg, calls))
+
+    replayed = [event for event in _sse_events(replay.text) if event["_event"] == "thread.turn.replayed"]
+    assert replayed[0]["payload"]["reply"] == "Persisted before delivery."
+    assert gateway.calls == 1
+
+
+def test_cockpit_simultaneous_idle_same_key_dispatches_once(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    gateway = FakeGateway(["Only one dispatch."])
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=gateway,
+        tts=None,
+        tracer=None,
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+    original_lookup = connector.index.foreground_turn_receipt
+    barrier = threading.Barrier(2)
+
+    def synchronized_lookup(*args, **kwargs):  # noqa: ANN002, ANN003
+        receipt = original_lookup(*args, **kwargs)
+        barrier.wait(timeout=2)
+        return receipt
+
+    monkeypatch.setattr(connector.index, "foreground_turn_receipt", synchronized_lookup)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> tuple[httpx.Response, httpx.Response, str]:
+        opened = (await client.post(f"{base}/v1/projects/neil-shared/threads", json={})).json()["thread"]
+        url = f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}/turns"
+        payload = {"text": "Dispatch once concurrently.", "idempotency_key": "concurrent-once"}
+        first, second = await asyncio.gather(client.post(url, json=payload), client.post(url, json=payload))
+        return first, second, opened["thread_id"]
+
+    first, second, thread_id = asyncio.run(_with_server(cfg, calls))
+
+    stored = connector.index.get_with_messages("neil-shared", thread_id)
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert gateway.calls == 1
+    assert stored is not None
+    assert [message["content"] for message in stored.messages] == [
+        "Dispatch once concurrently.",
+        "Only one dispatch.",
+    ]
+
+
+def test_cockpit_project_thread_turn_requires_idempotency_key(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json").save(
+        CockpitThread(
+            thread_id="thread_missing_key",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_missing_key"),
+            title="Missing key",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+        )
+    )
+
+    async def calls(base: str, client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_missing_key/turns",
+            json={"text": "Missing key."},
+        )
+
+    response = asyncio.run(_with_server(cfg, calls, auto_turn_idempotency=False))
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "idempotency_key is required"
+
+
+def test_cockpit_queued_worker_turn_uses_stable_logical_and_idempotency_ids(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    posts: list[dict[str, Any]] = []
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        if url.endswith("/execution-state"):
+            return Response({"status": "created", "active_turn": None})
+        return Response({"session_id": "conv_stable", "status": "created"})
+
+    def worker_post(url: str, **kwargs: Any) -> Response:
+        assert url.endswith("/sessions/conv_stable/turns")
+        posts.append(kwargs["json"])
+        return Response({"ok": True})
+
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+        worker_get=worker_get,
+        worker_post=worker_post,
+    )
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_stable_queue",
+            project_id=project.id,
+            session_id=orchestrator_session_id(project.id, "thread_stable_queue"),
+            title="Stable queue",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            workspace={
+                "worker_id": "macbook-worker",
+                "session_id": "conv_stable",
+                "status": "ready",
+                "provision_phase": "ready",
+            },
+        )
+    )
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    receipt, should_dispatch = connector.index.reserve_foreground_turn(
+        project.id,
+        thread.thread_id,
+        requester=requester,
+        text="Stable retry.",
+        idempotency_key="stable-key",
+        dispatch_mode="worker",
+    )
+    assert should_dispatch is True
+    connector.index.recover_dispatching_turns(project.id, thread.thread_id)
+    recovered = connector.index.get(project.id, thread.thread_id)
+    assert recovered is not None
+    queued = recovered.queued_turns[0]
+    assert queued["queue_id"] == receipt["logical_turn_id"]
+
+    asyncio.run(connector.drain_queued_turns(project, thread.thread_id))
+
+    assert posts[0]["turn_id"] == queued["queue_id"]
+    assert posts[0]["idempotency_key"] == f"thread-turn:{thread.thread_id}:stable-key"
+    completed = connector.index.get(project.id, thread.thread_id)
+    assert completed is not None
+    completed_receipt = next(item for item in completed.turn_receipts if item["idempotency_key"] == "stable-key")
+    assert completed_receipt["status"] == "completed"
+    assert {"text", "requester", "workspace_request", "has_attachments"}.isdisjoint(completed_receipt)
+
+
+def test_cockpit_startup_blocks_ambiguous_brain_receipt_instead_of_redispatching(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_uncertain_brain",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_uncertain_brain"),
+            title="Uncertain brain turn",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            worker_id="preferred-worker-only",
+        )
+    )
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    connector.index.reserve_foreground_turn(
+        thread.project_id,
+        thread.thread_id,
+        requester=requester,
+        text="Potentially ambiguous work.",
+        idempotency_key="uncertain-key",
+        dispatch_mode="brain",
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}/turns",
+            json={"text": "Potentially ambiguous work.", "idempotency_key": "uncertain-key"},
+        )
+
+    response = asyncio.run(_with_server(cfg, calls))
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "turn_outcome_uncertain"
+    assert "new idempotency_key" in response.json()["error"]["message"]
+    uncertain = connector.index.get(thread.project_id, thread.thread_id)
+    assert uncertain is not None
+    uncertain_receipt = next(item for item in uncertain.turn_receipts if item["idempotency_key"] == "uncertain-key")
+    assert uncertain_receipt["status"] == "uncertain"
+    assert {"text", "requester", "workspace_request", "has_attachments"}.isdisjoint(uncertain_receipt)
+
+
+def test_cockpit_dispatching_receipt_replays_in_progress_without_terminal_done(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    connector = CockpitConnector(cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None)
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_dispatching_replay",
+            project_id="neil-shared",
+            session_id="session_dispatching_replay",
+            title="Dispatching",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+        )
+    )
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> httpx.Response:
+        connector.index.reserve_foreground_turn(
+            thread.project_id,
+            thread.thread_id,
+            requester=requester,
+            dispatch_mode="brain",
+            text="Still running.",
+            idempotency_key="dispatching-key",
+        )
+        return await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}/turns",
+            json={"text": "Still running.", "idempotency_key": "dispatching-key"},
+        )
+
+    response = asyncio.run(_with_server(cfg, calls))
+    events = _sse_events(response.text)
+    assert [event["_event"] for event in events] == ["thread.turn.in_progress"]
+
+
+def test_cockpit_completed_queue_receipt_replays_as_completed_not_queued(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    connector = CockpitConnector(cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None)
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_completed_queue",
+            project_id="neil-shared",
+            session_id="session_completed_queue",
+            title="Completed queue",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+        )
+    )
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    _stored, queued, _created = connector.index.enqueue_turn(
+        thread.project_id,
+        thread.thread_id,
+        requester=requester,
+        text="Already completed.",
+        idempotency_key="completed-queue-key",
+    )
+    connector.index.finish_queued_turn(thread.project_id, thread.thread_id, queued["queue_id"])
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}/turns",
+            json={"text": "Already completed.", "idempotency_key": "completed-queue-key"},
+        )
+
+    response = asyncio.run(_with_server(cfg, calls))
+    assert [event["_event"] for event in _sse_events(response.text)] == [
+        "thread.turn.replayed",
+        "thread.turn.done",
+    ]
+
+
+def test_cockpit_recovery_never_exceeds_queue_cap(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    connector = CockpitConnector(cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_recovery_cap",
+            project_id="neil-shared",
+            session_id="session_recovery_cap",
+            title="Recovery cap",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            workspace={"worker_id": "macbook-worker", "session_id": "conv_recovery_cap"},
+        )
+    )
+    for index in range(32):
+        connector.index.enqueue_turn(
+            thread.project_id,
+            thread.thread_id,
+            requester=requester,
+            text=f"Queued {index}",
+            idempotency_key=f"queued-{index}",
+        )
+    connector.index.reserve_foreground_turn(
+        thread.project_id,
+        thread.thread_id,
+        requester=requester,
+        dispatch_mode="worker",
+        text="Overflow recovery.",
+        idempotency_key="overflow-recovery",
+    )
+
+    recovered = connector.index.recover_dispatching_turns(thread.project_id, thread.thread_id)
+    assert recovered is not None
+    assert len(recovered.queued_turns) == 32
+    receipt = next(item for item in recovered.turn_receipts if item["idempotency_key"] == "overflow-recovery")
+    assert receipt["status"] == "retry_required"
+    assert {"text", "requester", "workspace_request", "has_attachments"}.isdisjoint(receipt)
+
+
+def test_cockpit_queue_rejects_raw_attachments_without_persisting_them(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    thread = connector.index.save(
+        CockpitThread(
+            thread_id="thread_attachment_queue",
+            project_id="neil-shared",
+            session_id="session_attachment_queue",
+            title="Attachment queue",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+        )
+    )
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+
+    with pytest.raises(ValueError, match="durable attachment references"):
+        connector.index.enqueue_turn(
+            thread.project_id,
+            thread.thread_id,
+            requester=requester,
+            text="Queue this image.",
+            idempotency_key="attachment-key",
+            attachments=[{"name": "secret.png", "content_base64": "raw-secret-base64"}],
+        )
+
+    assert "raw-secret-base64" not in Path(connector.index.path).read_text()
+
+
+def test_cockpit_queue_drainer_waits_through_active_completion_without_detail_poll(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    execution_reads = 0
+    turn_posts: list[dict[str, Any]] = []
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        nonlocal execution_reads
+        if url.endswith("/execution-state"):
+            execution_reads += 1
+            active = execution_reads <= 3
+            return Response(
+                {
+                    "session_id": "conv_polling_queue",
+                    "status": "running" if active else "created",
+                    "active_turn": {"turn_id": "turn_old", "status": "running"} if active else None,
+                    "pending_requests": [],
+                    "supported_controls": ["turn"],
+                    "supports": {"steer": False, "queue": False},
+                }
+            )
+        return Response({"session_id": "conv_polling_queue", "status": "created"})
+
+    def worker_post(url: str, **kwargs: Any) -> Response:
+        assert url.endswith("/sessions/conv_polling_queue/turns")
+        turn_posts.append(kwargs["json"])
+        return Response({"ok": True})
+
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+        worker_get=worker_get,
+        worker_post=worker_post,
+    )
+    connector.index.save(
+        CockpitThread(
+            thread_id="thread_polling_queue",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id("neil-shared", "thread_polling_queue"),
+            title="Polling queue",
+            created_at="2026-07-13T00:00:00Z",
+            updated_at="2026-07-13T00:00:00Z",
+            created_by="neil",
+            workspace={
+                "worker_id": "macbook-worker",
+                "session_id": "conv_polling_queue",
+                "status": "ready",
+                "provision_phase": "ready",
+            },
+        )
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> httpx.Response:
+        return await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_polling_queue/turns",
+            json={"text": "Run after completion.", "idempotency_key": "polling-key"},
+        )
+
+    response = asyncio.run(_with_server(cfg, calls, http_get=worker_get, http_post=worker_post))
+    for _ in range(100):
+        if turn_posts:
+            break
+        time.sleep(0.02)
+
+    assert response.status_code == 200
+    assert turn_posts[0]["idempotency_key"] == "thread-turn:thread_polling_queue:polling-key"
+
+
+def test_cockpit_brain_thread_detail_exposes_addressable_local_active_turn(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    class BlockingGateway(FakeGateway):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def stream_with_tools(self, messages, **_kwargs):  # noqa: ANN001
+            self.messages.append(messages)
+            self.entered.set()
+            await self.release.wait()
+            yield "Finished."
+
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    gateway = BlockingGateway()
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=gateway,
+        tts=None,
+        tracer=None,
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        opened = (await client.post(f"{base}/v1/projects/neil-shared/threads", json={})).json()["thread"]
+        turn = asyncio.create_task(
+            client.post(
+                f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}/turns",
+                json={"text": "Hold this turn open."},
+            )
+        )
+        await asyncio.wait_for(gateway.entered.wait(), timeout=2)
+        detail = (
+            await client.get(f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}")
+        ).json()["thread"]
+        gateway.release.set()
+        await turn
+        return detail
+
+    thread = asyncio.run(_with_server(cfg, calls))
+
+    assert thread["execution"]["status"] == "working"
+    assert thread["execution"]["active_turn"]["turn_id"].startswith("turn_")
+    assert thread["execution"]["active_turn"]["status"] == "working"
+    assert thread["execution"]["active_turn"]["started_at"]
+    assert thread["execution"]["pending_requests"] == []
+    assert thread["execution"]["supported_controls"] == ["turn"]
+    assert thread["execution"]["supports"] == {"steer": False, "queue": True}
+
+
 def test_cockpit_thread_turn_streams_reply_and_writes_lane1_attribution(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)
@@ -3422,6 +5272,18 @@ def test_cockpit_thread_escalates_to_workspace_without_losing_thread_history(tmp
     turn_posts = [call for call in state["posts"] if call["url"].endswith("/turns")]
     assert turn_posts
     assert "Honcho session: project:neil-shared:orchestrator:" in turn_posts[0]["json"]["prompt"]
+    session_create = next(call["json"] for call in state["posts"] if call["url"].endswith("/sessions"))
+    granted = set(session_create["metadata"]["allowed_actions"])
+    assert granted >= {
+        WORKER_SESSION_INPUT,
+        WORKER_SESSION_INTERRUPT,
+    }
+    # Conversation turns are awaited headlessly, so the session must act rather
+    # than raise an approval nobody is there to answer.
+    assert WORKER_SESSION_APPROVE not in granted
+    assert session_create["metadata"]["execution_envelope"]["allowed_actions"] == session_create["metadata"][
+        "allowed_actions"
+    ]
 
 
 def test_cockpit_thread_workspace_turn_idempotency_key_differs_for_repeat_text(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -3607,7 +5469,11 @@ def test_cockpit_thread_workspace_failure_marks_workspace_failed(tmp_path, monke
     errors = [event for event in result["events"] if event["_event"] == "thread.turn.error"]
     assert errors
     thread = result["detail"]["thread"]
+    assert thread["lifecycle"] == "open"
+    assert thread["operational_state"] == "degraded"
     assert thread["status"] == "failed"
+    assert thread["diagnostic_reason"] == "engine_error"
+    assert thread["ended_reason"] == "engine_error"
     assert thread["workspace"]["status"] == "failed"
     assert thread["workspace"]["provision_phase"] == "failed"
 
@@ -5749,6 +7615,177 @@ def test_cockpit_checkpoint_aggregation_uses_worker_bulk_endpoint(tmp_path, monk
     asyncio.run(_with_server(cfg, calls, http_get=get))
 
 
+def test_cockpit_snapshot_uses_same_version_worker_bulk_checkpoints(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    worker_token = "worker-test-token"
+    worker_cfg = WorkerConfig(_env_file=None, token=worker_token, workspace=str(tmp_path / "worker"))
+    sessions = SessionManager(str(tmp_path / "worker" / "sessions"))
+    for index in range(20):
+        session_id = f"sess_{index:02d}"
+        sessions.create({"session_id": session_id, "provider": "fake", "engine": "fake"})
+        sessions.append_event(
+            session_id,
+            EVENT_CHECKPOINT_CREATED,
+            {"checkpoint_id": f"ckpt_{index:02d}", "label": f"Checkpoint {index:02d}", "provider": "fake"},
+        )
+    cfg = _cfg(tmp_path, monkeypatch, worker_token=worker_token)
+
+    async def run() -> tuple[dict[str, Any], list[str]]:
+        worker_runner = web.AppRunner(make_worker_app(worker_cfg))
+        await worker_runner.setup()
+        worker_site = web.TCPSite(worker_runner, "localhost", 0)
+        await worker_site.start()
+        worker_socket = worker_site._server.sockets[0]  # type: ignore[union-attr]  # noqa: SLF001
+        worker_base = f"http://localhost:{worker_socket.getsockname()[1]}"
+        workers_path = Path(cfg.orchestration.workers_path)
+        workers = json.loads(workers_path.read_text())
+        workers["workers"][0]["base_url"] = worker_base
+        workers_path.write_text(json.dumps(workers))
+        calls_seen: list[str] = []
+        try:
+            with httpx.Client(timeout=10) as worker_client:
+                def worker_get(url: str, **kwargs):  # noqa: ANN001, ANN202
+                    calls_seen.append(url)
+                    return worker_client.get(url, **kwargs)
+
+                async def snapshot(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+                    response = await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})
+                    assert response.status_code == 200
+                    return response.json()
+
+                body = await _with_server(cfg, snapshot, http_get=worker_get)
+            return body, calls_seen
+        finally:
+            await worker_runner.cleanup()
+
+    body, calls_seen = asyncio.run(run())
+
+    assert len(body["sessions"]) == 20
+    assert len(body["checkpoints"]) == 20
+    assert sum(url.endswith("/sessions/checkpoints") for url in calls_seen) == 1
+    assert not any("/sessions/sess_" in url and url.endswith("/checkpoints") for url in calls_seen)
+
+
+@pytest.mark.parametrize("bulk_failure", ["timeout", "http_503", "invalid_payload"])
+def test_cockpit_checkpoint_aggregation_does_not_fan_out_after_bulk_failure(  # noqa: ANN001
+    tmp_path, monkeypatch, bulk_failure
+) -> None:
+    cfg = _cfg(tmp_path, monkeypatch)
+    calls_seen: list[str] = []
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        calls_seen.append(url)
+        if url.endswith("/health"):
+            return Response({"ok": True, "agent": "codex", "supported_engines": ["codex"]})
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions"):
+            return Response(
+                {
+                    "sessions": [
+                        {
+                            "session_id": f"sess_{index}",
+                            "provider": "codex",
+                            "engine": "codex",
+                            "status": "completed",
+                            "title": f"Historical session {index}",
+                        }
+                        for index in range(20)
+                    ]
+                }
+            )
+        if url.endswith("/sessions/requests"):
+            return Response({"requests": []})
+        if url.endswith("/sessions/checkpoints"):
+            if bulk_failure == "timeout":
+                raise TimeoutError("worker checkpoint endpoint timed out")
+            if bulk_failure == "http_503":
+                return Response({}, status_code=503)
+            return Response({"checkpoints": {}})
+        if "/sessions/sess_" in url and url.endswith("/checkpoints"):
+            raise AssertionError("bulk transport failure must not fan out per historical session")
+        raise AssertionError(url)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> None:
+        response = await client.get(f"{base}/v1/cockpit/snapshot", params={"sync": "fast"})
+
+        assert response.status_code == 200
+        assert len(response.json()["sessions"]) == 20
+        assert sum(url.endswith("/sessions/checkpoints") for url in calls_seen) == 1
+        assert not any("/sessions/sess_" in url and url.endswith("/checkpoints") for url in calls_seen)
+
+    import asyncio
+
+    asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_kind", "expected_status", "expected_error_type"),
+    [
+        ("timeout", "transport_error", 0, "TimeoutError"),
+        ("http_503", "http_error", 503, ""),
+        ("invalid_json", "invalid_payload", 0, ""),
+        ("non_object", "invalid_payload", 0, ""),
+        ("wrong_container", "invalid_payload", 0, ""),
+        ("invalid_entry", "invalid_payload", 0, ""),
+    ],
+)
+def test_worker_bulk_checkpoint_failure_diagnostics_are_bounded_and_redacted(  # noqa: ANN001
+    monkeypatch, caplog, scenario, expected_kind, expected_status, expected_error_type
+) -> None:
+    cockpit_module._bulk_checkpoint_next_warning_at.clear()  # noqa: SLF001
+    times = iter([0.0, 1.0, 61.0])
+    monkeypatch.setattr(cockpit_module.time, "monotonic", lambda: next(times))
+
+    def failed_get(*_args, **_kwargs):  # noqa: ANN001
+        if scenario == "timeout":
+            raise TimeoutError("secret-worker.example checkpoint request timed out")
+        if scenario == "http_503":
+            return Response({}, status_code=503)
+        if scenario == "invalid_json":
+            return TextResponse("not-json", status_code=200)
+        if scenario == "non_object":
+            return Response([])  # type: ignore[arg-type]
+        if scenario == "wrong_container":
+            return Response({"checkpoints": {}})
+        return Response({"checkpoints": [{"checkpoint_id": "ok"}, "invalid"]})  # type: ignore[list-item]
+
+    with caplog.at_level("WARNING", logger=cockpit_module.__name__):
+        results = [
+            cockpit_module._worker_bulk_checkpoints(  # noqa: SLF001
+                "worker-safe-id", "https://private-worker.example", {"Authorization": "secret"}, 1.0, failed_get
+            )
+            for _ in range(3)
+        ]
+
+    records = [record for record in caplog.records if record.message.startswith("worker bulk checkpoints unavailable")]
+    assert results == [[], [], []]
+    assert len(records) == 2
+    assert all(record.event == "worker_bulk_checkpoints_unavailable" for record in records)
+    assert all(record.worker_id == "worker-safe-id" for record in records)
+    assert all(record.failure_kind == expected_kind for record in records)
+    assert all(record.status_code == expected_status for record in records)
+    assert all(record.error_type == expected_error_type for record in records)
+    assert all("private-worker.example" not in record.message for record in records)
+    assert all("Authorization" not in record.message for record in records)
+
+
+@pytest.mark.parametrize("status_code", [404, 405])
+def test_worker_bulk_checkpoint_compatibility_fallback_is_explicit_and_silent(status_code, caplog) -> None:  # noqa: ANN001
+    cockpit_module._bulk_checkpoint_next_warning_at.clear()  # noqa: SLF001
+
+    with caplog.at_level("WARNING", logger=cockpit_module.__name__):
+        result = cockpit_module._worker_bulk_checkpoints(  # noqa: SLF001
+            "worker-safe-id",
+            "https://private-worker.example",
+            {},
+            1.0,
+            lambda *_args, **_kwargs: Response({}, status_code=status_code),
+        )
+
+    assert result is None
+    assert not [record for record in caplog.records if record.message.startswith("worker bulk checkpoints unavailable")]
+
+
 def test_cockpit_session_detail_returns_not_found_for_stale_worker_only_ref(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch)
     ref = make_session_ref("macbook-worker", "sess_worker_only")
@@ -7855,10 +9892,10 @@ def test_failed_orchestrator_session_is_recreated_for_retry(tmp_path, monkeypatc
         max_concurrent_jobs=2,
     )
     registry = type("Registry", (), {"choose": lambda *_args, **_kwargs: profile})()
-    posts: list[str] = []
+    posts: list[tuple[str, dict[str, Any]]] = []
 
     def post(_worker_id: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
-        posts.append(path)
+        posts.append((path, body))
         if path == "/conversation-workspaces":
             return {"ok": True, "workspace": {"root": str(tmp_path / "conversation")}}
         assert path == "/sessions"
@@ -7877,13 +9914,26 @@ def test_failed_orchestrator_session_is_recreated_for_retry(tmp_path, monkeypatc
         )
     )
 
-    assert posts == ["/conversation-workspaces", "/sessions"]
+    assert [path for path, _body in posts] == ["/conversation-workspaces", "/sessions"]
     assert retried.workspace["session_id"] == "orch_thread-retry_1"
     assert retried.workspace["provider_started"] is False
     assert retried.workspace["status"] == "ready"
+    session_create = posts[-1][1]
+    granted = set(session_create["metadata"]["allowed_actions"])
+    assert granted >= {
+        WORKER_SESSION_INPUT,
+        WORKER_SESSION_INTERRUPT,
+    }
+    # The orchestrator acts autonomously: holding approve authority would make
+    # the provider ask for approvals no one can answer on a headless turn.
+    assert WORKER_SESSION_APPROVE not in granted
+    assert session_create["metadata"]["landing"]["mode"] == "branch_only"
+    assert session_create["metadata"]["execution_envelope"]["allowed_actions"] == session_create["metadata"][
+        "allowed_actions"
+    ]
 
 
-def test_cockpit_thread_projection_carries_engine_model_status(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+def test_cockpit_thread_projection_keeps_conversation_open_after_turn(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)
     memory = FakeProjectMemory()
@@ -7898,6 +9948,9 @@ def test_cockpit_thread_projection_carries_engine_model_status(tmp_path, monkeyp
         assert opened["model"] == str(cfg.gateway.voice_model or cfg.gateway.fast_model)
         assert opened["worker_id"] is None
         assert opened["host"]
+        assert opened["conversation_id"] == opened["thread_id"]
+        assert opened["lifecycle"] == "open"
+        assert opened["operational_state"] == "idle"
         assert opened["status"] == "created"
         assert opened["ended_reason"] is None
 
@@ -7909,6 +9962,8 @@ def test_cockpit_thread_projection_carries_engine_model_status(tmp_path, monkeyp
         listed = (await client.get(f"{base}/v1/projects/neil-shared/threads")).json()["threads"]
         detail = (await client.get(f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}")).json()["thread"]
 
+        assert done["payload"]["thread"]["lifecycle"] == "open"
+        assert done["payload"]["thread"]["operational_state"] == "idle"
         assert done["payload"]["thread"]["status"] == "completed"
         assert done["payload"]["thread"]["ended_reason"] == "completed"
         assert listed[0]["engine"] == "jarvis"
@@ -7919,6 +9974,140 @@ def test_cockpit_thread_projection_carries_engine_model_status(tmp_path, monkeyp
     import asyncio
 
     asyncio.run(_with_server(cfg, calls))
+
+
+def test_cockpit_thread_operational_state_is_non_terminal() -> None:
+    thread = CockpitThread(
+        thread_id="thread_durable",
+        project_id="jarvis",
+        session_id="project:jarvis:orchestrator:thread_durable",
+        title="Durable conversation",
+        created_at="2026-07-12T12:00:00+00:00",
+        updated_at="2026-07-12T12:00:00+00:00",
+        created_by="operator",
+    )
+
+    assert cockpit_api_module._thread_operational_state(thread, None) == ("idle", "")  # noqa: SLF001
+    assert cockpit_api_module._thread_status(thread, None) == ("created", "")  # noqa: SLF001
+    archived = replace(thread, archived_at="2026-07-12T13:00:00+00:00")
+    assert cockpit_api_module._thread_operational_state(archived, None) == ("archived", "")  # noqa: SLF001
+    assert cockpit_api_module._thread_status(archived, None) == ("created", "")  # noqa: SLF001
+
+    for legacy, expected in (
+        ("created", "starting"),
+        ("running", "working"),
+        ("completed", "idle"),
+        ("failed", "degraded"),
+    ):
+        ctx = SimpleNamespace(
+            thread_turn_states={(thread.project_id, thread.thread_id): (legacy, "")}
+        )
+        assert cockpit_api_module._thread_operational_state(thread, ctx) == (expected, "")  # noqa: SLF001
+
+
+def test_cockpit_thread_projection_clears_transient_degraded_state() -> None:
+    thread = CockpitThread(
+        thread_id="thread_recovered",
+        project_id="jarvis",
+        session_id="project:jarvis:orchestrator:thread_recovered",
+        title="Recovered conversation",
+        created_at="2026-07-12T12:00:00+00:00",
+        updated_at="2026-07-12T12:00:00+00:00",
+        created_by="operator",
+        engine="codex",
+        model="gpt-5.5",
+        last_turn_at="2026-07-12T12:01:00+00:00",
+    )
+    state_key = (thread.project_id, thread.thread_id)
+    ctx = SimpleNamespace(
+        thread_turn_states={state_key: ("degraded", "engine_error")},
+        thread_turn_legacy_states={},
+    )
+
+    assert cockpit_api_module._thread_operational_state(thread, ctx) == ("degraded", "engine_error")  # noqa: SLF001
+    ctx.thread_turn_states.pop(state_key)
+
+    projection = cockpit_api_module._thread_projection(thread, ctx)  # noqa: SLF001
+    assert projection["operational_state"] == "idle"
+    assert projection["diagnostic_reason"] is None
+    assert projection["status"] == "completed"
+    assert projection["ended_reason"] == "completed"
+
+
+def test_cockpit_thread_projection_separates_legacy_failure_from_operational_state() -> None:
+    thread = CockpitThread(
+        thread_id="thread_retryable",
+        project_id="jarvis",
+        session_id="project:jarvis:orchestrator:thread_retryable",
+        title="Retryable conversation",
+        created_at="2026-07-12T12:00:00+00:00",
+        updated_at="2026-07-12T12:01:00+00:00",
+        created_by="operator",
+        engine="codex",
+        model="gpt-5.5",
+        last_turn_at="2026-07-12T12:01:00+00:00",
+    )
+    state_key = (thread.project_id, thread.thread_id)
+    ctx = SimpleNamespace(
+        thread_turn_states={},
+        thread_turn_legacy_states={state_key: ("failed", "engine_error")},
+    )
+
+    failed = cockpit_api_module._thread_projection(thread, ctx)  # noqa: SLF001
+    assert failed["operational_state"] == "idle"
+    assert failed["diagnostic_reason"] is None
+    assert failed["status"] == "failed"
+    assert failed["ended_reason"] == "engine_error"
+
+    workspace_failed = replace(thread, workspace={"status": "failed"})
+    ctx.thread_turn_legacy_states.clear()
+    workspace_projection = cockpit_api_module._thread_projection(workspace_failed, ctx)  # noqa: SLF001
+    assert workspace_projection["operational_state"] == "degraded"
+    assert workspace_projection["diagnostic_reason"] == "engine_error"
+    assert workspace_projection["status"] == "completed"
+    assert workspace_projection["ended_reason"] == "completed"
+
+    ctx.thread_turn_states[state_key] = ("working", "")
+    assert cockpit_api_module._thread_status(thread, ctx) == ("running", "")  # noqa: SLF001
+
+    ctx.thread_turn_states.pop(state_key)
+    assert cockpit_api_module._thread_status(thread, ctx) == ("completed", "completed")  # noqa: SLF001
+
+
+def test_cockpit_thread_turn_error_preserves_legacy_failure_without_degrading_conversation(  # noqa: ANN001
+    tmp_path, monkeypatch
+) -> None:
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        opened = (await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Retryable"})).json()[
+            "thread"
+        ]
+        failed = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}/turns",
+            json={"text": "Try once"},
+        )
+        detail = (await client.get(f"{base}/v1/projects/neil-shared/threads/{opened['thread_id']}"))
+        return {"events": _sse_events(failed.text), "thread": detail.json()["thread"]}
+
+    import asyncio
+
+    result = asyncio.run(_with_server(cfg, calls))
+
+    assert any(event["_event"] == "thread.turn.error" for event in result["events"])
+    assert result["thread"]["operational_state"] == "idle"
+    assert result["thread"]["diagnostic_reason"] is None
+    assert result["thread"]["status"] == "failed"
+    assert result["thread"]["ended_reason"] == "engine_error"
 
 
 def test_cockpit_thread_rename_persists_and_records_activity(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -8510,3 +10699,628 @@ def test_duplicate_child_terminal_notifications_schedule_one_parent_continuation
     _start_ready_child_watch(cfg, parent.thread_id)
 
     assert len(started) == 1
+
+
+def test_turn_failure_message_extracts_provider_detail() -> None:
+    from jarvis.worker_session_contract import turn_failure_message
+
+    codex_payload = {
+        "provider_status": "failed",
+        "raw": {
+            "turn": {
+                "status": "failed",
+                "error": {
+                    "codexErrorInfo": "usageLimitExceeded",
+                    "message": "You've hit your usage limit.",
+                },
+            }
+        },
+    }
+    assert turn_failure_message(codex_payload) == "usageLimitExceeded: You've hit your usage limit."
+    assert turn_failure_message({"error": "worker exploded"}) == "worker exploded"
+    claude_payload = {
+        "provider_status": "error_max_turns",
+        "raw": {"is_error": True, "result": "ran out of turns", "subtype": "error_max_turns"},
+    }
+    assert turn_failure_message(claude_payload) == "ran out of turns"
+    assert turn_failure_message({"provider_status": "error_during_execution", "raw": {}}) == "error_during_execution"
+    assert turn_failure_message({"provider_status": "failed", "raw": {}}) == ""
+    assert turn_failure_message(None) == ""
+
+
+def test_orchestrator_turn_failure_surfaces_provider_error(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+
+    def get_events(_worker_id: str, path: str) -> dict:
+        return {
+            "events": [
+                {
+                    "event_id": "event_1",
+                    "type": "turn.failed",
+                    "data": {
+                        "turn_id": "turn_current",
+                        "provider": "codex",
+                        "provider_status": "failed",
+                        "raw": {
+                            "turn": {
+                                "status": "failed",
+                                "error": {
+                                    "codexErrorInfo": "usageLimitExceeded",
+                                    "message": "You've hit your usage limit.",
+                                },
+                            }
+                        },
+                    },
+                }
+            ]
+        }
+
+    monkeypatch.setattr(connector, "_get_worker_json", get_events)
+
+    with pytest.raises(ProviderTurnError, match="usageLimitExceeded"):
+        asyncio.run(
+            connector._wait_for_orchestrator_turn(  # noqa: SLF001
+                "worker_a",
+                "session_a",
+                "turn_current",
+            )
+        )
+
+
+def test_orchestrator_turn_engine_override_switches_idle_thread(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    thread = CockpitThread(
+        thread_id="thread_engine_switch",
+        project_id=project.id,
+        session_id=orchestrator_session_id(project.id, "thread_engine_switch"),
+        title="Plan",
+        created_at="2026-07-13T10:00:00Z",
+        updated_at="2026-07-13T10:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        engine="codex",
+        model="gpt-5.5",
+        workspace={
+            "worker_id": "worker_a",
+            "session_id": "orch_thread_engine_switch",
+            "provider_started": True,
+            "status": "ready",
+            "session_generation": 3,
+        },
+    )
+    connector.index.save(thread)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    seen: list[CockpitThread] = []
+
+    async def fake_orchestrator_turn(_project, context_thread, *_args, **_kwargs):  # noqa: ANN001, ANN002, ANN003
+        seen.append(context_thread)
+        return "ok", context_thread
+
+    monkeypatch.setattr(connector, "_orchestrator_turn", fake_orchestrator_turn)
+
+    reply, updated, events = asyncio.run(
+        connector.turn(
+            project,
+            thread,
+            requester,
+            "switch to claude",
+            workspace_request={"engine": "claude"},
+        )
+    )
+
+    assert reply == "ok"
+    assert events == ()
+    assert seen[0].engine == "claude"
+    stored = connector.index.get(project.id, thread.thread_id)
+    assert stored is not None
+    assert stored.engine == "claude"
+    assert stored.model == ""
+    assert stored.workspace["session_id"] == ""
+    assert stored.workspace["provider_started"] is False
+    assert stored.workspace["session_generation"] == 4
+
+    with pytest.raises(ValueError, match="orchestrator engine must be codex or claude"):
+        asyncio.run(
+            connector.turn(
+                project,
+                thread,
+                requester,
+                "switch to something else",
+                workspace_request={"engine": "gpt4"},
+            )
+        )
+
+    same = asyncio.run(
+        connector.turn(
+            project,
+            thread,
+            requester,
+            "same engine keeps the session",
+            workspace_request={"engine": "claude"},
+        )
+    )
+    assert same[0] == "ok"
+    unchanged = connector.index.get(project.id, thread.thread_id)
+    assert unchanged is not None
+    assert unchanged.workspace["session_generation"] == 4
+
+
+def test_project_thread_turn_maps_provider_failures_to_engine_error(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    connector = CockpitConnector(
+        cfg,
+        memory=memory,
+        gateway=FakeGateway(["unused"]),
+        tts=None,
+        tracer=None,
+    )
+
+    async def failing_turn(*_args, **_kwargs):  # noqa: ANN002, ANN003
+        raise ProviderTurnError("usageLimitExceeded: You've hit your usage limit.")
+
+    monkeypatch.setattr(connector, "turn", failing_turn)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        opened = await client.post(f"{base}/v1/projects/neil-shared/threads", json={"title": "Plan"})
+        thread = opened.json()["thread"]
+        failed = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread['thread_id']}/turns",
+            json={"text": "Run a turn.", "idempotency_key": "turn-engine-error-1"},
+        )
+        return {"events": _sse_events(failed.text)}
+
+    result = asyncio.run(_with_server(cfg, calls))
+
+    errors = [event for event in result["events"] if event["_event"] == "thread.turn.error"]
+    assert errors
+    payload = json.dumps(errors[0])
+    assert "engine_error" in payload
+    assert "usageLimitExceeded" in payload
+
+
+def test_child_work_repo_resolves_registry_alias_to_remote() -> None:
+    from jarvis.brain.registry import ProjectEntry, RepoEntry
+    from jarvis.connectors.cockpit import _child_work_repo
+
+    project = ProjectEntry(
+        id="jarvis",
+        name="Jarvis",
+        owner="neil",
+        members=("neil",),
+        repos=(
+            RepoEntry(name="runtime", remote="roughcoder/jarvis", default=True),
+            RepoEntry(name="cockpit", remote="roughcoder/jarvis-cockpit"),
+        ),
+    )
+
+    assert _child_work_repo(project, "cockpit") == "roughcoder/jarvis-cockpit"
+    assert _child_work_repo(project, "roughcoder/jarvis-cockpit") == "roughcoder/jarvis-cockpit"
+    assert _child_work_repo(project, "") == "roughcoder/jarvis"
+    assert _child_work_repo(project, "other-org/other-repo") == "other-org/other-repo"
+    assert _child_work_repo(project, "/Users/someone/Development/jarvis-cockpit") == "roughcoder/jarvis-cockpit"
+    assert _child_work_repo(project, "~/src/runtime") == "roughcoder/jarvis"
+    with pytest.raises(ValueError, match="worker-local path"):
+        _child_work_repo(project, "/opt/checkouts/unrelated-repo")
+    empty = ProjectEntry(id="bare", name="Bare", owner="neil", members=("neil",))
+    assert _child_work_repo(empty, "", default="fallback/repo") == "fallback/repo"
+
+
+def test_child_watch_continuation_survives_worker_restart(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    parent = CockpitThread(
+        thread_id="thread_restart_join",
+        project_id="neil-shared",
+        session_id="project:neil-shared:orchestrator:thread_restart_join",
+        title="Restart drill",
+        created_at="2026-07-13T12:00:00Z",
+        updated_at="2026-07-13T12:00:00Z",
+        created_by="neil",
+    )
+    index.save(parent)
+    requester = RequestContext(
+        device_id="local-mac",
+        identity="neil",
+        scope="personal",
+        capabilities=frozenset({"orchestration.runs.read"}),
+    )
+    index.register_child_watch(parent, ["run_restart"], requester=requester)
+    watch = index.claim_ready_child_watch(parent.thread_id, {"run_restart"})
+    assert watch is not None
+    attempts: list[str] = []
+
+    async def turn(_self, _project, _thread, _requester, instruction):  # noqa: ANN001
+        attempts.append(instruction)
+        if len(attempts) < 3:
+            raise ConnectionRefusedError(61, "Connection refused")
+        return "done", parent, []
+
+    monkeypatch.setattr(CockpitConnector, "turn", turn)
+
+    _continue_child_watch(cfg, parent.thread_id, watch)
+
+    assert len(attempts) == 3
+    stored = index.get(parent.project_id, parent.thread_id)
+    assert stored is not None
+    records = [
+        message
+        for message in index._thread_messages(stored)  # noqa: SLF001
+        if message.get("type") == "child_watch"
+    ]
+    assert records
+    assert not records[-1].get("error")
+
+
+def test_worker_state_refresh_is_single_flight_under_a_hung_worker(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    import threading as _threading
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    ctx = CockpitAppContext(
+        cfg=cfg,
+        get=lambda *_args, **_kwargs: Response({}),
+        post=lambda *_args, **_kwargs: Response({}),
+        store=OrchestrationStore(cfg.orchestration.workspace),
+        idempotency=IdempotencyStore(cfg.orchestration.workspace),
+        idempotency_locks={},
+        idempotency_lock_refs={},
+        source_factory=lambda _source, _cfg: None,
+    )
+    entered = _threading.Event()
+    release = _threading.Event()
+    calls: list[str] = []
+
+    def slow_hub_worker_state(_ctx, mode, *_args, **_kwargs):  # noqa: ANN001, ANN002, ANN003
+        calls.append(mode)
+        entered.set()
+        # Model an unresponsive worker: the read blocks until its timeout.
+        release.wait(timeout=5)
+        return {"workers": [], "mode": mode}
+
+    monkeypatch.setattr(cockpit_api_module, "_hub_worker_state", slow_hub_worker_state)
+
+    first = _threading.Thread(
+        target=lambda: cockpit_api_module._refresh_worker_state(ctx, "all", None),  # noqa: SLF001
+        daemon=True,
+    )
+    first.start()
+    assert entered.wait(timeout=5)
+
+    # A second refresh while the first is stuck must not queue another blocking
+    # read; it returns immediately with the last-known projection.
+    ctx.worker_state_cache["all"] = {"workers": [], "mode": "all", "cached": True}
+    done = _threading.Event()
+
+    def second() -> None:
+        cockpit_api_module._refresh_worker_state(ctx, "all", None)  # noqa: SLF001
+        done.set()
+
+    _threading.Thread(target=second, daemon=True).start()
+    assert done.wait(timeout=2), "second refresh convoyed on the stuck worker read"
+    assert calls == ["all"]
+
+    release.set()
+    first.join(timeout=5)
+    assert calls == ["all"]
+    assert "all" not in ctx.worker_state_refresh_modes
+
+
+def test_restart_recovery_releases_orphaned_execution_and_drains_queue(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    thread = CockpitThread(
+        thread_id="thread_orphaned_lease",
+        project_id="neil-shared",
+        session_id="project:neil-shared:orchestrator:thread_orphaned_lease",
+        title="Drill",
+        created_at="2026-07-13T14:00:00Z",
+        updated_at="2026-07-13T14:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        engine="claude",
+        workspace={
+            "worker_id": "worker_a",
+            "session_id": "orch_thread_orphaned_lease",
+            "provider_started": True,
+            # The process that owned this in-flight turn died mid-turn.
+            "status": "running",
+            "provision_phase": "running",
+            "session_generation": 5,
+        },
+    )
+    index.save(thread)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    index.enqueue_turn(
+        thread.project_id,
+        thread.thread_id,
+        requester=requester,
+        text="Queued behind the dead turn.",
+        idempotency_key="queued-1",
+    )
+    stored = index.get(thread.project_id, thread.thread_id)
+    assert stored is not None
+    assert len(stored.queued_turns) == 1
+
+    recovered = index.recover_orphaned_execution(thread.project_id, thread.thread_id)
+
+    assert recovered is not None
+    assert recovered.workspace["status"] == "ready"
+    assert recovered.workspace["provision_phase"] == "ready"
+    assert recovered.workspace["provider_started"] is False
+    # The provider session itself is preserved for the next turn to re-ensure.
+    assert recovered.workspace["session_id"] == "orch_thread_orphaned_lease"
+    execution = cockpit_api_module._thread_execution_projection(recovered, None)  # noqa: SLF001
+    assert not cockpit_api_module._thread_execution_is_active(execution)  # noqa: SLF001
+
+
+def test_orchestrator_session_authority_is_not_read_only_or_plan_mode() -> None:
+    from jarvis.connectors.cockpit import (
+        CONVERSATION_SESSION_ALLOWED_ACTIONS,
+        CONVERSATION_SESSION_LANDING,
+    )
+    from jarvis.worker.authority import WorkerSessionAuthority
+
+    authority = WorkerSessionAuthority(
+        allowed_actions=list(CONVERSATION_SESSION_ALLOWED_ACTIONS),
+        landing=dict(CONVERSATION_SESSION_LANDING),
+        trusted_mcp_servers=["jarvis_orchestrator"],
+    )
+
+    # The orchestrator must be able to act on the work it coordinates. Plan mode
+    # stays an operator choice, never an imposed default.
+    assert authority.codex_sandbox == "workspace-write"
+    assert authority.claude_permission_mode != "plan"
+    assert authority.claude_tool_denial("Bash") == ""
+    assert authority.claude_tool_denial("Edit") == ""
+    assert authority.claude_tool_denial("mcp__jarvis_orchestrator__spawn_child_work_session") == ""
+    # An orchestrator turn runs headless: asking for approval would hang it, so
+    # the session must be minted to act without one.
+    assert authority.codex_approval_policy == "never"
+    assert authority.claude_permission_mode == "dontAsk"
+    assert not authority.can_resolve_approval
+
+
+def test_orchestrator_turn_fails_closed_on_an_unanswerable_approval(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+
+    def get_events(_worker_id: str, _path: str) -> dict:
+        return {
+            "events": [
+                {
+                    "event_id": "event_1",
+                    "type": "approval.requested",
+                    "data": {"turn_id": "turn_current", "request_id": "req_1"},
+                }
+            ]
+        }
+
+    monkeypatch.setattr(connector, "_get_worker_json", get_events)
+
+    with pytest.raises(ProviderTurnError, match="approval"):
+        asyncio.run(
+            connector._wait_for_orchestrator_turn("worker_a", "session_a", "turn_current")  # noqa: SLF001
+        )
+
+
+def test_spawn_child_rejects_an_unknown_engine_with_a_truthful_error(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.connectors.cockpit import _spawn_child_work_tool
+
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    thread = CockpitThread(
+        thread_id="thread_engine_validation",
+        project_id=project.id,
+        session_id="project:neil-shared:orchestrator:thread_engine_validation",
+        title="Spawn",
+        created_at="2026-07-13T15:00:00Z",
+        updated_at="2026-07-13T15:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+    )
+    tool = _spawn_child_work_tool(cfg, project, thread)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+
+    result = asyncio.run(tool.handler(requester, {"task": "list dirs", "engine": "claude-engine"}))
+
+    # An unknown engine used to match no worker and surface as the misleading
+    # "No eligible worker found".
+    assert "unknown engine" in result
+    assert "claude-engine" in result
+    assert "claude" in result and "codex" in result
+
+
+def test_child_watch_claim_renewal_does_not_grow_the_transcript(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.connectors import cockpit as cockpit_connector_module
+
+    cfg = _cfg(tmp_path, monkeypatch)
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    parent = CockpitThread(
+        thread_id="thread_renewal",
+        project_id="neil-shared",
+        session_id="project:neil-shared:orchestrator:thread_renewal",
+        title="Join",
+        created_at="2026-07-13T16:00:00Z",
+        updated_at="2026-07-13T16:00:00Z",
+        created_by="neil",
+    )
+    index.save(parent)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    index.register_child_watch(parent, ["run_a"], requester=requester)
+    watch = index.claim_ready_child_watch(parent.thread_id, {"run_a"})
+    assert watch is not None
+    watch_id = str(watch["watch_id"])
+
+    # The projection collapses a watch to its latest record, so growth is only
+    # visible in the append-only transcript itself.
+    transcript = index._transcript_path(parent.project_id, parent.thread_id)  # noqa: SLF001
+
+    def transcript_lines() -> int:
+        return len([line for line in transcript.read_text().splitlines() if line.strip()])
+
+    baseline = transcript_lines()
+
+    # The continuation loop renews on every retry tick while it waits. A live
+    # lease must not append a record each time: one join once wrote 158.
+    for _ in range(40):
+        index.renew_child_watch_claim(parent.thread_id, watch_id)
+
+    assert transcript_lines() == baseline
+
+    # A lease that has aged past the heartbeat interval still renews, so a long
+    # join keeps its claim alive.
+    monkeypatch.setattr(cockpit_connector_module, "CHILD_WATCH_RENEW_INTERVAL_S", -60)
+
+    index.renew_child_watch_claim(parent.thread_id, watch_id)
+
+    assert transcript_lines() == baseline + 1
+
+
+def test_completed_child_watch_is_never_reclaimed(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch)
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json")
+    parent = CockpitThread(
+        thread_id="thread_reclaim",
+        project_id="neil-shared",
+        session_id="project:neil-shared:orchestrator:thread_reclaim",
+        title="Join",
+        created_at="2026-07-13T16:00:00Z",
+        updated_at="2026-07-13T16:00:00Z",
+        created_by="neil",
+    )
+    index.save(parent)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    index.register_child_watch(parent, ["run_a"], requester=requester)
+
+    claimed = index.claim_ready_child_watch(parent.thread_id, {"run_a"})
+    assert claimed is not None
+    watch_id = str(claimed["watch_id"])
+    assert index.child_watch_is_claimed(parent.thread_id, watch_id)
+
+    index.finish_child_watch(parent.thread_id, watch_id)
+
+    # The append-only transcript still holds the original "waiting" record. Only
+    # the latest record is the effective state, so the finished watch must not
+    # be claimable again — a second claim would fire a duplicate continuation.
+    assert not index.child_watch_is_claimed(parent.thread_id, watch_id)
+    assert index.claim_ready_child_watch(parent.thread_id, {"run_a"}) is None
+
+
+def test_publish_review_tool_refuses_to_claim_an_unposted_review(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.connectors.cockpit import _publish_github_pr_review_tool
+
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+
+    class _Worker:
+        worker_id = "worker_a"
+        base_url = "http://worker.test"
+        token_env = ""
+
+    from jarvis.connectors import cockpit as cockpit_connector_module
+
+    monkeypatch.setattr(cockpit_connector_module, "_github_review_worker", lambda *_a, **_k: _Worker())
+
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, Any]:
+            # The worker posted nothing: GitHub returned no review.
+            return {"ok": True, "review": {"review_id": 0, "url": "", "comments": 0}}
+
+    monkeypatch.setattr(cockpit_connector_module.httpx, "post", lambda *_a, **_k: _Response())
+
+    tool = _publish_github_pr_review_tool(cfg, project)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+
+    repo = project.repos[0].remote
+    result = asyncio.run(
+        tool.handler(
+            requester,
+            {"repo": repo, "pull_number": 7, "commit_id": "abc", "summary": "s", "comments": []},
+        )
+    )
+
+    # A receipt must describe what happened: claiming "published" here let an
+    # orchestrator faithfully report a review that was never posted.
+    assert result.startswith("error:")
+    assert "nothing was posted" in result
+
+
+def test_publish_review_tool_rejects_a_replayed_zero_id_result(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.connectors.cockpit import _publish_github_pr_review_tool
+
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+
+    class _Worker:
+        worker_id = "worker_a"
+        base_url = "http://worker.test"
+        token_env = ""
+
+    from jarvis.connectors import cockpit as cockpit_connector_module
+
+    monkeypatch.setattr(cockpit_connector_module, "_github_review_worker", lambda *_a, **_k: _Worker())
+
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, Any]:
+            # A cached idempotency result from an earlier empty response: the
+            # worker replays it, but no GitHub review was ever created.
+            return {"ok": True, "replayed": True, "review": {"review_id": 0, "url": "", "comments": 0}}
+
+    monkeypatch.setattr(cockpit_connector_module.httpx, "post", lambda *_a, **_k: _Response())
+
+    tool = _publish_github_pr_review_tool(cfg, project)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+
+    repo = project.repos[0].remote
+    result = asyncio.run(
+        tool.handler(
+            requester,
+            {"repo": repo, "pull_number": 7, "commit_id": "abc", "summary": "s", "comments": []},
+        )
+    )
+
+    # A zero id means no review exists, replayed or not. Trusting the replay
+    # flag preserved the false success on every retry.
+    assert result.startswith("error:")
+    assert "nothing was posted" in result

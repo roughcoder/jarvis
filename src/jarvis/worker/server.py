@@ -179,6 +179,27 @@ def _engine_supports(engines: list[str]) -> dict[str, dict[str, bool]]:
     return supports
 
 
+def _session_supported_controls(
+    session: WorkerSession,
+    provider_capabilities: dict[str, Any],
+) -> list[str]:
+    metadata = session.metadata or {}
+    envelope = metadata.get("execution_envelope")
+    source = envelope if isinstance(envelope, dict) else metadata
+    allowed = set(source.get("allowed_actions") or [])
+    controls = []
+    for control, action, supported in (
+        ("turn", WORKER_SESSION_TURN, True),
+        ("input", WORKER_SESSION_INPUT, bool(provider_capabilities.get("questions"))),
+        ("approval", WORKER_SESSION_APPROVE, bool(provider_capabilities.get("approvals"))),
+        ("interrupt", WORKER_SESSION_INTERRUPT, bool(provider_capabilities.get("interrupt"))),
+        ("stop", WORKER_SESSION_STOP, True),
+    ):
+        if action in allowed and supported:
+            controls.append(control)
+    return controls
+
+
 def _turn_attachments(body: dict[str, Any]) -> list[dict[str, Any]] | None:
     """Turn attachments from a request body; [] when absent, None when malformed."""
     raw = body.get("attachments")
@@ -642,11 +663,35 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         requests = await asyncio.to_thread(sessions.pending_requests, session_id)
         return web.json_response({"requests": requests})
 
+    async def get_session_execution_state(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        session_id = request.match_info["id"]
+        state = await asyncio.to_thread(sessions.execution_state, session_id)
+        if state is None:
+            return web.json_response({"error": "no such session"}, status=404)
+        session = await asyncio.to_thread(sessions.get, session_id)
+        if session is None:
+            return web.json_response({"error": "no such session"}, status=404)
+        try:
+            capabilities = provider_for(session.provider).capabilities()
+        except ValueError:
+            capabilities = {}
+        state["supported_controls"] = _session_supported_controls(session, capabilities)
+        state["supports"] = {"steer": False, "queue": False}
+        return web.json_response(state)
+
     async def list_session_requests(request: web.Request) -> web.Response:
         if not authorised(request):
             return web.json_response({"error": "unauthorized"}, status=401)
         requests = await asyncio.to_thread(sessions.pending_requests)
         return web.json_response({"requests": requests})
+
+    async def list_session_checkpoints(request: web.Request) -> web.Response:
+        if not authorised(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        checkpoints = await asyncio.to_thread(sessions.all_checkpoints)
+        return web.json_response({"checkpoints": checkpoints})
 
     async def get_session_checkpoints(request: web.Request) -> web.Response:
         if not authorised(request):
@@ -1181,12 +1226,14 @@ def make_app(cfg: WorkerConfig) -> web.Application:
         web.post("/sessions", create_session),
         web.get("/sessions", list_sessions),
         web.get("/sessions/requests", list_session_requests),
+        web.get("/sessions/checkpoints", list_session_checkpoints),
         web.post("/conversation-workspaces", create_conversation_workspace),
         web.get("/conversation-workspaces/{conversation_id}", get_conversation_workspace),
         web.post("/conversation-workspaces/{conversation_id}/worktrees", create_conversation_worktree),
         web.delete("/conversation-workspaces/{conversation_id}/worktrees/{repo_name}", delete_conversation_worktree),
         web.get("/sessions/{id}/events", get_session_events),
         web.get("/sessions/{id}/requests", get_session_requests),
+        web.get("/sessions/{id}/execution-state", get_session_execution_state),
         web.get("/sessions/{id}/checkpoints", get_session_checkpoints),
         web.post("/sessions/{id}/checkpoints/restore", restore_session_checkpoint),
         web.post("/sessions/{id}/turns", start_session_turn),
