@@ -3108,14 +3108,27 @@ def _publish_github_pr_review_tool(cfg: Config, project: ProjectEntry) -> Tool:
         except Exception as exc:  # noqa: BLE001 - external write errors become bounded tool output
             return f"error: could not publish GitHub review ({public_error_message(str(exc))})"
         result = payload.get("review") if isinstance(payload.get("review"), dict) else {}
+        review_id = int(result.get("review_id") or 0)
+        replayed = bool(payload.get("replayed"))
+        # A receipt must describe what actually happened. Reporting published
+        # for an empty result let an orchestrator truthfully relay a review it
+        # never posted. A zero id means no GitHub review exists — including a
+        # replayed idempotency result cached from an earlier empty or
+        # all-duplicate response, which would otherwise preserve the false
+        # success on every retry.
+        if review_id <= 0:
+            return (
+                "error: GitHub returned no review for this publish; nothing was posted. "
+                f"skipped_comments={int(result.get('skipped_comments') or 0)}"
+            )
         return json.dumps(
             {
                 "published": True,
-                "review_id": int(result.get("review_id") or 0),
+                "review_id": review_id,
                 "url": str(result.get("url") or ""),
                 "comments": int(result.get("comments") or 0),
                 "skipped_comments": int(result.get("skipped_comments") or 0),
-                "replayed": bool(payload.get("replayed")),
+                "replayed": replayed,
                 "worker_id": worker.worker_id,
             },
             sort_keys=True,

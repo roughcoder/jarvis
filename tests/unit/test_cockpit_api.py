@@ -11147,3 +11147,92 @@ def test_completed_child_watch_is_never_reclaimed(tmp_path, monkeypatch) -> None
     # be claimable again — a second claim would fire a duplicate continuation.
     assert not index.child_watch_is_claimed(parent.thread_id, watch_id)
     assert index.claim_ready_child_watch(parent.thread_id, {"run_a"}) is None
+
+
+def test_publish_review_tool_refuses_to_claim_an_unposted_review(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.connectors.cockpit import _publish_github_pr_review_tool
+
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+
+    class _Worker:
+        worker_id = "worker_a"
+        base_url = "http://worker.test"
+        token_env = ""
+
+    from jarvis.connectors import cockpit as cockpit_connector_module
+
+    monkeypatch.setattr(cockpit_connector_module, "_github_review_worker", lambda *_a, **_k: _Worker())
+
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, Any]:
+            # The worker posted nothing: GitHub returned no review.
+            return {"ok": True, "review": {"review_id": 0, "url": "", "comments": 0}}
+
+    monkeypatch.setattr(cockpit_connector_module.httpx, "post", lambda *_a, **_k: _Response())
+
+    tool = _publish_github_pr_review_tool(cfg, project)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+
+    repo = project.repos[0].remote
+    result = asyncio.run(
+        tool.handler(
+            requester,
+            {"repo": repo, "pull_number": 7, "commit_id": "abc", "summary": "s", "comments": []},
+        )
+    )
+
+    # A receipt must describe what happened: claiming "published" here let an
+    # orchestrator faithfully report a review that was never posted.
+    assert result.startswith("error:")
+    assert "nothing was posted" in result
+
+
+def test_publish_review_tool_rejects_a_replayed_zero_id_result(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.connectors.cockpit import _publish_github_pr_review_tool
+
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+
+    class _Worker:
+        worker_id = "worker_a"
+        base_url = "http://worker.test"
+        token_env = ""
+
+    from jarvis.connectors import cockpit as cockpit_connector_module
+
+    monkeypatch.setattr(cockpit_connector_module, "_github_review_worker", lambda *_a, **_k: _Worker())
+
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, Any]:
+            # A cached idempotency result from an earlier empty response: the
+            # worker replays it, but no GitHub review was ever created.
+            return {"ok": True, "replayed": True, "review": {"review_id": 0, "url": "", "comments": 0}}
+
+    monkeypatch.setattr(cockpit_connector_module.httpx, "post", lambda *_a, **_k: _Response())
+
+    tool = _publish_github_pr_review_tool(cfg, project)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+
+    repo = project.repos[0].remote
+    result = asyncio.run(
+        tool.handler(
+            requester,
+            {"repo": repo, "pull_number": 7, "commit_id": "abc", "summary": "s", "comments": []},
+        )
+    )
+
+    # A zero id means no review exists, replayed or not. Trusting the replay
+    # flag preserved the false success on every retry.
+    assert result.startswith("error:")
+    assert "nothing was posted" in result
