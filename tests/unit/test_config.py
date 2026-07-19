@@ -17,6 +17,7 @@ from jarvis.config import (
     LinearConfig,
     MCPServeConfig,
     MemoryConfig,
+    OrchestrationConfig,
     WorkerConfig,
 )
 
@@ -58,6 +59,16 @@ def test_mcp_serve_resource_url_defaults_to_host_port(monkeypatch) -> None:
 
     assert c.resource_url == ""
     assert c.resolved_resource_url == "http://jarvis.local:8795"
+
+
+def test_orchestration_worker_probe_interval_is_env_driven(monkeypatch) -> None:
+    _clean(monkeypatch, "ORCHESTRATION_WORKER_PROBE_INTERVAL_S")
+
+    assert OrchestrationConfig(_env_file=None).worker_probe_interval_s == 600.0
+
+    monkeypatch.setenv("ORCHESTRATION_WORKER_PROBE_INTERVAL_S", "0")
+
+    assert OrchestrationConfig(_env_file=None).worker_probe_interval_s == 0.0
 
 
 def test_resolved_includes_mcp_serve_oauth_fields(monkeypatch) -> None:

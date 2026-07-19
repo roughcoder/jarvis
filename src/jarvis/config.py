@@ -895,6 +895,9 @@ class OrchestrationConfig(_Base):
     # Safety valve for a future writer outside this API process. Generation is
     # process-local, so periodically re-read file metadata and project anew.
     sse_forced_refresh_ticks: int = 30
+    # Best-effort cold-path worker probes keep liveness and model catalogs warm
+    # even when no cockpit client explicitly asks for probe=true. 0 disables.
+    worker_probe_interval_s: float = 600.0
     turn_attachment_max_count: int = 4
     turn_attachment_max_bytes: int = 5 * 1024 * 1024
     # Conversation retention. The store keeps thread records, JSONL transcripts,
@@ -1197,6 +1200,7 @@ class Config:
             "orchestration.sse_sync_backoff_ticks": self.orchestration.sse_sync_backoff_ticks,
             "orchestration.sse_notify_min_interval_s": self.orchestration.sse_notify_min_interval_s,
             "orchestration.sse_forced_refresh_ticks": self.orchestration.sse_forced_refresh_ticks,
+            "orchestration.worker_probe_interval_s": self.orchestration.worker_probe_interval_s,
             "orchestration.retention_enabled": self.orchestration.retention_enabled,
             "orchestration.retention_interval_s": self.orchestration.retention_interval_s,
             "orchestration.retention_archived_ttl_days": self.orchestration.retention_archived_ttl_days,
