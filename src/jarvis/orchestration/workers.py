@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import socket
+from copy import deepcopy
 from collections.abc import Callable
 from typing import Any
 
@@ -24,12 +25,32 @@ _PROFILE_CACHE: dict[str, tuple[int, float, list[dict[str, Any]]]] = {}
 # seen, of unknown version, with zero worktrees — indistinguishable from a
 # healthy empty worker. Remember the last successful probe per worker so
 # unprobed reads (the cockpit's default) report last-known truth instead.
-_PROBE_SNAPSHOT_FIELDS = ("last_seen_at", "runtime", "system", "worktree_inventory")
+_PROBE_SNAPSHOT_FIELDS = (
+    "last_seen_at",
+    "agent",
+    "default_engine",
+    "supported_engines",
+    "engine_supports",
+    "engine_models",
+    "engine_default_model",
+    "runtime",
+    "system",
+    "worktree_inventory",
+)
+_PROBE_SNAPSHOT_REPLACE_FIELDS = {
+    "agent",
+    "default_engine",
+    "supported_engines",
+    "engine_supports",
+    "engine_models",
+    "engine_default_model",
+}
 # Bounded: a worker that has been unreachable for this long should read as
 # unknown again rather than keep showing numbers from a machine that may since
 # have been rebuilt.
 _PROBE_SNAPSHOT_TTL_S = 30 * 60.0
 _PROBE_SNAPSHOTS: dict[str, tuple[float, dict[str, Any]]] = {}
+_PROBE_SNAPSHOT_STORE_VERSION = 1
 
 
 def reset_probe_snapshots() -> None:
@@ -41,23 +62,98 @@ def _probe_snapshot_key(profile: WorkerProfile) -> str:
     return f"{profile.worker_id}@{profile.base_url}"
 
 
-def _remember_probe(profile: WorkerProfile) -> None:
-    snapshot = {field: getattr(profile, field) for field in _PROBE_SNAPSHOT_FIELDS}
+def _probe_snapshots_path(profiles_path: pathlib.Path | None) -> pathlib.Path | None:
+    if profiles_path is None:
+        return None
+    return profiles_path.with_name(f"{profiles_path.name}.probes.json")
+
+
+def _remember_probe(profile: WorkerProfile, snapshots_path: pathlib.Path | None = None) -> None:
+    snapshot = {field: deepcopy(getattr(profile, field)) for field in _PROBE_SNAPSHOT_FIELDS}
     _PROBE_SNAPSHOTS[_probe_snapshot_key(profile)] = (time_monotonic() + _PROBE_SNAPSHOT_TTL_S, snapshot)
+    _write_probe_snapshot(snapshots_path, _probe_snapshot_key(profile), snapshot)
 
 
-def _apply_probe_snapshot(profile: WorkerProfile) -> WorkerProfile:
-    entry = _PROBE_SNAPSHOTS.get(_probe_snapshot_key(profile))
+def _apply_probe_snapshot(profile: WorkerProfile, snapshots_path: pathlib.Path | None = None) -> WorkerProfile:
+    key = _probe_snapshot_key(profile)
+    entry = _PROBE_SNAPSHOTS.get(key)
+    if entry is None:
+        entry = _read_probe_snapshot(snapshots_path, key)
     if entry is None:
         return profile
     expires_at, snapshot = entry
     if expires_at <= time_monotonic():
-        _PROBE_SNAPSHOTS.pop(_probe_snapshot_key(profile), None)
+        _PROBE_SNAPSHOTS.pop(key, None)
         return profile
     for field, value in snapshot.items():
-        if not getattr(profile, field, None):
-            setattr(profile, field, value)
+        if _should_apply_probe_field(profile, field, value):
+            setattr(profile, field, deepcopy(value))
+    profile.__post_init__()
     return profile
+
+
+def _should_apply_probe_field(profile: WorkerProfile, field: str, value: Any) -> bool:
+    if field not in _PROBE_SNAPSHOT_FIELDS or not value:
+        return False
+    if field in _PROBE_SNAPSHOT_REPLACE_FIELDS:
+        return True
+    return not getattr(profile, field, None)
+
+
+def _read_probe_snapshot(snapshots_path: pathlib.Path | None, key: str) -> tuple[float, dict[str, Any]] | None:
+    if snapshots_path is None:
+        return None
+    try:
+        raw = json.loads(snapshots_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    snapshots = raw.get("snapshots")
+    if not isinstance(snapshots, dict):
+        return None
+    row = snapshots.get(key)
+    if not isinstance(row, dict):
+        return None
+    try:
+        expires_wall = float(row.get("expires_at") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    remaining = expires_wall - time_wall()
+    if remaining <= 0:
+        return None
+    snapshot = row.get("snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    filtered = {field: deepcopy(snapshot[field]) for field in _PROBE_SNAPSHOT_FIELDS if field in snapshot}
+    entry = (time_monotonic() + remaining, filtered)
+    _PROBE_SNAPSHOTS[key] = entry
+    return entry
+
+
+def _write_probe_snapshot(snapshots_path: pathlib.Path | None, key: str, snapshot: dict[str, Any]) -> None:
+    if snapshots_path is None:
+        return
+    now = time_wall()
+    rows: dict[str, Any] = {}
+    try:
+        raw = json.loads(snapshots_path.read_text())
+        existing = raw.get("snapshots") if isinstance(raw, dict) else None
+        if isinstance(existing, dict):
+            for existing_key, row in existing.items():
+                if isinstance(row, dict) and float(row.get("expires_at") or 0.0) > now:
+                    rows[str(existing_key)] = row
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        rows = {}
+    rows[key] = {"expires_at": now + _PROBE_SNAPSHOT_TTL_S, "snapshot": deepcopy(snapshot)}
+    payload = {"version": _PROBE_SNAPSHOT_STORE_VERSION, "snapshots": rows}
+    try:
+        snapshots_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = snapshots_path.with_name(f".{snapshots_path.name}.tmp")
+        tmp_path.write_text(json.dumps(payload, sort_keys=True))
+        tmp_path.replace(snapshots_path)
+    except OSError:
+        return
 # The orchestration API makes many small worker reads while assembling cockpit
 # projections.  Keep one process-local client so those reads reuse connections
 # instead of paying a TCP/TLS setup cost for every row.  Callers can still
@@ -84,6 +180,7 @@ class WorkerRegistry:
     ) -> None:
         self.worker_cfg = worker_cfg
         self.profiles_path = pathlib.Path(profiles_path).expanduser() if profiles_path else None
+        self.probe_snapshots_path = _probe_snapshots_path(self.profiles_path)
         self._http_get = http_get or worker_http_get
         self._http_post = http_post or worker_http_post
 
@@ -93,7 +190,7 @@ class WorkerRegistry:
             profiles = [self._default_profile()]
         if probe:
             return [self._probe(p) for p in profiles]
-        return [_apply_probe_snapshot(p) for p in profiles]
+        return [_apply_probe_snapshot(p, self.probe_snapshots_path) for p in profiles]
 
     def get(self, worker_id: str = "", *, probe: bool = False) -> WorkerProfile | None:
         profiles = self.profiles(probe=probe)
@@ -263,7 +360,7 @@ class WorkerRegistry:
             profile.runtime = {str(key): _string_or_none(value) for key, value in data["runtime"].items()}
         profile.system = _system_from_health(data.get("system"))
         profile.__post_init__()
-        _remember_probe(profile)
+        _remember_probe(profile, self.probe_snapshots_path)
         return profile
 
     def _probe_repo_access(self, profile: WorkerProfile, repo: str) -> WorkerProfile:
@@ -373,6 +470,12 @@ def time_monotonic() -> float:
     import time
 
     return time.monotonic()
+
+
+def time_wall() -> float:
+    import time
+
+    return time.time()
 
 
 def _engine_supports_from_mapping(raw: dict[str, Any]) -> dict[str, dict[str, bool]]:
