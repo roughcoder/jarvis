@@ -73,6 +73,10 @@ class QueueStatus:
         return self.pending_work_units + self.in_progress_work_units == 0
 
 
+class UnsupportedMemoryOperation(NotImplementedError):
+    """Raised when live memory is unavailable for an optional higher-level surface."""
+
+
 class MemoryBackend(Protocol):
     """Common surface used by the brain and future memory tools."""
 

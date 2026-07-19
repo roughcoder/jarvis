@@ -39,9 +39,6 @@ def test_memory_session_and_peer_per_user() -> None:
     assert mc._session_id("jules") == "voice:jules"
     assert mc._peer("jules") == "jules"
     assert mc._peer(None) == "user"
-    # The rollback v2 backend keeps its legacy separator.
-    v2 = MemoryClient(MemoryConfig(_env_file=None, user_peer_id="user", backend="v2"))
-    assert v2._session_id("jules") == "voice-jules"
 
 
 def test_context_store_isolates_and_reuses_sessions() -> None:

@@ -50,7 +50,6 @@ def _cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
                 f"REGISTRY_UPLOAD_MANIFEST_PATH={tmp_path / 'jarvis-workspace' / 'registry' / 'upload-manifest.json'}",
                 f"MEMORY_CACHE_PATH={tmp_path / 'cache.json'}",
                 f"MEMORY_CURATION_OUTBOX_PATH={tmp_path / 'outbox.jsonl'}",
-                "MEMORY_BACKEND=v3",
                 "BRAIN_PEER_TOKEN=peer-token",
             ]
         ),

@@ -1,6 +1,6 @@
 # Honcho Memory Model for Jarvis
 
-Date: 2026-07-04 (v2 — supersedes the initial draft of the same date)
+Date: 2026-07-04 (revised after v3 validation; updated 2026-07-19 for v3-only runtime)
 
 This note records how Jarvis should use Honcho now that Honcho remains the
 chosen memory backend. It turns the design discussion into a durable model for
@@ -14,8 +14,7 @@ two write lanes.
 ## Source Evidence
 
 Verified at the `v3.0.11` tag of https://github.com/plastic-labs/honcho/
-(self-hosted images published at `ghcr.io/plastic-labs/honcho`; we currently
-run `v2.0.3`):
+(self-hosted images published at `ghcr.io/plastic-labs/honcho`):
 
 - Workspaces, peers, sessions, and messages work as in the v3 docs. Peers are
   the representation target; a peer can be a person, agent, or any entity.
@@ -655,27 +654,17 @@ Contacts are not routinely cached — contact reads go through the memory tool.
 | `observe_others` | off initially | Lane 1 already lands hearsay in the speaker's rep; enable per-session later if shared-session perspective segmentation is needed. |
 | Deriver custom instructions on `project:*` peers | set | The deriver is tuned for conversation; tell it these peers hold artifacts (uploads, meeting notes). |
 | Peer cards | seed for principals and contacts | Grounding: name, relationship, disambiguators. |
-| Honcho LLM provider | `custom` → LiteLLM | As today; must be re-validated against v3's new `src/llm/` runtime (`structured_output_mode: json_object` exists for OpenAI-compatible providers). |
+| Honcho LLM provider | OpenAI transport -> LiteLLM | Use LiteLLM route names with per-caller `base_url` overrides; deriver requires `structured_output_mode: json_object`. |
 
-## Migration (v2.0.3 → v3.0.11)
+## v3-Only Runtime
 
-- Upstream ships a continuous Alembic chain, so in-place DB upgrade is
-  supported — but this model changes the ontology anyway. Plan: **start
-  `jarvis-home` fresh on v3**; keep the v2 volume as `jarvis-dev` history.
-  Nothing in the current single-user `voice` session transcript is worth a
-  data migration — **but the authoritative profile-file facts are**.
-- **Seed the declared rail at cutover.** The two-rail collapse means the
-  current authoritative rail (the `users/<name>.md` profile facts written by
-  `remember`) must be imported as explicit conclusions on the matching
-  principal peers (`level=explicit`, `recorded_by` = the user,
-  `source: profile-migration`, `observed_at` = the fact's original date
-  where known, else the migration date). Verify the seed with a
-  count/read-back before retiring the files; without this step the facts
-  users deliberately saved are exactly the ones lost.
-- v3 renamed API routes, so the raw-`/v2` `memory_client` breaks against a v3
-  server regardless. The v2-SDK/v3-server mismatch that forced raw REST now
-  inverts: on v3 the official SDK is usable. Either way, the swap happens
-  behind the backend interface (below).
+- Production cut over to Honcho v3 on 2026-07-05.
+- Rollback support for the old Honcho v2 stack was retired on 2026-07-19.
+- `MemoryClient` now uses the v3 HTTP API unconditionally behind the existing
+  brain memory interface.
+- The profile-fact seeding command remains available for explicit v3 conclusion
+  imports, and the conclusion provenance sidecar remains load-bearing because
+  Honcho v3.0.11 does not round-trip conclusion metadata.
 
 ## Queries Jarvis Should Support
 
@@ -711,7 +700,7 @@ Forget what I told you about ...
 | Dependency | What we need from it | Risk / action |
 | --- | --- | --- |
 | Honcho v3 (self-hosted, `ghcr.io/plastic-labs/honcho:v3.x`) | Peers, sessions, conclusions CRUD, observer scopes, file uploads, queue status | Verified at v3.0.11; pin the image, re-verify on bumps. |
-| LiteLLM gateway (`custom` provider) | All Honcho reasoning (deriver/dialectic/dreamer/summary/embeddings) routes through it | Must be re-validated against v3's new `src/llm/` runtime (`structured_output_mode`); do this before anything else. |
+| LiteLLM gateway (OpenAI-compatible transport) | All Honcho reasoning (deriver/dialectic/dreamer/summary/embeddings) routes through it | Validated against v3.0.11; keep `structured_output_mode=json_object` for deriver calls. |
 | Identity layer (`identity.py`, trust tiers) | Maps devices/channels/voices to principals; the requester for every gate check | Exists; contacts add no requirement. |
 | Capability gate (`capabilities.py`) | Deny-by-default enforcement of the access matrix and curation writes | Exists; needs the memory/curation capability definitions. |
 | Registry storage (private Jarvis workspace) | Projects and contacts: identity, aliases, owner/members, repos, links | New; single-writer via the brain, so a JSON/SQLite store suffices. |
@@ -734,8 +723,7 @@ Forget what I told you about ...
 
 ### Build order
 
-1. Re-validate LiteLLM `custom`-provider routing against a v3 container
-   (blocks everything).
+1. Validate LiteLLM OpenAI-transport routing against a v3 container.
 2. Memory backend interface + v3 client (peers, sessions, messages,
    conclusions, representation, queue status), `jarvis-dev` workspace.
 3. Registry (projects + contacts) with owner/members/visibility, repos,
@@ -747,12 +735,13 @@ Forget what I told you about ...
 8. MCP server lane (`jarvis mcp-serve`): per-principal tokens over the same
    gate and tools.
 9. Cutover: fresh `jarvis-home` on v3; seed profile-file facts as explicit
-   conclusions (verified by read-back); retire the v2 stack.
+   conclusions (verified by read-back). Completed 2026-07-05; v2 retired
+   2026-07-19.
 
 ## Implementation Implications
 
-1. A memory backend interface so the v2 client and the v3 client can be
-   swapped without changing `BrainSession`.
+1. A memory backend interface so `BrainSession` stays decoupled from Honcho's
+   HTTP details.
 2. A registry for entity peers (projects and contacts) under the private
    Jarvis workspace: identity, aliases, owner/members/visibility, repos,
    links.

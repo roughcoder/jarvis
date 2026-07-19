@@ -2,44 +2,74 @@
 #
 #   Step 1: litellm                       (LLM gateway)
 #   Step 8: honcho-db / honcho-redis /
-#           honcho-api / honcho-deriver   (memory service, spec §4)
+#           honcho-api / honcho-deriver   (Honcho v3 memory service, spec §4)
 #
 # Honcho runs in this same compose so its deriver/summary/dream/embedding LLM
-# calls reach LiteLLM over the internal network at http://litellm:4000/v1 —
-# i.e. NO local model (spec §4). The real OpenAI key lives only in litellm;
-# Honcho authenticates to LiteLLM with the gateway master key.
-#
+# calls reach LiteLLM over the internal network at http://litellm:4000/v1.
 # Ports come from .env so Phase 2 (spec §3.1) is an env change, not an edit.
-# (DB/redis healthchecks below are for correct boot ordering, not Phase 3
-# hardening; restart policies are intentionally omitted per spec §2.)
 
 x-honcho-env: &honcho-env
+  HONCHO_CONFIG_TOML_DISABLED: "true"
   DB_CONNECTION_URI: postgresql+psycopg://postgres:postgres@honcho-db:5432/postgres
   CACHE_URL: redis://honcho-redis:6379/0?suppress=true
   CACHE_ENABLED: "true"
   AUTH_USE_AUTH: "false"
-  LOG_LEVEL: INFO
-  # Honcho v2.0.3: every LLM feature uses the "custom" provider, which is an
-  # OpenAI-compatible client pointed at LiteLLM — i.e. no local model, all
-  # reasoning routed through the gateway (spec §4). Embeddings stay off
-  # (EMBED_MESSAGES=false) so no extra key is needed for Phase 1.
-  LLM_OPENAI_COMPATIBLE_BASE_URL: http://litellm:4000/v1
-  # Honcho's own virtual key (alias "honcho-memory") so memory reasoning is
-  # attributable separately from voice in the gateway logs.
-  LLM_OPENAI_COMPATIBLE_API_KEY: ${HONCHO_LLM_KEY:-sk-honcho-memory}
-  # Required at startup even with embeddings off (EmbeddingClient is OpenAI-only
-  # in v2.0.3). Real key so embeddings work if ever enabled; reasoning still
-  # goes through LiteLLM via the custom provider above.
-  LLM_OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-jarvis-local}
-  LLM_DIALECTIC_PROVIDER: custom
-  LLM_DIALECTIC_MODEL: honcho-llm
-  LLM_QUERY_GENERATION_PROVIDER: custom
-  LLM_QUERY_GENERATION_MODEL: honcho-llm
-  LLM_TOM_INFERENCE_PROVIDER: custom
-  LLM_TOM_INFERENCE_MODEL: honcho-llm
-  LLM_SUMMARY_PROVIDER: custom
-  LLM_SUMMARY_MODEL: honcho-llm
-  LLM_EMBED_MESSAGES: "false"
+  LOG_LEVEL: ${HONCHO_V3_LOG_LEVEL:-INFO}
+  PERFORMANCE_LOG_FORMAT: compact
+  EMBED_MESSAGES: "true"
+  EMBEDDING_VECTOR_DIMENSIONS: "1536"
+  EMBEDDING_MODEL_CONFIG__TRANSPORT: openai
+  EMBEDDING_MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_EMBED_MODEL:-embed}
+  EMBEDDING_MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm:4000/v1}
+  LLM_OPENAI_API_KEY: ${HONCHO_V3_LITELLM_KEY:-${HONCHO_LLM_KEY:-sk-honcho-memory}}
+
+  # Honcho v3 uses OpenAI transport plus a LiteLLM base_url override per model
+  # caller. Model names below are LiteLLM route names, not provider-native ids.
+  DERIVER_ENABLED: "true"
+  DERIVER_POLLING_SLEEP_INTERVAL_SECONDS: "0.5"
+  DERIVER_POLLING_BACKOFF_ENABLED: "false"
+  DERIVER_POLLING_STARTUP_JITTER_SECONDS: "0"
+  DERIVER_POLLING_JITTER_RATIO: "0"
+  DERIVER_FLUSH_ENABLED: "true"
+  DERIVER_MODEL_CONFIG__TRANSPORT: openai
+  DERIVER_MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
+  DERIVER_MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm:4000/v1}
+  DERIVER_MODEL_CONFIG__STRUCTURED_OUTPUT_MODE: json_object
+  DERIVER_MODEL_CONFIG__MAX_OUTPUT_TOKENS: "4096"
+
+  DIALECTIC_LEVELS__minimal__MODEL_CONFIG__TRANSPORT: openai
+  DIALECTIC_LEVELS__minimal__MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
+  DIALECTIC_LEVELS__minimal__MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm:4000/v1}
+  DIALECTIC_LEVELS__low__MODEL_CONFIG__TRANSPORT: openai
+  DIALECTIC_LEVELS__low__MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
+  DIALECTIC_LEVELS__low__MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm:4000/v1}
+  DIALECTIC_LEVELS__medium__MODEL_CONFIG__TRANSPORT: openai
+  DIALECTIC_LEVELS__medium__MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
+  DIALECTIC_LEVELS__medium__MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm:4000/v1}
+  DIALECTIC_LEVELS__high__MODEL_CONFIG__TRANSPORT: openai
+  DIALECTIC_LEVELS__high__MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
+  DIALECTIC_LEVELS__high__MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm:4000/v1}
+  DIALECTIC_LEVELS__max__MODEL_CONFIG__TRANSPORT: openai
+  DIALECTIC_LEVELS__max__MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
+  DIALECTIC_LEVELS__max__MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm:4000/v1}
+
+  SUMMARY_ENABLED: "true"
+  SUMMARY_MESSAGES_PER_SHORT_SUMMARY: "10"
+  SUMMARY_MESSAGES_PER_LONG_SUMMARY: "20"
+  SUMMARY_MODEL_CONFIG__TRANSPORT: openai
+  SUMMARY_MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
+  SUMMARY_MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm:4000/v1}
+
+  DREAM_ENABLED: "true"
+  DREAM_DOCUMENT_THRESHOLD: "1"
+  DREAM_IDLE_TIMEOUT_MINUTES: "1"
+  DREAM_MIN_HOURS_BETWEEN_DREAMS: "1"
+  DREAM_DEDUCTION_MODEL_CONFIG__TRANSPORT: openai
+  DREAM_DEDUCTION_MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
+  DREAM_DEDUCTION_MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm:4000/v1}
+  DREAM_INDUCTION_MODEL_CONFIG__TRANSPORT: openai
+  DREAM_INDUCTION_MODEL_CONFIG__MODEL: ${HONCHO_V3_LITELLM_CHAT_MODEL:-honcho-llm}
+  DREAM_INDUCTION_MODEL_CONFIG__OVERRIDES__BASE_URL: ${HONCHO_V3_LITELLM_BASE_URL:-http://litellm:4000/v1}
 
 services:
   litellm:
@@ -75,7 +105,7 @@ services:
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
       - ./deploy/honcho/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-      - honcho-pgdata:/var/lib/postgresql/data/
+      - honcho-v3-pgdata:/var/lib/postgresql/data/
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
       interval: 5s
@@ -86,7 +116,7 @@ services:
     image: redis:8.2
     container_name: jarvis-honcho-redis
     volumes:
-      - honcho-redis-data:/data
+      - honcho-v3-redis-data:/data
     healthcheck:
       test: ["CMD-SHELL", "redis-cli ping"]
       interval: 5s
@@ -94,13 +124,9 @@ services:
       retries: 10
 
   honcho-api:
-    image: ghcr.io/plastic-labs/honcho:v2.0.3
+    image: ghcr.io/plastic-labs/honcho:v3.0.11
     container_name: jarvis-honcho-api
-    # Prebuilt image's default CMD runs the API but skips migrations; run
-    # provision_db.py first, then start the server.
-    entrypoint: ["sh", "-c"]
-    command:
-      - "/app/.venv/bin/python scripts/provision_db.py && exec /app/.venv/bin/fastapi run --host 0.0.0.0 src/main.py"
+    entrypoint: ["sh", "docker/entrypoint.sh"]
     depends_on:
       honcho-db:
         condition: service_healthy
@@ -110,17 +136,16 @@ services:
       - "${MEMORY_PORT:-8000}:8000"
     environment: *honcho-env
     healthcheck:
-      # v2.0.3 has no /health route; /openapi.json is a cheap 200 liveness probe.
       test:
         ["CMD", "/app/.venv/bin/python", "-c",
-         "import urllib.request; urllib.request.urlopen('http://localhost:8000/openapi.json', timeout=2).read()"]
+         "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()"]
       interval: 5s
       timeout: 5s
-      retries: 12
-      start_period: 15s
+      retries: 18
+      start_period: 20s
 
   honcho-deriver:
-    image: ghcr.io/plastic-labs/honcho:v2.0.3
+    image: ghcr.io/plastic-labs/honcho:v3.0.11
     container_name: jarvis-honcho-deriver
     entrypoint: ["/app/.venv/bin/python", "-m", "src.deriver"]
     depends_on:
@@ -133,5 +158,7 @@ services:
     environment: *honcho-env
 
 volumes:
-  honcho-pgdata:
-  honcho-redis-data:
+  honcho-v3-pgdata:
+    name: jarvis-honcho-v3-pgdata
+  honcho-v3-redis-data:
+    name: jarvis-honcho-v3-redis-data

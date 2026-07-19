@@ -69,11 +69,10 @@ Per-step extras install as each build step is reached, e.g.
       `wakeword` (say "Hey Jarvis" to interrupt — robust without AEC; confirmed
       live). `vad` mode available (needs AEC mic/headphones). Toggle via
       VAD_BARGEIN_ENABLED / --no-bargein.
-- [x] Step 8 — Honcho v2.0.3 stack (api+deriver+pgvector+redis) in compose;
-      all LLM features route through LiteLLM via the `custom` provider (verified
-      in gateway logs). Memory client uses the raw /v2 REST API. Recall via the
-      cold-path dialectic (Neil/sailing fact stored + retrieved). DB on :5433
-      (5432 taken by alice-postgres).
+- [x] Step 8 — Honcho v3 stack (api+deriver+pgvector+redis) in compose;
+      all LLM features route through LiteLLM via OpenAI transport and
+      per-caller base URL overrides. Memory client uses the v3 HTTP API. Recall
+      stays on the cold-path dialectic; the hot path reads only the local cache.
 - [x] Step 9 — memory wired into `jarvis run`: hot path injects the local
       cached representation (~0.03ms read); cold path is a detached task (write
       → deriver → refresh) that never blocks. Confirmed live: cross-session

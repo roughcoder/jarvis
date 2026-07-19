@@ -61,7 +61,6 @@ def test_cache_path_keeps_default_peer_byte_compatible(tmp_path) -> None:
     v3 = HonchoV3MemoryClient(
         MemoryConfig(
             _env_file=None,
-            backend="v3",
             cache_path=str(tmp_path / "rep.json"),
             conclusion_sidecar_path=str(tmp_path / "sidecar.json"),
             user_peer_id="user",

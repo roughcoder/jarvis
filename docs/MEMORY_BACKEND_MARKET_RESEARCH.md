@@ -32,8 +32,9 @@ Jarvis is already close to a backend-adapter architecture:
 - `MemoryClient.read_cached_representation()` is the hot-path read.
 - `MemoryClient.write_turn()` and `MemoryClient.refresh_cache()` run on the
   cold path after the response.
-- The current implementation is hardcoded to Honcho `/v2` REST endpoints, while
-  Honcho hosted documentation is v3.
+- At the time of this research, the implementation used Honcho `/v2` REST
+  endpoints while Honcho hosted documentation was v3. Jarvis has since retired
+  v2 and now uses Honcho v3 only.
 
 The correct migration shape is therefore a `MemoryBackend` interface with
 vendor-specific adapters, not a rewrite of the brain/session layer.
@@ -107,7 +108,7 @@ Strengths:
 
 Risks:
 
-- Jarvis currently uses Honcho `/v2`; hosted docs and SDK are v3.
+- Jarvis now uses Honcho v3 only; this replaced the earlier `/v2` REST client.
 - Smaller open-source footprint than Mem0/Zep ecosystem projects.
 - AGPL license matters for self-host/customization posture.
 - Hosted pricing and enterprise controls need direct validation before commit.

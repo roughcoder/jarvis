@@ -1,125 +1,102 @@
-# Honcho v3 Cutover Runbook
+# Honcho v3 Cutover
 
-This runbook is for the later real cutover. Step 9 only builds and proves the
-tooling against dev or throwaway v3 workspaces. Do not use this document as
-permission to retire the v2 stack.
+Honcho v3 production cutover completed on 2026-07-05. Honcho v2 rollback
+support was retired on 2026-07-19, and v3 is now Jarvis's only memory backend.
 
-## Safety Boundary
+The old dual-stack runbook and rollback path are intentionally removed. The
+canonical local stack is the root `docker-compose.yml`, which runs Honcho v3
+alongside LiteLLM.
 
-- The source of truth for deliberately saved personal facts is
-  `jarvis-workspace/users/<name>.md`, under `## What Jarvis knows`.
-- The cutover imports those facts into a fresh Honcho v3 workspace as explicit
-  conclusions on the matching principal peer.
-- The migration command never deletes profile files and never retires v2.
-- Non-dev workspace writes require both `--workspace` and an exact
-  `--i-understand-this-writes-to <workspace>` acknowledgement.
-- **The provenance envelope lives in the local sidecar, not on the server.**
-  Honcho v3.0.11 silently drops conclusion metadata, so `recorded_by`,
-  `source`, `observed_at`, and `content_hash` for every migrated fact are held
-  only in the sidecar file at `MEMORY_CONCLUSION_SIDECAR_PATH` (default
-  `jarvis-workspace/memory/conclusions-v3-sidecar.json`). This file is
-  load-bearing, durable state: the read-back gate matches on it, and losing it
-  after the seed silently strips provenance from every migrated fact. Keep
-  `MEMORY_CONCLUSION_SIDECAR_PATH` fixed for the whole cutover (seed, verify,
-  and production runtime must all point at the same path), and back the file up
-  immediately after the seed.
+## Canonical Compose Volume Migration
 
-## Reversible Preparation
+The retired root compose used `honcho-pgdata` and `honcho-redis-data` for
+Honcho v2. The new root compose uses explicit v3 volume names:
 
-1. Make sure the current v2 stack and local Jarvis runtime are healthy enough to
-   inspect, but do not write new cutover state yet.
-2. Start a fresh Honcho v3 stack and point Jarvis at it:
+- `jarvis-honcho-v3-pgdata`
+- `jarvis-honcho-v3-redis-data`
+
+Do not start the new root compose against the old v2 volumes. On a host that was
+already cut over to the temporary `deploy/honcho-v3` stack, copy the v3 data
+into the canonical root-compose volumes before the first `docker compose up -d`
+from the upgraded checkout.
+
+1. Stop the temporary v3 stack and the old root-stack Honcho containers:
 
    ```bash
-   docker compose --env-file .env -f deploy/honcho-v3/docker-compose.v3.yml --profile gateway up -d
+   docker rm -f jarvis-honcho-v3-api jarvis-honcho-v3-deriver jarvis-honcho-v3-db jarvis-honcho-v3-redis jarvis-litellm-v3 2>/dev/null || true
+   docker rm -f jarvis-honcho-api jarvis-honcho-deriver jarvis-honcho-db jarvis-honcho-redis jarvis-litellm-v3 2>/dev/null || true
    ```
 
-3. Configure the migration shell for v3:
+   If you are still on the old checkout before upgrading, you may stop the
+   temporary stack with
+   `docker compose --env-file .env -f deploy/honcho-v3/docker-compose.v3.yml --profile gateway down`
+   instead.
+
+   The old v2 root-stack containers used the same `container_name`s
+   (`jarvis-honcho-api`, `jarvis-honcho-deriver`, `jarvis-honcho-db`,
+   `jarvis-honcho-redis`). Removing them is expected; the new root compose
+   recreates those names with the v3 image. `jarvis-litellm-v3` belonged only to
+   the temporary validation/cutover stack and should be retired explicitly.
+
+2. Find the existing temporary v3 data volumes. Compose project names may vary,
+   so select the volumes by their v3 suffix:
 
    ```bash
-   export MEMORY_BACKEND=v3
-   export MEMORY_HOST=localhost
-   export MEMORY_PORT=8003
-   export MEMORY_MIGRATION_WORKSPACE_ID=jarvis-migration-dev
+   OLD_PG_VOLUME="$(docker volume ls --format '{{.Name}}' | grep 'honcho-v3-pgdata$' | head -n 1)"
+   OLD_REDIS_VOLUME="$(docker volume ls --format '{{.Name}}' | grep 'honcho-v3-redis-data$' | head -n 1)"
+   test -n "$OLD_PG_VOLUME"
+   test -n "$OLD_REDIS_VOLUME"
    ```
 
-4. Dry-run the profile seed and inspect the exact conclusions:
+3. Create the canonical v3 volumes:
 
    ```bash
-   uv run jarvis memory-migrate \
-     --users-dir jarvis-workspace/users \
-     --workspace jarvis-migration-dryrun \
-     --as-of YYYY-MM-DD \
-     --dry-run
+   docker volume create jarvis-honcho-v3-pgdata
+   docker volume create jarvis-honcho-v3-redis-data
    ```
 
-## Real Cutover Seed
-
-Irreversible actions have not started yet. This stage writes only to a fresh v3
-workspace.
-
-1. Create or select the fresh v3 workspace for the real home memory:
+4. Copy the temporary v3 data into the canonical volumes:
 
    ```bash
-   export MEMORY_WORKSPACE_ID=jarvis-home
+   docker run --rm \
+     -v "$OLD_PG_VOLUME:/from:ro" \
+     -v jarvis-honcho-v3-pgdata:/to \
+     alpine sh -c 'cd /from && cp -a . /to/'
+
+   docker run --rm \
+     -v "$OLD_REDIS_VOLUME:/from:ro" \
+     -v jarvis-honcho-v3-redis-data:/to \
+     alpine sh -c 'cd /from && cp -a . /to/'
    ```
 
-2. Seed the declared rail into that fresh workspace:
+5. Remove the stale v2 volumes only after the v3 copy is complete and backed up:
 
    ```bash
-   uv run jarvis memory-migrate \
-     --users-dir jarvis-workspace/users \
-     --workspace jarvis-home \
-     --as-of YYYY-MM-DD \
-     --i-understand-this-writes-to jarvis-home
+   docker volume rm honcho-pgdata honcho-redis-data 2>/dev/null || true
    ```
 
-   Each migrated fact is written with:
-
-   - `level=explicit`
-   - `recorded_by=<profile name>`
-   - `source=profile-migration`
-   - `observed_at=<as-of date>`
-   - `content_hash=sha256:...`
-
-   All of the above except the content itself is stored only in the local
-   sidecar (see Safety Boundary). **Immediately after the seed, back up the
-   sidecar file** (`MEMORY_CONCLUSION_SIDECAR_PATH`) before running the
-   read-back gate — the gate depends on it, and it is the only copy of the
-   migration provenance.
-
-3. Run the read-back gate again without writing:
+6. Start the canonical stack:
 
    ```bash
-   uv run jarvis memory-migrate \
-     --users-dir jarvis-workspace/users \
-     --workspace jarvis-home \
-     --as-of YYYY-MM-DD \
-     --verify \
-     --i-understand-this-writes-to jarvis-home
+   docker compose --env-file .env up -d
    ```
 
-4. The gate must report `Verification PASS` with the expected fact count before
-   any profile files are retired or any v2 service is stopped.
+7. Verify the v3 data is present before using voice turns:
 
-## Irreversible Gate
+   ```bash
+   curl -fsS "http://${MEMORY_HOST:-localhost}:${MEMORY_PORT:-8000}/health"
+   uv run jarvis config
+   uv run jarvis traces -n 5
+   docker exec jarvis-honcho-db psql -U postgres -d postgres -c "select count(*) as honcho_documents from documents;"
+   ```
 
-Stop here unless a human explicitly confirms the cutover outcome and accepts the
-rollback plan.
+   The health check must pass, `jarvis config` must point at the expected
+   `memory.base_url`, recent traces should show successful cold-path memory
+   refreshes, and the document count should match the temporary v3 stack before
+   the cutover. A warm local representation cache should remain non-empty for
+   known users; the hot path reads that cache and does not prove server data by
+   itself.
 
-Irreversible steps:
-
-- Point production Jarvis runtime env at the v3 `jarvis-home` workspace.
-- Stop the old v2 runtime stack.
-- Retire the profile files from the active declared rail.
-
-Do not delete the v2 volume. Keep it as `jarvis-dev` history until a separate
-human-reviewed cleanup says otherwise.
-
-## Rollback Notes
-
-Before the irreversible gate, rollback is just switching Jarvis env back to the
-v2 memory service and workspace. After production env points at v3, rollback
-requires restoring the previous env and restarting the affected Jarvis services.
-The v2 volume must still exist for that rollback.
-
+Keep `MEMORY_CONCLUSION_SIDECAR_PATH` stable and backed up. Honcho v3.0.11
+drops conclusion metadata on read-back, so Jarvis stores conclusion provenance
+in the local sidecar at that path.

@@ -9,11 +9,9 @@ import httpx
 import pytest
 
 from jarvis.brain.memory_client import (
-    HonchoV2MemoryClient,
     MemoryClient,
     MemoryMessage,
     SessionPeer,
-    UnsupportedMemoryOperation,
     decode_honcho_id,
     encode_honcho_id,
 )
@@ -24,7 +22,6 @@ from jarvis.config import MemoryConfig
 def _cfg(tmp_path: Path, **over: Any) -> MemoryConfig:
     return MemoryConfig(
         _env_file=None,
-        backend="v3",
         port=8003,
         workspace_id="jarvis-dev",
         cache_path=str(tmp_path / "representation.json"),
@@ -39,18 +36,10 @@ def _json(request: httpx.Request) -> dict[str, Any]:
     return json.loads(request.content.decode("utf-8"))
 
 
-def test_memory_client_factory_defaults_to_v3() -> None:
+def test_memory_client_uses_v3() -> None:
     client = MemoryClient(MemoryConfig(_env_file=None))
 
     assert isinstance(client, HonchoV3MemoryClient)
-
-
-def test_memory_client_factory_keeps_v2_for_rollback() -> None:
-    client = MemoryClient(MemoryConfig(_env_file=None, backend="v2"))
-
-    assert isinstance(client, HonchoV2MemoryClient)
-    with pytest.raises(UnsupportedMemoryOperation):
-        client.list_conclusions()
 
 
 def test_memory_client_factory_selects_v3(tmp_path) -> None:
