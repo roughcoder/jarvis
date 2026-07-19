@@ -79,6 +79,7 @@ from jarvis.orchestration.cockpit import (
     paged,
     project_worker_profile,
     project_worker_system,
+    _worktree_inventory as _cockpit_worktree_inventory,
     project_checkpoint,
     project_request,
     project_session_event,
@@ -776,6 +777,7 @@ def make_app(
         web.get("/v1/projects/{project_id}/activity", reads.project_activity),
         web.get("/v1/projects/{project_id}", reads.project_detail),
         web.get("/v1/workers", reads.workers),
+        web.post("/v1/workers/{worker_id}/worktrees/prune", writes.worker_worktrees_prune),
         web.get("/v1/workers/{worker_id}", reads.worker_detail),
         web.get("/v1/runs", reads.runs),
         web.get("/v1/runs/{run_id}/events", reads.run_events),
@@ -2512,6 +2514,31 @@ class CockpitWriteHandlers:
         response_body = await _idempotent_write_body(self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce)
         return web.json_response(response_body)
 
+    async def worker_worktrees_prune(self, request: web.Request) -> web.Response:
+        """Sweep a worker's stale worktrees.
+
+        The cockpit's "Prune stale worktrees" action had no endpoint on this
+        tier at all, so it could only ever be a no-op — /v1/workers was
+        read-only. This proxies the worker's own /worktrees/prune, which is the
+        surface that knows the workspace-relative worktrees root.
+        """
+        await self.ctx.require_auth(request)
+        body = await _optional_json_body(request)
+        worker_id = request.match_info["worker_id"]
+        requester = _cockpit_requester_context(request, self.ctx.cfg)
+        scope = f"workers/{worker_id}/worktrees/prune"
+
+        async def produce() -> dict[str, Any]:
+            # Same capability as run/session deletion — this reclaims the same
+            # worktrees by another route, so it needs no new grant on the fleet.
+            _require_capability(self.ctx.cfg, "orchestration.runs.write")
+            return await asyncio.to_thread(_prune_worker_worktrees_packet, self.ctx, worker_id, body)
+
+        response_body = await _idempotent_write_body(
+            self.ctx, scope, str(body.get("idempotency_key") or ""), body, produce, requester=requester
+        )
+        return web.json_response(response_body)
+
     async def run_archive(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
         body = await _json_body(request)
@@ -3623,6 +3650,50 @@ def _deleted_session_row(ref: SessionRef, deleted: dict[str, str]) -> dict[str, 
             "updated_at": str(deleted.get("deleted_at") or ""),
         }
     ) | {"deleted_at": str(deleted.get("deleted_at") or "")}
+
+
+def _prune_worker_worktrees_packet(ctx: CockpitAppContext, worker_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Ask one worker to sweep its stale worktrees and report what it reclaimed.
+
+    `stale_ttl_s` is the worker's own configured threshold unless the caller
+    overrides it; the worker owns the definition of stale because only it can
+    see its live sessions and running jobs.
+    """
+    payload: dict[str, Any] = {"reason": str(body.get("reason") or "cockpit worktree prune")}
+    if body.get("stale_ttl_s") is not None:
+        try:
+            payload["stale_ttl_s"] = float(body["stale_ttl_s"])
+        except (TypeError, ValueError):
+            raise CockpitError("validation_failed", "stale_ttl_s must be numeric", recoverable=True, status=400) from None
+    if body.get("target"):
+        payload["target"] = str(body["target"])
+    raw = _worker_post_json(ctx.cfg, worker_id, "/worktrees/prune", payload, post=ctx.post)
+    reclamation = _reclamation_summary(
+        worktrees=int(raw.get("worktrees") or 0),
+        bytes_reclaimed=int(raw.get("bytes") or 0),
+        notes=[f"repo metadata pruned: {len(raw.get('repos_pruned') or [])}"],
+    )
+    inventory = _worker_worktree_inventory(ctx, worker_id)
+    return {
+        "ok": bool(raw.get("ok", True)),
+        "worker_id": worker_id,
+        "cursor": snapshot_cursor({"worker_id": worker_id, "reclamation": reclamation, "worktree_inventory": inventory}),
+        "reclamation": reclamation,
+        "pruned": [
+            {"name": str(item.get("name") or ""), "bytes": int(item.get("bytes") or 0)}
+            for item in raw.get("pruned") or []
+            if isinstance(item, dict)
+        ],
+        "refused": [dict(item) for item in raw.get("refused") or [] if isinstance(item, dict)],
+        "worktree_inventory": inventory,
+    }
+
+
+def _worker_worktree_inventory(ctx: CockpitAppContext, worker_id: str) -> dict[str, Any]:
+    """Post-sweep recount, so the caller can show before/after without a second probe."""
+    registry = WorkerRegistry(ctx.cfg.worker, profiles_path=ctx.cfg.orchestration.workers_path, http_get=ctx.get)
+    profile = registry.get(worker_id, probe=True)
+    return _cockpit_worktree_inventory(profile.worktree_inventory) if profile is not None else {}
 
 
 def _delete_worker_session(cfg: Config, ref: SessionRef, *, delete: HttpDelete) -> dict[str, int]:

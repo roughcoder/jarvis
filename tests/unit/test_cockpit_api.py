@@ -56,6 +56,17 @@ from jarvis.worker.sessions import SessionManager  # noqa: E402
 from jarvis.worker_session_contract import EVENT_CHECKPOINT_CREATED  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _clean_probe_snapshots():  # noqa: ANN202
+    """Remembered worker probes are process-global by design (they keep the
+    cockpit card truthful between probes) — isolate them per test."""
+    from jarvis.orchestration.workers import reset_probe_snapshots
+
+    reset_probe_snapshots()
+    yield
+    reset_probe_snapshots()
+
+
 class Response:
     def __init__(self, data: dict[str, Any], status_code: int = 200) -> None:
         self._data = data
@@ -1291,7 +1302,15 @@ def test_cockpit_catalog_snapshot_and_worker_projection(tmp_path, monkeypatch) -
         assert workers["workers"][0]["engines"][0]["supports"]["checkpoints"] is True
         assert workers["workers"][0]["engines"][1]["engine"] == "claude"
         assert workers["workers"][0]["engines"][1]["supports"]["interrupt"] is False
-        assert workers["workers"][0]["worktree_inventory"] == {"count": 3, "disk_bytes": 2048, "stale_count": 1}
+        # Unmeasured fields stay null so "not scanned" never renders as "zero".
+        assert workers["workers"][0]["worktree_inventory"] == {
+            "root": "",
+            "count": 3,
+            "disk_bytes": 2048,
+            "stale_count": 1,
+            "orphan_count": None,
+            "status": "measured",
+        }
         assert snapshot["workers"][0]["worktree_inventory"]["stale_count"] == 1
         assert snapshot["workers"][0]["system"]["cpu_model"] == "Apple M4 Pro"
         assert workers["workers"][0]["system"] == worker_detail["system"]
@@ -1401,6 +1420,54 @@ def test_cockpit_snapshot_probe_uses_probed_worker_status_for_worker_sessions(tm
     import asyncio
 
     asyncio.run(_with_server(cfg, calls, http_get=get))
+
+
+def test_cockpit_worker_worktree_prune_reaches_the_worker(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """The cockpit's "Prune stale worktrees" action had no endpoint on this tier
+    at all — /v1/workers was read-only, so the button could only ever no-op."""
+    cfg = _cfg(tmp_path, monkeypatch, caps="orchestration.runs.write")
+    posted: list[tuple[str, dict[str, Any]]] = []
+    inventory_after = {"root": "/w/worktrees", "count": 1, "disk_bytes": 4096, "stale_count": 0, "orphan_count": 0}
+
+    def post(url: str, **kwargs) -> Response:  # noqa: ANN001
+        posted.append((url, kwargs.get("json") or {}))
+        return Response(
+            {
+                "ok": True,
+                "worktrees": 3,
+                "bytes": 12_000_000,
+                "pruned": [{"name": "old-a", "bytes": 6_000_000}, {"name": "old-b", "bytes": 6_000_000}],
+                "refused": [],
+                "repos_pruned": ["/repos/jarvis/.git"],
+            }
+        )
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions"):
+            return Response({"sessions": []})
+        return Response({"ok": True, "worktree_inventory": inventory_after})
+
+    async def calls(base: str, client: httpx.AsyncClient) -> dict[str, Any]:
+        response = await client.post(
+            f"{base}/v1/workers/macbook-worker/worktrees/prune",
+            json={"idempotency_key": "prune_1"},
+        )
+        assert response.status_code == 200
+        return response.json()
+
+    import asyncio
+
+    body = asyncio.run(_with_server(cfg, calls, http_get=get, http_post=post))
+
+    assert posted and posted[0][0].endswith("/worktrees/prune")
+    assert body["reclamation"]["worktrees"] == 3
+    assert body["reclamation"]["bytes"] == 12_000_000
+    assert [item["name"] for item in body["pruned"]] == ["old-a", "old-b"]
+    # The response carries a fresh recount so a caller can show before/after.
+    assert body["worktree_inventory"]["count"] == 1
+    assert body["worktree_inventory"]["stale_count"] == 0
 
 
 def test_cockpit_archived_run_is_not_worker_synced(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -9464,13 +9531,49 @@ def test_cockpit_work_start_capacity_uses_probed_worker_state(tmp_path, monkeypa
 
 def test_cockpit_worker_last_seen_at_is_empty_without_probe(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     from jarvis.orchestration.cockpit import worker_profiles
+    from jarvis.orchestration.workers import reset_probe_snapshots
 
+    reset_probe_snapshots()
     cfg = _cfg(tmp_path, monkeypatch)
     rows = worker_profiles(worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, probe=False)
 
     # The static profile says online, but nothing has actually seen the worker.
     assert rows[0]["status"] == "online"
     assert rows[0]["last_seen_at"] == ""
+
+
+def test_cockpit_unprobed_worker_reports_last_probed_inventory(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """The cockpit reads /v1/workers WITHOUT probe=true, and workers.json on disk
+    carries no inventory — which is why the card showed 0 worktrees / 0 B while
+    12 GB sat on the worker. An unprobed read now reports the last probe."""
+    from jarvis.orchestration.cockpit import worker_profiles
+    from jarvis.orchestration.workers import reset_probe_snapshots
+
+    reset_probe_snapshots()
+    cfg = _cfg(tmp_path, monkeypatch)
+    health = {
+        "ok": True,
+        "runtime": {"version": "0.1.22", "channel": "dogfood", "git_sha": ""},
+        "worktree_inventory": {"root": "/w/worktrees", "count": 79, "disk_bytes": 12_000_000_000, "stale_count": 79, "orphan_count": 12},
+    }
+
+    def get(url: str, **_kwargs) -> Response:  # noqa: ANN001
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions"):
+            return Response({"sessions": []})
+        return Response(health)
+
+    probed = worker_profiles(
+        worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, probe=True, http_get=get
+    )
+    unprobed = worker_profiles(worker_cfg=cfg.worker, workers_path=cfg.orchestration.workers_path, probe=False)
+
+    assert probed[0]["worktree_inventory"]["count"] == 79
+    assert unprobed[0]["worktree_inventory"]["count"] == 79
+    assert unprobed[0]["worktree_inventory"]["orphan_count"] == 12
+    assert unprobed[0]["runtime"]["version"] == "0.1.22"
+    assert unprobed[0]["last_seen_at"] != ""
 
 
 def test_cockpit_snapshot_hides_requests_for_archived_sessions(tmp_path, monkeypatch) -> None:  # noqa: ANN001

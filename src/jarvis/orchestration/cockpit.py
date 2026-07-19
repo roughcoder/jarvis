@@ -530,17 +530,41 @@ def project_worker_profile(profile: WorkerProfile, *, default_repo: str = "") ->
         "repo_access": _repo_access_rows(profile.repo_access),
         "repositories": _repository_rows(profile.repositories, profile.default_repo or default_repo),
         "worktree_inventory": _worktree_inventory(profile.worktree_inventory),
+        "runtime": _worker_runtime(profile.runtime),
         "public_metadata": {},
     }
 
 
-def _worktree_inventory(raw: Any) -> dict[str, int]:
+def _worktree_inventory(raw: Any) -> dict[str, Any]:
+    data = raw if isinstance(raw, dict) else {}
+    # Counts stay null when the worker has not scanned yet (or the scan failed):
+    # "not measured" and "measured zero" must not render identically.
+    return {
+        "root": str(data.get("root") or ""),
+        "count": _optional_nonnegative_int(data.get("count")),
+        "disk_bytes": _optional_nonnegative_int(data.get("disk_bytes")),
+        "stale_count": _optional_nonnegative_int(data.get("stale_count")),
+        "orphan_count": _optional_nonnegative_int(data.get("orphan_count")),
+        "status": str(data.get("status") or ("error" if data.get("error") else "measured" if data else "unknown")),
+    }
+
+
+def _worker_runtime(raw: Any) -> dict[str, str]:
     data = raw if isinstance(raw, dict) else {}
     return {
-        "count": _nonnegative_int(data.get("count")),
-        "disk_bytes": _nonnegative_int(data.get("disk_bytes")),
-        "stale_count": _nonnegative_int(data.get("stale_count")),
+        "version": str(data.get("version") or ""),
+        "channel": str(data.get("channel") or ""),
+        "git_sha": str(data.get("git_sha") or ""),
     }
+
+
+def _optional_nonnegative_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _nonnegative_int(value: Any) -> int:
