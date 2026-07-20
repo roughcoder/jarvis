@@ -333,6 +333,11 @@ class RegistryConfig(_Base):
     upload_manifest_path: str = "jarvis-workspace/registry/upload-manifest.json"
     max_upload_bytes: int = 25 * 1024 * 1024
     upload_url_max_redirects: int = 3
+    # An @-mentioned project file is inlined into the turn up to this many bytes
+    # (the rest is dropped with a truncation note), and at most this many files
+    # per turn — a mention must not blow the provider's context window.
+    mention_content_max_bytes: int = 32 * 1024
+    mention_max_files: int = 5
 
 
 class ToolsConfig(_Base):

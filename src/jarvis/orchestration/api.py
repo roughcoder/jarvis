@@ -26,6 +26,7 @@ from jarvis.brain.facade import (
     ProjectOperationError,
     RegistryStore,
     UnsupportedMemoryOperation,
+    resolve_project_mentions,
 )
 from jarvis.capabilities import (
     WORKER_SESSION_APPROVE,
@@ -1335,6 +1336,9 @@ class CockpitReadHandlers:
                 "project_id": request.match_info["project_id"],
                 "include_retracted": str(request.query.get("include_retracted") or "").lower()
                 in {"1", "true", "yes"},
+                # The composer's @-picker types here; absent/empty returns the
+                # full manifest as before.
+                "query": str(request.query.get("query") or ""),
             },
         )
         return web.json_response(
@@ -2944,6 +2948,9 @@ class CockpitWriteHandlers:
             attachments = _validate_attachments(body, self.ctx.cfg.orchestration)
             if attachments:
                 body["attachments"] = attachments
+            # Resolve @-mentions here, not on the worker: project files live in
+            # the brain-host vault, so only the rendered prompt crosses the wire.
+            body = await _session_turn_with_mentions(self.ctx, ref, body)
         requester = _cockpit_requester_context(request, self.ctx.cfg)
         scope = f"sessions/{ref.worker_id}/{ref.session_id}/{action}"
 
@@ -5956,6 +5963,36 @@ def _session_cwd_from_store(store: OrchestrationStore, ref: SessionRef) -> str:
             if link.worker_id == ref.worker_id and link.session_id == ref.session_id:
                 return link.cwd
     return ""
+
+
+def _session_project_id_from_store(store: OrchestrationStore, ref: SessionRef) -> str:
+    for run in store.list_runs():
+        for link in run.sessions:
+            if link.worker_id == ref.worker_id and link.session_id == ref.session_id:
+                return link.project_id or run.project_id
+    return ""
+
+
+async def _session_turn_with_mentions(
+    ctx: CockpitAppContext,
+    ref: SessionRef,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    """Inline @-mentioned project files into a worker-session turn prompt.
+
+    Best-effort per AGENTS.md: an unlinked session, a missing file or an
+    unreadable vault leaves the prompt exactly as the caller sent it.
+    """
+    prompt = str(body.get("prompt") or "")
+    if "@" not in prompt:
+        return body
+    project_id = await asyncio.to_thread(_session_project_id_from_store, ctx.store, ref)
+    if not project_id:
+        return body
+    resolved = await asyncio.to_thread(resolve_project_mentions, ctx.cfg, project_id, prompt)
+    if resolved == prompt:
+        return body
+    return {**body, "prompt": resolved}
 
 
 def _required_session_action(action: str) -> str:

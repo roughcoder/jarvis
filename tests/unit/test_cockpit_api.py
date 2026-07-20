@@ -3359,12 +3359,18 @@ def test_cockpit_project_files_list_uses_brain_manifest_op(tmp_path, monkeypatch
         assert files.json()["files"] == [{"doc_id": "upload-123"}]
         assert "result" not in files.json()
 
+        # The composer's @-picker types into ?query=, which rides through to the
+        # same brain op rather than filtering client-side.
+        searched = await client.get(f"{base}/v1/projects/neil-shared/files?query=spec")
+        assert searched.status_code == 200
+
     import asyncio
 
     asyncio.run(_with_server(cfg, calls))
 
     assert brain.calls[0]["op"] == "project.file.list"
-    assert brain.calls[0]["payload"] == {"project_id": "neil-shared", "include_retracted": True}
+    assert brain.calls[0]["payload"] == {"project_id": "neil-shared", "include_retracted": True, "query": ""}
+    assert brain.calls[1]["payload"] == {"project_id": "neil-shared", "include_retracted": False, "query": "spec"}
 
 
 def test_cockpit_forget_correct_forward_to_brain_memory_ops(tmp_path, monkeypatch) -> None:  # noqa: ANN001
