@@ -68,6 +68,15 @@ _RUNTIME_LOCK = threading.RLock()
 _RUNTIMES: dict[str, _ClaudeSessionRuntime] = {}
 _SDK: Any | None = None
 
+CLAUDE_NESTED_AGENT_TOOLS = [
+    "Agent",
+    "Task",
+    "SendMessage",
+    "Monitor",
+    "TaskOutput",
+    "TaskStop",
+]
+
 
 class ClaudeProviderAdapter:
     provider = "claude"
@@ -327,6 +336,8 @@ class _ClaudeSessionRuntime:
         )
         if self.effort:
             option_kwargs["effort"] = self.effort
+        if not self.authority.allow_nested_agents:
+            option_kwargs["disallowed_tools"] = list(CLAUDE_NESTED_AGENT_TOOLS)
         if self.orchestrator_mcp is not None:
             option_kwargs.update(
                 mcp_servers={ORCHESTRATOR_MCP_SERVER_NAME: self.orchestrator_mcp},

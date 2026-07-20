@@ -127,15 +127,46 @@ CHILD_WATCH_LEASE_S = 300
 CHILD_WATCH_RENEW_INTERVAL_S = CHILD_WATCH_LEASE_S // 3
 THREAD_TURN_QUEUE_LIMIT = 32
 THREAD_TURN_RECEIPT_REPLY_LIMIT = 4_000
+ORCHESTRATOR_DISPATCH_RETRY_ATTEMPTS = 3
+ORCHESTRATOR_DISPATCH_RETRY_DELAY_S = 0.25
+ORCHESTRATOR_DISPATCH_RECOVERY_MAX_DELAY_S = 5.0
 # Workspace keys the thread store owns outright. Callers hand back workspace
 # snapshots that can be arbitrarily stale, so these are always re-read from the
 # stored thread rather than merged from the caller's copy.
-STORE_OWNED_WORKSPACE_KEYS = frozenset({"pending_child_watch_ids"})
+STORE_OWNED_WORKSPACE_KEYS = frozenset({"pending_child_watch_ids", "pending_execution_interrupt"})
+PENDING_ORCHESTRATOR_COMPLETION_KEY = "pending_orchestrator_completion"
+PENDING_EXECUTION_INTERRUPT_KEY = "pending_execution_interrupt"
 CHILD_WORK_LANDING_MODES = {"none", "branch_only", "draft_pr", "ready_pr", "confirm_before_pr"}
 _THREAD_INDEX_LOCK = threading.RLock()
 _THREAD_TRANSCRIPT_LOCKS_LOCK = threading.Lock()
+
+
+def _detached_execution_workspace(workspace: dict[str, Any]) -> dict[str, Any]:
+    detached = dict(workspace)
+    detached.pop(PENDING_ORCHESTRATOR_COMPLETION_KEY, None)
+    detached.pop(PENDING_EXECUTION_INTERRUPT_KEY, None)
+    detached.update(
+        session_id="",
+        provider_started=False,
+        status="interrupted",
+        provision_phase="interrupted",
+        session_generation=int(workspace.get("session_generation") or 0) + 1,
+    )
+    return detached
+
+
+def _released_interrupt_workspace(
+    workspace: dict[str, Any], *, status: str, provision_phase: str
+) -> dict[str, Any]:
+    released = dict(workspace)
+    released.pop(PENDING_EXECUTION_INTERRUPT_KEY, None)
+    released.update(status=status, provision_phase=provision_phase)
+    return released
+
+
 _THREAD_TRANSCRIPT_LOCKS: dict[Path, threading.RLock] = {}
 _THREAD_TRANSCRIPT_CACHE_MAX = 500
+_ORCHESTRATOR_CONTINUATIONS: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 logger = logging.getLogger(__name__)
 _WORK_SESSION_OFFER = (
     "I can't do that from this project conversation because it has no workspace, "
@@ -155,6 +186,16 @@ _WORK_ACTION_CLAIM_RE = re.compile(
     r"[^.?!\n]{0,120}\b(?:code\s+review|review|repo|repository|codebase|pull\s+request|pr|tests?|test\s+suite|pytest|ruff|lint|typecheck)\b",
     re.IGNORECASE,
 )
+
+
+async def stop_orchestrator_continuations() -> None:
+    tasks = list(_ORCHESTRATOR_CONTINUATIONS.values())
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 _WORK_ACTION_TOOL_NAMES = ORCHESTRATOR_TOOL_NAME_SET
 
 
@@ -163,6 +204,16 @@ class WorkerRequestError(RuntimeError):
         self.code = code
         self.status_code = status_code
         super().__init__(message)
+
+
+def _worker_interrupt_replay_was_definitely_rejected(exc: Exception) -> bool:
+    return isinstance(exc, WorkerRequestError) and (
+        exc.code == "worker_not_configured" or 400 <= exc.status_code < 500
+    )
+
+
+def _worker_request_is_ambiguous_server_failure(exc: WorkerRequestError) -> bool:
+    return exc.code != "worker_not_configured" and 500 <= exc.status_code < 600
 
 
 def _snapshot_from_context(requester: RequestContext) -> dict[str, Any]:
@@ -192,6 +243,14 @@ def _context_from_snapshot(snapshot: dict[str, Any]) -> RequestContext:
         confidence=str(snapshot.get("confidence") or "strong"),
         peer=str(snapshot.get("peer") or ""),
     )
+
+
+def _accepted_orchestrator_completion(pending: dict[str, Any]) -> dict[str, Any]:
+    accepted = dict(pending)
+    accepted["phase"] = "accepted"
+    for key in ("prompt", "resume", "requested_tuning"):
+        accepted.pop(key, None)
+    return accepted
 
 
 def persist_turn_messages(
@@ -326,6 +385,14 @@ class CockpitThread:
         if self.turn_receipts:
             data["turn_receipts"] = [dict(item) for item in self.turn_receipts[-100:]]
         return data
+
+
+@dataclass(frozen=True)
+class ExecutionInterruptClaim:
+    thread: CockpitThread
+    restore_status: str
+    restore_provision_phase: str
+    acquired: bool = True
 
 
 class CockpitThreadIndex:
@@ -761,18 +828,23 @@ class CockpitThreadIndex:
     def recover_orphaned_execution(self, project_id: str, thread_id: str) -> CockpitThread | None:
         """Release an execution lease left behind by a previous API process.
 
-        A foreground turn holds the lease in memory of the process running it.
-        Once that process is gone the turn cannot still be in flight, so a lease
-        surviving a restart is orphaned — and while it survives, every new turn
-        queues behind an execution that will never finish. The provider session
-        itself is untouched: the next turn re-ensures or replaces it.
+        Ordinary foreground turns hold the lease in memory of the process
+        running them, so their surviving lease is orphaned. Accepted routine
+        turns are different: their durable completion marker is rearmed on
+        startup and must keep the lease while the worker session is still live.
+        Interrupt claims are also durable and must first be replayed and
+        verified against the worker before their session can be detached.
         """
         with _THREAD_INDEX_LOCK:
             thread = self.get(project_id, thread_id)
             if thread is None:
                 return None
             status = str(thread.workspace.get("status") or "")
+            if status == "interrupting":
+                return thread
             if status not in {"starting", "running"}:
+                return thread
+            if isinstance(thread.workspace.get(PENDING_ORCHESTRATOR_COMPLETION_KEY), dict):
                 return thread
             return self.save(
                 replace(
@@ -787,22 +859,90 @@ class CockpitThreadIndex:
                 )
             )
 
-    def claim_execution_interrupt(self, project_id: str, thread_id: str) -> CockpitThread | None:
+    def claim_execution_interrupt(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        turn_id: str = "",
+    ) -> ExecutionInterruptClaim | None:
         with _THREAD_INDEX_LOCK:
             thread = self.get(project_id, thread_id)
             if thread is None:
                 return None
+            restore_status = str(thread.workspace.get("status") or "running")
+            restore_provision_phase = str(
+                thread.workspace.get("provision_phase") or restore_status
+            )
+            if restore_status == "interrupting":
+                return ExecutionInterruptClaim(
+                    thread=thread,
+                    restore_status=restore_status,
+                    restore_provision_phase=restore_provision_phase,
+                    acquired=False,
+                )
             if not str(thread.workspace.get("session_id") or ""):
+                return ExecutionInterruptClaim(
+                    thread=thread,
+                    restore_status=restore_status,
+                    restore_provision_phase=restore_provision_phase,
+                )
+            workspace = {
+                **thread.workspace,
+                "status": "interrupting",
+                "provision_phase": "interrupting",
+                PENDING_EXECUTION_INTERRUPT_KEY: {
+                    "worker_id": str(
+                        thread.workspace.get("worker_id") or thread.worker_id or ""
+                    ),
+                    "session_id": str(thread.workspace.get("session_id") or ""),
+                    "session_generation": int(
+                        thread.workspace.get("session_generation") or 0
+                    ),
+                    "turn_id": turn_id.strip(),
+                    "restore_status": restore_status,
+                    "restore_provision_phase": restore_provision_phase,
+                    "requested_at": utc_now(),
+                },
+            }
+            claimed = self.save(
+                replace(thread, updated_at=utc_now(), workspace=workspace)
+            )
+            return ExecutionInterruptClaim(
+                thread=claimed,
+                restore_status=restore_status,
+                restore_provision_phase=restore_provision_phase,
+            )
+
+    def release_execution_interrupt_if_matches(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        expected_session_id: str,
+        expected_generation: int,
+        status: str,
+        provision_phase: str,
+    ) -> CockpitThread | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            if (
+                str(thread.workspace.get("session_id") or "") != expected_session_id
+                or int(thread.workspace.get("session_generation") or 0) != expected_generation
+                or str(thread.workspace.get("status") or "") != "interrupting"
+            ):
                 return thread
             return self.save(
                 replace(
                     thread,
                     updated_at=utc_now(),
-                    workspace={
-                        **thread.workspace,
-                        "status": "interrupting",
-                        "provision_phase": "interrupting",
-                    },
+                    workspace=_released_interrupt_workspace(
+                        thread.workspace,
+                        status=status,
+                        provision_phase=provision_phase,
+                    ),
                 )
             )
 
@@ -829,14 +969,7 @@ class CockpitThreadIndex:
                 replace(
                     thread,
                     updated_at=utc_now(),
-                    workspace={
-                        **thread.workspace,
-                        "session_id": "",
-                        "provider_started": False,
-                        "status": "interrupted",
-                        "provision_phase": "interrupted",
-                        "session_generation": current_generation + 1,
-                    },
+                    workspace=_detached_execution_workspace(thread.workspace),
                 )
             )
 
@@ -873,6 +1006,90 @@ class CockpitThreadIndex:
                     },
                 )
             )
+
+    def finish_orchestrator_completion_if_matches(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        expected_session_id: str,
+        expected_generation: int,
+        expected_turn_id: str,
+        status: str,
+        provision_phase: str,
+    ) -> CockpitThread | None:
+        with _THREAD_INDEX_LOCK:
+            thread = self.get(project_id, thread_id)
+            if thread is None:
+                return None
+            pending = thread.workspace.get(PENDING_ORCHESTRATOR_COMPLETION_KEY)
+            if (
+                str(thread.workspace.get("session_id") or "") != expected_session_id
+                or int(thread.workspace.get("session_generation") or 0) != expected_generation
+                or not isinstance(pending, dict)
+                or str(pending.get("turn_id") or "") != expected_turn_id
+                or str(thread.workspace.get("status") or "") == "interrupting"
+            ):
+                return None
+            workspace = dict(thread.workspace)
+            workspace.pop(PENDING_ORCHESTRATOR_COMPLETION_KEY, None)
+            workspace.update(status=status, provision_phase=provision_phase)
+            return self.save(replace(thread, updated_at=utc_now(), workspace=workspace))
+
+    def commit_orchestrator_completion_if_matches(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        expected_session_id: str,
+        expected_generation: int,
+        expected_turn_id: str,
+        user_peer_id: str,
+        user_text: str,
+        assistant_peer_id: str,
+        assistant_text: str,
+        idempotency_key: str,
+    ) -> CockpitThread | None:
+        # Keep ownership verification, transcript append, and durable-marker
+        # release under one index lock. An interrupt either wins before this
+        # section (and no reply is committed) or observes the completed turn.
+        # If the process dies after the idempotent transcript write but before
+        # marker release, startup safely repeats this section.
+        with self._transcript_lock(project_id, thread_id):
+            with _THREAD_INDEX_LOCK:
+                thread = self.get(project_id, thread_id)
+                if thread is None:
+                    return None
+                pending = thread.workspace.get(PENDING_ORCHESTRATOR_COMPLETION_KEY)
+                if (
+                    str(thread.workspace.get("session_id") or "") != expected_session_id
+                    or int(thread.workspace.get("session_generation") or 0)
+                    != expected_generation
+                    or str(thread.workspace.get("status") or "") == "interrupting"
+                    or not isinstance(pending, dict)
+                    or str(pending.get("turn_id") or "") != expected_turn_id
+                ):
+                    return None
+                appended = self.append_turn(
+                    thread,
+                    user_peer_id=user_peer_id,
+                    user_text=user_text,
+                    assistant_peer_id=assistant_peer_id,
+                    assistant_text=assistant_text,
+                    idempotency_key=idempotency_key,
+                )
+                finalized = self.finish_orchestrator_completion_if_matches(
+                    project_id,
+                    thread_id,
+                    expected_session_id=expected_session_id,
+                    expected_generation=expected_generation,
+                    expected_turn_id=expected_turn_id,
+                    status="ready",
+                    provision_phase="ready",
+                )
+                if finalized is None:
+                    return None
+                return replace(appended, workspace=dict(finalized.workspace))
 
     def set_archived(
         self,
@@ -1642,8 +1859,37 @@ class CockpitConnector:
             return thread
         return self._index.save(replace(thread, title=title[:200], updated_at=utc_now()))
 
-    def claim_execution_interrupt(self, project: ProjectEntry, thread_id: str) -> CockpitThread | None:
-        return self._index.claim_execution_interrupt(project.id, thread_id)
+    def claim_execution_interrupt(
+        self,
+        project: ProjectEntry,
+        thread_id: str,
+        *,
+        turn_id: str = "",
+    ) -> ExecutionInterruptClaim | None:
+        return self._index.claim_execution_interrupt(
+            project.id,
+            thread_id,
+            turn_id=turn_id,
+        )
+
+    def release_execution_interrupt(
+        self,
+        project: ProjectEntry,
+        thread_id: str,
+        *,
+        expected_session_id: str,
+        expected_generation: int,
+        status: str,
+        provision_phase: str,
+    ) -> CockpitThread | None:
+        return self._index.release_execution_interrupt_if_matches(
+            project.id,
+            thread_id,
+            expected_session_id=expected_session_id,
+            expected_generation=expected_generation,
+            status=status,
+            provision_phase=provision_phase,
+        )
 
     def detach_interrupted_execution(
         self,
@@ -1660,6 +1906,85 @@ class CockpitConnector:
             expected_generation=expected_generation,
         )
 
+    def recover_pending_execution_interrupt(
+        self, project_id: str, thread_id: str
+    ) -> CockpitThread | None:
+        """Replay a durable interrupt and detach only after worker verification.
+
+        A worker write can succeed even when the API process dies before seeing
+        its response. Repeating the terminal worker operation is idempotent; a
+        subsequent execution-state read is the authority for whether it is safe
+        to invalidate the attached session. Any unavailable or still-running
+        worker leaves the durable marker intact for a later recovery attempt.
+        """
+        thread = self._index.get(project_id, thread_id)
+        if (
+            thread is None
+            or str(thread.workspace.get("status") or "") != "interrupting"
+        ):
+            return thread
+        pending = thread.workspace.get(PENDING_EXECUTION_INTERRUPT_KEY)
+        if not isinstance(pending, dict):
+            return thread
+        worker_id = str(pending.get("worker_id") or "")
+        session_id = str(pending.get("session_id") or "")
+        try:
+            session_generation = int(pending.get("session_generation") or 0)
+        except (TypeError, ValueError):
+            return thread
+        if (
+            not worker_id
+            or not session_id
+            or worker_id
+            != str(thread.workspace.get("worker_id") or thread.worker_id or "")
+            or session_id != str(thread.workspace.get("session_id") or "")
+            or session_generation
+            != int(thread.workspace.get("session_generation") or 0)
+        ):
+            return thread
+        try:
+            self._post_worker_json(
+                worker_id,
+                f"/sessions/{session_id}/interrupt",
+                {
+                    "turn_id": str(pending.get("turn_id") or ""),
+                    "metadata": {},
+                    "allowed_actions": [WORKER_SESSION_INTERRUPT],
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - transport failures are ambiguous.
+            if _worker_interrupt_replay_was_definitely_rejected(exc):
+                restore_status = str(pending.get("restore_status") or "ready")
+                restore_phase = str(
+                    pending.get("restore_provision_phase") or restore_status
+                )
+                if restore_status == "interrupting":
+                    restore_status = "ready"
+                if restore_phase == "interrupting":
+                    restore_phase = restore_status
+                return self._index.release_execution_interrupt_if_matches(
+                    project_id,
+                    thread_id,
+                    expected_session_id=session_id,
+                    expected_generation=session_generation,
+                    status=restore_status,
+                    provision_phase=restore_phase,
+                )
+        try:
+            execution = self._get_worker_json(
+                worker_id, f"/sessions/{session_id}/execution-state"
+            )
+        except Exception:  # noqa: BLE001 - preserve the marker for later recovery.
+            return self._index.get(project_id, thread_id)
+        if str(execution.get("status") or "") != "interrupted":
+            return self._index.get(project_id, thread_id)
+        return self._index.detach_execution_if_matches(
+            project_id,
+            thread_id,
+            expected_session_id=session_id,
+            expected_generation=session_generation,
+        )
+
     async def drain_queued_turns(self, project: ProjectEntry, thread_id: str) -> int:
         drained = 0
         while True:
@@ -1674,7 +1999,9 @@ class CockpitConnector:
                     worker_id,
                     f"/sessions/{session_id}/execution-state",
                 )
-                if isinstance(execution.get("active_turn"), dict) or str(execution.get("status") or "") in {
+                if isinstance(execution.get("active_turn"), dict) or str(
+                    execution.get("status") or ""
+                ) in {
                     "starting",
                     "running",
                     "waiting_approval",
@@ -1722,6 +2049,7 @@ class CockpitConnector:
         project: ProjectEntry,
         requester: RequestContext,
         *,
+        thread_id: str = "",
         title: str = "",
         parent_chat_id: str = "",
         chat_type: str = "assistant",
@@ -1737,7 +2065,19 @@ class CockpitConnector:
             raise ValueError("orchestrator engine must be codex or claude")
         if chat_type == "assistant":
             resolved_engine = "jarvis"
-        thread_id = new_id("thread")
+        thread_id = thread_id.strip() or new_id("thread")
+        existing = self._index.get_with_messages(project.id, thread_id)
+        if existing is not None:
+            if (
+                existing.created_by != requester.memory_peer
+                or existing.chat_type != chat_type
+            ):
+                raise ValueError(
+                    "reserved thread identity does not match the requested conversation"
+                )
+            return existing
+        if any(item.thread_id == thread_id for item in self._index.list_all()):
+            raise ValueError("thread id is already assigned to another project")
         session_id = orchestrator_session_id(project.id, thread_id)
         now = utc_now()
         thread = CockpitThread(
@@ -1786,6 +2126,7 @@ class CockpitConnector:
         cold_task_sink: Callable[[BrainSession], Any] | None = None,
         logical_turn_id: str = "",
         idempotency_key: str = "",
+        await_orchestrator_completion: bool = True,
     ) -> tuple[str, CockpitThread, tuple[dict[str, Any], ...]]:
         text = text.strip()
         if not text:
@@ -1827,6 +2168,7 @@ class CockpitConnector:
                 progress=progress,
                 logical_turn_id=logical_turn_id,
                 idempotency_key=idempotency_key,
+                await_completion=await_orchestrator_completion,
             )
             return reply, updated, ()
         if is_conversation_workspace(context_thread.workspace) or explicit_workspace_request:
@@ -2023,6 +2365,53 @@ class CockpitConnector:
         )
         return reply, updated
 
+    def _orchestrator_turn_request(
+        self,
+        project: ProjectEntry,
+        thread: CockpitThread,
+        requester: RequestContext,
+        *,
+        prompt: str,
+        resume: bool,
+        turn_id: str,
+        idempotency_key: str,
+        requested_tuning: dict[str, str],
+    ) -> dict[str, Any]:
+        grant = mint_orchestrator_grant(
+            self._cfg.orchestration,
+            project_id=project.id,
+            thread_id=thread.thread_id,
+            requester=requester,
+        )
+        return {
+            "turn_id": turn_id,
+            "prompt": prompt,
+            "metadata": {
+                "surface": "cockpit_orchestrator",
+                "project_id": project.id,
+                "thread_id": thread.thread_id,
+                "resume_session": resume,
+                "allowed_actions": [WORKER_SESSION_TURN],
+            },
+            "runtime_context": {
+                "orchestrator_mcp": {
+                    "api_url": orchestrator_api_base_url(self._cfg.orchestration),
+                    "project_id": project.id,
+                    "thread_id": thread.thread_id,
+                    "grant": grant,
+                    "timeout_s": _orchestrator_mcp_timeout_s(self._cfg),
+                }
+            },
+            "idempotency_key": (
+                f"orchestrator-turn:{thread.thread_id}:{idempotency_key}"
+                if idempotency_key
+                else f"orchestrator-turn:{thread.thread_id}:{turn_id}"
+            ),
+            # The worker applies tuning before reserving the turn. Replaying this
+            # exact idempotency key after a crash cannot start a second turn.
+            **requested_tuning,
+        }
+
     async def _orchestrator_turn(
         self,
         project: ProjectEntry,
@@ -2035,6 +2424,7 @@ class CockpitConnector:
         progress: Callable[[dict[str, Any]], Any] | None,
         logical_turn_id: str = "",
         idempotency_key: str = "",
+        await_completion: bool = True,
     ) -> tuple[str, CockpitThread]:
         # `text` is provider-bound (mentions inlined); `persisted_text` is what
         # the user typed and is all the transcript and memory ever see.
@@ -2062,51 +2452,131 @@ class CockpitConnector:
             f"{context}\n\nCurrent orchestration instruction:\n{text}"
         )
         resume = bool(thread.workspace.get("provider_started"))
-        grant = mint_orchestrator_grant(
-            self._cfg.orchestration,
-            project_id=project.id,
-            thread_id=thread.thread_id,
-            requester=requester,
-        )
         turn_id = logical_turn_id or new_id("turn")
-        response = await asyncio.to_thread(
-            self._post_worker_json,
-            worker_id,
-            f"/sessions/{session_id}/turns",
-            {
-                "turn_id": turn_id,
-                "prompt": prompt,
-                "metadata": {
-                    "surface": "cockpit_orchestrator",
-                    "project_id": project.id,
-                    "thread_id": thread.thread_id,
-                    "resume_session": resume,
-                    "allowed_actions": [WORKER_SESSION_TURN],
-                },
-                "runtime_context": {
-                    "orchestrator_mcp": {
-                        "api_url": orchestrator_api_base_url(self._cfg.orchestration),
-                        "project_id": project.id,
-                        "thread_id": thread.thread_id,
-                        "grant": grant,
-                        "timeout_s": _orchestrator_mcp_timeout_s(self._cfg),
-                    }
-                },
-                "idempotency_key": (
-                    f"orchestrator-turn:{thread.thread_id}:{idempotency_key}"
-                    if idempotency_key
-                    else f"orchestrator-turn:{thread.thread_id}:{turn_id}"
+        pending_completion = {
+            "phase": "dispatching",
+            "worker_id": worker_id,
+            "session_id": session_id,
+            "session_generation": session_generation,
+            "turn_id": turn_id,
+            "idempotency_key": idempotency_key,
+            "persisted_text": persisted_text,
+            "prompt": prompt,
+            "resume": resume,
+            "requested_tuning": requested_tuning,
+            "requester": _snapshot_from_context(requester),
+        }
+        if not await_completion:
+            thread = self._index.update_execution_if_matches(
+                project.id,
+                thread.thread_id,
+                expected_session_id=session_id,
+                expected_generation=session_generation,
+                status="starting",
+                provision_phase="dispatching",
+                extra={PENDING_ORCHESTRATOR_COMPLETION_KEY: pending_completion},
+            )
+            if thread is None:
+                raise RuntimeError("conversation execution was interrupted")
+        try:
+            response = await asyncio.to_thread(
+                self._post_worker_json,
+                worker_id,
+                f"/sessions/{session_id}/turns",
+                self._orchestrator_turn_request(
+                    project,
+                    thread,
+                    requester,
+                    prompt=prompt,
+                    resume=resume,
+                    turn_id=turn_id,
+                    idempotency_key=idempotency_key,
+                    requested_tuning=requested_tuning,
                 ),
-                # Same contract as worker-session turns: the worker writes model,
-                # effort and speed to session metadata before reserving the turn,
-                # and the provider reads them when it starts. A model change has
-                # already respawned the session above; effort and speed apply in
-                # place (codex) or via the adapter's retire+resume (claude).
-                **requested_tuning,
-            },
-        )
+            )
+        except WorkerRequestError as exc:
+            if not _worker_request_is_ambiguous_server_failure(exc):
+                if not await_completion:
+                    self._index.finish_orchestrator_completion_if_matches(
+                        project.id,
+                        thread.thread_id,
+                        expected_session_id=session_id,
+                        expected_generation=session_generation,
+                        expected_turn_id=turn_id,
+                        status="failed",
+                        provision_phase="failed",
+                    )
+                raise
+            if await_completion:
+                raise
+            response = await self._retry_pending_orchestrator_dispatch(
+                project,
+                thread,
+                requester,
+                pending_completion,
+            )
+        except RuntimeError:
+            if not await_completion:
+                self._index.finish_orchestrator_completion_if_matches(
+                    project.id,
+                    thread.thread_id,
+                    expected_session_id=session_id,
+                    expected_generation=session_generation,
+                    expected_turn_id=turn_id,
+                    status="failed",
+                    provision_phase="failed",
+                )
+            raise
+        except (OSError, TimeoutError, httpx.TransportError):
+            if await_completion:
+                raise
+            response = await self._retry_pending_orchestrator_dispatch(
+                project,
+                thread,
+                requester,
+                pending_completion,
+            )
+        if response is None:
+            pending_thread = self._index.get(project.id, thread.thread_id)
+            pending_state = (
+                pending_thread.workspace.get(PENDING_ORCHESTRATOR_COMPLETION_KEY)
+                if pending_thread is not None
+                else None
+            )
+            if (
+                pending_thread is None
+                or not isinstance(pending_state, dict)
+                or str(pending_state.get("turn_id") or "") != turn_id
+                or not self.rearm_pending_orchestrator_completion(
+                    project,
+                    pending_thread,
+                )
+            ):
+                raise RuntimeError(
+                    "ambiguous orchestrator dispatch has no durable recovery state"
+                )
+            await _emit_progress(
+                progress,
+                {
+                    "phase": "dispatching",
+                    "thread_id": pending_thread.thread_id,
+                    "workspace": workspace_public(pending_thread.workspace),
+                },
+            )
+            return "Orchestrator turn dispatch is being recovered.", pending_thread
         if response.get("ok") is False:
+            if not await_completion:
+                self._index.finish_orchestrator_completion_if_matches(
+                    project.id,
+                    thread.thread_id,
+                    expected_session_id=session_id,
+                    expected_generation=session_generation,
+                    expected_turn_id=turn_id,
+                    status="failed",
+                    provision_phase="failed",
+                )
             raise RuntimeError(str(response.get("error") or "worker rejected orchestrator turn"))
+        pending_completion = _accepted_orchestrator_completion(pending_completion)
         thread = self._index.update_execution_if_matches(
             project.id,
             thread.thread_id,
@@ -2114,7 +2584,14 @@ class CockpitConnector:
             expected_generation=session_generation,
             status="running",
             provision_phase="running",
-            extra={"provider_started": True},
+            extra={
+                "provider_started": True,
+                **(
+                    {PENDING_ORCHESTRATOR_COMPLETION_KEY: pending_completion}
+                    if not await_completion
+                    else {}
+                ),
+            },
         )
         if thread is None:
             raise RuntimeError("conversation execution was interrupted")
@@ -2135,17 +2612,299 @@ class CockpitConnector:
                 )
             )
         await _emit_progress(progress, {"phase": "running", "thread_id": thread.thread_id, "workspace": workspace_public(thread.workspace)})
+        if not await_completion:
+            if not self.rearm_pending_orchestrator_completion(project, thread):
+                raise RuntimeError("accepted orchestrator turn has no durable completion state")
+            return "Orchestrator turn is running.", thread
+        return await self._complete_orchestrator_turn(
+            project,
+            thread,
+            requester,
+            persisted_text,
+            worker_id=worker_id,
+            session_id=session_id,
+            session_generation=session_generation,
+            turn_id=turn_id,
+            idempotency_key=idempotency_key,
+            progress=progress,
+        )
+
+    async def _retry_pending_orchestrator_dispatch(
+        self,
+        project: ProjectEntry,
+        thread: CockpitThread,
+        requester: RequestContext,
+        pending: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        worker_id = str(pending["worker_id"])
+        session_id = str(pending["session_id"])
+        session_generation = int(pending.get("session_generation") or 0)
+        turn_id = str(pending["turn_id"])
+        idempotency_key = str(pending.get("idempotency_key") or "")
+        for attempt in range(ORCHESTRATOR_DISPATCH_RETRY_ATTEMPTS):
+            active = self._active_pending_orchestrator_dispatch(
+                project.id,
+                thread.thread_id,
+                session_id=session_id,
+                session_generation=session_generation,
+                turn_id=turn_id,
+            )
+            if active is None:
+                return None
+            thread = active
+            try:
+                response = await asyncio.to_thread(
+                    self._post_worker_json,
+                    worker_id,
+                    f"/sessions/{session_id}/turns",
+                    self._orchestrator_turn_request(
+                        project,
+                        thread,
+                        requester,
+                        prompt=str(pending.get("prompt") or ""),
+                        resume=bool(pending.get("resume")),
+                        turn_id=turn_id,
+                        idempotency_key=idempotency_key,
+                        requested_tuning={
+                            str(key): str(value)
+                            for key, value in dict(
+                                pending.get("requested_tuning") or {}
+                            ).items()
+                        },
+                    ),
+                )
+            except WorkerRequestError as exc:
+                if not _worker_request_is_ambiguous_server_failure(exc):
+                    self._index.finish_orchestrator_completion_if_matches(
+                        project.id,
+                        thread.thread_id,
+                        expected_session_id=session_id,
+                        expected_generation=session_generation,
+                        expected_turn_id=turn_id,
+                        status="failed",
+                        provision_phase="failed",
+                    )
+                    raise
+                if attempt + 1 >= ORCHESTRATOR_DISPATCH_RETRY_ATTEMPTS:
+                    return None
+                await asyncio.sleep(ORCHESTRATOR_DISPATCH_RETRY_DELAY_S)
+                continue
+            except RuntimeError:
+                self._index.finish_orchestrator_completion_if_matches(
+                    project.id,
+                    thread.thread_id,
+                    expected_session_id=session_id,
+                    expected_generation=session_generation,
+                    expected_turn_id=turn_id,
+                    status="failed",
+                    provision_phase="failed",
+                )
+                raise
+            except (OSError, TimeoutError, httpx.TransportError):
+                if attempt + 1 >= ORCHESTRATOR_DISPATCH_RETRY_ATTEMPTS:
+                    # The worker may have accepted this idempotent turn before
+                    # the response was lost. Keep the dispatch marker durable
+                    # so a later re-arm can safely replay and recover it.
+                    return None
+                await asyncio.sleep(ORCHESTRATOR_DISPATCH_RETRY_DELAY_S)
+                continue
+            if response.get("ok") is False:
+                self._index.finish_orchestrator_completion_if_matches(
+                    project.id,
+                    thread.thread_id,
+                    expected_session_id=session_id,
+                    expected_generation=session_generation,
+                    expected_turn_id=turn_id,
+                    status="failed",
+                    provision_phase="failed",
+                )
+                raise RuntimeError(
+                    str(response.get("error") or "worker rejected orchestrator turn")
+                )
+            return response
+        raise AssertionError("orchestrator dispatch retry loop exited without a result")
+
+    def _active_pending_orchestrator_dispatch(
+        self,
+        project_id: str,
+        thread_id: str,
+        *,
+        session_id: str,
+        session_generation: int,
+        turn_id: str,
+    ) -> CockpitThread | None:
+        thread = self._index.get(project_id, thread_id)
+        if thread is None:
+            return None
+        pending = thread.workspace.get(PENDING_ORCHESTRATOR_COMPLETION_KEY)
+        if (
+            str(thread.workspace.get("session_id") or "") != session_id
+            or int(thread.workspace.get("session_generation") or 0) != session_generation
+            or str(thread.workspace.get("status") or "") != "starting"
+            or str(thread.workspace.get("provision_phase") or "") != "dispatching"
+            or not isinstance(pending, dict)
+            or str(pending.get("phase") or "") != "dispatching"
+            or str(pending.get("turn_id") or "") != turn_id
+        ):
+            return None
+        return thread
+
+    def _start_orchestrator_continuation(
+        self,
+        project: ProjectEntry,
+        thread: CockpitThread,
+        pending: dict[str, Any],
+    ) -> None:
+        requester = _context_from_snapshot(dict(pending["requester"]))
+        worker_id = str(pending["worker_id"])
+        session_id = str(pending["session_id"])
+        session_generation = int(pending.get("session_generation") or 0)
+        turn_id = str(pending["turn_id"])
+        idempotency_key = str(pending.get("idempotency_key") or "")
+        persisted_text = str(pending.get("persisted_text") or "")
+        continuation_key = (project.id, thread.thread_id, turn_id)
+        existing = _ORCHESTRATOR_CONTINUATIONS.get(continuation_key)
+        if existing is not None and not existing.done():
+            return
+
+        async def continue_turn() -> None:
+            try:
+                active_thread = thread
+                if str(pending.get("phase") or "accepted") == "dispatching":
+                    recovery_delay = ORCHESTRATOR_DISPATCH_RETRY_DELAY_S
+                    while True:
+                        # Each retry batch stays short so request handling and
+                        # shutdown remain responsive. Between batches, keep
+                        # rearming from the durable marker with bounded
+                        # backoff until the worker answers or ownership moves.
+                        response = await self._retry_pending_orchestrator_dispatch(project, active_thread, requester, pending)
+                        if response is not None:
+                            break
+                        active = self._active_pending_orchestrator_dispatch(
+                            project.id,
+                            thread.thread_id,
+                            session_id=session_id,
+                            session_generation=session_generation,
+                            turn_id=turn_id,
+                        )
+                        if active is None:
+                            return
+                        active_thread = active
+                        await asyncio.sleep(recovery_delay)
+                        recovery_delay = min(recovery_delay * 2, ORCHESTRATOR_DISPATCH_RECOVERY_MAX_DELAY_S)
+                    accepted = _accepted_orchestrator_completion(pending)
+                    active_thread = self._index.update_execution_if_matches(
+                        project.id,
+                        thread.thread_id,
+                        expected_session_id=session_id,
+                        expected_generation=session_generation,
+                        status="running",
+                        provision_phase="running",
+                        extra={
+                            "provider_started": True,
+                            PENDING_ORCHESTRATOR_COMPLETION_KEY: accepted,
+                        },
+                    )
+                    if active_thread is None:
+                        raise RuntimeError("conversation execution was interrupted")
+                await self._complete_orchestrator_turn(
+                    project,
+                    active_thread,
+                    requester,
+                    persisted_text,
+                    worker_id=worker_id,
+                    session_id=session_id,
+                    session_generation=session_generation,
+                    turn_id=turn_id,
+                    idempotency_key=idempotency_key,
+                    progress=None,
+                    durable_completion=True,
+                )
+            except Exception:
+                logger.exception(
+                    "accepted orchestrator turn failed during background continuation for %s/%s",
+                    project.id,
+                    thread.thread_id,
+                )
+
+        task = asyncio.create_task(
+            continue_turn(),
+            name=f"cockpit-orchestrator-continuation-{thread.thread_id}",
+        )
+        _ORCHESTRATOR_CONTINUATIONS[continuation_key] = task
+
+        def forget(completed: asyncio.Task[None]) -> None:
+            if _ORCHESTRATOR_CONTINUATIONS.get(continuation_key) is completed:
+                _ORCHESTRATOR_CONTINUATIONS.pop(continuation_key, None)
+
+        task.add_done_callback(forget)
+
+    def rearm_pending_orchestrator_completion(
+        self,
+        project: ProjectEntry,
+        thread: CockpitThread,
+    ) -> bool:
+        pending = thread.workspace.get(PENDING_ORCHESTRATOR_COMPLETION_KEY)
+        if not isinstance(pending, dict):
+            return False
+        worker_id = str(pending.get("worker_id") or "")
+        session_id = str(pending.get("session_id") or "")
+        turn_id = str(pending.get("turn_id") or "")
+        requester = pending.get("requester")
+        phase = str(pending.get("phase") or "accepted")
+        if (
+            not worker_id
+            or not session_id
+            or not turn_id
+            or not isinstance(requester, dict)
+            or (phase == "dispatching" and not str(pending.get("prompt") or ""))
+        ):
+            logger.error(
+                "cannot rearm malformed orchestrator completion for %s/%s",
+                project.id,
+                thread.thread_id,
+            )
+            return False
+        self._start_orchestrator_continuation(project, thread, dict(pending))
+        return True
+
+    async def _complete_orchestrator_turn(
+        self,
+        project: ProjectEntry,
+        thread: CockpitThread,
+        requester: RequestContext,
+        persisted_text: str,
+        *,
+        worker_id: str,
+        session_id: str,
+        session_generation: int,
+        turn_id: str,
+        idempotency_key: str,
+        progress: Callable[[dict[str, Any]], Any] | None,
+        durable_completion: bool = False,
+    ) -> tuple[str, CockpitThread]:
         try:
             reply = await self._wait_for_orchestrator_turn(worker_id, session_id, turn_id)
         except Exception:
-            failed = self._index.update_execution_if_matches(
-                project.id,
-                thread.thread_id,
-                expected_session_id=session_id,
-                expected_generation=session_generation,
-                status="failed",
-                provision_phase="failed",
-            )
+            if durable_completion:
+                failed = self._index.finish_orchestrator_completion_if_matches(
+                    project.id,
+                    thread.thread_id,
+                    expected_session_id=session_id,
+                    expected_generation=session_generation,
+                    expected_turn_id=turn_id,
+                    status="failed",
+                    provision_phase="failed",
+                )
+            else:
+                failed = self._index.update_execution_if_matches(
+                    project.id,
+                    thread.thread_id,
+                    expected_session_id=session_id,
+                    expected_generation=session_generation,
+                    status="failed",
+                    provision_phase="failed",
+                )
             if failed is not None:
                 await _emit_progress(
                     progress,
@@ -2156,6 +2915,51 @@ class CockpitConnector:
                     },
                 )
             raise
+        if durable_completion:
+            committed = self._index.commit_orchestrator_completion_if_matches(
+                project.id,
+                thread.thread_id,
+                expected_session_id=session_id,
+                expected_generation=session_generation,
+                expected_turn_id=turn_id,
+                user_peer_id=requester.memory_peer,
+                user_text=persisted_text,
+                assistant_peer_id=self._cfg.memory.assistant_peer_id,
+                assistant_text=reply,
+                idempotency_key=idempotency_key,
+            )
+            if committed is None:
+                raise RuntimeError("conversation execution was interrupted")
+            try:
+                await asyncio.to_thread(
+                    self._persist_turn,
+                    thread.session_id,
+                    requester.memory_peer,
+                    requester.device_id,
+                    persisted_text,
+                    reply,
+                )
+            except Exception:
+                pass
+            return reply, committed
+        completed = self._index.update_execution_if_matches(
+            project.id,
+            thread.thread_id,
+            expected_session_id=session_id,
+            expected_generation=session_generation,
+            status="ready",
+            provision_phase="ready",
+        )
+        if completed is None:
+            raise RuntimeError("conversation execution was interrupted")
+        appended = self._index.append_turn(
+            completed,
+            user_peer_id=requester.memory_peer,
+            user_text=persisted_text,
+            assistant_peer_id=self._cfg.memory.assistant_peer_id,
+            assistant_text=reply,
+            idempotency_key=idempotency_key,
+        )
         try:
             await asyncio.to_thread(
                 self._persist_turn,
@@ -2167,24 +2971,7 @@ class CockpitConnector:
             )
         except Exception:
             pass
-        completed = self._index.update_execution_if_matches(
-            project.id,
-            thread.thread_id,
-            expected_session_id=session_id,
-            expected_generation=session_generation,
-            status="ready",
-            provision_phase="ready",
-        )
-        if completed is None:
-            raise RuntimeError("conversation execution was interrupted")
-        return reply, self._index.append_turn(
-            completed,
-            user_peer_id=requester.memory_peer,
-            user_text=persisted_text,
-            assistant_peer_id=self._cfg.memory.assistant_peer_id,
-            assistant_text=reply,
-            idempotency_key=idempotency_key,
-        )
+        return reply, appended
 
     def _apply_orchestrator_engine_and_model(
         self,
@@ -2612,13 +3399,8 @@ class CockpitConnector:
     def _post_worker_json(self, worker_id: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
         profile = self._registry().get(worker_id, probe=False)
         if profile is None:
-            raise RuntimeError(f"worker {worker_id!r} is not configured")
-        response = self._worker_post(
-            f"{profile.base_url}{path}",
-            json=body,
-            headers=_worker_headers(self._cfg.worker, profile),
-            timeout=self._cfg.worker.request_timeout_s,
-        )
+            raise WorkerRequestError(f"worker {worker_id!r} is not configured", code="worker_not_configured", status_code=503)
+        response = self._worker_post(f"{profile.base_url}{path}", json=body, headers=_worker_headers(self._cfg.worker, profile), timeout=self._cfg.worker.request_timeout_s)
         data = _json_response(response)
         if getattr(response, "status_code", 200) >= 400 or data.get("ok") is False:
             error = data.get("error")
@@ -2893,6 +3675,9 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
         )
         worker_id = str(args.get("worker_id") or "").strip()
         provider_instance_id = str(args.get("provider_instance_id") or "").strip()
+        allow_nested_agents = args.get("allow_nested_agents", True)
+        if not isinstance(allow_nested_agents, bool):
+            return "error: allow_nested_agents must be a boolean"
         # An unknown engine id matched no worker and surfaced as the misleading
         # "No eligible worker found"; name the real problem instead.
         requested_engine = normalize_engine_id(str(args.get("engine") or ""))
@@ -2909,6 +3694,7 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
             target_engine_id=requested_engine,
             target_model_id=str(args.get("model") or ""),
             provider_instance_id=provider_instance_id,
+            allow_nested_agents=allow_nested_agents,
             start=True,
         )
         try:
@@ -2955,6 +3741,11 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
                     "description": "Optional worker engine route: exactly 'codex' or 'claude'.",
                 },
                 "model": {"type": "string", "description": "Optional explicit provider model id."},
+                "allow_nested_agents": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Allow the child to launch nested agents. Disable for synchronous review work.",
+                },
                 "landing_mode": {
                     "type": "string",
                     "enum": sorted(CHILD_WORK_LANDING_MODES),

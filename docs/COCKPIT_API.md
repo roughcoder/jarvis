@@ -100,6 +100,86 @@ POST   /v1/mcp/tokens
 DELETE /v1/mcp/tokens/{token_id}
 ```
 
+### Routines and schedules
+
+Routines are versioned, reusable orchestration processes. A schedule is one
+trigger for a routine; it is not the routine definition itself. Schedule state
+therefore stores `routine_id`, `routine_version`, contextual parameters, and
+execution tuning rather than a raw `WorkCommand` or arbitrary prompt.
+
+```text
+GET    /v1/routines
+GET    /v1/routines/{routine_id}?version=<int>
+POST   /v1/routines/{routine_id}/resolve
+POST   /v1/routines/{routine_id}/run
+
+GET    /v1/schedules
+POST   /v1/schedules
+PATCH  /v1/schedules/{schedule_id}
+DELETE /v1/schedules/{schedule_id}
+POST   /v1/schedules/{schedule_id}/run
+```
+
+The built-in v1 catalog includes `morning-brief`, `pull-request-review`,
+`issue-triage`, `system-health-check`, and `draft-release-notes`. Definitions
+are package-owned JSON and expose typed parameters to Cockpit. Supported types
+are `string`, `text`, `boolean`, `integer`, `date`, `enum`, `repository_ref`,
+`pull_request_ref`, `model_ref`, and `worker_ref`. Parameters may declare
+`allow_multiple`, `choices`, `min_items`, `max_items`, and an `options_source`
+that Cockpit resolves from an authenticated product surface. Default sources
+are intentionally declarative and bounded to `literal`, `today`, `target`,
+`project`, and `requester`; routine files cannot contain executable expressions.
+
+Resolution request:
+
+```json
+{
+  "project_id": "jarvis",
+  "target": {"repository": "roughcoder/jarvis", "number": 123},
+  "params": {
+    "reviewers": [
+      {"engine": "codex", "model": "gpt-5.5"},
+      {"engine": "claude", "model": "claude-opus"}
+    ]
+  }
+}
+```
+
+Resolution returns the routine plus:
+
+```json
+{
+  "resolution": {
+    "values": {},
+    "missing": [],
+    "ready": true,
+    "rendered_prompt": "..."
+  }
+}
+```
+
+`POST /run` requires `project_id` and `idempotency_key`; it accepts contextual
+`target`/`params` plus optional `engine`, `model`, `effort`, `speed`,
+`worker_id`, and `parent_chat_id`. It opens a normal project orchestrator thread
+and starts its first turn, returning HTTP `202` with a non-null `thread` and a
+routine run projection (`status: "started"`). During migration, authenticated
+Cockpit may send its existing fully rendered PR-review `prompt`; this preserves
+the richer current review dialog while the typed parameter UI moves to the
+catalog contract. The prompt override does not bypass project membership,
+worker authority, provider tool gates, or publication confirmation.
+
+Creating or changing schedules requires `orchestration.schedules.write`; listing
+requires `orchestration.schedules.read`. A schedule records its creator identity,
+project, routine/version, resolved parameters, target, timezone, wall-clock
+hour/minute, weekdays, enabled state, and optional engine tuning. The resident
+API tick checks due schedules once per minute. At fire time it resolves the
+creator and project membership again, re-evaluates current device capability,
+and dispatches through the same routine runner. A deterministic
+`schedule:<schedule_id>:<local-date>` idempotency key protects retries. The
+schedule is acknowledged only after dispatch succeeds; failed or no-longer-
+authorised schedules remain unacknowledged and are never silently run with
+stale authority.
+
 MCP status is a cockpit projection of the brain's last cold-path MCP bridge
 connect. The API process does **not** construct an `MCPBridge`, probe MCP
 servers, spawn stdio subprocesses, or pay connect timeouts. The brain publishes a
@@ -2389,6 +2469,18 @@ full projection; filtering clients should ignore rows they do not care about.
 
 Future API changes should be appended here with date, schema version, compatible
 or breaking status, and migration notes.
+
+### 2026-07-20 - First-class routines and routine schedules (compatible)
+
+- Added a package-owned, versioned routine catalog with typed deterministic
+  parameters and five initial built-in processes.
+- Added resolve and run-now routes that launch ordinary project orchestrator
+  threads, preserving the existing authority and provider boundaries.
+- Added routine-backed schedule CRUD, manual play, and a resident minute tick.
+  Schedule records reference a routine version and bound parameters rather than
+  embedding raw commands or executable prompt expressions.
+- Scheduled dispatch re-resolves creator/project authority, uses a stable local-
+  day idempotency key, and acknowledges only successful dispatch.
 
 ### 2026-07-07 - Project-linked run/session projections (compatible)
 

@@ -989,9 +989,9 @@ def test_thread_index_interrupt_detach_does_not_clear_new_session_generation(tmp
     assert claimed is not None
     index.save(
         replace(
-            claimed,
+            claimed.thread,
             workspace={
-                **claimed.workspace,
+                **claimed.thread.workspace,
                 "session_id": "session-new",
                 "session_generation": 4,
                 "status": "ready",
@@ -1032,6 +1032,12 @@ def test_thread_index_pending_turn_does_not_overwrite_interrupt_claim(tmp_path) 
     )
     claimed = index.claim_execution_interrupt("jarvis", stale.thread_id)
     assert claimed is not None
+    assert claimed.acquired is True
+
+    duplicate_claim = index.claim_execution_interrupt("jarvis", stale.thread_id)
+    assert duplicate_claim is not None
+    assert duplicate_claim.acquired is False
+    assert duplicate_claim.thread.workspace["status"] == "interrupting"
 
     updated = index.append_pending_turn(
         stale,

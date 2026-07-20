@@ -32,7 +32,10 @@ from jarvis.connectors.cockpit import (  # noqa: E402
     CockpitConnector,
     CockpitThread,
     CockpitThreadIndex,
+    PENDING_EXECUTION_INTERRUPT_KEY,
+    PENDING_ORCHESTRATOR_COMPLETION_KEY,
     ProviderTurnError,
+    WorkerRequestError,
     _continue_child_watch,
     _read_child_work_result_tool,
     _start_ready_child_watch,
@@ -373,6 +376,7 @@ def _cfg(
     monkeypatch: pytest.MonkeyPatch,
     *,
     caps: str = "",
+    profile_caps: str | None = None,
     token: str = "",
     cors_origins: str = "",
     identity: str = "house",
@@ -402,6 +406,7 @@ def _cfg(
     workers_path = workspace / "workers.json"
     registry_path = tmp_path / "registry.json"
     users_path = tmp_path / "users"
+    profiles_path = tmp_path / "profiles"
     env.write_text(
         "\n".join(
             [
@@ -422,6 +427,7 @@ def _cfg(
                 f"ORCHESTRATION_OAUTH_JWKS_TTL_S={oauth_jwks_ttl_s}",
                 f"ORCHESTRATION_OAUTH_JWKS_MIN_REFRESH_S={oauth_jwks_min_refresh_s}",
                 f"CAPS_DEFAULT_CAPABILITIES={caps}",
+                f"CAPS_PROFILES_DIR={profiles_path}",
                 f"CAPS_USERS_DIR={users_path}",
                 f"MEMORY_CACHE_PATH={tmp_path / 'memory-cache.json'}",
                 f"MEMORY_CURATION_OUTBOX_PATH={tmp_path / 'curation-outbox.jsonl'}",
@@ -447,6 +453,13 @@ def _cfg(
         )
     )
     monkeypatch.setenv("JARVIS_ENV_FILE", str(env))
+    if profile_caps is not None:
+        profiles_path.mkdir(parents=True, exist_ok=True)
+        capabilities = [cap.strip() for cap in profile_caps.split(",") if cap.strip()]
+        profiles_path.joinpath("local-mac.md").write_text(
+            f"---\ncapabilities: {json.dumps(capabilities)}\n---\n",
+            encoding="utf-8",
+        )
     workspace.mkdir(parents=True, exist_ok=True)
     workers_path.write_text(
         json.dumps(
@@ -495,6 +508,16 @@ def _set_worker_status(cfg: Config, status: str) -> None:
     data = json.loads(workers_path.read_text())
     data["workers"][0]["status"] = status
     workers_path.write_text(json.dumps(data))
+
+
+def _pull_request_review_params() -> dict[str, Any]:
+    return {
+        "pull_request": {"repository": "roughcoder/jarvis", "number": 142},
+        "reviewers": [
+            {"engine": "codex", "model": "gpt-5"},
+            {"engine": "claude", "model": "claude-opus"},
+        ],
+    }
 
 
 def _seed_retention_thread(cfg: Config, thread_id: str, *, days_idle: float = 30.0, project_id: str = "house-story") -> CockpitThread:
@@ -1504,7 +1527,7 @@ def test_cockpit_retention_reads_require_auth_and_return_contract_shape(tmp_path
         settings_response = await client.get(f"{base}/v1/retention/settings", headers=headers)
         assert plan_response.status_code == 200
         assert settings_response.status_code == 200
-        return unauthorized.status_code, unauthorized_settings.status_code, plan_response.json(), settings_response.json()
+        return (unauthorized.status_code, unauthorized_settings.status_code, plan_response.json(), settings_response.json())
 
     import asyncio
 
@@ -3051,11 +3074,74 @@ def test_cockpit_capabilities_requires_auth_and_reports_legacy_principal(tmp_pat
             "project_writes": {"available": True, "reason": ""},
             "mcp": {"available": True, "serve_configured": True},
             "worker_dispatch": {"available": True, "workers_configured": 1},
+            "routines": {"available": True, "builtin_count": 5},
+            "schedules": {"available": False, "resident_tick": True, "writable": False},
         }
 
     import asyncio
 
     asyncio.run(_with_server(cfg, calls))
+
+
+def test_schedule_write_authority_comes_from_device_profile_when_present(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    schedule_body = {
+        "name": "Weekday brief",
+        "routine_id": "morning-brief",
+        "project_id": "neil-shared",
+        "hour": 9,
+        "minute": 15,
+        "weekdays": [0, 1, 2, 3, 4],
+        "timezone": "Europe/London",
+        "idempotency_key": "create-profile-brief",
+    }
+
+    read_only_root = tmp_path / "read-only-profile"
+    read_only_root.mkdir()
+    read_only_cfg = _cfg(
+        read_only_root,
+        monkeypatch,
+        identity="neil",
+        caps="orchestration.schedules.read,orchestration.schedules.write",
+        profile_caps="orchestration.schedules.read",
+    )
+    _seed_project_registry(read_only_cfg)
+
+    async def denied_calls(base: str, client: httpx.AsyncClient) -> None:
+        capabilities = await client.get(f"{base}/v1/capabilities")
+        created = await client.post(f"{base}/v1/schedules", json=schedule_body)
+
+        assert capabilities.json()["features"]["schedules"] == {
+            "available": True,
+            "resident_tick": True,
+            "writable": False,
+        }
+        assert created.status_code == 403
+        assert created.json()["error"]["message"] == "missing authority: orchestration.schedules.write"
+
+    asyncio.run(_with_server(read_only_cfg, denied_calls))
+
+    writable_root = tmp_path / "writable-profile"
+    writable_root.mkdir()
+    writable_cfg = _cfg(
+        writable_root,
+        monkeypatch,
+        identity="neil",
+        profile_caps="orchestration.schedules.read,orchestration.schedules.write",
+    )
+    _seed_project_registry(writable_cfg)
+
+    async def allowed_calls(base: str, client: httpx.AsyncClient) -> None:
+        capabilities = await client.get(f"{base}/v1/capabilities")
+        created = await client.post(f"{base}/v1/schedules", json=schedule_body)
+
+        assert capabilities.json()["features"]["schedules"] == {
+            "available": True,
+            "resident_tick": True,
+            "writable": True,
+        }
+        assert created.status_code == 201
+
+    asyncio.run(_with_server(writable_cfg, allowed_calls))
 
 
 def test_cockpit_capabilities_reports_oauth_principal_and_unavailable_features(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -4016,7 +4102,13 @@ def test_cockpit_thread_interrupt_keeps_conversation_open_and_next_turn_recreate
     async def calls(
         base: str,
         client: httpx.AsyncClient,
-    ) -> tuple[httpx.Response, httpx.Response, httpx.Response, dict[str, Any]]:
+    ) -> tuple[
+        httpx.Response,
+        httpx.Response,
+        httpx.Response,
+        httpx.Response,
+        dict[str, Any],
+    ]:
         interrupt_task = asyncio.create_task(
             client.post(
                 f"{base}/v1/projects/neil-shared/threads/thread_interrupt/interrupt",
@@ -4024,6 +4116,10 @@ def test_cockpit_thread_interrupt_keeps_conversation_open_and_next_turn_recreate
             )
         )
         assert await asyncio.to_thread(interrupt_started.wait, 2)
+        duplicate_interrupt = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_interrupt/interrupt",
+            json={"turn_id": "turn_active", "idempotency_key": "interrupt-twice"},
+        )
         raced_turn = await client.post(
             f"{base}/v1/projects/neil-shared/threads/thread_interrupt/turns",
             json={"text": "Do not reuse the execution being interrupted."},
@@ -4037,9 +4133,9 @@ def test_cockpit_thread_interrupt_keeps_conversation_open_and_next_turn_recreate
         detail = (
             await client.get(f"{base}/v1/projects/neil-shared/threads/thread_interrupt")
         ).json()["thread"]
-        return interrupted, raced_turn, next_turn, detail
+        return interrupted, duplicate_interrupt, raced_turn, next_turn, detail
 
-    interrupted, raced_turn, next_turn, detail = asyncio.run(
+    interrupted, duplicate_interrupt, raced_turn, next_turn, detail = asyncio.run(
         _with_server(cfg, calls, http_get=worker_get, http_post=worker_post)
     )
 
@@ -4050,6 +4146,8 @@ def test_cockpit_thread_interrupt_keeps_conversation_open_and_next_turn_recreate
         "accepted": True,
         "turn_id": "turn_active",
     }
+    assert duplicate_interrupt.status_code == 409
+    assert duplicate_interrupt.json()["error"]["code"] == "execution_busy"
     assert raced_turn.status_code == 200
     assert "thread.turn.error" in raced_turn.text
     assert next_turn.status_code == 200
@@ -4060,6 +4158,219 @@ def test_cockpit_thread_interrupt_keeps_conversation_open_and_next_turn_recreate
     assert not any(
         url.endswith("/sessions/conv_thread_interrupt/turns") for url, _body in posts
     )
+
+
+def test_cockpit_ambiguous_remote_interrupt_preserves_durable_recovery_state(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil", caps=WORKER_SESSION_INTERRUPT)
+    _seed_project_registry(cfg)
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        if url.endswith("/health"):
+            return Response(
+                {
+                    "ok": True,
+                    "agent": "codex",
+                    "default_engine": "codex",
+                    "supported_engines": ["codex"],
+                    "engine_supports": {"codex": {"streaming": True}},
+                    "repositories": [],
+                }
+            )
+        if url.endswith("/jobs"):
+            return Response({"jobs": []})
+        if url.endswith("/sessions"):
+            return Response({"sessions": []})
+        return Response({})
+
+    def worker_post(url: str, **_kwargs: Any) -> Response:
+        if url.endswith("/interrupt"):
+            raise OSError("worker connection dropped before interrupt acceptance")
+        return Response({"ok": False, "error": "unexpected worker post"}, status_code=400)
+
+    connector = CockpitConnector(cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None, worker_get=worker_get, worker_post=worker_post)
+    connector.index.save(
+        CockpitThread(
+            thread_id="thread_interrupt_recovery",
+            project_id="neil-shared",
+            session_id=orchestrator_session_id(
+                "neil-shared",
+                "thread_interrupt_recovery",
+            ),
+            title="Recover failed interrupt",
+            created_at="2026-07-20T12:00:00Z",
+            updated_at="2026-07-20T12:00:00Z",
+            created_by="neil",
+            chat_type="orchestrator",
+            workspace={
+                "worker_id": "macbook-worker",
+                "session_id": "orch_interrupt_recovery",
+                "session_generation": 2,
+                "status": "running",
+                "provision_phase": "running",
+                PENDING_ORCHESTRATOR_COMPLETION_KEY: {
+                    "phase": "accepted",
+                    "worker_id": "macbook-worker",
+                    "session_id": "orch_interrupt_recovery",
+                    "session_generation": 2,
+                    "turn_id": "turn_interrupt_recovery",
+                    "idempotency_key": "routine-interrupt-recovery",
+                    "persisted_text": "Keep waiting for this result.",
+                    "requester": {
+                        "device_id": "local-mac",
+                        "identity": "neil",
+                        "scope": "personal",
+                        "capabilities": [],
+                        "channel": "cockpit",
+                        "confidence": "strong",
+                        "peer": "neil",
+                    },
+                },
+            },
+        )
+    )
+    wait_calls: list[tuple[str, str, str]] = []
+    wait_started = asyncio.Event()
+
+    async def wait_until_cancelled(worker_id, session_id, turn_id):  # noqa: ANN001, ANN202
+        wait_calls.append((worker_id, session_id, turn_id))
+        wait_started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(connector, "_wait_for_orchestrator_turn", wait_until_cancelled)
+    claim_execution_interrupt = connector.claim_execution_interrupt
+
+    def claim_after_completion(project, thread_id, *, turn_id=""):  # noqa: ANN001, ANN202
+        current = connector.index.get(project.id, thread_id)
+        assert current is not None
+        connector.index.save(replace(current, workspace={**current.workspace, "status": "ready", "provision_phase": "ready"}))
+        return claim_execution_interrupt(project, thread_id, turn_id=turn_id)
+
+    monkeypatch.setattr(connector, "claim_execution_interrupt", claim_after_completion)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def scenario(base: str, client: httpx.AsyncClient):
+        await asyncio.wait_for(wait_started.wait(), timeout=0.5)
+        response = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/thread_interrupt_recovery/interrupt",
+            json={
+                "turn_id": "turn_interrupt_recovery",
+                "idempotency_key": "interrupt-recovery",
+            },
+        )
+        restored = connector.index.get("neil-shared", "thread_interrupt_recovery")
+        return response, restored
+
+    response, restored = asyncio.run(
+        _with_server(cfg, scenario, http_get=worker_get, http_post=worker_post)
+    )
+
+    assert response.status_code >= 500
+    assert restored is not None
+    assert restored.workspace["status"] == "interrupting"
+    assert restored.workspace["provision_phase"] == "interrupting"
+    assert restored.workspace["session_id"] == "orch_interrupt_recovery"
+    assert restored.workspace[PENDING_EXECUTION_INTERRUPT_KEY]["turn_id"] == ("turn_interrupt_recovery")
+    assert wait_calls == [("macbook-worker", "orch_interrupt_recovery", "turn_interrupt_recovery")]
+    assert restored.workspace[PENDING_ORCHESTRATOR_COMPLETION_KEY]["turn_id"] == "turn_interrupt_recovery"
+
+
+def test_cockpit_immediate_definite_interrupt_replay_rearms_pending_completion(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil", caps=WORKER_SESSION_INTERRUPT)
+    _seed_project_registry(cfg)
+    posts = 0
+
+    def worker_post(url: str, **_kwargs: Any) -> Response:
+        nonlocal posts
+        if not url.endswith("/interrupt"):
+            return Response(
+                {"ok": False, "error": "unexpected worker post"},
+                status_code=400,
+            )
+        posts += 1
+        if posts == 1:
+            raise OSError("interrupt response was lost")
+        return Response({"ok": False, "error": "no such session"}, status_code=404)
+
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+        worker_post=worker_post,
+    )
+    thread = CockpitThread(
+        thread_id="thread_interrupt_immediate_rearm",
+        project_id="neil-shared",
+        session_id="project:neil-shared:thread_interrupt_immediate_rearm",
+        title="Immediate interrupt rearm",
+        created_at="2026-07-20T12:00:00Z",
+        updated_at="2026-07-20T12:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        worker_id="macbook-worker",
+        workspace={
+            "worker_id": "macbook-worker",
+            "session_id": "session_interrupt_immediate_rearm",
+            "session_generation": 2,
+            "status": "running",
+            "provision_phase": "running",
+            PENDING_ORCHESTRATOR_COMPLETION_KEY: {
+                "phase": "accepted",
+                "worker_id": "macbook-worker",
+                "session_id": "session_interrupt_immediate_rearm",
+                "session_generation": 2,
+                "turn_id": "turn_interrupt_immediate_rearm",
+                "requester": {
+                    "device_id": "local-mac",
+                    "identity": "neil",
+                    "scope": "personal",
+                    "capabilities": [],
+                    "channel": "cockpit",
+                    "confidence": "strong",
+                    "peer": "neil",
+                },
+            },
+        },
+    )
+    connector.index.save(thread)
+    rearmed: list[tuple[str, str]] = []
+
+    def record_rearm(project, recovered):  # noqa: ANN001, ANN202
+        rearmed.append((project.id, recovered.thread_id))
+        return True
+
+    monkeypatch.setattr(
+        connector,
+        "rearm_pending_orchestrator_completion",
+        record_rearm,
+    )
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def scenario(base: str, client: httpx.AsyncClient):
+        rearmed.clear()
+        response = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}/interrupt",
+            json={
+                "turn_id": "turn_interrupt_immediate_rearm",
+                "idempotency_key": "interrupt-immediate-rearm",
+            },
+        )
+        return response, connector.index.get(thread.project_id, thread.thread_id)
+
+    response, recovered = asyncio.run(
+        _with_server(cfg, scenario, http_post=worker_post)
+    )
+
+    assert response.status_code == 502
+    assert posts == 2
+    assert recovered is not None
+    assert recovered.workspace["status"] == "running"
+    assert PENDING_EXECUTION_INTERRUPT_KEY not in recovered.workspace
+    assert rearmed == [("neil-shared", thread.thread_id)]
 
 
 def test_cockpit_thread_controls_require_addressable_request_or_turn_ids(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -10614,6 +10925,24 @@ def test_child_watch_claims_exactly_once_after_every_expected_child_is_terminal(
     assert completed_parent is not None
     assert "pending_child_watch_ids" not in completed_parent.workspace
     assert cockpit_api_module._thread_status(completed_parent, None) == ("completed", "completed")
+    completed_detail = index.get_with_messages(thread.project_id, thread.thread_id)
+    assert completed_detail is not None
+    projected_watch = next(
+        message
+        for message in cockpit_api_module._thread_detail_projection(completed_detail)["messages"]
+        if message.get("type") == "child_watch"
+    )
+    assert projected_watch == {
+        "role": "system",
+        "peer_id": "jarvis",
+        "content": "Watching 2 child work session(s) for completion.",
+        "observed_at": projected_watch["observed_at"],
+        "type": "child_watch",
+        "watch_id": watch_id,
+        "child_chat_ids": ["run_a", "run_b"],
+        "phase": "completed",
+        "completed_at": projected_watch["completed_at"],
+    }
 
 
 def test_child_watch_tool_enforces_optional_expected_count(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -11508,6 +11837,15 @@ def test_spawn_child_rejects_an_unknown_engine_with_a_truthful_error(tmp_path, m
     tool = _spawn_child_work_tool(cfg, project, thread)
     requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
 
+    nested_policy = tool.parameters["properties"]["allow_nested_agents"]
+    assert nested_policy == {
+        "type": "boolean",
+        "default": True,
+        "description": "Allow the child to launch nested agents. Disable for synchronous review work.",
+    }
+    invalid = asyncio.run(tool.handler(requester, {"task": "list dirs", "allow_nested_agents": "false"}))
+    assert invalid == "error: allow_nested_agents must be a boolean"
+
     result = asyncio.run(tool.handler(requester, {"task": "list dirs", "engine": "claude-engine"}))
 
     # An unknown engine used to match no worker and surface as the misleading
@@ -11515,6 +11853,54 @@ def test_spawn_child_rejects_an_unknown_engine_with_a_truthful_error(tmp_path, m
     assert "unknown engine" in result
     assert "claude-engine" in result
     assert "claude" in result and "codex" in result
+
+
+def test_spawn_child_carries_nested_agent_policy_into_the_execution_envelope(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.connectors.cockpit import _spawn_child_work_tool
+    from jarvis.orchestration.service import OrchestrationService
+
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    thread = CockpitThread(
+        thread_id="thread_nested_policy",
+        project_id=project.id,
+        session_id="project:neil-shared:orchestrator:thread_nested_policy",
+        title="Spawn",
+        created_at="2026-07-13T15:00:00Z",
+        updated_at="2026-07-13T15:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+    )
+    seen: list[bool] = []
+
+    def next_work(_self, command, **_kwargs):  # noqa: ANN001
+        seen.append(command.allow_nested_agents)
+        item = WorkItem(source="manual", id="manual_policy", title="Review", repo="roughcoder/jarvis")
+        envelope = ExecutionEnvelope(
+            run_id="run_policy",
+            repo=item.repo,
+            prompt="review",
+            allow_nested_agents=command.allow_nested_agents,
+        )
+        return StartedWork(
+            item=item,
+            worker=WorkerProfile(worker_id="worker_a", display_name="Worker A"),
+            envelope=envelope,
+            session=WorkerSessionLink(worker_id="worker_a", session_id="session_policy"),
+        )
+
+    monkeypatch.setattr(OrchestrationService, "next_work", next_work)
+    tool = _spawn_child_work_tool(cfg, project, thread)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+
+    disabled = asyncio.run(tool.handler(requester, {"task": "review", "allow_nested_agents": False}))
+    defaulted = asyncio.run(tool.handler(requester, {"task": "review"}))
+
+    assert seen == [False, True]
+    assert disabled.startswith("Spawned child chat run_policy")
+    assert defaulted.startswith("Spawned child chat run_policy")
 
 
 def test_child_watch_claim_renewal_does_not_grow_the_transcript(tmp_path, monkeypatch) -> None:  # noqa: ANN001
@@ -12369,3 +12755,2008 @@ def test_orchestrator_engine_switch_clears_stale_effort_and_speed(tmp_path, monk
     assert (switched.effort, switched.speed) == ("", "")
     assert "effort" not in switched.workspace
     assert "speed" not in switched.workspace
+
+
+def test_cockpit_routine_library_resolve_and_idempotent_run(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    calls: list[str] = []
+
+    class FakeRoutineConnector:
+        async def open_thread(self, project, requester, **kwargs):  # noqa: ANN001
+            calls.append("open")
+            now = "2026-07-20T12:00:00+00:00"
+            return CockpitThread(
+                thread_id="thread_routine",
+                project_id=project.id,
+                session_id="conv_routine",
+                title=kwargs["title"],
+                created_at=now,
+                updated_at=now,
+                created_by=requester.identity,
+                chat_type="orchestrator",
+                engine=kwargs["engine"],
+            )
+
+        async def turn(self, _project, thread, _requester, text, **_kwargs):  # noqa: ANN001
+            calls.append(text)
+            return "Workspace turn is running.", thread, ()
+
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: FakeRoutineConnector())
+
+    async def scenario(base: str, client: httpx.AsyncClient):
+        library = await client.get(f"{base}/v1/routines")
+        resolved = await client.post(
+            f"{base}/v1/routines/morning-brief/resolve",
+            json={"params": {"day": "2026-07-20"}},
+        )
+        body = {
+            "project_id": "neil-shared",
+            "prompt": "Use the existing rich pull request review prompt.",
+            "params": _pull_request_review_params(),
+            "idempotency_key": "review-123",
+        }
+        first = await client.post(f"{base}/v1/routines/pull-request-review/run", json=body)
+        replay = await client.post(f"{base}/v1/routines/pull-request-review/run", json=body)
+        return library, resolved, first, replay
+
+    library, resolved, first, replay = asyncio.run(_with_server(cfg, scenario))
+
+    assert library.status_code == 200
+    assert {item["routine_id"] for item in library.json()["routines"]} == {
+        "morning-brief",
+        "pull-request-review",
+        "issue-triage",
+        "system-health-check",
+        "draft-release-notes",
+    }
+    assert resolved.json()["resolution"]["ready"] is True
+    assert first.status_code == 202
+    assert first.json()["run"]["status"] == "started"
+    assert first.json()["thread"]["thread_id"] == "thread_routine"
+    assert replay.json()["idempotent"] is True
+    assert calls == ["open", "Use the existing rich pull request review prompt."]
+
+
+@pytest.mark.parametrize(
+    ("terminal_state", "stored_status", "retry_status"),
+    [
+        ("completed", "ready", "completed"),
+        ("failed", "failed", "failed"),
+        ("interrupted", "interrupted", "interrupted"),
+    ],
+)
+def test_cockpit_routine_run_resumes_terminal_reserved_thread_when_response_save_fails(
+    tmp_path, monkeypatch, terminal_state, stored_status, retry_status
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    connector = CockpitConnector(
+        cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None
+    )
+    active_connector = [connector]
+    worker_posts: list[dict[str, Any]] = []
+    release_wait = asyncio.Event()
+
+    async def fake_ensure(_project, thread, _requester, *, progress):  # noqa: ANN001
+        del progress
+        return connector.index.save(
+            replace(
+                thread,
+                worker_id="macbook-worker",
+                workspace={
+                    **thread.workspace,
+                    "worker_id": "macbook-worker",
+                    "session_id": "orch_reserved_routine",
+                    "session_generation": 0,
+                    "status": "ready",
+                    "provision_phase": "ready",
+                },
+            )
+        )
+
+    def fake_post(_worker_id: str, _path: str, body: dict[str, Any]) -> dict[str, Any]:
+        worker_posts.append(body)
+        return {"ok": True}
+
+    async def fake_wait(_worker_id: str, _session_id: str, _turn_id: str) -> str:
+        if terminal_state == "failed":
+            raise RuntimeError("simulated provider failure after acceptance")
+        if terminal_state == "interrupted":
+            await release_wait.wait()
+        return "Reserved routine completed."
+
+    original_save = cockpit_api_module.IdempotencyStore.save
+    routine_response_saves = 0
+
+    def fail_first_routine_response_save(store, scope, key, body, response):  # noqa: ANN001, ANN202
+        nonlocal routine_response_saves
+        if scope.startswith("routines/pull-request-review/run/principal/"):
+            routine_response_saves += 1
+            if routine_response_saves == 1:
+                raise OSError("simulated crash after worker acceptance")
+        return original_save(store, scope, key, body, response)
+
+    monkeypatch.setattr(connector, "_ensure_orchestrator_session", fake_ensure)
+    monkeypatch.setattr(connector, "_post_worker_json", fake_post)
+    monkeypatch.setattr(connector, "_wait_for_orchestrator_turn", fake_wait)
+    monkeypatch.setattr(
+        cockpit_api_module, "_cockpit_connector", lambda _ctx: active_connector[0]
+    )
+    monkeypatch.setattr(
+        cockpit_api_module.IdempotencyStore, "save", fail_first_routine_response_save
+    )
+    body = {
+        "project_id": "neil-shared",
+        "prompt": "Dispatch this routine exactly once.",
+        "params": _pull_request_review_params(),
+        "idempotency_key": f"review-response-save-crash-{terminal_state}",
+    }
+
+    async def failed_process(base: str, client: httpx.AsyncClient):
+        failed = await client.post(
+            f"{base}/v1/routines/pull-request-review/run", json=body
+        )
+        assert failed.status_code == 500
+        reserved_thread = connector.index.list_all()[0]
+        if terminal_state == "interrupted":
+            interrupted = connector.index.detach_execution_if_matches(
+                "neil-shared",
+                reserved_thread.thread_id,
+                expected_session_id="orch_reserved_routine",
+                expected_generation=0,
+            )
+            assert interrupted is not None
+            release_wait.set()
+        deadline = asyncio.get_running_loop().time() + 0.5
+        while asyncio.get_running_loop().time() < deadline:
+            reserved_thread = (
+                connector.index.get("neil-shared", reserved_thread.thread_id)
+                or reserved_thread
+            )
+            if reserved_thread.workspace.get("status") == stored_status:
+                break
+            await asyncio.sleep(0.01)
+        return reserved_thread
+
+    reserved_thread = asyncio.run(_with_server(cfg, failed_process))
+    restarted_connector = CockpitConnector(
+        cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None
+    )
+    active_connector[0] = restarted_connector
+
+    async def restarted_process(base: str, client: httpx.AsyncClient):
+        conflicting = await client.post(
+            f"{base}/v1/routines/pull-request-review/run",
+            json={
+                **body,
+                "prompt": "A different request must not claim the reservation.",
+            },
+        )
+        retry = await client.post(
+            f"{base}/v1/routines/pull-request-review/run", json=body
+        )
+        return conflicting, retry
+
+    conflicting, retry = asyncio.run(_with_server(cfg, restarted_process))
+
+    assert reserved_thread.workspace["status"] == stored_status
+    assert conflicting.status_code == 409
+    assert conflicting.json()["error"]["code"] == "idempotency_conflict"
+    assert retry.status_code == 202
+    assert retry.json()["run"]["status"] == retry_status
+    assert retry.json()["run"]["run_id"] == worker_posts[0]["turn_id"]
+    assert retry.json()["run"]["thread_id"] == reserved_thread.thread_id
+    assert retry.json()["thread"]["thread_id"] == reserved_thread.thread_id
+    assert len(restarted_connector.index.list_all()) == 1
+    assert len(worker_posts) == 1
+    activity, _cursor = cockpit_api_module._project_activity_log(  # noqa: SLF001
+        cockpit_api_module.cockpit_context(cfg)
+    ).list("neil-shared", limit=20, activity_type="routine.started")
+    assert len(activity) == 1
+    assert activity[0]["data"]["run_id"] == retry.json()["run"]["run_id"]
+
+
+def test_cockpit_routine_prompt_override_still_requires_typed_parameters(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+
+    async def scenario(base: str, client: httpx.AsyncClient):
+        return await client.post(
+            f"{base}/v1/routines/pull-request-review/run",
+            json={
+                "project_id": "neil-shared",
+                "prompt": "A rich override cannot replace the routine's typed bindings.",
+                "idempotency_key": "review-missing-params",
+            },
+        )
+
+    response = asyncio.run(_with_server(cfg, scenario))
+
+    assert response.status_code == 400
+    assert response.json()["error"] == {
+        "code": "validation_failed",
+        "message": "missing routine parameters: pull_request, reviewers",
+        "recoverable": True,
+    }
+
+
+def test_cockpit_routine_run_returns_after_worker_acceptance_and_continues_async(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    memory = FakeProjectMemory()
+    connector = CockpitConnector(
+        cfg,
+        memory=memory,
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    worker_posts: list[dict[str, Any]] = []
+    wait_started = asyncio.Event()
+    release_completion = asyncio.Event()
+
+    async def fake_ensure(_project, thread, _requester, *, progress):  # noqa: ANN001
+        del progress
+        return connector.index.save(
+            replace(
+                thread,
+                worker_id="macbook-worker",
+                workspace={
+                    **thread.workspace,
+                    "worker_id": "macbook-worker",
+                    "session_id": "orch_routine_async",
+                    "session_generation": 0,
+                    "status": "ready",
+                    "provision_phase": "ready",
+                },
+            )
+        )
+
+    def fake_post(_worker_id: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        stored = connector.index.list_all()
+        assert len(stored) == 1
+        pending = stored[0].workspace[PENDING_ORCHESTRATOR_COMPLETION_KEY]
+        assert stored[0].workspace["provision_phase"] == "dispatching"
+        assert pending["phase"] == "dispatching"
+        assert pending["turn_id"] == body["turn_id"]
+        worker_posts.append({"path": path, "body": body})
+        return {"ok": True}
+
+    async def fake_wait(_worker_id: str, _session_id: str, _turn_id: str) -> str:
+        wait_started.set()
+        await release_completion.wait()
+        return "Routine completed in the background."
+
+    monkeypatch.setattr(connector, "_ensure_orchestrator_session", fake_ensure)
+    monkeypatch.setattr(connector, "_post_worker_json", fake_post)
+    monkeypatch.setattr(connector, "_wait_for_orchestrator_turn", fake_wait)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def scenario(base: str, client: httpx.AsyncClient):
+        body = {
+            "project_id": "neil-shared",
+            "prompt": "Run the review without holding the HTTP request open.",
+            "params": _pull_request_review_params(),
+            "idempotency_key": "review-async-123",
+        }
+        response = await asyncio.wait_for(
+            client.post(
+                f"{base}/v1/routines/pull-request-review/run",
+                json=body,
+            ),
+            timeout=0.5,
+        )
+        replay = await asyncio.wait_for(
+            client.post(f"{base}/v1/routines/pull-request-review/run", json=body),
+            timeout=0.5,
+        )
+        await asyncio.wait_for(wait_started.wait(), timeout=0.5)
+        accepted = connector.index.get("neil-shared", response.json()["thread"]["thread_id"])
+        assert accepted is not None
+        assert accepted.workspace["status"] == "running"
+        assert (
+            accepted.workspace[PENDING_ORCHESTRATOR_COMPLETION_KEY]["turn_id"]
+            == worker_posts[0]["body"]["turn_id"]
+        )
+        assert not {
+            "prompt",
+            "resume",
+            "requested_tuning",
+        } & accepted.workspace[PENDING_ORCHESTRATOR_COMPLETION_KEY].keys()
+        assert accepted.messages == ()
+
+        release_completion.set()
+        deadline = asyncio.get_running_loop().time() + 0.5
+        completed = accepted
+        while asyncio.get_running_loop().time() < deadline:
+            completed = connector.index.get_with_messages("neil-shared", accepted.thread_id) or completed
+            if completed.workspace.get("status") == "ready" and completed.messages:
+                break
+            await asyncio.sleep(0.01)
+        return response, replay, completed
+
+    response, replay, completed = asyncio.run(_with_server(cfg, scenario))
+
+    assert response.status_code == 202
+    assert response.json()["run"]["status"] == "started"
+    assert replay.status_code == 202
+    assert replay.json()["idempotent"] is True
+    assert len(worker_posts) == 1
+    assert worker_posts[0]["path"] == "/sessions/orch_routine_async/turns"
+    assert completed.workspace["status"] == "ready"
+    assert PENDING_ORCHESTRATOR_COMPLETION_KEY not in completed.workspace
+    assert [message["content"] for message in completed.messages] == [
+        "Run the review without holding the HTTP request open.",
+        "Routine completed in the background.",
+    ]
+
+
+def _ambiguous_worker_500(message: str) -> WorkerRequestError:
+    return WorkerRequestError(message, code="internal_error", status_code=500)
+
+
+@pytest.mark.parametrize(
+    ("dispatch_error", "failures_before_success"),
+    [
+        (OSError, 1),
+        (TimeoutError, 1),
+        (_ambiguous_worker_500, 1),
+        (OSError, 4),
+        (OSError, 7),
+    ],
+)
+def test_cockpit_routine_initial_ambiguous_dispatch_retries_before_response(tmp_path, monkeypatch, dispatch_error, failures_before_success) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    posts: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_ensure(_project, thread, _requester, *, progress):  # noqa: ANN001
+        del progress
+        return connector.index.save(
+            replace(
+                thread,
+                worker_id="macbook-worker",
+                workspace={
+                    **thread.workspace,
+                    "worker_id": "macbook-worker",
+                    "session_id": "orch_routine_retry",
+                    "session_generation": 0,
+                    "status": "ready",
+                    "provision_phase": "ready",
+                },
+            )
+        )
+
+    def fake_post(_worker_id: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        posts.append((path, body))
+        if len(posts) <= failures_before_success:
+            # A 5xx may be returned after the worker accepted the idempotent
+            # turn, so recovery must replay this exact request identity.
+            raise dispatch_error("ambiguous initial dispatch failure")
+        return {"ok": True}
+
+    async def fake_wait(_worker_id: str, _session_id: str, _turn_id: str) -> str:
+        return "Recovered without waiting for a process restart."
+
+    monkeypatch.setattr(connector, "_ensure_orchestrator_session", fake_ensure)
+    monkeypatch.setattr(connector, "_post_worker_json", fake_post)
+    monkeypatch.setattr(connector, "_wait_for_orchestrator_turn", fake_wait)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def scenario(base: str, client: httpx.AsyncClient):
+        response = await client.post(
+            f"{base}/v1/routines/pull-request-review/run",
+            json={
+                "project_id": "neil-shared",
+                "prompt": "Recover this ambiguous dispatch.",
+                "params": _pull_request_review_params(),
+                "idempotency_key": "review-ambiguous-dispatch",
+            },
+        )
+        replay = await client.post(
+            f"{base}/v1/routines/pull-request-review/run",
+            json={
+                "project_id": "neil-shared",
+                "prompt": "Recover this ambiguous dispatch.",
+                "params": _pull_request_review_params(),
+                "idempotency_key": "review-ambiguous-dispatch",
+            },
+        )
+        deadline = asyncio.get_running_loop().time() + 2
+        completed = connector.index.list_all()[0]
+        retained_state = None
+        if failures_before_success == 7:
+            while len(posts) < 7 and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.01)
+            completed = connector.index.get("neil-shared", completed.thread_id) or completed
+            retained_state = (completed.workspace.get("status"), completed.workspace.get("provision_phase"), isinstance(completed.workspace.get(PENDING_ORCHESTRATOR_COMPLETION_KEY), dict))
+        while asyncio.get_running_loop().time() < deadline:
+            completed = connector.index.get_with_messages(
+                "neil-shared",
+                completed.thread_id,
+            ) or completed
+            if completed.workspace.get("status") == "ready" and completed.messages:
+                break
+            await asyncio.sleep(0.01)
+        return response, replay, retained_state, completed
+
+    response, replay, retained_state, completed = asyncio.run(_with_server(cfg, scenario))
+
+    assert response.status_code == 202
+    assert response.json()["run"]["status"] == (
+        "dispatching" if failures_before_success >= 4 else "started"
+    )
+    assert replay.status_code == 202
+    assert replay.json()["idempotent"] is True
+    assert len(posts) == failures_before_success + 1
+    assert len({body["turn_id"] for _path, body in posts}) == 1
+    assert len({body["idempotency_key"] for _path, body in posts}) == 1
+    assert all(path == "/sessions/orch_routine_retry/turns" for path, _body in posts)
+    if failures_before_success == 7:
+        assert retained_state == ("starting", "dispatching", True)
+    assert PENDING_ORCHESTRATOR_COMPLETION_KEY not in completed.workspace
+    assert len(connector.index.list_all()) == 1
+    assert completed.workspace["status"] == "ready"
+    assert [message["content"] for message in completed.messages] == [
+        "Recover this ambiguous dispatch.",
+        "Recovered without waiting for a process restart.",
+    ]
+
+
+@pytest.mark.parametrize("terminal_failure", ["runtime", "worker_4xx", "removed_worker"])
+def test_cockpit_routine_dispatch_recovery_stops_on_terminal_failure(
+    tmp_path, monkeypatch, terminal_failure
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    connector = CockpitConnector(
+        cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None
+    )
+    posts: list[str] = []
+
+    async def fake_ensure(_project, thread, _requester, *, progress):  # noqa: ANN001
+        del progress
+        return connector.index.save(
+            replace(
+                thread,
+                worker_id="removed-worker",
+                workspace={
+                    **thread.workspace,
+                    "worker_id": "removed-worker",
+                    "session_id": "orch_removed_worker",
+                    "session_generation": 0,
+                    "status": "ready",
+                    "provision_phase": "ready",
+                },
+            )
+        )
+
+    original_post = connector._post_worker_json
+
+    def flaky_then_terminal(
+        worker_id: str, path: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        posts.append(path)
+        if len(posts) <= 4:
+            raise OSError("ambiguous response loss")
+        if terminal_failure == "runtime":
+            raise RuntimeError("deterministic local dispatch failure")
+        if terminal_failure == "worker_4xx":
+            raise WorkerRequestError("worker rejected dispatch", status_code=409)
+        return original_post(worker_id, path, body)
+
+    monkeypatch.setattr(connector, "_ensure_orchestrator_session", fake_ensure)
+    monkeypatch.setattr(connector, "_post_worker_json", flaky_then_terminal)
+    monkeypatch.setattr(
+        cockpit_api_module, "_cockpit_connector", lambda _ctx: connector
+    )
+
+    async def scenario(base: str, client: httpx.AsyncClient):
+        response = await client.post(
+            f"{base}/v1/routines/pull-request-review/run",
+            json={
+                "project_id": "neil-shared",
+                "prompt": "Do not retry forever after worker removal.",
+                "params": _pull_request_review_params(),
+                "idempotency_key": "review-worker-removed",
+            },
+        )
+        deadline = asyncio.get_running_loop().time() + 1
+        thread = connector.index.list_all()[0]
+        while asyncio.get_running_loop().time() < deadline:
+            thread = connector.index.get("neil-shared", thread.thread_id) or thread
+            if thread.workspace.get("status") == "failed":
+                break
+            await asyncio.sleep(0.01)
+        attempts_after_failure = len(posts)
+        await asyncio.sleep(0.35)
+        return response, thread, attempts_after_failure
+
+    response, thread, attempts_after_failure = asyncio.run(_with_server(cfg, scenario))
+
+    assert response.status_code == 202
+    assert response.json()["run"]["status"] == "dispatching"
+    assert thread.workspace["status"] == "failed"
+    assert thread.workspace["provision_phase"] == "failed"
+    assert PENDING_ORCHESTRATOR_COMPLETION_KEY not in thread.workspace
+    assert attempts_after_failure == 5
+    assert len(posts) == attempts_after_failure
+
+
+def test_cockpit_startup_replays_preaccepted_routine_dispatch_and_keeps_turn_lease(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    now = "2026-07-20T12:00:00+00:00"
+    thread = CockpitThread(
+        thread_id="thread_routine_restart",
+        project_id="neil-shared",
+        session_id="project:neil-shared:thread_routine_restart",
+        title="Restart-safe routine",
+        created_at=now,
+        updated_at=now,
+        created_by="neil",
+        chat_type="orchestrator",
+        engine="codex",
+        worker_id="macbook-worker",
+        workspace={
+            "worker_id": "macbook-worker",
+            "session_id": "orch_routine_restart",
+            "session_generation": 3,
+            "status": "starting",
+            "provision_phase": "dispatching",
+            PENDING_ORCHESTRATOR_COMPLETION_KEY: {
+                "phase": "dispatching",
+                "worker_id": "macbook-worker",
+                "session_id": "orch_routine_restart",
+                "session_generation": 3,
+                "turn_id": "routine_restart_turn",
+                "idempotency_key": "review-restart-123",
+                "persisted_text": "Finish this accepted routine after an API restart.",
+                "prompt": "Recovered authoritative context and routine instruction.",
+                "resume": False,
+                "requested_tuning": {"model": "gpt-5"},
+                "requester": {
+                    "device_id": "local-mac",
+                    "identity": "neil",
+                    "scope": "personal",
+                    "capabilities": [],
+                    "channel": "cockpit",
+                    "confidence": "strong",
+                    "peer": "neil",
+                },
+            },
+        },
+    )
+    connector.index.save(thread)
+    wait_started = asyncio.Event()
+    release_completion = asyncio.Event()
+    replayed_posts: list[dict[str, Any]] = []
+
+    def fake_post(worker_id: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        replayed_posts.append({"worker_id": worker_id, "path": path, "body": body})
+        if len(replayed_posts) == 1:
+            raise OSError("worker restarting")
+        if len(replayed_posts) == 2:
+            raise TimeoutError("worker still starting")
+        return {"ok": True}
+
+    async def fake_wait(worker_id: str, session_id: str, turn_id: str) -> str:
+        assert (worker_id, session_id, turn_id) == (
+            "macbook-worker",
+            "orch_routine_restart",
+            "routine_restart_turn",
+        )
+        wait_started.set()
+        await release_completion.wait()
+        return "The restarted API persisted this worker result."
+
+    monkeypatch.setattr(connector, "_post_worker_json", fake_post)
+    monkeypatch.setattr(connector, "_wait_for_orchestrator_turn", fake_wait)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def scenario(_base: str, _client: httpx.AsyncClient):
+        await asyncio.wait_for(wait_started.wait(), timeout=2)
+        accepted = connector.index.get("neil-shared", thread.thread_id)
+        assert accepted is not None
+        assert accepted.workspace[PENDING_ORCHESTRATOR_COMPLETION_KEY]["phase"] == "accepted"
+        assert not {
+            "prompt",
+            "resume",
+            "requested_tuning",
+        } & accepted.workspace[PENDING_ORCHESTRATOR_COMPLETION_KEY].keys()
+        with pytest.raises(RuntimeError, match="already has an active turn"):
+            connector.index.reserve_execution_turn("neil-shared", thread.thread_id)
+
+        release_completion.set()
+        deadline = asyncio.get_running_loop().time() + 0.5
+        completed = thread
+        while asyncio.get_running_loop().time() < deadline:
+            completed = connector.index.get_with_messages("neil-shared", thread.thread_id) or completed
+            if completed.workspace.get("status") == "ready" and completed.messages:
+                break
+            await asyncio.sleep(0.01)
+        return completed
+
+    completed = asyncio.run(_with_server(cfg, scenario))
+
+    assert completed.workspace["status"] == "ready"
+    assert PENDING_ORCHESTRATOR_COMPLETION_KEY not in completed.workspace
+    assert len(replayed_posts) == 3
+    assert replayed_posts[0]["worker_id"] == "macbook-worker"
+    assert replayed_posts[0]["path"] == "/sessions/orch_routine_restart/turns"
+    assert replayed_posts[0]["body"]["turn_id"] == "routine_restart_turn"
+    assert (
+        replayed_posts[0]["body"]["idempotency_key"]
+        == "orchestrator-turn:thread_routine_restart:review-restart-123"
+    )
+    assert replayed_posts[0]["body"]["prompt"] == (
+        "Recovered authoritative context and routine instruction."
+    )
+    assert replayed_posts[0]["body"]["model"] == "gpt-5"
+    assert [message["content"] for message in completed.messages] == [
+        "Finish this accepted routine after an API restart.",
+        "The restarted API persisted this worker result.",
+    ]
+
+
+def test_cockpit_interrupt_preserves_and_detach_removes_pending_orchestrator_completion(tmp_path) -> None:
+    index = CockpitThreadIndex(tmp_path / "threads.json")
+    now = "2026-07-20T12:00:00+00:00"
+
+    def running_thread(thread_id: str) -> CockpitThread:
+        return CockpitThread(
+            thread_id=thread_id,
+            project_id="project",
+            session_id=f"project:project:{thread_id}",
+            title="Routine",
+            created_at=now,
+            updated_at=now,
+            created_by="neil",
+            chat_type="orchestrator",
+            workspace={
+                "session_id": f"session_{thread_id}",
+                "session_generation": 4,
+                "status": "running",
+                "provision_phase": "running",
+                PENDING_ORCHESTRATOR_COMPLETION_KEY: {
+                    "phase": "accepted",
+                    "turn_id": f"turn_{thread_id}",
+                },
+            },
+        )
+
+    interrupted = running_thread("interrupt")
+    index.save(interrupted)
+    claimed = index.claim_execution_interrupt("project", interrupted.thread_id, turn_id="turn_interrupt")
+    assert claimed is not None
+    assert claimed.thread.workspace["status"] == "interrupting"
+    assert PENDING_ORCHESTRATOR_COMPLETION_KEY in claimed.thread.workspace
+    assert claimed.thread.workspace[PENDING_EXECUTION_INTERRUPT_KEY] == {
+        "worker_id": "",
+        "session_id": "session_interrupt",
+        "session_generation": 4,
+        "turn_id": "turn_interrupt",
+        "restore_status": "running",
+        "restore_provision_phase": "running",
+        "requested_at": claimed.thread.workspace[PENDING_EXECUTION_INTERRUPT_KEY]["requested_at"],
+    }
+
+    recovered = index.recover_orphaned_execution("project", interrupted.thread_id)
+    assert recovered is not None
+    assert recovered.workspace["status"] == "interrupting"
+    assert recovered.workspace["session_id"] == "session_interrupt"
+    assert recovered.workspace["session_generation"] == 4
+    assert PENDING_EXECUTION_INTERRUPT_KEY in recovered.workspace
+    with pytest.raises(RuntimeError, match="being interrupted"):
+        index.reserve_execution_turn("project", interrupted.thread_id)
+
+    detached = running_thread("detach")
+    index.save(detached)
+    released = index.detach_execution_if_matches(
+        "project",
+        detached.thread_id,
+        expected_session_id="session_detach",
+        expected_generation=4,
+    )
+    assert released is not None
+    assert released.workspace["status"] == "interrupted"
+    assert released.workspace["session_generation"] == 5
+    assert PENDING_ORCHESTRATOR_COMPLETION_KEY not in released.workspace
+
+
+def test_cockpit_restart_replays_interrupt_before_detaching_session(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    connector = CockpitConnector(
+        cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None
+    )
+    thread = CockpitThread(
+        thread_id="thread_interrupt_before_worker_acceptance",
+        project_id="project",
+        session_id="project:project:thread_interrupt_before_worker_acceptance",
+        title="Interrupt before acceptance",
+        created_at="2026-07-20T12:00:00Z",
+        updated_at="2026-07-20T12:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        worker_id="worker_a",
+        workspace={
+            "worker_id": "worker_a",
+            "session_id": "session_interrupt_before_acceptance",
+            "session_generation": 7,
+            "status": "running",
+            "provision_phase": "running",
+        },
+    )
+    connector.index.save(thread)
+    claim = connector.index.claim_execution_interrupt(
+        thread.project_id, thread.thread_id, turn_id="turn_interrupt_before_acceptance"
+    )
+    assert claim is not None
+    posts: list[tuple[str, str, dict[str, Any]]] = []
+
+    def accept_interrupt(
+        worker_id: str, path: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        posts.append((worker_id, path, body))
+        return {"ok": True}
+
+    monkeypatch.setattr(connector, "_post_worker_json", accept_interrupt)
+    monkeypatch.setattr(
+        connector,
+        "_get_worker_json",
+        lambda _worker_id, _path: {"status": "interrupted"},
+    )
+
+    recovered = connector.recover_pending_execution_interrupt(
+        thread.project_id, thread.thread_id
+    )
+
+    assert posts == [
+        (
+            "worker_a",
+            "/sessions/session_interrupt_before_acceptance/interrupt",
+            {
+                "turn_id": "turn_interrupt_before_acceptance",
+                "metadata": {},
+                "allowed_actions": [WORKER_SESSION_INTERRUPT],
+            },
+        )
+    ]
+    assert recovered is not None
+    assert recovered.workspace["status"] == "interrupted"
+    assert recovered.workspace["session_id"] == ""
+    assert recovered.workspace["session_generation"] == 8
+    assert PENDING_EXECUTION_INTERRUPT_KEY not in recovered.workspace
+
+
+def test_cockpit_restart_verifies_accepted_interrupt_after_ambiguous_worker_write(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    connector = CockpitConnector(
+        cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None
+    )
+    thread = CockpitThread(
+        thread_id="thread_interrupt_after_worker_acceptance",
+        project_id="project",
+        session_id="project:project:thread_interrupt_after_worker_acceptance",
+        title="Interrupt after acceptance",
+        created_at="2026-07-20T12:00:00Z",
+        updated_at="2026-07-20T12:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        worker_id="worker_a",
+        workspace={
+            "worker_id": "worker_a",
+            "session_id": "session_interrupt_after_acceptance",
+            "session_generation": 2,
+            "status": "running",
+            "provision_phase": "running",
+        },
+    )
+    connector.index.save(thread)
+    connector.index.claim_execution_interrupt(
+        thread.project_id, thread.thread_id, turn_id="turn_interrupt_after_acceptance"
+    )
+
+    def ambiguous_interrupt(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise WorkerRequestError("connection closed after worker acceptance")
+
+    monkeypatch.setattr(connector, "_post_worker_json", ambiguous_interrupt)
+    monkeypatch.setattr(
+        connector,
+        "_get_worker_json",
+        lambda _worker_id, _path: {"status": "interrupted"},
+    )
+
+    recovered = connector.recover_pending_execution_interrupt(
+        thread.project_id, thread.thread_id
+    )
+
+    assert recovered is not None
+    assert recovered.workspace["status"] == "interrupted"
+    assert recovered.workspace["session_id"] == ""
+    assert PENDING_EXECUTION_INTERRUPT_KEY not in recovered.workspace
+
+
+@pytest.mark.parametrize(
+    "rejection",
+    [
+        WorkerRequestError("no such session", status_code=404),
+        WorkerRequestError(
+            "worker is no longer configured",
+            code="worker_not_configured",
+            status_code=503,
+        ),
+    ],
+)
+def test_cockpit_restart_restores_execution_after_definite_interrupt_rejection(
+    tmp_path,
+    monkeypatch,
+    rejection,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    thread = CockpitThread(
+        thread_id="thread_interrupt_rejected",
+        project_id="project",
+        session_id="project:project:thread_interrupt_rejected",
+        title="Interrupt rejected",
+        created_at="2026-07-20T12:00:00Z",
+        updated_at="2026-07-20T12:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        worker_id="worker_a",
+        workspace={
+            "worker_id": "worker_a",
+            "session_id": "session_interrupt_rejected",
+            "session_generation": 9,
+            "status": "running",
+            "provision_phase": "running",
+        },
+    )
+    connector.index.save(thread)
+    connector.index.claim_execution_interrupt(
+        thread.project_id,
+        thread.thread_id,
+        turn_id="turn_interrupt_rejected",
+    )
+
+    def reject_interrupt(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise rejection
+
+    def unexpected_state_read(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise AssertionError("a definite rejection must not be treated as ambiguous")
+
+    monkeypatch.setattr(connector, "_post_worker_json", reject_interrupt)
+    monkeypatch.setattr(connector, "_get_worker_json", unexpected_state_read)
+
+    recovered = connector.recover_pending_execution_interrupt(
+        thread.project_id,
+        thread.thread_id,
+    )
+
+    assert recovered is not None
+    assert recovered.workspace["status"] == "running"
+    assert recovered.workspace["provision_phase"] == "running"
+    assert recovered.workspace["session_id"] == "session_interrupt_rejected"
+    assert recovered.workspace["session_generation"] == 9
+    assert PENDING_EXECUTION_INTERRUPT_KEY not in recovered.workspace
+
+
+def test_cockpit_live_definite_interrupt_rejection_rearms_pending_completion(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    ctx = cockpit_api_module.cockpit_context(cfg)
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    thread = CockpitThread(
+        thread_id="thread_interrupt_rearm_completion",
+        project_id="neil-shared",
+        session_id="project:neil-shared:thread_interrupt_rearm_completion",
+        title="Interrupt rearm completion",
+        created_at="2026-07-20T12:00:00Z",
+        updated_at="2026-07-20T12:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        worker_id="macbook-worker",
+        workspace={
+            "worker_id": "macbook-worker",
+            "session_id": "session_interrupt_rearm_completion",
+            "session_generation": 4,
+            "status": "running",
+            "provision_phase": "running",
+            PENDING_ORCHESTRATOR_COMPLETION_KEY: {
+                "phase": "accepted",
+                "worker_id": "macbook-worker",
+                "session_id": "session_interrupt_rearm_completion",
+                "session_generation": 4,
+                "turn_id": "turn_interrupt_rearm_completion",
+                "requester": {
+                    "device_id": "local-mac",
+                    "identity": "neil",
+                    "scope": "personal",
+                    "capabilities": [],
+                    "channel": "cockpit",
+                    "confidence": "strong",
+                    "peer": "neil",
+                },
+            },
+        },
+    )
+    connector.index.save(thread)
+    connector.index.claim_execution_interrupt(
+        thread.project_id,
+        thread.thread_id,
+        turn_id="turn_interrupt_rearm_completion",
+    )
+    rearmed: list[tuple[str, str]] = []
+
+    def reject_interrupt(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise WorkerRequestError("no such session", status_code=404)
+
+    def record_rearm(project, recovered):  # noqa: ANN001, ANN202
+        rearmed.append((project.id, recovered.thread_id))
+        return True
+
+    monkeypatch.setattr(connector, "_post_worker_json", reject_interrupt)
+    monkeypatch.setattr(connector, "rearm_pending_orchestrator_completion", record_rearm)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    pending = asyncio.run(
+        cockpit_api_module._recover_pending_execution_interrupts(ctx)  # noqa: SLF001
+    )
+
+    recovered = connector.index.get(thread.project_id, thread.thread_id)
+    assert pending == 0
+    assert recovered is not None
+    assert recovered.workspace["status"] == "running"
+    assert PENDING_EXECUTION_INTERRUPT_KEY not in recovered.workspace
+    assert rearmed == [("neil-shared", thread.thread_id)]
+
+
+def test_cockpit_restart_keeps_interrupt_marker_while_worker_is_still_running(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    connector = CockpitConnector(
+        cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None
+    )
+    thread = CockpitThread(
+        thread_id="thread_interrupt_worker_still_running",
+        project_id="project",
+        session_id="project:project:thread_interrupt_worker_still_running",
+        title="Interrupt still pending",
+        created_at="2026-07-20T12:00:00Z",
+        updated_at="2026-07-20T12:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        worker_id="worker_a",
+        workspace={
+            "worker_id": "worker_a",
+            "session_id": "session_interrupt_worker_still_running",
+            "session_generation": 3,
+            "status": "running",
+            "provision_phase": "running",
+        },
+    )
+    connector.index.save(thread)
+    connector.index.claim_execution_interrupt(
+        thread.project_id,
+        thread.thread_id,
+        turn_id="turn_interrupt_worker_still_running",
+    )
+
+    def unavailable_interrupt(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise WorkerRequestError("worker unavailable")
+
+    monkeypatch.setattr(connector, "_post_worker_json", unavailable_interrupt)
+    monkeypatch.setattr(
+        connector, "_get_worker_json", lambda _worker_id, _path: {"status": "running"}
+    )
+
+    recovered = connector.recover_pending_execution_interrupt(
+        thread.project_id, thread.thread_id
+    )
+
+    assert recovered is not None
+    assert recovered.workspace["status"] == "interrupting"
+    assert recovered.workspace["session_id"] == "session_interrupt_worker_still_running"
+    assert recovered.workspace["session_generation"] == 3
+    assert PENDING_EXECUTION_INTERRUPT_KEY in recovered.workspace
+
+
+def test_cockpit_live_recovery_retries_pending_interrupt_without_another_restart(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    index = CockpitThreadIndex(
+        Path(cfg.orchestration.workspace) / "cockpit-threads.json"
+    )
+    thread = CockpitThread(
+        thread_id="thread_interrupt_live_retry",
+        project_id="neil-shared",
+        session_id="project:neil-shared:thread_interrupt_live_retry",
+        title="Interrupt live retry",
+        created_at="2026-07-20T12:00:00Z",
+        updated_at="2026-07-20T12:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        worker_id="macbook-worker",
+        workspace={
+            "worker_id": "macbook-worker",
+            "session_id": "session_interrupt_live_retry",
+            "session_generation": 6,
+            "status": "running",
+            "provision_phase": "running",
+        },
+    )
+    index.save(thread)
+    index.claim_execution_interrupt(
+        thread.project_id, thread.thread_id, turn_id="turn_interrupt_live_retry"
+    )
+    attempts = 0
+    worker_status = "running"
+
+    def worker_post(url: str, **_kwargs: Any) -> Response:
+        nonlocal attempts, worker_status
+        if not url.endswith("/interrupt"):
+            return Response(
+                {"ok": False, "error": "unexpected worker post"}, status_code=400
+            )
+        attempts += 1
+        if attempts == 1:
+            raise OSError("worker temporarily unavailable")
+        worker_status = "interrupted"
+        return Response({"ok": True})
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        if url.endswith("/execution-state"):
+            return Response({"status": worker_status})
+        return Response({"ok": True})
+
+    async def scenario(_base: str, _client: httpx.AsyncClient):
+        deadline = asyncio.get_running_loop().time() + 2.0
+        recovered = index.get(thread.project_id, thread.thread_id)
+        while asyncio.get_running_loop().time() < deadline:
+            recovered = index.get(thread.project_id, thread.thread_id)
+            if (
+                recovered is not None
+                and recovered.workspace.get("status") == "interrupted"
+            ):
+                break
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.05)
+        task_names = [task.get_name() for task in asyncio.all_tasks()]
+        return recovered, task_names
+
+    recovered, task_names = asyncio.run(
+        _with_server(cfg, scenario, http_get=worker_get, http_post=worker_post)
+    )
+
+    assert attempts >= 2
+    assert recovered is not None
+    assert recovered.workspace["status"] == "interrupted"
+    assert recovered.workspace["session_id"] == ""
+    assert PENDING_EXECUTION_INTERRUPT_KEY not in recovered.workspace
+    assert "cockpit-interrupt-recovery" in task_names
+
+
+def test_cockpit_interrupt_recovery_context_idles_without_polling_when_none_are_pending(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    ctx = cockpit_api_module.cockpit_context(cfg)
+    recovery_calls = 0
+
+    async def recover_none(_ctx):  # noqa: ANN001, ANN202
+        nonlocal recovery_calls
+        recovery_calls += 1
+        return 0
+
+    monkeypatch.setattr(
+        cockpit_api_module,
+        "_recover_pending_execution_interrupts",
+        recover_none,
+    )
+
+    async def scenario() -> list[str]:
+        app = web.Application()
+        app[cockpit_api_module.INTERRUPT_RECOVERY_CTX_KEY] = ctx
+        manager = cockpit_api_module._interrupt_recovery_context(app)  # noqa: SLF001
+        await anext(manager)
+        await asyncio.sleep(0.05)
+        task_names = [task.get_name() for task in asyncio.all_tasks()]
+        await manager.aclose()
+        return task_names
+
+    task_names = asyncio.run(scenario())
+
+    assert recovery_calls == 1
+    assert "cockpit-interrupt-recovery" in task_names
+
+
+def test_cockpit_interrupt_recovery_event_does_not_lose_wakeup_during_scan(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    ctx = cockpit_api_module.cockpit_context(cfg)
+    scan_started = asyncio.Event()
+    release_scan = asyncio.Event()
+    recovery_calls = 0
+
+    async def recover_after_wakeup(_ctx):  # noqa: ANN001, ANN202
+        nonlocal recovery_calls
+        recovery_calls += 1
+        if recovery_calls == 1:
+            scan_started.set()
+            await release_scan.wait()
+        return 0
+
+    monkeypatch.setattr(
+        cockpit_api_module,
+        "_recover_pending_execution_interrupts",
+        recover_after_wakeup,
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            cockpit_api_module._retry_pending_execution_interrupts(ctx),  # noqa: SLF001
+        )
+        cockpit_api_module._start_interrupt_recovery(ctx)  # noqa: SLF001
+        await asyncio.wait_for(scan_started.wait(), timeout=1)
+        cockpit_api_module._start_interrupt_recovery(ctx)  # noqa: SLF001
+        release_scan.set()
+        deadline = asyncio.get_running_loop().time() + 1.0
+        while recovery_calls < 2 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        assert recovery_calls == 2
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+
+def test_cockpit_idle_server_rearms_recovery_after_later_ambiguous_interrupt(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil", caps=WORKER_SESSION_INTERRUPT)
+    _seed_project_registry(cfg)
+    index = CockpitThreadIndex(
+        Path(cfg.orchestration.workspace) / "cockpit-threads.json"
+    )
+    attempts = 0
+    worker_status = "running"
+
+    def worker_post(url: str, **_kwargs: Any) -> Response:
+        nonlocal attempts, worker_status
+        if not url.endswith("/interrupt"):
+            return Response(
+                {"ok": False, "error": "unexpected worker post"},
+                status_code=400,
+            )
+        attempts += 1
+        if attempts <= 2:
+            raise OSError("ambiguous interrupt delivery")
+        worker_status = "interrupted"
+        return Response({"ok": True})
+
+    def worker_get(url: str, **_kwargs: Any) -> Response:
+        if url.endswith("/execution-state"):
+            return Response({"status": worker_status})
+        return Response({"ok": True})
+
+    async def scenario(base: str, client: httpx.AsyncClient):
+        assert "cockpit-interrupt-recovery" in {
+            task.get_name() for task in asyncio.all_tasks()
+        }
+        thread = CockpitThread(
+            thread_id="thread_interrupt_after_idle_start",
+            project_id="neil-shared",
+            session_id="project:neil-shared:thread_interrupt_after_idle_start",
+            title="Interrupt after idle start",
+            created_at="2026-07-20T12:00:00Z",
+            updated_at="2026-07-20T12:00:00Z",
+            created_by="neil",
+            chat_type="orchestrator",
+            worker_id="macbook-worker",
+            workspace={
+                "worker_id": "macbook-worker",
+                "session_id": "session_interrupt_after_idle_start",
+                "session_generation": 3,
+                "status": "running",
+                "provision_phase": "running",
+            },
+        )
+        index.save(thread)
+        response = await client.post(
+            f"{base}/v1/projects/neil-shared/threads/{thread.thread_id}/interrupt",
+            json={
+                "turn_id": "turn_interrupt_after_idle_start",
+                "idempotency_key": "interrupt-after-idle-start",
+            },
+        )
+        deadline = asyncio.get_running_loop().time() + 2.0
+        recovered = index.get(thread.project_id, thread.thread_id)
+        while asyncio.get_running_loop().time() < deadline:
+            recovered = index.get(thread.project_id, thread.thread_id)
+            if recovered is not None and recovered.workspace.get("status") == "interrupted":
+                break
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.05)
+        task_names = [task.get_name() for task in asyncio.all_tasks()]
+        return response, recovered, task_names
+
+    response, recovered, task_names = asyncio.run(
+        _with_server(
+            cfg,
+            scenario,
+            http_get=worker_get,
+            http_post=worker_post,
+        )
+    )
+
+    assert response.status_code == 502
+    assert attempts >= 3
+    assert recovered is not None
+    assert recovered.workspace["status"] == "interrupted"
+    assert recovered.workspace["session_id"] == ""
+    assert PENDING_EXECUTION_INTERRUPT_KEY not in recovered.workspace
+    assert "cockpit-interrupt-recovery" in task_names
+
+
+def test_cockpit_interrupt_winning_before_completion_commit_drops_transcript_and_memory(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    requester = RequestContext(
+        "local-mac",
+        "neil",
+        "personal",
+        frozenset(),
+        channel="cockpit",
+        peer="neil",
+    )
+    thread = CockpitThread(
+        thread_id="thread_completion_interrupt_race",
+        project_id=project.id,
+        session_id="project:neil-shared:thread_completion_interrupt_race",
+        title="Completion interrupt race",
+        created_at="2026-07-20T12:00:00Z",
+        updated_at="2026-07-20T12:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        workspace={
+            "worker_id": "macbook-worker",
+            "session_id": "orch_completion_interrupt_race",
+            "session_generation": 5,
+            "status": "running",
+            "provision_phase": "running",
+            PENDING_ORCHESTRATOR_COMPLETION_KEY: {
+                "phase": "accepted",
+                "turn_id": "turn_completion_interrupt_race",
+            },
+        },
+    )
+    connector.index.save(thread)
+    interrupt_requested = threading.Event()
+    interrupt_completed = threading.Event()
+    persist_calls: list[tuple[Any, ...]] = []
+
+    def interrupt() -> None:
+        assert interrupt_requested.wait(timeout=2)
+        claimed = connector.index.claim_execution_interrupt(project.id, thread.thread_id)
+        assert claimed is not None
+        assert claimed.thread.workspace["status"] == "interrupting"
+        interrupt_completed.set()
+
+    interrupter = threading.Thread(target=interrupt)
+    interrupter.start()
+
+    async def fake_wait(*_args):  # noqa: ANN002, ANN202
+        interrupt_requested.set()
+        assert await asyncio.to_thread(interrupt_completed.wait, 2)
+        return "This reply must not survive an interrupt that won ownership."
+
+    def record_persist(*args):  # noqa: ANN002, ANN202
+        persist_calls.append(args)
+
+    monkeypatch.setattr(connector, "_wait_for_orchestrator_turn", fake_wait)
+    monkeypatch.setattr(connector, "_persist_turn", record_persist)
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeError, match="execution was interrupted"):
+            await connector._complete_orchestrator_turn(  # noqa: SLF001
+                project,
+                thread,
+                requester,
+                "Original routine request.",
+                worker_id="macbook-worker",
+                session_id="orch_completion_interrupt_race",
+                session_generation=5,
+                turn_id="turn_completion_interrupt_race",
+                idempotency_key="completion-interrupt-race",
+                progress=None,
+                durable_completion=True,
+            )
+
+    asyncio.run(scenario())
+    interrupter.join(timeout=2)
+    assert not interrupter.is_alive()
+
+    interrupted = connector.index.get_with_messages(project.id, thread.thread_id)
+    assert interrupted is not None
+    assert interrupted.workspace["status"] == "interrupting"
+    assert PENDING_ORCHESTRATOR_COMPLETION_KEY in interrupted.workspace
+    assert interrupted.messages == ()
+    assert persist_calls == []
+
+
+def test_cockpit_routine_run_does_not_accept_a_synchronous_worker_rejection(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+
+    async def fake_ensure(_project, thread, _requester, *, progress):  # noqa: ANN001
+        del progress
+        return connector.index.save(
+            replace(
+                thread,
+                worker_id="macbook-worker",
+                workspace={
+                    **thread.workspace,
+                    "worker_id": "macbook-worker",
+                    "session_id": "orch_routine_rejected",
+                    "session_generation": 0,
+                    "status": "ready",
+                    "provision_phase": "ready",
+                },
+            )
+        )
+
+    monkeypatch.setattr(connector, "_ensure_orchestrator_session", fake_ensure)
+    def reject_turn(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise WorkerRequestError("worker rejected test turn", status_code=409)
+
+    monkeypatch.setattr(connector, "_post_worker_json", reject_turn)
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: connector)
+
+    async def scenario(base: str, client: httpx.AsyncClient):
+        return await client.post(
+            f"{base}/v1/routines/pull-request-review/run",
+            json={
+                "project_id": "neil-shared",
+                "prompt": "This dispatch must fail synchronously.",
+                "params": _pull_request_review_params(),
+                "idempotency_key": "review-rejected-123",
+            },
+        )
+
+    response = asyncio.run(_with_server(cfg, scenario))
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "routine_dispatch_failed"
+    rejected_threads = connector.index.list_all()
+    assert len(rejected_threads) == 1
+    assert rejected_threads[0].workspace["status"] == "failed"
+    assert PENDING_ORCHESTRATOR_COMPLETION_KEY not in rejected_threads[0].workspace
+
+
+def test_cockpit_routine_schedule_crud_records_routine_reference(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        identity="neil",
+        caps="orchestration.schedules.read,orchestration.schedules.write",
+    )
+    _seed_project_registry(cfg)
+
+    async def scenario(base: str, client: httpx.AsyncClient):
+        created = await client.post(
+            f"{base}/v1/schedules",
+            json={
+                "name": "Weekday brief",
+                "routine_id": "morning-brief",
+                "project_id": "neil-shared",
+                "hour": 9,
+                "minute": 15,
+                "weekdays": [0, 1, 2, 3, 4],
+                "timezone": "Europe/London",
+                "idempotency_key": "create-brief",
+            },
+        )
+        listed = await client.get(f"{base}/v1/schedules")
+        schedule_id = created.json()["schedule"]["schedule_id"]
+        updated = await client.patch(
+            f"{base}/v1/schedules/{schedule_id}",
+            json={"enabled": False, "idempotency_key": "disable-brief"},
+        )
+        deleted = await client.request(
+            "DELETE",
+            f"{base}/v1/schedules/{schedule_id}",
+            json={"idempotency_key": "delete-brief"},
+        )
+        return created, listed, updated, deleted
+
+    created, listed, updated, deleted = asyncio.run(_with_server(cfg, scenario))
+
+    assert created.status_code == 201
+    assert created.json()["schedule"]["routine_id"] == "morning-brief"
+    assert created.json()["schedule"]["routine_version"] == 1
+    assert created.json()["schedule"]["creator_auth_mode"] == "none"
+    assert created.json()["schedule"]["params"] == {}
+    assert len(listed.json()["schedules"]) == 1
+    assert updated.json()["schedule"]["enabled"] is False
+    assert deleted.json() == {
+        "ok": True,
+        "api_version": "v1",
+        "schema_version": 1,
+        "schedule_id": created.json()["schedule"]["schedule_id"],
+        "deleted": True,
+    }
+
+
+def test_cockpit_routine_schedule_create_rejects_invalid_tuning_without_saving(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        identity="neil",
+        caps="orchestration.schedules.read,orchestration.schedules.write",
+    )
+    _seed_project_registry(cfg)
+    _warm_probe_model_catalog_snapshot(cfg)
+
+    async def scenario(base: str, client: httpx.AsyncClient):
+        rejected = await client.post(
+            f"{base}/v1/schedules",
+            json={
+                "routine_id": "morning-brief",
+                "project_id": "neil-shared",
+                "engine": "codex",
+                "model": "gpt-nope",
+                "idempotency_key": "create-invalid-model",
+            },
+        )
+        listed = await client.get(f"{base}/v1/schedules")
+        return rejected, listed
+
+    rejected, listed = asyncio.run(_with_server(cfg, scenario))
+
+    assert rejected.status_code == 400
+    assert rejected.json()["error"]["code"] == "validation_failed"
+    assert "gpt-x, gpt-y" in rejected.json()["error"]["message"]
+    assert listed.json()["schedules"] == []
+
+
+def test_cockpit_routine_schedule_update_rejects_invalid_tuning_without_mutating(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        identity="neil",
+        caps="orchestration.schedules.read,orchestration.schedules.write",
+    )
+    _seed_project_registry(cfg)
+    _warm_probe_model_catalog_snapshot(cfg)
+
+    async def scenario(base: str, client: httpx.AsyncClient):
+        created = await client.post(
+            f"{base}/v1/schedules",
+            json={
+                "routine_id": "morning-brief",
+                "project_id": "neil-shared",
+                "engine": "codex",
+                "model": "gpt-x",
+                "idempotency_key": "create-valid-model",
+            },
+        )
+        schedule_id = created.json()["schedule"]["schedule_id"]
+        rejected = await client.patch(
+            f"{base}/v1/schedules/{schedule_id}",
+            json={"model": "gpt-nope", "idempotency_key": "update-invalid-model"},
+        )
+        listed = await client.get(f"{base}/v1/schedules")
+        return created, rejected, listed
+
+    created, rejected, listed = asyncio.run(_with_server(cfg, scenario))
+
+    assert created.status_code == 201
+    assert rejected.status_code == 400
+    assert rejected.json()["error"]["code"] == "validation_failed"
+    schedules = listed.json()["schedules"]
+    assert len(schedules) == 1
+    assert schedules[0]["model"] == "gpt-x"
+
+
+def test_oauth_schedule_writes_require_the_requester_grant(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        identity="neil",
+        profile_caps="orchestration.schedules.read,orchestration.schedules.write",
+        auth_mode="oauth",
+        oauth_issuer="https://cockpit.example",
+        oauth_audience="jarvis-brain",
+        oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+        oauth_required_scopes="jarvis:read",
+    )
+    _seed_project_registry(cfg)
+    _seed_user_profile(cfg, "neil", capabilities=["orchestration.schedules.read"])
+    schedule = cockpit_api_module._routine_schedule_store(  # noqa: SLF001
+        cockpit_api_module.cockpit_context(cfg)
+    ).create(
+        name="Protected brief",
+        routine_id="morning-brief",
+        routine_version=1,
+        project_id="neil-shared",
+        created_by="neil",
+        creator_auth_mode="oauth",
+        hour=9,
+        minute=15,
+        timezone="UTC",
+    )
+    token = fixture["sign"](subject="neil", jarvis_user="neil", scope="jarvis:read")
+    headers = {"Authorization": f"Bearer {token}"}
+    dispatches: list[str] = []
+
+    async def fake_execute(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        dispatches.append("dispatched")
+        return {"ok": True}
+
+    monkeypatch.setattr(cockpit_api_module, "_execute_routine", fake_execute)
+
+    async def scenario(base: str, client: httpx.AsyncClient):
+        capabilities = await client.get(f"{base}/v1/capabilities", headers=headers)
+        created = await client.post(
+            f"{base}/v1/schedules",
+            headers=headers,
+            json={
+                "name": "Denied brief",
+                "routine_id": "morning-brief",
+                "project_id": "neil-shared",
+                "hour": 9,
+                "minute": 15,
+                "timezone": "UTC",
+                "idempotency_key": "denied-create",
+            },
+        )
+        updated = await client.patch(
+            f"{base}/v1/schedules/{schedule.schedule_id}",
+            headers=headers,
+            json={"enabled": False, "idempotency_key": "denied-update"},
+        )
+        run = await client.post(
+            f"{base}/v1/schedules/{schedule.schedule_id}/run",
+            headers=headers,
+            json={"idempotency_key": "denied-run"},
+        )
+        deleted = await client.request(
+            "DELETE",
+            f"{base}/v1/schedules/{schedule.schedule_id}",
+            headers=headers,
+            json={"idempotency_key": "denied-delete"},
+        )
+        assert capabilities.json()["features"]["schedules"]["writable"] is False
+        assert "orchestration.schedules.write" not in capabilities.json()["capabilities"]
+        return created, updated, run, deleted
+
+    responses = asyncio.run(_with_server(cfg, scenario, http_get=jwks_get))
+
+    assert [response.status_code for response in responses] == [403, 403, 403, 403]
+    assert {
+        response.json()["error"]["message"] for response in responses
+    } == {"missing authority: orchestration.schedules.write"}
+    assert dispatches == []
+    assert cockpit_api_module._routine_schedule_store(  # noqa: SLF001
+        cockpit_api_module.cockpit_context(cfg)
+    ).get(schedule.schedule_id) is not None
+
+
+def test_oauth_schedule_list_requires_the_requester_read_grant(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        identity="neil",
+        profile_caps="orchestration.schedules.read,orchestration.schedules.write",
+        auth_mode="oauth",
+        oauth_issuer="https://cockpit.example",
+        oauth_audience="jarvis-brain",
+        oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+        oauth_required_scopes="jarvis:read",
+    )
+    _seed_project_registry(cfg)
+    _seed_user_profile(cfg, "neil", capabilities=["orchestration.schedules.write"])
+    token = fixture["sign"](subject="neil", jarvis_user="neil", scope="jarvis:read")
+    headers = {"Authorization": f"Bearer {token}"}
+
+    async def scenario(base: str, client: httpx.AsyncClient):
+        capabilities = await client.get(f"{base}/v1/capabilities", headers=headers)
+        listed = await client.get(f"{base}/v1/schedules", headers=headers)
+        return capabilities, listed
+
+    capabilities, listed = asyncio.run(_with_server(cfg, scenario, http_get=jwks_get))
+
+    assert capabilities.status_code == 200
+    assert capabilities.json()["features"]["schedules"]["available"] is False
+    assert "orchestration.schedules.read" not in capabilities.json()["capabilities"]
+    assert listed.status_code == 403
+    assert listed.json()["error"]["message"] == "missing authority: orchestration.schedules.read"
+
+
+def test_scheduled_routine_uses_trigger_local_date_for_dynamic_today(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    prompts: list[str] = []
+
+    class FakeRoutineConnector:
+        async def open_thread(self, project, requester, **kwargs):  # noqa: ANN001
+            now = "2026-07-20T12:00:00+00:00"
+            return CockpitThread(
+                thread_id="thread_scheduled_date",
+                project_id=project.id,
+                session_id="conv_scheduled_date",
+                title=kwargs["title"],
+                created_at=now,
+                updated_at=now,
+                created_by=requester.identity,
+                chat_type="orchestrator",
+                engine=kwargs["engine"],
+            )
+
+        async def turn(self, _project, thread, _requester, text, **_kwargs):  # noqa: ANN001
+            prompts.append(text)
+            return "Workspace turn is running.", thread, ()
+
+    monkeypatch.setattr(cockpit_api_module, "_cockpit_connector", lambda _ctx: FakeRoutineConnector())
+    ctx = cockpit_api_module.cockpit_context(cfg)
+    requester = RequestContext(
+        device_id=cfg.capabilities.device_id,
+        identity="neil",
+        scope="personal",
+        capabilities=frozenset(),
+        channel="schedule",
+        peer="neil",
+    )
+
+    asyncio.run(
+        cockpit_api_module._execute_routine(  # noqa: SLF001
+            ctx,
+            requester,
+            "morning-brief",
+            {"project_id": "neil-shared", "params": {}, "target": {}},
+            trigger={"type": "schedule", "local_date": "2030-01-02"},
+        )
+    )
+
+    assert len(prompts) == 1
+    assert "morning brief for 2030-01-02" in prompts[0]
+    assert "Focus on Priorities, deadlines, blockers, and decisions that need attention." in prompts[0]
+
+
+def test_routine_schedule_tick_rechecks_revoked_oauth_creator_grant(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    fixture, jwks_get = _oauth_fixture()
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        identity="neil",
+        profile_caps="orchestration.schedules.write",
+        auth_mode="oauth",
+        oauth_issuer="https://cockpit.example",
+        oauth_audience="jarvis-brain",
+        oauth_jwks_url="https://cockpit.example/api/auth/jwks",
+        oauth_required_scopes="jarvis:read",
+    )
+    _seed_project_registry(cfg)
+    _seed_user_profile(cfg, "neil", capabilities=["orchestration.schedules.write"])
+    token = fixture["sign"](subject="neil", jarvis_user="neil", scope="jarvis:read")
+
+    async def create_schedule(base: str, client: httpx.AsyncClient):
+        return await client.post(
+            f"{base}/v1/schedules",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "name": "Revocable brief",
+                "routine_id": "morning-brief",
+                "project_id": "neil-shared",
+                "hour": 9,
+                "minute": 15,
+                "timezone": "UTC",
+                "idempotency_key": "revocable-create",
+            },
+        )
+
+    created = asyncio.run(_with_server(cfg, create_schedule, http_get=jwks_get))
+    assert created.status_code == 201
+    assert created.json()["schedule"]["creator_auth_mode"] == "oauth"
+    schedule_id = created.json()["schedule"]["schedule_id"]
+
+    _seed_user_profile(cfg, "neil", capabilities=[])
+    ctx = cockpit_api_module.cockpit_context(cfg)
+    dispatches: list[str] = []
+
+    async def fake_execute(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+        dispatches.append("dispatched")
+        return {"ok": True}
+
+    monkeypatch.setattr(cockpit_api_module, "_execute_routine", fake_execute)
+    now = datetime(2026, 7, 20, 9, 15, tzinfo=UTC)
+    asyncio.run(cockpit_api_module._dispatch_due_routine_schedules(ctx, now))  # noqa: SLF001
+
+    assert dispatches == []
+    schedule = cockpit_api_module._routine_schedule_store(ctx).get(schedule_id)  # noqa: SLF001
+    assert schedule is not None
+    assert schedule.last_fired_date == ""
+
+
+def test_routine_schedule_tick_rechecks_authority_and_acks_only_after_dispatch(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        identity="neil",
+        caps="orchestration.schedules.write",
+    )
+    _seed_project_registry(cfg)
+    ctx = cockpit_api_module.cockpit_context(cfg)
+    store = cockpit_api_module._routine_schedule_store(ctx)  # noqa: SLF001
+    schedule = store.create(
+        name="Morning brief",
+        routine_id="morning-brief",
+        routine_version=1,
+        project_id="neil-shared",
+        created_by="neil",
+        params={"day": "2026-07-20"},
+        target={},
+        hour=9,
+        minute=15,
+        timezone="UTC",
+        first_eligible_date="2026-07-20",
+    )
+    dispatches: list[str] = []
+
+    async def fake_execute(  # noqa: ANN001
+        _ctx, _requester, routine_id, _body, *, trigger, launch_reservation
+    ):
+        assert launch_reservation["run_id"].startswith("routine_")
+        assert launch_reservation["thread_id"].startswith("thread_")
+        dispatches.append(f"{routine_id}:{trigger['schedule_id']}:{trigger['local_date']}")
+        return {"ok": True, "run": {"status": "started"}}
+
+    monkeypatch.setattr(cockpit_api_module, "_execute_routine", fake_execute)
+    now = datetime(2026, 7, 20, 9, 15, tzinfo=UTC)
+
+    asyncio.run(cockpit_api_module._dispatch_due_routine_schedules(ctx, now))  # noqa: SLF001
+    asyncio.run(cockpit_api_module._dispatch_due_routine_schedules(ctx, now))  # noqa: SLF001
+
+    assert dispatches == [f"morning-brief:{schedule.schedule_id}:2026-07-20"]
+    assert store.get(schedule.schedule_id).last_fired_date == "2026-07-20"  # type: ignore[union-attr]
+
+    denied_root = tmp_path / "denied"
+    denied_root.mkdir()
+    denied_cfg = _cfg(denied_root, monkeypatch, identity="neil", caps="")
+    denied_ctx = cockpit_api_module.cockpit_context(denied_cfg)
+    denied_store = cockpit_api_module._routine_schedule_store(denied_ctx)  # noqa: SLF001
+    denied = denied_store.create(
+        name="Denied",
+        routine_id="morning-brief",
+        routine_version=1,
+        project_id="neil-shared",
+        created_by="neil",
+        params={"day": "2026-07-20"},
+        target={},
+        hour=9,
+        minute=15,
+        timezone="UTC",
+        first_eligible_date="2026-07-20",
+    )
+    asyncio.run(cockpit_api_module._dispatch_due_routine_schedules(denied_ctx, now))  # noqa: SLF001
+    assert denied_store.get(denied.schedule_id).last_fired_date == ""  # type: ignore[union-attr]
+
+
+def test_routine_schedule_tick_resumes_reserved_launch_after_response_save_failure(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    cfg = _cfg(
+        tmp_path, monkeypatch, identity="neil", caps="orchestration.schedules.write"
+    )
+    _seed_project_registry(cfg)
+    ctx = cockpit_api_module.cockpit_context(cfg)
+    store = cockpit_api_module._routine_schedule_store(ctx)  # noqa: SLF001
+    schedule = store.create(
+        name="Crash-safe brief",
+        routine_id="morning-brief",
+        routine_version=1,
+        project_id="neil-shared",
+        created_by="neil",
+        hour=9,
+        minute=15,
+        timezone="UTC",
+        first_eligible_date="2026-07-20",
+    )
+    connector = CockpitConnector(
+        cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None
+    )
+    worker_posts: list[dict[str, Any]] = []
+
+    async def fake_ensure(_project, thread, _requester, *, progress):  # noqa: ANN001
+        del progress
+        return connector.index.save(
+            replace(
+                thread,
+                worker_id="macbook-worker",
+                workspace={
+                    **thread.workspace,
+                    "worker_id": "macbook-worker",
+                    "session_id": "orch_reserved_schedule",
+                    "session_generation": 0,
+                    "status": "ready",
+                    "provision_phase": "ready",
+                },
+            )
+        )
+
+    def fake_post(_worker_id: str, _path: str, body: dict[str, Any]) -> dict[str, Any]:
+        worker_posts.append(body)
+        return {"ok": True}
+
+    async def fake_wait(_worker_id: str, _session_id: str, _turn_id: str) -> str:
+        return "Scheduled routine completed."
+
+    original_save = cockpit_api_module.IdempotencyStore.save
+    response_saves = 0
+
+    def fail_first_automatic_response_save(store_instance, scope, key, body, response):  # noqa: ANN001, ANN202
+        nonlocal response_saves
+        expected_scope = (
+            f"routine-schedules/{schedule.schedule_id}/automatic-run/principal/"
+        )
+        if scope.startswith(expected_scope):
+            response_saves += 1
+            if response_saves == 1:
+                raise OSError("simulated scheduler crash after worker acceptance")
+        return original_save(store_instance, scope, key, body, response)
+
+    monkeypatch.setattr(connector, "_ensure_orchestrator_session", fake_ensure)
+    monkeypatch.setattr(connector, "_post_worker_json", fake_post)
+    monkeypatch.setattr(connector, "_wait_for_orchestrator_turn", fake_wait)
+    monkeypatch.setattr(
+        cockpit_api_module, "_cockpit_connector", lambda _ctx: connector
+    )
+    monkeypatch.setattr(
+        cockpit_api_module.IdempotencyStore, "save", fail_first_automatic_response_save
+    )
+    now = datetime(2026, 7, 20, 9, 15, tzinfo=UTC)
+
+    asyncio.run(cockpit_api_module._dispatch_due_routine_schedules(ctx, now))  # noqa: SLF001
+    assert store.get(schedule.schedule_id).last_fired_date == ""  # type: ignore[union-attr]
+    reserved_thread = connector.index.list_all()[0]
+
+    asyncio.run(cockpit_api_module._dispatch_due_routine_schedules(ctx, now))  # noqa: SLF001
+
+    fired = store.get(schedule.schedule_id)
+    assert fired is not None
+    assert fired.last_fired_date == "2026-07-20"
+    assert len(connector.index.list_all()) == 1
+    assert connector.index.list_all()[0].thread_id == reserved_thread.thread_id
+    assert len(worker_posts) == 1
+
+
+def test_routine_schedule_retries_a_failed_dispatch_after_the_target_minute(
+    tmp_path, monkeypatch
+) -> None:  # noqa: ANN001
+    cfg = _cfg(
+        tmp_path,
+        monkeypatch,
+        identity="neil",
+        caps="orchestration.schedules.write",
+    )
+    _seed_project_registry(cfg)
+    ctx = cockpit_api_module.cockpit_context(cfg)
+    store = cockpit_api_module._routine_schedule_store(ctx)  # noqa: SLF001
+    schedule = store.create(
+        name="Morning brief",
+        routine_id="morning-brief",
+        routine_version=1,
+        project_id="neil-shared",
+        created_by="neil",
+        hour=9,
+        minute=15,
+        timezone="UTC",
+        first_eligible_date="2026-07-20",
+    )
+    dispatches: list[str] = []
+
+    async def flaky_execute(  # noqa: ANN001
+        _ctx, _requester, routine_id, _body, *, trigger, launch_reservation
+    ):
+        assert launch_reservation["run_id"].startswith("routine_")
+        dispatches.append(f"{routine_id}:{trigger['schedule_id']}")
+        if len(dispatches) == 1:
+            raise RuntimeError("worker temporarily unavailable")
+        return {"ok": True, "run": {"status": "started"}}
+
+    monkeypatch.setattr(cockpit_api_module, "_execute_routine", flaky_execute)
+
+    asyncio.run(
+        cockpit_api_module._dispatch_due_routine_schedules(  # noqa: SLF001
+            ctx,
+            datetime(2026, 7, 20, 9, 16, tzinfo=UTC),
+        )
+    )
+    assert store.get(schedule.schedule_id).last_fired_date == ""  # type: ignore[union-attr]
+
+    asyncio.run(
+        cockpit_api_module._dispatch_due_routine_schedules(  # noqa: SLF001
+            ctx,
+            datetime(2026, 7, 20, 9, 17, tzinfo=UTC),
+        )
+    )
+
+    assert dispatches == [
+        f"morning-brief:{schedule.schedule_id}",
+        f"morning-brief:{schedule.schedule_id}",
+    ]
+    assert store.get(schedule.schedule_id).last_fired_date == "2026-07-20"  # type: ignore[union-attr]

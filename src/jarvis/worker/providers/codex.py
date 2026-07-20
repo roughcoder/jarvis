@@ -284,7 +284,7 @@ def _codex_start_or_resume_thread(
     session = sessions.get(session_id) or session
     thread_id = str(session.metadata.get("codex_thread_id") or "").strip()
     model = str(session.metadata.get("model") or "").strip()
-    orchestrator_overrides = _orchestrator_thread_overrides(turn)
+    thread_overrides = _thread_policy_overrides(turn, authority)
     if thread_id:
         rpc_id += 1
         thread_response = _send_request(
@@ -297,7 +297,7 @@ def _codex_start_or_resume_thread(
                 "approvalPolicy": authority.codex_approval_policy,
                 "sandbox": authority.codex_sandbox,
                 **({"model": model} if model else {}),
-                **orchestrator_overrides,
+                **thread_overrides,
             },
             session_id=session_id,
             turn=turn,
@@ -316,7 +316,7 @@ def _codex_start_or_resume_thread(
                 "approvalPolicy": authority.codex_approval_policy,
                 "sandbox": authority.codex_sandbox,
                 **({"model": model} if model else {}),
-                **orchestrator_overrides,
+                **thread_overrides,
             },
             session_id=session_id,
             turn=turn,
@@ -555,6 +555,17 @@ def _orchestrator_thread_overrides(turn: ProviderTurn) -> dict[str, Any]:
         },
         "developerInstructions": ORCHESTRATOR_INSTRUCTIONS,
     }
+
+
+def _thread_policy_overrides(turn: ProviderTurn, authority: WorkerSessionAuthority) -> dict[str, Any]:
+    overrides = _orchestrator_thread_overrides(turn)
+    if authority.allow_nested_agents:
+        return overrides
+    config = dict(overrides.get("config") or {})
+    features = dict(config.get("features") or {})
+    features["multi_agent"] = False
+    config["features"] = features
+    return {**overrides, "config": config}
 
 
 def _send_notification(process: subprocess.Popen[str], method: str, params: dict[str, Any] | None = None) -> None:

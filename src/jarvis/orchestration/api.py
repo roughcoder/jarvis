@@ -9,6 +9,7 @@ import hmac
 import json
 import logging
 import threading
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from dataclasses import dataclass, field, replace
@@ -41,12 +42,14 @@ from jarvis.connectors.cockpit import (
     CockpitConnector,
     CockpitThread,
     CockpitThreadIndex,
+    PENDING_ORCHESTRATOR_COMPLETION_KEY,
     ProviderTurnError,
     THREAD_INDEX_FILENAME,
     execute_orchestrator_tool,
     is_conversation_workspace,
     make_child_terminal_notifier,
     schedule_cold_task_drain,
+    stop_orchestrator_continuations,
     workspace_public,
 )
 from jarvis.ids import new_id, utc_now
@@ -139,6 +142,14 @@ from jarvis.orchestration.retention import (
     resolve_retention_settings,
     update_retention_overrides,
 )
+from jarvis.orchestration.routines import (
+    RoutineCatalog,
+    RoutineDefinition,
+    RoutineSchedule,
+    RoutineScheduleStore,
+    resolve_routine,
+    routine_schedules_path,
+)
 from jarvis.orchestration.service import (
     MissingAuthorityError,
     MissingWorkRepoError,
@@ -161,6 +172,7 @@ from jarvis.users import HOUSE
 HttpGet = Callable[..., Any]
 HttpPost = Callable[..., Any]
 HttpDelete = Callable[..., Any]
+_ROUTINE_CATALOG = RoutineCatalog()
 CONFIG_KEY = web.AppKey("config", Config)
 logger = logging.getLogger(__name__)
 SSE_REFRESH_ERROR_LOG_INTERVAL_S = 60.0
@@ -204,6 +216,11 @@ class CockpitAppContext:
     worker_state_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
     worker_state_cache_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     worker_state_refresh_modes: set[str] = field(default_factory=set, repr=False, compare=False)
+    interrupt_recovery_event: asyncio.Event = field(
+        default_factory=asyncio.Event,
+        repr=False,
+        compare=False,
+    )
     delete: HttpDelete = httpx.delete
 
     async def require_auth(self, request: web.Request) -> None:
@@ -658,6 +675,9 @@ class SseSnapshotHub:
 SSE_SNAPSHOT_HUB_KEY = web.AppKey("sse_snapshot_hub", SseSnapshotHub)
 RETENTION_CTX_KEY = web.AppKey("retention_ctx", CockpitAppContext)
 WORKER_PROBE_CTX_KEY = web.AppKey("worker_probe_ctx", CockpitAppContext)
+ROUTINE_SCHEDULE_CTX_KEY = web.AppKey("routine_schedule_ctx", CockpitAppContext)
+ORCHESTRATOR_COMPLETION_CTX_KEY = web.AppKey("orchestrator_completion_ctx", CockpitAppContext)
+INTERRUPT_RECOVERY_CTX_KEY = web.AppKey("interrupt_recovery_ctx", CockpitAppContext)
 
 
 def _queue_latest(queue: asyncio.Queue[dict[str, Any] | None], item: dict[str, Any] | None) -> None:
@@ -674,6 +694,88 @@ async def _sse_snapshot_hub_context(app: web.Application):  # noqa: ANN202
         yield
     finally:
         await hub.stop()
+
+
+async def _routine_schedule_context(app: web.Application):  # noqa: ANN202
+    ctx = app[ROUTINE_SCHEDULE_CTX_KEY]
+
+    async def loop() -> None:
+        while True:
+            now = datetime.now().astimezone()
+            try:
+                await _dispatch_due_routine_schedules(ctx, now)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - one bad schedule must not stop future ticks.
+                logger.exception("routine schedule tick failed")
+            await asyncio.sleep(max(1.0, 60.0 - datetime.now().astimezone().second))
+
+    task = asyncio.create_task(loop(), name="cockpit-routine-schedules")
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def _orchestrator_completion_context(app: web.Application):  # noqa: ANN202
+    ctx = app[ORCHESTRATOR_COMPLETION_CTX_KEY]
+    _rearm_pending_orchestrator_completions(ctx)
+    try:
+        yield
+    finally:
+        await stop_orchestrator_continuations()
+
+
+async def _retry_pending_execution_interrupts(ctx: CockpitAppContext) -> None:
+    while True:
+        await ctx.interrupt_recovery_event.wait()
+        ctx.interrupt_recovery_event.clear()
+        delay_s = 0.0
+        while True:
+            if delay_s:
+                await asyncio.sleep(delay_s)
+            try:
+                still_pending = await _recover_pending_execution_interrupts(ctx)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a later pass must retry recovery.
+                logger.exception("pending execution interrupt recovery failed")
+                still_pending = 1
+            if still_pending:
+                delay_s = min(max(delay_s * 2, 0.5), 5.0)
+                continue
+            if ctx.interrupt_recovery_event.is_set():
+                ctx.interrupt_recovery_event.clear()
+                delay_s = 0.0
+                continue
+            break
+
+
+def _start_interrupt_recovery(ctx: CockpitAppContext) -> None:
+    ctx.interrupt_recovery_event.set()
+
+
+async def _interrupt_recovery_context(app: web.Application):  # noqa: ANN202
+    ctx = app[INTERRUPT_RECOVERY_CTX_KEY]
+    task = asyncio.create_task(
+        _retry_pending_execution_interrupts(ctx),
+        name="cockpit-interrupt-recovery",
+    )
+    try:
+        pending = await _recover_pending_execution_interrupts(ctx)
+    except Exception:  # noqa: BLE001 - recovery must not prevent API startup.
+        logger.exception("initial pending execution interrupt recovery failed")
+        pending = 1
+    if pending:
+        _start_interrupt_recovery(ctx)
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 def cockpit_context(
@@ -922,6 +1024,12 @@ def make_app(
     app.cleanup_ctx.append(_retention_context)
     app[WORKER_PROBE_CTX_KEY] = ctx
     app.cleanup_ctx.append(_worker_probe_context)
+    app[INTERRUPT_RECOVERY_CTX_KEY] = ctx
+    app.cleanup_ctx.append(_interrupt_recovery_context)
+    app[ORCHESTRATOR_COMPLETION_CTX_KEY] = ctx
+    app.cleanup_ctx.append(_orchestrator_completion_context)
+    app[ROUTINE_SCHEDULE_CTX_KEY] = ctx
+    app.cleanup_ctx.append(_routine_schedule_context)
 
     async def worker_notify(request: web.Request) -> web.Response:
         try:
@@ -974,12 +1082,21 @@ def make_app(
         web.get("/v1/mcp/status", reads.mcp_status),
         web.get("/v1/mcp/tools", reads.mcp_tools),
         web.get("/v1/mcp/tokens", reads.mcp_token_list),
+        web.get("/v1/routines", reads.routines),
+        web.get("/v1/routines/{routine_id}", reads.routine_detail),
+        web.get("/v1/schedules", reads.routine_schedules),
         web.post("/v1/mcp/tokens", writes.mcp_token_issue),
         web.post(
             "/v1/orchestrator-tools/{project_id}/{thread_id}/{tool_name}",
             writes.orchestrator_tool,
         ),
         web.delete("/v1/mcp/tokens/{token_id}", writes.mcp_token_revoke),
+        web.post("/v1/routines/{routine_id}/resolve", writes.routine_resolve),
+        web.post("/v1/routines/{routine_id}/run", writes.routine_run),
+        web.post("/v1/schedules", writes.routine_schedule_create),
+        web.patch("/v1/schedules/{schedule_id}", writes.routine_schedule_update),
+        web.delete("/v1/schedules/{schedule_id}", writes.routine_schedule_delete),
+        web.post("/v1/schedules/{schedule_id}/run", writes.routine_schedule_run),
         web.get("/v1/projects", reads.projects),
         web.post("/v1/projects", writes.project_create),
         web.get("/v1/projects/{project_id}/threads", reads.project_threads),
@@ -1082,7 +1199,13 @@ class CockpitReadHandlers:
         await self.ctx.require_auth(request)
         requester = _requester_or_401(request, self.ctx.cfg)
         auth = request.get("auth", {})
-        features = await asyncio.to_thread(_feature_availability, self.ctx.cfg)
+        requester_auth_mode = _request_auth_mode(request)
+        features = await asyncio.to_thread(
+            _feature_availability,
+            self.ctx.cfg,
+            requester=requester,
+            auth_mode=requester_auth_mode,
+        )
         return web.json_response(
             {
                 "api_version": API_VERSION,
@@ -1092,7 +1215,11 @@ class CockpitReadHandlers:
                     "scope": requester.scope,
                     "auth_mode": str(auth.get("mode") or ""),
                 },
-                "capabilities": _cockpit_advertised_capabilities(requester, self.ctx.cfg),
+                "capabilities": _cockpit_advertised_capabilities(
+                    requester,
+                    self.ctx.cfg,
+                    auth_mode=requester_auth_mode,
+                ),
                 "routes": _route_templates(request.app),
                 "features": features,
             }
@@ -1156,6 +1283,61 @@ class CockpitReadHandlers:
                 "api_version": API_VERSION,
                 "schema_version": SCHEMA_VERSION,
                 "tokens": [token_record_public(record) for record in records],
+            }
+        )
+
+    async def routines(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        routines = await asyncio.to_thread(_ROUTINE_CATALOG.list)
+        return web.json_response(
+            {
+                "ok": True,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "routines": [routine.to_dict() for routine in routines],
+            }
+        )
+
+    async def routine_detail(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        routine = await asyncio.to_thread(
+            _ROUTINE_CATALOG.get,
+            request.match_info["routine_id"],
+            str(request.query.get("version") or ""),
+        )
+        if routine is None:
+            raise CockpitError("not_found", "routine not found", status=404)
+        return web.json_response(
+            {
+                "ok": True,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "routine": routine.to_dict(),
+            }
+        )
+
+    async def routine_schedules(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_401(request, self.ctx.cfg)
+        _require_requester_capability(
+            self.ctx.cfg,
+            requester,
+            "orchestration.schedules.read",
+            auth_mode=_request_auth_mode(request),
+        )
+        registry = await asyncio.to_thread(_registry_store, self.ctx.cfg)
+        schedules = await asyncio.to_thread(_routine_schedule_store, self.ctx)
+        visible: list[RoutineSchedule] = []
+        for schedule in await asyncio.to_thread(schedules.list):
+            project = await asyncio.to_thread(registry.get_project, schedule.project_id)
+            if project is not None and can_edit_project(requester, project).allowed:
+                visible.append(schedule)
+        return web.json_response(
+            {
+                "ok": True,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "schedules": [schedule.to_dict() for schedule in visible],
             }
         )
 
@@ -1559,6 +1741,267 @@ class CockpitReadHandlers:
 class CockpitWriteHandlers:
     def __init__(self, ctx: CockpitAppContext) -> None:
         self.ctx = ctx
+
+    async def routine_resolve(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_401(request, self.ctx.cfg)
+        body = await _json_body(request)
+        routine = await asyncio.to_thread(
+            _routine_or_404,
+            request.match_info["routine_id"],
+            str(body.get("routine_version") or ""),
+        )
+        project = await _routine_project(self.ctx, requester, str(body.get("project_id") or ""), required=False)
+        try:
+            resolution = resolve_routine(
+                routine,
+                params=_object_field(body, "params"),
+                target=_object_field(body, "target"),
+                project=project.as_dict() if project is not None else None,
+                requester=_activity_actor(requester),
+            )
+        except ValueError as exc:
+            raise CockpitError("validation_failed", str(exc), recoverable=True, status=400) from exc
+        return web.json_response(
+            {
+                "ok": True,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "routine": routine.to_dict(),
+                "resolution": resolution.to_dict(),
+            }
+        )
+
+    async def routine_run(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_401(request, self.ctx.cfg)
+        body = await _json_body(request)
+        key = _required_idempotency_key(body)
+        routine_id = request.match_info["routine_id"]
+        fingerprint = {**body, "routine_id": routine_id}
+
+        async def produce(reservation: dict[str, Any]) -> dict[str, Any]:
+            return await _execute_routine(
+                self.ctx,
+                requester,
+                routine_id,
+                body,
+                trigger={"type": "manual"},
+                launch_reservation=reservation,
+            )
+
+        response_body = await _idempotent_reserved_write_body(
+            self.ctx,
+            f"routines/{routine_id}/run",
+            key,
+            fingerprint,
+            produce,
+            _routine_launch_reservation,
+            requester=requester,
+        )
+        return web.json_response(response_body, status=202)
+
+    async def routine_schedule_create(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_401(request, self.ctx.cfg)
+        creator_auth_mode = _request_auth_mode(request)
+        _require_requester_capability(
+            self.ctx.cfg,
+            requester,
+            "orchestration.schedules.write",
+            auth_mode=creator_auth_mode,
+        )
+        body = await _json_body(request)
+        key = _required_idempotency_key(body)
+        routine = await asyncio.to_thread(
+            _routine_or_404,
+            str(body.get("routine_id") or ""),
+            str(body.get("routine_version") or ""),
+        )
+        project = await _routine_project(
+            self.ctx,
+            requester,
+            str(body.get("project_id") or ""),
+            required=True,
+        )
+        assert project is not None
+        values, target = _resolved_schedule_values(routine, project, requester, body)
+        normalized = _routine_schedule_fields(
+            body,
+            default_timezone=self.ctx.cfg.orchestration.default_timezone,
+        )
+        await _routine_execution_settings(self.ctx, routine, body)
+        fingerprint = {**body, "routine_version": routine.version, "project_id": project.id}
+
+        async def produce() -> dict[str, Any]:
+            try:
+                schedule = await asyncio.to_thread(
+                    _routine_schedule_store(self.ctx).create,
+                    name=str(body.get("name") or routine.name).strip() or routine.name,
+                    routine_id=routine.routine_id,
+                    routine_version=routine.version,
+                    project_id=project.id,
+                    created_by=requester.identity,
+                    creator_auth_mode=creator_auth_mode,
+                    params=values,
+                    target=target,
+                    **normalized,
+                )
+            except ValueError as exc:
+                raise CockpitError(
+                    "validation_failed",
+                    str(exc),
+                    recoverable=True,
+                    status=400,
+                ) from exc
+            return _routine_schedule_response(schedule)
+
+        response_body = await _idempotent_write_body(
+            self.ctx,
+            "routine-schedules/create",
+            key,
+            fingerprint,
+            produce,
+            requester=requester,
+        )
+        return web.json_response(response_body, status=201)
+
+    async def routine_schedule_update(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_401(request, self.ctx.cfg)
+        _require_requester_capability(
+            self.ctx.cfg,
+            requester,
+            "orchestration.schedules.write",
+            auth_mode=_request_auth_mode(request),
+        )
+        body = await _json_body(request)
+        key = _required_idempotency_key(body)
+        schedule = await _routine_schedule_for_write(self.ctx, requester, request.match_info["schedule_id"])
+        routine = await asyncio.to_thread(_routine_or_404, schedule.routine_id, schedule.routine_version)
+        project = await _routine_project(self.ctx, requester, schedule.project_id, required=True)
+        assert project is not None
+        merged_body = {
+            **schedule.to_dict(),
+            **{key: value for key, value in body.items() if key != "idempotency_key"},
+        }
+        values, target = _resolved_schedule_values(routine, project, requester, merged_body)
+        mutable = _routine_schedule_fields(
+            merged_body,
+            default_timezone=self.ctx.cfg.orchestration.default_timezone,
+        )
+        await _routine_execution_settings(self.ctx, routine, merged_body)
+        mutable.update(
+            name=str(merged_body.get("name") or schedule.name).strip()
+            or schedule.name,
+            params=values,
+            target=target,
+        )
+
+        async def produce() -> dict[str, Any]:
+            try:
+                updated = await asyncio.to_thread(
+                    _routine_schedule_store(self.ctx).update,
+                    schedule.schedule_id,
+                    **mutable,
+                )
+            except ValueError as exc:
+                raise CockpitError(
+                    "validation_failed",
+                    str(exc),
+                    recoverable=True,
+                    status=400,
+                ) from exc
+            if updated is None:
+                raise CockpitError("not_found", "schedule not found", status=404)
+            return _routine_schedule_response(updated)
+
+        response_body = await _idempotent_write_body(
+            self.ctx,
+            f"routine-schedules/{schedule.schedule_id}/update",
+            key,
+            {**body, "schedule_id": schedule.schedule_id},
+            produce,
+            requester=requester,
+        )
+        return web.json_response(response_body)
+
+    async def routine_schedule_delete(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_401(request, self.ctx.cfg)
+        _require_requester_capability(
+            self.ctx.cfg,
+            requester,
+            "orchestration.schedules.write",
+            auth_mode=_request_auth_mode(request),
+        )
+        body = await _optional_json_body(request)
+        key = _required_idempotency_key(body)
+        schedule = await _routine_schedule_for_write(self.ctx, requester, request.match_info["schedule_id"])
+
+        async def produce() -> dict[str, Any]:
+            deleted = await asyncio.to_thread(
+                _routine_schedule_store(self.ctx).delete,
+                schedule.schedule_id,
+            )
+            return {
+                "ok": True,
+                "api_version": API_VERSION,
+                "schema_version": SCHEMA_VERSION,
+                "schedule_id": schedule.schedule_id,
+                "deleted": deleted,
+            }
+
+        response_body = await _idempotent_write_body(
+            self.ctx,
+            f"routine-schedules/{schedule.schedule_id}/delete",
+            key,
+            {"schedule_id": schedule.schedule_id},
+            produce,
+            requester=requester,
+        )
+        return web.json_response(response_body)
+
+    async def routine_schedule_run(self, request: web.Request) -> web.Response:
+        await self.ctx.require_auth(request)
+        requester = _requester_or_401(request, self.ctx.cfg)
+        _require_requester_capability(
+            self.ctx.cfg,
+            requester,
+            "orchestration.schedules.write",
+            auth_mode=_request_auth_mode(request),
+        )
+        body = await _json_body(request)
+        key = _required_idempotency_key(body)
+        schedule = await _routine_schedule_for_write(self.ctx, requester, request.match_info["schedule_id"])
+        run_body = _routine_run_body_from_schedule(schedule, body)
+
+        async def produce(reservation: dict[str, Any]) -> dict[str, Any]:
+            local_date = schedule.local_date(datetime.now().astimezone())
+            result = await _execute_routine(
+                self.ctx,
+                requester,
+                schedule.routine_id,
+                run_body,
+                trigger={
+                    "type": "schedule_manual",
+                    "schedule_id": schedule.schedule_id,
+                    "local_date": local_date,
+                },
+                launch_reservation=reservation,
+            )
+            return {**result, "schedule": schedule.to_dict()}
+
+        response_body = await _idempotent_reserved_write_body(
+            self.ctx,
+            f"routine-schedules/{schedule.schedule_id}/run",
+            key,
+            {**body, "schedule_id": schedule.schedule_id},
+            produce,
+            _routine_launch_reservation,
+            requester=requester,
+        )
+        return web.json_response(response_body, status=202)
 
     async def project_create(self, request: web.Request) -> web.Response:
         await self.ctx.require_auth(request)
@@ -2391,15 +2834,24 @@ class CockpitWriteHandlers:
         async def produce() -> dict[str, Any]:
             _require_capability(self.ctx.cfg, required)
             control_thread = thread
+            interrupt_claim = None
             if action == "interrupt":
-                claimed = await asyncio.to_thread(
+                interrupt_claim = await asyncio.to_thread(
                     connector.claim_execution_interrupt,
                     project,
                     thread_id,
+                    turn_id=reference_id,
                 )
-                if claimed is None:
+                if interrupt_claim is None:
                     raise CockpitError("not_found", "thread not found", status=404)
-                control_thread = claimed
+                if not interrupt_claim.acquired:
+                    raise CockpitError(
+                        "execution_busy",
+                        "thread execution is already being interrupted",
+                        recoverable=True,
+                        status=409,
+                    )
+                control_thread = interrupt_claim.thread
             control_worker_id = str(
                 control_thread.workspace.get("worker_id") or control_thread.worker_id or ""
             )
@@ -2412,17 +2864,69 @@ class CockpitWriteHandlers:
                     status=409,
                 )
             expected_generation = int(control_thread.workspace.get("session_generation") or 0)
-            await asyncio.to_thread(
-                _worker_post_json,
-                self.ctx.cfg,
-                control_worker_id,
-                f"/sessions/{control_session_id}/{action}",
-                _worker_control_body(body, required),
-                post=self.ctx.post,
-            )
+            interrupt_recovered = False
+            try:
+                await asyncio.to_thread(
+                    _worker_post_json,
+                    self.ctx.cfg,
+                    control_worker_id,
+                    f"/sessions/{control_session_id}/{action}",
+                    _worker_control_body(body, required),
+                    post=self.ctx.post,
+                )
+            except Exception as exc:
+                if action == "interrupt":
+                    assert interrupt_claim is not None
+                    if _worker_control_write_was_definitely_rejected(exc):
+                        restored = await asyncio.to_thread(
+                            connector.release_execution_interrupt,
+                            project,
+                            thread_id,
+                            expected_session_id=control_session_id,
+                            expected_generation=expected_generation,
+                            status=interrupt_claim.restore_status,
+                            provision_phase=interrupt_claim.restore_provision_phase,
+                        )
+                        if restored is not None and isinstance(
+                            restored.workspace.get(PENDING_ORCHESTRATOR_COMPLETION_KEY),
+                            dict,
+                        ):
+                            connector.rearm_pending_orchestrator_completion(project, restored)
+                    else:
+                        recovered = await asyncio.to_thread(
+                            connector.recover_pending_execution_interrupt,
+                            project.id,
+                            thread_id,
+                        )
+                        if (
+                            recovered is not None
+                            and str(recovered.workspace.get("status") or "")
+                            == "interrupted"
+                            and not str(recovered.workspace.get("session_id") or "")
+                        ):
+                            control_thread = recovered
+                            interrupt_recovered = True
+                        elif (
+                            recovered is not None
+                            and str(recovered.workspace.get("status") or "")
+                            == "interrupting"
+                        ):
+                            _start_interrupt_recovery(self.ctx)
+                        elif recovered is not None and isinstance(
+                            recovered.workspace.get(
+                                PENDING_ORCHESTRATOR_COMPLETION_KEY
+                            ),
+                            dict,
+                        ):
+                            connector.rearm_pending_orchestrator_completion(
+                                project,
+                                recovered,
+                            )
+                if not interrupt_recovered:
+                    raise
             control = {"action": action, "accepted": True, reference_key: reference_id}
             execution = _thread_execution_projection(control_thread, self.ctx)
-            if action == "interrupt":
+            if action == "interrupt" and not interrupt_recovered:
                 detached = await asyncio.to_thread(
                     connector.detach_interrupted_execution,
                     project,
@@ -3601,8 +4105,42 @@ async def _idempotent_write_body(
         return response_body
 
 
+async def _idempotent_reserved_write_body(
+    ctx: CockpitAppContext,
+    scope: str,
+    key: str,
+    fingerprint_body: dict[str, Any],
+    producer: Callable[[dict[str, Any]], Any],
+    reservation_factory: Callable[[], dict[str, Any]],
+    *,
+    requester: RequestContext | None = None,
+) -> dict[str, Any]:
+    """Run one externally-effectful write behind a durable identity.
+
+    The reservation is committed before the producer may dispatch work.  If
+    the process dies, or final response persistence fails after acceptance, a
+    later request resumes the same run/thread rather than creating another.
+    """
+
+    if requester is not None:
+        scope = f"{scope}/principal/{_idempotency_principal(requester)}"
+    async with _idempotency_scope(ctx, scope, key):
+        cached = ctx.idempotency.get(scope, key, fingerprint_body)
+        if cached is not None:
+            return cached
+        reservation = ctx.idempotency.get_reservation(scope, key, fingerprint_body)
+        if reservation is None:
+            reservation = reservation_factory()
+            ctx.idempotency.save_reservation(scope, key, fingerprint_body, reservation)
+        response_body = await producer(reservation)
+        ctx.idempotency.save(scope, key, fingerprint_body, response_body)
+        return response_body
+
+
 def _idempotency_principal(requester: RequestContext) -> str:
-    return "\0".join((requester.scope, requester.identity, requester.memory_peer, requester.channel))
+    return "\0".join(
+        (requester.scope, requester.identity, requester.memory_peer, requester.channel)
+    )
 
 
 def _reject_attachments(body: dict[str, Any]) -> None:
@@ -4741,7 +5279,12 @@ def _route_path_template(route: web.AbstractRoute) -> str:
     return str(info.get("path") or info.get("formatter") or "")
 
 
-def _feature_availability(cfg: Config) -> dict[str, Any]:
+def _feature_availability(
+    cfg: Config,
+    *,
+    requester: RequestContext,
+    auth_mode: str,
+) -> dict[str, Any]:
     project_write_available, project_write_reason = _project_write_available(cfg)
     workers_configured = _configured_worker_count(cfg)
     return {
@@ -4757,12 +5300,38 @@ def _feature_availability(cfg: Config) -> dict[str, Any]:
             "available": workers_configured > 0,
             "workers_configured": workers_configured,
         },
+        "routines": {
+            "available": True,
+            "builtin_count": len(_ROUTINE_CATALOG.list()),
+        },
+        "schedules": {
+            "available": _requester_capability_allowed(
+                cfg,
+                requester,
+                "orchestration.schedules.read",
+                auth_mode=auth_mode,
+            ),
+            "writable": _requester_capability_allowed(
+                cfg,
+                requester,
+                "orchestration.schedules.write",
+                auth_mode=auth_mode,
+            ),
+            "resident_tick": True,
+        },
     }
 
 
-def _cockpit_advertised_capabilities(requester: RequestContext, cfg: Config) -> list[str]:
+def _cockpit_advertised_capabilities(
+    requester: RequestContext,
+    cfg: Config,
+    *,
+    auth_mode: str,
+) -> list[str]:
     enforced = resolve_capabilities(cfg.capabilities)
-    return sorted(set(requester.capabilities) & enforced)
+    return sorted(
+        _requester_scoped_capabilities(cfg, requester, auth_mode=auth_mode) & enforced
+    )
 
 
 def _project_write_available(cfg: Config) -> tuple[bool, str]:
@@ -4776,6 +5345,471 @@ def _project_write_available(cfg: Config) -> tuple[bool, str]:
 def _configured_worker_count(cfg: Config) -> int:
     registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path)
     return registry.configured_profile_count()
+
+
+def _routine_or_404(routine_id: str, version: int | str | None = None) -> RoutineDefinition:
+    routine = _ROUTINE_CATALOG.get(routine_id.strip(), version)
+    if routine is None:
+        raise CockpitError("not_found", "routine not found", status=404)
+    return routine
+
+
+def _routine_schedule_store(ctx: CockpitAppContext) -> RoutineScheduleStore:
+    return RoutineScheduleStore(routine_schedules_path(ctx.cfg.orchestration.workspace))
+
+
+def _object_field(body: dict[str, Any], field_name: str) -> dict[str, Any]:
+    value = body.get(field_name)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise CockpitError(
+            "validation_failed",
+            f"{field_name} must be an object",
+            recoverable=True,
+            status=400,
+        )
+    return dict(value)
+
+
+async def _routine_project(
+    ctx: CockpitAppContext,
+    requester: RequestContext,
+    project_id: str,
+    *,
+    required: bool,
+) -> ProjectEntry | None:
+    project_id = project_id.strip()
+    if not project_id:
+        if required:
+            raise CockpitError(
+                "validation_failed",
+                "project_id is required",
+                recoverable=True,
+                status=400,
+            )
+        return None
+    project = await asyncio.to_thread(_registry_store(ctx.cfg).get_project, project_id)
+    if project is None or not can_edit_project(requester, project).allowed:
+        raise CockpitError("not_found", "project not found", status=404)
+    return project
+
+
+def _routine_schedule_fields(
+    body: dict[str, Any],
+    *,
+    default_timezone: str = "Europe/London",
+) -> dict[str, Any]:
+    weekdays = body.get("weekdays", [0, 1, 2, 3, 4, 5, 6])
+    if not isinstance(weekdays, list):
+        raise CockpitError(
+            "validation_failed",
+            "weekdays must be an array",
+            recoverable=True,
+            status=400,
+        )
+    try:
+        return {
+            "hour": int(body.get("hour", 9)),
+            "minute": int(body.get("minute", 0)),
+            "weekdays": tuple(int(day) for day in weekdays),
+            "timezone": str(body.get("timezone") or default_timezone or "Europe/London"),
+            "enabled": bool(body.get("enabled", True)),
+            "engine": str(body.get("engine") or ""),
+            "model": str(body.get("model") or ""),
+            "effort": str(body.get("effort") or ""),
+            "speed": str(body.get("speed") or ""),
+            "worker_id": str(body.get("worker_id") or ""),
+        }
+    except (TypeError, ValueError) as exc:
+        raise CockpitError(
+            "validation_failed",
+            "invalid schedule time or weekdays",
+            recoverable=True,
+            status=400,
+        ) from exc
+
+
+def _resolved_schedule_values(
+    routine: RoutineDefinition,
+    project: ProjectEntry,
+    requester: RequestContext,
+    body: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    target = _object_field(body, "target")
+    supplied_params = _object_field(body, "params")
+    try:
+        resolution = resolve_routine(
+            routine,
+            params=supplied_params,
+            target=target,
+            project=project.as_dict(),
+            requester=_activity_actor(requester),
+        )
+    except ValueError as exc:
+        raise CockpitError("validation_failed", str(exc), recoverable=True, status=400) from exc
+    if not resolution.ready:
+        raise CockpitError(
+            "validation_failed",
+            f"missing routine parameters: {', '.join(resolution.missing)}",
+            recoverable=True,
+            status=400,
+        )
+    # Persist only explicit bindings. Dynamic defaults such as `today` must be
+    # resolved again when the schedule fires, not frozen on creation day.
+    return supplied_params, target
+
+
+async def _routine_schedule_for_write(
+    ctx: CockpitAppContext,
+    requester: RequestContext,
+    schedule_id: str,
+) -> RoutineSchedule:
+    schedule = await asyncio.to_thread(_routine_schedule_store(ctx).get, schedule_id)
+    if schedule is None:
+        raise CockpitError("not_found", "schedule not found", status=404)
+    project = await _routine_project(ctx, requester, schedule.project_id, required=True)
+    if project is None:
+        raise CockpitError("not_found", "schedule not found", status=404)
+    return schedule
+
+
+def _routine_schedule_response(schedule: RoutineSchedule) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "api_version": API_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "schedule": schedule.to_dict(),
+    }
+
+
+def _routine_run_body_from_schedule(
+    schedule: RoutineSchedule,
+    overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    body = {
+        "project_id": schedule.project_id,
+        "routine_version": schedule.routine_version,
+        "params": dict(schedule.params),
+        "target": dict(schedule.target),
+        "engine": schedule.engine,
+        "model": schedule.model,
+        "effort": schedule.effort,
+        "speed": schedule.speed,
+        "worker_id": schedule.worker_id,
+    }
+    allowed_overrides = {
+        key: value
+        for key, value in (overrides or {}).items()
+        if key
+        in {
+            "params",
+            "target",
+            "engine",
+            "model",
+            "effort",
+            "speed",
+            "worker_id",
+            "prompt",
+        }
+    }
+    return {**body, **allowed_overrides}
+
+
+def _routine_launch_reservation() -> dict[str, str]:
+    return {"run_id": new_id("routine"), "thread_id": new_id("thread")}
+
+
+def _reserved_routine_run_status(thread: CockpitThread) -> str:
+    workspace = thread.workspace
+    execution_status = str(workspace.get("status") or "").strip().lower()
+    provision_phase = str(workspace.get("provision_phase") or "").strip().lower()
+    terminal = {"cancelled", "completed", "failed", "interrupted", "stopped"}
+    if execution_status in terminal:
+        return execution_status
+    if provision_phase in terminal:
+        return provision_phase
+    pending = workspace.get(PENDING_ORCHESTRATOR_COMPLETION_KEY)
+    if isinstance(pending, dict):
+        return (
+            "dispatching"
+            if str(pending.get("phase") or "") == "dispatching"
+            else "started"
+        )
+    if execution_status == "ready" and bool(workspace.get("provider_started")):
+        return "completed"
+    if execution_status == "interrupting":
+        return "interrupting"
+    return "started"
+
+
+async def _routine_execution_settings(
+    ctx: CockpitAppContext, routine: RoutineDefinition, body: dict[str, Any]
+) -> tuple[str, dict[str, str]]:
+    engine = (
+        str(body.get("engine") or routine.execution.get("default_engine") or "codex")
+        .strip()
+        .lower()
+    )
+    supported_engines = [
+        str(item) for item in routine.execution.get("supported_engines") or []
+    ]
+    if engine not in supported_engines:
+        raise CockpitError(
+            "validation_failed",
+            f"routine does not support engine {engine!r}",
+            recoverable=True,
+            status=400,
+        )
+    tuning = {
+        key: str(body.get(key) or "").strip()
+        for key in ("model", "effort", "speed")
+        if str(body.get(key) or "").strip()
+    }
+    _, _, engine_supports = await asyncio.to_thread(_catalog_context, ctx.cfg)
+    supports = engine_supports.get(engine, {})
+    try:
+        for key, validate, rows_key in (
+            ("model", validate_model, "models"),
+            ("effort", validate_effort, "efforts"),
+            ("speed", validate_speed, "speeds"),
+        ):
+            if key in tuning:
+                validate(tuning[key], supports.get(rows_key), engine)
+    except ValueError as exc:
+        raise CockpitError(
+            "validation_failed", str(exc), recoverable=True, status=400
+        ) from exc
+    return engine, tuning
+
+
+async def _execute_routine(
+    ctx: CockpitAppContext,
+    requester: RequestContext,
+    routine_id: str,
+    body: dict[str, Any],
+    *,
+    trigger: dict[str, Any],
+    launch_reservation: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    routine = await asyncio.to_thread(
+        _routine_or_404, routine_id, str(body.get("routine_version") or "")
+    )
+    project = await _routine_project(
+        ctx, requester, str(body.get("project_id") or ""), required=True
+    )
+    assert project is not None
+    try:
+        resolution = resolve_routine(
+            routine,
+            params=_object_field(body, "params"),
+            target=_object_field(body, "target"),
+            project=project.as_dict(),
+            requester=_activity_actor(requester),
+            today=str(trigger.get("local_date") or ""),
+        )
+    except ValueError as exc:
+        raise CockpitError(
+            "validation_failed", str(exc), recoverable=True, status=400
+        ) from exc
+    prompt_override = str(body.get("prompt") or "").strip()
+    if not resolution.ready:
+        raise CockpitError(
+            "validation_failed",
+            f"missing routine parameters: {', '.join(resolution.missing)}",
+            recoverable=True,
+            status=400,
+        )
+    prompt = prompt_override or resolution.rendered_prompt
+    engine, tuning = await _routine_execution_settings(ctx, routine, body)
+    connector = _cockpit_connector(ctx)
+    reservation = dict(launch_reservation or {})
+    run_id = str(reservation.get("run_id") or new_id("routine"))
+    reserved_thread_id = str(reservation.get("thread_id") or "")
+    dispatched = False
+    try:
+        thread = await connector.open_thread(
+            project,
+            requester,
+            thread_id=reserved_thread_id,
+            title=str(body.get("title") or routine.name),
+            parent_chat_id=str(body.get("parent_chat_id") or ""),
+            chat_type="orchestrator",
+            engine=engine,
+            model=tuning.get("model", ""),
+            worker_id=str(body.get("worker_id") or ""),
+        )
+        existing_status = _reserved_routine_run_status(thread)
+        terminal_statuses = {
+            "cancelled",
+            "completed",
+            "failed",
+            "interrupted",
+            "interrupting",
+            "stopped",
+        }
+        dispatch = thread.workspace.get(PENDING_ORCHESTRATOR_COMPLETION_KEY)
+        if (
+            existing_status in terminal_statuses
+            or bool(thread.workspace.get("provider_started"))
+            or isinstance(dispatch, dict)
+        ):
+            updated = thread
+        else:
+            _reply, updated, _events = await connector.turn(
+                project,
+                thread,
+                requester,
+                prompt,
+                workspace_request={"engine": engine, **tuning},
+                logical_turn_id=run_id,
+                idempotency_key=str(body.get("idempotency_key") or run_id),
+                await_orchestrator_completion=False,
+            )
+            dispatched = True
+    except ValueError as exc:
+        raise CockpitError(
+            "validation_failed", str(exc), recoverable=True, status=400
+        ) from exc
+    except UnsupportedMemoryOperation as exc:
+        raise CockpitError(
+            "memory_unavailable", str(exc), recoverable=True, status=503
+        ) from exc
+    except (TimeoutError, OSError, RuntimeError) as exc:
+        raise CockpitError(
+            "routine_dispatch_failed",
+            public_error_message(str(exc)),
+            recoverable=True,
+            status=503,
+        ) from exc
+    if dispatched:
+        await _record_project_activity(
+            ctx,
+            project.id,
+            "routine.started",
+            requester,
+            f"Started routine {routine.name}",
+            {
+                "routine_id": routine.routine_id,
+                "routine_version": routine.version,
+                "run_id": run_id,
+                "thread_id": updated.thread_id,
+                "trigger": trigger,
+            },
+        )
+    return {
+        "ok": True,
+        "api_version": API_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "run": {
+            "run_id": run_id,
+            "routine_id": routine.routine_id,
+            "routine_version": routine.version,
+            "status": _reserved_routine_run_status(updated),
+            "project_id": project.id,
+            "thread_id": updated.thread_id,
+            "trigger": trigger,
+        },
+        "thread": _thread_projection(updated, ctx, include_messages=True),
+    }
+
+
+def _requester_for_scheduled_identity(
+    cfg: Config,
+    identity: str,
+    *,
+    auth_mode: str,
+) -> RequestContext | None:
+    identity = identity.strip()
+    if not identity:
+        return None
+    if auth_mode == "oauth":
+        user = load_users(cfg.capabilities.users_dir).get(identity)
+        if user is None:
+            return None
+        resolution = Resolution(user.name, user.scope, "strong", user)
+        return replace(
+            context_for_resolution(cfg.capabilities, resolution),
+            capabilities=user.capabilities,
+            channel="schedule",
+        )
+    if identity != _legacy_cockpit_requester_id(cfg):
+        return None
+    return RequestContext(
+        device_id=cfg.capabilities.device_id,
+        identity=identity,
+        scope="personal",
+        capabilities=frozenset(resolve_capabilities(cfg.capabilities)),
+        channel="schedule",
+        peer=identity,
+    )
+
+
+async def _dispatch_due_routine_schedules(ctx: CockpitAppContext, now: datetime) -> None:
+    capabilities = resolve_capabilities(ctx.cfg.capabilities)
+    if not allowed(
+        "orchestration.schedules.write",
+        capabilities,
+        public_write_mode=ctx.cfg.orchestration.landing_mode,
+    ):
+        return
+    store = _routine_schedule_store(ctx)
+    schedules = await asyncio.to_thread(store.due, now)
+    for schedule in schedules:
+        requester = _requester_for_scheduled_identity(
+            ctx.cfg,
+            schedule.created_by,
+            auth_mode=schedule.creator_auth_mode,
+        )
+        if requester is None or not _requester_capability_allowed(
+            ctx.cfg,
+            requester,
+            "orchestration.schedules.write",
+            auth_mode=schedule.creator_auth_mode,
+        ):
+            logger.warning(
+                "routine schedule %s not dispatched: creator no longer has schedule authority",
+                schedule.schedule_id,
+            )
+            continue
+        body = _routine_run_body_from_schedule(schedule)
+        local_date = schedule.local_date(now)
+        idempotency_key = f"schedule:{schedule.schedule_id}:{local_date}"
+        body["idempotency_key"] = idempotency_key
+
+        async def produce(
+            reservation: dict[str, Any],
+            scheduled: RoutineSchedule = schedule,
+            run_body: dict[str, Any] = body,
+            scheduled_local_date: str = local_date,
+        ) -> dict[str, Any]:
+            return await _execute_routine(
+                ctx,
+                requester,
+                scheduled.routine_id,
+                run_body,
+                trigger={
+                    "type": "schedule",
+                    "schedule_id": scheduled.schedule_id,
+                    "local_date": scheduled_local_date,
+                },
+                launch_reservation=reservation,
+            )
+
+        try:
+            await _idempotent_reserved_write_body(
+                ctx,
+                f"routine-schedules/{schedule.schedule_id}/automatic-run",
+                idempotency_key,
+                body,
+                produce,
+                _routine_launch_reservation,
+                requester=requester,
+            )
+        except Exception as exc:  # noqa: BLE001 - failed dispatch remains due for a bounded retry.
+            logger.warning("routine schedule %s dispatch failed: %s", schedule.schedule_id, exc)
+            continue
+        await asyncio.to_thread(store.ack, schedule.schedule_id, now)
 
 
 def _registry_store(cfg: Config) -> RegistryStore:
@@ -4821,6 +5855,11 @@ def _cockpit_requester_context(
         channel="cockpit",
         peer=identity,
     )
+
+
+def _request_auth_mode(request: web.Request) -> str:
+    mode = str(request.get("auth", {}).get("mode") or "none")
+    return mode if mode in {"legacy", "none", "oauth"} else "none"
 
 
 def _requester_or_401(request: web.Request, cfg: Config) -> RequestContext:
@@ -5171,7 +6210,7 @@ def _project_memory_conclusion(conclusion: ConclusionRecord) -> dict[str, str]:
 
 
 def _cockpit_connector(ctx: CockpitAppContext) -> CockpitConnector:
-    return CockpitConnector(ctx.cfg)
+    return CockpitConnector(ctx.cfg, worker_get=ctx.get, worker_post=ctx.post)
 
 
 def _start_thread_queue_drain(ctx: CockpitAppContext, project_id: str, thread_id: str) -> None:
@@ -5218,8 +6257,42 @@ def _start_thread_queue_drain(ctx: CockpitAppContext, project_id: str, thread_id
     ).start()
 
 
+async def _recover_pending_execution_interrupts(ctx: CockpitAppContext) -> int:
+    index = CockpitThreadIndex(
+        Path(ctx.cfg.orchestration.workspace) / THREAD_INDEX_FILENAME
+    )
+    registry = RegistryStore(ctx.cfg.registry.path)
+    connector: CockpitConnector | None = None
+    for thread in index.list_all():
+        if str(thread.workspace.get("status") or "") != "interrupting":
+            continue
+        connector = connector or _cockpit_connector(ctx)
+        recovered = await asyncio.to_thread(
+            connector.recover_pending_execution_interrupt,
+            thread.project_id,
+            thread.thread_id,
+        )
+        if recovered is None or str(recovered.workspace.get("status") or "") == "interrupting":
+            continue
+        if not isinstance(
+            recovered.workspace.get(PENDING_ORCHESTRATOR_COMPLETION_KEY),
+            dict,
+        ):
+            continue
+        project = registry.get_project(recovered.project_id)
+        if project is not None:
+            connector.rearm_pending_orchestrator_completion(project, recovered)
+    return sum(
+        1
+        for thread in index.list_all()
+        if str(thread.workspace.get("status") or "") == "interrupting"
+    )
+
+
 def _rearm_thread_queues(ctx: CockpitAppContext) -> None:
-    index = CockpitThreadIndex(Path(ctx.cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
+    index = CockpitThreadIndex(
+        Path(ctx.cfg.orchestration.workspace) / THREAD_INDEX_FILENAME
+    )
     for thread in index._threads().values():  # noqa: SLF001 - startup recovery scans durable thread state.
         if thread.archived_at:
             continue
@@ -5232,6 +6305,24 @@ def _rearm_thread_queues(ctx: CockpitAppContext) -> None:
             continue
         index.rearm_queued_turns(thread.project_id, thread.thread_id)
         _start_thread_queue_drain(ctx, thread.project_id, thread.thread_id)
+
+
+def _rearm_pending_orchestrator_completions(ctx: CockpitAppContext) -> None:
+    index = CockpitThreadIndex(
+        Path(ctx.cfg.orchestration.workspace) / THREAD_INDEX_FILENAME
+    )
+    registry = RegistryStore(ctx.cfg.registry.path)
+    connector: CockpitConnector | None = None
+    for thread in index.list_all():
+        if str(thread.workspace.get("status") or "") == "interrupting":
+            continue
+        if not isinstance(thread.workspace.get(PENDING_ORCHESTRATOR_COMPLETION_KEY), dict):
+            continue
+        project = registry.get_project(thread.project_id)
+        if project is None:
+            continue
+        connector = connector or _cockpit_connector(ctx)
+        connector.rearm_pending_orchestrator_completion(project, thread)
 
 
 def _make_thread_child_terminal_notifier(cfg: Config) -> Callable[[str, Any], bool]:
@@ -5397,6 +6488,26 @@ def _thread_detail_projection(
             "peer_id": message.get("peer_id", ""),
             "content": message.get("content", ""),
             "observed_at": message.get("observed_at", ""),
+            **{
+                key: message[key]
+                for key in (
+                    "event_id",
+                    "message_id",
+                    "call_id",
+                    "correlation_id",
+                    "sequence",
+                    "type",
+                    "watch_id",
+                    "child_chat_ids",
+                    "child_chat_id",
+                    "title",
+                    "phase",
+                    "status",
+                    "error",
+                    "completed_at",
+                )
+                if key in message
+            },
         }
         for message in thread.messages
     ]
@@ -5755,6 +6866,15 @@ def _worker_control_body(body: dict[str, Any], required: str) -> dict[str, Any]:
     return proxied
 
 
+def _worker_control_write_was_definitely_rejected(exc: Exception) -> bool:
+    """Distinguish a worker rejection from an ambiguously delivered write."""
+    return (
+        isinstance(exc, CockpitError)
+        and exc.status < 500
+        and exc.code != "worker_unavailable"
+    )
+
+
 def _project_run_event(event, sequence: int) -> dict[str, Any]:  # noqa: ANN001
     return {
         "event_id": f"{event.run_id}:{sequence}",
@@ -6009,6 +7129,55 @@ def _required_session_action(action: str) -> str:
 def _require_capability(cfg: Config, action: str) -> None:
     capabilities = resolve_capabilities(cfg.capabilities)
     if not allowed(action, capabilities, public_write_mode=cfg.orchestration.landing_mode):
+        raise CockpitError("forbidden", f"missing authority: {action}", status=403)
+
+
+def _requester_capability_allowed(
+    cfg: Config,
+    requester: RequestContext,
+    action: str,
+    *,
+    auth_mode: str,
+) -> bool:
+    device_capabilities = resolve_capabilities(cfg.capabilities)
+    if not allowed(
+        action,
+        device_capabilities,
+        public_write_mode=cfg.orchestration.landing_mode,
+    ):
+        return False
+    return allowed(
+        action,
+        _requester_scoped_capabilities(cfg, requester, auth_mode=auth_mode),
+        public_write_mode=cfg.orchestration.landing_mode,
+    )
+
+
+def _requester_scoped_capabilities(
+    cfg: Config,
+    requester: RequestContext,
+    *,
+    auth_mode: str,
+) -> set[str]:
+    if auth_mode != "oauth":
+        return set(requester.capabilities)
+    user = load_users(cfg.capabilities.users_dir).get(requester.identity)
+    return set(user.capabilities) if user is not None else set()
+
+
+def _require_requester_capability(
+    cfg: Config,
+    requester: RequestContext,
+    action: str,
+    *,
+    auth_mode: str,
+) -> None:
+    if not _requester_capability_allowed(
+        cfg,
+        requester,
+        action,
+        auth_mode=auth_mode,
+    ):
         raise CockpitError("forbidden", f"missing authority: {action}", status=403)
 
 

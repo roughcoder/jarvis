@@ -1069,6 +1069,7 @@ def test_execution_envelope_uses_natural_language_verification() -> None:
             start=True,
             target_model_id="gpt-5.5",
             provider_instance_id="codex-primary",
+            allow_nested_agents=False,
         ),
         items=[item],
         worker_id="macbook-worker",
@@ -1076,6 +1077,9 @@ def test_execution_envelope_uses_natural_language_verification() -> None:
     assert envelope.worker_id == "macbook-worker"
     assert envelope.model == "gpt-5.5"
     assert envelope.provider_instance_id == "codex-primary"
+    assert envelope.allow_nested_agents is False
+    assert ExecutionEnvelope.from_dict(envelope.to_dict()).allow_nested_agents is False
+    assert WorkCommand.from_dict({"operation": "start_next_work"}).allow_nested_agents is True
     assert envelope.verification.minimum_rung == "real_app_exercise"
     assert "real browser" in envelope.verification.task_proof
     assert "Do not merge or release" in envelope.prompt
@@ -2209,6 +2213,7 @@ def test_start_worker_session_links_run_graph(tmp_path) -> None:
             start=True,
             target_model_id="gpt-5.5",
             provider_instance_id="codex-primary",
+            allow_nested_agents=False,
         ),
         items=[_item()],
         worker_id="local-worker",
@@ -2272,6 +2277,8 @@ def test_start_worker_session_links_run_graph(tmp_path) -> None:
     assert calls[0][1]["metadata"]["execution_envelope"]["run_id"] == run.run_id
     assert calls[0][1]["metadata"]["execution_envelope"]["model"] == "gpt-5.5"
     assert calls[0][1]["metadata"]["execution_envelope"]["provider_instance_id"] == "codex-primary"
+    assert calls[0][1]["metadata"]["execution_envelope"]["allow_nested_agents"] is False
+    assert calls[0][1]["metadata"]["allow_nested_agents"] is False
     assert calls[0][1]["metadata"]["execution_envelope"]["display_title"] == "Fix the worker"
     assert calls[0][1]["title"] == "Fix the worker"
     assert calls[0][1]["metadata"]["model"] == "gpt-5.5"
@@ -4230,6 +4237,18 @@ def test_orchestration_service_resume_run_dispatches_existing_session(tmp_path, 
     cfg = load_config()
     store = OrchestrationStore(cfg.orchestration.workspace)
     run = store.create_run("Fix worker", work_items=[_item(id="#55")])
+    store.append_event(
+        run.run_id,
+        "execution_envelope_created",
+        "Initial execution envelope created",
+        ExecutionEnvelope(
+            run_id=run.run_id,
+            repo="roughcoder/jarvis",
+            prompt="Fix worker",
+            landing=LandingPolicy(mode="branch_only"),
+            allow_nested_agents=False,
+        ).to_dict(),
+    )
     store.link_session(
         run.run_id,
         WorkerSessionLink(
@@ -4290,6 +4309,7 @@ def test_orchestration_service_resume_run_dispatches_existing_session(tmp_path, 
     envelope = seen["envelope"]
     assert envelope.run_id == run.run_id
     assert envelope.resume_session is True
+    assert envelope.allow_nested_agents is False
     assert envelope.session_id == "550e8400-e29b-41d4-a716-446655440000"
     assert envelope.session_name == "550e8400-e29b-41d4-a716-446655440000"
     assert envelope.cwd == "/worker/worktrees/55"

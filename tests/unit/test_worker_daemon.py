@@ -43,6 +43,7 @@ from jarvis.worker.providers.codex import (  # noqa: E402
     _approval_result,
     _input_result,
     _orchestrator_thread_overrides,
+    _thread_policy_overrides,
     _project_jsonrpc_message,
     _read_until_turn_done,
     _restore_running_if_waiting,
@@ -403,6 +404,33 @@ def test_codex_orchestrator_overrides_are_thread_scoped_and_secret_free() -> Non
     }
     assert server["default_tools_approval_mode"] == "approve"
     assert "scoped-grant" not in str(overrides)
+    assert "Jarvis project orchestrator" in overrides["developerInstructions"]
+
+
+def test_codex_nested_agents_can_be_disabled_per_thread() -> None:
+    authority = WorkerSessionAuthority(
+        allowed_actions=[WORKER_SESSION_TURN],
+        allow_nested_agents=False,
+    )
+
+    overrides = _thread_policy_overrides(
+        ProviderTurn(
+            turn_id="turn_review",
+            prompt="review synchronously",
+            runtime_context={
+                "orchestrator_mcp": {
+                    "api_url": "http://brain.test:8790",
+                    "project_id": "project_a",
+                    "thread_id": "thread_a",
+                    "grant_file": "/private/session/.orchestrator-grant",
+                }
+            },
+        ),
+        authority,
+    )
+
+    assert overrides["config"]["features"] == {"multi_agent": False}
+    assert list(overrides["config"]["mcp_servers"]) == ["jarvis_orchestrator"]
     assert "Jarvis project orchestrator" in overrides["developerInstructions"]
 
 
@@ -4149,7 +4177,55 @@ def test_daemon_claude_provider_projects_sdk_events_and_reuses_stream(tmp_path, 
     assert _FakeClaudeClient.instances[0].options.kwargs["model"] == "claude-opus-4-7"
     assert _FakeClaudeClient.instances[0].options.kwargs["system_prompt"] == {"type": "preset", "preset": "claude_code"}
     assert _FakeClaudeClient.instances[0].options.kwargs["setting_sources"] is None
+    assert "disallowed_tools" not in _FakeClaudeClient.instances[0].options.kwargs
     assert _FakeClaudeClient.instances[0].response_exhausted == 2
+
+
+def test_claude_nested_agents_can_be_disabled_per_session(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    _install_fake_claude_sdk(
+        monkeypatch,
+        [[[_FakeAssistantMessage([_FakeTextBlock("review complete")]), _FakeResultMessage()]]],
+    )
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    metadata = _authority_metadata("claude")
+    metadata["execution_envelope"]["allow_nested_agents"] = False
+    metadata["allow_nested_agents"] = False
+    session, _ = sessions.create(
+        {
+            "provider": "claude",
+            "engine": "claude",
+            "cwd": _owned_worker_cwd(tmp_path, "claude-synchronous"),
+            "metadata": metadata,
+        }
+    )
+
+    try:
+        claude.ClaudeProviderAdapter().start_turn(
+            session=session,
+            turn=ProviderTurn(turn_id="turn_review", prompt="review synchronously"),
+            sessions=sessions,
+            worker_cfg=WorkerConfig(
+                _env_file=None,
+                workspace=str(tmp_path / "worker"),
+                claude_bin="fake-claude",
+                job_timeout_s=5,
+            ),
+        )
+        for _ in range(100):
+            if any(event.type == "turn.completed" for event in sessions.events(session.session_id)):
+                break
+            time.sleep(0.02)
+    finally:
+        _stop_fake_claude_runtimes()
+
+    assert _FakeClaudeClient.instances[0].options.kwargs["disallowed_tools"] == [
+        "Agent",
+        "Task",
+        "SendMessage",
+        "Monitor",
+        "TaskOutput",
+        "TaskStop",
+    ]
 
 
 def test_claude_orchestrator_turn_receives_only_scoped_jarvis_mcp_tools(tmp_path, monkeypatch) -> None:  # noqa: ANN001
