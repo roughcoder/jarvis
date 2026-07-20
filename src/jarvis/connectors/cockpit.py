@@ -281,6 +281,8 @@ class CockpitThread:
             chat_type=str(data.get("chat_type") or "assistant"),
             engine=str(data.get("engine") or "jarvis"),
             model=str(data.get("model") or ""),
+            effort=str(data.get("effort") or ""),
+            speed=str(data.get("speed") or ""),
             worker_id=str(data.get("worker_id") or ""),
             parent_chat_id=str(data.get("parent_chat_id") or ""),
             archived_at=str(data.get("archived_at") or ""),
@@ -305,6 +307,8 @@ class CockpitThread:
             "chat_type": self.chat_type,
             "engine": self.engine,
             "model": self.model,
+            "effort": self.effort,
+            "speed": self.speed,
             "worker_id": self.worker_id,
             "parent_chat_id": self.parent_chat_id,
             "archived_at": self.archived_at,
@@ -1790,19 +1794,24 @@ class CockpitConnector:
         workspace_request = dict(workspace_request or {})
         if context_thread.chat_type == "orchestrator":
             requested_engine = str(workspace_request.get("engine") or "").strip().lower()
-            requested_model = str(workspace_request.get("model") or "").strip()
-            if requested_engine or requested_model:
+            requested_tuning = {
+                key: str(workspace_request.get(key) or "").strip()
+                for key in ("model", "effort", "speed")
+            }
+            requested_tuning = {key: value for key, value in requested_tuning.items() if value}
+            if requested_engine or requested_tuning:
                 context_thread = self._apply_orchestrator_engine_and_model(
                     project,
                     context_thread,
                     requested_engine,
-                    requested_model,
+                    requested_tuning.get("model", ""),
                 )
             reply, updated = await self._orchestrator_turn(
                 project,
                 context_thread,
                 requester,
                 _text_with_attachment_markers(text, attachments),
+                requested_tuning=requested_tuning,
                 progress=progress,
                 logical_turn_id=logical_turn_id,
                 idempotency_key=idempotency_key,
@@ -2008,10 +2017,12 @@ class CockpitConnector:
         requester: RequestContext,
         text: str,
         *,
+        requested_tuning: dict[str, str] | None = None,
         progress: Callable[[dict[str, Any]], Any] | None,
         logical_turn_id: str = "",
         idempotency_key: str = "",
     ) -> tuple[str, CockpitThread]:
+        requested_tuning = dict(requested_tuning or {})
         thread = self._index.reserve_execution_turn(project.id, thread.thread_id) or thread
         reserved_session_id = str(thread.workspace.get("session_id") or "")
         thread = await self._ensure_orchestrator_session(project, thread, requester, progress=progress)
@@ -2069,6 +2080,12 @@ class CockpitConnector:
                     if idempotency_key
                     else f"orchestrator-turn:{thread.thread_id}:{turn_id}"
                 ),
+                # Same contract as worker-session turns: the worker writes model,
+                # effort and speed to session metadata before reserving the turn,
+                # and the provider reads them when it starts. A model change has
+                # already respawned the session above; effort and speed apply in
+                # place (codex) or via the adapter's retire+resume (claude).
+                **requested_tuning,
             },
         )
         if response.get("ok") is False:
@@ -2084,6 +2101,22 @@ class CockpitConnector:
         )
         if thread is None:
             raise RuntimeError("conversation execution was interrupted")
+        applied = {
+            key: value
+            for key, value in requested_tuning.items()
+            if value != getattr(thread, key, "")
+        }
+        if applied:
+            # The worker accepted them, so they are effective from here on;
+            # thread detail reports them without waiting for a provider event.
+            thread = self._index.save(
+                replace(
+                    thread,
+                    **applied,
+                    updated_at=utc_now(),
+                    workspace={**thread.workspace, **applied},
+                )
+            )
         await _emit_progress(progress, {"phase": "running", "thread_id": thread.thread_id, "workspace": workspace_public(thread.workspace)})
         try:
             reply = await self._wait_for_orchestrator_turn(worker_id, session_id, turn_id)
@@ -2174,6 +2207,15 @@ class CockpitConnector:
             workspace["model"] = target_model
         else:
             workspace.pop("model", None)
+        # Effort and speed are engine-scoped catalogs (claude publishes no speeds
+        # at all), so a stale tier must not survive an engine change. The turn's
+        # own effort/speed, already validated against the target engine, is
+        # re-applied on the turn body once the new session exists.
+        tuning: dict[str, str] = {}
+        if engine_changed:
+            tuning = {"effort": "", "speed": ""}
+            workspace.pop("effort", None)
+            workspace.pop("speed", None)
         return self._index.save(
             replace(
                 thread,
@@ -2181,6 +2223,7 @@ class CockpitConnector:
                 model=target_model,
                 updated_at=utc_now(),
                 workspace=workspace,
+                **tuning,
             )
         )
 
@@ -2278,6 +2321,11 @@ class CockpitConnector:
                     "allowed_actions": CONVERSATION_SESSION_ALLOWED_ACTIONS,
                     "landing": dict(CONVERSATION_SESSION_LANDING),
                     "model": thread.model,
+                    # A respawned session starts under the thread's tuning rather
+                    # than the engine default; the turn re-asserts it anyway, but
+                    # this keeps the very first provider start honest.
+                    "effort": thread.effort,
+                    "speed": thread.speed,
                     "trusted_mcp_servers": ["jarvis_orchestrator"],
                     "chat_type": "orchestrator",
                     "project_id": project.id,
