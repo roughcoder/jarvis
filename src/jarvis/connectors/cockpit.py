@@ -3402,8 +3402,14 @@ def _project_has_repo(project: ProjectEntry, repo: str) -> bool:
 
 def _github_review_worker(cfg: Config, project: ProjectEntry, repo: str):  # noqa: ANN202 - WorkerProfile inferred across boundary
     registry = WorkerRegistry(cfg.worker, profiles_path=cfg.orchestration.workers_path)
-    profiles = registry.with_repo_access(registry.profiles(probe=True), repo)
-    for worker in profiles:
+    for candidate in registry.candidates(probe=True):
+        if (
+            candidate.status != "online"
+            or not candidate.base_url
+            or candidate.git_identity.get("authenticated") is not True
+        ):
+            continue
+        worker = registry.with_repo_access([candidate], repo)[0]
         access = next(
             (
                 item
@@ -3413,10 +3419,7 @@ def _github_review_worker(cfg: Config, project: ProjectEntry, repo: str):  # noq
             {},
         )
         if (
-            worker.status == "online"
-            and worker.base_url
-            and access.get("accessible") is True
-            and worker.git_identity.get("authenticated") is True
+            access.get("accessible") is True
         ):
             return worker
     raise RuntimeError(f"no authenticated worker can publish reviews for a repository in project {project.id}")

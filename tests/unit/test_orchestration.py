@@ -732,6 +732,72 @@ def test_worker_registry_filters_by_engine(tmp_path) -> None:
     assert reg.choose(engine="claude").worker_id == "claude-worker"
 
 
+def test_worker_registry_choose_stops_after_first_eligible_preferred_worker(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    path = tmp_path / "workers.json"
+    path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {"worker_id": "worker-a", "display_name": "Worker A", "base_url": "http://worker-a"},
+                    {"worker_id": "worker-b", "display_name": "Worker B", "base_url": "http://worker-b"},
+                    {"worker_id": "worker-c", "display_name": "Worker C", "base_url": "http://worker-c"},
+                ]
+            }
+        )
+    )
+    registry = WorkerRegistry(WorkerConfig(_env_file=None), profiles_path=str(path))
+    probed: list[str] = []
+
+    def probe(profile):  # noqa: ANN001, ANN202
+        probed.append(profile.worker_id)
+        profile.status = "online"
+        return profile
+
+    monkeypatch.setattr(registry, "_probe", probe)
+
+    selected = registry.choose(preferred=["worker-b"])
+
+    assert selected is not None
+    assert selected.worker_id == "worker-b"
+    assert probed == ["worker-b"]
+
+
+def test_worker_registry_choose_probes_next_candidate_only_when_needed(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    path = tmp_path / "workers.json"
+    path.write_text(
+        json.dumps(
+            {
+                "workers": [
+                    {"worker_id": "worker-a", "display_name": "Worker A", "base_url": "http://worker-a"},
+                    {"worker_id": "worker-b", "display_name": "Worker B", "base_url": "http://worker-b"},
+                    {"worker_id": "worker-c", "display_name": "Worker C", "base_url": "http://worker-c"},
+                ]
+            }
+        )
+    )
+    registry = WorkerRegistry(WorkerConfig(_env_file=None), profiles_path=str(path))
+    probed: list[str] = []
+
+    def probe(profile):  # noqa: ANN001, ANN202
+        probed.append(profile.worker_id)
+        profile.status = "offline" if profile.worker_id == "worker-b" else "online"
+        return profile
+
+    monkeypatch.setattr(registry, "_probe", probe)
+
+    selected = registry.choose(preferred=["worker-b"])
+
+    assert selected is not None
+    assert selected.worker_id == "worker-a"
+    assert probed == ["worker-b", "worker-a"]
+
+
 @pytest.mark.parametrize(
     ("phrase", "operation", "source", "start"),
     [

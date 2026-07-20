@@ -1261,6 +1261,40 @@ def test_session_manager_hides_pending_requests_for_terminal_sessions(tmp_path) 
     assert sessions.pending_requests() == []
 
 
+def test_session_manager_does_not_scan_terminal_session_events(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create({"provider": "fake", "engine": "fake"})
+    sessions.update_status(session.session_id, SESSION_COMPLETED)
+    monkeypatch.setattr(
+        sessions,
+        "_execution_events",
+        lambda *_args, **_kwargs: pytest.fail("terminal session event scan"),
+    )
+
+    assert sessions.pending_requests(session.session_id) == []
+    assert sessions.pending_requests() == []
+
+
+def test_session_execution_state_uses_durable_projection_without_event_scan(
+    tmp_path,
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create({"provider": "fake", "engine": "fake"})
+    sessions.reserve_turn(session.session_id, {"turn_id": "turn_fast", "idempotency_key": "turn_fast"})
+    monkeypatch.setattr(
+        sessions,
+        "_execution_events",
+        lambda *_args, **_kwargs: pytest.fail("projected execution event scan"),
+    )
+
+    state = sessions.execution_state(session.session_id)
+
+    assert state is not None
+    assert state["active_turn"]["turn_id"] == "turn_fast"
+    assert state["pending_requests"] == []
+
+
 def test_session_manager_rejects_duplicate_session_id_without_overwriting(tmp_path) -> None:
     sessions = SessionManager(str(tmp_path / "sessions"))
     original, _ = sessions.create(

@@ -371,6 +371,7 @@ class SessionManager:
                 "turn_id": str(data.get("turn_id") or ""),
                 "started_at": event.time,
             }
+            session.metadata.setdefault("execution_pending_requests", [])
             _apply_ended_reason(session, SESSION_RUNNING)
             session.updated_at = event.time
             self.save(session)
@@ -453,7 +454,9 @@ class SessionManager:
         sessions = [self.get(session_id)] if session_id else self.list()
         pending: list[dict[str, Any]] = []
         for session in [x for x in sessions if x is not None]:
-            pending.extend(_pending_requests_from_events(session, self.events(session.session_id)))
+            if session.status in FAILED_SESSION_STATUSES or session.status in SUCCESS_SESSION_STATUSES:
+                continue
+            pending.extend(_pending_requests_from_events(session, self._execution_events(session.session_id)))
         return pending
 
     def execution_state(self, session_id: str) -> dict[str, Any] | None:
@@ -461,8 +464,14 @@ class SessionManager:
         session = self.get(session_id)
         if session is None:
             return None
-        events = self._execution_events(session_id)
         stored_active = session.metadata.get("active_turn")
+        stored_pending = session.metadata.get("execution_pending_requests")
+        needs_events = (
+            session.status in ACTIVE_SESSION_STATUSES
+            and session.status != SESSION_CREATED
+            and (not isinstance(stored_active, dict) or not isinstance(stored_pending, list))
+        )
+        events = self._execution_events(session_id) if needs_events else []
         active_turn = (
             {
                 "turn_id": str(stored_active.get("turn_id") or ""),

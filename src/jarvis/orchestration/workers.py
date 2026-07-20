@@ -6,7 +6,7 @@ import os
 import pathlib
 import socket
 from copy import deepcopy
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import httpx
@@ -192,12 +192,23 @@ class WorkerRegistry:
         self._http_post = http_post or worker_http_post
 
     def profiles(self, *, probe: bool = False) -> list[WorkerProfile]:
+        return list(self.candidates(probe=probe))
+
+    def candidates(
+        self,
+        *,
+        preferred: list[str] | None = None,
+        probe: bool = False,
+    ) -> Iterator[WorkerProfile]:
+        """Yield workers in selection order, probing only as they are consumed."""
         profiles = self._load_profiles()
         if not profiles:
             profiles = [self._default_profile()]
-        if probe:
-            return [self._probe(p) for p in profiles]
-        return [_apply_probe_snapshot(p, self.probe_snapshots_path) for p in profiles]
+        if preferred:
+            rank = {worker_id: index for index, worker_id in enumerate(preferred)}
+            profiles.sort(key=lambda profile: rank.get(profile.worker_id, len(rank)))
+        for profile in profiles:
+            yield self._probe(profile) if probe else _apply_probe_snapshot(profile, self.probe_snapshots_path)
 
     def get(self, worker_id: str = "", *, probe: bool = False) -> WorkerProfile | None:
         profiles = self.profiles(probe=probe)
@@ -244,13 +255,7 @@ class WorkerRegistry:
         required_engines = _required_engines(engines or [])
         if engine and not required_engines:
             required_engines = [engine]
-        profiles = self.profiles(probe=True)
-        if preferred:
-            by_id = {p.worker_id: p for p in profiles}
-            ordered = [by_id[p] for p in preferred if p in by_id] + [p for p in profiles if p.worker_id not in preferred]
-        else:
-            ordered = profiles
-        for profile in ordered:
+        for profile in self.candidates(preferred=preferred, probe=True):
             if profile.status == "offline":
                 continue
             if any(not worker_supports_engine(profile.supported_engines, target) for target in required_engines):

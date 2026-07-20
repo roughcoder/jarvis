@@ -151,7 +151,9 @@ Query parameters:
 ### `GET /sessions/requests`
 
 List pending approval and input requests across all worker sessions. This is a
-derived view over append-only events, not a second state store.
+derived view over append-only events. Current sessions keep a durable metadata
+projection so reads do not rescan historical logs; legacy active sessions fall
+back to a bounded event-tail scan.
 
 Response:
 
