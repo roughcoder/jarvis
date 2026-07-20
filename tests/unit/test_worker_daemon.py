@@ -1275,6 +1275,50 @@ def test_session_manager_does_not_scan_terminal_session_events(tmp_path, monkeyp
     assert sessions.pending_requests() == []
 
 
+def test_session_manager_reads_current_pending_requests_from_projection(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create({"provider": "fake", "engine": "fake"})
+    sessions.append_event(
+        session.session_id,
+        "approval.requested",
+        {"request_id": "approval_fast", "detail": "Approve fast path"},
+    )
+    monkeypatch.setattr(
+        sessions,
+        "_execution_events",
+        lambda *_args, **_kwargs: pytest.fail("projected pending-request event scan"),
+    )
+
+    request = sessions.pending_requests(session.session_id)[0]
+
+    assert request["request_id"] == "approval_fast"
+    assert request["event"]["type"] == "approval.requested"
+    assert request["event"]["data"]["detail"] == "Approve fast path"
+
+
+def test_session_manager_falls_back_to_event_tail_for_legacy_pending_requests(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create({"provider": "fake", "engine": "fake"})
+    sessions.append_event(session.session_id, "approval.requested", {"request_id": "approval_legacy"})
+    legacy = sessions.get(session.session_id)
+    assert legacy is not None
+    legacy.metadata.pop("execution_pending_requests", None)
+    sessions.save(legacy)
+    original = sessions._execution_events
+    scanned: list[str] = []
+
+    def execution_events(session_id):  # noqa: ANN001, ANN202
+        scanned.append(session_id)
+        return original(session_id)
+
+    monkeypatch.setattr(sessions, "_execution_events", execution_events)
+
+    request = sessions.pending_requests(session.session_id)[0]
+
+    assert request["request_id"] == "approval_legacy"
+    assert scanned == [session.session_id]
+
+
 def test_session_execution_state_uses_durable_projection_without_event_scan(
     tmp_path,
     monkeypatch,

@@ -456,6 +456,14 @@ class SessionManager:
         for session in [x for x in sessions if x is not None]:
             if session.status in FAILED_SESSION_STATUSES or session.status in SUCCESS_SESSION_STATUSES:
                 continue
+            stored = session.metadata.get("execution_pending_requests")
+            if isinstance(stored, list):
+                pending.extend(
+                    _pending_request_from_execution_projection(session, item)
+                    for item in stored
+                    if isinstance(item, dict)
+                )
+                continue
             pending.extend(_pending_requests_from_events(session, self._execution_events(session.session_id)))
         return pending
 
@@ -736,6 +744,38 @@ def _pending_requests_from_events(
             if request_id:
                 pending.pop((session.session_id, resolved_kind, request_id), None)
     return list(pending.values())
+
+
+def _pending_request_from_execution_projection(
+    session: WorkerSession,
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    request_id = str(item.get("request_id") or "")
+    kind = str(item.get("kind") or "")
+    created_at = str(item.get("created_at") or "")
+    data: dict[str, Any] = {
+        "request_id": request_id,
+        "title": str(item.get("title") or ""),
+        "detail": str(item.get("detail") or ""),
+        "created_at": created_at,
+    }
+    if kind == "approval" and item.get("request_kind"):
+        data["request_kind"] = str(item["request_kind"])
+    if kind == "input" and isinstance(item.get("questions"), list):
+        data["questions"] = item["questions"]
+    return {
+        "session_id": session.session_id,
+        "request_id": request_id,
+        "kind": kind,
+        "status": str(item.get("status") or "pending"),
+        "event": {
+            "event_id": request_id,
+            "session_id": session.session_id,
+            "type": f"{kind}.requested",
+            "data": data,
+            "time": created_at,
+        },
+    }
 
 
 def _execution_pending_requests(
