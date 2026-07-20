@@ -169,7 +169,14 @@ def test_project_file_rows_query_filters_ranks_and_caps(tmp_path, monkeypatch) -
         ],
     )
 
-    assert [row["doc_id"] for row in project_file_rows(cfg, "jarvis")] == ["notes", "spec-v2", "draft"]
+    rows = project_file_rows(cfg, "jarvis")
+    assert [row["doc_id"] for row in rows] == ["notes", "spec-v2", "draft"]
+    # Every row carries the stored filename the composer turns into a handle,
+    # so the picker never has to parse a brain-host path.
+    assert [row["filename"] for row in rows] == ["notes.md", "spec-v2.md", "draft.md"]
+    assert all(row["filename"] == Path(row["original_path"]).name for row in rows)
+    # A handle must never contain whitespace, or it cannot be mentioned at all.
+    assert all(" " not in row["filename"] for row in rows)
     # Filename prefix ("spec-v2.md") outranks the title substring hit ("A spec draft").
     assert [row["doc_id"] for row in project_file_rows(cfg, "jarvis", query="spec")] == ["spec-v2", "draft"]
     assert project_file_rows(cfg, "jarvis", query="zzz") == []
@@ -203,11 +210,13 @@ def test_file_list_op_accepts_a_query(tmp_path, monkeypatch) -> None:  # noqa: A
     assert len(filtered["files"]) == 1
     row = filtered["files"][0]
     assert row["doc_id"].startswith("alpha-")
-    assert Path(row["original_path"]).name == f"{row['doc_id']}.md"
+    assert row["filename"] == f"{row['doc_id']}.md"
+    assert row["filename"] == Path(row["original_path"]).name
     assert filtered["query"] == "alpha"
 
-    # And the stored filename is exactly what an @-mention resolves against.
-    mentioned = resolve_project_mentions(service.cfg, "jarvis", f"read @{Path(row['original_path']).name}")
+    # The contract the composer depends on: the row's `filename` is exactly the
+    # handle the resolver matches — build `@<filename>` and it resolves.
+    mentioned = resolve_project_mentions(service.cfg, "jarvis", f"read @{row['filename']}")
     assert "body of alpha.md" in mentioned
 
 

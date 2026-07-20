@@ -836,6 +836,16 @@ def _manifest_entries(cfg: Config, project_id: str) -> list[dict[str, Any]]:
     return [dict(entry) for entry in entries if isinstance(entry, dict)]
 
 
+def stored_filename(row: dict[str, Any]) -> str:
+    """The file's name as stored in the vault — the mentionable `@<filename>`.
+
+    Derived from `original_path` rather than persisted, so rows written before
+    the field existed still carry it and it can never drift from what the
+    mention resolver matches against.
+    """
+    return Path(str(row.get("original_path") or "")).name
+
+
 def project_file_rows(
     cfg: Config,
     project_id: str,
@@ -848,10 +858,11 @@ def project_file_rows(
 
     The single read path behind both `project.file.list` and @-mention
     resolution, so the picker and the resolver can never disagree about which
-    files exist.
+    files exist. Each row gains a derived `filename` — the handle a composer
+    needs, without making callers parse a brain-host path.
     """
     rows = [
-        entry
+        {**entry, "filename": stored_filename(entry)}
         for entry in _manifest_entries(cfg, project_id)
         if include_retracted or not entry.get("retracted")
     ]
@@ -871,7 +882,7 @@ def _file_query_rank(row: dict[str, Any], needle: str) -> int | None:
     Prefix matches on the stored filename outrank prefix matches on doc_id or
     title, which in turn outrank plain substring hits.
     """
-    stored_name = Path(str(row.get("original_path") or "")).name.lower()
+    stored_name = stored_filename(row).lower()
     doc_id = str(row.get("doc_id") or "").lower()
     title = str(row.get("title") or "").lower()
     for rank, candidates in ((0, (stored_name,)), (1, (doc_id, title))):

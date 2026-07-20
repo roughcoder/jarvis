@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from jarvis.brain.project_management import project_file_rows
+from jarvis.brain.project_management import project_file_rows, stored_filename
 from jarvis.config import Config
 
 logger = logging.getLogger(__name__)
@@ -51,13 +51,12 @@ def _row_matches(row: dict[str, Any], handle: str) -> bool:
     doc_id = str(row.get("doc_id") or "")
     if handle.startswith("memory:"):
         return bool(doc_id) and doc_id == handle.removeprefix("memory:")
-    stored_name = Path(str(row.get("original_path") or "")).name
-    return handle in {value for value in (doc_id, stored_name) if value}
+    return handle in {value for value in (doc_id, stored_filename(row)) if value}
 
 
 def _render_block(row: dict[str, Any], handle: str, max_bytes: int) -> str:
     """Render one bounded context block for a matched manifest row."""
-    label = Path(str(row.get("original_path") or "")).name or str(row.get("doc_id") or handle)
+    label = stored_filename(row) or str(row.get("doc_id") or handle)
     header = f"--- @file {label} (project file) ---"
     mime_type = str(row.get("mime_type") or "")
     path = Path(str(row.get("original_path") or ""))
