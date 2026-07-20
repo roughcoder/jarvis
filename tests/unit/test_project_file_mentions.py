@@ -340,3 +340,149 @@ def test_worker_session_turn_without_a_project_link_is_a_no_op(tmp_path, monkeyp
 
     body = {"prompt": "apply @plan.md"}
     assert asyncio.run(_session_turn_with_mentions(StubCtx(), type("R", (), {"worker_id": "w", "session_id": "s"})(), body)) is body
+
+
+# --- worker-backed thread paths ---------------------------------------------
+#
+# The two branches of `CockpitConnector.turn()` that hand the prompt to a worker
+# session used to persist the text they were given — which is the *injected*
+# prompt. That rewrote the user's words in the durable transcript and replayed
+# the inlined file as history on every later turn in the thread.
+
+
+def _worker_thread_connector(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, doc_body: str):  # noqa: ANN202
+    """A connector whose project vault holds `@spec.md`, plus its project."""
+
+    from test_cockpit_api import FakeGateway, FakeProjectMemory, _cfg as _api_cfg, _seed_project_registry
+
+    from jarvis.connectors.cockpit import CockpitConnector
+    from jarvis.brain.registry import RegistryStore
+
+    cfg = _api_cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+
+    doc = tmp_path / "spec.md"
+    doc.write_text(doc_body, encoding="utf-8")
+    _manifest(cfg, [_row("spec", doc)], project_id=project.id)
+
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    return connector, project
+
+
+def _persisted_user_messages(connector, project_id: str, thread_id: str) -> list[str]:  # noqa: ANN001
+    """Re-read the thread from disk — #138 showed an in-memory assertion can
+    pass while the persisted form is wrong."""
+
+    from jarvis.connectors.cockpit import CockpitThreadIndex
+
+    stored = CockpitThreadIndex(connector.index.path).get_with_messages(project_id, thread_id, limit=50)
+    assert stored is not None
+    return [str(row.get("content") or "") for row in stored.messages if row.get("role") == "user"]
+
+
+def test_orchestrator_thread_turn_persists_typed_text_not_the_injection(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.brain.facade import RequestContext
+    from jarvis.connectors.cockpit import CockpitThread, orchestrator_session_id
+
+    connector, project = _worker_thread_connector(tmp_path, monkeypatch, "SPEC BODY")
+    thread = CockpitThread(
+        thread_id="thread_orchestrator_mention",
+        project_id=project.id,
+        session_id=orchestrator_session_id(project.id, "thread_orchestrator_mention"),
+        title="Plan",
+        created_at="2026-07-20T10:00:00Z",
+        updated_at="2026-07-20T10:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        engine="codex",
+        workspace={
+            "worker_id": "worker_a",
+            "session_id": "orch_thread_orchestrator_mention",
+            "provider_started": True,
+            "status": "ready",
+            "session_generation": 1,
+        },
+    )
+    connector.index.save(thread)
+
+    posted: list[dict[str, Any]] = []
+
+    async def ensure(_project, current_thread, _requester, **_kwargs):  # noqa: ANN001, ANN003
+        return current_thread
+
+    def post(_worker_id: str, _path: str, body: dict[str, Any]) -> dict[str, Any]:
+        posted.append(body)
+        return {"ok": True}
+
+    async def wait(*_args: Any) -> str:
+        return "Read it."
+
+    monkeypatch.setattr(connector, "_ensure_orchestrator_session", ensure)
+    monkeypatch.setattr(connector, "_post_worker_json", post)
+    monkeypatch.setattr(connector, "_wait_for_orchestrator_turn", wait)
+
+    typed = "summarise @spec.md"
+    reply, _updated, _events = asyncio.run(
+        connector.turn(project, thread, RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil"), typed)
+    )
+
+    assert reply == "Read it."
+    # The provider got the injected block...
+    assert "SPEC BODY" in posted[0]["prompt"]
+    assert "--- @file spec.md (project file) ---" in posted[0]["prompt"]
+    # ...and the durable transcript kept only what the user typed.
+    persisted = _persisted_user_messages(connector, project.id, thread.thread_id)
+    assert persisted == [typed]
+
+
+def test_workspace_thread_turn_persists_typed_text_not_the_injection(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.brain.facade import RequestContext
+    from jarvis.connectors.cockpit import CockpitThread
+
+    connector, project = _worker_thread_connector(tmp_path, monkeypatch, "SPEC BODY")
+    thread = CockpitThread(
+        thread_id="thread_workspace_mention",
+        project_id=project.id,
+        session_id=f"project:{project.id}:thread_workspace_mention",
+        title="Build",
+        created_at="2026-07-20T10:00:00Z",
+        updated_at="2026-07-20T10:00:00Z",
+        created_by="neil",
+        workspace={
+            "worker_id": "worker_a",
+            "session_id": "conv_thread_workspace_mention",
+            "status": "ready",
+            "session_generation": 1,
+        },
+    )
+    connector.index.save(thread)
+
+    posted: list[dict[str, Any]] = []
+
+    async def ensure(_project, current_thread, _requester, **_kwargs):  # noqa: ANN001, ANN003
+        return current_thread
+
+    def post(_worker_id: str, _path: str, body: dict[str, Any]) -> dict[str, Any]:
+        posted.append(body)
+        return {"ok": True}
+
+    monkeypatch.setattr(connector, "_ensure_workspace", ensure)
+    monkeypatch.setattr(connector, "_post_worker_json", post)
+
+    typed = "apply @spec.md"
+    _reply, _updated, _events = asyncio.run(
+        connector.turn(project, thread, RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil"), typed)
+    )
+
+    assert "SPEC BODY" in posted[0]["prompt"]
+    assert "--- @file spec.md (project file) ---" in posted[0]["prompt"]
+    persisted = _persisted_user_messages(connector, project.id, thread.thread_id)
+    assert persisted == [typed]

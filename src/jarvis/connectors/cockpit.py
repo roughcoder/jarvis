@@ -1793,6 +1793,13 @@ class CockpitConnector:
         # `@spec.md` / `@memory:<doc_id>` gain a bounded content block for the
         # provider only; `text` stays as typed for the transcript and memory.
         prompt_text = await asyncio.to_thread(resolve_project_mentions, self._cfg, project.id, text)
+        # Durable stores (transcript + memory) keep the text plus a compact
+        # marker per image — later turns and the deriver know an image was
+        # shared, but base64 payloads live only in the gateway request. The
+        # mention injection is likewise provider-only: persisting it would
+        # rewrite the user's words and replay the inlined file on every
+        # subsequent turn in this thread.
+        persisted_text = _text_with_attachment_markers(text, attachments)
         context_thread = self._index.get_with_messages(project.id, thread.thread_id, limit=THREAD_HISTORY_LIMIT) or thread
         explicit_workspace_request = workspace_request is not None
         workspace_request = dict(workspace_request or {})
@@ -1815,6 +1822,7 @@ class CockpitConnector:
                 context_thread,
                 requester,
                 _text_with_attachment_markers(prompt_text, attachments),
+                persisted_text=persisted_text,
                 requested_tuning=requested_tuning,
                 progress=progress,
                 logical_turn_id=logical_turn_id,
@@ -1827,6 +1835,7 @@ class CockpitConnector:
                 context_thread,
                 requester,
                 _text_with_attachment_markers(prompt_text, attachments),
+                persisted_text=persisted_text,
                 workspace_request=workspace_request,
                 progress=progress,
                 logical_turn_id=logical_turn_id,
@@ -1872,10 +1881,6 @@ class CockpitConnector:
         if self._tracer is not None:
             self._tracer.emit(trace)
         reply = result.reply or reply
-        # Durable stores (transcript + memory) keep the text plus a compact
-        # marker per image — later turns and the deriver know an image was
-        # shared, but base64 payloads live only in the gateway request.
-        persisted_text = _text_with_attachment_markers(text, attachments)
         # Best-effort per AGENTS.md: tracing/memory must never break a turn. The
         # worker/reply already happened, so a Honcho outage here must not raise
         # out of the turn handler and turn a delivered reply into a user-facing
@@ -1909,11 +1914,15 @@ class CockpitConnector:
         requester: RequestContext,
         text: str,
         *,
+        persisted_text: str = "",
         workspace_request: dict[str, Any],
         progress: Callable[[dict[str, Any]], Any] | None,
         logical_turn_id: str = "",
         idempotency_key: str = "",
     ) -> tuple[str, CockpitThread]:
+        # `text` is provider-bound (mentions inlined); `persisted_text` is what
+        # the user typed and is all the transcript and memory ever see.
+        persisted_text = persisted_text or text
         await _emit_progress(progress, {"phase": "resolving-access", "thread_id": thread.thread_id})
         thread = self._index.reserve_execution_turn(project.id, thread.thread_id) or thread
         reserved_session_id = str(thread.workspace.get("session_id") or "")
@@ -2001,14 +2010,14 @@ class CockpitConnector:
                 thread.session_id,
                 requester.memory_peer,
                 requester.device_id,
-                text,
+                persisted_text,
             )
         except Exception:
             pass
         updated = self._index.append_pending_turn(
             thread,
             user_peer_id=requester.memory_peer,
-            user_text=text,
+            user_text=persisted_text,
             assistant_peer_id=self._cfg.memory.assistant_peer_id,
             idempotency_key=idempotency_key,
         )
@@ -2021,11 +2030,15 @@ class CockpitConnector:
         requester: RequestContext,
         text: str,
         *,
+        persisted_text: str = "",
         requested_tuning: dict[str, str] | None = None,
         progress: Callable[[dict[str, Any]], Any] | None,
         logical_turn_id: str = "",
         idempotency_key: str = "",
     ) -> tuple[str, CockpitThread]:
+        # `text` is provider-bound (mentions inlined); `persisted_text` is what
+        # the user typed and is all the transcript and memory ever see.
+        persisted_text = persisted_text or text
         requested_tuning = dict(requested_tuning or {})
         thread = self._index.reserve_execution_turn(project.id, thread.thread_id) or thread
         reserved_session_id = str(thread.workspace.get("session_id") or "")
@@ -2149,7 +2162,7 @@ class CockpitConnector:
                 thread.session_id,
                 requester.memory_peer,
                 requester.device_id,
-                text,
+                persisted_text,
                 reply,
             )
         except Exception:
@@ -2167,7 +2180,7 @@ class CockpitConnector:
         return reply, self._index.append_turn(
             completed,
             user_peer_id=requester.memory_peer,
-            user_text=text,
+            user_text=persisted_text,
             assistant_peer_id=self._cfg.memory.assistant_peer_id,
             assistant_text=reply,
             idempotency_key=idempotency_key,
