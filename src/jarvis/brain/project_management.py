@@ -57,6 +57,9 @@ OWNER_ONLY_FIELDS = {"owner", "members", "visibility"}
 PROJECT_STATUSES = {"active", "paused", "archived"}
 PROJECT_VISIBILITIES = {"household", "private", "shared"}
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+# The manifest is per-project and small, but the composer's @-picker types
+# server-side so it never has to hold the whole list — cap what a query returns.
+FILE_QUERY_LIMIT = 20
 logger = logging.getLogger(__name__)
 
 
@@ -219,13 +222,15 @@ class ProjectOperationService:
 
     def _execute_file_list(self, ctx: RequestContext, payload: dict[str, Any]) -> dict[str, Any]:
         project = self._member_project(ctx, payload)
-        include_retracted = bool(payload.get("include_retracted", False))
-        files = [
-            entry
-            for entry in _manifest_entries(self.cfg, project.id)
-            if include_retracted or not entry.get("retracted")
-        ]
-        return {"project_id": project.id, "files": files}
+        query = str(payload.get("query") or "").strip()
+        files = project_file_rows(
+            self.cfg,
+            project.id,
+            include_retracted=bool(payload.get("include_retracted", False)),
+            query=query,
+            limit=FILE_QUERY_LIMIT if query else 0,
+        )
+        return {"project_id": project.id, "files": files, "query": query}
 
     async def _execute_memory(
         self,
@@ -829,6 +834,63 @@ def _manifest_entries(cfg: Config, project_id: str) -> list[dict[str, Any]]:
     projects = data.get("projects") if isinstance(data.get("projects"), dict) else {}
     entries = projects.get(project_id) if isinstance(projects.get(project_id), list) else []
     return [dict(entry) for entry in entries if isinstance(entry, dict)]
+
+
+def stored_filename(row: dict[str, Any]) -> str:
+    """The file's name as stored in the vault — the mentionable `@<filename>`.
+
+    Derived from `original_path` rather than persisted, so rows written before
+    the field existed still carry it and it can never drift from what the
+    mention resolver matches against.
+    """
+    return Path(str(row.get("original_path") or "")).name
+
+
+def project_file_rows(
+    cfg: Config,
+    project_id: str,
+    *,
+    include_retracted: bool = False,
+    query: str = "",
+    limit: int = 0,
+) -> list[dict[str, Any]]:
+    """Manifest rows for a project, optionally name-filtered and ranked.
+
+    The single read path behind both `project.file.list` and @-mention
+    resolution, so the picker and the resolver can never disagree about which
+    files exist. Each row gains a derived `filename` — the handle a composer
+    needs, without making callers parse a brain-host path.
+    """
+    rows = [
+        {**entry, "filename": stored_filename(entry)}
+        for entry in _manifest_entries(cfg, project_id)
+        if include_retracted or not entry.get("retracted")
+    ]
+    needle = query.strip().lower()
+    if needle:
+        ranked = [(rank, row) for row in rows if (rank := _file_query_rank(row, needle)) is not None]
+        ranked.sort(key=lambda item: (item[0], str(item[1].get("observed_at") or "")))
+        rows = [row for _, row in ranked]
+    if limit > 0:
+        rows = rows[:limit]
+    return rows
+
+
+def _file_query_rank(row: dict[str, Any], needle: str) -> int | None:
+    """Rank a row against a lowercased needle; None when it does not match.
+
+    Prefix matches on the stored filename outrank prefix matches on doc_id or
+    title, which in turn outrank plain substring hits.
+    """
+    stored_name = stored_filename(row).lower()
+    doc_id = str(row.get("doc_id") or "").lower()
+    title = str(row.get("title") or "").lower()
+    for rank, candidates in ((0, (stored_name,)), (1, (doc_id, title))):
+        if any(value.startswith(needle) for value in candidates if value):
+            return rank
+    if any(needle in value for value in (stored_name, doc_id, title) if value):
+        return 2
+    return None
 
 
 def _upsert_manifest_entry(cfg: Config, project_id: str, entry: dict[str, Any]) -> None:

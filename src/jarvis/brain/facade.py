@@ -45,6 +45,7 @@ from jarvis.brain.tracing import Tracer
 
 # Project & registry layer.
 from jarvis.brain.memory_tools import make_memory_tools
+from jarvis.brain.project_files import resolve_project_mentions
 from jarvis.brain.project_management import BrainProjectClient, ProjectOperationError
 from jarvis.brain.project_tools import make_project_tools
 from jarvis.brain.registry import ProjectEntry, RegistryStore
@@ -81,5 +82,6 @@ __all__ = [
     "load_users",
     "make_memory_tools",
     "make_project_tools",
+    "resolve_project_mentions",
     "resolve_capabilities",
 ]

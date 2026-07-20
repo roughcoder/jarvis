@@ -51,6 +51,7 @@ from jarvis.brain.facade import (
     UnsupportedMemoryOperation,
     make_memory_tools,
     make_project_tools,
+    resolve_project_mentions,
 )
 from jarvis.config import Config
 from jarvis.engines import BUILTIN_CODE_ENGINES, normalize_engine_id, worker_supports_engine
@@ -1789,6 +1790,9 @@ class CockpitConnector:
         text = text.strip()
         if not text:
             raise ValueError("turn text is required")
+        # `@spec.md` / `@memory:<doc_id>` gain a bounded content block for the
+        # provider only; `text` stays as typed for the transcript and memory.
+        prompt_text = await asyncio.to_thread(resolve_project_mentions, self._cfg, project.id, text)
         context_thread = self._index.get_with_messages(project.id, thread.thread_id, limit=THREAD_HISTORY_LIMIT) or thread
         explicit_workspace_request = workspace_request is not None
         workspace_request = dict(workspace_request or {})
@@ -1810,7 +1814,7 @@ class CockpitConnector:
                 project,
                 context_thread,
                 requester,
-                _text_with_attachment_markers(text, attachments),
+                _text_with_attachment_markers(prompt_text, attachments),
                 requested_tuning=requested_tuning,
                 progress=progress,
                 logical_turn_id=logical_turn_id,
@@ -1822,7 +1826,7 @@ class CockpitConnector:
                 project,
                 context_thread,
                 requester,
-                _text_with_attachment_markers(text, attachments),
+                _text_with_attachment_markers(prompt_text, attachments),
                 workspace_request=workspace_request,
                 progress=progress,
                 logical_turn_id=logical_turn_id,
@@ -1852,7 +1856,7 @@ class CockpitConnector:
             await _emit_progress(progress, {"type": "text.delta", "delta": delta})
 
         reply = await session.respond_text(
-            text, trace, result, attachments=attachments, on_text=on_text if progress is not None else None
+            prompt_text, trace, result, attachments=attachments, on_text=on_text if progress is not None else None
         )
         events = _safe_thread_tool_events(thread.session_id, result.tool_messages)
         guarded_reply = _guard_project_thread_reply(result.raw or reply, events)
