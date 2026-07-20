@@ -12191,3 +12191,130 @@ def test_cockpit_workspace_turn_forwards_the_model_to_the_worker_session(tmp_pat
     assert stored.workspace["session_id"] == "conv_thread_ws_model"
     # Thread detail reports the new effective model.
     assert stored.model == "gpt-y"
+
+
+def test_orchestrator_turn_applies_and_reports_effort_and_speed(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """Effort/speed on an orchestrator-thread turn must reach the provider session
+    AND be reported by thread detail afterwards.
+
+    #137 wired both for worker sessions; the orchestrator path consumed neither,
+    so the request was validated, dropped, and reported back as empty.
+    """
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    connector = CockpitConnector(cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None)
+    thread = CockpitThread(
+        thread_id="thread_effort_speed",
+        project_id=project.id,
+        session_id=orchestrator_session_id(project.id, "thread_effort_speed"),
+        title="Plan",
+        created_at="2026-07-20T10:00:00Z",
+        updated_at="2026-07-20T10:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        engine="codex",
+        model="gpt-5.5",
+        worker_id="worker_a",
+        workspace={
+            "worker_id": "worker_a",
+            "session_id": "orch_thread_effort_speed",
+            "provider_started": True,
+            "status": "ready",
+            "session_generation": 1,
+            "model": "gpt-5.5",
+        },
+    )
+    connector.index.save(thread)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+    posted: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_post(_worker_id: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        posted.append((path, body))
+        return {"ok": True, "turn_id": body.get("turn_id")}
+
+    def fake_get(_worker_id: str, _path: str) -> dict[str, Any]:
+        return {"status": "ready"}
+
+    async def fake_wait(*_args, **_kwargs) -> str:  # noqa: ANN002, ANN003
+        return "done"
+
+    monkeypatch.setattr(connector, "_post_worker_json", fake_post)
+    monkeypatch.setattr(connector, "_get_worker_json", fake_get)
+    monkeypatch.setattr(connector, "_wait_for_orchestrator_turn", fake_wait)
+
+    reply, _updated, _events = asyncio.run(
+        connector.turn(
+            project,
+            thread,
+            requester,
+            "think harder",
+            workspace_request={"effort": "xhigh", "speed": "priority"},
+        )
+    )
+
+    assert reply == "done"
+    # (a) application: the worker turn carries them, on the same contract the
+    # worker-session path uses.
+    turn_bodies = [body for path, body in posted if path.endswith("/turns")]
+    assert len(turn_bodies) == 1
+    assert turn_bodies[0]["effort"] == "xhigh"
+    assert turn_bodies[0]["speed"] == "priority"
+    # Tuning alone must not respawn the session — codex applies it in place.
+    assert turn_bodies[0]["metadata"]["resume_session"] is True
+
+    # (b) reporting: thread detail reflects the effective values, and survives
+    # the round-trip through the on-disk index.
+    stored = connector.index.get(project.id, thread.thread_id)
+    assert stored is not None
+    assert stored.effort == "xhigh"
+    assert stored.speed == "priority"
+    assert stored.model == "gpt-5.5"
+    assert stored.workspace["session_generation"] == 1
+
+    reloaded = CockpitThreadIndex(Path(cfg.orchestration.workspace) / "cockpit-threads.json").get(
+        project.id, thread.thread_id
+    )
+    assert reloaded is not None
+    assert (reloaded.effort, reloaded.speed) == ("xhigh", "priority")
+
+
+def test_orchestrator_engine_switch_clears_stale_effort_and_speed(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """Effort/speed are engine-scoped catalogs (claude publishes no speeds), so a
+    tier must not survive a switch to an engine that never offered it."""
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    connector = CockpitConnector(cfg, memory=FakeProjectMemory(), gateway=FakeGateway([]), tts=None, tracer=None)
+    thread = CockpitThread(
+        thread_id="thread_tuning_switch",
+        project_id=project.id,
+        session_id=orchestrator_session_id(project.id, "thread_tuning_switch"),
+        title="Plan",
+        created_at="2026-07-20T10:00:00Z",
+        updated_at="2026-07-20T10:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+        engine="codex",
+        model="gpt-5.5",
+        effort="xhigh",
+        speed="priority",
+        workspace={"worker_id": "worker_a", "session_id": "s1", "session_generation": 1, "model": "gpt-5.5"},
+    )
+    connector.index.save(thread)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+
+    async def fake_orchestrator_turn(_project, context_thread, *_args, **_kwargs):  # noqa: ANN001, ANN002, ANN003
+        return "ok", context_thread
+
+    monkeypatch.setattr(connector, "_orchestrator_turn", fake_orchestrator_turn)
+
+    asyncio.run(connector.turn(project, thread, requester, "go claude", workspace_request={"engine": "claude"}))
+    switched = connector.index.get(project.id, thread.thread_id)
+    assert switched is not None
+    assert switched.engine == "claude"
+    assert (switched.effort, switched.speed) == ("", "")
+    assert "effort" not in switched.workspace
+    assert "speed" not in switched.workspace
