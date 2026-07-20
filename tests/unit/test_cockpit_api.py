@@ -11639,6 +11639,51 @@ def test_publish_review_tool_refuses_to_claim_an_unposted_review(tmp_path, monke
     assert "nothing was posted" in result
 
 
+def test_github_review_worker_stops_after_first_publish_capable_candidate(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.connectors import cockpit as cockpit_connector_module
+    from jarvis.connectors.cockpit import _github_review_worker
+
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    seen: list[str] = []
+    repo_probes: list[str] = []
+
+    class _Registry:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def candidates(self, *, probe):  # noqa: ANN001, ANN202
+            assert probe is True
+            for worker_id, status, authenticated in (
+                ("offline", "offline", False),
+                ("eligible", "online", True),
+                ("unused", "online", True),
+            ):
+                seen.append(worker_id)
+                yield SimpleNamespace(
+                    worker_id=worker_id,
+                    status=status,
+                    base_url=f"http://{worker_id}",
+                    git_identity={"authenticated": authenticated},
+                    repo_access=[],
+                )
+
+        def with_repo_access(self, profiles, repo):  # noqa: ANN001, ANN202
+            repo_probes.append(profiles[0].worker_id)
+            profiles[0].repo_access = [{"repo": repo, "accessible": True}]
+            return profiles
+
+    monkeypatch.setattr(cockpit_connector_module, "WorkerRegistry", _Registry)
+
+    selected = _github_review_worker(cfg, project, project.repos[0].remote)
+
+    assert selected.worker_id == "eligible"
+    assert seen == ["offline", "eligible"]
+    assert repo_probes == ["eligible"]
+
+
 def test_publish_review_tool_rejects_a_replayed_zero_id_result(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     from jarvis.connectors.cockpit import _publish_github_pr_review_tool
 
