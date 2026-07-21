@@ -393,7 +393,11 @@ class OrchestrationService:
         run = _resolve_run(store, run_ref)
         if run is None:
             raise ResumeRunError(f"No run found for {run_ref!r}.")
-        landing, allowed_actions = _resume_policy(store, run.run_id, self.cfg.orchestration.landing_mode)
+        landing, allowed_actions, allow_nested_agents = _resume_policy(
+            store,
+            run.run_id,
+            self.cfg.orchestration.landing_mode,
+        )
         self._require(allowed_actions)
 
         sync_run_sessions(
@@ -436,6 +440,7 @@ class OrchestrationService:
             session_id=previous.session_id,
             session_name=previous.session_id,
             resume_session=True,
+            allow_nested_agents=allow_nested_agents,
             allowed_actions=allowed_actions,
             landing=landing,
         )
@@ -765,7 +770,11 @@ def _resume_session(sessions: list[WorkerSessionLink]) -> WorkerSessionLink | No
     return None
 
 
-def _resume_policy(store: OrchestrationStore, run_id: str, fallback_mode: str) -> tuple[LandingPolicy, list[str]]:
+def _resume_policy(
+    store: OrchestrationStore,
+    run_id: str,
+    fallback_mode: str,
+) -> tuple[LandingPolicy, list[str], bool]:
     for event in store.events(run_id):
         if event.type != "execution_envelope_created":
             continue
@@ -776,8 +785,8 @@ def _resume_policy(store: OrchestrationStore, run_id: str, fallback_mode: str) -
         if envelope.resume_session:
             continue
         allowed = envelope.allowed_actions or required_for_worker_dispatch(envelope.landing.mode)
-        return envelope.landing, list(allowed)
-    return LandingPolicy(mode=fallback_mode), required_for_worker_dispatch(fallback_mode)
+        return envelope.landing, list(allowed), envelope.allow_nested_agents
+    return LandingPolicy(mode=fallback_mode), required_for_worker_dispatch(fallback_mode), True
 
 
 def _record_failed_resume(store: OrchestrationStore, run_id: str, error: str) -> None:

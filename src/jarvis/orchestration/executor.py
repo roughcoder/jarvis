@@ -122,6 +122,7 @@ def _acquire_worker_session(
                 "execution_envelope": envelope.to_dict(),
                 "model": envelope.model,
                 "provision_workspace": bool(envelope.repo and not envelope.cwd and not envelope.resume_session),
+                "allow_nested_agents": envelope.allow_nested_agents,
                 "allowed_actions": envelope.allowed_actions,
                 "landing": envelope.landing.to_dict(),
                 "verification": envelope.verification.to_dict(),

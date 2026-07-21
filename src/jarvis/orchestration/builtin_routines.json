@@ -1,0 +1,142 @@
+{
+  "schema_version": "1",
+  "routines": [
+    {
+      "builtin": true,
+      "description": "Create a focused briefing from the selected project or conversation context for a specific day.",
+      "execution": {"chat_type": "orchestrator", "default_engine": "codex", "supported_engines": ["codex", "claude"]},
+      "name": "Morning brief",
+      "parameters": [
+        {"allow_multiple": false, "choices": [], "default": {"source": "today"}, "description": "The day covered by the briefing.", "label": "Day", "max_items": 0, "min_items": 0, "name": "day", "options_source": "", "required": true, "sensitive": false, "type": "date"},
+        {"allow_multiple": false, "choices": [], "default": {"source": "literal", "value": "Priorities, deadlines, blockers, and decisions that need attention."}, "description": "What the briefing should emphasise.", "label": "Focus", "max_items": 0, "min_items": 0, "name": "focus", "options_source": "", "required": false, "sensitive": false, "type": "text"}
+      ],
+      "prompt_template": "Prepare a concise morning brief for {{day}}. Focus on {{focus}}. Use only context and tools available to this project or conversation, distinguish facts from inference, and call out missing sources rather than inventing updates.",
+      "routine_id": "morning-brief",
+      "summary": "Summarise priorities, deadlines, blockers, and decisions for the day.",
+      "target_types": ["global", "project", "conversation"],
+      "version": 1
+    },
+    {
+      "builtin": true,
+      "description": "Run a structured, multi-agent review of a pull request and optionally prepare a GitHub review for publication.",
+      "execution": {
+        "chat_type": "orchestrator",
+        "default_engine": "codex",
+        "supported_engines": ["codex", "claude"]
+      },
+      "name": "Pull request review",
+      "parameters": [
+        {
+          "allow_multiple": false,
+          "default": {"source": "target"},
+          "description": "The GitHub pull request to review.",
+          "label": "Pull request",
+          "name": "pull_request",
+          "options_source": "",
+          "required": true,
+          "sensitive": false,
+          "type": "pull_request_ref"
+        },
+        {
+          "allow_multiple": true,
+          "default": null,
+          "description": "Exactly two provider/model combinations that independently review the pull request.",
+          "label": "Reviewers",
+          "max_items": 2,
+          "min_items": 2,
+          "name": "reviewers",
+          "options_source": "runtime.models",
+          "required": true,
+          "sensitive": false,
+          "type": "model_ref"
+        },
+        {
+          "allow_multiple": true,
+          "choices": ["correctness", "security", "performance", "tests", "maintainability", "style"],
+          "default": {"source": "literal", "value": ["correctness", "security", "performance", "tests", "maintainability", "style"]},
+          "description": "The review dimensions each reviewer should assess.",
+          "label": "Review dimensions",
+          "name": "dimensions",
+          "options_source": "review.dimensions",
+          "required": false,
+          "sensitive": false,
+          "type": "enum"
+        },
+        {
+          "allow_multiple": false,
+          "default": {"source": "literal", "value": "No additional instructions."},
+          "description": "Additional review emphasis, context, or constraints.",
+          "label": "Extra instructions",
+          "name": "extra_instructions",
+          "options_source": "",
+          "required": false,
+          "sensitive": false,
+          "type": "text"
+        },
+        {
+          "allow_multiple": false,
+          "default": {"source": "literal", "value": true},
+          "description": "Post the synthesised review comments back to GitHub after review.",
+          "label": "Post review comments",
+          "name": "post_comments",
+          "options_source": "",
+          "required": false,
+          "sensitive": false,
+          "type": "boolean"
+        }
+      ],
+      "prompt_template": "Review pull request {{pull_request}}.\n\nRun exactly two independent reviewer sessions using these provider/model selections: {{reviewers}}.\nReview dimensions: {{dimensions}}.\nExtra instructions: {{extra_instructions}}.\nPost the synthesised review comments to GitHub: {{post_comments}}.\n\nUse the project orchestration tools and preserve the pull request's repository context. Require evidence from both reviewers before synthesising. Do not claim that comments were posted unless the publication tool confirms it.",
+      "routine_id": "pull-request-review",
+      "summary": "Review a pull request with independent agents and a synthesised verdict.",
+      "target_types": ["pull_request"],
+      "version": 1
+    },
+    {
+      "builtin": true,
+      "description": "Inspect open issues in a selected repository, group related reports, and propose a prioritised triage plan.",
+      "execution": {"chat_type": "orchestrator", "default_engine": "codex", "supported_engines": ["codex", "claude"]},
+      "name": "Issue triage",
+      "parameters": [
+        {"allow_multiple": false, "choices": [], "default": {"source": "target"}, "description": "The repository whose issues should be triaged.", "label": "Repository", "max_items": 0, "min_items": 0, "name": "repository", "options_source": "project.repositories", "required": true, "sensitive": false, "type": "repository_ref"},
+        {"allow_multiple": true, "choices": ["bug", "duplicate", "priority", "missing_information", "good_first_issue"], "default": {"source": "literal", "value": ["bug", "duplicate", "priority", "missing_information"]}, "description": "The classifications to include in the triage pass.", "label": "Triage dimensions", "max_items": 0, "min_items": 1, "name": "dimensions", "options_source": "", "required": false, "sensitive": false, "type": "enum"},
+        {"allow_multiple": false, "choices": [], "default": {"source": "literal", "value": false}, "description": "Prepare proposed labels and comments, but never publish without an explicit approved tool action.", "label": "Prepare updates", "max_items": 0, "min_items": 0, "name": "prepare_updates", "options_source": "", "required": false, "sensitive": false, "type": "boolean"}
+      ],
+      "prompt_template": "Triage open issues for {{repository}} across {{dimensions}}. Prepare updates: {{prepare_updates}}. Group duplicates with evidence, identify missing reproduction details, and propose priorities. Do not publish labels or comments unless an authorised tool confirms the write.",
+      "routine_id": "issue-triage",
+      "summary": "Categorise open issues, identify duplicates, and propose priorities.",
+      "target_types": ["repository", "project"],
+      "version": 1
+    },
+    {
+      "builtin": true,
+      "description": "Check configured Jarvis workers and services for availability, degraded state, and actionable failures.",
+      "execution": {"chat_type": "orchestrator", "default_engine": "codex", "supported_engines": ["codex", "claude"]},
+      "name": "System health check",
+      "parameters": [
+        {"allow_multiple": true, "choices": [], "default": {"source": "literal", "value": []}, "description": "Optional worker selection; empty checks all workers visible to the project.", "label": "Workers", "max_items": 0, "min_items": 0, "name": "workers", "options_source": "runtime.workers", "required": false, "sensitive": false, "type": "worker_ref"},
+        {"allow_multiple": true, "choices": ["availability", "capacity", "sessions", "recent_failures"], "default": {"source": "literal", "value": ["availability", "capacity", "sessions", "recent_failures"]}, "description": "Health signals included in the check.", "label": "Checks", "max_items": 0, "min_items": 1, "name": "checks", "options_source": "", "required": false, "sensitive": false, "type": "enum"}
+      ],
+      "prompt_template": "Run a system health check using these checks: {{checks}}. Worker selection: {{workers}}; an empty list means all workers visible to the project. Report healthy, degraded, and unavailable components separately. Prefer observed runtime state and recent events; do not expose secrets or private host details.",
+      "routine_id": "system-health-check",
+      "summary": "Check worker availability, capacity, sessions, and recent failures.",
+      "target_types": ["fleet", "project"],
+      "version": 1
+    },
+    {
+      "builtin": true,
+      "description": "Draft release notes from repository history with explicit audience and release range.",
+      "execution": {"chat_type": "orchestrator", "default_engine": "codex", "supported_engines": ["codex", "claude"]},
+      "name": "Draft release notes",
+      "parameters": [
+        {"allow_multiple": false, "choices": [], "default": {"source": "target"}, "description": "The repository whose changes should be summarised.", "label": "Repository", "max_items": 0, "min_items": 0, "name": "repository", "options_source": "project.repositories", "required": true, "sensitive": false, "type": "repository_ref"},
+        {"allow_multiple": false, "choices": [], "default": {"source": "literal", "value": "the repository's documented release range"}, "description": "Optional tag, branch, or commit range. Empty uses the repository's documented release convention.", "label": "Release range", "max_items": 0, "min_items": 0, "name": "release_range", "options_source": "", "required": false, "sensitive": false, "type": "string"},
+        {"allow_multiple": false, "choices": ["users", "operators", "developers"], "default": {"source": "literal", "value": "users"}, "description": "The primary audience for the notes.", "label": "Audience", "max_items": 0, "min_items": 0, "name": "audience", "options_source": "", "required": false, "sensitive": false, "type": "enum"}
+      ],
+      "prompt_template": "Draft release notes for {{repository}} over range {{release_range}} for {{audience}}. Derive claims from commits, pull requests, and repository release guidance. Separate breaking changes and operator actions. Do not publish a release, create tags, or modify release metadata.",
+      "routine_id": "draft-release-notes",
+      "summary": "Draft evidence-backed release notes without publishing a release.",
+      "target_types": ["repository", "project"],
+      "version": 1
+    }
+  ]
+}

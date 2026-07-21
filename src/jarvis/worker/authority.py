@@ -21,6 +21,7 @@ class WorkerSessionAuthority:
     allowed_actions: list[str]
     landing: dict[str, Any] = field(default_factory=dict)
     trusted_mcp_servers: list[str] = field(default_factory=list)
+    allow_nested_agents: bool = True
 
     @classmethod
     def from_metadata(
@@ -47,6 +48,7 @@ class WorkerSessionAuthority:
             allowed_actions=allowed,
             landing=dict(landing) if isinstance(landing, dict) else {},
             trusted_mcp_servers=_string_list(metadata.get("trusted_mcp_servers")),
+            allow_nested_agents=_allow_nested_agents(metadata, envelope_data),
         )
         authority.validate(provider)
         return authority
@@ -155,6 +157,15 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value if str(item)]
+
+
+def _allow_nested_agents(metadata: dict[str, Any], envelope: dict[str, Any] | None) -> bool:
+    value = (
+        envelope.get("allow_nested_agents")
+        if envelope is not None and "allow_nested_agents" in envelope
+        else metadata.get("allow_nested_agents")
+    )
+    return value if isinstance(value, bool) else True
 
 
 def _claude_tool_is_read_only(tool_name: str, *, trusted_mcp_servers: list[str] | None = None) -> bool:

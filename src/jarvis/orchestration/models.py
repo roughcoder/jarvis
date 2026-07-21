@@ -205,6 +205,7 @@ class ExecutionEnvelope:
     session_name: str = ""
     display_title: str = ""
     resume_session: bool = False
+    allow_nested_agents: bool = True
     allowed_actions: list[str] = field(default_factory=lambda: [WORKER_SESSION_CREATE, WORKER_SESSION_TURN])
     verification: VerificationPlan = field(default_factory=VerificationPlan)
     landing: LandingPolicy = field(default_factory=LandingPolicy)
@@ -330,6 +331,7 @@ class WorkCommand:
     target_model_id: str = ""
     provider_instance_id: str = ""
     engine_strategy: str = "single"
+    allow_nested_agents: bool = True
     start: bool = False
 
     @classmethod

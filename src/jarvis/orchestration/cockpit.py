@@ -223,7 +223,10 @@ class IdempotencyStore:
             return None
         if record.get("fingerprint") != _body_fingerprint(body):
             raise CockpitError("idempotency_conflict", "idempotency key was reused with a different request body", status=409)
-        response = dict(record.get("response") or {})
+        stored_response = record.get("response")
+        if not isinstance(stored_response, dict):
+            return None
+        response = dict(stored_response)
         response["idempotent"] = True
         return response
 
@@ -233,6 +236,49 @@ class IdempotencyStore:
         self.prune()
         path = self._path(scope, key)
         record = {"created_at": time.time(), "fingerprint": _body_fingerprint(body), "response": response}
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(record, indent=2, sort_keys=True))
+        tmp.replace(path)
+
+    def get_reservation(self, scope: str, key: str, body: dict[str, Any]) -> dict[str, Any] | None:
+        """Return durable pre-dispatch identity for an unfinished write.
+
+        Responses remain the public idempotency result.  A reservation is the
+        smaller crash boundary written before an external side effect so a
+        retry can resume that same operation instead of inventing new IDs.
+        """
+
+        if not key:
+            return None
+        path = self._path(scope, key)
+        if not path.exists():
+            return None
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            path.unlink(missing_ok=True)
+            return None
+        if not isinstance(record, dict):
+            path.unlink(missing_ok=True)
+            return None
+        if _idempotency_expired(record):
+            path.unlink(missing_ok=True)
+            return None
+        if record.get("fingerprint") != _body_fingerprint(body):
+            raise CockpitError("idempotency_conflict", "idempotency key was reused with a different request body", status=409)
+        reservation = record.get("reservation")
+        return dict(reservation) if isinstance(reservation, dict) else None
+
+    def save_reservation(self, scope: str, key: str, body: dict[str, Any], reservation: dict[str, Any]) -> None:
+        if not key:
+            return
+        self.prune()
+        path = self._path(scope, key)
+        record = {
+            "created_at": time.time(),
+            "fingerprint": _body_fingerprint(body),
+            "reservation": dict(reservation),
+        }
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(record, indent=2, sort_keys=True))
         tmp.replace(path)

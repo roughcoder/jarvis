@@ -48,6 +48,7 @@ def build_execution_envelope(
         session_id=session_id,
         session_name=session_name,
         display_title=title,
+        allow_nested_agents=command.allow_nested_agents,
         allowed_actions=envelope_allowed_actions(landing_mode),
         verification=VerificationPlan(
             minimum_rung=_minimum_rung(primary),
