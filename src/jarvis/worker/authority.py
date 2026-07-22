@@ -14,6 +14,12 @@ from jarvis.capabilities import (
 )
 from jarvis.worker.actions import normalize_github_repo
 from jarvis.worker.sessions import WorkerSession
+from jarvis.worker_session_contract import (
+    WORKER_ACCESS_FULL_TRUST,
+    WORKER_ACCESS_INTERACTIVE,
+    WORKER_ACCESS_MODES,
+    WORKER_ACCESS_READ_ONLY,
+)
 
 REAL_SESSION_PROVIDERS = {"codex", "claude"}
 
@@ -34,6 +40,7 @@ class WorkerSessionAuthority:
     repo: str = ""
     trusted_mcp_servers: list[str] = field(default_factory=list)
     allow_nested_agents: bool = True
+    access_mode: str = ""
 
     @classmethod
     def from_metadata(
@@ -62,6 +69,7 @@ class WorkerSessionAuthority:
             repo=normalize_github_repo(str(envelope_data.get("repo") or "")) if envelope_data else "",
             trusted_mcp_servers=_string_list(metadata.get("trusted_mcp_servers")),
             allow_nested_agents=_allow_nested_agents(metadata, envelope_data),
+            access_mode=str(envelope_data.get("access_mode") or "") if envelope_data else "",
         )
         authority.validate(provider)
         return authority
@@ -78,6 +86,10 @@ class WorkerSessionAuthority:
         return authority
 
     def validate(self, provider: str) -> None:
+        if self.access_mode and self.access_mode not in WORKER_ACCESS_MODES:
+            raise RuntimeError(f"unknown worker session access_mode: {self.access_mode}")
+        if self.access_mode == WORKER_ACCESS_INTERACTIVE and WORKER_SESSION_APPROVE not in self.allowed:
+            raise RuntimeError(f"worker session interactive access requires {WORKER_SESSION_APPROVE}")
         mode = self.landing_mode
         if self.landing.get("allow_merge") is True or mode in {"merge", "release"}:
             raise RuntimeError("worker session landing policy cannot merge or release")
@@ -100,12 +112,20 @@ class WorkerSessionAuthority:
 
     @property
     def codex_approval_policy(self) -> str:
+        if self.access_mode:
+            return "on-request" if self.access_mode == WORKER_ACCESS_INTERACTIVE else "never"
         if WORKER_SESSION_APPROVE in self.allowed:
             return "on-request"
         return "never"
 
     @property
     def codex_sandbox(self) -> str:
+        if self.access_mode == WORKER_ACCESS_READ_ONLY:
+            return "read-only"
+        if self.access_mode == WORKER_ACCESS_INTERACTIVE:
+            return "workspace-write"
+        if self.access_mode == WORKER_ACCESS_FULL_TRUST:
+            return "danger-full-access"
         if self.landing_mode in {"read_only", "inspect", "review"} or FORGE_BRANCH_PUSH not in self.allowed:
             return "read-only"
         return "workspace-write"
@@ -129,6 +149,12 @@ class WorkerSessionAuthority:
 
     @property
     def claude_permission_mode(self) -> str:
+        if self.access_mode == WORKER_ACCESS_READ_ONLY:
+            return "plan"
+        if self.access_mode == WORKER_ACCESS_INTERACTIVE:
+            return "default"
+        if self.access_mode == WORKER_ACCESS_FULL_TRUST:
+            return "bypassPermissions"
         if self.codex_sandbox == "read-only":
             return "plan"
         if self.can_resolve_approval:
@@ -137,6 +163,8 @@ class WorkerSessionAuthority:
 
     def claude_tool_denial(self, tool_name: str, tool_input: dict[str, Any] | None = None) -> str:
         name = str(tool_name or "").strip()
+        if self.access_mode == WORKER_ACCESS_FULL_TRUST:
+            return ""
         if self.codex_sandbox == "read-only" and not _claude_tool_is_read_only(
             name,
             tool_input=tool_input,
@@ -158,6 +186,8 @@ class WorkerSessionAuthority:
         tool_name: str,
         tool_input: dict[str, Any] | None = None,
     ) -> bool:
+        if self.access_mode == WORKER_ACCESS_FULL_TRUST:
+            return True
         return self.codex_sandbox == "read-only" and _claude_tool_is_read_only(
             str(tool_name or ""),
             tool_input=tool_input,

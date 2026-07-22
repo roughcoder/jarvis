@@ -85,6 +85,7 @@ def run_orchestrator_mcp(
         model: str = "",
         landing_mode: str = "none",
         allow_nested_agents: bool = True,
+        access_mode: str = "read_only",
     ) -> str:
         return await call(
             SPAWN_CHILD_WORK_SESSION,
@@ -98,6 +99,7 @@ def run_orchestrator_mcp(
                 "model": model,
                 "landing_mode": landing_mode,
                 "allow_nested_agents": allow_nested_agents,
+                "access_mode": access_mode,
             },
         )
 

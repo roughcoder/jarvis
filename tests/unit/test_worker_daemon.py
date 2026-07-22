@@ -154,17 +154,21 @@ def _session_with_authority(
     allowed_actions: list[str] | None = None,
     landing: dict | None = None,
     repo: str = "",
+    access_mode: str = "",
 ) -> WorkerSession:
+    envelope = {
+        "allowed_actions": allowed_actions or [WORKER_SESSION_TURN],
+        "landing": landing or {"mode": "read_only", "allow_merge": False},
+        "repo": repo,
+    }
+    if access_mode:
+        envelope["access_mode"] = access_mode
     return WorkerSession(
         session_id="sess_authority",
         provider=provider,
         engine=provider,
         metadata={
-            "execution_envelope": {
-                "allowed_actions": allowed_actions or [WORKER_SESSION_TURN],
-                "landing": landing or {"mode": "read_only", "allow_merge": False},
-                "repo": repo,
-            }
+            "execution_envelope": envelope
         },
     )
 
@@ -364,6 +368,46 @@ def test_worker_session_authority_maps_read_only_to_codex_read_only() -> None:
     # exit would trap the session with no way to use its permitted tools.
     assert authority.claude_tool_denial("ExitPlanMode") == ""
     assert authority.claude_tool_is_preapproved("ExitPlanMode")
+
+
+@pytest.mark.parametrize(
+    ("access_mode", "allowed_actions", "sandbox", "approval", "claude_mode"),
+    [
+        ("read_only", [WORKER_SESSION_TURN], "read-only", "never", "plan"),
+        (
+            "interactive",
+            [WORKER_SESSION_TURN, WORKER_SESSION_APPROVE],
+            "workspace-write",
+            "on-request",
+            "default",
+        ),
+        ("full_trust", [WORKER_SESSION_TURN], "danger-full-access", "never", "bypassPermissions"),
+    ],
+)
+def test_worker_session_authority_maps_explicit_access_modes(
+    access_mode: str,
+    allowed_actions: list[str],
+    sandbox: str,
+    approval: str,
+    claude_mode: str,
+) -> None:
+    authority = WorkerSessionAuthority.from_session(
+        _session_with_authority(access_mode=access_mode, allowed_actions=allowed_actions)
+    )
+
+    assert authority.codex_sandbox == sandbox
+    assert authority.codex_approval_policy == approval
+    assert authority.claude_permission_mode == claude_mode
+    if access_mode == "read_only":
+        assert authority.claude_tool_denial("Bash")
+    else:
+        assert authority.claude_tool_denial("Bash") == ""
+    assert authority.claude_tool_is_preapproved("Bash") is (access_mode == "full_trust")
+
+
+def test_worker_session_authority_rejects_interactive_without_approval_authority() -> None:
+    with pytest.raises(RuntimeError, match=WORKER_SESSION_APPROVE):
+        WorkerSessionAuthority.from_session(_session_with_authority(access_mode="interactive"))
 
 
 @pytest.mark.parametrize(
