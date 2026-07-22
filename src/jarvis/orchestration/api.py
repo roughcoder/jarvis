@@ -2625,6 +2625,15 @@ class CockpitWriteHandlers:
             nonlocal client_gone
             if client_gone:
                 return
+            if update.get("type") == "event":
+                event = update.get("event")
+                if not isinstance(event, dict):
+                    return
+                try:
+                    await _try_write_thread_event(response, cursor, event)
+                except (ConnectionResetError, OSError):
+                    client_gone = True
+                return
             if update.get("type") != "text.delta":
                 return
             delta = str(update.get("delta") or "")

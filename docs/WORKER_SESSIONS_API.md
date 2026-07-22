@@ -325,6 +325,9 @@ Initial event vocabulary:
 - `provider.error`
 - `assistant.delta`
 - `assistant.message`
+- `assistant.commentary`
+- `reasoning.delta`
+- `reasoning.completed`
 - `tool.call`
 - `tool.result`
 - `approval.requested`

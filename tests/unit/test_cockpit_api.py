@@ -10433,6 +10433,101 @@ def test_orchestrator_turn_wait_pages_past_old_worker_events(tmp_path, monkeypat
     ]
 
 
+def test_orchestrator_turn_streams_and_persists_code_agent_events(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    connector = CockpitConnector(
+        cfg,
+        memory=FakeProjectMemory(),
+        gateway=FakeGateway([]),
+        tts=None,
+        tracer=None,
+    )
+    occurred_at = "2026-07-22T10:30:48Z"
+    worker_events = [
+        {
+            "event_id": "event_reasoning",
+            "session_id": "session_a",
+            "type": "reasoning.completed",
+            "time": occurred_at,
+            "data": {
+                "turn_id": "turn_current",
+                "message_id": "reasoning_1",
+                "text": "Checked the transcript ordering.",
+            },
+        },
+        {
+            "event_id": "event_tool",
+            "session_id": "session_a",
+            "type": "tool.call",
+            "time": occurred_at,
+            "data": {
+                "turn_id": "turn_current",
+                "item": {"id": "call_1", "name": "web_search", "input": {"query": "result"}},
+            },
+        },
+        {
+            "event_id": "event_reply",
+            "session_id": "session_a",
+            "type": "assistant.message",
+            "time": occurred_at,
+            "data": {"turn_id": "turn_current", "text": "Done."},
+        },
+        {
+            "event_id": "event_done",
+            "session_id": "session_a",
+            "type": "turn.completed",
+            "time": occurred_at,
+            "data": {"turn_id": "turn_current"},
+        },
+    ]
+    monkeypatch.setattr(connector, "_get_worker_json", lambda *_args: {"events": worker_events})
+    durable_events: list[dict[str, Any]] = []
+    progress_events: list[dict[str, Any]] = []
+
+    async def progress(update: dict[str, Any]) -> None:
+        progress_events.append(update)
+
+    connector._orchestrator_event_sinks["turn_current"] = (durable_events, progress)  # noqa: SLF001
+    try:
+        result = asyncio.run(
+            connector._wait_for_orchestrator_turn("worker_a", "session_a", "turn_current")  # noqa: SLF001
+        )
+    finally:
+        connector._orchestrator_event_sinks.pop("turn_current", None)  # noqa: SLF001
+
+    assert result == "Done."
+    assert [update["event"]["type"] for update in progress_events] == [
+        "reasoning.completed",
+        "tool.call",
+    ]
+    assert [event["type"] for event in durable_events] == ["reasoning.completed", "tool.call"]
+
+    thread = CockpitThread(
+        thread_id="thread_code_events",
+        project_id="project_code_events",
+        session_id="project:code-events",
+        title="Code events",
+        created_at=occurred_at,
+        updated_at=occurred_at,
+        created_by="neil",
+    )
+    connector.index.save(thread)
+    updated = connector.index.append_turn(
+        thread,
+        user_peer_id="neil",
+        user_text="Check this",
+        assistant_peer_id="jarvis",
+        assistant_text="Done.",
+        events=durable_events,
+        turn_id="turn_current",
+    )
+    assert [message["role"] for message in updated.messages] == ["user", "event", "event", "assistant"]
+    assert {message.get("turn_id") for message in updated.messages} == {"turn_current"}
+    assert updated.messages[1]["type"] == "reasoning.completed"
+    assert updated.messages[1]["data"]["text"] == "Checked the transcript ordering."
+    assert updated.messages[2]["call_id"] == "call_1"
+
+
 def test_orchestrator_poll_failure_preserves_session_for_reconciliation(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     cfg = _cfg(tmp_path, monkeypatch, identity="neil")
     _seed_project_registry(cfg)

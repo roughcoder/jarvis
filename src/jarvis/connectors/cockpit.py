@@ -1051,6 +1051,7 @@ class CockpitThreadIndex:
         assistant_peer_id: str,
         assistant_text: str,
         idempotency_key: str,
+        events: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
     ) -> CockpitThread | None:
         # Keep ownership verification, transcript append, and durable-marker
         # release under one index lock. An interrupt either wins before this
@@ -1078,6 +1079,8 @@ class CockpitThreadIndex:
                     user_text=user_text,
                     assistant_peer_id=assistant_peer_id,
                     assistant_text=assistant_text,
+                    events=events,
+                    turn_id=expected_turn_id,
                     idempotency_key=idempotency_key,
                 )
                 finalized = self.finish_orchestrator_completion_if_matches(
@@ -1405,6 +1408,7 @@ class CockpitThreadIndex:
         assistant_peer_id: str,
         assistant_text: str,
         events: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
+        turn_id: str = "",
         idempotency_key: str = "",
     ) -> CockpitThread:
         with self._transcript_lock(thread.project_id, thread.thread_id):
@@ -1425,15 +1429,17 @@ class CockpitThreadIndex:
                     "peer_id": user_peer_id,
                     "content": user_text,
                     "observed_at": observed_at,
+                    **({"turn_id": turn_id} if turn_id else {}),
                     "turn_idempotency_key": idempotency_key,
                 },
+                *_thread_event_messages(events, assistant_peer_id=assistant_peer_id),
                 {
                     "role": "assistant",
                     "peer_id": assistant_peer_id,
                     "content": assistant_text,
                     "observed_at": observed_at,
+                    **({"turn_id": turn_id} if turn_id else {}),
                 },
-                *_thread_event_messages(events, assistant_peer_id=assistant_peer_id),
             ]
             updated = self.save(
                 replace(
@@ -1820,6 +1826,10 @@ class CockpitConnector:
         self._worker_get = worker_get or httpx.get
         self._index = CockpitThreadIndex(Path(cfg.orchestration.workspace) / THREAD_INDEX_FILENAME)
         self._worker_registry: WorkerRegistry | None = None
+        self._orchestrator_event_sinks: dict[
+            str,
+            tuple[list[dict[str, Any]], Callable[[dict[str, Any]], Any] | None],
+        ] = {}
         self._curation_outbox = CurationOutbox(
             self._cfg.memory.curation_outbox_path,
             max_retries=self._cfg.memory.curation_outbox_max_retries,
@@ -2885,6 +2895,8 @@ class CockpitConnector:
         progress: Callable[[dict[str, Any]], Any] | None,
         durable_completion: bool = False,
     ) -> tuple[str, CockpitThread]:
+        captured_events: list[dict[str, Any]] = []
+        self._orchestrator_event_sinks[turn_id] = (captured_events, progress)
         try:
             reply = await self._wait_for_orchestrator_turn(worker_id, session_id, turn_id)
         except Exception:
@@ -2917,6 +2929,8 @@ class CockpitConnector:
                     },
                 )
             raise
+        finally:
+            self._orchestrator_event_sinks.pop(turn_id, None)
         if durable_completion:
             committed = self._index.commit_orchestrator_completion_if_matches(
                 project.id,
@@ -2929,6 +2943,7 @@ class CockpitConnector:
                 assistant_peer_id=self._cfg.memory.assistant_peer_id,
                 assistant_text=reply,
                 idempotency_key=idempotency_key,
+                events=captured_events,
             )
             if committed is None:
                 raise RuntimeError("conversation execution was interrupted")
@@ -2960,6 +2975,8 @@ class CockpitConnector:
             user_text=persisted_text,
             assistant_peer_id=self._cfg.memory.assistant_peer_id,
             assistant_text=reply,
+            events=captured_events,
+            turn_id=turn_id,
             idempotency_key=idempotency_key,
         )
         try:
@@ -3174,13 +3191,25 @@ class CockpitConnector:
             terminal_error = ""
             terminal = False
             events = body.get("events") or []
-            for event in events:
+            for event_index, event in enumerate(events):
                 if not isinstance(event, dict):
                     continue
                 data = event.get("data") if isinstance(event.get("data"), dict) else {}
                 if str(data.get("turn_id") or "") != turn_id:
                     continue
                 event_type = str(event.get("type") or "")
+                projected = project_session_event(
+                    event,
+                    worker_id=worker_id,
+                    sequence=int(event.get("sequence") or event_index),
+                )
+                sink = self._orchestrator_event_sinks.get(turn_id)
+                if sink is not None:
+                    captured_events, progress = sink
+                    if _orchestrator_event_is_durable(projected):
+                        captured_events.append(projected)
+                    if _orchestrator_event_is_streamable(projected):
+                        await _emit_progress(progress, {"type": "event", "event": projected})
                 if event_type == EVENT_ASSISTANT_MESSAGE:
                     event_text = str(data.get("text") or "").strip()
                     if event_text:
@@ -3587,16 +3616,42 @@ def _thread_event_messages(
         event_type = str(event.get("type") or "")
         name = _thread_event_tool_name(event)
         content = " ".join(part for part in (event_type, name) if part)
-        messages.append(
-            {
-                "role": "event",
-                "peer_id": assistant_peer_id,
-                "content": content,
-                "observed_at": str(event.get("occurred_at") or ""),
-                "event": dict(event),
-            }
-        )
+        data = dict(event.get("data") or {})
+        message = {
+            "role": "event",
+            "peer_id": assistant_peer_id,
+            "content": content,
+            "observed_at": str(event.get("occurred_at") or ""),
+            "event_id": str(event.get("event_id") or ""),
+            "message_id": str(event.get("message_id") or ""),
+            "sequence": int(event.get("sequence") or 0),
+            "type": event_type,
+            "turn_id": str(event.get("turn_id") or data.get("turn_id") or ""),
+            "data": data,
+            "event": dict(event),
+        }
+        if event_type in {EVENT_TOOL_CALL, EVENT_TOOL_RESULT}:
+            message["call_id"] = str(event.get("message_id") or data.get("tool_call_id") or "")
+        messages.append({key: value for key, value in message.items() if value not in ("", None)})
     return messages
+
+
+def _orchestrator_event_is_durable(event: dict[str, Any]) -> bool:
+    event_type = str(event.get("type") or "")
+    return (
+        event_type in {EVENT_TOOL_CALL, EVENT_TOOL_RESULT, "assistant.commentary"}
+        or event_type.startswith("reasoning.")
+        or event_type.startswith("plan.")
+        or event_type.startswith("artifact.")
+    )
+
+
+def _orchestrator_event_is_streamable(event: dict[str, Any]) -> bool:
+    return str(event.get("type") or "") not in {
+        EVENT_ASSISTANT_MESSAGE,
+        EVENT_TURN_COMPLETED,
+        EVENT_TURN_FAILED,
+    }
 
 
 def _cockpit_project_context(requester: RequestContext) -> RequestContext:
@@ -4568,12 +4623,22 @@ def _normalized_messages(messages: Any) -> list[dict[str, Any]]:
             "claimed_at",
             "completed_at",
             "error",
+            "event_id",
+            "message_id",
+            "call_id",
+            "correlation_id",
+            "turn_id",
             "turn_idempotency_key",
         ):
             if key in item:
                 message[key] = str(item.get(key) or "")
         if isinstance(item.get("child_chat_ids"), list):
             message["child_chat_ids"] = [str(value) for value in item["child_chat_ids"] if str(value)]
+        if "sequence" in item:
+            message["sequence"] = int(item.get("sequence") or 0)
+        data = item.get("data")
+        if isinstance(data, dict):
+            message["data"] = dict(data)
         requester = item.get("requester")
         if isinstance(requester, dict):
             message["requester"] = _snapshot_from_context(_context_from_snapshot(requester))

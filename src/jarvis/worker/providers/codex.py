@@ -39,6 +39,7 @@ from jarvis.worker_session_contract import (
     EVENT_APPROVAL_REQUESTED,
     EVENT_APPROVAL_RESOLVED,
     EVENT_ARTIFACT_UPDATED,
+    EVENT_ASSISTANT_COMMENTARY,
     EVENT_ASSISTANT_DELTA,
     EVENT_ASSISTANT_MESSAGE,
     EVENT_INPUT_RECEIVED,
@@ -49,6 +50,8 @@ from jarvis.worker_session_contract import (
     EVENT_PROVIDER_STARTED,
     EVENT_PROVIDER_THREAD_READY,
     EVENT_PROVIDER_TURN_STARTED,
+    EVENT_REASONING_COMPLETED,
+    EVENT_REASONING_DELTA,
     EVENT_SESSION_INTERRUPTED,
     EVENT_SESSION_STOPPED,
     EVENT_TOOL_CALL,
@@ -731,11 +734,45 @@ def _project_jsonrpc_message(
         )
     elif method == "item/agentMessage/delta":
         sessions.append_event(session_id, EVENT_ASSISTANT_DELTA, {**common, "text": str(params.get("delta") or "")})
+    elif method in {"item/reasoning/summaryTextDelta", "item/reasoning/textDelta"}:
+        sessions.append_event(
+            session_id,
+            EVENT_REASONING_DELTA,
+            {
+                **common,
+                "message_id": str(params.get("itemId") or ""),
+                "text": str(params.get("delta") or ""),
+            },
+        )
     elif method == "item/completed":
         item = dict(params.get("item") or {})
         item_type = str(item.get("type") or "")
         if item_type == "agentMessage":
-            sessions.append_event(session_id, EVENT_ASSISTANT_MESSAGE, {**common, "text": str(item.get("text") or "")})
+            event_type = (
+                EVENT_ASSISTANT_COMMENTARY
+                if str(item.get("phase") or "") == "commentary"
+                else EVENT_ASSISTANT_MESSAGE
+            )
+            sessions.append_event(
+                session_id,
+                event_type,
+                {
+                    **common,
+                    "message_id": str(item.get("id") or ""),
+                    "phase": str(item.get("phase") or ""),
+                    "text": str(item.get("text") or ""),
+                },
+            )
+        elif item_type == "reasoning":
+            sessions.append_event(
+                session_id,
+                EVENT_REASONING_COMPLETED,
+                {
+                    **common,
+                    "message_id": str(item.get("id") or ""),
+                    "text": _codex_reasoning_text(item),
+                },
+            )
         elif canonical_tool_item_type(item):
             sessions.append_event(session_id, EVENT_TOOL_RESULT, {**common, **tool_event_data(item, phase="result")})
     elif method == "item/started":
@@ -822,6 +859,17 @@ def _project_jsonrpc_message(
     elif method == "turn/plan/updated":
         sessions.append_event(session_id, EVENT_PLAN_UPDATED, {**common, "raw": params})
     return False
+
+
+def _codex_reasoning_text(item: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("summary", "content"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+        elif isinstance(value, list):
+            parts.extend(str(part).strip() for part in value if str(part).strip())
+    return "\n".join(parts)
 
 
 def _message_request_id(message: dict[str, Any], params: dict[str, Any]) -> str:
