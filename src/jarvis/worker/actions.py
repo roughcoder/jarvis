@@ -389,7 +389,7 @@ def probe_repo_access(repo: str, *, timeout_s: float, ttl_s: float) -> dict[str,
     and is cached per worker process. It reports public access as accessible even
     without a connected GitHub identity.
     """
-    repo_ref = _normalize_github_repo(repo)
+    repo_ref = normalize_github_repo(repo)
     now = time.monotonic()
     cache_key = f"repo_access:{repo_ref or repo}"
     cached = _REPO_ACCESS_CACHE.get(cache_key)
@@ -438,7 +438,7 @@ def probe_repo_access(repo: str, *, timeout_s: float, ttl_s: float) -> dict[str,
     return row
 
 
-def _normalize_github_repo(repo: str) -> str:
+def normalize_github_repo(repo: str) -> str:
     text = str(repo or "").strip()
     if text.startswith("git@github.com:"):
         text = text.removeprefix("git@github.com:")

@@ -153,6 +153,7 @@ def _session_with_authority(
     provider: str = "codex",
     allowed_actions: list[str] | None = None,
     landing: dict | None = None,
+    repo: str = "",
 ) -> WorkerSession:
     return WorkerSession(
         session_id="sess_authority",
@@ -162,6 +163,7 @@ def _session_with_authority(
             "execution_envelope": {
                 "allowed_actions": allowed_actions or [WORKER_SESSION_TURN],
                 "landing": landing or {"mode": "read_only", "allow_merge": False},
+                "repo": repo,
             }
         },
     )
@@ -372,10 +374,20 @@ def test_worker_session_authority_maps_read_only_to_codex_read_only() -> None:
     ],
 )
 def test_worker_session_authority_allows_bounded_github_pr_reads(command: str) -> None:
-    authority = WorkerSessionAuthority.from_session(_session_with_authority(provider="claude"))
+    authority = WorkerSessionAuthority.from_session(
+        _session_with_authority(provider="claude", repo="git@github.com:roughcoder/project-x.git")
+    )
 
     assert authority.claude_tool_denial("Bash", {"command": command}) == ""
     assert authority.claude_tool_is_preapproved("Bash", {"command": command})
+
+
+def test_worker_session_authority_requires_repo_scope_for_github_pr_reads() -> None:
+    authority = WorkerSessionAuthority.from_session(_session_with_authority(provider="claude"))
+    tool_input = {"command": "gh pr diff 31 --repo roughcoder/project-x"}
+
+    assert authority.claude_tool_denial("Bash", tool_input)
+    assert not authority.claude_tool_is_preapproved("Bash", tool_input)
 
 
 @pytest.mark.parametrize(
@@ -384,6 +396,7 @@ def test_worker_session_authority_allows_bounded_github_pr_reads(command: str) -
         {},
         {"command": "gh pr view 31 --repo roughcoder/project-x"},
         {"command": "gh pr checkout 31 --repo roughcoder/project-x"},
+        {"command": "gh pr diff 31 --repo roughcoder/another-private-repo"},
         {"command": "gh pr diff 31 --repo roughcoder/project-x > /tmp/pr.diff"},
         {"command": "gh pr diff 31 --repo roughcoder/project-x && touch owned"},
         {"command": "gh pr diff 31 --repo roughcoder/project-x\nwhoami"},
@@ -392,7 +405,9 @@ def test_worker_session_authority_allows_bounded_github_pr_reads(command: str) -
 def test_worker_session_authority_rejects_unbounded_bash_in_read_only_mode(
     tool_input: dict[str, str],
 ) -> None:
-    authority = WorkerSessionAuthority.from_session(_session_with_authority(provider="claude"))
+    authority = WorkerSessionAuthority.from_session(
+        _session_with_authority(provider="claude", repo="roughcoder/project-x")
+    )
 
     assert authority.claude_tool_denial("Bash", tool_input)
     assert not authority.claude_tool_is_preapproved("Bash", tool_input)
@@ -416,6 +431,7 @@ def test_claude_read_only_session_preapproves_bounded_github_pr_read(tmp_path, m
     sessions = SessionManager(str(tmp_path / "sessions"))
     metadata = _authority_metadata("claude")
     metadata["execution_envelope"]["landing"] = {"mode": "read_only", "allow_merge": False}
+    metadata["execution_envelope"]["repo"] = "roughcoder/project-x"
     metadata["landing"] = {"mode": "read_only", "allow_merge": False}
     session, _ = sessions.create(
         {

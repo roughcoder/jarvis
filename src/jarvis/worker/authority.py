@@ -12,6 +12,7 @@ from jarvis.capabilities import (
     WORKER_SESSION_INPUT,
     WORKER_SESSION_TURN,
 )
+from jarvis.worker.actions import normalize_github_repo
 from jarvis.worker.sessions import WorkerSession
 
 REAL_SESSION_PROVIDERS = {"codex", "claude"}
@@ -20,10 +21,9 @@ REAL_SESSION_PROVIDERS = {"codex", "claude"}
 # prompt. Full matching keeps shell operators, alternate gh actions, and writes
 # outside the read-only session boundary.
 _READ_ONLY_GH_PR_COMMAND = re.compile(
-    r"gh pr (?:"
-    r"view [1-9][0-9]* --repo [A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]* --json headRefOid"
-    r"|diff [1-9][0-9]* --repo [A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*"
-    r")"
+    r"gh pr (?P<action>view|diff) (?P<number>[1-9][0-9]*) --repo "
+    r"(?P<repo>[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)"
+    r"(?P<view_json> --json headRefOid)?"
 )
 
 
@@ -31,6 +31,7 @@ _READ_ONLY_GH_PR_COMMAND = re.compile(
 class WorkerSessionAuthority:
     allowed_actions: list[str]
     landing: dict[str, Any] = field(default_factory=dict)
+    repo: str = ""
     trusted_mcp_servers: list[str] = field(default_factory=list)
     allow_nested_agents: bool = True
 
@@ -58,6 +59,7 @@ class WorkerSessionAuthority:
         authority = cls(
             allowed_actions=allowed,
             landing=dict(landing) if isinstance(landing, dict) else {},
+            repo=normalize_github_repo(str(envelope_data.get("repo") or "")) if envelope_data else "",
             trusted_mcp_servers=_string_list(metadata.get("trusted_mcp_servers")),
             allow_nested_agents=_allow_nested_agents(metadata, envelope_data),
         )
@@ -138,6 +140,7 @@ class WorkerSessionAuthority:
         if self.codex_sandbox == "read-only" and not _claude_tool_is_read_only(
             name,
             tool_input=tool_input,
+            allowed_repo=self.repo,
             trusted_mcp_servers=self.trusted_mcp_servers,
         ):
             return f"worker session is read-only; refusing Claude tool {name or '<unknown>'}"
@@ -158,6 +161,7 @@ class WorkerSessionAuthority:
         return self.codex_sandbox == "read-only" and _claude_tool_is_read_only(
             str(tool_name or ""),
             tool_input=tool_input,
+            allowed_repo=self.repo,
             trusted_mcp_servers=self.trusted_mcp_servers,
         )
 
@@ -189,6 +193,7 @@ def _claude_tool_is_read_only(
     tool_name: str,
     *,
     tool_input: dict[str, Any] | None = None,
+    allowed_repo: str = "",
     trusted_mcp_servers: list[str] | None = None,
 ) -> bool:
     name = tool_name.strip()
@@ -198,7 +203,12 @@ def _claude_tool_is_read_only(
         return any(name.startswith(f"mcp__{server}__") for server in trusted_mcp_servers or [])
     if name == "Bash":
         command = (tool_input or {}).get("command")
-        return isinstance(command, str) and _READ_ONLY_GH_PR_COMMAND.fullmatch(command.strip()) is not None
+        match = _READ_ONLY_GH_PR_COMMAND.fullmatch(command.strip()) if isinstance(command, str) else None
+        if match is None or not allowed_repo:
+            return False
+        is_exact_view = match.group("action") == "view" and match.group("view_json") is not None
+        is_exact_diff = match.group("action") == "diff" and match.group("view_json") is None
+        return (is_exact_view or is_exact_diff) and normalize_github_repo(match.group("repo")) == allowed_repo
     # ExitPlanMode mutates nothing outside the agent's own mode. Denying it
     # traps a read-only Claude session in plan mode forever: it cannot act, not
     # even with the read-only and trusted-MCP tools it is explicitly allowed.
