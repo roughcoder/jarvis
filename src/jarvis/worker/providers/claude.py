@@ -478,10 +478,10 @@ class _ClaudeSessionRuntime:
             if response is None:
                 return sdk.PermissionResultDeny(message="input request timed out")
             return sdk.PermissionResultAllow(updated_input=_updated_question_input(tool_input, response))
-        denial = self.authority.claude_tool_denial(tool_name)
+        denial = self.authority.claude_tool_denial(tool_name, tool_input)
         if denial:
             return sdk.PermissionResultDeny(message=denial)
-        if self.authority.claude_tool_is_preapproved(tool_name):
+        if self.authority.claude_tool_is_preapproved(tool_name, tool_input):
             return sdk.PermissionResultAllow(updated_input=tool_input)
         if not self.authority.can_resolve_approval:
             return sdk.PermissionResultDeny(message="worker session missing required authority: worker.session.approve")

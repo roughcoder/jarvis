@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -11,17 +12,35 @@ from jarvis.capabilities import (
     WORKER_SESSION_INPUT,
     WORKER_SESSION_TURN,
 )
+from jarvis.worker.actions import normalize_github_repo
 from jarvis.worker.sessions import WorkerSession
+from jarvis.worker_session_contract import (
+    WORKER_ACCESS_FULL_TRUST,
+    WORKER_ACCESS_INTERACTIVE,
+    WORKER_ACCESS_MODES,
+    WORKER_ACCESS_READ_ONLY,
+)
 
 REAL_SESSION_PROVIDERS = {"codex", "claude"}
+
+# These are the two immutable-evidence reads emitted by Cockpit's PR review
+# prompt. Full matching keeps shell operators, alternate gh actions, and writes
+# outside the read-only session boundary.
+_READ_ONLY_GH_PR_COMMAND = re.compile(
+    r"gh pr (?P<action>view|diff) (?P<number>[1-9][0-9]*) --repo "
+    r"(?P<repo>[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*)"
+    r"(?P<view_json> --json headRefOid)?"
+)
 
 
 @dataclass(frozen=True)
 class WorkerSessionAuthority:
     allowed_actions: list[str]
     landing: dict[str, Any] = field(default_factory=dict)
+    repo: str = ""
     trusted_mcp_servers: list[str] = field(default_factory=list)
     allow_nested_agents: bool = True
+    access_mode: str = ""
 
     @classmethod
     def from_metadata(
@@ -47,8 +66,10 @@ class WorkerSessionAuthority:
         authority = cls(
             allowed_actions=allowed,
             landing=dict(landing) if isinstance(landing, dict) else {},
+            repo=normalize_github_repo(str(envelope_data.get("repo") or "")) if envelope_data else "",
             trusted_mcp_servers=_string_list(metadata.get("trusted_mcp_servers")),
             allow_nested_agents=_allow_nested_agents(metadata, envelope_data),
+            access_mode=str(envelope_data.get("access_mode") or "") if envelope_data else "",
         )
         authority.validate(provider)
         return authority
@@ -65,6 +86,10 @@ class WorkerSessionAuthority:
         return authority
 
     def validate(self, provider: str) -> None:
+        if self.access_mode and self.access_mode not in WORKER_ACCESS_MODES:
+            raise RuntimeError(f"unknown worker session access_mode: {self.access_mode}")
+        if self.access_mode == WORKER_ACCESS_INTERACTIVE and WORKER_SESSION_APPROVE not in self.allowed:
+            raise RuntimeError(f"worker session interactive access requires {WORKER_SESSION_APPROVE}")
         mode = self.landing_mode
         if self.landing.get("allow_merge") is True or mode in {"merge", "release"}:
             raise RuntimeError("worker session landing policy cannot merge or release")
@@ -87,12 +112,20 @@ class WorkerSessionAuthority:
 
     @property
     def codex_approval_policy(self) -> str:
+        if self.access_mode:
+            return "on-request" if self.access_mode == WORKER_ACCESS_INTERACTIVE else "never"
         if WORKER_SESSION_APPROVE in self.allowed:
             return "on-request"
         return "never"
 
     @property
     def codex_sandbox(self) -> str:
+        if self.access_mode == WORKER_ACCESS_READ_ONLY:
+            return "read-only"
+        if self.access_mode == WORKER_ACCESS_INTERACTIVE:
+            return "workspace-write"
+        if self.access_mode == WORKER_ACCESS_FULL_TRUST:
+            return "danger-full-access"
         if self.landing_mode in {"read_only", "inspect", "review"} or FORGE_BRANCH_PUSH not in self.allowed:
             return "read-only"
         return "workspace-write"
@@ -116,16 +149,26 @@ class WorkerSessionAuthority:
 
     @property
     def claude_permission_mode(self) -> str:
+        if self.access_mode == WORKER_ACCESS_READ_ONLY:
+            return "plan"
+        if self.access_mode == WORKER_ACCESS_INTERACTIVE:
+            return "default"
+        if self.access_mode == WORKER_ACCESS_FULL_TRUST:
+            return "bypassPermissions"
         if self.codex_sandbox == "read-only":
             return "plan"
         if self.can_resolve_approval:
             return "default"
         return "dontAsk"
 
-    def claude_tool_denial(self, tool_name: str) -> str:
+    def claude_tool_denial(self, tool_name: str, tool_input: dict[str, Any] | None = None) -> str:
         name = str(tool_name or "").strip()
+        if self.access_mode == WORKER_ACCESS_FULL_TRUST:
+            return ""
         if self.codex_sandbox == "read-only" and not _claude_tool_is_read_only(
             name,
+            tool_input=tool_input,
+            allowed_repo=self.repo,
             trusted_mcp_servers=self.trusted_mcp_servers,
         ):
             return f"worker session is read-only; refusing Claude tool {name or '<unknown>'}"
@@ -138,9 +181,17 @@ class WorkerSessionAuthority:
             return f"worker session lacks {WORKER_SESSION_APPROVE}; refusing Claude tool {name or '<unknown>'}"
         return ""
 
-    def claude_tool_is_preapproved(self, tool_name: str) -> bool:
+    def claude_tool_is_preapproved(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any] | None = None,
+    ) -> bool:
+        if self.access_mode == WORKER_ACCESS_FULL_TRUST:
+            return True
         return self.codex_sandbox == "read-only" and _claude_tool_is_read_only(
             str(tool_name or ""),
+            tool_input=tool_input,
+            allowed_repo=self.repo,
             trusted_mcp_servers=self.trusted_mcp_servers,
         )
 
@@ -168,12 +219,26 @@ def _allow_nested_agents(metadata: dict[str, Any], envelope: dict[str, Any] | No
     return value if isinstance(value, bool) else True
 
 
-def _claude_tool_is_read_only(tool_name: str, *, trusted_mcp_servers: list[str] | None = None) -> bool:
+def _claude_tool_is_read_only(
+    tool_name: str,
+    *,
+    tool_input: dict[str, Any] | None = None,
+    allowed_repo: str = "",
+    trusted_mcp_servers: list[str] | None = None,
+) -> bool:
     name = tool_name.strip()
     if not name:
         return False
     if name.startswith("mcp__"):
         return any(name.startswith(f"mcp__{server}__") for server in trusted_mcp_servers or [])
+    if name == "Bash":
+        command = (tool_input or {}).get("command")
+        match = _READ_ONLY_GH_PR_COMMAND.fullmatch(command.strip()) if isinstance(command, str) else None
+        if match is None or not allowed_repo:
+            return False
+        is_exact_view = match.group("action") == "view" and match.group("view_json") is not None
+        is_exact_diff = match.group("action") == "diff" and match.group("view_json") is None
+        return (is_exact_view or is_exact_diff) and normalize_github_repo(match.group("repo")) == allowed_repo
     # ExitPlanMode mutates nothing outside the agent's own mode. Denying it
     # traps a read-only Claude session in plan mode forever: it cannot act, not
     # even with the read-only and trusted-MCP tools it is explicitly allowed.

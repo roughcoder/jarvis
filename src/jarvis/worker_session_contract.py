@@ -50,6 +50,13 @@ ENGINE_CATALOG_KEYS = (
     "default_speed",
 )
 
+WORKER_ACCESS_READ_ONLY = "read_only"
+WORKER_ACCESS_INTERACTIVE = "interactive"
+WORKER_ACCESS_FULL_TRUST = "full_trust"
+WORKER_ACCESS_MODES = frozenset(
+    {WORKER_ACCESS_READ_ONLY, WORKER_ACCESS_INTERACTIVE, WORKER_ACCESS_FULL_TRUST}
+)
+
 
 def model_ids(models: list[dict[str, Any]] | None) -> list[str]:
     return [str(row.get("id") or "") for row in (models or []) if isinstance(row, dict) and row.get("id")]

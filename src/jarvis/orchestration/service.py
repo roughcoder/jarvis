@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from jarvis.capabilities import WORKER_SESSION_STOP
+from jarvis.capabilities import WORKER_SESSION_APPROVE, WORKER_SESSION_STOP
 from jarvis.engines import normalize_engine_id, worker_supports_engine
 from jarvis.orchestration import executor
 from jarvis.orchestration.authority import allowed
@@ -140,6 +140,8 @@ class OrchestrationService:
             return item
 
         dispatch_actions = required_for_worker_dispatch(self.cfg.orchestration.landing_mode)
+        if command.access_mode == "interactive":
+            dispatch_actions = [*dispatch_actions, WORKER_SESSION_APPROVE]
         if command.engine_strategy == "ensemble":
             dispatch_actions = [*dispatch_actions, WORKER_SESSION_STOP]
         self._require(dispatch_actions)
@@ -393,7 +395,7 @@ class OrchestrationService:
         run = _resolve_run(store, run_ref)
         if run is None:
             raise ResumeRunError(f"No run found for {run_ref!r}.")
-        landing, allowed_actions, allow_nested_agents = _resume_policy(
+        landing, allowed_actions, allow_nested_agents, access_mode = _resume_policy(
             store,
             run.run_id,
             self.cfg.orchestration.landing_mode,
@@ -441,6 +443,7 @@ class OrchestrationService:
             session_name=previous.session_id,
             resume_session=True,
             allow_nested_agents=allow_nested_agents,
+            access_mode=access_mode,
             allowed_actions=allowed_actions,
             landing=landing,
         )
@@ -774,7 +777,7 @@ def _resume_policy(
     store: OrchestrationStore,
     run_id: str,
     fallback_mode: str,
-) -> tuple[LandingPolicy, list[str], bool]:
+) -> tuple[LandingPolicy, list[str], bool, str]:
     for event in store.events(run_id):
         if event.type != "execution_envelope_created":
             continue
@@ -785,8 +788,8 @@ def _resume_policy(
         if envelope.resume_session:
             continue
         allowed = envelope.allowed_actions or required_for_worker_dispatch(envelope.landing.mode)
-        return envelope.landing, list(allowed), envelope.allow_nested_agents
-    return LandingPolicy(mode=fallback_mode), required_for_worker_dispatch(fallback_mode), True
+        return envelope.landing, list(allowed), envelope.allow_nested_agents, envelope.access_mode
+    return LandingPolicy(mode=fallback_mode), required_for_worker_dispatch(fallback_mode), True, ""
 
 
 def _record_failed_resume(store: OrchestrationStore, run_id: str, error: str) -> None:

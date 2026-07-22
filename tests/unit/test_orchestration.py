@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from jarvis.capabilities import WORKER_SESSION_STOP
+from jarvis.capabilities import WORKER_SESSION_APPROVE, WORKER_SESSION_STOP
 from jarvis.config import WorkerConfig, load_config
 from jarvis.connectors.cockpit import CockpitThread, CockpitThreadIndex
 from jarvis.orchestration import store as store_module
@@ -1099,6 +1099,20 @@ def test_execution_envelope_uses_central_dispatch_policy() -> None:
 
     assert envelope.allowed_actions == envelope_allowed_actions("draft_pr")
     assert "forge.write.local" not in envelope.allowed_actions
+
+
+def test_execution_envelope_carries_interactive_access_authority() -> None:
+    envelope = build_execution_envelope(
+        run_id="run_access",
+        command=WorkCommand("start_next_work", access_mode="interactive", start=True),
+        items=[_item()],
+        worker_id="local-worker",
+        landing_mode="none",
+    )
+
+    assert envelope.access_mode == "interactive"
+    assert WORKER_SESSION_APPROVE in envelope.allowed_actions
+    assert ExecutionEnvelope.from_dict(envelope.to_dict()).access_mode == "interactive"
 
 
 def test_confirm_before_pr_dispatch_policy_includes_pr_authority() -> None:
@@ -4247,6 +4261,7 @@ def test_orchestration_service_resume_run_dispatches_existing_session(tmp_path, 
             prompt="Fix worker",
             landing=LandingPolicy(mode="branch_only"),
             allow_nested_agents=False,
+            access_mode="full_trust",
         ).to_dict(),
     )
     store.link_session(
@@ -4310,6 +4325,7 @@ def test_orchestration_service_resume_run_dispatches_existing_session(tmp_path, 
     assert envelope.run_id == run.run_id
     assert envelope.resume_session is True
     assert envelope.allow_nested_agents is False
+    assert envelope.access_mode == "full_trust"
     assert envelope.session_id == "550e8400-e29b-41d4-a716-446655440000"
     assert envelope.session_name == "550e8400-e29b-41d4-a716-446655440000"
     assert envelope.cwd == "/worker/worktrees/55"

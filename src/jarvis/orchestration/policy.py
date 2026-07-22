@@ -84,9 +84,12 @@ def required_for_worker_dispatch(landing_mode: str) -> list[str]:
     return [WORKER_JOB_START, WORKER_SESSION_CREATE, WORKER_SESSION_TURN, *required_for_landing_mode(landing_mode)]
 
 
-def envelope_allowed_actions(landing_mode: str) -> list[str]:
-    return [
+def envelope_allowed_actions(landing_mode: str, access_mode: str = "") -> list[str]:
+    actions = [
         *required_for_worker_dispatch(landing_mode),
         WORKER_SESSION_INTERRUPT,
         WORKER_SESSION_STOP,
     ]
+    if access_mode == "interactive":
+        actions.append(WORKER_SESSION_APPROVE)
+    return actions

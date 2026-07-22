@@ -11903,6 +11903,54 @@ def test_spawn_child_carries_nested_agent_policy_into_the_execution_envelope(tmp
     assert defaulted.startswith("Spawned child chat run_policy")
 
 
+def test_spawn_child_validates_and_propagates_access_mode(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from jarvis.connectors.cockpit import _spawn_child_work_tool
+    from jarvis.orchestration.service import OrchestrationService
+
+    cfg = _cfg(tmp_path, monkeypatch, identity="neil")
+    _seed_project_registry(cfg)
+    project = RegistryStore(cfg.registry.path).get_project("neil-shared")
+    assert project is not None
+    thread = CockpitThread(
+        thread_id="thread_access_policy",
+        project_id=project.id,
+        session_id="project:neil-shared:orchestrator:thread_access_policy",
+        title="Spawn",
+        created_at="2026-07-13T15:00:00Z",
+        updated_at="2026-07-13T15:00:00Z",
+        created_by="neil",
+        chat_type="orchestrator",
+    )
+    seen: list[str] = []
+
+    def next_work(_self, command, **_kwargs):  # noqa: ANN001
+        seen.append(command.access_mode)
+        return StartedWork(
+            item=WorkItem(source="manual", id="manual_access", title="Review", repo="roughcoder/jarvis"),
+            worker=WorkerProfile(worker_id="worker_a", display_name="Worker A"),
+            envelope=ExecutionEnvelope(run_id="run_access", repo="roughcoder/jarvis", prompt="review"),
+            session=WorkerSessionLink(worker_id="worker_a", session_id="session_access"),
+        )
+
+    monkeypatch.setattr(OrchestrationService, "next_work", next_work)
+    tool = _spawn_child_work_tool(cfg, project, thread)
+    requester = RequestContext("mac", "neil", "personal", frozenset(), channel="cockpit", peer="neil")
+
+    assert tool.parameters["properties"]["access_mode"]["enum"] == [
+        "full_trust",
+        "interactive",
+        "read_only",
+    ]
+    invalid = asyncio.run(tool.handler(requester, {"task": "review", "access_mode": "root"}))
+    explicit = asyncio.run(tool.handler(requester, {"task": "review", "access_mode": "full_trust"}))
+    defaulted = asyncio.run(tool.handler(requester, {"task": "review"}))
+
+    assert invalid == "error: unsupported access_mode: root"
+    assert explicit.startswith("Spawned child chat run_access")
+    assert defaulted.startswith("Spawned child chat run_access")
+    assert seen == ["full_trust", "read_only"]
+
+
 def test_child_watch_claim_renewal_does_not_grow_the_transcript(tmp_path, monkeypatch) -> None:  # noqa: ANN001
     from jarvis.connectors import cockpit as cockpit_connector_module
 

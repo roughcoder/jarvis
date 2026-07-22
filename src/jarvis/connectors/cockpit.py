@@ -86,6 +86,8 @@ from jarvis.worker_session_contract import (
     EVENT_TURN_COMPLETED,
     EVENT_TURN_FAILED,
     FAILED_SESSION_STATUSES,
+    WORKER_ACCESS_MODES,
+    WORKER_ACCESS_READ_ONLY,
     WORKER_ERROR_SESSION_ACTIVE,
     WORKER_ERROR_SESSION_TERMINAL,
     turn_failure_message,
@@ -3678,6 +3680,9 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
         allow_nested_agents = args.get("allow_nested_agents", True)
         if not isinstance(allow_nested_agents, bool):
             return "error: allow_nested_agents must be a boolean"
+        access_mode = str(args.get("access_mode") or WORKER_ACCESS_READ_ONLY).strip()
+        if access_mode not in WORKER_ACCESS_MODES:
+            return f"error: unsupported access_mode: {access_mode}"
         # An unknown engine id matched no worker and surfaced as the misleading
         # "No eligible worker found"; name the real problem instead.
         requested_engine = normalize_engine_id(str(args.get("engine") or ""))
@@ -3695,6 +3700,7 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
             target_model_id=str(args.get("model") or ""),
             provider_instance_id=provider_instance_id,
             allow_nested_agents=allow_nested_agents,
+            access_mode=access_mode,
             start=True,
         )
         try:
@@ -3746,10 +3752,16 @@ def _spawn_child_work_tool(cfg: Config, project: ProjectEntry, thread: CockpitTh
                     "default": True,
                     "description": "Allow the child to launch nested agents. Disable for synchronous review work.",
                 },
+                "access_mode": {
+                    "type": "string",
+                    "enum": sorted(WORKER_ACCESS_MODES),
+                    "default": WORKER_ACCESS_READ_ONLY,
+                    "description": "Child tool access: read_only, interactive approvals, or full_trust without prompts.",
+                },
                 "landing_mode": {
                     "type": "string",
                     "enum": sorted(CHILD_WORK_LANDING_MODES),
-                    "description": "Child delivery policy. Defaults to none so review and analysis children stay read-only.",
+                    "description": "Child delivery policy. Defaults to none so review and analysis children do not land changes.",
                 },
             },
             "required": ["task"],
