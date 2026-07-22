@@ -1192,8 +1192,10 @@ Lane 2 only: the orchestrator must call the existing curation tools such as
 `add_finding` or `record_decision`; it does not silently auto-curate project
 memory from every reply.
 
-When a tool ran, the returned thread projection's `messages` array can include
-event messages alongside user and assistant messages:
+When a code agent emits reasoning summaries, commentary, or tool activity, the
+returned thread projection's `messages` array includes flattened event messages
+alongside user and assistant messages. `turn_id` groups those rows with the
+prompt and final reply while `data` carries the public event payload:
 
 ```json
 {
@@ -1201,6 +1203,24 @@ event messages alongside user and assistant messages:
   "peer_id": "jarvis",
   "content": "tool.call add_finding",
   "observed_at": "2026-07-07T10:00:00+00:00",
+  "event_id": "ev_...",
+  "message_id": "call_...",
+  "call_id": "call_...",
+  "sequence": 1,
+  "type": "tool.call",
+  "turn_id": "turn_...",
+  "data": {
+    "id": "call_...",
+    "item": {
+      "id": "call_...",
+      "type": "tool_use",
+      "name": "add_finding",
+      "input": {
+        "project": "Jarvis",
+        "content": "Thread turns should expose tool calls."
+      }
+    }
+  },
   "event": {
     "event_id": "ev_...",
     "sequence": 1,
@@ -1866,6 +1886,9 @@ provider.started
 provider.session.ready
 assistant.delta
 assistant.message
+assistant.commentary
+reasoning.delta
+reasoning.completed
 tool.call
 tool.result
 approval.requested

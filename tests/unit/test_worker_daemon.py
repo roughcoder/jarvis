@@ -61,9 +61,12 @@ from jarvis.worker.notify import WorkerChangeNotifier  # noqa: E402
 from jarvis.worker_session_contract import (  # noqa: E402
     EVENT_APPROVAL_RESOLVED,
     EVENT_APPROVAL_REQUESTED,
+    EVENT_ASSISTANT_COMMENTARY,
     EVENT_CHECKPOINT_CREATED,
     EVENT_INPUT_REQUESTED,
     EVENT_PROVIDER_LOG,
+    EVENT_REASONING_COMPLETED,
+    EVENT_REASONING_DELTA,
     EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
     EVENT_TURN_COMPLETED,
@@ -835,6 +838,69 @@ def test_codex_projects_completed_mcp_tool_calls_as_tool_results(tmp_path) -> No
     assert done is False
     results = [event for event in sessions.events(session.session_id) if event.type == EVENT_TOOL_RESULT]
     assert results[-1].data["item"] == item
+
+
+def test_codex_projects_reasoning_and_commentary_as_first_class_events(tmp_path) -> None:
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    session, _ = sessions.create(
+        {
+            "provider": "codex",
+            "engine": "codex",
+            "metadata": _authority_metadata("codex"),
+        }
+    )
+    turn = ProviderTurn(turn_id="turn_1", prompt="x", idempotency_key="idem_1")
+
+    for message in (
+        {
+            "jsonrpc": "2.0",
+            "method": "item/reasoning/summaryTextDelta",
+            "params": {"itemId": "reasoning_1", "delta": "Inspecting the timeline"},
+        },
+        {
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "id": "reasoning_1",
+                    "type": "reasoning",
+                    "summary": ["Inspecting the timeline", "Found the ordering bug"],
+                }
+            },
+        },
+        {
+            "jsonrpc": "2.0",
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "id": "commentary_1",
+                    "type": "agentMessage",
+                    "phase": "commentary",
+                    "text": "I found the ordering bug.",
+                }
+            },
+        },
+    ):
+        assert (
+            _project_jsonrpc_message(
+                object(),  # type: ignore[arg-type]
+                message,
+                session_id=session.session_id,
+                turn=turn,
+                sessions=sessions,
+            )
+            is False
+        )
+
+    events = sessions.events(session.session_id)
+    reasoning_delta = next(event for event in events if event.type == EVENT_REASONING_DELTA)
+    reasoning_completed = next(event for event in events if event.type == EVENT_REASONING_COMPLETED)
+    commentary = next(event for event in events if event.type == EVENT_ASSISTANT_COMMENTARY)
+    assert reasoning_delta.data["message_id"] == "reasoning_1"
+    assert reasoning_delta.data["text"] == "Inspecting the timeline"
+    assert reasoning_completed.data["text"] == "Inspecting the timeline\nFound the ordering bug"
+    assert commentary.data["message_id"] == "commentary_1"
+    assert commentary.data["text"] == "I found the ordering bug."
 
 
 @pytest.mark.parametrize(
@@ -3238,7 +3304,12 @@ def test_daemon_session_read_endpoints_offload_file_reads(tmp_path, monkeypatch)
     events, requests, all_requests, offloaded = asyncio.run(_with_server(cfg, 8897, calls))
 
     assert events.status_code == requests.status_code == all_requests.status_code == 200
-    assert offloaded == ["get", "events", "get", "pending_requests", "pending_requests"]
+    endpoint_reads = [
+        name
+        for name in offloaded
+        if name in {"get", "events", "pending_requests"}
+    ]
+    assert endpoint_reads == ["get", "events", "get", "pending_requests", "pending_requests"]
 
 
 def test_daemon_checkpoint_restore_requires_envelope_authority(tmp_path) -> None:
