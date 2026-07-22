@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -14,6 +15,16 @@ from jarvis.capabilities import (
 from jarvis.worker.sessions import WorkerSession
 
 REAL_SESSION_PROVIDERS = {"codex", "claude"}
+
+# These are the two immutable-evidence reads emitted by Cockpit's PR review
+# prompt. Full matching keeps shell operators, alternate gh actions, and writes
+# outside the read-only session boundary.
+_READ_ONLY_GH_PR_COMMAND = re.compile(
+    r"gh pr (?:"
+    r"view [1-9][0-9]* --repo [A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]* --json headRefOid"
+    r"|diff [1-9][0-9]* --repo [A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*"
+    r")"
+)
 
 
 @dataclass(frozen=True)
@@ -122,10 +133,11 @@ class WorkerSessionAuthority:
             return "default"
         return "dontAsk"
 
-    def claude_tool_denial(self, tool_name: str) -> str:
+    def claude_tool_denial(self, tool_name: str, tool_input: dict[str, Any] | None = None) -> str:
         name = str(tool_name or "").strip()
         if self.codex_sandbox == "read-only" and not _claude_tool_is_read_only(
             name,
+            tool_input=tool_input,
             trusted_mcp_servers=self.trusted_mcp_servers,
         ):
             return f"worker session is read-only; refusing Claude tool {name or '<unknown>'}"
@@ -138,9 +150,14 @@ class WorkerSessionAuthority:
             return f"worker session lacks {WORKER_SESSION_APPROVE}; refusing Claude tool {name or '<unknown>'}"
         return ""
 
-    def claude_tool_is_preapproved(self, tool_name: str) -> bool:
+    def claude_tool_is_preapproved(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any] | None = None,
+    ) -> bool:
         return self.codex_sandbox == "read-only" and _claude_tool_is_read_only(
             str(tool_name or ""),
+            tool_input=tool_input,
             trusted_mcp_servers=self.trusted_mcp_servers,
         )
 
@@ -168,12 +185,20 @@ def _allow_nested_agents(metadata: dict[str, Any], envelope: dict[str, Any] | No
     return value if isinstance(value, bool) else True
 
 
-def _claude_tool_is_read_only(tool_name: str, *, trusted_mcp_servers: list[str] | None = None) -> bool:
+def _claude_tool_is_read_only(
+    tool_name: str,
+    *,
+    tool_input: dict[str, Any] | None = None,
+    trusted_mcp_servers: list[str] | None = None,
+) -> bool:
     name = tool_name.strip()
     if not name:
         return False
     if name.startswith("mcp__"):
         return any(name.startswith(f"mcp__{server}__") for server in trusted_mcp_servers or [])
+    if name == "Bash":
+        command = (tool_input or {}).get("command")
+        return isinstance(command, str) and _READ_ONLY_GH_PR_COMMAND.fullmatch(command.strip()) is not None
     # ExitPlanMode mutates nothing outside the agent's own mode. Denying it
     # traps a read-only Claude session in plan mode forever: it cannot act, not
     # even with the read-only and trusted-MCP tools it is explicitly allowed.

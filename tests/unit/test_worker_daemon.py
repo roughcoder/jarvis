@@ -364,6 +364,40 @@ def test_worker_session_authority_maps_read_only_to_codex_read_only() -> None:
     assert authority.claude_tool_is_preapproved("ExitPlanMode")
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr view 31 --repo roughcoder/project-x --json headRefOid",
+        "gh pr diff 31 --repo roughcoder/project-x",
+    ],
+)
+def test_worker_session_authority_allows_bounded_github_pr_reads(command: str) -> None:
+    authority = WorkerSessionAuthority.from_session(_session_with_authority(provider="claude"))
+
+    assert authority.claude_tool_denial("Bash", {"command": command}) == ""
+    assert authority.claude_tool_is_preapproved("Bash", {"command": command})
+
+
+@pytest.mark.parametrize(
+    "tool_input",
+    [
+        {},
+        {"command": "gh pr view 31 --repo roughcoder/project-x"},
+        {"command": "gh pr checkout 31 --repo roughcoder/project-x"},
+        {"command": "gh pr diff 31 --repo roughcoder/project-x > /tmp/pr.diff"},
+        {"command": "gh pr diff 31 --repo roughcoder/project-x && touch owned"},
+        {"command": "gh pr diff 31 --repo roughcoder/project-x\nwhoami"},
+    ],
+)
+def test_worker_session_authority_rejects_unbounded_bash_in_read_only_mode(
+    tool_input: dict[str, str],
+) -> None:
+    authority = WorkerSessionAuthority.from_session(_session_with_authority(provider="claude"))
+
+    assert authority.claude_tool_denial("Bash", tool_input)
+    assert not authority.claude_tool_is_preapproved("Bash", tool_input)
+
+
 def test_worker_session_authority_allows_only_declared_mcp_server_in_read_only_mode() -> None:
     session = _session_with_authority()
     session.metadata["trusted_mcp_servers"] = ["jarvis_orchestrator"]
@@ -371,6 +405,52 @@ def test_worker_session_authority_allows_only_declared_mcp_server_in_read_only_m
 
     assert authority.claude_tool_denial("mcp__jarvis_orchestrator__spawn_child_work_session") == ""
     assert authority.claude_tool_denial("mcp__github__create_issue")
+
+
+def test_claude_read_only_session_preapproves_bounded_github_pr_read(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    command = "gh pr diff 31 --repo roughcoder/project-x"
+    _install_fake_claude_sdk(
+        monkeypatch,
+        [[[_FakePermissionAsk("Bash", {"command": command}), _FakeResultMessage()]]],
+    )
+    sessions = SessionManager(str(tmp_path / "sessions"))
+    metadata = _authority_metadata("claude")
+    metadata["execution_envelope"]["landing"] = {"mode": "read_only", "allow_merge": False}
+    metadata["landing"] = {"mode": "read_only", "allow_merge": False}
+    session, _ = sessions.create(
+        {
+            "provider": "claude",
+            "engine": "claude",
+            "cwd": _owned_worker_cwd(tmp_path, "claude-read-only-gh"),
+            "metadata": metadata,
+        }
+    )
+
+    try:
+        claude.ClaudeProviderAdapter().start_turn(
+            session=session,
+            turn=ProviderTurn(turn_id="turn_review", prompt="review the pull request"),
+            sessions=sessions,
+            worker_cfg=WorkerConfig(
+                _env_file=None,
+                workspace=str(tmp_path / "worker"),
+                claude_bin="fake-claude",
+                job_timeout_s=5,
+            ),
+        )
+        for _ in range(100):
+            if any(event.type == "turn.completed" for event in sessions.events(session.session_id)):
+                break
+            time.sleep(0.02)
+    finally:
+        _stop_fake_claude_runtimes()
+
+    client = _FakeClaudeClient.instances[0]
+    result = client.permission_results[0]
+    assert client.options.permission_mode == "plan"
+    assert isinstance(result, _FakePermissionResultAllow)
+    assert result.updated_input == {"command": command}
+    assert not any(event.type == "approval.requested" for event in sessions.events(session.session_id))
 
 
 def test_codex_orchestrator_overrides_are_thread_scoped_and_secret_free() -> None:
