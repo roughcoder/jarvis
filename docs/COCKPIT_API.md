@@ -341,11 +341,13 @@ If `workers.json` is missing or unreadable, Jarvis still exposes one compatible
 fallback worker with id `local-worker`; its display name is derived from the
 local host so the cockpit does not show an ambiguous generic machine. This
 synthesized profile advertises eight concurrent job slots by default; set
-`WORKER_MAX_CONCURRENT_JOBS` to tune it for the host. Multi-host fleets must
-still provide `workers.json` because Jarvis cannot safely infer remote worker
-URLs or tokens. Put secrets in env vars and reference them from profiles with
-`token_env`; tokens can come from the process environment or the configured
-`JARVIS_ENV_FILE`.
+`WORKER_MAX_CONCURRENT_JOBS` to tune it for the host. Existing installations
+that persist `WORKER_MAX_CONCURRENT_JOBS=2` in their env file must raise it to
+`8` or remove the setting to adopt the new default, then restart the Jarvis API
+and worker services. Multi-host fleets must still provide `workers.json`
+because Jarvis cannot safely infer remote worker URLs or tokens. Put secrets in
+env vars and reference them from profiles with `token_env`; tokens can come
+from the process environment or the configured `JARVIS_ENV_FILE`.
 
 Worker rows include public hygiene metadata when probed:
 
