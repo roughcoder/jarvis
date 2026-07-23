@@ -146,6 +146,15 @@ def test_worker_workspace_defaults_outside_repo() -> None:
     assert WorkerConfig(_env_file=None).workspace == "~/.jarvis/worker"
 
 
+def test_worker_capacity_defaults_to_eight_and_remains_env_driven(monkeypatch) -> None:
+    _clean(monkeypatch, "WORKER_MAX_CONCURRENT_JOBS")
+    assert WorkerConfig(_env_file=None).max_concurrent_jobs == 8
+
+    monkeypatch.setenv("WORKER_MAX_CONCURRENT_JOBS", "3")
+
+    assert WorkerConfig(_env_file=None).max_concurrent_jobs == 3
+
+
 def test_worker_id_uses_documented_env_name(monkeypatch) -> None:
     _clean(monkeypatch, "WORKER_ID", "WORKER_WORKER_ID")
     monkeypatch.setenv("WORKER_ID", "kitchen-worker")

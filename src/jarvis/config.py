@@ -519,7 +519,7 @@ class WorkerConfig(_Base):
     notify_delivery_timeout_s: float = 2.0
     allow_insecure: bool = False     # permit a no-token, non-loopback bind (else refuse to start)
     workspace: str = "~/.jarvis/worker"  # default cwd for actions/jobs
-    max_concurrent_jobs: int = 2  # advertised orchestration capacity for the synthesized local profile
+    max_concurrent_jobs: int = 8  # advertised orchestration capacity for the synthesized local profile
     # HTTP request body ceiling. Must fit turn attachments after base64
     # encoding (the cockpit's per-turn budget is ~28 MiB at its defaults).
     max_request_bytes: int = 32 * 1024 * 1024
