@@ -517,6 +517,7 @@ def _pull_request_review_params() -> dict[str, Any]:
             {"engine": "codex", "model": "gpt-5"},
             {"engine": "claude", "model": "claude-opus"},
         ],
+        "access_mode": "full_trust",
     }
 
 

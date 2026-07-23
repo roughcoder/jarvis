@@ -53,6 +53,9 @@ def test_builtin_routine_catalog_exposes_first_class_library() -> None:
         "maintainability",
         "style",
     ]
+    access_mode = next(item for item in pr_review["parameters"] if item["name"] == "access_mode")
+    assert access_mode["choices"] == ["read_only", "interactive", "full_trust"]
+    assert access_mode["default"] == {"source": "literal", "value": "read_only"}
 
 
 def test_builtin_routine_catalog_parses_once_per_catalog(monkeypatch) -> None:  # noqa: ANN001
@@ -84,15 +87,18 @@ def test_pr_review_resolution_validates_two_models_and_renders_target() -> None:
             "reviewers": [
                 {"engine": "codex", "model": "gpt-5"},
                 {"engine": "claude", "model": "claude-opus"},
-            ]
+            ],
+            "access_mode": "full_trust",
         },
     )
 
     assert resolution.ready is True
     assert resolution.missing == ()
     assert resolution.values["post_comments"] is True
+    assert resolution.values["access_mode"] == "full_trust"
     assert '"number":123' in resolution.rendered_prompt
     assert "gpt-5" in resolution.rendered_prompt
+    assert "Child reviewer access mode: full_trust." in resolution.rendered_prompt
 
     with pytest.raises(ValueError, match="requires at least 2 items"):
         resolve_routine(

@@ -64,6 +64,18 @@
         },
         {
           "allow_multiple": false,
+          "choices": ["read_only", "interactive", "full_trust"],
+          "default": {"source": "literal", "value": "read_only"},
+          "description": "The worker access mode applied to both child reviewer sessions.",
+          "label": "Reviewer access",
+          "name": "access_mode",
+          "options_source": "",
+          "required": false,
+          "sensitive": false,
+          "type": "enum"
+        },
+        {
+          "allow_multiple": false,
           "default": {"source": "literal", "value": "No additional instructions."},
           "description": "Additional review emphasis, context, or constraints.",
           "label": "Extra instructions",
@@ -85,7 +97,7 @@
           "type": "boolean"
         }
       ],
-      "prompt_template": "Review pull request {{pull_request}}.\n\nRun exactly two independent reviewer sessions using these provider/model selections: {{reviewers}}.\nReview dimensions: {{dimensions}}.\nExtra instructions: {{extra_instructions}}.\nPost the synthesised review comments to GitHub: {{post_comments}}.\n\nUse the project orchestration tools and preserve the pull request's repository context. Require evidence from both reviewers before synthesising. Do not claim that comments were posted unless the publication tool confirms it.",
+      "prompt_template": "Review pull request {{pull_request}}.\n\nRun exactly two independent reviewer sessions using these provider/model selections: {{reviewers}}.\nReview dimensions: {{dimensions}}.\nChild reviewer access mode: {{access_mode}}.\nExtra instructions: {{extra_instructions}}.\nPost the synthesised review comments to GitHub: {{post_comments}}.\n\nUse the project orchestration tools and preserve the pull request's repository context. Require evidence from both reviewers before synthesising. Do not claim that comments were posted unless the publication tool confirms it.",
       "routine_id": "pull-request-review",
       "summary": "Review a pull request with independent agents and a synthesised verdict.",
       "target_types": ["pull_request"],
